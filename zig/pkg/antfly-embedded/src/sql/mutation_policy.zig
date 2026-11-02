@@ -54,17 +54,65 @@ fn predicateReadsColumn(value: ?*const ast.Predicate) bool {
     };
 }
 
+pub fn returningReadsColumn(projections: ?[]const ast.Projection) bool {
+    const items = projections orelse return false;
+    // The parser's compact spelling for plain RETURNING * is a present,
+    // empty projection list. It reads stored columns, unlike RETURNING 1.
+    if (items.len == 0) return true;
+    for (items) |projection| {
+        if (projection.wildcard or projection.field.len != 0) return true;
+        if (projection.expression) |expression| if (scalarReadsColumn(expression)) return true;
+    }
+    return false;
+}
+
+fn sourceSelectRequired(source: ?*const ast.Relation) bool {
+    const relation = source orelse return false;
+    // DEFAULT/subquery lowering may synthesize the target's preimage source.
+    // That scan retains the command's authority; it is not a user FROM/USING
+    // reference. Explicit sources still resolve through their read authority.
+    return relation.* != .table or !relation.table.mutation_target;
+}
+
 pub fn selectRequired(statement: ast.Statement) bool {
     return switch (statement) {
-        .insert => |insert| insert.returning != null or insert.conflict != null,
+        .insert => |insert| returningReadsColumn(insert.returning) or if (insert.conflict) |conflict| conflict.columns.len != 0 or conflict.constraint_name != null or conflict.expressions.len != 0 or conflict.arbiter_predicate != null or conflict.assignments.len != 0 or conflict.predicate != null else false,
         .update => |update| blk: {
-            if (update.returning != null or update.source != null or predicateReadsColumn(update.predicate)) break :blk true;
+            if (returningReadsColumn(update.returning) or sourceSelectRequired(update.source) or predicateReadsColumn(update.predicate)) break :blk true;
             for (update.assignments) |assignment| if (assignment.expression) |expression| if (scalarReadsColumn(expression)) break :blk true;
             break :blk false;
         },
-        .delete => |delete| delete.returning != null or delete.source != null or predicateReadsColumn(delete.predicate),
+        .delete => |delete| returningReadsColumn(delete.returning) or sourceSelectRequired(delete.source) or predicateReadsColumn(delete.predicate),
         else => true,
     };
+}
+
+pub fn requiredPrivileges(statement: ast.Statement) u16 {
+    const access = @import("../system_catalog/privileges.zig").Access;
+    const select = if (selectRequired(statement)) access.bit(.select) else @as(u16, 0);
+    return switch (statement) {
+        .insert => |insert| access.bit(.insert) | select | if (insert.conflict) |conflict| (if (conflict.assignments.len != 0) access.bit(.update) else @as(u16, 0)) else @as(u16, 0),
+        .update => access.bit(.update) | select,
+        .delete => access.bit(.delete) | select,
+        .merge => |merge| blk: {
+            var required = access.bit(.select);
+            for (merge.arms) |arm| required |= switch (arm.action) {
+                .update => access.bit(.update),
+                .delete => access.bit(.delete),
+                .insert => access.bit(.insert),
+                .nothing => 0,
+            };
+            break :blk required;
+        },
+        else => access.bit(.select),
+    };
+}
+
+pub fn bindPrivileges(table: *@import("catalog.zig").Table, statement: ast.Statement) !void {
+    table.sql_required_privileges = requiredPrivileges(statement);
+    if (table.sql_access) |access| {
+        if ((access.rights | table.sql_native_rights) & table.sql_required_privileges != table.sql_required_privileges) return error.Forbidden;
+    }
 }
 
 pub fn scanPurpose(statement: ast.Statement) authority.Purpose {
@@ -84,11 +132,69 @@ test "constant write-only mutations do not acquire SELECT authority" {
         .{ .sql = "UPDATE items SET status = upper(status)", .selected = true },
         .{ .sql = "UPDATE items SET status = 'active' WHERE id = 'a'", .selected = true },
         .{ .sql = "UPDATE items SET status = 'active' RETURNING status", .selected = true },
+        .{ .sql = "INSERT INTO items(id) VALUES('a') RETURNING *", .selected = true },
+        .{ .sql = "INSERT INTO items(id) VALUES('a') RETURNING items.*", .selected = true },
+        .{ .sql = "UPDATE items SET status = 'active' RETURNING *", .selected = true },
+        .{ .sql = "DELETE FROM items RETURNING *", .selected = true },
         .{ .sql = "DELETE FROM items", .selected = false },
         .{ .sql = "DELETE FROM items WHERE id = 'a'", .selected = true },
     }) |case| {
         var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
         defer compiled.deinit();
         try std.testing.expectEqual(case.selected, selectRequired(compiled.statement));
+    }
+}
+
+test "SQL privileges mutation intent separates insert update delete conflict and literal returning" {
+    const std = @import("std");
+    const compiler = @import("compiler.zig");
+    const bits = @import("../system_catalog/privileges.zig").Access;
+    const catalog = @import("catalog.zig");
+    for ([_]struct { sql: []const u8, required: u16 }{
+        .{ .sql = "INSERT INTO t(id,v) VALUES(2,2) RETURNING 1", .required = bits.bit(.insert) },
+        .{ .sql = "INSERT INTO t(id,v) VALUES(1,2) ON CONFLICT DO NOTHING", .required = bits.bit(.insert) },
+        .{ .sql = "INSERT INTO t(id,v) VALUES(1,2) ON CONFLICT(id) DO NOTHING", .required = bits.bit(.insert) | bits.bit(.select) },
+        .{ .sql = "INSERT INTO t(id,v) VALUES(1,2) ON CONFLICT(id) DO UPDATE SET v=3", .required = bits.bit(.insert) | bits.bit(.select) | bits.bit(.update) },
+        .{ .sql = "UPDATE t SET v=4 RETURNING 1", .required = bits.bit(.update) },
+        .{ .sql = "DELETE FROM t WHERE false RETURNING 1", .required = bits.bit(.delete) },
+        .{ .sql = "DELETE FROM t WHERE id=1", .required = bits.bit(.delete) | bits.bit(.select) },
+    }) |example| {
+        var compiled = try compiler.compile(std.testing.allocator, example.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(example.required, requiredPrivileges(compiled.statement));
+        var table: catalog.Table = .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{}, .sql_access = .{ .rights = bits.bit(.insert) } };
+        if (example.required == bits.bit(.insert)) {
+            try bindPrivileges(&table, compiled.statement);
+        } else try std.testing.expectError(error.Forbidden, bindPrivileges(&table, compiled.statement));
+    }
+}
+
+test "SQL privileges lowered target preimages retain command authority without adding SELECT" {
+    const std = @import("std");
+    const compiler = @import("compiler.zig");
+    const access = @import("../system_catalog/privileges.zig").Access;
+    for ([_]struct { sql: []const u8, selected: bool }{
+        .{ .sql = "UPDATE t SET v=DEFAULT RETURNING 1", .selected = false },
+        .{ .sql = "UPDATE t SET v=DEFAULT WHERE id=1 RETURNING 1", .selected = true },
+        .{ .sql = "UPDATE t SET v=DEFAULT RETURNING v", .selected = true },
+        .{ .sql = "DELETE FROM t WHERE false RETURNING 1", .selected = false },
+        .{ .sql = "DELETE FROM t RETURNING id", .selected = true },
+    }) |input| {
+        var compiled = try compiler.compile(std.testing.allocator, input.sql, .{});
+        defer compiled.deinit();
+        const before = requiredPrivileges(compiled.statement);
+        const purpose = scanPurpose(compiled.statement);
+        var target: ast.Relation = .{ .table = .{ .name = .{ .table = "t" }, .mutation_target = true } };
+        switch (compiled.statement) {
+            .update => |*update| update.source = &target,
+            .delete => |*deletion| deletion.source = &target,
+            else => unreachable,
+        }
+        try std.testing.expectEqual(input.selected, selectRequired(compiled.statement));
+        try std.testing.expectEqual(before, requiredPrivileges(compiled.statement));
+        try std.testing.expectEqual(purpose, scanPurpose(compiled.statement));
+        try std.testing.expectEqual(input.selected, before & access.bit(.select) != 0);
+        target.table.mutation_target = false;
+        try std.testing.expect(selectRequired(compiled.statement));
     }
 }

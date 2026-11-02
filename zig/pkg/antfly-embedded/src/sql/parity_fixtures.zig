@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const inventory = @embedFile("fixtures/sql_parity_inventory.json");
+pub const prepared_transaction_reference = @embedFile("fixtures/sql_prepared_transaction_reference.json");
 pub const role_defaults_reference = @embedFile("fixtures/sql_role_defaults_reference.json");
 pub const generated_original_reference = @embedFile("fixtures/sql_generated_original_reference.json");
 pub const catalog_campaign = @embedFile("fixtures/sql_catalog_campaign.json");
@@ -44,6 +45,7 @@ pub const source_mutation_reference = @embedFile("fixtures/sql_source_mutation_r
 pub const prepared_source_reference = @embedFile("fixtures/sql_prepared_source_reference.json");
 pub const table_comment_reference = @embedFile("fixtures/sql_table_comment_reference.json");
 pub const resource_comment_reference = @embedFile("fixtures/sql_resource_comment_reference.json");
+pub const object_comment_reference = @embedFile("fixtures/postgres_object_comments.json");
 pub const column_comment_reference = @embedFile("fixtures/sql_column_comment_reference.json");
 pub const identity_reference = @embedFile("fixtures/sql_identity_reference.json");
 pub const sequence_declaration_reference = @embedFile("fixtures/sql_sequence_declaration_reference.json");
@@ -190,3 +192,18 @@ pub const cast_reference = @embedFile("fixtures/sql_cast_reference.json");
 pub const enum_catalog_reference = @embedFile("fixtures/sql_enum_catalog_reference.json");
 
 pub const enum_execution_reference = @embedFile("fixtures/sql_enum_execution_reference.json");
+
+pub const maintenance_reference = @embedFile("fixtures/sql_maintenance_reference.json");
+
+pub const authorization_reference = @embedFile("fixtures/sql_authorization_reference.json");
+
+pub const domain_annotation_reference = @embedFile("fixtures/sql_domain_annotation_reference.json");
+pub const domain_row_reference = @embedFile("fixtures/sql_domain_row_reference.json");
+
+pub const sync_control_reference = @embedFile("fixtures/sql_sync_control_reference.json");
+
+pub const bytea_reference = @embedFile("fixtures/sql_bytea_reference.json");
+
+pub const trigger_reference = @embedFile("fixtures/sql_trigger_reference.json");
+
+pub const phonetic_reference = @embedFile("fixtures/sql_phonetic_reference.json");

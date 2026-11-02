@@ -217,17 +217,21 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
     {
         // Zig 0.17.0, SDK 27.0, baseline CPU, CPU inference dependencies in
         // ReleaseFast. Complete cold compiler peaks were 17,932,107,776 and
-        // 14,813,134,848 bytes; data implementation reached 18,559,696,896
-        // in the bounded build. Add 10%, rounding up to 128 MiB so useful
+        // 14,813,134,848 bytes; the external-transaction Debug correctness
+        // gate reached 20,858,257,408 bytes in the data implementation.
+        // Add 10%, rounding up to 128 MiB so useful
         // pairs still fit the host-aware budget. See COMPILATION.md.
         const measured = [_]struct { name: []const u8, mib: usize }{
+            // Native index/portable restore Debug closure: 18,387,369,984
+            // bytes on Zig 0.17/macOS arm64; +10%, rounded to 128 MiB.
+            .{ .name = "api-derived-coverage-tests", .mib = 19_328 },
             .{ .name = test_owner_names.root_unit, .mib = 18_816 },
             .{ .name = test_owner_names.api_storage_authority, .mib = 12_672 },
             // Observed kernel high-water footprint under memory compression:
             // 15,545,119,176 bytes, plus 10% rounded up to 128 MiB.
             .{ .name = test_owner_names.capi_contract, .mib = 16_384 },
             .{ .name = "data-runtime-tests", .mib = 15_616 },
-            .{ .name = "data-runtime-implementation-tests", .mib = 19_584 },
+            .{ .name = "data-runtime-implementation-tests", .mib = 21_888 },
         };
         for (measured) |sample| if (std.mem.eql(u8, name, sample.name))
             return @max(authored, sample.mib * 1024 * 1024);
@@ -559,14 +563,13 @@ test "native Darwin Debug test reservations cover measured peaks without unsafe 
     try std.testing.expectEqual(12 * gib, testCompileMaxRss("api-docid-tests", linux, macos, .debug, 12 * gib));
     try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-docid-tests", linux, linux, .debug, 7 * gib));
     const names = [_][]const u8{ "api-auth-tests", "api-derived-coverage-tests", "raft-unit-tests", "api-table-write-implementation-tests", "secret-backends-tests", "antfly-hosted-truncate-fk-recovery", "data-runtime-implementation-tests", "antfly-hosted-self-fk-recovery", "antfly-hosted-initial-fk-recovery" };
-    const peaks = [_]usize{ 13_895_155_712, 14_097_039_360, 14_420_606_976, 13_252_476_928, 15_418_605_568, 12_111_249_408, 18_268_717_056, 11_942_445_056, 11_940_200_448 };
+    const peaks = [_]usize{ 13_895_155_712, 18_387_369_984, 14_420_606_976, 13_252_476_928, 15_418_605_568, 12_111_249_408, 18_268_717_056, 11_942_445_056, 11_940_200_448 };
     for (names, peaks) |name, measured| {
         const floor = testCompileMaxRss(name, macos, macos, .debug, 12 * gib);
-        // The data implementation has a newer, larger measured peak and a
-        // qualified 10%/128-MiB envelope in the expanded-profile test below.
-        // Check its earlier peak under that same policy; other owners retain
+        // Data implementation and derived coverage have independently measured
+        // 10%/128-MiB envelopes. Other owners retain
         // their existing 25% floors and every authored/cross-host assertion.
-        const margin = if (std.mem.eql(u8, name, "data-runtime-implementation-tests")) measured / 10 else measured / 4;
+        const margin = if (std.mem.eql(u8, name, "data-runtime-implementation-tests") or std.mem.eql(u8, name, "api-derived-coverage-tests")) measured / 10 else measured / 4;
         try std.testing.expect(floor >= measured + margin);
         try std.testing.expect(floor + identity_claim > 30 * gib);
         try std.testing.expectEqual(24 * gib, testCompileMaxRss(name, macos, macos, .debug, 24 * gib));
@@ -636,7 +639,7 @@ test "expanded Darwin Debug claims cover complete peaks with bounded headroom" {
         .{ .name = test_owner_names.api_storage_authority, .peak = 12_037_652_480 },
         .{ .name = test_owner_names.capi_contract, .peak = 15_545_119_176 },
         .{ .name = "data-runtime-tests", .peak = 14_813_134_848 },
-        .{ .name = "data-runtime-implementation-tests", .peak = 18_559_696_896 },
+        .{ .name = "data-runtime-implementation-tests", .peak = 20_858_257_408 },
     }) |sample| {
         const claim = testCompileMaxRss(sample.name, macos, macos, .debug, 0);
         const required = sample.peak + (sample.peak + 9) / 10;
@@ -649,7 +652,10 @@ test "expanded Darwin Debug claims cover complete peaks with bounded headroom" {
     }
     const budget = 36 * gib * 4 / 5;
     try std.testing.expect(testCompileMaxRss("root-unit-tests", macos, macos, .debug, 0) + 10 * gib <= budget);
-    try std.testing.expect(testCompileMaxRss("data-runtime-implementation-tests", macos, macos, .debug, 0) + 9 * gib <= budget);
+    // The expanded data graph can still overlap a seven-GiB owner. Its
+    // measured footprint no longer permits the old nine-GiB pairing.
+    try std.testing.expect(testCompileMaxRss("data-runtime-implementation-tests", macos, macos, .debug, 0) + 7 * gib <= budget);
+    try std.testing.expect(testCompileMaxRss("data-runtime-implementation-tests", macos, macos, .debug, 0) + 9 * gib > budget);
     try std.testing.expect(testCompileMaxRss(test_owner_names.capi_contract, macos, macos, .debug, 0) + testCompileMaxRss(test_owner_names.api_storage_authority, macos, macos, .debug, 0) <= budget);
 }
 

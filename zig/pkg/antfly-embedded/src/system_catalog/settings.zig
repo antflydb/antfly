@@ -20,6 +20,11 @@ const std = @import("std");
 pub const Kind = enum { boolean, integer, string };
 pub const Value = union(Kind) { boolean: bool, integer: i64, string: []const u8 };
 pub const Identity = struct { id: u64, generation: u64 };
+/// Runtime-owned SQL control identities cannot be allocated or redefined by
+/// administrator-published settings. Their values use the ordinary overlays.
+pub const native_sync_identity: Identity = .{ .id = std.math.maxInt(u64), .generation = 1 };
+pub const native_sync_name = "antfly.sync_level";
+
 pub const Scope = struct {
     principal: []const u8,
     database: []const u8,
@@ -87,6 +92,7 @@ pub const Record = struct {
         if (self.identity.id == 0 or self.identity.generation == 0 or
             (self.policy_sensitive and self.session_writable) or self.database_defaults.len > 256 or self.role_defaults.len > 1024)
             return error.InvalidSettingRecord;
+        if (self.identity.id == native_sync_identity.id or std.ascii.eqlIgnoreCase(self.name, native_sync_name)) return error.InvalidSettingRecord;
         try validateName(self.name);
         try validateValue(self.kind, self.default);
         const builtin = builtinInput(self.name) != null;

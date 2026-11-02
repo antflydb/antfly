@@ -130,15 +130,84 @@ components:
           pattern: '^(?:[0-9a-f]{2})+$'
           description: Server-managed immutable ordering key encoded as lowercase hexadecimal.
 
-    SQLNamedTypeLayout:
+    SQLNamedTypeReference:
       type: object
       additionalProperties: false
-      required: [kind, identity, labels]
-      description: Server-resolved executable type layout retained by a table schema epoch. Catalog ownership is separate from value representation.
+      required: [id, origin_id, generation]
+      description: Immutable named-base identity pinned by a domain definition.
+      properties:
+        id:
+          type: integer
+          format: uint64
+          minimum: 1
+        origin_id:
+          type: string
+          minLength: 32
+          maxLength: 32
+          pattern: '^[0-9a-f]{32}$'
+        generation:
+          type: integer
+          format: uint32
+          minimum: 1
+
+    SQLNamedDomainBase:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      description: Exactly one builtin or named base. The server resolves and verifies the complete base chain before publication.
       properties:
         kind:
           type: string
-          enum: [enum]
+          enum: [builtin, named]
+        builtin:
+          $ref: "#/components/schemas/SQLBuiltinType"
+        named:
+          $ref: "#/components/schemas/SQLNamedTypeReference"
+
+    SQLNamedDomainCheck:
+      type: object
+      additionalProperties: false
+      required: [name, expression, validated]
+      description: A named CHECK over the typed VALUE input. Unvalidated constraints still enforce every new assignment.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 63
+        expression:
+          $ref: "#/components/schemas/RelationalScalarExpression"
+        validated:
+          type: boolean
+
+    SQLNamedDomainDefinition:
+      type: object
+      additionalProperties: false
+      required: [base, not_null, checks]
+      description: Server-resolved immutable domain contract. Defaults affect future assignments; restrictive changes require dependent-owner activation.
+      properties:
+        base:
+          $ref: "#/components/schemas/SQLNamedDomainBase"
+        numeric_modifier:
+          $ref: "#/components/schemas/SQLNumericModifier"
+        default_expression:
+          $ref: "#/components/schemas/RelationalScalarExpression"
+        not_null:
+          type: boolean
+        checks:
+          type: array
+          maxItems: 128
+          items:
+            $ref: "#/components/schemas/SQLNamedDomainCheck"
+
+    SQLNamedTypeLayout:
+      type: object
+      additionalProperties: false
+      required: [kind, identity]
+      description: Server-resolved executable type layout retained by a table schema epoch. Enum layouts require labels; domain layouts require domain. The alternatives are mutually exclusive. Catalog ownership is separate from value representation.
+      properties:
+        kind:
+          type: string
+          enum: [enum, domain]
         identity:
           $ref: "#/components/schemas/SQLNamedTypeIdentity"
         labels:
@@ -146,6 +215,8 @@ components:
           maxItems: 4096
           items:
             $ref: "#/components/schemas/SQLNamedEnumLabel"
+        domain:
+          $ref: "#/components/schemas/SQLNamedDomainDefinition"
 
     SQLNamedEnumColumnSchema:
       type: object
@@ -638,11 +709,11 @@ components:
 
     RelationalExpressionOp:
       type: string
-      enum: [literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, and, or, not, cast, case_when, modulo, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt, jsonb_typeof, jsonb_array_length, jsonb_extract_path, jsonb_extract_path_text, uuidv4, uuidv7, transaction_timestamp]
+      enum: [literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, and, or, not, cast, case_when, modulo, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt, jsonb_typeof, jsonb_array_length, jsonb_extract_path, jsonb_extract_path_text, uuidv4, uuidv7, transaction_timestamp, length, octet_length, bit_length]
 
     RelationalExpressionType:
       type: string
-      enum: [string, blob, boolean, datetime, integer, number, numeric, sql_array, json, numrange, daterange, tsrange, tstzrange]
+      enum: [string, blob, boolean, datetime, integer, number, numeric, sql_array, json, numrange, daterange, tsrange, tstzrange, enumeration]
 
     RelationalScalarExpression:
       type: object
@@ -749,6 +820,12 @@ components:
         A matching candidate wins over NULL candidates; otherwise a NULL
         candidate makes the result UNKNOWN. These operations require schema
         capability version 19.
+        Enumeration expressions require reader capability version 40. Enum
+        literals and casts declare named_type_id from the owning schema directory.
+        Input labels are exact and case-sensitive; comparisons retain declaration
+        order and reject unrelated named identities. Enum/text conversions are
+        explicit; stored enum values retain four-byte symbols. CHECK, generated
+        values, defaults, typed-row ingress and restore share the native validator.
         JSON expressions require reader capability version 30. The json type
         carries JSONB semantics, including exact numeric values and display
         scale. jsonb_typeof and jsonb_array_length take one JSON argument;
@@ -763,6 +840,11 @@ components:
           $ref: "#/components/schemas/RelationalExpressionOp"
         type:
           $ref: "#/components/schemas/RelationalExpressionType"
+        named_type_id:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Required on enumeration literals and casts, including typed NULL. Resolved from the immutable schema-owned named-type directory; labels and executable definitions are never accepted here. Requires reader capability version 40. Other expression types reject this field.
         sql_type:
           $ref: "#/components/schemas/SQLBuiltinType"
           description: Numeric builtin result identity on numeric literals, arithmetic, negate, and cast (capability version 18), or required array element identity on sql_array literals including typed NULL (capability version 24).

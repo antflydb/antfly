@@ -289,6 +289,24 @@ pub const CompiledTableValidator = struct {
         return result;
     }
 
+    /// Authenticated producers may hand off completed domain coercions. The
+    /// fingerprint only proves the destination; callers must establish origin
+    /// authority before attaching this private marker to a native write.
+    pub fn forDomainAdmission(self: CompiledTableValidator, admission: ?@import("domain_row.zig").Admission) CompiledTableValidator {
+        var result = self;
+        result.execution.domain_admission = admission;
+        return result;
+    }
+
+    pub fn preparedDomainContract(self: CompiledTableValidator) ?@import("domain_handoff.zig").Contract {
+        return if (self.execution.domains) |*plan| plan.preparedContract() else null;
+    }
+
+    pub fn requirePreparedDomain(self: CompiledTableValidator, contract: @import("domain_handoff.zig").Contract) !void {
+        const domains = if (self.execution.domains) |*value| value else return error.InvalidBatchRequest;
+        try domains.requirePrepared(contract);
+    }
+
     pub fn prepareTypedValue(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value, json_null_fields: []const []const u8, preserve: bool) !void {
         if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
         try impl.prepareTypedDocumentValueWithRuntime(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution, json_null_fields, preserve, self.preparation_runtime);
@@ -1321,6 +1339,41 @@ fn requiresTextExpressions(schema: ParsedTableSchema) bool {
     return false;
 }
 
+fn stringLengthJson(expression: std.json.Value, depth: usize) bool {
+    if (depth > 16 or expression != .object) return false;
+    if (expression.object.get("op")) |op| if (op == .string and
+        (std.mem.eql(u8, op.string, "length") or std.mem.eql(u8, op.string, "octet_length") or std.mem.eql(u8, op.string, "bit_length"))) return true;
+    if (expression.object.get("args")) |args| if (args == .array) for (args.array.items) |arg| {
+        if (stringLengthJson(arg, depth + 1)) return true;
+    };
+    return false;
+}
+
+fn stringLengthWire(expression: anytype, depth: usize) bool {
+    if (depth > 16) return false;
+    if (expression.op == .length or expression.op == .octet_length or expression.op == .bit_length) return true;
+    if (expression.args) |args| for (args) |arg| if (stringLengthWire(arg, depth + 1)) return true;
+    return false;
+}
+
+fn requiresStringLengths(schema: ParsedTableSchema) bool {
+    if (schema.checks) |checks| for (checks.value) |check| if (check.expression) |expression| {
+        if (stringLengthWire(expression, 0)) return true;
+    };
+    if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+        for (index.keys) |key| if (key.expression) |expression| if (stringLengthWire(expression, 0)) return true;
+    };
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| if (constraint.keys) |keys| {
+        for (keys) |key| if (key.expression) |expression| if (stringLengthWire(expression, 0)) return true;
+    };
+    for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
+        if (declarations.value == .array) for (declarations.value.array.items) |entry| {
+            if (entry == .object) if (entry.object.get("expression")) |expression| if (stringLengthJson(expression, 0)) return true;
+        };
+    };
+    return false;
+}
+
 fn numericFunctionName(name: []const u8) bool {
     return std.meta.stringToEnum(@import("../sql/numeric_functions.zig").Function, name) != null;
 }
@@ -1975,6 +2028,15 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
 
 /// Reduced immutable layout for typed scalar validation. Compiling CHECKs
 /// does not need another copy of full-text, dynamic or physical index plans.
+/// Borrow executable domains from this immutable parsed schema. The returned
+/// plan owns only its column bindings; it must be released before the schema.
+pub fn prepareDomainRows(alloc: std.mem.Allocator, schema: ParsedTableSchema) !@import("domain_row.zig").Plan {
+    const registry = schema.named_types orelse return error.InvalidSchemaUpdateRequest;
+    const columns = try deriveRuntimeRelationalColumns(alloc, schema);
+    defer freeRuntimeRelationalColumns(alloc, columns);
+    return @import("domain_row.zig").Plan.initBorrowed(alloc, schema.version, if (schema.storage_mode == .relational) .relational else .document, columns, &registry.prepared);
+}
+
 pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTableSchema) !storage_schema.TableSchema {
     var result = expressionCapabilitySchema(schema);
     result.storage_mode = if (schema.storage_mode == .relational or impl.hasDocumentExpressions(schema)) switch (schema.storage_mode) {
@@ -2018,6 +2080,8 @@ fn expressionCapabilitySchema(schema: ParsedTableSchema) storage_schema.TableSch
         .requires_uuid_defaults = requiresUuidDefaults(schema),
         .requires_clock_defaults = requiresClockDefaults(schema),
         .requires_range_expressions = requiresRangeExpressions(schema),
+        .requires_enum_expressions = requiresEnumExpressions(schema),
+        .requires_string_lengths = requiresStringLengths(schema),
         .requires_temporal_keys = requiresTemporalKeys(schema),
         .requires_sequence_defaults = requiresSequenceDefaults(schema),
         .named_types = if (schema.named_types) |registry| registry.records else &.{},
@@ -2074,6 +2138,21 @@ fn rangeExpressionWire(expression: anytype, depth: usize) bool {
 fn requiresTemporalKeys(schema: ParsedTableSchema) bool {
     if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| {
         if (constraint.without_overlaps_column != null) return true;
+    };
+    return false;
+}
+
+fn requiresEnumExpressions(schema: ParsedTableSchema) bool {
+    if (schema.named_types == null) return false;
+    if (schema.checks) |checks| for (checks.value) |check| if (check.expression != null) return true;
+    if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+        for (index.keys) |key| if (key.expression != null) return true;
+    };
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| if (constraint.keys) |keys| {
+        for (keys) |key| if (key.expression != null) return true;
+    };
+    for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
+        if (declarations.value == .array and declarations.value.array.items.len != 0) return true;
     };
     return false;
 }

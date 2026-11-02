@@ -642,3 +642,29 @@ fn consumerTests() type {
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
 }
+
+test "raft protocol barrier external transaction admission expires only new votes and stamps at the leader" {
+    const owner: @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 200 };
+    const types = @import("antfly_local_sources").storage_db_types;
+    var request: types.BatchRequest = .{ .timestamp_ns = 1, .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 7, .external_decision_owner = owner } } };
+    try std.testing.expectEqual(@as(?u16, @import("../common/data_raft_protocol.zig").batch_external_transaction_protocol_version), internal_batch_forwarding.externalTransactionProtocol(request));
+    try internal_batch_forwarding.validateExternalVoteAdmission(request, 100);
+    internal_batch_forwarding.materializeExternalVoteTimestamp(&request, 100);
+    try std.testing.expectEqual(@as(u64, 100), request.timestamp_ns);
+    const prepared = try types.TransactionIntentRequest.fromBatch(request);
+    try owner.requireFreshVoteAt(prepared.timestamp_ns);
+    try std.testing.expectError(error.ExternalTransactionAdmissionExpired, internal_batch_forwarding.validateExternalVoteAdmission(request, 200));
+    request.transaction.?.prepare.external_activation = true;
+    try internal_batch_forwarding.validateExternalVoteAdmission(request, 10_000);
+    internal_batch_forwarding.materializeExternalVoteTimestamp(&request, 10_000);
+    try std.testing.expectEqual(@as(u64, 100), request.timestamp_ns);
+    request.transaction = .{ .begin = .{ .txn_id = @splat(4), .begin_timestamp = 5, .created_at_ns = 6, .topology_epoch = 7, .participants = &.{"table:rows:group:8"}, .retain_terminal = true, .external_decision_owner = owner } };
+    try std.testing.expect(internal_batch_forwarding.externalTransactionProtocol(request) != null);
+    try internal_batch_forwarding.validateExternalVoteAdmission(request, 100);
+    internal_batch_forwarding.materializeExternalVoteTimestamp(&request, 101);
+    try std.testing.expectEqual(@as(u64, 101), request.timestamp_ns);
+    try std.testing.expectError(error.ExternalTransactionAdmissionExpired, internal_batch_forwarding.validateExternalVoteAdmission(request, 200));
+    request.transaction = .{ .resolve = .{ .txn_id = @splat(4), .status = .committed, .commit_version = 10_000, .external_decision_owner = owner } };
+    try internal_batch_forwarding.validateExternalVoteAdmission(request, 10_000);
+    try std.testing.expect(internal_batch_forwarding.externalTransactionProtocol(request) != null);
+}

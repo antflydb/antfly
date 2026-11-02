@@ -72,7 +72,7 @@ pub fn runtimeType(declared: records.Type) scalar.Type {
 pub fn definition(a: A, intent: ast.RoutineDefinition, owner: @import("../system_catalog/owners.zig").Owner) !records.Definition {
     const arguments = try a.alloc(records.Argument, intent.arguments.len);
     for (intent.arguments, arguments) |arg, *out| out.* = .{ .name = if (arg.name) |name| try a.dupe(u8, name) else null, .type = try storageType(arg.type) };
-    const result: records.Definition = .{ .arguments = arguments, .result = if (intent.result) |result| try storageType(result) else null, .language = std.meta.stringToEnum(@FieldType(records.Definition, "language"), @tagName(intent.language)).?, .body = try a.dupe(u8, intent.body), .strict = intent.strict, .volatility = std.meta.stringToEnum(records.Volatility, @tagName(intent.volatility)).?, .owner = owner };
+    const result: records.Definition = .{ .arguments = arguments, .returns_trigger = intent.returns_trigger, .result = if (intent.result) |result| try storageType(result) else null, .language = std.meta.stringToEnum(@FieldType(records.Definition, "language"), @tagName(intent.language)).?, .body = try a.dupe(u8, intent.body), .strict = intent.strict, .volatility = std.meta.stringToEnum(records.Volatility, @tagName(intent.volatility)).?, .owner = owner };
     try result.validate();
     return result;
 }
@@ -97,6 +97,7 @@ pub fn prepare(a: A, record: records.Record, resolver: ?@import("routine_binding
         return alias;
     }
     if (record.kind != .function) return error.SqlWrongObjectType;
+    if (record.definition.returns_trigger) return error.SqlTriggerContextRequired;
     var parsed = try @import("compiler.zig").compile(a, record.definition.body, .{ .max_bytes = records.max_body_bytes });
     defer parsed.deinit();
     if (parsed.statement != .select) return error.SqlInvalidFunctionDefinition;
@@ -231,7 +232,12 @@ pub fn prepareAggregate(a: A, record: records.Record, resolver: bindings.Resolve
 pub fn validateBody(a: A, record: records.Record) !void {
     try record.validate();
     switch (record.kind) {
-        .function => _ = try prepare(a, record, null, null),
+        .function => if (record.definition.returns_trigger) {
+            var syntax = try @import("procedure.zig").compileBody(a, record);
+            syntax.deinit();
+        } else {
+            _ = try prepare(a, record, null, null);
+        },
         .procedure => _ = try @import("procedure.zig").compileBody(a, record),
         .operator => {},
         .aggregate => _ = try aggregateInitial(a, record.definition),

@@ -437,6 +437,16 @@ pub const RaftApplyStore = struct {
     pub fn sqlSequenceAdmissionHead(self: *RaftApplyStore, group_id: u64) !u64 {
         return self.catalogProjection(u64, self.alloc, group_id, .{ .sql_sequence_admission_head = {} });
     }
+    pub fn getSqlIndexAnnotations(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: @import("antfly_local_sources").system_catalog_domain.object_annotations.IndexDescriptionsRead) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group, .{ .sql_index_annotations = request });
+    }
+    pub fn validateRelationReplacement(self: *RaftApplyStore, group: u64, guard: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard, expected: metadata.TableRecord, replacement: metadata.TableRecord) !void {
+        const ready = try self.catalogProjection(bool, self.alloc, group, .{ .relation_replacement_check = .{ .guard = guard, .expected = expected, .replacement = replacement } });
+        if (!ready) return error.InvalidCatalogRecord;
+    }
+    pub fn getSqlObjectAnnotation(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: @import("antfly_local_sources").system_catalog_domain.ObjectAnnotationRead) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group, .{ .sql_object_annotation = request });
+    }
     pub fn getSqlColumnIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, guard: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard) !std.json.Parsed(@import("antfly_local_sources").system_catalog_column_identities.State) {
         const bytes = try self.catalogProjection([]u8, alloc, group, .{ .sql_column_identities = guard });
         defer alloc.free(bytes);
@@ -463,6 +473,59 @@ pub const RaftApplyStore = struct {
         errdefer alloc.free(result);
         try context.ensureActive();
         return result;
+    }
+    pub fn sqlPreparedRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/prepared_transactions.zig").Read, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        try context.ensureActive();
+        try request.validate();
+        const deadline = (@import("antfly_local_sources").api_routing_budget.RoutingBudget{}).deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        const Callback = struct {
+            fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                return @intFromBool(token.isCancelled());
+            }
+        };
+        const bytes = try std.json.Stringify.valueAlloc(alloc, contract.CatalogProjectionRequest{ .sql_prepared_read = request }, .{});
+        defer alloc.free(bytes);
+        const result = try self.projectionWithAllocator([]u8, alloc, .{ .kind = .system_catalog, .group_id = group_id, .key = .fromSlice(bytes), .control = .{
+            .execution_deadline_ns = deadline orelse 0,
+            .has_execution_deadline = @intFromBool(deadline != null),
+            .cancellation_ctx = @ptrCast(@constCast(&context.cancellation)),
+            .cancellation_fn = Callback.cancelled,
+        } });
+        errdefer alloc.free(result);
+        try context.ensureActive();
+        return result;
+    }
+    pub fn prepareSqlPreparedTransaction(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/prepared_transactions.zig").Mutation) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_prepared_prepare = request });
+    }
+    pub fn sqlPreparedOutcome(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/prepared_transactions.zig").Mutation) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_prepared_outcome = request });
+    }
+    pub fn sqlAuthorizationRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/authorization.zig").Read, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        try context.ensureActive();
+        try request.validate();
+        const deadline = (@import("antfly_local_sources").api_routing_budget.RoutingBudget{}).deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        const Callback = struct {
+            fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                return @intFromBool(token.isCancelled());
+            }
+        };
+        const bytes = try std.json.Stringify.valueAlloc(alloc, contract.CatalogProjectionRequest{ .sql_authorization_read = request }, .{});
+        defer alloc.free(bytes);
+        const result = try self.projectionWithAllocator([]u8, alloc, .{ .kind = .system_catalog, .group_id = group_id, .key = .fromSlice(bytes), .control = .{
+            .execution_deadline_ns = deadline orelse 0,
+            .has_execution_deadline = @intFromBool(deadline != null),
+            .cancellation_ctx = @ptrCast(@constCast(&context.cancellation)),
+            .cancellation_fn = Callback.cancelled,
+        } });
+        errdefer alloc.free(result);
+        try context.ensureActive();
+        return result;
+    }
+    pub fn sqlAuthorizationOutcome(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/authorization.zig").Observation) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_authorization_outcome = request });
     }
     pub fn sqlTypeSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/named_types.zig").SnapshotRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
@@ -514,6 +577,12 @@ pub const RaftApplyStore = struct {
     pub fn sqlCastOutcome(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/casts.zig").OutcomeRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .sql_cast_outcome = request });
     }
+    pub fn sqlNativeIndexPrepare(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/native_indexes.zig").Preparation) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_native_index_prepare = request });
+    }
+    pub fn sqlNativeIndexOutcome(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/native_indexes.zig").OutcomeRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_native_index_outcome = request });
+    }
     pub fn sqlRoutineSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/routines.zig").SnapshotRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
         try request.validate();
@@ -539,6 +608,16 @@ pub const RaftApplyStore = struct {
     pub fn sqlRoutineOutcome(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/routines.zig").OutcomeRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .sql_routine_outcome = request });
     }
+    fn sequenceSnapshotProjection(request: @import("../system_catalog/sequence_catalog.zig").SnapshotRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !contract.CatalogProjectionRequest {
+        try context.ensureActive();
+        try request.validate();
+        if (request.prepare_retirement) {
+            if (!context.setting_admin or !context.schema_validation_authority) return error.Forbidden;
+            return .{ .sql_sequence_retirement_snapshot = request };
+        }
+        return .{ .sql_sequence_snapshot = request };
+    }
+
     pub fn sqlSequenceSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/sequence_catalog.zig").SnapshotRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
         try request.validate();
@@ -549,7 +628,7 @@ pub const RaftApplyStore = struct {
                 return @intFromBool(token.isCancelled());
             }
         };
-        const bytes = try std.json.Stringify.valueAlloc(alloc, contract.CatalogProjectionRequest{ .sql_sequence_snapshot = request }, .{});
+        const bytes = try std.json.Stringify.valueAlloc(alloc, try sequenceSnapshotProjection(request, context), .{});
         defer alloc.free(bytes);
         const result = try self.projectionWithAllocator([]u8, alloc, .{ .kind = .system_catalog, .group_id = group_id, .key = .fromSlice(bytes), .control = .{
             .execution_deadline_ns = deadline orelse 0,
@@ -607,6 +686,7 @@ pub const RaftApplyStore = struct {
         });
         errdefer result.deinit(alloc);
         try context.ensureActive();
+        try result.validateAuthority(alloc, request);
         try result.validateRelations(request);
         return result;
     }
@@ -807,6 +887,14 @@ pub const RaftApplyStore = struct {
         return self.rawCatalogProjection(alloc, group_id, .{ .schema_validation_discover = request }, 1024);
     }
 
+    pub fn schemaValidationPublicationProjection(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, lookup: @import("../metadata/schema_validation_read.zig").Lookup) !std.json.Parsed(@import("../metadata/schema_validation_read.zig").PublicationProjection) {
+        if (lookup.group != group) return error.InvalidGenerationPublication;
+        const Projection = @import("../metadata/schema_validation_read.zig").PublicationProjection;
+        const bytes = try self.rawCatalogProjection(alloc, group, .{ .schema_validation_publication_projection = lookup }, Projection.max_wire_bytes);
+        defer alloc.free(bytes);
+        return std.json.parseFromSlice(Projection, alloc, bytes, .{ .allocate = .alloc_always });
+    }
+
     pub fn schemaValidationWork(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/schema_validation_work.zig").Query) ![]u8 {
         try request.validate();
         if (request.group != group_id) return error.InvalidGenerationPublication;
@@ -902,6 +990,44 @@ pub const RaftApplyStore = struct {
     pub fn fkInitialCreatePrepareJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialCreatePrepareRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         const normalized = try context.platformDeadline();
         const bytes = try self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_prepare_with_deadline = .{ .request = request, .deadline_ns = normalized.deadline_ns } });
+        errdefer alloc.free(bytes);
+        try context.ensureActive();
+        return bytes;
+    }
+    pub fn tableRetirementQueueJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, value: u64) ![]u8 {
+        return self.rawCatalogProjection(a, group, .{ .table_retirement_queue = value }, 32768);
+    }
+    pub fn tableRetirementEffectsJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, value: @import("../metadata/table_retirement_ledger.zig").Lookup) ![]u8 {
+        return self.rawCatalogProjection(a, group, .{ .table_retirement_effects = value }, @import("../metadata/table_retirement_manifest.zig").max_bytes);
+    }
+    pub fn tableRetirementPreflightJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, value: []const u8) ![]u8 {
+        return self.rawCatalogProjection(a, group, .{ .table_retirement_preflight = value }, 32768);
+    }
+    pub fn tableRetirementPublicationProjectionJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, value: @import("../metadata/table_retirement_ledger.zig").Lookup) ![]u8 {
+        return self.rawCatalogProjection(a, group, .{ .table_retirement_publication_projection = value }, 128 * 1024);
+    }
+    pub fn tableRetirementReceiptJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, request: @import("../metadata/table_retirement_receipt.zig").Request) ![]u8 {
+        try request.validate();
+        return self.rawCatalogProjection(a, group, .{ .table_retirement_receipt = request }, 32768);
+    }
+    pub fn schemaValidationPublicationProjectionJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, lookup: @import("../metadata/schema_validation_read.zig").Lookup) ![]u8 {
+        return self.rawCatalogProjection(a, group, .{ .schema_validation_publication_projection = lookup }, @import("../metadata/schema_validation_read.zig").PublicationProjection.max_wire_bytes);
+    }
+    pub fn tableRetirementReceipt(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, request: @import("../metadata/table_retirement_receipt.zig").Request) !std.json.Parsed(@import("../metadata/table_retirement_receipt.zig").Observation) {
+        try request.validate();
+        const bytes = try self.rawCatalogProjection(a, group, .{ .table_retirement_receipt = request }, 32768);
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(@import("../metadata/table_retirement_receipt.zig").Observation, a, bytes, .{ .allocate = .alloc_always });
+        errdefer parsed.deinit();
+        try parsed.value.requireFor(request);
+        return parsed;
+    }
+    pub fn tableRetirementWorkJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, lookup: @import("../metadata/table_retirement_ledger.zig").Lookup) ![]u8 {
+        return self.rawCatalogProjection(a, group, .{ .table_retirement_work = lookup }, 32768);
+    }
+    pub fn prepareTableRetirementManifestJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, guard: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        const normalized = try context.platformDeadline();
+        const bytes = try self.rawCatalogProjection(alloc, group_id, .{ .table_retirement_prepare = .{ .guard = guard, .deadline_ns = normalized.deadline_ns } }, @import("../metadata/table_retirement_manifest.zig").max_bytes);
         errdefer alloc.free(bytes);
         try context.ensureActive();
         return bytes;
@@ -1523,4 +1649,25 @@ fn consumerTests() type {
         }
     };
     return Suite;
+}
+
+test "schema validation publication sequence snapshot private projection preserves both required authorities" {
+    const Request = @import("../system_catalog/sequence_catalog.zig").SnapshotRequest;
+    const Context = @import("antfly_local_sources").api_operation.RequestContext;
+    var request: Request = .{ .targets = &.{.{ .table = "counter" }} };
+    try std.testing.expect((try RaftApplyStore.sequenceSnapshotProjection(request, .{})) == .sql_sequence_snapshot);
+    request.prepare_retirement = true;
+    for ([_]Context{ .{}, .{ .setting_admin = true }, .{ .schema_validation_authority = true } }) |context|
+        try std.testing.expectError(error.Forbidden, RaftApplyStore.sequenceSnapshotProjection(request, context));
+    const allowed: Context = .{ .setting_admin = true, .schema_validation_authority = true };
+    const selected = try RaftApplyStore.sequenceSnapshotProjection(request, allowed);
+    try std.testing.expect(selected == .sql_sequence_retirement_snapshot);
+    try std.testing.expect(selected.sql_sequence_retirement_snapshot.prepare_retirement);
+    var expired = allowed;
+    expired.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, RaftApplyStore.sequenceSnapshotProjection(request, expired));
+    var cancelled = std.atomic.Value(bool).init(true);
+    var stopped = allowed;
+    stopped.cancellation = @import("antfly_local_sources").api_operation.CancellationToken.fromAtomic(&cancelled);
+    try std.testing.expectError(error.Canceled, RaftApplyStore.sequenceSnapshotProjection(request, stopped));
 }

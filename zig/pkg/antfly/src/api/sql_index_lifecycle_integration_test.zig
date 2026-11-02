@@ -561,3 +561,299 @@ test "mounted SQL original concurrent index drop retires enforcement and permits
     // sql-0725; both warm and cold campaigns execute the exact original.
     try fixture.runWithState(DropCampaign, .{ .original_id = "sql-0725" });
 }
+
+const NativeFullTextCampaign = struct {
+    pub const cold_catalog = true;
+    pub fn beforeRestart(_: *@This(), ctx: *fixture.Context) !void {
+        try std.testing.expect((try relationOwner(ctx, "public")) == null);
+        try command(ctx, "public", "CREATE TABLE usage_records (id UUID PRIMARY KEY, email TEXT, tenant_id TEXT, status TEXT)");
+        const id = try owner(ctx, "public");
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, id);
+        try waitEnforced(ctx, "public");
+        try command(ctx, "public", "INSERT INTO usage_records(id,status) VALUES('00000000-0000-0000-0000-000000000001','pending'),('00000000-0000-0000-0000-000000000002','finished')");
+        var baseline = try execute(ctx, "public", "SELECT count(*) FROM usage_records", true);
+        defer baseline.deinit(ctx.alloc);
+        var rows = try std.json.parseFromSlice(struct { rows: []const []const std.json.Value }, ctx.alloc, baseline.body, .{ .ignore_unknown_fields = true });
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.value.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), rows.value.rows[0].len);
+        try std.testing.expect(rows.value.rows[0][0] == .string);
+        try std.testing.expectEqualStrings("2", rows.value.rows[0][0].string);
+        var corpus = try sources.sql_parity_fixtures.Corpus.init(ctx.alloc);
+        defer corpus.deinit();
+        for ([_][]const u8{ "sql-0696", "sql-0697" }) |case_id| {
+            const original = try corpus.get(case_id);
+            var result = try execute(ctx, "public", original.sql, false);
+            defer result.deinit(ctx.alloc);
+            var value = try std.json.parseFromSlice(struct { catalog_receipt: struct { state: enum { committed, unknown, failed } } }, ctx.alloc, result.body, .{ .ignore_unknown_fields = true });
+            defer value.deinit();
+            try std.testing.expectEqual(@as(u16, 200), result.status);
+            try std.testing.expectEqual(.committed, value.value.catalog_receipt.state);
+        }
+        try checkNativeFullText(ctx, "usage_records_status_fts", "pending");
+        try checkNativeFullText(ctx, "usage_records_status_fts_method", "pending");
+        try command(ctx, "public", "UPDATE usage_records SET status='Pending Changes' WHERE id='00000000-0000-0000-0000-000000000001'");
+        try checkNativeFullText(ctx, "usage_records_status_fts", "changes");
+        try checkNativeFullText(ctx, "usage_records_status_fts_method", "changes");
+        try nativeIndexLostAck(ctx);
+        try prepareNativeDocumentAlias(ctx);
+        var duplicate_name = try execute(ctx, "public", "CREATE TABLE usage_records_status_fts (id INTEGER)", false);
+        defer duplicate_name.deinit(ctx.alloc);
+        try std.testing.expect(duplicate_name.status >= 400);
+    }
+    pub fn afterRestart(_: *@This(), ctx: *fixture.Context) !void {
+        const id = try owner(ctx, "public");
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, id);
+        try checkNativeFullText(ctx, "usage_records_status_fts", "changes");
+        try checkNativeFullText(ctx, "usage_records_status_fts_method", "changes");
+        const document = try fixture.waitServingSchema(ctx, "docs_native", 0);
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, document.table_id);
+        try checkNativeDocumentAlias(ctx, "ready", "Ready Again", 0, 5);
+        try command(ctx, "public", "DROP INDEX docs_status_fts");
+        try command(ctx, "public", "DROP INDEX usage_records_status_fts");
+        var removed = try fixture.request(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/tables/usage_records/indexes/usage_records_status_fts_method", .DELETE, null);
+        defer removed.deinit(ctx.alloc);
+        if (removed.status != 201) std.debug.print("native index deletion status={d} body={s}\n", .{ removed.status, removed.body });
+        try std.testing.expectEqual(@as(u16, 201), removed.status);
+        try waitNativeNamesReleased(ctx);
+        // Both SQL and native deletion withdraw their SQL names atomically.
+        try command(ctx, "public", "CREATE TABLE usage_records_status_fts (id INTEGER)");
+        try command(ctx, "public", "CREATE TABLE usage_records_status_fts_method (id INTEGER)");
+    }
+};
+fn checkNativeFullText(ctx: *fixture.Context, name: []const u8, text: []const u8) !void {
+    try waitNativeFullText(ctx, name);
+    const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .full_text_search = .{ .match = text, .field = "status" }, .full_text_index = name, .fields = &[_][]const u8{"status"}, .highlight = .{ .fields = &[_][]const u8{"status"}, .fragment_size = 16, .max_fragments = 1 }, .limit = 5 }, .{});
+    defer ctx.alloc.free(body);
+    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    var reported = false;
+    while (platform.time.monotonicNs() < deadline) {
+        try ctx.checkDrivers();
+        var response = fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/tables/usage_records/query", .POST, body, 1000) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        defer response.deinit(ctx.alloc);
+        if (response.status == 200) {
+            var parsed = try std.json.parseFromSlice(@import("antfly_metadata_openapi").types.QueryResponses, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            if (parsed.value.responses) |responses| if (responses.len == 1) if (responses[0].hits) |hits| if (hits.total) |total| if (total.value == 1 and std.mem.eql(u8, total.relation, "exact")) {
+                const records = hits.hits orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), records.len);
+                const source = records[0]._source orelse return error.TestUnexpectedResult;
+                const status = source.map.get("status") orelse return error.TestUnexpectedResult;
+                try std.testing.expect(status == .string);
+                try std.testing.expectEqualStrings(if (std.mem.eql(u8, text, "pending")) "pending" else "Pending Changes", status.string);
+                const highlights = records[0]._highlights orelse {
+                    std.debug.print("native index missing highlight name={s} body={s}\n", .{ name, response.body });
+                    return error.TestUnexpectedResult;
+                };
+                const fragments = highlights.map.get("status") orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), fragments.len);
+                try std.testing.expectEqualStrings(status.string, fragments[0].text);
+                try std.testing.expectEqual(@as(i64, 0), fragments[0].offset);
+                try std.testing.expectEqual(@as(usize, 1), fragments[0].spans.len);
+                const start: i64 = if (std.mem.eql(u8, text, "pending")) 0 else 8;
+                try std.testing.expectEqual(start, fragments[0].spans[0].start);
+                try std.testing.expectEqual(start + 7, fragments[0].spans[0].end);
+                return;
+            };
+            if (!reported) {
+                std.debug.print("native index unexpected query response name={s} body={s}\n", .{ name, response.body });
+                reported = true;
+            }
+        } else if (response.status != 503 and response.status != 409) {
+            std.debug.print("native index query status={d} body={s}\n", .{ response.status, response.body });
+            return error.NativeIndexQueryFailed;
+        }
+        try ctx.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    var snapshot = try ctx.metadata.server.svc.adminSnapshot();
+    defer ctx.metadata.server.svc.freeAdminSnapshot(&snapshot);
+    for (snapshot.tables) |table| std.debug.print("native index backfill timed out name={s} table={s} configs={s}\n", .{ name, table.name, table.indexes_json });
+    return error.NativeIndexBackfillTimeout;
+}
+fn waitNativeFullText(ctx: *fixture.Context, name: []const u8) !void {
+    return waitNativeFullTextForTable(ctx, "usage_records", name);
+}
+fn waitNativeFullTextForTable(ctx: *fixture.Context, table: []const u8, name: []const u8) !void {
+    const path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/tables/{s}/indexes/{s}", .{ table, name });
+    defer ctx.alloc.free(path);
+    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < deadline) {
+        try ctx.checkDrivers();
+        var response = fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, path, .GET, null, 1000) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        defer response.deinit(ctx.alloc);
+        if (response.status == 200) {
+            var value = try std.json.parseFromSlice(struct { status: ?struct { milestones: ?struct { complete: struct { reached: bool } } = null } = null }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+            defer value.deinit();
+            if (value.value.status) |status| if (status.milestones) |milestones| if (milestones.complete.reached) return;
+        }
+        if (platform.time.monotonicNs() +| 250 * std.time.ns_per_ms >= deadline) std.debug.print("native index readiness status={d} body={s}\n", .{ response.status, response.body });
+        try ctx.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    std.debug.print("native index owner refresh started={} completed={} failed={} same_head={} same_fingerprint={} reconciled={} deferred={}\n", .{ ctx.data.provisioned_root_refresh_started.load(.acquire), ctx.data.provisioned_root_refresh_completed.load(.acquire), ctx.data.provisioned_root_refresh_failed.load(.acquire), ctx.data.provisioned_root_probe_same_head.load(.acquire), ctx.data.provisioned_root_probe_same_fingerprint.load(.acquire), ctx.data.provisioned_root_probe_reconciled_groups.load(.acquire), ctx.data.provisioned_root_probe_deferred_catch_up.load(.acquire) });
+    return error.NativeIndexReadinessTimeout;
+}
+test "mounted SQL original native full-text indexes share API lifecycle across cold restart" {
+    // sql-0696 and sql-0697 execute unchanged before querying their own backfill.
+    try fixture.run(NativeFullTextCampaign);
+}
+
+fn prepareNativeDocumentAlias(ctx: *fixture.Context) !void {
+    const body =
+        \\{"num_shards":1,"schema":{"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"metadata":{"type":"object","properties":{"state":{"type":"keyword","x-antfly-column-name":"status"}}},"count":{"type":"integer"},"literal.dot":{"type":"text"}},"additionalProperties":true}}}}}
+    ;
+    var created = try fixture.request(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/tables/docs_native", .POST, body);
+    defer created.deinit(ctx.alloc);
+    if (created.status != 200) std.debug.print("native document alias create status={d} body={s}\n", .{ created.status, created.body });
+    try std.testing.expectEqual(@as(u16, 200), created.status);
+    const serving = try fixture.waitServingSchema(ctx, "docs_native", 0);
+    try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, serving.table_id);
+    try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "docs_native");
+    var seeded = try fixture.batch(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "docs_native", "{\"inserts\":{\"doc-a\":{\"metadata\":{\"state\":\"Pending Changes\"},\"count\":2,\"literal.dot\":\"do not misaddress\"}},\"sync_level\":\"full_text\"}");
+    defer seeded.deinit(ctx.alloc);
+    if (seeded.status != 201) std.debug.print("native document alias seed body={s}\n", .{seeded.body});
+    try std.testing.expectEqual(@as(u16, 201), seeded.status);
+    for ([_]struct { sql: []const u8, status: u16, code: []const u8 }{
+        .{ .sql = "CREATE INDEX rejected_native ON docs_native USING antfly_full_text(missing)", .status = 400, .code = "42703" },
+        .{ .sql = "CREATE INDEX rejected_native ON docs_native USING antfly_full_text(count)", .status = 400, .code = "22023" },
+        .{ .sql = "CREATE INDEX rejected_native ON docs_native USING antfly_full_text(\"literal.dot\")", .status = 501, .code = "0A000" },
+    }) |probe| {
+        var response = try execute(ctx, "public", probe.sql, false);
+        defer response.deinit(ctx.alloc);
+        if (response.status != probe.status) std.debug.print("native document guard sql={s} status={d} body={s}\n", .{ probe.sql, response.status, response.body });
+        try std.testing.expectEqual(probe.status, response.status);
+        var diagnostic = std.json.parseFromSlice(@import("antfly_metadata_openapi").types.SQLDiagnostic, ctx.alloc, response.body, .{ .ignore_unknown_fields = true }) catch |err| {
+            std.debug.print("native document diagnostic sql={s} body={s}\n", .{ probe.sql, response.body });
+            return err;
+        };
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings(probe.code, diagnostic.value.code);
+        try std.testing.expect(!(diagnostic.value.retryable orelse false));
+    }
+    try command(ctx, "public", "CREATE TABLE rejected_native (id INTEGER)");
+    try command(ctx, "public", "CREATE INDEX docs_status_fts ON docs_native USING antfly_full_text(status)");
+    try checkNativeDocumentAlias(ctx, "changes", "Pending Changes", 8, 15);
+    try command(ctx, "public", "UPDATE docs_native SET status='Ready Again' WHERE _id='doc-a'");
+    try checkNativeDocumentAlias(ctx, "ready", "Ready Again", 0, 5);
+}
+
+fn checkNativeDocumentAlias(ctx: *fixture.Context, text: []const u8, expected: []const u8, start: i64, end: i64) !void {
+    try waitNativeFullTextForTable(ctx, "docs_native", "docs_status_fts");
+    const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .full_text_search = .{ .match = text, .field = "metadata.state" }, .full_text_index = "docs_status_fts", .highlight = .{ .fields = &[_][]const u8{"metadata.state"}, .fragment_size = 16, .max_fragments = 1 }, .limit = 5 }, .{});
+    defer ctx.alloc.free(body);
+    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < deadline) {
+        try ctx.checkDrivers();
+        var response = fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/tables/docs_native/query", .POST, body, 1000) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        defer response.deinit(ctx.alloc);
+        if (response.status == 200) {
+            errdefer std.debug.print("native alias postimage text={s} body={s}\n", .{ text, response.body });
+            var parsed = try std.json.parseFromSlice(@import("antfly_metadata_openapi").types.QueryResponses, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            if (parsed.value.responses) |responses| if (responses.len == 1) if (responses[0].hits) |hits| if (hits.total) |total| if (total.value == 1 and std.mem.eql(u8, total.relation, "exact")) {
+                const records = hits.hits orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), records.len);
+                const source = records[0]._source orelse return error.TestUnexpectedResult;
+                const metadata = source.map.get("metadata") orelse return error.TestUnexpectedResult;
+                try std.testing.expect(metadata == .object);
+                const state = metadata.object.get("state") orelse return error.TestUnexpectedResult;
+                try std.testing.expect(state == .string);
+                try std.testing.expectEqualStrings(expected, state.string);
+                const highlights = records[0]._highlights orelse return error.TestUnexpectedResult;
+                const fragments = highlights.map.get("metadata.state") orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), fragments.len);
+                try std.testing.expectEqualStrings(expected, fragments[0].text);
+                try std.testing.expectEqual(@as(i64, 0), fragments[0].offset);
+                try std.testing.expectEqual(@as(usize, 1), fragments[0].spans.len);
+                try std.testing.expectEqual(start, fragments[0].spans[0].start);
+                try std.testing.expectEqual(end, fragments[0].spans[0].end);
+                return;
+            };
+        } else if (response.status != 503 and response.status != 409) {
+            std.debug.print("native alias query status={d} body={s}\n", .{ response.status, response.body });
+            return error.NativeIndexQueryFailed;
+        }
+        try ctx.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return error.NativeIndexBackfillTimeout;
+}
+
+fn waitNativeNamesReleased(ctx: *fixture.Context) !void {
+    const domain = sources.system_catalog_domain;
+    const source = server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+    const lookup: domain.ResolveMany = .{ .relations = &.{
+        .{ .database = "default", .namespace = "public", .name = "usage_records_status_fts" },
+        .{ .database = "default", .namespace = "public", .name = "usage_records_status_fts_method" },
+    } };
+    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < deadline) {
+        try ctx.checkDrivers();
+        const bytes = source.systemCatalog(ctx.alloc, .{ .deadline_ns = deadline }, .{ .resolve_many = lookup }) catch |err| switch (err) {
+            error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady => {
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        defer ctx.alloc.free(bytes);
+        var snapshot = try std.json.parseFromSlice(domain.ResolvedMany, ctx.alloc, bytes, .{});
+        defer snapshot.deinit();
+        try snapshot.value.validateRelations(lookup);
+        if (snapshot.value.relations[0] == null and snapshot.value.relations[1] == null) return;
+        try ctx.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return error.SqlIndexCampaignPublicationTimeout;
+}
+
+fn nativeIndexLostAck(ctx: *fixture.Context) !void {
+    const Call = @import("../system_catalog/server_call.zig").Call;
+    const Probe = struct {
+        source: server.StatusSource,
+        hidden: bool = true,
+        mutations: usize = 0,
+        fn status(raw: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return (@as(*@This(), @ptrCast(@alignCast(raw)))).source.status();
+        }
+        fn catalog(raw: *anyopaque, a: std.mem.Allocator, context: sources.api_operation.RequestContext, call: Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .sql_native_index_outcome and self.hidden) return error.MetadataMutationOutcomeUnknown;
+            const bytes = try self.source.systemCatalog(a, context, call);
+            if (call == .sql_native_index_mutate) {
+                self.mutations += 1;
+                a.free(bytes);
+                return error.MetadataMutationOutcomeUnknown;
+            }
+            return bytes;
+        }
+    };
+    const original = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi;
+    var probe: Probe = .{ .source = original.source };
+    var gateway = server.ApiHttpServer.init(ctx.alloc, .{ .backend_runtime = original.cfg.backend_runtime, .imported_runtime_io = original.cfg.imported_runtime_io }, .{ .ptr = &probe, .vtable = &.{ .supports_query_definitions = true, .status = Probe.status, .system_catalog = Probe.catalog } }, null, null);
+    defer gateway.deinit();
+    var parsed = try sources.sql_compiler.compile(ctx.alloc, "CREATE INDEX lost_ack_fts ON usage_records USING antfly_full_text(status)", .{});
+    defer parsed.deinit();
+    const outcome = try @import("sql_catalog.zig").execute(&gateway, null, .{}, "default", "public", ctx.alloc, .{ .catalog_ddl = parsed.statement.catalog_ddl });
+    const receipt = outcome.catalog_receipt orelse return error.MissingNativeIndexReceipt;
+    defer receipt.deinit(ctx.alloc);
+    try std.testing.expectEqual(.unknown, receipt.state);
+    try std.testing.expectEqual(.index, receipt.kind);
+    try std.testing.expect(receipt.recovery_token.len < 2048);
+    try std.testing.expectEqual(@as(usize, 1), probe.mutations);
+    try command(ctx, "public", "DROP INDEX lost_ack_fts");
+    try command(ctx, "public", "CREATE INDEX lost_ack_fts ON usage_records USING antfly_full_text(status)");
+    probe.hidden = false;
+    const recovered = try @import("sql_catalog_recovery.zig").recover(&gateway, null, .{}, ctx.alloc, receipt.recovery_token);
+    defer recovered.deinit(ctx.alloc);
+    try std.testing.expectEqual(.committed, recovered.state);
+    try std.testing.expectEqual(.index, recovered.kind);
+    try std.testing.expect(recovered.object_id == null);
+    try std.testing.expectEqual(@as(usize, 1), probe.mutations);
+}

@@ -12801,7 +12801,7 @@ pub const SQLArrayValue = struct {
     sql_nulls: []const bool,
 };
 
-/// Native catalog resource kind; never a synthetic physical table.
+/// Catalog object affected by an exact recoverable operation.
 pub const SQLCatalogObjectKind = enum {
     sequence,
     function,
@@ -12810,6 +12810,9 @@ pub const SQLCatalogObjectKind = enum {
     aggregate,
     cast,
     type,
+    authorization,
+    table,
+    index,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -12820,6 +12823,9 @@ pub const SQLCatalogObjectKind = enum {
             .aggregate => "aggregate",
             .cast => "cast",
             .type => "type",
+            .authorization => "authorization",
+            .table => "table",
+            .index => "index",
         };
         try jw.write(s);
     }
@@ -12837,6 +12843,9 @@ pub const SQLCatalogObjectKind = enum {
             .{ "aggregate", .aggregate },
             .{ "cast", .cast },
             .{ "type", .type },
+            .{ "authorization", .authorization },
+            .{ "table", .table },
+            .{ "index", .index },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -12953,12 +12962,14 @@ pub const SQLCatalogOperationState = enum {
     committed,
     rejected,
     unknown,
+    pending,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .committed => "committed",
             .rejected => "rejected",
             .unknown => "unknown",
+            .pending => "pending",
         };
         try jw.write(s);
     }
@@ -12972,6 +12983,7 @@ pub const SQLCatalogOperationState = enum {
             .{ "committed", .committed },
             .{ "rejected", .rejected },
             .{ "unknown", .unknown },
+            .{ "pending", .pending },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -12985,7 +12997,7 @@ pub const SQLColumn = struct {
     /// Display label. Labels need not be unique; rows use matching ordinal positions.
     name: []const u8,
     type: SQLColumnType,
-    /// Required for enumeration values, including NULL. Identifies the immutable catalog type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains a null cell.
+    /// Required for enum and domain values, including NULL. Identifies the immutable logical catalog type and its scalar/array wire OIDs. The type and element_type fields describe the physical value; enum cells use exact label strings. Domain parameters undergo fresh constraint validation; a declared identity does not prove an already validated value. SQL NULL remains a null cell.
     named_type: ?antfly_schema_openapi.SQLNamedTypeIdentity = null,
     temporal_kind: ?SQLTemporalKind = null,
     /// Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
@@ -13046,7 +13058,7 @@ pub const SQLColumn = struct {
     }
 };
 
-/// Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
+/// Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client. Bytea results use PostgreSQL hex text (a backslash followed by x and lowercase hex digits) in JSON and opaque bytes in PostgreSQL binary format.
 pub const SQLColumnType = enum {
     string,
     uuid,
@@ -13062,6 +13074,7 @@ pub const SQLColumnType = enum {
     tsrange,
     tstzrange,
     enumeration,
+    bytea,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -13079,6 +13092,7 @@ pub const SQLColumnType = enum {
             .tsrange => "tsrange",
             .tstzrange => "tstzrange",
             .enumeration => "enumeration",
+            .bytea => "bytea",
         };
         try jw.write(s);
     }
@@ -13103,6 +13117,7 @@ pub const SQLColumnType = enum {
             .{ "tsrange", .tsrange },
             .{ "tstzrange", .tstzrange },
             .{ "enumeration", .enumeration },
+            .{ "bytea", .bytea },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -13376,10 +13391,10 @@ pub const SQLNotice = struct {
     message: []const u8,
 };
 
-/// Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint.
+/// Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. Bytea arguments are PostgreSQL bytea input strings; use hex text (a backslash followed by x and hexadecimal octets) for arbitrary binary data. SQL NULL remains a null cell.
 pub const SQLParameterDescriptor = struct {
     type: SQLColumnType,
-    /// Required for enumeration values, including NULL. Identifies the immutable catalog type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains a null cell.
+    /// Required for enum and domain values, including NULL. Identifies the immutable logical catalog type and its scalar/array wire OIDs. The type and element_type fields describe the physical value; enum cells use exact label strings. Domain parameters undergo fresh constraint validation; a declared identity does not prove an already validated value. SQL NULL remains a null cell.
     named_type: ?antfly_schema_openapi.SQLNamedTypeIdentity = null,
     temporal_kind: ?SQLTemporalKind = null,
     element_type: ?SQLArrayElementType = null,

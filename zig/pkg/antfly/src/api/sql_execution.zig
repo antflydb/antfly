@@ -99,7 +99,8 @@ test "SQL statement read admission calls native capture once without write autho
         .{ .failure = error.SqlRangeTrackingRequired, .expected = error.SqlRangeTrackingRequired },
     }) |case| {
         var fake: Fake = .{ .failure = case.failure, .native_absent = case.native_absent };
-        var server: http_server.ApiHttpServer = undefined;
+        var server = adapterTestServer();
+        defer server.deinit();
         server.source = .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve } };
         server.table_reads = .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.capture, .open_relational_read = Fake.open } };
         server.table_writes = null;
@@ -201,6 +202,7 @@ fn supportsRangeGuards(server: *const http_server.ApiHttpServer) bool {
 }
 
 fn rejectTransactionalDdl(statement: ast.Statement) !void {
+    if (statement == .catalog_ddl and statement.catalog_ddl.action == .maintenance and statement.catalog_ddl.maintenance.?.operation == .vacuum) return error.SqlMaintenanceInTransaction;
     if (statement == .catalog_ddl and statement.catalog_ddl.concurrently) return error.SqlConcurrentDdlInTransaction;
     // Catalog and publication operations have their own durable commit
     // boundary; a surrounding SQL ROLLBACK cannot undo them.
@@ -210,8 +212,14 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
 const ReceiptWaitBudget = @import("antfly_local_sources").sql_read_requirements.WaitBudget;
 
 pub const Adapter = struct {
+    sql_authority: ?@import("antfly_local_sources").system_catalog_privileges.Authority = null,
+    /// Once a native read is retained, statistics attachment is cache-only.
+    statistics_reads_started: bool = false,
     /// COPY input retains ordinary write authority but cannot target active RLS.
     copy_input: bool = false,
+    /// Exact non-DML table intent supplied by a trusted SQL producer. Zero
+    /// keeps ordinary admin-only DDL admission; this is never client input.
+    table_privileges: u16 = 0,
     copy_filter: ?catalog.CopyFilter = null,
     statement_instant: ?catalog.Clock.Instant = null,
     lake_visibility: enum { committed, accepted } = .committed,
@@ -260,6 +268,9 @@ pub const Adapter = struct {
     staged: ?*@import("transactions.zig").OwnedTransactionCommitRequest = null,
     range_reads: ?*@import("transactions.zig").OwnedTransactionCommitRequest = null,
     dynamic_snapshot: ?*@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot = null,
+    // Binding must authorize every source before a transaction contacts owners.
+    // The slot belongs to the execution lease and retains the published cut.
+    pending_transaction_cut: ?struct { id: db_types.TxnId, slot: *?*@import("sql_retained_snapshot.zig").Shared } = null,
     dynamic_table: ?[]const u8 = null,
     ranges_staged: bool = false,
     inserting: bool = false,
@@ -273,9 +284,10 @@ pub const Adapter = struct {
     expected_setting_epoch: ?u64 = null,
     collect_prepared_bindings: ?*std.ArrayListUnmanaged(@import("sql_prepared.zig").Binding) = null,
     collect_view_authorities: ?*std.ArrayListUnmanaged(*const @import("sql_read_authority.zig").Context) = null,
-    /// One linearizable publication lookup and role capture per table in a
-    /// statement. Owner verification still fences every scan against the
-    /// exact serving generation, including a publication changed mid-read.
+    /// Statement-owned proofs retain table/schema/authority/purpose identity.
+    /// Ordinary and normalization reads share an absent publication; signed
+    /// tokens stay purpose-specific. Owners fence every scan against the exact
+    /// serving generation, including a publication changed mid-read.
     policy_proofs: ?std.AutoHashMapUnmanaged(@import("sql_read_authority.zig").ProofKey, ?[]u8) = null,
 
     pub fn decisionRuntime(self: *Adapter) !?@import("antfly_local_sources").functions_runtime.Runtime {
@@ -406,8 +418,8 @@ pub const Adapter = struct {
                 return zig017_err;
             });
         }
-        var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context };
-        var owner = session_api.Adapter{ .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay, .connection_search_path = if (self.connection_id != null and self.ddl_search_path != null) self.ddl_search_path.?.* else null };
+        var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context, .sync_level = if (self.setting_overlay_source == .connection) try setting_catalog.mutationSyncLevel(self.setting_overlay) else null };
+        var owner = session_api.Adapter{ .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = if (self.setting_overlay_source == .durable_session) self.setting_overlay else &.{}, .connection_search_path = if (self.connection_id != null and self.ddl_search_path != null) self.ddl_search_path.?.* else null };
         var session = sessions.Session{ .owner = owner.owner(), .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .namespace = self.session_namespace orelse self.namespace } };
         if (self.session_id) |encoded| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return zig017_failure: {
@@ -430,6 +442,13 @@ pub const Adapter = struct {
             zig017_return_error = error.ReadSnapshotTooOld;
             break :zig017_failure error.ReadSnapshotTooOld;
         };
+        if (compiled.statement == .prepared_transaction) {
+            if (parameters.len != 0) return error.InvalidSqlParameters;
+            return @import("sql_prepared_coordinator.zig").execute(self, &session, alloc, compiled.statement.prepared_transaction) catch |err| {
+                zig017_return_error = err;
+                return err;
+            };
+        }
         if (compiled.statement == .set_transaction) {
             if (parameters.len != 0) return error.InvalidSqlParameters;
             var result = try @import("antfly_local_sources").sql_runtime.Result.empty(alloc, "SET");
@@ -574,15 +593,17 @@ pub const Adapter = struct {
                     break :zig017_failure error.SqlWriteCapacityUnavailable;
                 };
                 defer execution_lease.release();
-                const transaction_cut = if (transaction.isolation != .read_committed)
-                    self.pinTransactionSnapshot(id) catch |err| {
-                        zig017_return_error = err;
-                        return err;
-                    }
-                else
-                    null;
-                defer if (transaction_cut) |cut| cut.release();
-                self.server.txn_sessions.lockSqlCharacteristics(self.server.alloc, id) catch |err| {
+                var transaction_cut: ?*@import("sql_retained_snapshot.zig").Shared = null;
+                self.pending_transaction_cut = if (transaction.isolation != .read_committed) .{ .id = id, .slot = &transaction_cut } else null;
+                defer {
+                    self.pending_transaction_cut = null;
+                    if (transaction_cut) |cut| cut.release();
+                }
+                if (transaction.isolation != .read_committed) {
+                    // An earlier statement may already retain a cut. Binding
+                    // must never start statistics maintenance behind that cut.
+                    self.statistics_reads_started = true;
+                } else self.server.txn_sessions.lockSqlCharacteristics(self.server.alloc, id) catch |err| {
                     zig017_return_error = err;
                     return err;
                 };
@@ -645,11 +666,7 @@ pub const Adapter = struct {
                 defer if (dynamic) |snapshot| snapshot.deinit();
                 var dynamic_scratch = std.heap.ArenaAllocator.init(alloc);
                 defer dynamic_scratch.deinit();
-                if (transaction_cut) |cut| {
-                    self.dynamic_snapshot = &cut.snapshot;
-                    self.dynamic_table = null;
-                }
-                if (deferred_conflict and transaction_cut == null) {
+                if (deferred_conflict and self.pending_transaction_cut == null) {
                     const table = (resolve(self, dynamic_scratch.allocator(), compiled.statement.insert.table, .read_write) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
@@ -681,6 +698,11 @@ pub const Adapter = struct {
                     self.dynamic_table = table.physical_name;
                 }
                 var active_backend = guarded_backend orelse self.backend();
+                // Guarded backends can predate the execution lease. Chain
+                // their bound-authority checks with this statement's cut.
+                var bound_guard: BoundExecutionGuard = .{ .root = self, .prior = active_backend.execution_binding_validator };
+                if (self.pending_transaction_cut != null)
+                    active_backend.execution_binding_validator = .{ .ptr = &bound_guard, .validate = BoundExecutionGuard.validate };
                 active_backend.write_version = transaction.write_version;
                 active_backend.supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null;
                 // Internal guarded autocommit is still one implicit SQL
@@ -694,10 +716,11 @@ pub const Adapter = struct {
                 active_backend.decision_provider = self.decision_provider;
                 if (compiled.uses_current_setting and active_backend.setting_capture == null) active_backend.setting_capture = self.settingCapture();
                 if (guarded_backend != null) {
+                    active_backend.supports_expression_access_hints = active_backend.supports_expression_access_hints and staged.tables.len == 0;
                     active_backend.atomic_statement_read_set = self.range_reads != null;
                     active_backend.coordinated_point_reads = self.range_reads != null;
-                    active_backend.coordinated_index_reads = self.dynamic_snapshot == null and self.range_reads != null and staged.tables.len == 0;
-                    active_backend.dynamic_statement_read_set = self.dynamic_snapshot != null;
+                    active_backend.coordinated_index_reads = self.dynamic_snapshot == null and self.pending_transaction_cut == null and self.range_reads != null and staged.tables.len == 0;
+                    active_backend.dynamic_statement_read_set = self.dynamic_snapshot != null or self.pending_transaction_cut != null;
                 }
                 var output = (@import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), active_backend, compiled, parameters, limits) catch |zig017_err| {
                     zig017_return_error = zig017_err;
@@ -800,7 +823,7 @@ pub const Adapter = struct {
         const bindings = self.prepared_bindings orelse return input;
         var result: ?ast.Name = null;
         for (bindings) |binding| {
-            if (binding.kind == .sequence or binding.kind == .function or binding.kind == .procedure or !std.mem.eql(u8, binding.name, input.table) or !std.mem.eql(u8, binding.database, self.database)) continue;
+            if ((binding.kind != .table and binding.kind != .view) or !std.mem.eql(u8, binding.name, input.table) or !std.mem.eql(u8, binding.database, self.database)) continue;
             if (result) |prior| if (!std.mem.eql(u8, prior.namespace.?, binding.namespace)) return error.CatalogGenerationChanged;
             result = .{ .database = binding.database, .namespace = binding.namespace, .table = input.table };
         }
@@ -811,7 +834,7 @@ pub const Adapter = struct {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .validate_persisted_expressions = @import("sql_persisted_expressions.zig").validate, .copy_filter = self.copy_filter, .notice_sink = self.notice_sink, .procedure_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bindProcedure } else null, .routine_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bind, .resolve_operator = @import("sql_routine_execution.zig").bindOperator, .resolve_aggregate = @import("sql_routine_execution.zig").bindAggregate, .resolve_cast = @import("sql_routine_execution.zig").bindCast } else null, .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.dynamic_snapshot == null and self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
+        return .{ .prepare_definition_copy = .{ .ptr = self, .prepare = @import("sql_definition_copy.zig").prepare }, .named_type_resolver = if (self.server.source.vtable.supports_sql_types) .{ .ptr = self, .resolve = @import("sql_type_schema.zig").bindCast } else null, .resolve_declared_types = if (self.server.source.vtable.supports_sql_types) .{ .ptr = self, .resolve = @import("sql_type_schema.zig").bindDeclaredColumns } else null, .validate_persisted_expressions = .{ .ptr = self, .validate = @import("sql_persisted_expressions.zig").validate }, .copy_filter = self.copy_filter, .notice_sink = self.notice_sink, .procedure_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bindProcedure } else null, .routine_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bind, .resolve_operator = @import("sql_routine_execution.zig").bindOperator, .resolve_aggregate = @import("sql_routine_execution.zig").bindAggregate, .resolve_cast = @import("sql_routine_execution.zig").bindCast } else null, .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null or self.pending_transaction_cut != null) .{ .ptr = self, .validate = validatePreparedExecution } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.dynamic_snapshot == null and self.pending_transaction_cut == null and self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null or self.pending_transaction_cut != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -820,7 +843,14 @@ pub const Adapter = struct {
 
     fn loadSettings(ptr: *anyopaque, alloc: std.mem.Allocator, scope: setting_catalog.Scope) !setting_catalog.RawSnapshot {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
-        if (scope.principal.len == 0 or !std.mem.eql(u8, scope.principal, http_server.transactionPrincipal(self.identity.*) orelse "") or !std.mem.eql(u8, scope.database, self.database)) return error.Forbidden;
+        if (!std.mem.eql(u8, scope.principal, http_server.transactionPrincipal(self.identity.*) orelse "") or !std.mem.eql(u8, scope.database, self.database)) return error.Forbidden;
+        if (scope.principal.len == 0) {
+            // Runtime-owned controls remain available when authentication is
+            // disabled. This grants no access to administrator/policy settings.
+            if (self.server.cfg.auth_enabled) return error.Forbidden;
+            if (self.expected_setting_epoch) |epoch| if (epoch != 1) return error.SettingCatalogChanged;
+            return .{ .scope = scope, .epoch = 1, .definitions = &.{} };
+        }
         var context = self.context;
         context.setting_read_principal = scope.principal;
         const bytes = try self.server.source.systemCatalog(alloc, context, .{ .setting_snapshot = scope });
@@ -874,6 +904,7 @@ pub const Adapter = struct {
         // Catalog jobs are not transaction participants yet. Never commit
         // their namespace change independently of an explicit SQL transaction.
         if (input == .populate and self.active_transaction != null) return error.UnsupportedSqlExecution;
+        if (input == .catalog_ddl and input.catalog_ddl.action == .maintenance) return @import("sql_maintenance.zig").execute(self, allocators, input.catalog_ddl);
         if (input == .catalog_ddl and input.catalog_ddl.kind == .named_type) return @import("sql_type_ddl.zig").execute(self, allocators, input.catalog_ddl);
         if (input == .catalog_ddl and input.catalog_ddl.kind == .cast) return @import("sql_cast_ddl.zig").execute(self, allocators, input.catalog_ddl);
         if (input == .catalog_ddl and (input.catalog_ddl.kind == .function or input.catalog_ddl.kind == .procedure or input.catalog_ddl.kind == .operator or input.catalog_ddl.kind == .aggregate))
@@ -954,17 +985,23 @@ pub const Adapter = struct {
             .write, .read_write => .write,
             .admin => .admin,
         };
-        if (self.identity.*) |identity| {
-            if (!http_server.permissionsAllow(identity.permissions, .table, logical, permission)) return error.Forbidden;
-            if (action == .read_write and !http_server.permissionsAllow(identity.permissions, .table, logical, .read)) return error.Forbidden;
-        }
+        const access = @import("sql_authorization_runtime.zig");
+        const native_allowed = if (self.identity.*) |identity| http_server.permissionsAllow(identity.permissions, .table, logical, permission) and (action != .read_write or http_server.permissionsAllow(identity.permissions, .table, logical, .read)) else true;
+        const sql_principal = try access.principal(self);
+        if (!native_allowed and (sql_principal == null or (action == .admin and self.table_privileges == 0))) return error.Forbidden;
         // A narrow definition read pins schema and physical identity in one
         // catalog epoch; never enumerate/clone every table on a SQL request.
         if (!self.server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
-        const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true, .expected_revision = self.revision } });
+        const lookup: system_catalog.ResolveMany = .{ .targets = &.{target}, .include_query_definitions = true, .expected_revision = self.revision, .sql_principal = sql_principal };
+        var private = self.context;
+        if (sql_principal != null) private.setting_admin = true;
+        const bytes = try self.server.source.systemCatalog(alloc, private, .{ .resolve_many = lookup });
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
+        try snapshot.validateAuthority(alloc, lookup);
+        if (snapshot.sql_authority) |authority| self.sql_authority = authority;
         if (snapshot.tables.len != 1) return error.InvalidSqlBackendResponse;
         const table = snapshot.tables[0] orelse {
+            if (!native_allowed) return error.Forbidden;
             if (action != .read) {
                 const resolved = try @import("sql_view_execution.zig").lookup(self, alloc, target);
                 if (resolved.sql_sources[0]) |source| switch (source.value) {
@@ -978,6 +1015,16 @@ pub const Adapter = struct {
             }
             return error.TableNotFound;
         };
+        if (!native_allowed) {
+            const granted = table.sql_access orelse return error.Forbidden;
+            if (self.table_privileges != 0) {
+                if (granted.rights & self.table_privileges != self.table_privileges) return error.Forbidden;
+            } else {
+                const writes = @import("antfly_local_sources").system_catalog_privileges.Access.bit(.insert) | @import("antfly_local_sources").system_catalog_privileges.Access.bit(.update) | @import("antfly_local_sources").system_catalog_privileges.Access.bit(.delete);
+                if ((action == .read or action == .read_write) and !granted.allows(.select)) return error.Forbidden;
+                if ((action == .write or action == .read_write) and granted.rights & writes == 0) return error.Forbidden;
+            }
+        }
         return self.bindResolvedTable(alloc, target, table, snapshot.revision, action);
     }
 
@@ -988,11 +1035,16 @@ pub const Adapter = struct {
         return self.bindResolvedTableImpl(alloc, target, table, revision, .read, false);
     }
     fn bindResolvedTableImpl(self: *Adapter, alloc: std.mem.Allocator, target: system_catalog.Target, table: system_catalog.ResolvedTable, revision: u64, action: catalog.Action, capture_prepared: bool) !catalog.Table {
+        try table.requireAccess(self.context.native_service);
         const logical = try target.resourceNameAlloc(alloc);
         const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
         binding.schema_json = definition.schema_json;
+        binding.sql_access = table.sql_access;
+        binding.sql_native_rights = @import("sql_authorization_runtime.zig").admittedNativeRights(self.identity.*, logical);
+        binding.sql_required_privileges = self.table_privileges;
+        if (self.copy_input) binding.sql_required_privileges = @import("antfly_local_sources").system_catalog_privileges.Access.bit(.insert);
         if (binding.external_base_source != null and action != .read and action != .admin) return error.ExternalLakeReadOnly;
         if (binding.external_base_source != null) binding.external_indexes = .{
             .catalog_json = definition.lake_index_catalog_json,
@@ -1026,8 +1078,9 @@ pub const Adapter = struct {
             }
         }
         if (self.identity.*) |*identity| try http_server.projectCatalogIdentity(self.server.alloc, identity, logical, table.name);
+        if (!self.copy_input and action != .admin) try @import("sql_maintenance.zig").prepareStatistics(self, binding);
         if (self.copy_input) {
-            const proof = try self.server.rowPolicyMutationReadProof(alloc, if (self.identity.*) |*identity| identity else null, self.context, binding.id, binding.physical_name, target.database, binding.schema_version, .normalize);
+            const proof = if (binding.sql_access != null) try self.normalizationProof(alloc, binding) else try self.server.rowPolicyMutationReadProof(alloc, if (self.identity.*) |*identity| identity else null, self.context, binding.id, binding.physical_name, target.database, binding.schema_version, .normalize);
             defer if (proof) |bytes| alloc.free(bytes);
             if (proof != null) return error.UnsupportedSqlShape;
         }
@@ -1059,6 +1112,7 @@ pub const Adapter = struct {
         if (snapshot.revision != scope.revision or snapshot.tables.len != 1) return error.CatalogGenerationChanged;
         const current = snapshot.tables[0] orelse return error.CatalogGenerationChanged;
         if (current.table_id != table.id or !std.mem.eql(u8, current.name, table.physical_name)) return error.CatalogGenerationChanged;
+        try @import("sql_authorization_runtime.zig").authorize(self, temporary, table);
     }
 
     /// Read-only serializable lake transactions serialize immediately before
@@ -1104,11 +1158,19 @@ pub const Adapter = struct {
         const authority_api = @import("sql_read_authority.zig");
         try authority_api.check(table);
         const key = try authority_api.ProofKey.from(table);
-        if (self.policy_proofs) |*proofs| if (proofs.get(key)) |cached| return cached;
+        var absence_key = key;
+        if (key.purpose == .normalize) absence_key.purpose = .ordinary;
+        if (self.policy_proofs) |*proofs| {
+            if (proofs.get(key)) |cached| return cached;
+            // Publication absence is shared by ordinary and normalization
+            // reads. Signed tokens remain purpose-specific; native owners
+            // still fence every read against their serving generation.
+            if (key.purpose == .normalize) if (proofs.get(absence_key)) |cached| if (cached == null) return null;
+        }
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         const identity: ?*const http_server.AuthenticatedIdentity = if (self.identity.*) |*value| value else null;
         const proof_alloc = if (self.policy_proofs != null) self.server.alloc else alloc;
-        const signed = if (table.row_policy_purpose != .ordinary) try self.server.rowPolicyMutationReadProof(proof_alloc, identity, self.context, table.id, table.physical_name, scope.database, table.schema_version, table.row_policy_purpose) else if (authority_api.context(table)) |authority| delegated: {
+        const signed = if (table.sql_access != null and table.read_authority == null) try @import("sql_authorization_runtime.zig").policyProof(self, proof_alloc, table) else if (table.row_policy_purpose != .ordinary) try self.server.rowPolicyMutationReadProof(proof_alloc, identity, self.context, table.id, table.physical_name, scope.database, table.schema_version, table.row_policy_purpose) else if (authority_api.context(table)) |authority| delegated: {
             const caller = identity orelse return error.Forbidden;
             if (authority.delegation) |grant| {
                 if (!std.mem.eql(u8, authority.effective.username, grant.owner) or !std.mem.eql(u8, &authority.instance, &grant.owner_instance)) return error.Forbidden;
@@ -1129,7 +1191,10 @@ pub const Adapter = struct {
         );
         if (self.policy_proofs) |*proofs| {
             errdefer if (signed) |token| self.server.alloc.free(token);
-            try proofs.put(self.server.alloc, key, signed);
+            // A publication may disappear after another purpose was signed.
+            // Keep that earlier token owned until statement teardown.
+            const cache_key = if (signed == null and proofs.get(absence_key) == null) absence_key else key;
+            try proofs.put(self.server.alloc, cache_key, signed);
             return signed;
         }
         return signed;
@@ -1163,6 +1228,8 @@ pub const Adapter = struct {
         }
         if (table.read_authority != null) {
             try @import("sql_read_authority.zig").check(table);
+        } else if (table.sql_access != null) {
+            try @import("sql_authorization_runtime.zig").authorize(self, alloc, table);
         } else if (self.identity.*) |identity| {
             if (!scanPermissionsAllow(identity.permissions, table)) return error.Forbidden;
         }
@@ -1231,6 +1298,11 @@ pub const Adapter = struct {
         projection: @import("antfly_local_sources").sql_document_row.Projection,
         view: @import("antfly_local_sources").api_table_read_source.RelationalReadView,
         column_page: ?catalog.Page = null,
+        statistics_arena: ?std.heap.ArenaAllocator = null,
+        fn retireStatistics(self: *@This()) void {
+            if (self.statistics_arena) |*arena| arena.deinit();
+            self.statistics_arena = null;
+        }
         fn retireColumns(self: *@This()) void {
             if (self.column_page) |*page| page.deinit();
             self.column_page = null;
@@ -1297,6 +1369,7 @@ pub const Adapter = struct {
             const self: *ReadCursor = @ptrCast(@alignCast(ptr));
             self.retireColumns();
             self.view.deinit();
+            self.retireStatistics();
             self.projection.deinit(self.alloc);
             self.alloc.destroy(self);
         }
@@ -1739,6 +1812,33 @@ pub const Adapter = struct {
         return err;
     }
 
+    const BoundExecutionGuard = struct {
+        root: *Adapter,
+        prior: @FieldType(catalog.Backend, "execution_binding_validator"),
+        fn validate(raw: *anyopaque, alloc: std.mem.Allocator, binding: @import("antfly_local_sources").sql_describe.BoundStatement) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.prior) |prior| {
+                const own: @FieldType(catalog.Backend, "execution_binding_validator") = .{ .ptr = self.root, .validate = validatePreparedExecution };
+                // The ordinary backend already carries this callback. A guard
+                // captured before session attachment may carry another one.
+                if (prior.ptr == own.?.ptr and prior.validate == own.?.validate)
+                    return validatePreparedExecution(self.root, alloc, binding);
+                try prior.validate(prior.ptr, alloc, binding);
+            }
+            return validatePreparedExecution(self.root, alloc, binding);
+        }
+    };
+
+    fn validatePreparedExecution(raw: *anyopaque, alloc: std.mem.Allocator, binding: @import("antfly_local_sources").sql_describe.BoundStatement) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        try validateReadReceiptBinding(raw, alloc, binding);
+        if (self.pending_transaction_cut) |pending| {
+            if (pending.slot.* == null) pending.slot.* = try self.pinTransactionSnapshot(pending.id);
+            self.dynamic_snapshot = &pending.slot.*.?.snapshot;
+            self.dynamic_table = null;
+        }
+    }
+
     fn validateReadReceiptBinding(raw: *anyopaque, alloc: std.mem.Allocator, binding: @import("antfly_local_sources").sql_describe.BoundStatement) !void {
         const self: *Adapter = @ptrCast(@alignCast(raw));
         const receipt = self.read_requirements.after_write orelse return;
@@ -1957,6 +2057,7 @@ pub const Adapter = struct {
         // A native provider is advertised and the logical table is bound.
         // Missing physical serving state is availability, never permission
         // to fall back to pages from a different visibility cut.
+        self.statistics_reads_started = true;
         const view = (source.openRelationalRead(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.SqlStatementReadUnavailable;
         errdefer view.deinit();
         try verifyTextPredicate(request, view);
@@ -1967,8 +2068,11 @@ pub const Adapter = struct {
         const projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, table, request.fields);
         errdefer projection.deinit(alloc);
         const cursor = try alloc.create(ReadCursor);
+        errdefer alloc.destroy(cursor);
         cursor.* = .{ .alloc = alloc, .adapter = self, .schema_version = table.schema_version, .require_primary_digest = request.include_primary_digest, .view = view, .projection = projection };
-        return .{ .ptr = cursor, .next = ReadCursor.next, .next_columns = if (request.include_primary_digest) null else ReadCursor.nextColumns, .close = ReadCursor.close };
+        var result: catalog.Cursor = .{ .ptr = cursor, .next = ReadCursor.next, .next_columns = if (request.include_primary_digest) null else ReadCursor.nextColumns, .close = ReadCursor.close };
+        cursor.statistics_arena = try @import("sql_maintenance.zig").attachStatistics(self, alloc, table, &result);
+        return result;
     }
 
     const StatementRead = struct {
@@ -1987,6 +2091,7 @@ pub const Adapter = struct {
             self.native.deinit();
             for (self.wrappers) |*wrapper| {
                 wrapper.retireColumns();
+                wrapper.retireStatistics();
                 wrapper.projection.deinit(self.alloc);
             }
             self.alloc.free(self.cursors);
@@ -2011,6 +2116,7 @@ pub const Adapter = struct {
             for (self.views[0..self.view_count]) |view| view.deinit();
             for (self.wrappers) |*wrapper| {
                 wrapper.retireColumns();
+                wrapper.retireStatistics();
                 wrapper.projection.deinit(self.alloc);
             }
             self.alloc.free(self.cursors);
@@ -2046,6 +2152,7 @@ pub const Adapter = struct {
             try targets.append(a, .{ .table = table.table, .schema_version = table.schema_version, .table_id = table.id });
             try writes.activateRangeTracking(a, table.table, self.context);
         }
+        self.statistics_reads_started = true;
         const snapshot = reads.openRelationalSnapshotCohort(self.server.alloc, targets.items, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns) catch |err| return physicalReadAdmissionError(err);
         const shared = @import("sql_retained_snapshot.zig").Shared.create(self.server.alloc, snapshot, &registry.snapshot_retirement) catch |err| {
             snapshot.deinit();
@@ -2067,8 +2174,12 @@ pub const Adapter = struct {
         const wrappers = try alloc.alloc(ReadCursor, requests.len);
         errdefer alloc.free(wrappers);
         var projected: usize = 0;
-        errdefer for (wrappers[0..projected]) |wrapper| wrapper.projection.deinit(alloc);
+        errdefer for (wrappers[0..projected]) |*wrapper| {
+            wrapper.retireStatistics();
+            wrapper.projection.deinit(alloc);
+        };
         for (requests, wrappers) |request, *wrapper| {
+            wrapper.statistics_arena = null;
             wrapper.projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, request.table, request.request.fields);
             projected += 1;
         }
@@ -2125,8 +2236,10 @@ pub const Adapter = struct {
             const scope = request.table.scope orelse return error.InvalidSqlBackendResponse;
             const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(temporary);
             try observed.observeRanges(self.server.alloc, logical, bound_table, request.table.schema_version, guarded.owner_proofs);
+            try @import("sql_authorization_runtime.zig").retainObservedIntent(self, observed, request.table);
             wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view.*, .projection = wrapper.projection };
             cursor.* = .{ .ptr = wrapper, .next = ReadCursor.next, .next_columns = if (request.request.include_primary_digest) null else ReadCursor.nextColumns, .close = StatementRead.borrowedClose };
+            wrapper.statistics_arena = try @import("sql_maintenance.zig").attachStatistics(self, alloc, request.table, cursor);
             if (if (overlay_staged) self.staged else null) |staged| {
                 const row_filter = try @import("sql_read_authority.zig").filter(temporary, request.table, self.identity.*);
                 cursor.* = try self.openSessionOverlay(alloc, cursor.*, staged, request.table, query, row_filter);
@@ -2185,13 +2298,18 @@ pub const Adapter = struct {
         const wrappers = try alloc.alloc(ReadCursor, requests.len);
         errdefer alloc.free(wrappers);
         var projected: usize = 0;
-        errdefer for (wrappers[0..projected]) |wrapper| wrapper.projection.deinit(alloc);
+        errdefer for (wrappers[0..projected]) |*wrapper| {
+            wrapper.retireStatistics();
+            wrapper.projection.deinit(alloc);
+        };
         for (requests, wrappers) |request, *wrapper| {
+            wrapper.statistics_arena = null;
             wrapper.projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, request.table, request.request.fields);
             projected += 1;
         }
         const cursors = try alloc.alloc(catalog.Cursor, requests.len);
         errdefer alloc.free(cursors);
+        self.statistics_reads_started = true;
         const native = read_source.openRelationalStatement(alloc, scans, .read_index) catch |err| blk: {
             if (err != error.SqlRangeTrackingRequired or self.range_reads == null) return physicalReadAdmissionError(err);
             const writes = self.server.table_writes orelse return error.SqlRangeTrackingRequired;
@@ -2234,9 +2352,11 @@ pub const Adapter = struct {
                 const scope = request.table.scope orelse return error.InvalidSqlBackendResponse;
                 const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(temporary);
                 try observed.observeRanges(self.server.alloc, logical, request.table.physical_name, request.table.schema_version, proofs);
+                try @import("sql_authorization_runtime.zig").retainObservedIntent(self, observed, request.table);
             }
             wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view, .projection = wrapper.projection };
             cursor.* = .{ .ptr = wrapper, .next = ReadCursor.next, .next_columns = if (request.request.include_primary_digest) null else ReadCursor.nextColumns, .close = StatementRead.borrowedClose };
+            wrapper.statistics_arena = try @import("sql_maintenance.zig").attachStatistics(self, alloc, request.table, cursor);
             if (if (overlay_staged) self.staged else null) |staged| {
                 const row_filter = try @import("sql_read_authority.zig").filter(temporary, request.table, self.identity.*);
                 var ordered = request.request;
@@ -2270,36 +2390,29 @@ pub const Adapter = struct {
         filter: ?@import("antfly_local_sources").search_pattern_filter.PreparedPatternFilter = null,
         allocator: std.mem.Allocator,
         validator: ?@import("sql_schema_cache.zig").Cache.ValidatorLease = null,
+        candidate_input: bool = false,
 
         fn prepare(raw: *anyopaque, alloc: std.mem.Allocator, input: []const catalog.Mutation) ![]const catalog.Mutation {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.validator != null) return self.normalizeLocal(alloc, input, false);
-            var stateful = false;
-            for (self.table.columns) |column| stateful = stateful or column.sequence_default != null;
-            if (!stateful) return self.normalize(alloc, input);
+            if (self.candidate_input) {
+                self.candidate_input = false;
+                return self.normalizeLocal(alloc, input, false);
+            }
+            if (self.validator == null) for (self.table.columns) |column| {
+                if (column.domain_view == null and column.sequence_default == null) continue;
+                self.validator = try self.adapter.server.sql_schema_cache.pinValidator(self.adapter.server.sqlPlanCacheIo(), alloc, self.table.schema_json);
+                if (self.validator.?.validator().schema.version != self.table.schema_version) return error.CatalogGenerationChanged;
+                break;
+            };
+            if (self.validator == null) return self.normalize(alloc, input);
+            // The shared typed preparation pipeline owns defaults, generated
+            // expressions and row constraints. Complete one row before any
+            // effect of the next; cached validators do not mean cached rows.
             const result = try alloc.alloc(catalog.Mutation, input.len);
             for (input, result) |mutation, *out| {
-                var prepared = mutation;
-                if (mutation.row) |document| {
-                    if (document != .object) return error.InvalidSqlBackendResponse;
-                    // Copy the map before filling defaults; callers may retain
-                    // the original image for conflict and RETURNING guards.
-                    var object: std.json.ObjectMap = .empty;
-                    for (document.object.keys(), document.object.values()) |key, value_| try object.put(alloc, key, value_);
-                    for (self.table.columns) |column| if (column.sequence_default) |binding| {
-                        if (!object.contains(column.path)) {
-                            const next = try @import("sql_sequence_execution.zig").allocateColumn(self.adapter, alloc, .{
-                                .table_id = self.table.id,
-                                .schema_version = self.table.schema_version,
-                                .storage_name = self.table.physical_name,
-                            }, column.name, binding.*);
-                            try object.put(alloc, column.path, .{ .integer = next });
-                        }
-                    };
-                    prepared.row = .{ .object = object };
-                }
-                // Validation of this row precedes every effect of the next.
-                const normalized = try self.normalize(alloc, &.{prepared});
+                const owned = try ownCandidate(alloc, mutation);
+                const candidate = try self.normalizeLocal(alloc, &.{owned}, true);
+                const normalized = try self.normalizeLocal(alloc, candidate, false);
                 if (normalized.len != 1) return error.InvalidSqlBackendResponse;
                 out.* = normalized[0];
             }
@@ -2311,19 +2424,41 @@ pub const Adapter = struct {
             if (self.validator == null) self.validator = try self.adapter.server.sql_schema_cache.pinValidator(self.adapter.server.sqlPlanCacheIo(), alloc, self.table.schema_json);
             if (self.validator.?.validator().schema.version != self.table.schema_version) return error.CatalogGenerationChanged;
             const owned = try alloc.dupe(catalog.Mutation, input);
-            for (owned) |*mutation| if (mutation.row) |row| {
+            for (owned) |*mutation| mutation.* = try ownCandidate(alloc, mutation.*);
+            const prepared = try self.normalizeLocal(alloc, owned, true);
+            self.candidate_input = true;
+            return prepared;
+        }
+        fn ownCandidate(alloc: std.mem.Allocator, mutation: catalog.Mutation) !catalog.Mutation {
+            var owned = mutation;
+            if (mutation.row) |row| {
+                // Conflict and RETURNING guards may retain the input image.
+                // Normalization can also change nested arrays and objects.
                 const value = try @import("antfly_local_sources").sql_operators.cloneDatum(alloc, .json(row));
                 if (value.value != .object) return error.InvalidSqlBackendResponse;
-                mutation.row = value.value;
-            };
-            return self.normalizeLocal(alloc, owned, true);
+                owned.row = value.value;
+            }
+            return owned;
+        }
+        fn allocateSequence(raw: *anyopaque, alloc: std.mem.Allocator, scope: @import("antfly_local_sources").system_catalog_column_sequences.Scope, column: []const u8, binding: @import("antfly_local_sources").system_catalog_column_sequences.Binding) !i64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (scope.table_id != self.table.id or scope.schema_version != self.table.schema_version or !std.mem.eql(u8, scope.storage_name, self.table.physical_name)) return error.CatalogGenerationChanged;
+            return @import("sql_sequence_execution.zig").allocateTableColumn(self.adapter, alloc, self.table, column, binding);
         }
         fn normalizeLocal(self: *@This(), alloc: std.mem.Allocator, input: []const catalog.Mutation, candidate: bool) ![]const catalog.Mutation {
             try self.adapter.context.ensureActive();
             const io = self.adapter.server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
-            const validator = self.validator.?.validator().forPreparation(.{ .io = io, .sequences = self.adapter.context.column_sequences, .sequence_scope = .{ .table_id = self.table.id, .schema_version = self.table.schema_version, .storage_name = self.table.physical_name }, .transaction_start = if (self.adapter.context.sql_transaction_micros) |micros| .{ .micros = micros } else null });
+            const validator = self.validator.?.validator().forPreparation(.{ .io = io, .sequences = .{ .ptr = self, .allocate = allocateSequence }, .sequence_scope = .{ .table_id = self.table.id, .schema_version = self.table.schema_version, .storage_name = self.table.physical_name }, .transaction_start = if (self.adapter.context.sql_transaction_micros) |micros| .{ .micros = micros } else null });
             const result = try alloc.dupe(catalog.Mutation, input);
+            const prepared_contract = if (!candidate) validator.preparedDomainContract() else null;
+            const prepared_owner = if (prepared_contract) |contract| owner: {
+                const owned = try alloc.create(@TypeOf(contract));
+                owned.* = contract;
+                break :owner owned;
+            } else null;
             for (result) |*mutation| if (mutation.row) |*row| {
+                const row_validator = validator.forDomainAdmission(mutation.domain_admission);
+                mutation.prepared_domain = null;
                 if (!candidate and self.table.storage_mode == .document) for (self.table.columns) |column| {
                     if (!column.document_null_is_absent) continue;
                     const value = if (column.document_path.len != 0) @import("antfly_local_sources").sql_document_path.get(row.*, column.document_path) else row.object.get(column.path);
@@ -2333,8 +2468,9 @@ pub const Adapter = struct {
                     } else false;
                     if (!explicit) try column.assignStorageValue(alloc, &row.object, .null, true);
                 };
-                const nulls = if (candidate) try validator.prepareCandidateValueWithNulls(alloc, row, mutation.json_null_fields) else try validator.prepareSelectedValueWithNulls(alloc, row, mutation.json_null_fields);
+                const nulls = if (candidate) try row_validator.prepareCandidateValueWithNulls(alloc, row, mutation.json_null_fields) else try row_validator.prepareSelectedValueWithNulls(alloc, row, mutation.json_null_fields);
                 mutation.json_null_fields = nulls.fields;
+                if (!candidate) mutation.prepared_domain = prepared_owner;
                 if (!candidate) if (self.filter) |*filter| if (!try filter.matchesJson(alloc, mutation.key, row.*)) return error.Forbidden;
             };
             return result;
@@ -2380,6 +2516,7 @@ pub const Adapter = struct {
         defer if (mandatory_filter) |filter| alloc.free(filter);
         const owner = try alloc.create(MutationPreparation);
         errdefer alloc.destroy(owner);
+        self.statistics_reads_started = true;
         const view = (source.openRelationalRead(alloc, table.physical_name, key, upper, .{
             .limit = 1,
             .inclusive_from = true,
@@ -2393,9 +2530,9 @@ pub const Adapter = struct {
         }, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.SqlStatementReadUnavailable;
         errdefer view.deinit();
         owner.* = .{ .adapter = self, .table = table, .view = view, .allocator = alloc };
-        if (require_visible) if (mandatory_filter) |json| {
+        if (mandatory_filter) |json| {
             owner.filter = try @import("antfly_local_sources").search_pattern_filter.PreparedPatternFilter.init(alloc, json);
-        };
+        }
         return .{ .ptr = owner, .candidates = MutationPreparation.candidates, .prepare = MutationPreparation.prepare, .finish = MutationPreparation.finish, .close = MutationPreparation.close };
     }
     fn prepareMutationsWithVisibility(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation, require_visible: bool) ![]const catalog.Mutation {
@@ -2422,9 +2559,10 @@ pub const Adapter = struct {
         if (table.read_authority != null) return error.Forbidden;
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
-        // Only omitted clock defaults need SQL-owned normalization. Ordinary
-        // defaults keep their existing single native commit preparation;
-        // volatile defaults must observe this SQL transaction's captured time.
+        // Normalize final images before enforcing ingress row filters, even
+        // for relational INSERTs without RETURNING. Unfiltered ordinary rows
+        // retain their single native commit preparation. Volatile defaults
+        // must observe this SQL transaction's captured time.
         const omitted_default = if (already_prepared) false else missing: {
             for (table.columns) |column| if (column.clock_defaulted or column.sequence_default != null) {
                 for (raw_input) |mutation| if (mutation.row) |row| {
@@ -2434,7 +2572,10 @@ pub const Adapter = struct {
             };
             break :missing false;
         };
-        const prepared_here = !already_prepared and omitted_default;
+        const domain_preparation = for (table.columns) |column| {
+            if (column.domain_view != null) break true;
+        } else false;
+        const prepared_here = !already_prepared and (domain_preparation or omitted_default or http_server.effectiveRowFilterJson(self.identity.*, table.physical_name) != null);
         const input = if (prepared_here) try prepareMutationsWithVisibility(ptr, alloc, table, raw_input, false) else raw_input;
         const guards = try conflictGuards(alloc, input);
         if (self.active_transaction) |id| {
@@ -2460,7 +2601,7 @@ pub const Adapter = struct {
                     };
                 };
                 if (mutation.row) |row| {
-                    try writes.append(alloc, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(alloc, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields });
+                    try writes.append(alloc, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(alloc, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields, .prepared_domain = mutation.prepared_domain });
                 } else try deletes.append(alloc, mutation.key);
             }
             // Document mutations always cross preparation in the executor;
@@ -2473,6 +2614,7 @@ pub const Adapter = struct {
                 const policy_proof = try self.normalizationProof(alloc, table);
                 const first_key = writes.items[0].key;
                 const upper = try pointUpperBound(alloc, first_key);
+                self.statistics_reads_started = true;
                 const view = (source.openRelationalRead(alloc, table.physical_name, first_key, upper, .{
                     .limit = 1,
                     .inclusive_from = true,
@@ -2489,12 +2631,14 @@ pub const Adapter = struct {
             } else writes.items;
             const scope = table.scope orelse return error.InvalidSqlBackendResponse;
             const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(alloc);
-            var tables = [_]txn.TableCommitRequest{.{ .table_name = @constCast(logical), .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .batch = .{ .writes = normalized, .deletes = deletes.items }, .predicates = .{ .items = predicates, .capacity = predicates.len, .pointer_stability = .{} } }};
+            var tables = [_]txn.TableCommitRequest{.{ .sql_authorization = try @import("sql_authorization_runtime.zig").transactionIntent(self, table), .table_name = @constCast(logical), .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .batch = .{ .writes = normalized, .deletes = deletes.items }, .predicates = .{ .items = predicates, .capacity = predicates.len, .pointer_stability = .{} } }};
             defer if (tables[0].conflict_guards) |*owned| owned.deinit();
             if (guards) |value| try tables[0].mergeConflictGuards(alloc, value);
             var bindings = [_]txn.CatalogBinding{.{ .logical = logical, .physical = table.physical_name }};
             const statement = txn.OwnedTransactionCommitRequest{ .tables = &tables, .catalog_bindings = .{ .items = &bindings, .capacity = 1, .pointer_stability = .{} } };
-            if (!(try self.server.transactionRequestAuthorized(self.identity.*, statement))) return error.Forbidden;
+            var authorization = try @import("sql_authorization_runtime.zig").TransactionScope.init(self.server, self.identity.*, self.context, alloc, statement);
+            defer if (authorization) |*authority_owner| authority_owner.deinit();
+            if (!(try self.server.transactionRequestAuthorizedWithSql(self.identity.*, statement, if (authorization) |*authority_scope| authority_scope else null))) return error.Forbidden;
             _ = (try self.server.txn_sessions.stageValidated(self.server.alloc, id, &statement, .{ .ptr = self, .validate = validateStaged })) orelse return error.SqlTransactionNotActive;
             self.ranges_staged = true;
             self.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
@@ -2507,10 +2651,13 @@ pub const Adapter = struct {
             predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest, .unique_absence = mutation.unique_absence, .row_policy_requirement = mutation.row_policy_requirement };
             if (mutation.predicate_only) continue;
             if (mutation.row) |row| {
-                try writes.append(alloc, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(alloc, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields });
+                try writes.append(alloc, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(alloc, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields, .prepared_domain = mutation.prepared_domain });
             } else try deletes.append(alloc, mutation.key);
         }
-        var response = @import("public_table_http.zig").handleNativeTableBatch(scratch, table.physical_name, .{ .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .integrity_commands = if (guards) |value| value.commands else &.{}, .relational_integrity_generation_set = if (guards) |value| value.generation_set else null }, self.server.tableApi(self.context)) catch
+        var sql_write_scope: ?@import("sql_authorization_runtime.zig").WriteScope = if (table.sql_access != null) try @import("sql_authorization_runtime.zig").WriteScope.init(self, alloc, table) else null;
+        defer if (sql_write_scope) |*authority_owner| authority_owner.deinit();
+        const commit_context = if (sql_write_scope) |*scope| scope.context() else self.context;
+        var response = @import("public_table_http.zig").handleNativeTableBatch(scratch, table.physical_name, .{ .sync_level = try setting_catalog.mutationSyncLevel(self.setting_overlay), .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .integrity_commands = if (guards) |value| value.commands else &.{}, .relational_integrity_generation_set = if (guards) |value| value.generation_set else null }, self.server.tableApi(commit_context)) catch
             return error.SqlMutationOutcomeUnknown;
         defer response.deinit(scratch);
         self.outcome_transaction_id = mutationTransactionId(response.body);
@@ -2529,7 +2676,10 @@ pub const Adapter = struct {
         // A failed second staging operation must never leave unfenced writes.
         if (self.range_reads) |guards| try candidate.retainRangeGuards(alloc, guards);
         try @import("transactions.zig").SessionRegistry.normalizeSqlStage(ptr, alloc, previous, candidate, statement);
-        try @import("relational_session_statement.zig").validate(self.server, alloc, previous, candidate, statement, self.context);
+        var authorization = try @import("sql_authorization_runtime.zig").TransactionScope.init(self.server, self.identity.*, self.context, alloc, candidate.*);
+        defer if (authorization) |*authority_owner| authority_owner.deinit();
+        const request = if (authorization) |*scope| scope.context() else self.context;
+        try @import("relational_session_statement.zig").validate(self.server, alloc, previous, candidate, statement, request);
     }
 };
 
@@ -2754,7 +2904,8 @@ test "SQL require-index equality uses exact native bounds only inside a guarded 
         }
     };
     var fake: u8 = 0;
-    var server: http_server.ApiHttpServer = undefined;
+    var server = adapterTestServer();
+    defer server.deinit();
     server.source = .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve } };
     var identity: ?http_server.AuthenticatedIdentity = null;
     var guarded: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
@@ -2797,6 +2948,103 @@ test "SQL require-index equality uses exact native bounds only inside a guarded 
     try std.testing.expectEqualStrings("", disabled.opts.row_policy_principal_proof);
 }
 
+// Test authorities fail through typed callbacks instead of undefined server
+// memory. Backend construction may inspect capabilities before authorization.
+fn adapterTestServer() http_server.ApiHttpServer {
+    const Poison = struct {
+        var token: u8 = 0;
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return error.TestUnexpectedAuthorityAccess;
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            return error.TestUnexpectedAuthorityAccess;
+        }
+    };
+    return http_server.ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &Poison.token, .vtable = &.{ .status = Poison.status, .system_catalog = Poison.resolve } }, null, null);
+}
+
+/// Immutable fixture cuts use copied data, independent per-cursor iteration,
+/// and frozen owner proofs. Fault/counter instrumentation stays on the source.
+fn AdapterTestSnapshot(comptime Provider: type) type {
+    const reads = @import("antfly_local_sources").api_table_read_source;
+    return struct {
+        const Self = @This();
+        const Item = struct { table: []u8, data: Provider.SnapshotState };
+        alloc: std.mem.Allocator,
+        source: *Provider,
+        items: []Item,
+        cursors: usize = 0,
+        const Cursor = struct {
+            owner: *Self,
+            data: Provider.SnapshotState,
+            fn next(ptr: *anyopaque, a: std.mem.Allocator, limit: u32) !reads.RelationalReadView.Page {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                return Provider.snapshotNext(self.owner.source, &self.data, a, limit);
+            }
+            fn close(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const owner = self.owner;
+                std.debug.assert(owner.cursors != 0);
+                owner.cursors -= 1;
+                Provider.snapshotCursorClosed(owner.source);
+                owner.alloc.destroy(self);
+            }
+        };
+        fn capture(ptr: *anyopaque, a: std.mem.Allocator, targets: []const reads.RelationalSnapshotTarget, consistency: @import("../raft/read_gate.zig").ReadConsistency, _: ?@import("antfly_cancellation").CancellationToken, _: ?u64) !reads.RelationalStatementSnapshot {
+            try std.testing.expectEqual(.read_index, consistency);
+            const source: *Provider = @ptrCast(@alignCast(ptr));
+            const self = try a.create(Self);
+            errdefer a.destroy(self);
+            const items = try a.alloc(Item, targets.len);
+            errdefer a.free(items);
+            var initialized: usize = 0;
+            errdefer for (items[0..initialized]) |item| a.free(item.table);
+            for (targets, items) |target, *item| {
+                const data = try Provider.snapshotData(source, target);
+                item.* = .{ .table = try a.dupe(u8, target.table), .data = data };
+                initialized += 1;
+            }
+            self.* = .{ .alloc = a, .source = source, .items = items };
+            Provider.snapshotCaptured(source);
+            return .{ .ptr = self, .vtable = &.{ .open = open, .open_guarded = guarded, .close = close } };
+        }
+        fn stateForScan(self: *Self, scan: reads.RelationalStatementScan) !Provider.SnapshotState {
+            for (self.items) |entry| if (std.mem.eql(u8, entry.table, scan.table)) return entry.data;
+            return error.TableNotFound;
+        }
+        fn cursor(self: *Self, data: Provider.SnapshotState, scan: reads.RelationalStatementScan) !reads.RelationalReadView {
+            const result = try self.alloc.create(Cursor);
+            errdefer self.alloc.destroy(result);
+            result.* = .{ .owner = self, .data = data };
+            try Provider.snapshotOpened(self.source, &result.data, scan);
+            self.cursors += 1;
+            return .{ .ptr = result, .vtable = &.{ .next = Cursor.next, .close = Cursor.close } };
+        }
+        fn open(ptr: *anyopaque, _: std.mem.Allocator, scan: reads.RelationalStatementScan) !reads.RelationalReadView {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return self.cursor(try self.stateForScan(scan), scan);
+        }
+        fn guarded(ptr: *anyopaque, a: std.mem.Allocator, scan: reads.RelationalStatementScan) !reads.RelationalStatementSnapshot.GuardedRead {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const data = try self.stateForScan(scan);
+            const proofs = try Provider.snapshotProofs(self.source, a, data);
+            errdefer {
+                for (proofs) |proof| a.free(proof.proofs);
+                a.free(proofs);
+            }
+            return .{ .view = try self.cursor(data, scan), .owner_proofs = proofs };
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.cursors == 0);
+            const a = self.alloc;
+            for (self.items) |entry| a.free(entry.table);
+            a.free(self.items);
+            a.destroy(self);
+        }
+    };
+}
+
 test "SQL API empty transaction overlays preserve native index planning" {
     const reads = @import("antfly_local_sources").api_table_read_source;
     const Fake = struct {
@@ -2822,7 +3070,8 @@ test "SQL API empty transaction overlays preserve native index planning" {
         }
     };
     var fake: Fake = .{};
-    var server: http_server.ApiHttpServer = undefined;
+    var server = adapterTestServer();
+    defer server.deinit();
     server.alloc = std.testing.allocator;
     server.source = .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve } };
     server.table_reads = .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_read = Fake.open } };
@@ -2892,7 +3141,8 @@ test "SQL API document preparation uses native normalization and retains mutatio
         }
     };
     var fake: Fake = .{};
-    var server: http_server.ApiHttpServer = undefined;
+    var server = adapterTestServer();
+    defer server.deinit();
     server.source = .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve } };
     server.table_reads = .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_read = Fake.open } };
     var identity: ?http_server.AuthenticatedIdentity = null;
@@ -2953,10 +3203,47 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
         unknown_commit: bool = false,
         views: [2]View = undefined,
         records: [1]@import("antfly_local_sources").common_topology_records.TableRecord = .{.{ .table_id = 3, .name = "physical", .schema_json = schema }},
+        snapshots: usize = 0,
+        last_rows: usize = 0,
+        const SnapshotState = struct { generation: u64, emit_row: bool, absent: bool = false, done: bool = false };
+        fn snapshotData(self: *@This(), target: reads.RelationalSnapshotTarget) !SnapshotState {
+            try std.testing.expectEqualStrings("physical", target.table);
+            try std.testing.expectEqual(@as(u32, 7), target.schema_version);
+            return .{ .generation = self.generation, .emit_row = self.emit_row };
+        }
+        fn snapshotCaptured(self: *@This()) void {
+            self.snapshots += 1;
+        }
+        fn snapshotOpened(self: *@This(), data: *SnapshotState, scan: reads.RelationalStatementScan) !void {
+            if (!self.active) return error.SqlRangeTrackingRequired;
+            if (scan.from.len == 0) self.full_scans += 1 else self.point_scans += 1;
+            data.absent = std.mem.eql(u8, scan.from, "b");
+        }
+        fn snapshotNext(self: *@This(), data: *SnapshotState, a: std.mem.Allocator, _: u32) !View.Page {
+            self.pages += 1;
+            var arena = std.heap.ArenaAllocator.init(a);
+            errdefer arena.deinit();
+            if (data.done or !data.emit_row or data.absent) return .{ .arena = arena, .rows = &.{}, .after = null };
+            data.done = true;
+            const rows = try arena.allocator().alloc(View.Row, 1);
+            rows[0] = .{ .id = "a", .version = 42, .schema_version = 7, .value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"n\":1}", .{}), .expected_content_digest = @splat(9) };
+            return .{ .arena = arena, .rows = rows, .after = null };
+        }
+        fn snapshotProofs(self: *@This(), a: std.mem.Allocator, data: SnapshotState) ![]reads.RelationalStatementRead.OwnerRangeProof {
+            self.proof_calls += 1;
+            if (self.fail_proof_call == self.proof_calls) return error.TestProofUnavailable;
+            const observations = try a.dupe(@import("antfly_local_sources").api_range_read_guards.Proof, &.{.{ .bucket = 98, .generation = data.generation }});
+            errdefer a.free(observations);
+            return a.dupe(reads.RelationalStatementRead.OwnerRangeProof, &.{.{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{ .group_id = 5, .range_id = 6, .identity_namespace = .{ .table_id = 3, .shard_id = 5, .range_id = 6 } } }, .proofs = observations }});
+        }
+        fn snapshotCursorClosed(self: *@This()) void {
+            self.closes += 1;
+        }
         fn status(_: *anyopaque) !metadata.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
         fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            if (call == .sql_snapshot_cohort) return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").SqlSnapshotCohort{ .revision = 2, .tables = &.{.{ .id = 3, .table = "physical", .schema_version = 7, .external = false }} }, .{});
             if (call == .write_validation) return std.json.Stringify.valueAlloc(alloc, .{ .schema_json = schema }, .{});
             if (call == .policy_publication_status) return alloc.dupe(u8, "null");
             return std.json.Stringify.valueAlloc(alloc, .{ .revision = 2, .tables = .{.{ .table_id = 3, .name = "physical", .query_definition = .{ .table_id = 3, .schema_json = schema, .read_schema_json = "", .indexes_json = "{}" } }}, .logical_names = .{"docs"} }, .{});
@@ -3064,12 +3351,16 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
         fn run(adapter: *Adapter, text: []const u8) !void {
             var compiled = try compiler.compile(std.testing.allocator, text, .{});
             defer compiled.deinit();
-            var result = try adapter.execute(std.testing.allocator, &compiled, &.{}, .{}, null);
+            // Model HTTP/pgwire guards copied before session attachment.
+            const guarded = adapter.backend();
+            var result = try adapter.execute(std.testing.allocator, &compiled, &.{}, .{}, guarded);
             defer result.deinit();
+            const self: *@This() = @ptrCast(@alignCast(adapter.server.source.ptr));
+            self.last_rows = result.output.rows.len;
         }
     };
     var fake: Fake = .{};
-    var server = http_server.ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.open, .open_relational_read = Fake.openNormalize } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .activate_range_tracking = Fake.activate, .commit_transaction_with_id = Fake.commit } });
+    var server = http_server.ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.open, .open_relational_read = Fake.openNormalize, .open_relational_snapshot_cohort = AdapterTestSnapshot(Fake).capture } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .activate_range_tracking = Fake.activate, .commit_transaction_with_id = Fake.commit } });
     defer server.deinit();
     var identity: ?http_server.AuthenticatedIdentity = null;
     var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
@@ -3086,6 +3377,8 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
     // owner scope, including native timing and savepoint commands.
     adapter.session_namespace = "public";
     adapter.namespace = "analytics";
+    try Fake.run(&adapter, "SELECT 1");
+    try std.testing.expectEqual(@as(usize, 1), fake.snapshots);
     try Fake.run(&adapter, "SET CONSTRAINTS ALL DEFERRED");
     try Fake.run(&adapter, "SAVEPOINT before_read");
     try Fake.run(&adapter, "SET CONSTRAINTS ALL IMMEDIATE");
@@ -3105,7 +3398,8 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
     try Fake.run(&adapter, "BEGIN ISOLATION LEVEL READ COMMITTED");
     session = adapter.result_session_id.?;
     adapter.session_id = &session;
-    try std.testing.expectError(error.SqlRangeTrackingRequired, Fake.run(&adapter, "MERGE INTO docs d USING docs s ON d._id=s._id WHEN MATCHED THEN DELETE"));
+    // READ COMMITTED MERGE now uses the coordinated statement-read path.
+    try Fake.run(&adapter, "MERGE INTO docs d USING docs s ON d._id=s._id WHEN MATCHED THEN DELETE");
     try Fake.run(&adapter, "ROLLBACK");
     adapter.session_id = null;
     adapter.session_namespace = null;
@@ -3113,11 +3407,18 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
     try Fake.run(&adapter, "BEGIN ISOLATION LEVEL REPEATABLE READ");
     session = adapter.result_session_id.?;
     adapter.session_id = &session;
+    fake.emit_row = true;
     try Fake.run(&adapter, "SELECT n FROM docs");
+    try std.testing.expectEqual(@as(usize, 1), fake.last_rows);
     const before = fake.pages;
+    const captures = fake.snapshots;
     fake.generation += 1;
-    try std.testing.expectError(error.SqlWriteConflict, Fake.run(&adapter, "SELECT n FROM docs"));
-    try std.testing.expectEqual(before, fake.pages); // abort before fetching/exposing rows
+    fake.emit_row = false;
+    // REPEATABLE READ forks its original immutable cut after live data changes.
+    try Fake.run(&adapter, "SELECT n FROM docs");
+    try std.testing.expectEqual(@as(usize, 1), fake.last_rows);
+    try std.testing.expect(fake.pages > before);
+    try std.testing.expectEqual(captures, fake.snapshots);
     try Fake.run(&adapter, "ROLLBACK");
     try std.testing.expectEqual(@as(usize, 1), fake.commits);
     adapter.session_id = null;
@@ -3285,11 +3586,38 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
         archive_id: u64 = 5,
         target_guard: bool = false,
         source_guard: bool = false,
+        const SnapshotState = State;
+        fn snapshotData(self: *Self, target: reads.RelationalSnapshotTarget) !State {
+            try std.testing.expectEqual(@as(u32, 1), target.schema_version);
+            const id = target.table_id orelse return error.TestUnexpectedTable;
+            return .{ .table_id = id, .expression_case = self.expression_case, .conditional_case = self.conditional_case, .skip_case = self.skip_case, .delete_case = self.delete_case, .insert_returning_case = self.insert_returning_case, .expression_predicate_case = self.expression_predicate_case, .grouped_predicate_case = self.grouped_predicate_case, .cte_case = self.cte_case };
+        }
+        fn snapshotCaptured(self: *Self) void {
+            self.captures += 1;
+        }
+        fn snapshotOpened(_: *Self, _: *State, _: reads.RelationalStatementScan) !void {}
+        fn snapshotNext(_: *Self, data: *State, a: std.mem.Allocator, limit: u32) !View.Page {
+            return next(data, a, limit);
+        }
+        fn snapshotCursorClosed(_: *Self) void {}
+        fn activate(_: *anyopaque, _: std.mem.Allocator, _: []const u8, context: operation.RequestContext) !void {
+            try context.ensureActive();
+        }
+        fn snapshotProofs(self: *Self, a: std.mem.Allocator, data: State) ![]reads.RelationalStatementRead.OwnerRangeProof {
+            const table_id = data.table_id;
+            if ((table_id != 3 and self.fail_source_proof) or (table_id == 3 and self.prepared_cte_merge_case and self.fail_merge_proof)) return error.TestProofUnavailable;
+            const group_id: u64 = if (table_id == 3) 5 else if (table_id == 4) 7 else 9;
+            const range_id: u64 = if (table_id == 3) 6 else if (table_id == 4) 8 else 10;
+            const observations = try a.dupe(@import("antfly_local_sources").api_range_read_guards.Proof, &.{.{ .bucket = @intCast(table_id), .generation = 1 }});
+            errdefer a.free(observations);
+            return a.dupe(reads.RelationalStatementRead.OwnerRangeProof, &.{.{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = table_id, .topology_epoch = 4, .route = .{ .group_id = group_id, .range_id = range_id, .identity_namespace = .{ .table_id = table_id, .shard_id = group_id, .range_id = range_id } } }, .proofs = observations }});
+        }
         fn status(_: *anyopaque) !metadata.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
         fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *Self = @ptrCast(@alignCast(ptr));
+            if (call == .sql_snapshot_cohort) return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").SqlSnapshotCohort{ .revision = 2, .tables = &.{ .{ .id = 3, .table = "physical_usage", .schema_version = 1, .external = false }, .{ .id = 4, .table = "physical_source", .schema_version = 1, .external = false }, .{ .id = self.archive_id, .table = "physical_archive", .schema_version = 1, .external = false } } }, .{});
             if (call == .write_validation) return std.json.Stringify.valueAlloc(alloc, .{ .schema_json = schema }, .{});
             if (call == .policy_publication_status) return alloc.dupe(u8, "null");
             if (call != .resolve_many) return error.TestUnexpectedCatalogCall;
@@ -3496,7 +3824,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
     var prepared_store = try prepared_backend.runtimeStore(std.testing.allocator, .{ .name = "merge-prepared-test" });
     defer prepared_store.deinit();
     var prepared_durable = @import("transactions.zig").DurableSessionStore.initRuntime(std.testing.allocator, &prepared_store);
-    var server = http_server.ApiHttpServer.init(std.testing.allocator, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.open, .open_relational_read = Fake.openNormalize } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .commit_batch = Fake.commitBatch, .commit_transaction_with_id = Fake.commit } });
+    var server = http_server.ApiHttpServer.init(std.testing.allocator, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.open, .open_relational_read = Fake.openNormalize, .open_relational_snapshot_cohort = AdapterTestSnapshot(Fake).capture } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .activate_range_tracking = Fake.activate, .commit_batch = Fake.commitBatch, .commit_transaction_with_id = Fake.commit } });
     defer server.deinit();
     var permissions = [_]@import("../usermgr/mod.zig").Permission{
         .{ .resource = @constCast("*"), .resource_type = .table, .type = .read },
@@ -4111,9 +4439,10 @@ test "SQL stateless fallback rejects JSON scans before transport" {
     var identity: ?http_server.AuthenticatedIdentity = null;
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
-    var server: http_server.ApiHttpServer = undefined;
-    // Backend construction borrows the executor. Catalog and transport remain
-    // poisoned so rejected requests cannot touch those authorities.
+    var server = adapterTestServer();
+    defer server.deinit();
+    // Capability inspection is valid; attempting catalog or transport work
+    // reaches a typed poison callback and fails the authorization regression.
     server.embedding_provider_runtime.io = io_impl.io();
     var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{} };
     try std.testing.expectError(error.SqlStatementSnapshotRequired, Adapter.scan(&adapter, std.testing.allocator, .{ .id = 1, .physical_name = "rows", .schema_version = 1, .storage_mode = .relational, .columns = &.{} }, .{ .fields = &.{}, .limit = 1 }));
@@ -4139,9 +4468,10 @@ test "SQL no-op mutations authorize read and write before consulting catalog" {
     // must fail before metadata access, including contradictory/no-op writes.
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
-    var server: http_server.ApiHttpServer = undefined;
-    // Backend construction borrows the executor. Catalog and transport remain
-    // poisoned so rejected requests cannot touch those authorities.
+    var server = adapterTestServer();
+    defer server.deinit();
+    // Capability inspection is valid; attempting catalog or transport work
+    // reaches a typed poison callback and fails the authorization regression.
     server.embedding_provider_runtime.io = io_impl.io();
     var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{} };
     const compiler = @import("antfly_local_sources").sql_compiler;
@@ -4230,6 +4560,10 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
                 self.publication_reads += 1;
                 return allocator.dupe(u8, "null");
             }
+            if (call == .sql_snapshot_cohort) return std.json.Stringify.valueAlloc(allocator, @import("../system_catalog/server_call.zig").SqlSnapshotCohort{
+                .revision = 2,
+                .tables = &.{.{ .id = 3, .table = "physical_usage", .schema_version = 1, .external = false }},
+            }, .{});
             if (call != .resolve_many) return error.TestUnexpectedCatalogCall;
             const request = call.resolve_many;
             if (request.storage_names.len != 0) {
@@ -4281,6 +4615,36 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
                 view.* = .{ .ptr = state, .vtable = &.{ .next = next, .close = close } };
             }
             return .{ .ptr = self, .views = self.views[0..scans.len], .vtable = &.{ .close = close, .range_proofs = proofs } };
+        }
+        const SnapshotState = struct { absent: bool, cursor: State = .{} };
+        fn snapshotData(self: *Self, target: reads.RelationalSnapshotTarget) !SnapshotState {
+            try std.testing.expectEqualStrings("physical_usage", target.table);
+            try std.testing.expectEqual(@as(?u64, 3), target.table_id);
+            try std.testing.expectEqual(@as(u32, 1), target.schema_version);
+            return .{ .absent = self.absence_case };
+        }
+        fn snapshotCaptured(self: *Self) void {
+            self.captures += 1;
+        }
+        fn snapshotCursorClosed(_: *Self) void {}
+        fn snapshotOpened(self: *Self, data: *SnapshotState, scan: reads.RelationalStatementScan) !void {
+            try std.testing.expect(scan.opts.include_range_proofs);
+            self.dynamic_opens += 1;
+            data.cursor = .{ .point = std.mem.eql(u8, scan.from, "stored-1"), .absent = data.absent and !std.mem.eql(u8, scan.from, "stored-1") };
+            if (data.cursor.point) self.point_reads += 1;
+        }
+        fn snapshotNext(_: *Self, data: *SnapshotState, a: std.mem.Allocator, limit: u32) !View.Page {
+            return next(&data.cursor, a, limit);
+        }
+        fn snapshotProofs(_: *Self, a: std.mem.Allocator, data: SnapshotState) ![]reads.RelationalStatementRead.OwnerRangeProof {
+            const Proof = @import("antfly_local_sources").api_range_read_guards.Proof;
+            const observations = try a.dupe(Proof, if (data.absent) &.{ .{ .bucket = 98, .generation = 1 }, .{ .bucket = 99, .generation = 1 } } else &.{.{ .bucket = 98, .generation = 1 }});
+            errdefer a.free(observations);
+            return a.dupe(reads.RelationalStatementRead.OwnerRangeProof, &.{.{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{ .group_id = 5, .range_id = 6, .identity_namespace = .{ .table_id = 3, .shard_id = 5, .range_id = 6 } } }, .proofs = observations }});
+        }
+        fn activate(_: *anyopaque, _: std.mem.Allocator, table: []const u8, context: operation.RequestContext) !void {
+            try context.ensureActive();
+            try std.testing.expectEqualStrings("physical_usage", table);
         }
         fn openSnapshot(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, _: u32, _: @import("../raft/read_gate.zig").ReadConsistency, _: ?@import("antfly_cancellation").CancellationToken, _: ?u64) !reads.RelationalStatementSnapshot {
             const self: *Self = @ptrCast(@alignCast(ptr));
@@ -4373,7 +4737,7 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
     var native = try native_catalog.decode(alloc, decoded);
     defer native.deinit();
     var fake: Fake = .{ .envelope = envelope, .digest = native.schema_digest, .generation_set = activation.generationSet(native) };
-    const source: reads.TableReadSource = .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .lookup = Fake.lookup, .scan = undefined, .query = undefined, .open_relational_statement = Fake.open, .open_relational_statement_snapshot = Fake.openSnapshot, .open_relational_read = Fake.openNormalize } };
+    const source: reads.TableReadSource = .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .lookup = Fake.lookup, .scan = undefined, .query = undefined, .open_relational_statement = Fake.open, .open_relational_statement_snapshot = Fake.openSnapshot, .open_relational_snapshot_cohort = AdapterTestSnapshot(Fake).capture, .open_relational_read = Fake.openNormalize } };
     var tuple_arena = std.heap.ArenaAllocator.init(alloc);
     defer tuple_arena.deinit();
     fake.tuple = try alloc.dupe(u8, try integrity.testConflictTuple(tuple_arena.allocator(), source, &fake.records, "physical_usage", &.{"id"}, .{ .key = "proposed-1", .value = "{\"id\":\"u1\",\"status\":\"ready\",\"quantity\":1}" }));
@@ -4386,7 +4750,7 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
     var prepared_store = try prepared_backend.runtimeStore(alloc, .{ .name = "native-conflict-capture-test" });
     defer prepared_store.deinit();
     var durable = @import("transactions.zig").DurableSessionStore.initRuntime(alloc, &prepared_store);
-    var server = http_server.ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, source, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .commit_transaction_with_id = Fake.commit } });
+    var server = http_server.ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, source, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .activate_range_tracking = Fake.activate, .commit_transaction_with_id = Fake.commit } });
     defer server.deinit();
     var permissions = [_]@import("../usermgr/mod.zig").Permission{ .{ .resource = @constCast("*"), .resource_type = .table, .type = .read }, .{ .resource = @constCast("*"), .resource_type = .table, .type = .write } };
     var identity = try http_server.cloneCatalogIdentity(alloc, .{ .username = @constCast("native_conflict_writer"), .permissions = &permissions });
@@ -4630,7 +4994,8 @@ test "public execution SQL estimates use planning metadata without row authority
     };
     var fake: Fake = .{ .generation = generation };
     // All row, search, mutation and tracking authorities remain poisoned.
-    var server: http_server.ApiHttpServer = undefined;
+    var server = adapterTestServer();
+    defer server.deinit();
     server.source = .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve, .acquire_join_planning = Fake.capture } };
     var identity: ?http_server.AuthenticatedIdentity = null;
     var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };

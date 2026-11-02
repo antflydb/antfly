@@ -99,10 +99,19 @@ pub fn describe(err: anyerror) Diagnostic {
         error.ConstrainedInputTooLarge => .{ .code = "54000", .message = "The inference input exceeds the model or batch limit.", .retryable = false },
         error.DecisionRateLimited, error.DecisionProviderUnavailable, error.MissingDecisionApiKey => .{ .code = "53300", .message = "The decision provider is unavailable or rate limited.", .retryable = false },
         error.InvalidDecisionOutput, error.DecisionUpstreamFailure, error.DecisionUnauthorized => .{ .code = "38000", .message = "The decision provider failed.", .retryable = false },
+        error.InvalidPreparedTransactionId => .{ .code = "22023", .message = "Prepared transaction identifiers must contain fewer than 200 UTF-8 bytes and no NUL." },
+        error.SqlPreparedInsideTransaction => .{ .code = "25001", .message = "COMMIT PREPARED and ROLLBACK PREPARED cannot run inside a transaction." },
+        error.SqlPreparedTransactionAlreadyExists => .{ .code = "42710", .message = "The prepared transaction identifier already exists." },
+        error.SqlPreparedTransactionNotFound => .{ .code = "42704", .message = "The prepared transaction does not exist." },
+        error.SqlPreparedTransactionWrongDatabase => .{ .code = "0A000", .message = "The prepared transaction belongs to a different database." },
+        error.SqlPreparedTransactionCapacityExceeded => .{ .code = "53200", .message = "The prepared transaction or durable delivery capacity is exhausted.", .hint = "Resolve existing prepared transactions or restore their API receipt owners." },
+        error.InvalidPreparedTransactionPhase, error.ExternalTransactionDecisionChanged => .{ .code = "40003", .message = "The prepared transaction decision must be reconciled.", .hint = "Do not replay the original mutations or reuse this GID while reconciling its recorded decision." },
         error.SqlPreparedNotFound => .{ .code = "26000", .message = "The prepared resource is unknown, expired or inaccessible.", .retryable = false },
         error.SqlConnectionNotFound => .{ .code = "08003", .message = "The SQL connection is unknown, expired or inaccessible.", .retryable = false },
         error.SqlConnectionWrongOwner => .{ .code = "55000", .message = "The SQL connection belongs to another API node.", .hint = "Send the request to the owner_node_id returned when the connection was opened.", .retryable = false },
+        error.SqlConnectionExecutionBusy => .{ .code = "55006", .message = "This SQL connection is already executing a request.", .hint = "Wait for the current request to finish before submitting another command on this connection.", .retryable = true },
         error.SqlConnectionBusy, error.ActiveSqlTransaction => .{ .code = "25001", .message = "DISCARD or connection close requires an idle SQL connection with no active or uncertain transaction.", .hint = "Finish or reconcile the active transaction first.", .retryable = false },
+        error.SqlMaintenanceInTransaction => .{ .code = "25001", .message = "Maintenance cannot run inside a transaction block.", .hint = "Run this statement on an idle connection.", .retryable = false },
         error.SqlConcurrentDdlInTransaction => .{ .code = "25001", .message = "Concurrent index DDL cannot run inside a transaction block.", .hint = "Run this statement on an idle connection.", .retryable = false },
         error.NoActiveSqlTransaction => .{ .code = "25P01", .message = "SET LOCAL requires an active SQL transaction.", .retryable = false },
         error.SqlConnectionChanged => .{ .code = "40001", .message = "The SQL connection scope or setting overlay changed during this request.", .hint = "Refresh the connection and retry only after checking the prior request outcome.", .retryable = false },
@@ -127,10 +136,16 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlRefreshOptionsConflict => .{ .code = "42601", .message = "CONCURRENTLY and WITH NO DATA cannot be used together.", .retryable = false },
         error.SqlConcurrentRefreshIndexRequired => .{ .code = "55000", .message = "Concurrent refresh requires a ready unique index covering all rows.", .retryable = false },
         error.SqlMaterializedViewNotPopulated => .{ .code = "55000", .message = "Materialized view has not been populated.", .hint = "Use REFRESH MATERIALIZED VIEW to populate it.", .retryable = false },
+        error.SqlTriggerDeclaredArguments => .{ .code = "42P13", .message = "Trigger functions cannot have declared arguments." },
+        error.SqlTriggerSqlLanguage => .{ .code = "42P13", .message = "SQL functions cannot return type trigger." },
+        error.SqlTriggerReturnValueRequired => .{ .code = "42P13", .message = "RETURN in a trigger function requires a row value or NULL." },
+        error.SqlTriggerContextRequired => .{ .code = "0A000", .message = "Trigger functions can only be called in a trigger context." },
+        error.SqlTriggerReturnedNoValue => .{ .code = "2F005", .message = "Control reached the end of a trigger function without RETURN." },
         error.SqlWrongObjectType => .{ .code = "42809", .message = "The named relation has an incompatible object type.", .retryable = false },
         error.SqlWindowingError => .{ .code = "42P20", .message = "A RANGE frame with offset PRECEDING or FOLLOWING requires exactly one ORDER BY column.", .retryable = false },
         error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped => .{ .code = "42P16", .message = "The replacement view must preserve existing output column names, order, and types.", .hint = "Keep the existing output prefix unchanged; new columns may be appended.", .retryable = false },
-        error.SqlDependentObjectsExist => .{ .code = "2BP01", .message = "A stored view depends on this relation or column.", .hint = "Remove the dependent views explicitly before changing their referenced columns or dropping the relation.", .retryable = false },
+        error.SqlIdentitySequenceOwnership => .{ .code = "0A000", .message = "Cannot change ownership of an identity sequence.", .hint = "Manage the identity through its owning table column.", .retryable = false },
+        error.SqlDependentObjectsExist => .{ .code = "2BP01", .message = "Other objects depend on this object.", .hint = "Remove the dependent views or column defaults before retiring their referenced objects.", .retryable = false },
         error.InvalidSqlViewRecord => .{ .code = "XX001", .message = "The stored view catalog or its dependency records are inconsistent.", .retryable = false },
         error.SqlViewCycle => .{ .code = "42P17", .message = "Infinite recursion detected while expanding a stored view.", .hint = "Remove the dependency cycle or use a recursive query within the view.", .retryable = false },
         error.SqlConstraintAlreadyExists => .{ .code = "42710", .message = "The constraint already exists.", .hint = "Inspect the existing table constraint or choose a distinct constraint name.", .retryable = false },
@@ -202,6 +217,12 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlTransactionAborted => .{ .code = "25P02", .message = "The transaction is aborted; roll back before continuing.", .retryable = false },
         error.UnknownSetting => .{ .code = "42704", .message = "The SQL setting does not exist in the current catalog scope.", .retryable = false },
         error.SqlRoleNotFound => .{ .code = "42704", .message = "The requested SQL role does not exist.", .retryable = false },
+        error.SqlDuplicateRole => .{ .code = "42710", .message = "The SQL role already exists.", .retryable = false },
+        error.SqlReservedRoleName => .{ .code = "42939", .message = "The SQL role name is reserved.", .retryable = false },
+        error.SqlDependentRole => .{ .code = "2BP01", .message = "The SQL role still owns objects or has dependent grants.", .hint = "Transfer ownership and revoke dependent grants before dropping the role.", .retryable = false },
+        error.SqlDependentGrant => .{ .code = "2BP01", .message = "Dependent privileges still exist.", .hint = "Revoke dependent grants first or use CASCADE.", .retryable = false },
+        error.SqlRoleMembershipCycle => .{ .code = "0LP01", .message = "The role membership would create a cycle.", .retryable = false },
+        error.InvalidSqlGrant => .{ .code = "0LP01", .message = "The SQL grant is invalid.", .retryable = false },
         error.SettingWriteForbidden => .{ .code = "42501", .message = "The SQL setting cannot be changed by this session.", .retryable = false },
         error.InvalidSettingValue => .{ .code = "22023", .message = "The SQL setting value does not match its catalog type or limit.", .retryable = false },
         error.SettingCatalogChanged => .{ .code = "40001", .message = "The SQL setting definition changed before this statement completed.", .retryable = true },
@@ -303,14 +324,17 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlJsonUnicodeEscape => .{ .code = "22P05", .message = "The JSONB value contains an unsupported Unicode escape.", .hint = "JSONB cannot contain a Unicode zero character." },
         error.InvalidSqlBinaryRepresentation => .{ .code = "22P03", .message = "A binary SQL value has invalid framing or payload.", .hint = "Use the declared PostgreSQL type and a complete binary value." },
         error.SqlBinaryTypeMismatch => .{ .code = "42804", .message = "The binary value's element type differs from the declared SQL type.", .hint = "Encode the parameter using its declared element type." },
+        error.SqlInvalidCharacterEncoding => .{ .code = "22021", .message = "Invalid byte sequence for the selected character encoding.", .retryable = false },
+        error.SqlCharsetUntranslatableCharacter => .{ .code = "22P05", .message = "Character has no equivalent in the selected encoding.", .retryable = false },
         error.SqlUntranslatableCharacter => .{ .code = "22P05", .message = "SQL TEXT and JSONB strings and object keys cannot contain NUL (U+0000).", .hint = "Remove NUL characters or replace them with U+FFFD before binding.", .retryable = false },
         error.SqlInvalidTextEncoding => .{ .code = "22021", .message = "The SQL text value contains invalid UTF-8 or a zero byte.", .hint = "Use valid UTF-8 text without embedded zero bytes." },
         error.SqlInvalidRegularExpression => .{ .code = "2201B", .message = "The regular expression is invalid.", .hint = "Use PostgreSQL-compatible regular expression syntax." },
         error.SqlTypeMismatch, error.InvalidSqlParameters, error.InvalidBatchRequest, error.InvalidRelationalExpressionInput, error.InvalidRelationalGeneratedValue => .{ .code = "22023", .message = "A parameter or row value does not match the required type.", .hint = "Check parameter count, nullability, and the current column types." },
         error.InvalidCatalogName => .{ .code = "22023", .message = "The database, namespace, or table name is invalid.", .hint = "Use a valid catalog name without empty components." },
+        error.CatalogGenerationExhausted => .{ .code = "54000", .message = "The catalog identity or generation capacity was exhausted.", .retryable = false },
         error.SqlWorkingMemoryLimitExceeded => .{ .code = "54000", .message = "The statement exceeds its working-memory limit (default: 256 MiB, 268435456 bytes).", .hint = "Reduce the number and size of simultaneously retained rows or increase the runtime retained-byte limit.", .retryable = false },
         error.SqlRequestTooLarge => .{ .code = "54000", .message = "The SQL JSON request exceeds the 64 MiB (67108864 byte) limit.", .hint = "Reduce the statement and parameter payload size.", .retryable = false },
-        error.RelationPopulationPageTooLarge, error.QueryCandidateBudgetExceeded, error.SqlProgramLimitExceeded, error.ProgramLimitExceeded, error.SqlLimitExceeded, error.SqlResultTooLarge, error.RelationalRowResultTooLarge, error.RelationalExpressionBudgetExceeded, error.TransactionTooLarge, error.IntegrityRecordTooLarge, error.RelationalIndexKeyTooLarge, error.SettingLimitExceeded => .{ .code = "54000", .message = "The statement exceeds the supported work, result, or mutation limit.", .hint = "Narrow the predicate or reduce the number and size of rows." },
+        error.CatalogCommandTooLarge, error.RelationPopulationPageTooLarge, error.QueryCandidateBudgetExceeded, error.SqlProgramLimitExceeded, error.ProgramLimitExceeded, error.SqlLimitExceeded, error.SqlResultTooLarge, error.RelationalRowResultTooLarge, error.RelationalExpressionBudgetExceeded, error.TransactionTooLarge, error.IntegrityRecordTooLarge, error.RelationalIndexKeyTooLarge, error.SettingLimitExceeded => .{ .code = "54000", .message = "The statement exceeds the supported work, result, or mutation limit.", .hint = "Narrow the predicate or reduce the number and size of rows." },
         error.SqlNegativeLimit => .{ .code = "2201W", .message = "LIMIT must not be negative." },
         error.SqlNegativeOffset => .{ .code = "2201X", .message = "OFFSET must not be negative." },
         error.InvalidSqlLimit => .{ .code = "54000", .message = "The SQL execution limit is invalid.", .hint = "Choose execution limits within the configured capacity." },
@@ -320,7 +344,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlWriteConflict, error.PreparedReadSetChanged, error.VersionConflict, error.IntentConflict => .{ .code = "40001", .message = "The mutation conflicted with a concurrent change and was not committed.", .hint = "Read the current rows before retrying the complete statement.", .retryable = true },
         error.FileBusy, error.WouldBlock => .{ .code = "55P03", .message = "The database resource is temporarily locked.", .hint = "Retry the complete statement after the competing operation finishes.", .retryable = true },
         error.SqlWriteCapacityUnavailable, error.SqlPlanCacheBusy, error.Backpressured, error.DenseRepairBackpressure => .{ .code = "53300", .message = "SQL execution capacity is temporarily exhausted.", .hint = "Retry after a bounded delay; reduce concurrent requests.", .retryable = true },
-        error.SqlStatementReadUnavailable => .{ .code = "53300", .message = "A consistent SQL statement read is temporarily unavailable.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
+        error.SqlStatementReadUnavailable, error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout => .{ .code = "53300", .message = "A consistent SQL statement read is temporarily unavailable.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
         error.RestoreValidationPending => .{ .code = "53300", .message = "The source owner is not ready to admit a schema rewrite.", .hint = "No rewrite job was admitted; wait for the table owner to become ready before retrying the DDL.", .retryable = true },
         error.HAReadOnlyStandby, error.HAPromotedStandbyRequiresPrimaryOpen, error.HAFencedPrimary => .{ .code = "25006", .message = "This server is not accepting writes in its current standby or fencing state.", .hint = "Send the mutation to an active writable primary.", .retryable = false },
         error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown => .{ .code = "40003", .message = "The mutation outcome is unknown; it may already have committed.", .hint = "Do not replay the statement. Use its transaction receipt to reconcile the outcome.", .retryable = false },
@@ -488,4 +512,27 @@ test "SQL FK validity guard is explicit unsupported work without replay permissi
 test "SQL relation population delivery limits retain a controlled PostgreSQL work-limit diagnostic" {
     try std.testing.expectEqualStrings("54000", describe(error.RelationPopulationPageTooLarge).code);
     try std.testing.expect(!isRowEvaluationError(error.RelationPopulationPageTooLarge));
+}
+
+test "SQL privileges diagnostics preserve PostgreSQL authorization SQLSTATEs" {
+    for ([_]struct { failure: anyerror, code: []const u8 }{
+        .{ .failure = error.SqlRoleNotFound, .code = "42704" },
+        .{ .failure = error.SqlDuplicateRole, .code = "42710" },
+        .{ .failure = error.SqlReservedRoleName, .code = "42939" },
+        .{ .failure = error.SqlDependentRole, .code = "2BP01" },
+        .{ .failure = error.SqlDependentGrant, .code = "2BP01" },
+        .{ .failure = error.SqlRoleMembershipCycle, .code = "0LP01" },
+    }) |example| {
+        const diagnostic = describe(example.failure);
+        try std.testing.expectEqualStrings(example.code, diagnostic.code);
+        try std.testing.expect(!diagnostic.retryable.?);
+    }
+}
+
+test "SQL routing publication lag is a bounded retryable read diagnostic" {
+    for ([_]anyerror{ error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout }) |err| {
+        const diagnostic = describe(err);
+        try std.testing.expectEqualStrings("53300", diagnostic.code);
+        try std.testing.expectEqual(@as(?bool, true), diagnostic.retryable);
+    }
 }

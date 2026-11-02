@@ -38,7 +38,7 @@ pub const AddTestsResult = struct {
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
-    run_sql_owner_lifecycle_tests: [31]*std.Build.Step.Run,
+    run_sql_owner_lifecycle_tests: [35]*std.Build.Step.Run,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -277,6 +277,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api.sql_retained_snapshot",
         "SQL typed mutation boundary",
         "SQL JSON null metadata",
+        "SQL domain session handoffs",
+        "SQL domain distributed prepare",
         "SQL session metadata",
         "SQL staged statements",
         "relational row query coordinator",
@@ -1049,6 +1051,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "txn resolve codec preserves sync level and accepts legacy requests",
             "distributed txn classifies local and transported visibility outcomes identically",
             "distributed txn coordinator groups by range and commits all participants",
+            "distributed txn external recovery pass retains a sendable hosted budget",
+            "distributed txn external coordinator freezes authority and resumes every lost phase reply",
             "stable distributed transaction retry resumes a durable commit decision",
             "distributed txn retries an ambiguous coordinator decision under the same id",
             "distributed txn bounds unresolved coordinator decision retries",
@@ -1728,6 +1732,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
+    const domain_cascade_tests = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{"distributed txn domain cascade"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const domain_cascade_run = addFilteredTestRunArtifact(b, domain_cascade_tests);
+    domain_cascade_run.addArg("--require-no-skips");
+    b.step("antfly-api-domain-cascade-test", "Verify domain provenance and defaults through distributed cascade commits").dependOn(&domain_cascade_run.step);
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
     b.step("antfly-api-public-table-http-test", "Run public table HTTP response contracts").dependOn(&run_api_public_table_http_docid_tests.step);
     const api_relational_row_contract_tests = b.addTest(.{
@@ -2226,7 +2238,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_owner_lifecycle_tests = b.addTest(.{
         .root_module = sql_owner_lifecycle_test_mod,
         .filters = selectTestFilters(b, &.{
+            "mounted SQL LIKE declaration copies retain grants constraints isolation and cold owners",
+            "mounted SQL LIKE full ownership lifetime retires borrowed defaults and fresh identities through cold owners",
+            "mounted SQL original prepared transactions retain multi-owner intents across complete cold restart",
+            "mounted SQL native sync controls",
+            "pgwire native sync controls",
+            "pgwire transaction preparation",
+            "mounted SQL original maintenance preserves all owners rows authorization and cold progress",
+            "SQL statistics cache cannot start owner work after native read admission",
+            "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+            "SQL privileges staged intent survives private recovery without public injection or native authority loss",
+            "SQL privileges commit cuts fence revocation credential caps incarnations and physical identity without native grants",
+            "SQL privileges integrity normalization preserves admitted intent and discovered native participants",
+            "SQL privileges integrity proof caches remain bound to their admission authority",
             "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections",
+            "mounted SQL connection command admission",
             "HTTP role default timeout retains hard limits and includes connection lookup time",
             "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation",
             "mounted SQL original nullability validates staged generations and preserves relaxation across restart",
@@ -2236,6 +2262,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "httpx SQL original nullability relaxation preserves ambiguous metadata results across cold authority recovery",
             "mounted SQL original schema lifecycles preserve postimages enforcement and cold owners",
             "mounted SQL original constraint rename preserves validation and cold enforcement",
+            "mounted SQL object comment renames preserve CHECK UNIQUE backing index and FK identities through cold publication",
             "mounted SQL original covering constraints publish atomic native payloads and cold enforcement",
             "mounted SQL named FK and CHECK timing preserves schema epochs",
             "mounted SQL original transaction characteristics retain snapshots and savepoint modes",
@@ -2255,6 +2282,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "httpx SQL policy observation rejects public capabilities even in legacy internal mode",
             "FK historical reference coverage",
             "mounted SQL constrained table drops",
+            "mounted SQL CASCADE retirement",
 
             "distributed txn SQL characteristics survive faults reopen and savepoint rollback",
             "distributed txn SQL recovery decodes into the registry allocator without adopting store memory",
@@ -2280,7 +2308,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "SQL sequence intent producer",
             "mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows",
             "mounted SQL original serial and identity declarations preserve PostgreSQL writes and cold owners",
-            "SQL owned sequence handoff preserves CONTINUE leases and invalidates RESTART generations",
+            "SQL owned sequence handoff",
             "mounted SQL original document multi table and CASCADE truncate publish atomic cohorts and recover cold rows",
             "mounted SQL sequence effects",
             "SQL sequence cache",
@@ -2290,6 +2318,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "SQL catalog recovery",
             "mounted SQL original transaction controls preserve independent visibility savepoints and cold postimages",
             "mounted SQL original unique indexes enforce exact postimages across owner restart",
+            "mounted SQL original native full-text indexes share API lifecycle across cold restart",
             "mounted SQL original views preserve identity dependencies and postimages across owner restart",
             "mounted SQL original document views preserve real paths typed arrays and lateral reads across owner restart",
             "mounted SQL original exact text predicates preserve residuals lateral reads and cold owners",
@@ -2312,6 +2341,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL temporal originals and mutation assignments preserve diagnostics precise kinds and cold postimages",
             "mounted SQL temporal view domains survive nested replacement and cold owners",
             "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners",
+            "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards",
             "SQL prepared routine manifests",
             "mounted SQL original procedures preserve demanded calls notices errors and cold ownership",
             "pgwire procedure notices",
@@ -2320,6 +2350,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes",
             "mounted SQL named enum schema binding prepares public typed writes and retains cold projections",
             "SQL named enum schema ingress authorizes one catalog cut and preserves ordinary escaped schemas",
+            "SQL named type completion",
+            "mounted SQL domain catalog",
+            "mounted SQL domain rows",
+            "SQL domain session handoffs",
+            "SQL domain distributed prepare",
             "mounted SQL original aggregates preserve typed transitions bounded states and cold dependency retirement",
             "mounted SQL ordinary aggregates preserve PostgreSQL ordering distinct filters and cold rows",
             "mounted SQL EXPLAIN original reads and options preserve full execution RLS and cold owners",
@@ -2331,6 +2366,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "httpx temporal probes require service authority unambiguous controls and bounded bodies",
             "SQL mutation classification preserves wrapped definite conflicts and constraints",
             "mounted SQL original column comment preserves stable identities rows privileges and cold owners",
+            "mounted SQL original index and constraint comments preserve schemas rows authorization and cold object identities",
             "transaction read preflight preserves physical unique absence without relabeling optimistic conflicts",
             "transaction commit version retains nanoseconds and rejects overflow",
             "SQL session overlay staged versions retain original fences through projection and cursor release",
@@ -2370,7 +2406,32 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // release/Linux bounds retain their independently measured profiles.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 21 else 12) else 7) * 1024 * 1024 * 1024,
     });
-    const sql_enum_catalog_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes", "mounted SQL named enum schema binding prepares public typed writes and retains cold projections", "SQL named enum schema ingress authorizes one catalog cut and preserves ordinary escaped schemas" });
+    const sql_sync_control_tests = b.addTest(.{
+        .root_module = sql_owner_lifecycle_test_mod,
+        .filters = &.{ "mounted SQL native sync controls", "pgwire native sync controls" },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 21 else 12) else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_sync_control_run = addFilteredTestRunArtifact(b, sql_sync_control_tests);
+    sql_sync_control_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-sync-control-test", "Verify native SQL sync settings through public lifetimes and durable multi-owner commits").dependOn(&sql_sync_control_run.step);
+    const sql_prepared_transaction_tests = b.addTest(.{
+        .root_module = sql_owner_lifecycle_test_mod,
+        .filters = &.{ "mounted SQL original prepared transactions", "pgwire transaction preparation" },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 21 else 12) else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_prepared_transaction_run = addFilteredTestRunArtifact(b, sql_prepared_transaction_tests);
+    sql_prepared_transaction_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-prepared-transaction-test", "Verify SQL GID preparation resolution and complete cold multi-owner recovery")
+        .dependOn(&sql_prepared_transaction_run.step);
+    const sql_domain_rows_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL domain rows"});
+    sql_domain_rows_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-domain-row-test", "Verify original domain declarations through typed SQL writes queries and cold owners").dependOn(&sql_domain_rows_run.step);
+    const sql_domain_handoff_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "SQL domain session handoffs", "SQL domain distributed prepare" });
+    sql_domain_handoff_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-domain-handoff-test", "Verify private domain preparation across session recovery and distributed prepare").dependOn(&sql_domain_handoff_run.step);
+    const sql_enum_catalog_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes", "mounted SQL named enum schema binding prepares public typed writes and retains cold projections", "SQL named enum schema ingress authorizes one catalog cut and preserves ordinary escaped schemas", "SQL named type completion", "mounted SQL domain catalog" });
     sql_enum_catalog_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-enum-catalog-test", "Verify enum catalog scope, original DDL and cold outcome transport").dependOn(&sql_enum_catalog_run.step);
     const sql_cast_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original database casts preserve conversion contexts prepared witnesses and cold dependency retirement"});
@@ -2385,9 +2446,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_procedure_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original procedures preserve demanded calls notices errors and cold ownership", "pgwire procedure notices" });
     sql_procedure_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-procedure-test", "Run original procedures, lazy SQL steps, notices and cold catalog ownership").dependOn(&sql_procedure_run.step);
+    const sql_trigger_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards"});
+    sql_trigger_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-trigger-test", "Verify original trigger-function catalog lifecycle and cold context boundaries").dependOn(&sql_trigger_run.step);
     const sql_routine_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original routine declarations preserve typed calls overloads mutations receipts and cold owners", "SQL prepared routine manifests" });
     sql_routine_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-routine-test", "Run original callable DDL, typed calls, overloads and cold native recovery").dependOn(&sql_routine_run.step);
+    const sql_authorization_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation"});
+    sql_authorization_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-authorization-test", "Run original SQL authorization through native HTTP and cold catalog recovery").dependOn(&sql_authorization_run.step);
+    const sql_privileges_runtime_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "SQL privileges staged intent survives private recovery without public injection or native authority loss", "SQL privileges commit cuts fence revocation credential caps incarnations and physical identity without native grants", "SQL privileges integrity normalization preserves admitted intent and discovered native participants", "SQL privileges integrity proof caches remain bound to their admission authority" });
+    sql_privileges_runtime_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-privileges-runtime-test", "Verify SQL authorization staging and private recovery contracts").dependOn(&sql_privileges_runtime_run.step);
+    const sql_maintenance_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original maintenance preserves all owners rows authorization and cold progress", "SQL statistics cache cannot start owner work after native read admission" });
+    sql_maintenance_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-maintenance-test", "Run original SQL maintenance across native owners and restart").dependOn(&sql_maintenance_run.step);
+    const sql_connection_admission_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL connection command admission"});
+    sql_connection_admission_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-connection-admission-test", "Verify public SQL rejects overlapping connection commands before mutating their owners").dependOn(&sql_connection_admission_run.step);
     const sql_role_defaults_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "HTTP role default timeout retains hard limits and includes connection lookup time" });
     sql_role_defaults_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-role-defaults-test", "Run original role default DDL with login baselines and cold metadata/session recovery").dependOn(&sql_role_defaults_run.step);
@@ -2403,7 +2479,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     timing_run.addArg("--require-no-skips");
     const named_timing_filter = "mounted SQL named FK and CHECK timing preserves schema epochs";
     const tablespace_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original tablespace names preserve bound owners deletion guards and restart", "mounted SQL table placement and name evolution follows captured search path through cold recovery", "SQL catalog name DDL pins first search path owner without fetching schema or replaying admission", "SQL catalog captured name mutations retain exact owners across forwarding", "distributed txn SQL search paths retain local committed savepoint and recovery state", "SQL durable search paths encode compact names own decoded bytes and reject invalid state" });
-    const drop_retirement_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "native metadata job state projections", "SQL statement read admission calls native capture once without write authority", "SQL drop retirement", "FK historical reference coverage", "mounted SQL constrained table drops", "SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes", "relational row query primary digest transport preserves snapshot proof and rejects missing or invalid headers", "httpx SQL policy observation rejects public capabilities even in legacy internal mode" });
+    const drop_retirement_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "native metadata job state projections", "SQL statement read admission calls native capture once without write authority", "SQL drop retirement", "FK historical reference coverage", "mounted SQL constrained table drops", "mounted SQL CASCADE retirement", "SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes", "relational row query primary digest transport preserves snapshot proof and rejects missing or invalid headers", "httpx SQL policy observation rejects public capabilities even in legacy internal mode" });
     drop_retirement_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-drop-retirement-test", "Verify durable SQL deletion through native constraint retirement and cold owners").dependOn(&drop_retirement_run.step);
     tablespace_run.addArg("--require-no-skips");
@@ -2526,10 +2602,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     document_alias_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-document-alias-lifecycle-test", "Verify schema-bound document aliases through native mutations and cold owners")
         .dependOn(&document_alias_run.step);
-    const sql_identity_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original serial and identity declarations preserve PostgreSQL writes and cold owners", "SQL owned sequence handoff preserves CONTINUE leases and invalidates RESTART generations" });
+    const sql_identity_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original serial and identity declarations preserve PostgreSQL writes and cold owners", "SQL owned sequence handoff" });
     sql_identity_lifecycle_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-identity-lifecycle-test", "Verify original serial and identity declarations through PostgreSQL lifecycles and native cold owners")
         .dependOn(&sql_identity_lifecycle_run.step);
+    const sql_sequence_retirement_tests = b.addTest(.{
+        .root_module = sql_owner_lifecycle_test_mod,
+        .filters = &.{ "mounted SQL sequence CASCADE", "schema validation publication sequence snapshot private projection" },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 21 else 12) else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_sequence_retirement_run = addFilteredTestRunArtifact(b, sql_sequence_retirement_tests);
+    sql_sequence_retirement_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-sequence-retirement-test", "Verify multi-table sequence retirement, cold owner publication and exact catalog outcomes").dependOn(&sql_sequence_retirement_run.step);
     const sql_sequence_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original sequence declarations preserve allocated counters ownership and all cold rows"});
     sql_sequence_lifecycle_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-sequence-lifecycle-test", "Verify original sequence DDL with allocated native counters, PostgreSQL postimages and independent cold owners")
@@ -2558,6 +2643,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_resource_comment_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-resource-comment-lifecycle-test", "Verify original schema/database COMMENT through PostgreSQL witnesses and cold catalog owners")
         .dependOn(&sql_resource_comment_run.step);
+    const sql_object_comment_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original index and constraint comments preserve schemas rows authorization and cold object identities", "mounted SQL object comment renames preserve CHECK UNIQUE backing index and FK identities through cold publication" });
+    sql_object_comment_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-object-comment-lifecycle-test", "Verify original index/constraint comments through guarded metadata transactions and independent cold owners").dependOn(&sql_object_comment_run.step);
     const sql_column_comment_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original column comment preserves stable identities rows privileges and cold owners"});
     sql_column_comment_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-column-comment-lifecycle-test", "Verify original column COMMENT, stable identities, unchanged rows and cold metadata recovery")
@@ -2620,7 +2708,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&sql_validation_run.step);
     b.step("antfly-api-sql-nullability-lifecycle-test", "Run original nullability DDL through staged validation, publication, enforcement and cold owner recovery")
         .dependOn(&sql_nullability_run.step);
-    const sql_index_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original unique indexes enforce exact postimages across owner restart"});
+    const sql_index_lifecycle_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original unique indexes enforce exact postimages across owner restart", "mounted SQL original native full-text indexes share API lifecycle across cold restart" });
     sql_index_lifecycle_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-index-lifecycle-test", "Run exact original index DDL, data-owner enforcement and restart qualification")
         .dependOn(&sql_index_lifecycle_run.step);
@@ -2688,10 +2776,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_table_contract_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-table-contract-test", "Verify the original combined table declaration with typed defaults constraints cascades and cold UUID evolution")
         .dependOn(&sql_table_contract_run.step);
+    const sql_definition_copy_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL LIKE declaration copies retain grants constraints isolation and cold owners", "mounted SQL LIKE full ownership lifetime retires borrowed defaults and fresh identities through cold owners" });
+    sql_definition_copy_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-definition-copy-test", "Verify immutable LIKE declaration admission, constraint isolation and cold recovery").dependOn(&sql_definition_copy_run.step);
     const sql_table_creation_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original generated and casted tables own creation enforcement and restart"});
     sql_table_creation_run.addArg("--require-no-skips");
     const sql_table_creation_step = b.step("antfly-api-sql-table-creation-test", "Run original generated/default table creation, primary-key enforcement and cold owner restart");
     sql_table_creation_step.dependOn(&sql_table_creation_run.step);
+    sql_table_creation_step.dependOn(&sql_definition_copy_run.step);
     sql_table_creation_step.dependOn(&sql_schema_ack_run.step);
     const sql_batch_transport_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "raft batch round trips", "raft protocol barrier" });
     sql_batch_transport_run.addArg("--require-no-skips");
@@ -2999,7 +3091,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
         .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
-        .run_sql_owner_lifecycle_tests = .{ sql_enum_catalog_run, sql_cast_run, sql_procedure_run, sql_aggregate_run, sql_operator_run, sql_routine_run, sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run, cursor_lifecycle_run, copy_input_run, characteristics_run, tablespace_run, drop_retirement_run },
+        .run_sql_owner_lifecycle_tests = .{ sql_prepared_transaction_run, sql_domain_rows_run, sql_domain_handoff_run, sql_maintenance_run, sql_enum_catalog_run, sql_cast_run, sql_procedure_run, sql_aggregate_run, sql_operator_run, sql_routine_run, sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run, cursor_lifecycle_run, copy_input_run, characteristics_run, tablespace_run, drop_retirement_run },
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,

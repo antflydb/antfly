@@ -24,7 +24,8 @@ const parser = @import("sql_parser");
 const A = std.mem.Allocator;
 pub const max_steps = 256;
 pub const Notice = @import("notices.zig").Notice;
-const SyntaxStep = union(enum) { perform: compiler.CompiledScalar, notice: []const u8, return_void };
+pub const TriggerReturn = enum { new, old, skip };
+const SyntaxStep = union(enum) { perform: compiler.CompiledScalar, notice: []const u8, return_void, return_trigger: TriggerReturn };
 pub const Syntax = struct {
     allocator: A,
     steps: []const SyntaxStep,
@@ -35,7 +36,7 @@ pub const Syntax = struct {
                 owned.deinit();
             },
             .notice => |text| self.allocator.free(text),
-            .return_void => {},
+            .return_void, .return_trigger => {},
         };
         self.allocator.free(self.steps);
     }
@@ -49,7 +50,7 @@ fn word(value: anytype, expected: []const u8) bool {
 /// semicolons, dollar strings and comments are never statement boundaries.
 pub fn compileBody(a: A, record: routines.records.Record) !Syntax {
     try record.validate();
-    if (record.kind != .procedure) return error.SqlWrongObjectType;
+    if (record.kind != .procedure and !(record.kind == .function and record.definition.returns_trigger)) return error.SqlWrongObjectType;
     if (record.definition.language != .plpgsql) return error.UnsupportedSqlShape;
     var scratch: std.heap.ArenaAllocator = .init(a);
     defer scratch.deinit();
@@ -68,7 +69,7 @@ pub fn compileBody(a: A, record: routines.records.Record) !Syntax {
                 parsed.deinit();
             },
             .notice => |text| a.free(text),
-            .return_void => {},
+            .return_void, .return_trigger => {},
         };
         steps.deinit(a);
     }
@@ -79,7 +80,13 @@ pub fn compileBody(a: A, record: routines.records.Record) !Syntax {
             pos += 1;
         } else if (word(tokens[pos], "RETURN")) {
             pos += 1;
-            try steps.append(a, .return_void);
+            if (record.definition.returns_trigger) {
+                if (pos >= tokens.len) return error.InvalidSqlSyntax;
+                if (tokens[pos].kind == .semicolon) return error.SqlTriggerReturnValueRequired;
+                const selection: TriggerReturn = if (word(tokens[pos], "NEW")) .new else if (word(tokens[pos], "OLD")) .old else if (word(tokens[pos], "NULL")) .skip else return error.UnsupportedSqlShape;
+                pos += 1;
+                try steps.append(a, .{ .return_trigger = selection });
+            } else try steps.append(a, .return_void);
         } else if (word(tokens[pos], "RAISE")) {
             pos += 1;
             if (pos >= tokens.len or !word(tokens[pos], "NOTICE")) return error.UnsupportedSqlShape;
@@ -119,11 +126,12 @@ pub fn compileBody(a: A, record: routines.records.Record) !Syntax {
     return .{ .allocator = a, .steps = try steps.toOwnedSlice(a) };
 }
 
-pub const Step = union(enum) { perform: struct { syntax: usize, program: ?scalar.Program = null }, notice: []const u8, return_void };
+pub const Step = union(enum) { perform: struct { syntax: usize, program: ?scalar.Program = null }, notice: []const u8, return_void, return_trigger: TriggerReturn };
 pub const Resolved = struct {
     allocator: A,
     id: u64,
     generation: u32,
+    returns_trigger: bool = false,
     arguments: []const scalar.Type,
     columns: []const scalar.Column,
     syntax: Syntax,
@@ -149,6 +157,7 @@ pub fn prepare(a: A, record: routines.records.Record, functions: ?routines.bindi
     for (syntax.steps, steps, 0..) |source, *target, ordinal| target.* = switch (source) {
         .notice => |text| .{ .notice = text },
         .return_void => .return_void,
+        .return_trigger => |selection| .{ .return_trigger = selection },
         .perform => .{ .perform = .{ .syntax = ordinal } },
     };
     const invocation = try @import("parameter_binding.zig").Invocation.initLeaky(a, types.len);
@@ -156,7 +165,7 @@ pub fn prepare(a: A, record: routines.records.Record, functions: ?routines.bindi
     invocation.routine_resolver = functions;
     invocation.sequence_resolver = sequences;
     const result = try a.create(Resolved);
-    result.* = .{ .allocator = a, .id = record.id, .generation = record.generation, .arguments = types, .columns = columns, .syntax = syntax, .steps = steps, .invocation = invocation, .settings = settings };
+    result.* = .{ .allocator = a, .id = record.id, .generation = record.generation, .returns_trigger = record.definition.returns_trigger, .arguments = types, .columns = columns, .syntax = syntax, .steps = steps, .invocation = invocation, .settings = settings };
     return result;
 }
 
@@ -181,6 +190,7 @@ pub fn bind(a: A, backend: @import("catalog.zig").Backend, invocation: ?*@import
 }
 
 pub fn execute(context: @import("runtime.zig").Context, call: Call) anyerror!@import("runtime.zig").Output {
+    if (call.procedure.returns_trigger) return error.SqlTriggerContextRequired;
     const decision = @import("decision_eval.zig");
     const a = context.arena;
     const arguments = try a.alloc(scalar.Datum, call.arguments.len);
@@ -190,25 +200,82 @@ pub fn execute(context: @import("runtime.zig").Context, call: Call) anyerror!@im
     limits.effect_work = &work;
     limits.effect_bytes = &bytes;
     for (call.arguments, arguments) |*program, *value| value.* = try decision.evaluateWithLimits(a, context.backend.decision_provider, program, &.{}, context.parameters, limits);
+    const result = try run(context, call.procedure, arguments, limits);
+    return .{ .command_tag = "CALL", .notices = result.notices };
+}
+
+/// Borrowed row images, pinned by the mutation owner for this invocation. The
+/// function never clones an unchanged row or transfers ownership of its image.
+pub const TriggerContext = struct {
+    event: enum { insert, update, delete },
+    level: enum { row, statement } = .row,
+    new: ?*const @import("catalog.zig").Row = null,
+    old: ?*const @import("catalog.zig").Row = null,
+
+    fn validate(self: TriggerContext) !void {
+        if (self.level == .statement) {
+            if (self.new != null or self.old != null) return error.InvalidSqlBackendResponse;
+            return;
+        }
+        const valid = switch (self.event) {
+            .insert => self.new != null and self.old == null,
+            .update => self.new != null and self.old != null,
+            .delete => self.new == null and self.old != null,
+        };
+        if (!valid) return error.InvalidSqlBackendResponse;
+    }
+};
+pub const TriggerOutput = struct {
+    row: ?*const @import("catalog.zig").Row,
+    notices: []const Notice,
+};
+
+/// Explicit trigger-only ABI. Table trigger attachment and the mutation owner
+/// decide when to invoke this program and whether to use its returned image.
+pub fn executeTrigger(context: @import("runtime.zig").Context, prepared: *Resolved, images: TriggerContext) anyerror!TriggerOutput {
+    if (!prepared.returns_trigger) return error.SqlWrongObjectType;
+    try images.validate();
+    const decision = @import("decision_eval.zig");
+    var work: @import("numeric_value.zig").Context = .{ .alloc = context.alloc, .remaining = 65536, .checkpoint = if (context.backend.scalar_control) |control| control.checkpoint else null, .ptr = if (context.backend.scalar_control) |control| control.ptr else null };
+    var bytes: usize = 0;
+    var limits = decision.limitsFor(context.backend);
+    limits.effect_work = &work;
+    limits.effect_bytes = &bytes;
+    const result = try run(context, prepared, &.{}, limits);
+    const selection = result.selection orelse return error.SqlTriggerReturnedNoValue;
+    return .{ .row = switch (selection) {
+        .new => images.new,
+        .old => images.old,
+        .skip => null,
+    }, .notices = result.notices };
+}
+
+const RunOutput = struct { selection: ?TriggerReturn = null, notices: []const Notice };
+fn run(context: @import("runtime.zig").Context, prepared: *Resolved, arguments: []const scalar.Datum, limits: scalar.EvalLimits) !RunOutput {
+    const a = context.arena;
     var notices: std.ArrayList(Notice) = .empty;
-    for (call.procedure.steps) |*step| {
+    var selection: ?TriggerReturn = null;
+    for (prepared.steps) |*step| {
         try context.checkpoint();
         switch (step.*) {
             .return_void => break,
+            .return_trigger => |value| {
+                selection = value;
+                break;
+            },
             .notice => |text| {
                 const notice: Notice = .{ .message = text };
                 if (context.backend.notice_sink) |sink| try sink.emit(sink.ptr, notice);
                 try notices.append(a, .{ .message = try a.dupe(u8, text) });
             },
             .perform => |*instruction| {
-                const procedure = call.procedure;
-                if (instruction.program == null) instruction.program = try scalar.bindTypedExpectedWithSettings(procedure.allocator, procedure.syntax.steps[instruction.syntax].perform.expression, procedure.columns, procedure.arguments, null, .{ .invocation = procedure.invocation }, procedure.settings);
-                const prepared: scalar.PreparedEvaluation = .{ .program = &instruction.program.?, .parameters = arguments };
-                _ = try decision.evaluatePreparedWithLimits(a, context.backend.decision_provider, prepared, arguments, limits);
+                if (instruction.program == null) instruction.program = try scalar.bindTypedExpectedWithSettings(prepared.allocator, prepared.syntax.steps[instruction.syntax].perform.expression, prepared.columns, prepared.arguments, null, .{ .invocation = prepared.invocation }, prepared.settings);
+                const evaluation: scalar.PreparedEvaluation = .{ .program = &instruction.program.?, .parameters = arguments };
+                _ = try @import("decision_eval.zig").evaluatePreparedWithLimits(a, context.backend.decision_provider, evaluation, arguments, limits);
             },
         }
     }
-    return .{ .command_tag = "CALL", .notices = try notices.toOwnedSlice(a) };
+    return .{ .selection = selection, .notices = try notices.toOwnedSlice(a) };
 }
 
 test "SQL procedure syntax retains complete original blocks without executing or resolving PERFORM" {
@@ -261,4 +328,85 @@ test "SQL procedure CALL shares typed parameter frames and preserves lazy RETURN
     try std.testing.expect(plan.steps[1].perform.program != null);
     try std.testing.expect(plan.steps[3].perform.program == null);
     try std.testing.expectEqual(@as(usize, 1), fixture.lookups);
+}
+
+test "SQL trigger functions preserve original row returns lazy PERFORM and context boundaries" {
+    const catalog = @import("catalog.zig");
+    const runtime = @import("runtime.zig");
+    const Fixture = struct {
+        available: bool = false,
+        lookups: usize = 0,
+        cancelled: bool = false,
+        fn lookup(raw: *anyopaque, a: A, name: []const u8, inputs: []const routines.bindings.Argument) !*const routines.bindings.Resolved {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.lookups += 1;
+            if (!self.available or !std.mem.eql(u8, name, "audit_log")) return error.SqlUndefinedFunction;
+            const args = try a.alloc(routines.records.Argument, inputs.len);
+            for (args) |*arg| arg.* = .{ .type = .{ .scalar = .int64 } };
+            return routines.prepare(a, .{ .id = 91, .generation = 1, .definition = .{ .arguments = args, .result = .{ .scalar = .int64 }, .body = if (inputs.len == 0) "SELECT 1" else "SELECT $1", .owner = .auth_disabled } }, null, null);
+        }
+        fn checkpoint(raw: *anyopaque) !void {
+            if ((@as(*@This(), @ptrCast(@alignCast(raw)))).cancelled) return error.Cancelled;
+        }
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = checkpoint } };
+        }
+    };
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    const old: catalog.Row = .{ .id = "row", .version = 1, .value = .{ .string = "old" } };
+    const new: catalog.Row = .{ .id = "row", .version = 2, .value = .{ .string = "new" } };
+    for ([_][]const u8{ "sql-0405", "sql-0406", "sql-0407", "sql-0408", "sql-0409", "sql-0410" }, 0..) |id, index| {
+        var region: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer region.deinit();
+        const a = region.allocator();
+        var compiled = try compiler.compile(a, (try corpus.get(id)).sql, .{});
+        defer compiled.deinit();
+        const definition = try routines.definition(a, compiled.statement.catalog_ddl.routine.?, .auth_disabled);
+        const record: routines.records.Record = .{ .id = 8, .generation = 1, .definition = definition };
+        var fixture: Fixture = .{};
+        const prepared = try prepare(a, record, .{ .ptr = &fixture, .resolve = Fixture.lookup }, null, null);
+        try std.testing.expectEqual(@as(usize, 0), fixture.lookups);
+        const context: runtime.Context = .{ .alloc = a, .arena = a, .backend = fixture.backend(), .binding = undefined, .parameters = &.{}, .limits = .{} };
+        try std.testing.expectError(error.SqlTriggerContextRequired, routines.prepare(a, record, null, null));
+        try std.testing.expectError(error.SqlTriggerContextRequired, execute(context, .{ .procedure = prepared, .arguments = &.{} }));
+        try std.testing.expectError(error.InvalidSqlBackendResponse, executeTrigger(context, prepared, .{ .event = .insert, .old = &old, .new = &new }));
+        try std.testing.expectEqual(@as(usize, 0), fixture.lookups);
+        if (index >= 4) {
+            try std.testing.expectError(error.SqlUndefinedFunction, executeTrigger(context, prepared, .{ .event = .update, .old = &old, .new = &new }));
+            fixture.available = true;
+        }
+        const result = try executeTrigger(context, prepared, .{ .event = .update, .old = &old, .new = &new });
+        try std.testing.expectEqual(if (index == 1) &old else if (index == 2) @as(?*const catalog.Row, null) else &new, result.row);
+        try std.testing.expectEqual(@as(usize, if (index == 3) 1 else 0), result.notices.len);
+        if (index == 3) try std.testing.expectEqualStrings("audit", result.notices[0].message);
+        const bound_lookups = fixture.lookups;
+        _ = try executeTrigger(context, prepared, .{ .event = .update, .old = &old, .new = &new });
+        try std.testing.expectEqual(bound_lookups, fixture.lookups);
+        fixture.cancelled = true;
+        try std.testing.expectError(error.Cancelled, executeTrigger(context, prepared, .{ .event = .update, .old = &old, .new = &new }));
+    }
+}
+
+test "SQL trigger row-return fast path allocates no row memory and preserves event nulls" {
+    const catalog = @import("catalog.zig");
+    const runtime = @import("runtime.zig");
+    const Fixture = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var region: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer region.deinit();
+    const a = region.allocator();
+    var sentinel: u8 = 0;
+    const backend: catalog.Backend = .{ .ptr = &sentinel, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = Fixture.checkpoint } };
+    var empty: std.heap.FixedBufferAllocator = .init(&.{});
+    const context: runtime.Context = .{ .alloc = empty.allocator(), .arena = empty.allocator(), .backend = backend, .binding = undefined, .parameters = &.{}, .limits = .{} };
+    const row: catalog.Row = .{ .id = "row", .version = 1, .value = .null };
+    const plan = try prepare(a, .{ .id = 1, .generation = 1, .definition = .{ .returns_trigger = true, .language = .plpgsql, .arguments = &.{}, .body = "BEGIN RETURN NEW; PERFORM nonexistent(); END", .owner = .auth_disabled } }, null, null, null);
+    for (0..10000) |_| try std.testing.expectEqual(&row, (try executeTrigger(context, plan, .{ .event = .insert, .new = &row })).row.?);
+    try std.testing.expect(plan.steps[1].perform.program == null);
+    try std.testing.expect((try executeTrigger(context, plan, .{ .event = .delete, .old = &row })).row == null);
+    try std.testing.expect((try executeTrigger(context, plan, .{ .event = .update, .level = .statement })).row == null);
+    const fallthrough = try prepare(a, .{ .id = 2, .generation = 1, .definition = .{ .returns_trigger = true, .language = .plpgsql, .arguments = &.{}, .body = "BEGIN NULL; END", .owner = .auth_disabled } }, null, null, null);
+    try std.testing.expectError(error.SqlTriggerReturnedNoValue, executeTrigger(context, fallthrough, .{ .event = .insert, .new = &row }));
 }

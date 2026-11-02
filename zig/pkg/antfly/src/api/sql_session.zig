@@ -28,6 +28,9 @@ pub const Coordinator = struct {
     server: *http.ApiHttpServer,
     identity: *?http.AuthenticatedIdentity,
     context: operation.RequestContext,
+    /// Pgwire owns its connection overlay; HTTP instead resolves the durable
+    /// session's current value inside the commit body's atomic publication.
+    sync_level: ?@import("antfly_local_sources").storage_db_types.SyncLevel = null,
 
     pub fn commit(ptr: *anyopaque, _: sql.Scope, id: sql.Id) !sql.CommitResult {
         const self: *Coordinator = @ptrCast(@alignCast(ptr));
@@ -43,12 +46,18 @@ pub const Coordinator = struct {
             if (!server.txn_sessions.removeBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .aborted, .reconciliation_id = id };
         };
-        var request = (try server.txn_sessions.cloneCommitRequest(alloc, id, null)) orelse {
+        var request = (try server.txn_sessions.cloneCommitRequestWithSqlSyncLevel(alloc, id, null, self.sync_level)) orelse {
             if (!server.txn_sessions.commitBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .committed, .reconciliation_id = id };
         };
         defer request.deinit(alloc);
-        if (!(try server.transactionRequestAuthorized(self.identity.*, request))) return error.Forbidden;
+        const frozen = server.txn_sessions.getInfo(id) orelse return error.SqlTransactionNotActive;
+        var authorization_arena = std.heap.ArenaAllocator.init(alloc);
+        defer authorization_arena.deinit();
+        var sql_scope = try @import("sql_authorization_runtime.zig").TransactionScope.init(server, self.identity.*, self.context, authorization_arena.allocator(), request);
+        defer if (sql_scope) |*authority_owner| authority_owner.deinit();
+        if (!(try server.transactionRequestAuthorizedWithSql(self.identity.*, request, if (sql_scope) |*scope| scope else null))) return error.Forbidden;
+        const commit_context = if (sql_scope) |*scope| scope.context() else self.context;
         const tables_view = try request.distributedTables(alloc);
         defer tables_view.deinit();
         const tables = tables_view.tables;
@@ -62,16 +71,16 @@ pub const Coordinator = struct {
             return .{ .outcome = .committed, .reconciliation_id = id };
         }
         const source = server.table_writes orelse return error.UnsupportedSqlExecution;
-        var prepared = try server.preparePublicCommitWithIntegrity(alloc, tables, self.context);
+        var prepared = try server.preparePublicCommitWithIntegrity(alloc, tables, commit_context);
         defer prepared.deinit();
         var proof_arena = std.heap.ArenaAllocator.init(alloc);
         defer proof_arena.deinit();
-        const signed = try server.signCurrentRowPolicyMutationParticipants(proof_arena.allocator(), prepared.tables, self.context);
+        const signed = try server.signCurrentRowPolicyMutationParticipants(proof_arena.allocator(), prepared.tables, commit_context);
         var plan = (try server.txn_sessions.sealExecutionPlan(alloc, id, signed)) orelse return error.SqlTransactionNotActive;
         defer plan.deinit();
         // Once the durable plan is sealed, no error is safe to turn into a
         // replay invitation. Maintenance owns completion under this same id.
-        const outcome = (source.commitTransactionWithIdAndCancellation(alloc, id, info.begin_timestamp, plan.value, info.sync_level, self.context.cancellation) catch |err| {
+        const outcome = (source.commitTransactionWithIdAndCancellation(alloc, id, info.begin_timestamp, plan.value, frozen.sync_level, self.context.cancellation) catch |err| {
             if (err == error.EnrichmentWorkerFailed) {
                 // Persist terminal repair debt before exposing it. The legacy
                 // error lacks coordinator metadata; maintenance retains the
@@ -199,7 +208,7 @@ pub const Adapter = struct {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        return .{ .id = id, .isolation = state.metadata.isolation, .mode = state.metadata.mode, .savepoints = state.savepoints, .started_at = try clock.Instant.fromUnixMicroseconds(@divFloor(@as(i128, state.begin_timestamp), 1000)), .write_version = try @import("distributed_txn.zig").commitVersion(state.begin_timestamp), .state = if (state.terminal_abort) .aborted else if (state.terminal != null) .committed else if (state.execution_started) .uncertain else if (state.metadata.failed) .failed else .active };
+        return .{ .id = id, .isolation = state.metadata.isolation, .mode = state.metadata.mode, .savepoints = state.savepoints, .started_at = try clock.Instant.fromUnixMicroseconds(@divFloor(@as(i128, state.begin_timestamp), 1000)), .write_version = try @import("distributed_txn.zig").commitVersion(state.begin_timestamp), .state = if (state.terminal_prepare) .prepared else if (state.terminal_abort) .aborted else if (state.terminal != null) .committed else if (state.execution_started) .uncertain else if (state.metadata.failed) .failed else .active };
     }
 
     fn commit(ptr: *anyopaque, scope: sql.Scope, id: sql.Id) !sql.CommitResult {

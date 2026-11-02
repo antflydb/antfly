@@ -2079,6 +2079,7 @@ pub const MetadataHttpServer = struct {
         try server.postWithBodyLimit(@import("../common/secret_delivery.zig").path, @import("../common/secret_delivery.zig").max_request_bytes, httpx.Handler.bind(self, metadataSecretRead));
         try server.post("/internal/v1/system-catalog", httpx.Handler.bind(self, metadataSystemCatalog));
         try server.post(routes.Routes.internal_schema_validation, httpx.Handler.bind(self, metadataSchemaValidation));
+        try server.postWithBodyLimit(routes.Routes.internal_table_retirement, @import("table_retirement_ledger.zig").max_command_bytes, httpx.Handler.bind(self, metadataTableRetirement));
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_catalog_group_retirement_check, httpx.Handler.bind(self, metadataCatalogGroupRetirementCheck));
@@ -2146,29 +2147,38 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataSystemCatalog(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
-        return self.metadataSystemCatalogImpl(ctx, false);
+        return self.metadataSystemCatalogImpl(ctx, .json);
     }
 
     fn metadataSchemaValidation(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
-        return self.metadataSystemCatalogImpl(ctx, true);
+        return self.metadataSystemCatalogImpl(ctx, .schema);
     }
 
-    fn metadataSystemCatalogImpl(self: *MetadataHttpServer, ctx: *httpx.Context, raw_schema: bool) !httpx.Response {
+    fn metadataTableRetirement(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        return self.metadataSystemCatalogImpl(ctx, .retirement);
+    }
+
+    fn metadataSystemCatalogImpl(self: *MetadataHttpServer, ctx: *httpx.Context, transport: enum { json, schema, retirement }) !httpx.Response {
+        const raw_schema = transport == .schema;
+        const raw_retirement = transport == .retirement;
         try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
         const body = (try ctx.body()) orelse return ctx.status(400).text("missing body");
         const Call = @import("../system_catalog/server_call.zig").Call;
         const ledger = @import("schema_validation_ledger.zig");
-        const maximum: usize = if (raw_schema) (if (ledger.requiresAdmissionAuthority(body)) ledger.max_command_bytes else ledger.max_control_command_bytes) else system_catalog.max_command_bytes;
+        const maximum: usize = if (raw_retirement) @import("table_retirement_ledger.zig").max_command_bytes else if (raw_schema) (if (ledger.requiresAdmissionAuthority(body)) ledger.max_command_bytes else ledger.max_control_command_bytes) else system_catalog.max_command_bytes;
         if (body.len > maximum) return ctx.status(413).text("catalog request too large");
         var parsed: ?std.json.Parsed(Call) = null;
         defer if (parsed) |*value| value.deinit();
-        const input: Call = if (raw_schema) blk: {
+        const input: Call = if (raw_retirement) blk: {
+            if (!std.mem.eql(u8, ctx.header("content-type") orelse "", "application/octet-stream")) return ctx.status(415).text("lifecycle submission requires raw transport");
+            break :blk .{ .table_retirement_submit = body };
+        } else if (raw_schema) blk: {
             if (!std.mem.eql(u8, ctx.header("content-type") orelse "", "application/octet-stream"))
                 return ctx.status(415).text("schema validation requires binary transport");
             break :blk .{ .schema_validation_submit = body };
         } else blk: {
             parsed = std.json.parseFromSlice(Call, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid catalog request");
-            if (parsed.?.value == .schema_validation_submit)
+            if (parsed.?.value == .schema_validation_submit or parsed.?.value == .table_retirement_submit)
                 return ctx.status(415).text("schema validation requires binary transport");
             break :blk parsed.?.value;
         };

@@ -56,6 +56,43 @@ fn commandScope(command: @FieldType(ast.PolicyDdl, "command")) policies.CommandS
     };
 }
 
+fn bindRoles(server: *server_mod.ApiHttpServer, context: operation.RequestContext, a: std.mem.Allocator, ddl: ast.PolicyDdl, revision: u64) ![]const []const u8 {
+    if (!server.source.vtable.supports_sql_authorization or ddl.role_targets.len == 0) return ddl.roles;
+    const graph = @import("antfly_local_sources").system_catalog_privileges;
+    const authorization = @import("../system_catalog/authorization.zig");
+    var names: std.ArrayList([]const u8) = .empty;
+    for (ddl.role_targets) |target| if (target == .role) try names.append(a, target.role);
+    var roles: []const ?authorization.Role = &.{};
+    if (names.items.len != 0) {
+        const request: authorization.Read = .{ .role_names = names.items, .expected_revision = revision };
+        var private = context;
+        private.setting_admin = true;
+        const bytes = try server.source.systemCatalog(a, private, .{ .sql_authorization_read = request });
+        const cut = try std.json.parseFromSliceLeaky(authorization.Snapshot, a, bytes, .{ .allocate = .alloc_always });
+        try cut.validate(a, request);
+        roles = cut.roles;
+    }
+    var result: std.ArrayList([]const u8) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var role_index: usize = 0;
+    for (ddl.role_targets) |target| {
+        const role = switch (target) {
+            .public => "PUBLIC",
+            .role => |name| blk: {
+                defer role_index += 1;
+                if (roles[role_index]) |found| break :blk try graph.roleAlias(a, found);
+                // Existing native users/Casbin roles keep their RLS semantics.
+                // A quoted PUBLIC or reserved alias must never become PUBLIC
+                // or an unauthenticated SQL-role claim through that fallback.
+                if (std.mem.eql(u8, name, "PUBLIC") or graph.reservedRoleAlias(name)) return error.SqlRoleNotFound;
+                break :blk name;
+            },
+        };
+        if (!(try seen.getOrPut(a, role)).found_existing) try result.append(a, role);
+    }
+    return result.toOwnedSlice(a);
+}
+
 pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: ast.PolicyDdl) !catalog.DdlOutcome {
     try context.ensureActive();
     const target: domain.Target = .{ .database = ddl.table.database orelse database, .namespace = ddl.table.namespace orelse namespace, .table = ddl.table.table };
@@ -137,7 +174,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
                 .schema_digest = schema_digest,
                 .name = ddl.name,
                 .commands = commands,
-                .roles = if (ddl.roles_specified) ddl.roles else if (prior) |value| value.roles else &.{"PUBLIC"},
+                .roles = if (ddl.roles_specified) try bindRoles(server, context, a, ddl, state.revision) else if (prior) |value| value.roles else &.{"PUBLIC"},
                 .permissive = if (prior) |value| value.permissive else ddl.permissive,
                 .using = if (ddl.using_specified or ddl.action == .create) if (using_program) |program| .{ .instructions = program.instructions, .root = program.root } else null else prior.?.using,
                 .with_check = if (ddl.check_specified or ddl.action == .create) if (check_program) |program| .{ .instructions = program.instructions, .root = program.root } else null else if (ddl.using_specified and prior.?.check_uses_using) if (using_program) |program| .{ .instructions = program.instructions, .root = program.root } else null else prior.?.with_check,

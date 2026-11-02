@@ -318,21 +318,47 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // SQL declaration lowering must agree with the distributed integrity
     // planner, which lives outside sql/. Keep that cross-layer regression in
     // this gate rather than leaving it silently outside the selected corpus.
-    const sql_tests = b.addTest(.{ .name = "sql-tests", .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "SQL named enum", "SQL enum", "document generated", "SQL range", "column nullability transition", "projected column nullability", "relational nullness", "relational predicate", "relational residual comparisons", "relational index system partial implication", "relational index system SQL immutable index constant", "relational index system schema reader", "relational declarations public NUMERIC modifiers", "common.sql_array_layout", "system_catalog.policies", "system catalog definite naming diagnostics", "system catalog relation guard", "SQL UNIQUE null clauses share distributed claims and conflict arbiters", "SQL covering constraint", "schema deserialization cleans initialized mappings on allocation failure", "prepared schema definitions", "installed view policy selects owner roles" }) });
+    // Domain coercion, shared row admission and activation kernels live in
+    // schema/, so the sql. namespace alone does not discover their contracts.
+    const sql_tests = b.addTest(.{ .name = "sql-tests", .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "SQL native index", "SQL owned sequence handoff", "SQL durable string lengths", "SQL maintenance", "SQL statistics cache", "SQL privileges", "SQL persisted index validation", "SQL named enum", "SQL enum", "SQL domain", "document generated", "SQL range", "column nullability transition", "projected column nullability", "relational nullness", "relational predicate", "relational residual comparisons", "relational index system partial implication", "relational index system SQL immutable index constant", "relational index system schema reader", "relational declarations public NUMERIC modifiers", "common.sql_array_layout", "system_catalog.policies", "system catalog definite naming diagnostics", "system catalog relation guard", "SQL UNIQUE null clauses share distributed claims and conflict arbiters", "SQL covering constraint", "schema deserialization cleans initialized mappings on allocation failure", "prepared schema definitions", "installed view policy selects owner roles" }) });
     // Use the same exact-filter runner as extracted SQL owners. Besides
     // consistent failure/leak attribution, this keeps compile-only anonymous
     // reachability anchors out of runtime selection.
     const run_sql_tests = addFilteredTestRunArtifact(b, sql_tests);
+    const prepared_control_tests = b.addTest(.{
+        .name = "sql-prepared-control-tests",
+        .root_module = sql_test_mod,
+        .filters = &.{"SQL prepared transaction commands"},
+    });
+    prepared_control_tests.step.max_rss = @as(usize, if (target.result.os.tag == .macos) 6 else 3) * 1024 * 1024 * 1024;
+    const run_prepared_control_tests = addFilteredTestRunArtifact(b, prepared_control_tests);
+    run_prepared_control_tests.addArg("--require-no-skips");
+    b.step("sql-prepared-control-test", "Verify prepared transaction syntax and literal identities in the SQL compiler owner")
+        .dependOn(&run_prepared_control_tests.step);
     // The native SQL contract corpus is larger than the parser-only owner but
     // remains below the full database compilation and integration test roots.
     // ReleaseFast macOS compilation reached 3.89 GB. Keep explicit headroom
     // for that owner without inflating the unmeasured Linux scheduling claim.
-    sql_tests.step.max_rss = (if (target.result.os.tag == .macos) @as(usize, 5) else 3) * 1024 * 1024 * 1024;
+    // Debug domain provenance qualification measured 5.49 GB on macOS.
+    sql_tests.step.max_rss = (if (target.result.os.tag == .macos) @as(usize, if (optimize == .debug) 6 else 5) else 3) * 1024 * 1024 * 1024;
     // The complete compiler/executor corpus includes exhaustive allocation-fault
     // runs and parallel partition lifecycle checks. This scheduling estimate
     // is independent of the executor's per-statement memory admission tests.
     run_sql_tests.step.max_rss = 384 * 1024 * 1024;
     b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
+    const privileges_bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench_sql_privileges.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    privileges_bench_mod.addImport("privileges", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/privileges.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const privileges_bench = b.addExecutable(.{ .name = "sql-privileges-bench", .root_module = privileges_bench_mod });
+    b.step("sql-privileges-bench", "Compare atomic grant matrices with repeated per-grant preparation")
+        .dependOn(&b.addRunArtifact(privileges_bench).step);
     const mutation_domain_tests = b.addTest(.{
         .name = "sql-mutation-domain-tests",
         .root_module = sql_test_mod,
@@ -1401,11 +1427,28 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
     antfly_imports.configureLocalDatabaseContracts(sql_test_mod);
     sql_test_mod.addImport("sql_parser", sql_parser_mod);
+    sql_test_mod.addImport("antfly_casbin", casbin_mod);
     sql_test_mod.addImport("antfly-json", json_mod);
     sql_test_mod.addImport("antfly_platform", platform_mod);
     sql_test_mod.addImport("antfly_generating", generating_mod);
     sql_test_mod.addImport("antfly_structured", structured_mod);
     sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    const sequence_binding_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/sequence_binding_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sequence_binding_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    sequence_binding_mod.addImport("antfly_platform", platform_mod);
+    const sequence_binding_tests = b.addTest(.{ .root_module = sequence_binding_mod, .filters = &.{ "column sequence", "dependent retirement" } });
+    const run_sequence_binding_tests = b.addRunArtifact(sequence_binding_tests);
+    b.step("system-catalog-sequence-binding-test", "Verify canonical typed sequence references and allocation-failure ownership").dependOn(&run_sequence_binding_tests.step);
+    run_sql_tests.step.dependOn(&run_sequence_binding_tests.step);
+
+    sql_test_mod.addImport("objectstore", objectstore_mod);
+    sql_test_mod.addImport("httpx", httpx_mod);
+    sql_test_mod.addImport("antfly_credentials", credentials_mod);
+    sql_test_mod.addOptions("build_options", build_options);
     pgwire_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     pgwire_test_mod.addImport("antfly-json", json_mod);
     pgwire_test_mod.addImport("antfly_regex", regex_mod);

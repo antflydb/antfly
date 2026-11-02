@@ -40,6 +40,7 @@ pub const status_server_response_reserve_ms: u32 = 50;
 /// Process-local execution context established by the receiving node. This is
 /// never serialized directly across the wire.
 pub const PreDecisionContext = struct {
+    external_decision_owner: ?@import("../storage/transactions.zig").ExternalDecisionOwner = null,
     route_fence: ?@import("../metadata/catalog_route_contract.zig").CatalogRouteFence = null,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,
@@ -54,6 +55,18 @@ pub const TxnStatusRequest = struct {
     txn_id: db_types.TxnId,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,
+};
+
+/// Resolution retains its exact authority through routing and native callbacks.
+pub const TxnResolveRequest = struct {
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
+    txn_id: db_types.TxnId,
+    status: db_types.TxnStatus,
+    commit_version: u64,
+    topology_epoch: u64 = 0,
+    sync_level: db_types.SyncLevel = .propose,
+    external_decision_owner: ?@import("../storage/transactions.zig").ExternalDecisionOwner = null,
 };
 
 pub const TableCommitRequest = struct {

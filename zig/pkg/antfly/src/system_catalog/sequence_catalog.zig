@@ -76,6 +76,9 @@ pub const SnapshotRequest = struct {
     sequence_ids: ?[]const u64 = null,
     incarnation: ?[16]u8 = null,
     include_counters: bool = false,
+    /// Capture the bounded dependency/physical-owner cut for coordinated DROP.
+    prepare_retirement: bool = false,
+
     /// Ingress has already authorized this exact table. Metadata rechecks
     /// its immutable owner/schema guard while resolving the attribute name.
     owner: ?struct { guard: domain.RelationMutationGuard, column: []const u8 } = null,
@@ -83,8 +86,20 @@ pub const SnapshotRequest = struct {
     /// The returned attribute identity must independently match the reference.
     column_default: ?struct { scope: sources.system_catalog_column_sequences.Scope, column: []const u8 } = null,
 
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "prepare_retirement")) or self.prepare_retirement) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validate(self: @This()) !void {
         if (self.targets.len == 0 or self.targets.len > max_lookup_targets) return error.InvalidCatalogMutation;
+        if (self.prepare_retirement and (self.targets.len != 1 or self.owner != null or self.column_default != null)) return error.InvalidCatalogMutation;
         for (self.targets) |target| try target.validate();
         if ((self.sequence_ids == null) != (self.incarnation == null)) return error.InvalidCatalogMutation;
         if (self.sequence_ids) |ids| {
@@ -117,14 +132,31 @@ pub const Snapshot = struct {
         column: sequence.OwnedBy,
         /// Only capability-70 column-default requests return this native name.
         table_name: ?[]const u8 = null,
+        /// Attested from the actual stored default, never caller-supplied mode.
+        default_binding_fingerprint: ?[32]u8 = null,
+
+        pub fn requireDefaultBinding(self: @This(), binding: sources.system_catalog_column_sequences.Binding) !void {
+            const actual = self.default_binding_fingerprint orelse return error.InvalidSqlBackendResponse;
+            const expected = binding.fingerprint();
+            if (!std.meta.eql(self.column, binding.owner) or !std.mem.eql(u8, &actual, &expected))
+                return error.CatalogGenerationChanged;
+        }
 
         pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            if (self.default_binding_fingerprint) |fingerprint| return writer.write(.{ .namespace_id = self.namespace_id, .column = self.column, .table_name = self.table_name, .default_binding_fingerprint = fingerprint });
             if (self.table_name) |name|
                 try writer.write(.{ .namespace_id = self.namespace_id, .column = self.column, .table_name = name })
             else
                 try writer.write(.{ .namespace_id = self.namespace_id, .column = self.column });
         }
     };
+    pub const Retirement = struct {
+        database_id: u64,
+        references: @import("sequence_default_dependencies.zig").Stamp,
+        dependents: []const sources.common_topology_records.TableRecord,
+        activation: ?@import("../metadata/schema_validation_publication.zig").OwnerCut = null,
+    };
+    retirement: ?Retirement = null,
     metadata_group_id: u64 = 0,
     revision: u64,
     head: u64,
@@ -133,6 +165,18 @@ pub const Snapshot = struct {
     /// Null means no requested owner, or no such attribute of the guarded
     /// table. The request distinguishes these; neither mints an identity.
     owner: ?Owner,
+
+    pub const max_retirement_bytes = 16 * 1024 * 1024;
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "retirement")) or self.retirement != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 
     pub fn validate(self: Snapshot, request: SnapshotRequest) !void {
         try request.validate();
@@ -159,16 +203,46 @@ pub const Snapshot = struct {
                 } else if (entry.counter != null) return error.InvalidSqlBackendResponse;
             } else if (entry.counter != null) return error.InvalidSqlBackendResponse;
         }
+        if (self.retirement) |retirement| {
+            if (!request.prepare_retirement or self.entries.len != 1 or self.entries[0].value != .sequence or retirement.database_id == 0 or
+                retirement.dependents.len > 128 or retirement.references.count > 128 * sources.system_catalog_column_identities.max_columns or
+                (retirement.references.count != 0 and retirement.references.revision == 0) or
+                (retirement.dependents.len == 0) != (retirement.references.count == 0)) return error.InvalidSqlBackendResponse;
+            var previous: u64 = 0;
+            var bytes: usize = 0;
+            for (retirement.dependents) |table| {
+                if (table.table_id <= previous) return error.InvalidSqlBackendResponse;
+                previous = table.table_id;
+                bytes +|= table.schema_json.len;
+                bytes +|= table.read_schema_json.len;
+                bytes +|= table.indexes_json.len;
+                if (bytes > max_retirement_bytes) return error.SqlProgramLimitExceeded;
+            }
+            if (retirement.activation) |activation| {
+                if (retirement.dependents.len == 0 or activation.metadata_group_id != self.metadata_group_id or activation.metadata_group_id == 0 or
+                    !std.mem.eql(u8, &activation.metadata_incarnation, &std.fmt.bytesToHex(self.incarnation, .lower)) or
+                    activation.ranges.len == 0 or activation.ranges.len > @import("../metadata/schema_validation_publication.zig").max_owners) return error.InvalidSqlBackendResponse;
+                var ordinal: usize = 0;
+                for (retirement.dependents) |table| {
+                    const start = ordinal;
+                    while (ordinal < activation.ranges.len and activation.ranges[ordinal].table_id == table.table_id) : (ordinal += 1) {}
+                    if (ordinal == start) return error.InvalidSqlBackendResponse;
+                    try @import("../metadata/table_manager.zig").validateCompleteKeyspaceRanges(activation.ranges[start..ordinal]);
+                }
+                if (ordinal != activation.ranges.len) return error.InvalidSqlBackendResponse;
+            } else if (retirement.dependents.len != 0) return error.InvalidSqlBackendResponse;
+        } else if (request.prepare_retirement and self.entries[0].value == .sequence) return error.InvalidSqlBackendResponse;
         if (request.owner) |wanted| {
             if (!std.mem.eql(u8, &wanted.guard.incarnation, &self.incarnation)) return error.InvalidSqlBackendResponse;
             if (self.owner) |value| {
                 value.column.validate() catch return error.InvalidSqlBackendResponse;
-                if (value.namespace_id == 0 or value.column.table_id != wanted.guard.owner.table_id) return error.InvalidSqlBackendResponse;
+                if (value.namespace_id == 0 or value.column.table_id != wanted.guard.owner.table_id or value.default_binding_fingerprint != null) return error.InvalidSqlBackendResponse;
             }
         } else if (request.column_default) |wanted| {
             if (self.owner) |value| {
                 value.column.validate() catch return error.InvalidSqlBackendResponse;
-                if (value.namespace_id == 0 or value.column.table_id != wanted.scope.table_id) return error.InvalidSqlBackendResponse;
+                const fingerprint = value.default_binding_fingerprint orelse return error.InvalidSqlBackendResponse;
+                if (value.namespace_id == 0 or value.column.table_id != wanted.scope.table_id or value.table_name == null or std.mem.allEqual(u8, &fingerprint, 0)) return error.InvalidSqlBackendResponse;
             }
         } else if (self.owner != null) return error.InvalidSqlBackendResponse;
     }

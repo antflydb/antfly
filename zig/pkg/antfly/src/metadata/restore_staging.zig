@@ -217,7 +217,8 @@ pub const MaterializedView = struct {
 
 pub const Target = struct {
     pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
-        return (std.mem.eql(u8, name, "sequence_handoffs") and self.sequence_handoffs.len == 0) or
+        return (std.mem.eql(u8, name, "attribute_renames") and self.attribute_renames.len == 0) or
+            (std.mem.eql(u8, name, "sequence_handoffs") and self.sequence_handoffs.len == 0) or
             (std.mem.eql(u8, name, "empty_generation") and !self.empty_generation) or
             (std.mem.eql(u8, name, "population") and self.population == null) or
             (std.mem.eql(u8, name, "materialized_view") and self.materialized_view == null) or
@@ -237,6 +238,7 @@ pub const Target = struct {
     /// The definition and backing rows publish in one catalog transaction.
     materialized_view: ?MaterializedView = null,
     sequence_handoffs: []const @import("column_sequence_handoff.zig").Move = &.{},
+    attribute_renames: []const @import("antfly_local_sources").system_catalog_column_identities.Rename = &.{},
     /// Binds graph artifact retirement to the exact old/new physical table
     /// incarnations and unchanged index declarations. Old edge/metric stores
     /// remain with the fenced old groups; fresh groups must prove pristine
@@ -425,7 +427,8 @@ pub const Plan = struct {
         // Preserve the canonical digest of in-flight plans created before
         // external parents became an optional part of the envelope.
         return (std.mem.eql(u8, name, "external_fk_parents") and self.external_fk_parents.len == 0) or
-            (std.mem.eql(u8, name, "constraint_name_guard") and self.constraint_name_guard == null);
+            (std.mem.eql(u8, name, "constraint_name_guard") and self.constraint_name_guard == null) or
+            (std.mem.eql(u8, name, "type_retirement") and self.type_retirement == null);
     }
 
     id: Id,
@@ -441,6 +444,7 @@ pub const Plan = struct {
     /// Optional SQL-generated primary-key identity. The shared plan/intent
     /// digests retain it through source freezing, cutover and cancellation.
     constraint_name_guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard = null,
+    type_retirement: ?@import("../system_catalog/named_types.zig").Retirement = null,
 
     pub fn jsonStringify(self: Plan, jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, jw);
@@ -461,6 +465,11 @@ pub const Plan = struct {
     }
 
     pub fn validate(self: Plan, alloc: std.mem.Allocator) !void {
+        if (self.type_retirement) |retirement| {
+            try retirement.validate(alloc);
+            if (self.constraint_name_guard != null or self.external_fk_parents.len != 0) return error.InvalidRestoreStaging;
+            for (self.targets) |target| if (target.rewrite == null or target.replace == null or target.population != null or target.materialized_view != null or target.empty_generation) return error.InvalidRestoreStaging;
+        }
         if (std.mem.allEqual(u8, &self.id, 0) or std.mem.allEqual(u8, &self.cohort_digest, 0) or
             self.targets.len == 0 or self.targets.len > 128 or self.external_fk_parents.len > 128) return error.InvalidRestoreStaging;
         if (try self.constraintNameTarget()) |target| {
@@ -484,6 +493,19 @@ pub const Plan = struct {
             for (self.skipped_tables[0..index]) |previous| if (std.mem.eql(u8, previous, name)) return error.InvalidRestoreStaging;
             for (self.targets) |target| if (std.mem.eql(u8, target.table.name, name)) return error.InvalidRestoreStaging;
         }
+        for (self.targets) |target| if (target.attribute_renames.len != 0) {
+            const rewrite = target.rewrite orelse return error.InvalidRestoreStaging;
+            const old = target.replace orelse return error.InvalidRestoreStaging;
+            if (target.empty_generation or !rewrite.allow_column_drops or !std.mem.eql(u8, rewrite.expression_schema, old.table.schema_json)) return error.InvalidRestoreStaging;
+            const definition = @import("column_identity_definition.zig");
+            var before = try definition.initial(alloc, old.table);
+            defer before.deinit();
+            var after = try definition.initial(alloc, target.table);
+            defer after.deinit();
+            var region = std.heap.ArenaAllocator.init(alloc);
+            defer region.deinit();
+            _ = try definition.prepareHandoffLeaky(region.allocator(), before.value, after.value, target.attribute_renames, rewrite.column_transforms);
+        };
         var sequence_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer sequence_ids.deinit(alloc);
         for (self.targets) |target| for (target.sequence_handoffs) |move| {
@@ -622,11 +644,10 @@ pub const Plan = struct {
                 if ((target.empty_generation and (self.preparing_sources or target.rewrite != null or target.rewrite_sources.len != 0 or target.source_artifacts.len != 0)) or (!target.empty_generation and target.rewrite == null) or old.table.table_id != target.source_table_id or old.fences.len != old.ranges.len or old.ranges.len != target.ranges.len) return error.InvalidRestoreStaging;
                 if (target.generation_handoffs.len != old.ranges.len) return error.InvalidRestoreStaging;
                 if (target.empty_generation) {
-                    const expected_schema = if (target.sequence_handoffs.len != 0)
-                        try @import("column_sequence_handoff.zig").rewriteOwnerReferences(alloc, old.table.schema_json, old.table.table_id, target.sequence_handoffs)
-                    else
-                        old.table.schema_json;
-                    if (!std.mem.eql(u8, expected_schema, table.schema_json) or !std.mem.eql(u8, old.table.read_schema_json, table.read_schema_json) or !std.mem.eql(u8, old.table.indexes_json, table.indexes_json)) return error.InvalidRestoreStaging;
+                    var destination_attributes = try @import("column_identity_definition.zig").initial(alloc, table);
+                    defer destination_attributes.deinit();
+                    try @import("column_sequence_handoff.zig").requireOwnerReferences(alloc, old.table.schema_json, table.schema_json, old.table.table_id, destination_attributes.value, target.sequence_handoffs);
+                    if (!std.mem.eql(u8, old.table.read_schema_json, table.read_schema_json) or !std.mem.eql(u8, old.table.indexes_json, table.indexes_json)) return error.InvalidRestoreStaging;
                 }
                 const graph_index = try hasGraphIndex(alloc, table.indexes_json);
                 if (target.empty_generation and graph_index != (target.graph_retirement_digest != null)) return error.InvalidRestoreStaging;
@@ -1273,7 +1294,25 @@ test "relational integrity restore staging sealed portable empty source admissio
 
 /// Progress is separate from the immutable plan so per-owner acknowledgements
 /// update only a small record, independent of schema/target count.
-pub const Progress = struct { state: State = .importing, revision: u64 = 1, completed_owners: u32 = 0 };
+pub const TypeRetirementProgress = struct {
+    work: @import("../system_catalog/sequence_outcomes.zig").RestoreWork,
+    admission_digest: Digest,
+    observed_revision: u64,
+    catalog_revision: u64 = 0,
+    failure: ?@import("../system_catalog/sequence_outcomes.zig").Rejection = null,
+};
+pub const Progress = struct {
+    state: State = .importing,
+    revision: u64 = 1,
+    completed_owners: u32 = 0,
+    type_retirement: ?TypeRetirementProgress = null,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, writer);
+    }
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "type_retirement") and self.type_retirement == null;
+    }
+};
 
 /// Private node-scoped authority reads are separate from the active-only
 /// provisioning projection: terminal publication/cancellation still needs an

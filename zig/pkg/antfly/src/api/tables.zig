@@ -709,36 +709,87 @@ pub fn encodeSingleTableStatusWithDefinitions(
 // Clone only the final wire projection into its owning arena. Generated JSON
 // parsers and capability aggregation allocate intermediate trees and indexes;
 // retaining those would make cache capacity depend on parser implementation.
-fn cloneSchemaProjection(comptime T: type, alloc: std.mem.Allocator, value: T) std.mem.Allocator.Error!T {
-    if (T == std.json.Value) return cloneJsonValueAlloc(alloc, value);
-    return switch (@typeInfo(T)) {
-        .optional => |info| if (value) |item| try cloneSchemaProjection(info.child, alloc, item) else null,
-        .pointer => |info| blk: {
-            if (info.size != .slice) @compileError("schema projection must contain owned slices");
-            const out = try alloc.alloc(info.child, value.len);
-            for (value, out) |item, *dest| dest.* = try cloneSchemaProjection(info.child, alloc, item);
-            break :blk out;
-        },
-        .@"struct" => |info| blk: {
-            if (@hasField(T, "map")) {
-                var out: T = .{};
-                try out.map.ensureTotalCapacity(alloc, value.map.count());
-                var it = value.map.iterator();
-                while (it.next()) |item| {
-                    out.map.putAssumeCapacity(try alloc.dupe(u8, item.key_ptr.*), try cloneSchemaProjection(@TypeOf(item.value_ptr.*), alloc, item.value_ptr.*));
+const SchemaProjectionCloner = struct {
+    // All destinations share one immutable owning arena. The intern index is
+    // compiler scratch; repeated schema paths and capability labels retain
+    // one owned byte slice across the wire and runtime projections.
+    alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    strings: std.StringHashMapUnmanaged([]u8) = .empty,
+
+    fn string(self: *@This(), value: []const u8) ![]u8 {
+        const slot = try self.strings.getOrPut(self.scratch, value);
+        if (slot.found_existing) return slot.value_ptr.*;
+        const owned = try self.alloc.dupe(u8, value);
+        slot.key_ptr.* = owned;
+        slot.value_ptr.* = owned;
+        return owned;
+    }
+
+    fn json(self: *@This(), value: std.json.Value) anyerror!std.json.Value {
+        return switch (value) {
+            .string => |text| .{ .string = try self.string(text) },
+            .number_string => |text| .{ .number_string = try self.string(text) },
+            .array => |array| blk: {
+                var out = std.json.Array.init(self.alloc);
+                try out.ensureTotalCapacity(array.items.len);
+                for (array.items) |item| out.appendAssumeCapacity(try self.json(item));
+                break :blk .{ .array = out };
+            },
+            .object => |object| blk: {
+                var out: std.json.ObjectMap = .empty;
+                try out.ensureTotalCapacity(self.alloc, object.count());
+                var it = object.iterator();
+                while (it.next()) |item| out.putAssumeCapacity(try self.string(item.key_ptr.*), try self.json(item.value_ptr.*));
+                break :blk .{ .object = out };
+            },
+            else => value,
+        };
+    }
+
+    fn clone(self: *@This(), comptime T: type, value: T) anyerror!T {
+        const alloc = self.alloc;
+        if (T == std.json.Value) return self.json(value);
+        const external = @import("antfly_local_sources").serverless_external_source_schema_binding;
+        // This binding owns parsed JSON arenas as well as slices. Its explicit
+        // clone rebinds interior references; reflecting its allocator would copy
+        // execution state and leave pointers into the compiler's scratch arena.
+        if (T == external.OwnedExternalTableBinding) return external.cloneAlloc(alloc, value);
+        return switch (@typeInfo(T)) {
+            .optional => |info| if (value) |item| try self.clone(info.child, item) else null,
+            .pointer => |info| blk: {
+                if (info.size == .one) {
+                    const out = try alloc.create(info.child);
+                    out.* = try self.clone(info.child, value.*);
+                    break :blk out;
                 }
+                if (info.size != .slice) @compileError("schema projection must contain owned pointers or slices");
+                if (info.child == u8) return self.string(value);
+                const out = try alloc.alloc(info.child, value.len);
+                for (value, out) |item, *dest| dest.* = try self.clone(info.child, item);
                 break :blk out;
-            }
-            var out: T = undefined;
-            inline for (info.field_names, info.field_types) |reflected_name, field_type| @field(out, reflected_name) = try cloneSchemaProjection(field_type, alloc, @field(value, reflected_name));
-            break :blk out;
-        },
-        .@"union" => switch (value) {
-            inline else => |item, tag| @unionInit(T, @tagName(tag), try cloneSchemaProjection(@TypeOf(item), alloc, item)),
-        },
-        else => value,
-    };
-}
+            },
+            .@"struct" => |info| blk: {
+                if (@hasField(T, "map")) {
+                    var out: T = .{};
+                    try out.map.ensureTotalCapacity(alloc, value.map.count());
+                    var it = value.map.iterator();
+                    while (it.next()) |item| {
+                        out.map.putAssumeCapacity(try self.string(item.key_ptr.*), try self.clone(@TypeOf(item.value_ptr.*), item.value_ptr.*));
+                    }
+                    break :blk out;
+                }
+                var out: T = undefined;
+                inline for (info.field_names, info.field_types) |reflected_name, field_type| @field(out, reflected_name) = try self.clone(field_type, @field(value, reflected_name));
+                break :blk out;
+            },
+            .@"union" => switch (value) {
+                inline else => |item, tag| @unionInit(T, @tagName(tag), try self.clone(@TypeOf(item), item)),
+            },
+            else => value,
+        };
+    }
+};
 
 /// Content-addressed schemas only: table-specific index incarnations and runtime
 /// status are read afresh. Compiler scratch never consumes the retained budget.
@@ -799,12 +850,15 @@ pub const DefinitionCache = struct {
         fn create(alloc: std.mem.Allocator, key: [32]u8, table: *const metadata_table_manager.TableRecord) !*Entry {
             const entry = try alloc.create(Entry);
             errdefer alloc.destroy(entry);
-            var arena = std.heap.ArenaAllocator.init(alloc);
-            errdefer arena.deinit();
-            const a = arena.allocator();
+            // Managed JSON values retain their allocator. Construct the arena
+            // at its final address before creating any interior owner.
+            entry.* = .{ .alloc = alloc, .arena = .init(alloc), .key = key, .schema = null, .read_schema = null, .declared = null, .runtime_schema = null, .capabilities = null };
+            errdefer entry.arena.deinit();
+            const a = entry.arena.allocator();
             var scratch = std.heap.ArenaAllocator.init(alloc);
             defer scratch.deinit();
             const temporary = scratch.allocator();
+            var cloner: SchemaProjectionCloner = .{ .alloc = a, .scratch = temporary };
             const schema_json = if (table.read_schema_json.len > 0) table.read_schema_json else effectiveSchemaJson(table.schema_json);
             const runtime: ?runtime_schema_mod.TableSchema = runtime: {
                 const parsed = schema_mod.parseValidatedTableSchema(temporary, schema_json) catch |err| {
@@ -818,21 +872,17 @@ pub const DefinitionCache = struct {
                 // Keep the same immutable routing model as executable queries.
                 // Durable round-trip owns every string inside the bounded cache.
                 const encoded = try runtime_schema_mod.serializeSchema(temporary, derived);
-                break :runtime try runtime_schema_mod.deserializeSchema(a, encoded);
+                // Decoder validation builds transient indexes. Retain only the
+                // finished immutable projection, not its parser/validator arena.
+                const decoded = try runtime_schema_mod.deserializeSchema(temporary, encoded);
+                break :runtime try cloner.clone(runtime_schema_mod.TableSchema, decoded);
             };
             const declared = if (runtime) |value| try runtime_schema_mod.fieldCapabilitiesAlloc(a, value) else null;
-            entry.* = .{
-                .alloc = alloc,
-                .arena = arena,
-                .key = key,
-                .schema = try cloneSchemaProjection(?schema_openapi.TableSchema, a, try parseOptionalTableSchema(temporary, table.schema_json)),
-                .read_schema = if (table.read_schema_json.len > 0) try cloneSchemaProjection(schema_openapi.TableSchema, a, try parseTableSchema(temporary, table.read_schema_json)) else null,
-                .declared = declared,
-                .runtime_schema = runtime,
-                .capabilities = if (declared) |caps| try cloneSchemaProjection([]const metadata_openapi.FieldCapability, a, try generatedFieldCapabilitiesFromSchema(temporary, caps, null, runtime.?)) else null,
-            };
-            // Entry fields above can grow the local arena after its first copy.
-            entry.arena = arena;
+            entry.schema = try cloner.clone(?schema_openapi.TableSchema, try parseOptionalTableSchema(temporary, table.schema_json));
+            entry.read_schema = if (table.read_schema_json.len > 0) try cloner.clone(schema_openapi.TableSchema, try parseTableSchema(temporary, table.read_schema_json)) else null;
+            entry.declared = declared;
+            entry.runtime_schema = runtime;
+            entry.capabilities = if (declared) |caps| try cloner.clone([]const metadata_openapi.FieldCapability, try generatedFieldCapabilitiesFromSchema(temporary, caps, null, runtime.?)) else null;
             return entry;
         }
     };
@@ -1727,7 +1777,7 @@ pub fn prepareSchemaValidationPublicationRecord(alloc: std.mem.Allocator, table:
     const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
     const nullability = @import("antfly_local_sources").schema_column_nullability;
     const columns = selection.names();
-    if (columns.len == 0 or columns.len > contract.max_columns or table.table_id == 0 or
+    if ((selection != .object_rename and columns.len == 0) or columns.len > contract.max_columns or table.table_id == 0 or
         table.schema_json.len == 0 or table.schema_json.len > contract.max_schema or
         table.storage.engine != .local or table.storage_migration != null or
         table.read_schema_json.len != 0 or table.restore_backup_id.len != 0 or
@@ -1740,6 +1790,11 @@ pub fn prepareSchemaValidationPublicationRecord(alloc: std.mem.Allocator, table:
     var foreign: ?@import("antfly_local_sources").schema_foreign_key_validation.Prepared = null;
     defer if (foreign) |*value| value.deinit();
     var candidate: std.json.Value = switch (selection) {
+        .object_rename => |renames| block: {
+            var changed = before;
+            try @import("antfly_local_sources").system_catalog_domain.object_definitions.renameSchemaValue(scratch, &changed, renames);
+            break :block changed;
+        },
         .not_null => block: {
             const changes = try scratch.alloc(nullability.Change, columns.len);
             for (columns, changes) |name, *change| change.* = .{ .column = name, .nullable = false };
@@ -6912,6 +6967,7 @@ test "system catalog wide schema cache retained budget" {
     defer entry.release();
     // Leave room for at least 100 independently evolved 200-field schemas
     // within the retained budget; parser scratch must not count as cache data.
+    if (entry.size() > 512 * 1024) std.debug.print("schema cache retained bytes={d}\n", .{entry.size()});
     try std.testing.expect(entry.size() <= 512 * 1024);
 }
 

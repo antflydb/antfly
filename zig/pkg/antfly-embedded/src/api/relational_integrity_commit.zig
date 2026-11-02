@@ -185,6 +185,7 @@ const Loaded = struct {
     uniques: []const native.UniqueConstraint,
     foreign: []const native.ForeignKey,
     plan: ?planner.Plan = null,
+    domain_contract: ?*const @import("../schema/domain_handoff.zig").Contract = null,
 };
 
 const Work = struct {
@@ -193,6 +194,8 @@ const Work = struct {
     before: ?reads.LookupResponse,
     after: ?[]const u8,
     after_json_null_fields: []const []const u8 = &.{},
+    after_prepared_domain: ?*const @import("../schema/domain_handoff.zig").Contract = null,
+    after_domain_inputs: ?[]@import("../schema/domain_row.zig").Input = null,
     observed_version: u64 = 0,
     observed_digest: ?[32]u8 = null,
     assignments: std.StringHashMapUnmanaged(std.json.Value) = .empty,
@@ -554,7 +557,7 @@ const Builder = struct {
         try self.charge(key.len + if (old) |row| row.json.len else @as(usize, 0));
         if (old) |row| try self.chargeJsonNullFields(row.json_null_fields);
         const item = try self.alloc.create(Work);
-        item.* = .{ .table = table, .key = try self.alloc.dupe(u8, key), .before = old, .after = if (old) |row| row.json else null, .after_json_null_fields = if (old) |row| row.json_null_fields else &.{}, .observed_version = observed_version, .observed_digest = observed_digest };
+        item.* = .{ .table = table, .key = try self.alloc.dupe(u8, key), .before = old, .after = if (old) |row| row.json else null, .after_json_null_fields = if (old) |row| row.json_null_fields else &.{}, .after_prepared_domain = if (old != null) try self.domainContract(table) else null, .observed_version = observed_version, .observed_digest = observed_digest };
         try self.work.append(self.alloc, item);
         try self.by_row.put(self.alloc, identity, item);
         return item;
@@ -732,6 +735,59 @@ const Builder = struct {
         return compiled;
     }
 
+    fn domainContract(self: *Builder, table: *Loaded) !?*const @import("../schema/domain_handoff.zig").Contract {
+        if (table.domain_contract) |value| return value;
+        const value = (table.view.validator() orelse return null).preparedDomainContract() orelse return null;
+        try self.charge(@sizeOf(@TypeOf(value)));
+        const owned = try self.alloc.create(@TypeOf(value));
+        owned.* = value;
+        table.domain_contract = owned;
+        return owned;
+    }
+
+    /// A native FK action assigns only its declared child columns. The
+    /// remaining domain cells are trusted output of the pinned native reader,
+    /// including historical NULLs and values covered by NOT VALID checks.
+    fn domainAction(self: *Builder, child: *Work, object: *std.json.ObjectMap, child_name: []const u8, parent: *Work, parent_name: []const u8, cascade: bool) !void {
+        const compiled = child.table.view.validator() orelse return;
+        const domains = if (compiled.execution.domains) |*plan| plan else return;
+        if (domains.bindings.len == 0) return;
+        if (child.after_domain_inputs == null) {
+            if (child.after_prepared_domain == null) return error.InvalidIntegrityRecord;
+            try self.charge(domains.bindings.len * @sizeOf(@import("../schema/domain_row.zig").Input));
+            const inputs = try self.alloc.alloc(@import("../schema/domain_row.zig").Input, domains.bindings.len);
+            for (domains.bindings, inputs) |binding, *input| {
+                const identity = binding.view.identity orelse return error.InvalidSqlNamedType;
+                input.* = .{ .ordinal = binding.ordinal, .source = if (!compiled.execution.domain_derived[binding.ordinal]) .{ .id = identity.id, .origin_id = identity.origin_id, .generation = identity.generation } else null };
+                // SQL's typed NULL includes an absent native cell. Materialize
+                // that value before attaching its compiler/native witness.
+                if (input.source != null and !object.contains(binding.name)) try object.put(self.alloc, binding.name, .null);
+            }
+            child.after_domain_inputs = inputs;
+        }
+        const column = child.table.view.physicalLayout().ordinalForName(child.table.view.tableSchema().relational_columns, child_name) orelse return error.InvalidIntegrityRecord;
+        for (child.after_domain_inputs.?) |*input| if (input.ordinal == column) {
+            // Fresh wins when several paths assign the same value. A later
+            // typed edge cannot erase a fresh coercion required by an earlier
+            // edge; contradictory values are rejected by ordinary FK planning.
+            if (input.source == null) break;
+            var source: ?@import("../system_catalog/domain_types.zig").Reference = null;
+            if (cascade) {
+                const parent_column = parent.table.view.physicalLayout().ordinalForName(parent.table.view.tableSchema().relational_columns, parent_name) orelse return error.InvalidIntegrityRecord;
+                if (parent.table.view.validator()) |parent_validator| if (parent_validator.execution.domains) |*parent_domains| {
+                    for (parent_domains.bindings) |binding| if (binding.ordinal == parent_column) {
+                        const identity = binding.view.identity orelse return error.InvalidSqlNamedType;
+                        if (identity.id == input.source.?.id) source = .{ .id = identity.id, .origin_id = identity.origin_id, .generation = identity.generation };
+                        break;
+                    };
+                };
+            }
+            input.source = source;
+            break;
+        };
+        child.after_prepared_domain = null;
+    }
+
     fn expandWork(self: *Builder, item: *Work) !planner.Expansion {
         if (item.expansion) |expansion| return expansion;
         const plan = try self.bindingPlan(item.table);
@@ -741,9 +797,12 @@ const Builder = struct {
         const temporary = scratch.allocator();
         var before: ?mapper.PreparedRelationalWrite = if (item.before) |row| try mapper.PreparedRelationalWrite.initTyped(temporary, temporary, temporary, false, item.key, row.json, null, view.tableSchema().*, view.physicalLayout(), row.json_null_fields, true) else null;
         defer if (before) |*row| row.deinit(temporary);
-        var after: ?mapper.PreparedRelationalWrite = if (item.after) |json| try mapper.PreparedRelationalWrite.initTyped(temporary, temporary, temporary, false, item.key, json, if (view.validator()) |validator| try self.preparationValidator(validator, item.table) else null, view.tableSchema().*, view.physicalLayout(), item.after_json_null_fields, false) else null;
+        const after_validator = if (view.validator()) |validator| (try self.preparationValidator(validator, item.table)).forDomainAdmission(if (item.after_domain_inputs) |inputs| .{ .schema_version = view.version(), .inputs = inputs, .complete_row = false } else null) else null;
+        const preserve_domain = try @import("../schema/domain_handoff.zig").preserveFor(after_validator, item.after_prepared_domain, false);
+        var after: ?mapper.PreparedRelationalWrite = if (item.after) |json| try mapper.PreparedRelationalWrite.initTyped(temporary, temporary, temporary, false, item.key, json, after_validator, view.tableSchema().*, view.physicalLayout(), item.after_json_null_fields, preserve_domain) else null;
         defer if (after) |*row| row.deinit(temporary);
-        if (after) |*row| if (view.validator()) |validator| if (validator.execution.expressions) |expressions| if (expressions.bindings.len != 0 or expressions.modifier_ordinals.len != 0) {
+        const materialize_after = if (view.validator()) |validator| validator.execution.domains != null or if (validator.execution.expressions) |expressions| expressions.bindings.len != 0 or expressions.modifier_ordinals.len != 0 else false else false;
+        if (after) |*row| if (materialize_after) {
             // Cascading parent assignments and final participant writes must
             // use the same normalized row used to derive integrity claims.
             const normalized = try std.json.Stringify.valueAlloc(self.alloc, row.parsedValue(), .{});
@@ -752,6 +811,8 @@ const Builder = struct {
             item.after_json_null_fields = try (try row.typedView(view.tableSchema().*, view.physicalLayout())).jsonNullFieldsAlloc(self.alloc);
             try self.chargeJsonNullFields(item.after_json_null_fields);
         };
+        if (after != null) item.after_prepared_domain = try self.domainContract(item.table);
+        item.after_domain_inputs = null;
         item.expansion = try plan.expand(self.alloc, &.{.{ .key = item.key, .before = if (before) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .after = if (after) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .repair = self.repairing(item.table.name) }});
         try self.charge(item.expansion.?.arena.queryCapacity());
         return item.expansion.?;
@@ -851,6 +912,7 @@ const Builder = struct {
             }
             const existing = object.get(child_column) orelse .null;
             if (try assignmentEqual(child.table, child_column, existing, next)) continue;
+            try self.domainAction(child, object, child_column, parent, parent_column, action == .cascade);
             try child.assignments.put(self.alloc, try self.alloc.dupe(u8, child_column), next);
             try object.put(self.alloc, child_column, next);
             changed = true;
@@ -1290,6 +1352,8 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
             item.explicit = true;
             item.after = if (entry.value_ptr.*) |write| write.value else null;
             item.after_json_null_fields = if (entry.value_ptr.*) |write| write.json_null_fields else &.{};
+            item.after_prepared_domain = if (entry.value_ptr.*) |write| write.prepared_domain else null;
+            item.after_domain_inputs = null;
             try builder.enqueue(item);
             // Materialize volatile defaults before visiting any FK edge. The
             // cached expansion, explicit assignments and final writes all use
@@ -1349,7 +1413,7 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
         if (!item.dirty) continue;
         const i = try builder.outputIndex(item.table.name, item.table.view.version());
         try builder.appendPredicate(i, item.key, item.observed_version, item.observed_digest);
-        if (item.after) |json| try final_writes[i].append(builder.alloc, .{ .key = item.key, .value = json, .json_null_fields = item.after_json_null_fields }) else try final_deletes[i].append(builder.alloc, item.key);
+        if (item.after) |json| try final_writes[i].append(builder.alloc, .{ .key = item.key, .value = json, .json_null_fields = item.after_json_null_fields, .prepared_domain = item.after_prepared_domain }) else try final_deletes[i].append(builder.alloc, item.key);
         // This arena is owned transitively by the returned request arena.
         const expansion = try builder.expandWork(item);
         for (expansion.commands) |command| try builder.appendCommand(command.table_name, command.command);
@@ -2762,6 +2826,12 @@ test "distributed txn deferred unique overlay permits repair and validates immed
             pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
                 return null;
             }
+            pub fn seekAtOrBefore(_: *@This(), _: []const u8) !?Entry {
+                return null;
+            }
+            pub fn prev(_: *@This()) !?Entry {
+                return null;
+            }
             pub fn next(_: *@This()) !?Entry {
                 return null;
             }
@@ -3301,14 +3371,19 @@ test "distributed txn deferred NO ACTION retains unchanged child proof through f
 }
 
 test "distributed txn atomic cascade adapter composes real native reference pages and commit guards" {
-    try testNativeCascade(false);
+    try testNativeCascade(false, false);
 }
 
 test "distributed txn generated parent values drive canonical cascade assignments" {
-    try testNativeCascade(true);
+    try testNativeCascade(true, false);
 }
 
-fn testNativeCascade(generated: bool) !void {
+test "distributed txn domain cascade preserves historical typed NULL defaults provenance and cold commits" {
+    try testNativeCascade(false, true);
+    try testNativeCascade(true, true);
+}
+
+fn testNativeCascade(generated: bool, with_domain: bool) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const gate = @import("../storage/read_consistency.zig");
     const alloc = std.testing.allocator;
@@ -3317,12 +3392,31 @@ fn testNativeCascade(generated: bool) !void {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/cascade", .{tmp.sub_path});
     var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 500, .shard_id = 501 }, .primary_backend = .{ .lsm = .{} } });
-    defer db.close();
-    const declaration = if (generated)
+    var db_open = true;
+    defer if (db_open) db.close();
+    const base_declaration = if (generated)
         \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"id","expression":{"op":"add","args":[{"op":"column","column":"seed"},{"op":"literal","type":"integer","value":"1"}]}}],"unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"seed":{"type":"integer"},"id":{"type":"integer"},"parent":{"type":"integer","nullable":true},"payload":{"type":"json","x-antfly-sql-type":"jsonb","nullable":true}},"additionalProperties":false}}}}
     else
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true},"payload":{"type":"json","x-antfly-sql-type":"jsonb","nullable":true}},"additionalProperties":false}}}}
     ;
+    var region = std.heap.ArenaAllocator.init(alloc);
+    defer region.deinit();
+    const r = region.allocator();
+    const declaration = if (with_domain) typed: {
+        const named = @import("../system_catalog/named_types.zig");
+        const record: named.Record = .{ .identity = try named.Identity.init(7, 2, 1, @splat(8)), .owner = .auth_disabled, .definition = .{ .domain = .{ .base = .{ .builtin = .text }, .not_null = true, .default_expression =
+            \\{"op":"literal","type":"string","value":"queued"}
+        } } };
+        const wire = try @import("../common/sql_named_type_layout.zig").toWireLeaky(r, record);
+        const directory = try std.json.parseFromSliceLeaky(std.json.Value, r, try std.json.Stringify.valueAlloc(r, [_]@TypeOf(wire){wire}, .{}), .{});
+        var root = try std.json.parseFromSliceLeaky(std.json.Value, r, base_declaration, .{ .parse_numbers = false });
+        try root.object.put(r, "named_types", directory);
+        const property = try std.json.parseFromSliceLeaky(std.json.Value, r,
+            \\{"type":["text","null"],"x-antfly-sql-type-id":7}
+        , .{});
+        try root.object.getPtr("document_schemas").?.object.getPtr("row").?.object.getPtr("schema").?.object.getPtr("properties").?.object.put(r, "status", property);
+        break :typed try std.json.Stringify.valueAlloc(r, root, .{});
+    } else base_declaration;
     try db.setSchemaJson(alloc, declaration);
     const Fixture = struct {
         db: *db_mod.DB,
@@ -3364,9 +3458,25 @@ fn testNativeCascade(generated: bool) !void {
     const source: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = Fixture.scan, .query = Fixture.query }, .strict_read_index_absence = true };
     const tables = [_]TableRecord{.{ .table_id = 500, .name = "rows", .placement_role = "data", .schema_json = declaration }};
     const ranges = [_]RangeRecord{.{ .group_id = 501, .table_id = 500, .start_key = "" }};
+    const initial_child: types.BatchWrite = if (with_domain) typed: {
+        var parsed = try std.json.parseFromSliceLeaky(std.json.Value, r, if (generated) "{\"seed\":1,\"parent\":1,\"payload\":null}" else "{\"id\":2,\"parent\":1,\"payload\":null}", .{});
+        try parsed.object.put(r, "status", .null);
+        const bytes = try std.json.Stringify.valueAlloc(r, parsed, .{});
+        try std.testing.expectError(error.SqlNotNullViolation, prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "raw-domain", .value = bytes, .json_null_fields = &.{"payload"} }} }}));
+        fixture.observation_batches = 0;
+        var validator = try schema_api.CompiledTableValidator.init(alloc, declaration);
+        defer validator.deinit(alloc);
+        const binding = validator.execution.domains.?.bindings[0];
+        const identity = binding.view.identity.?;
+        const descriptor = try r.create(@import("../schema/domain_handoff.zig").Contract);
+        const session = try db.openRelationalReadSession(r, "", "z", .{ .limit = 1, .relational_query = .{ .fields = &.{}, .schema_version = 1 } });
+        defer session.deinit();
+        const prepared = try session.normalizeDomainRows(r, &.{.{ .key = "c", .value = bytes, .json_null_fields = &.{"payload"} }}, &.{.{ .schema_version = 1, .inputs = &.{.{ .ordinal = binding.ordinal, .source = .{ .id = identity.id, .origin_id = identity.origin_id, .generation = identity.generation } }} }}, descriptor);
+        break :typed prepared[0];
+    } else .{ .key = "c", .value = if (generated) "{\"seed\":1,\"parent\":1,\"payload\":null}" else "{\"id\":2,\"parent\":1,\"payload\":null}", .json_null_fields = &.{"payload"} };
     var inserted = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{
         .{ .key = "p", .value = if (generated) "{\"seed\":0,\"parent\":null}" else "{\"id\":1,\"parent\":null}" },
-        .{ .key = "c", .value = if (generated) "{\"seed\":1,\"parent\":1,\"payload\":null}" else "{\"id\":2,\"parent\":1,\"payload\":null}", .json_null_fields = &.{"payload"} },
+        initial_child,
     } }});
     defer inserted.deinit();
     try std.testing.expectEqual(@as(usize, 1), fixture.observation_batches);
@@ -3400,8 +3510,8 @@ fn testNativeCascade(generated: bool) !void {
     defer winner.deinit();
     try Fixture.commit(&db, winner, 4);
     try std.testing.expectError(error.UniqueConstraintViolation, Fixture.commit(&db, optimistic, 5));
-    if (generated) {
-        var updated = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "p", .value = "{\"seed\":9007199254740993,\"parent\":null}" }} }});
+    if (generated or with_domain) {
+        var updated = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "p", .value = if (generated) "{\"seed\":9007199254740993,\"parent\":null}" else "{\"id\":3,\"parent\":null}" }} }});
         defer updated.deinit();
         try Fixture.commit(&db, updated, 2);
         var child = (try db.lookup(alloc, "c", .{ .include_json_null_fields = true })).?;
@@ -3410,7 +3520,19 @@ fn testNativeCascade(generated: bool) !void {
         try std.testing.expectEqualStrings("payload", child.json_null_fields[0]);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, child.json, .{ .parse_numbers = false });
         defer parsed.deinit();
-        try std.testing.expectEqualStrings("9007199254740994", parsed.value.object.get("parent").?.number_string);
+        try std.testing.expectEqualStrings(if (generated) "9007199254740994" else "3", parsed.value.object.get("parent").?.number_string);
+        if (with_domain) try std.testing.expect(parsed.value.object.get("status").? == .null);
+    }
+    if (with_domain) {
+        db.close();
+        db_open = false;
+        db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 500, .shard_id = 501 }, .primary_backend = .{ .lsm = .{} } });
+        db_open = true;
+        var cold = (try db.lookup(alloc, "c", .{})).?;
+        defer cold.deinit(alloc);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cold.json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("status").? == .null);
     }
     fixture.reference_pages = 0;
     var removed = try prepareWithCoverage(alloc, source, &tables, &ranges, &.{.{ .table_name = "rows", .deletes = &.{"p"} }});
@@ -3421,7 +3543,7 @@ fn testNativeCascade(generated: bool) !void {
     // Cascaded detaches/releases are evaluated together, never as isolated
     // probes against the pre-statement parent claim.
     try rejectDefiniteConflicts(alloc, source, &tables, &ranges, removed.tables, .{});
-    try Fixture.commit(&db, removed, if (generated) 3 else 2);
+    try Fixture.commit(&db, removed, if (generated or with_domain) 3 else 2);
     try std.testing.expect((try db.lookup(alloc, "p", .{})) == null);
     try std.testing.expect((try db.lookup(alloc, "c", .{})) == null);
 }

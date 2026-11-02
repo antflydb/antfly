@@ -98,6 +98,14 @@ pub fn checkResult(request: seq.Mutation, revision: u64, result: seq.Result) !vo
 pub fn decodeOutcome(a: A, bytes: []const u8, request: seq.Mutation, revision: u64) ?seq.Outcome {
     const value = (std.json.parseFromSliceLeaky(?seq.Outcome, a, bytes, .{}) catch return null) orelse return null;
     if (value == .success) checkResult(request, revision, value.success) catch return null;
+    if (value == .pending) {
+        const pending = value.pending;
+        pending.validate() catch return null;
+        if (request.operation != .drop or !request.operation.drop.cascade or pending.work != .sequence_schema or
+            pending.revision < revision or !pending.matchesIncarnation(request.incarnation)) return null;
+        const expected = request.operation.drop.expected orelse return null;
+        if (!std.meta.eql(pending.identity, expected)) return null;
+    }
     return value;
 }
 
@@ -105,9 +113,21 @@ pub fn decodeOutcome(a: A, bytes: []const u8, request: seq.Mutation, revision: u
 /// response encoding and cannot turn a committed operation into a retryable OOM.
 pub fn complete(receipt: *Receipt, outcome: seq.Outcome) void {
     switch (outcome) {
+        .pending => |value| {
+            receipt.state = .pending;
+            receipt.object_id = value.identity.id;
+            receipt.generation = null;
+            receipt.catalog_revision = null;
+            // Accepted work is observable progress, not a retryable failure.
+            receipt.diagnostic = null;
+        },
         .success => |value| {
             receipt.state = .committed;
             receipt.catalog_revision = value.revision;
+            // A pending receipt can identify the old target. Terminal DROP
+            // carries no surviving identity and must not retain that hint.
+            receipt.object_id = null;
+            receipt.generation = null;
             if (value.identity) |id| {
                 receipt.object_id = id.id;
                 receipt.generation = id.generation;
@@ -137,6 +157,9 @@ pub fn observe(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
 pub fn recover(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, a: A, encoded: []const u8) !Receipt {
     try context.ensureActive();
     if (server.cfg.auth_enabled and identity == null) return error.Forbidden;
+    if (try @import("sql_table_retirement.zig").recoverIfTable(server, identity, context, a, encoded)) |receipt| return receipt;
+    if (try @import("sql_authorization_recovery.zig").recoverIfAuthorization(server, identity, context, a, encoded)) |receipt| return receipt;
+    if (try @import("sql_native_index_recovery.zig").recoverIfIndex(server, identity, context, a, encoded)) |receipt| return receipt;
     if (try @import("sql_type_recovery.zig").recoverIfType(server, identity, context, a, encoded)) |receipt| return receipt;
     if (try @import("sql_cast_recovery.zig").recoverIfCast(server, identity, context, a, encoded)) |receipt| return receipt;
     if (try @import("sql_routine_recovery.zig").recoverIfCallable(server, identity, context, a, encoded)) |receipt| return receipt;

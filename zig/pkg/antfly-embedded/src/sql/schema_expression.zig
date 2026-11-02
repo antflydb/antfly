@@ -30,6 +30,7 @@ fn nullLiteral(instruction: scalar.Instruction) bool {
 }
 
 fn promoteNumeric(alloc: std.mem.Allocator, value: Json, source: scalar.Type, target: scalar.Type) !Json {
+    if (target.enum_view != null and source.kind == null) return inputLiteral(alloc, target, .{});
     if (value == .object and value.object.get("value") != null and value.object.get("value").? == .null and
         !std.meta.eql(value.object.get("json_null"), @as(?Json, .{ .bool = true })) and
         std.mem.eql(u8, value.object.get("op").?.string, "literal"))
@@ -89,6 +90,11 @@ fn json(alloc: std.mem.Allocator, input: anytype) !Json {
 }
 
 fn inputLiteral(alloc: std.mem.Allocator, result: scalar.Type, value: scalar.Datum) !Json {
+    if (result.enum_view) |view| {
+        if (result.kind != .enumeration) return error.InvalidSqlProgram;
+        if (!value.sql_null) _ = try view.output(value.enumeration() orelse return error.InvalidSqlProgram);
+        return json(alloc, .{ .op = "literal", .type = "enumeration", .named_type_id = view.record.identity.id, .value = if (value.sql_null) @as(?[]const u8, null) else value.enumeration().?.text });
+    }
     if (value.temporal() != null or value.enumeration() != null or result.kind == .enumeration) return error.UnsupportedSqlShape;
     const kind = result.kind orelse return error.SqlTypeMismatch;
     const identity = result.element_type;
@@ -143,7 +149,7 @@ pub fn lower(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scal
     return (try lowerTyped(alloc, schema, expression, expected)).expression;
 }
 
-const Lowered = struct { expression: Json, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType };
+const Lowered = struct { expression: Json, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType, enum_id: ?u64 = null, enum_origin: ?[16]u8 = null };
 
 pub fn lowerTyped(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType) !Lowered {
     return lowerTypedPolicy(alloc, schema, expression, expected, null, .{});
@@ -154,13 +160,30 @@ pub fn lowerIndexKey(alloc: std.mem.Allocator, schema: Json, expression: *const 
 }
 
 fn lowerTypedPolicy(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType, immutable: ?ExpressionContext, limits: @import("immutable_plan.zig").Limits) !Lowered {
-    const properties = try @import("schema_columns.zig").properties(schema);
-    var columns = std.ArrayList(scalar.Column).empty;
-    for (properties.object.keys(), properties.object.values()) |name, property| {
+    return lowerColumnsPolicy(alloc, try schemaColumnsLeaky(alloc, schema), expression, expected, immutable, limits);
+}
+
+/// All executable views live in the caller's bounded preparation region.
+/// The returned durable JSON contains IDs, never pointers to this directory.
+fn schemaColumnsLeaky(alloc: std.mem.Allocator, schema: Json) ![]const scalar.Column {
+    const fields = try @import("schema_columns.zig").properties(schema);
+    var registry: ?@import("../common/sql_named_type_layout.zig").Registry = null;
+    if (schema.object.get("named_types")) |layouts| registry = try .parseValue(alloc, layouts);
+    const columns = try alloc.alloc(scalar.Column, fields.object.count());
+    for (fields.object.keys(), fields.object.values(), columns) |name, property, *output| {
         const column = try @import("schema_columns.zig").column(name, property);
-        try columns.append(alloc, .{ .name = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier });
+        output.* = .{ .name = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+        if (column.type == .enumeration) {
+            const raw = property.object.get("x-antfly-sql-type-id") orelse return error.InvalidSqlBackendResponse;
+            const id = switch (raw) {
+                .integer => |value| std.math.cast(u64, value) orelse return error.InvalidSqlBackendResponse,
+                .number_string => |value| std.fmt.parseInt(u64, value, 10) catch return error.InvalidSqlBackendResponse,
+                else => return error.InvalidSqlBackendResponse,
+            };
+            output.enum_view = if (registry) |directory| directory.byId(id) orelse return error.InvalidSqlBackendResponse else return error.InvalidSqlBackendResponse;
+        }
     }
-    return lowerColumnsPolicy(alloc, columns.items, expression, expected, immutable, limits);
+    return columns;
 }
 
 pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, expression: *const ast.Scalar, expected: ?ast.ColumnType) !Lowered {
@@ -200,7 +223,7 @@ pub fn indexInstructionIdentity(alloc: std.mem.Allocator, program: *const scalar
         .column = "",
         .expression = lowered.expression,
         .result_type = switch (lowered.type) {
-            .enumeration => return error.UnsupportedSqlShape,
+            .enumeration, .bytea => return error.UnsupportedSqlShape,
             .string, .uuid => .string,
             .integer => .integer,
             .number => if (lowered.element_type == .numeric) .numeric else .number,
@@ -284,7 +307,9 @@ fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, 
             else => {},
         };
         out.* = switch (instruction.operation) {
-            .literal => |literal| if (kind == .array)
+            .literal => |literal| if (instruction.type.enum_view) |view|
+                try json(alloc, .{ .op = "literal", .type = "enumeration", .named_type_id = view.record.identity.id, .value = literal })
+            else if (kind == .array)
                 try json(alloc, .{ .op = "literal", .type = "sql_array", .sql_type = @tagName(instruction.type.element_type orelse return error.UnsupportedSqlShape), .value = literal })
             else if (instruction.type.element_type == .numeric)
                 try numericLiteral(alloc, literal)
@@ -416,6 +441,7 @@ fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, 
                     .mod => "modulo",
                     .replace => "replace",
                     .md5 => "md5",
+                    inline .length, .octet_length, .bit_length => |tag| @tagName(tag),
                     inline .jsonb_typeof, .jsonb_array_length, .jsonb_extract_path, .jsonb_extract_path_text => |tag| @tagName(tag),
                     inline .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => |tag| @tagName(tag),
                     else => return error.UnsupportedSqlShape,
@@ -434,6 +460,17 @@ fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, 
                 break :blk result;
             },
             .cast => |part| blk: {
+                // Stored schema programs need a durable domain opcode and
+                // reader fence; a physical base cast cannot replace its checks.
+                if (part.domain_check) return error.UnsupportedSqlExecution;
+                if (part.enum_view) |view| {
+                    if (nullLiteral(program.instructions[part.operand])) break :blk try inputLiteral(alloc, instruction.type, .{});
+                    break :blk try json(alloc, .{ .op = "cast", .type = "enumeration", .named_type_id = view.record.identity.id, .args = &[_]Json{values[part.operand]} });
+                }
+                if (program.instructions[part.operand].type.kind == .enumeration) {
+                    if (part.type != .string) return error.UnsupportedSqlShape;
+                    break :blk try json(alloc, .{ .op = "cast", .type = "string", .args = &[_]Json{values[part.operand]} });
+                }
                 const source = program.instructions[part.operand].type;
                 var lowered: Json = converted: {
                     if (instruction.input_function) break :converted try inputLiteral(alloc, instruction.type, program.constant_inputs.get(@intCast(instruction_index)) orelse return error.InvalidSqlProgram);
@@ -531,7 +568,7 @@ fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, 
             try out.object.put(alloc, "sql_type", .{ .string = @tagName(identity) });
         };
     }
-    return .{ .expression = values[program.root], .type = program.output_type.kind orelse return error.SqlTypeMismatch, .element_type = program.output_type.element_type };
+    return .{ .expression = values[program.root], .type = program.output_type.kind orelse return error.SqlTypeMismatch, .element_type = program.output_type.element_type, .enum_id = if (program.output_type.enum_view) |view| view.record.identity.id else null, .enum_origin = if (program.output_type.enum_view) |view| view.record.identity.origin_id else null };
 }
 
 test "SQL index key identities share native domains without narrowing or collation guesses" {
@@ -789,6 +826,12 @@ pub fn lowerAssignment(alloc: std.mem.Allocator, schema: Json, expression: *cons
 pub fn lowerAssignmentWithLimits(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, column: ast.Column, generated: bool, limits: @import("immutable_plan.zig").Limits) !Json {
     if (limits.checkpoint) |check| try check(limits.checkpoint_context);
     if (generated) try rejectGeneratedReferences(schema, column.name, expression);
+    if (column.enum_view) |view| {
+        const columns = if (generated) try schemaColumnsLeaky(alloc, schema) else &.{};
+        var program = try scalar.bindTypedExpectedWithSettings(alloc, expression, columns, &.{}, .{ .kind = .enumeration, .enum_view = view }, .{ .assignment = true }, null);
+        defer program.deinit();
+        return finishAssignment(alloc, try lowerProgramPolicy(alloc, &program, columns, if (generated) .generation else .column_default, limits), column);
+    }
     if (expression.* == .literal) return @import("ddl_runtime.zig").defaultExpression(alloc, expression.literal, column.type, column.element_type);
     const lowered = (if (generated)
         lowerTypedPolicy(alloc, schema, expression, column.type, .generation, limits)
@@ -813,6 +856,10 @@ pub fn lowerRewriteAssignment(alloc: std.mem.Allocator, schema: Json, expression
 }
 
 fn finishAssignment(alloc: std.mem.Allocator, lowered: Lowered, column: ast.Column) !Json {
+    if (column.enum_view) |view| {
+        if (lowered.type != .enumeration or lowered.enum_id != view.record.identity.id or lowered.enum_origin == null or !std.mem.eql(u8, &lowered.enum_origin.?, &view.record.identity.origin_id)) return error.SqlAssignmentTypeMismatch;
+        return lowered.expression;
+    }
     if (column.type == .integer or column.type == .number) {
         if (lowered.type != .integer and lowered.type != .number) return error.SqlAssignmentTypeMismatch;
         // Untyped SQL decimal arithmetic requires an exact decimal value

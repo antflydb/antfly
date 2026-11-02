@@ -39,6 +39,8 @@ test "SQL RETURNING preserves JSON numeric scalars instead of SQL bigint wire st
 }
 
 const Fixture = struct {
+    expected_action: catalog.Action = .read_write,
+    sql_rights: ?u16 = null,
     writes: usize = 0,
     prepares: usize = 0,
     rows: usize = 0,
@@ -54,9 +56,10 @@ const Fixture = struct {
     fn generateRowId(_: *anyopaque, alloc: Allocator) ![]const u8 {
         return alloc.dupe(u8, "generated");
     }
-    fn resolve(_: *anyopaque, _: Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
-        if (action != .read_write) return error.UnexpectedAuthorization;
-        return .{ .id = 1, .physical_name = "items", .schema_version = 7, .columns = &.{
+    fn resolve(raw: *anyopaque, _: Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
+        const self: *Fixture = @ptrCast(@alignCast(raw));
+        if (action != self.expected_action) return error.UnexpectedAuthorization;
+        return .{ .sql_access = if (self.sql_rights) |rights| .{ .rights = rights } else null, .id = 1, .physical_name = "items", .schema_version = 7, .columns = &.{
             .{ .name = "n", .path = "n", .type = .integer, .nullable = false, .defaulted = true },
             .{ .name = "j", .path = "j", .type = .json },
             .{ .name = "s", .path = "s", .type = .string },
@@ -281,8 +284,8 @@ test "SQL RETURNING qualified wildcard preparation owns every allocation failure
 }
 
 test "SQL RETURNING rejects preparation projection and quota failures before commit" {
-    const cases = [_]struct { sql: []const u8, failure: anyerror, prepare_failure: ?anyerror = null, corrupt: bool = false, capability: bool = true, limits: runtime.Limits = .{} }{
-        .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING 1/0", .failure = error.SqlDivisionByZero },
+    const cases = [_]struct { sql: []const u8, failure: anyerror, expected_action: catalog.Action = .read_write, prepare_failure: ?anyerror = null, corrupt: bool = false, capability: bool = true, limits: runtime.Limits = .{} }{
+        .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING 1/0", .failure = error.SqlDivisionByZero, .expected_action = .write },
         .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',4),('b',4) RETURNING n", .failure = error.SqlResultTooLarge, .limits = .{ .result_rows = 1 } },
         .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING n", .failure = error.SqlWriteConflict, .prepare_failure = error.SqlWriteConflict },
         .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING n", .failure = error.InvalidSqlBackendResponse, .corrupt = true },
@@ -290,7 +293,7 @@ test "SQL RETURNING rejects preparation projection and quota failures before com
         .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING n", .failure = error.SqlWorkingMemoryLimitExceeded, .limits = .{ .retained_bytes = 64 } },
     };
     for (cases) |case| {
-        var fixture: Fixture = .{ .prepare_failure = case.prepare_failure, .corrupt_identity = case.corrupt };
+        var fixture: Fixture = .{ .expected_action = case.expected_action, .prepare_failure = case.prepare_failure, .corrupt_identity = case.corrupt };
         var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
         defer compiled.deinit();
         try std.testing.expectError(case.failure, runtime.execute(std.testing.allocator, fixture.backend(case.capability), &compiled, &.{}, case.limits));
@@ -325,4 +328,23 @@ test "SQL RETURNING owns partial preparation and projected results under allocat
     var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id,n,j) VALUES ('a',4,CAST('null' AS json)) RETURNING _id,n+g,label,j,s", .{});
     defer compiled.deinit();
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
+}
+
+test "SQL RETURNING prepared images retain parent INSERT authority without granting stored column reads" {
+    const access = @import("antfly_local_sources").system_catalog_privileges.Access;
+    for ([_]bool{ false, true }) |wildcard| {
+        var fixture: Fixture = .{ .expected_action = if (wildcard) .read_write else .write, .sql_rights = access.bit(.insert) };
+        var compiled = try compiler.compile(std.testing.allocator, if (wildcard) "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING *" else "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING 1", .{});
+        defer compiled.deinit();
+        if (wildcard) {
+            try std.testing.expectError(error.Forbidden, runtime.execute(std.testing.allocator, fixture.backend(true), &compiled, &.{}, .{}));
+            try std.testing.expectEqual(@as(usize, 0), fixture.prepares);
+            try std.testing.expectEqual(@as(usize, 0), fixture.writes);
+        } else {
+            var result = try runtime.execute(std.testing.allocator, fixture.backend(true), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), fixture.writes);
+            try std.testing.expectEqual(@as(usize, 1), result.output.rowCount());
+        }
+    }
 }

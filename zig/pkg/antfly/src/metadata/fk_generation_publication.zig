@@ -290,6 +290,8 @@ pub const Plan = struct {
     /// generation tombstones authorize catalog deletion, never a weaker public
     /// child schema or a row-by-row unique-claim drain.
     sql_drop: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard = null,
+    /// A root-bound owner plan is never an independent FK schema publication.
+    table_retirement: ?@import("table_retirement_manifest.zig").Reference = null,
     id: Id,
     child_before: records.TableRecord,
     child_after: records.TableRecord,
@@ -303,6 +305,7 @@ pub const Plan = struct {
     /// Admission is checked before reserving the successor schema. The plan
     /// digest binds it through owner receipts, cancellation and restart.
     constraint_name_guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard = null,
+    object_rename_guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard = null,
     catalog_coverage: CatalogCoverage = .legacy,
 
     /// Proposal-time only: old committed plans still replay under their exact
@@ -322,7 +325,7 @@ pub const Plan = struct {
     pub fn jsonStringify(self: Plan, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Plan).@"struct".field_names) |field| {
-            const include = if (comptime std.mem.eql(u8, field, "sql_drop")) self.sql_drop != null else if (comptime std.mem.eql(u8, field, "constraint_name_guard")) self.constraint_name_guard != null else if (comptime std.mem.eql(u8, field, "catalog_coverage")) self.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field, "historical_reference_coverage")) self.historical_reference_coverage else true;
+            const include = if (comptime std.mem.eql(u8, field, "table_retirement")) self.table_retirement != null else if (comptime std.mem.eql(u8, field, "sql_drop")) self.sql_drop != null else if (comptime std.mem.eql(u8, field, "constraint_name_guard")) self.constraint_name_guard != null else if (comptime std.mem.eql(u8, field, "object_rename_guard")) self.object_rename_guard != null else if (comptime std.mem.eql(u8, field, "catalog_coverage")) self.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field, "historical_reference_coverage")) self.historical_reference_coverage else true;
             if (include) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
@@ -332,6 +335,10 @@ pub const Plan = struct {
     }
 
     pub fn validate(self: Plan, alloc: std.mem.Allocator) !void {
+        if (self.table_retirement) |root| {
+            try root.validate();
+            if (self.sql_drop == null or root.root_table != self.child_before.table_id) return error.InvalidGenerationPublication;
+        }
         if (!self.historical_reference_coverage and try schemaHasUnvalidatedForeignKeys(alloc, self.child_after.schema_json)) return error.InvalidGenerationPublication;
         if (std.mem.allEqual(u8, &self.id, 0) or self.child_before.table_id == 0 or
             self.child_before.table_id != self.child_after.table_id or
@@ -352,7 +359,7 @@ pub const Plan = struct {
             return error.InvalidGenerationPublication;
         if (self.sql_drop) |guard| {
             guard.validate() catch return error.InvalidGenerationPublication;
-            if (guard.owner.kind != .table or guard.constraint_name_admission != null or self.constraint_name_guard != null or
+            if (guard.owner.kind != .table or guard.hasDefinitionIntent() or self.constraint_name_guard != null or self.object_rename_guard != null or
                 guard.owner.table_id != self.child_before.table_id or guard.owner.schema_version != before.version or
                 !std.mem.eql(u8, guard.target.name, guard.logical_table)) return error.InvalidGenerationPublication;
             var source_digest: [32]u8 = undefined;
@@ -367,6 +374,18 @@ pub const Plan = struct {
             const shape = @import("schema_publication_shape.zig");
             try shape.requireTableImages(alloc, self.child_before, self.child_after);
             try shape.requireForeignKeySchemaDelta(alloc, self.child_before.schema_json, self.child_after.schema_json);
+        }
+        if (self.object_rename_guard) |guard| {
+            guard.validate() catch return error.InvalidGenerationPublication;
+            if (self.constraint_name_guard != null or self.sql_drop != null or guard.object_renames.len == 0 or guard.constraint_name_admission != null or
+                guard.owner.table_id != self.child_before.table_id or guard.owner.schema_version != before.version) return error.InvalidGenerationPublication;
+            var source_digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(self.child_before.schema_json, &source_digest, .{});
+            if (!std.mem.eql(u8, &source_digest, &guard.owner.schema_digest)) return error.InvalidGenerationPublication;
+            @import("antfly_local_sources").system_catalog_domain.object_definitions.validateRenameDefinitions(alloc, self.child_before.schema_json, self.child_before.indexes_json, self.child_after.schema_json, self.child_after.indexes_json, guard.object_renames) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return error.InvalidGenerationPublication;
+            };
         }
         if (self.constraint_name_guard) |guard| {
             guard.validate() catch return error.InvalidGenerationPublication;
@@ -640,6 +659,7 @@ pub const InitialCreatePlan = struct {
     }
 
     historical_reference_coverage: bool = false,
+    sql_owner: ?@import("antfly_local_sources").system_catalog_privileges.Principal = null,
     id: Id,
     catalog_coverage: CatalogCoverage = .legacy,
     retirement_scope: InitialRetirementScope,
@@ -662,10 +682,15 @@ pub const InitialCreatePlan = struct {
 
     constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
 
+    creation_copy: ?@import("initial_creation_copy.zig").Input = null,
+    copy_effects: ?@import("initial_creation_copy.zig").Effects = null,
+    column_sequences: []const @import("antfly_local_sources").system_catalog_column_sequences.Creation = &.{},
+    counter_effects: ?@import("initial_column_sequences.zig").Effects = null,
+
     pub fn jsonStringify(self: InitialCreatePlan, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(InitialCreatePlan).@"struct".field_names) |field_name| {
-            const include = if (comptime std.mem.eql(u8, field_name, "catalog_coverage")) self.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field_name, "constraint_name_admission")) self.constraint_name_admission != null else if (comptime std.mem.eql(u8, field_name, "historical_reference_coverage")) self.historical_reference_coverage else true;
+            const include = if (comptime std.mem.eql(u8, field_name, "creation_copy")) self.creation_copy != null else if (comptime std.mem.eql(u8, field_name, "copy_effects")) self.copy_effects != null else if (comptime std.mem.eql(u8, field_name, "column_sequences")) self.column_sequences.len != 0 else if (comptime std.mem.eql(u8, field_name, "counter_effects")) self.counter_effects != null else if (comptime std.mem.eql(u8, field_name, "sql_owner")) self.sql_owner != null else if (comptime std.mem.eql(u8, field_name, "catalog_coverage")) self.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field_name, "constraint_name_admission")) self.constraint_name_admission != null else if (comptime std.mem.eql(u8, field_name, "historical_reference_coverage")) self.historical_reference_coverage else true;
             if (include) {
                 try writer.objectField(field_name);
                 try writer.write(@field(self, field_name));
@@ -675,6 +700,18 @@ pub const InitialCreatePlan = struct {
     }
 
     pub fn validate(self: InitialCreatePlan, alloc: std.mem.Allocator) !void {
+        if (self.creation_copy) |copy| {
+            if (copy.revision != self.expected_catalog_revision) return error.InvalidGenerationPublication;
+            try (self.copy_effects orelse return error.InvalidGenerationPublication).validate(alloc, copy, self.child);
+        } else if (self.copy_effects != null) return error.InvalidGenerationPublication;
+        try @import("initial_column_sequences.zig").validate(alloc, self.child, self.logical_name, self.namespace_id, self.catalog_id, self.column_sequences, self.counter_effects);
+        if (self.counter_effects) |effects| if (effects.source_inputs.len != 0 and self.creation_copy == null) return error.InvalidGenerationPublication;
+        if (self.sql_owner) |owner| {
+            try owner.validate();
+            // SQL SET ROLE is not activated for asynchronous initial-FK
+            // ownership. The public producer admits only user/bootstrap IDs.
+            if (owner.kind != .user and owner.kind != .bootstrap) return error.InvalidGenerationPublication;
+        }
         if (self.historical_reference_coverage != try schemaHasUnvalidatedForeignKeys(alloc, self.child.schema_json)) return error.InvalidGenerationPublication;
         if (self.constraint_name_admission) |admission| {
             if (admission.namespace_id != self.namespace_id) return error.InvalidGenerationPublication;
@@ -1064,17 +1101,14 @@ pub const InitialPublication = struct {
                 if (self.phase != .preparing_support or !self.plan.support_pending) return error.GenerationPublicationChanged;
                 const sealed = command.plan.?;
                 try sealed.validate(alloc);
-                if (sealed.catalog_id != self.plan.catalog_id or sealed.namespace_id != self.plan.namespace_id or
-                    sealed.expected_catalog_revision != self.plan.expected_catalog_revision or
-                    sealed.retirement_scope != self.plan.retirement_scope or
-                    sealed.catalog_coverage != self.plan.catalog_coverage or
-                    sealed.tablespace_id != self.plan.tablespace_id or
-                    sealed.min_ranges_explicit != self.plan.min_ranges_explicit or
-                    !std.mem.eql(u8, sealed.logical_name, self.plan.logical_name) or
-                    !table_manager.tableDefinitionsEqual(sealed.child, self.plan.child) or
-                    sealed.child_ranges.len != self.plan.child_ranges.len or
-                    sealed.parents.len != self.plan.parents.len or
-                    sealed.self_transitions.len != self.plan.self_transitions.len) return error.GenerationPublicationChanged;
+                // Sealing may finalize only parent support witnesses and the
+                // preparatory phase flag. Compare the entire remaining plan
+                // so new ownership/counter/copy fields cannot bypass a manual
+                // allowlist when this durable protocol grows.
+                var envelope = sealed;
+                envelope.parents = self.plan.parents;
+                envelope.support_pending = self.plan.support_pending;
+                if (!try @import("initial_creation_copy.zig").equal(alloc, envelope, self.plan)) return error.GenerationPublicationChanged;
                 for (sealed.self_transitions, self.plan.self_transitions) |transition, pending| {
                     if (!initialTransitionsEqual(transition, pending)) return error.GenerationPublicationChanged;
                 }

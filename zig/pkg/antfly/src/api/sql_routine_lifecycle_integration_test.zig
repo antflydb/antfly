@@ -44,8 +44,9 @@ fn command(ctx: *fixture.Context, statement: []const u8) !void {
 fn rejected(ctx: *fixture.Context, statement: []const u8, code: []const u8) !void {
     var response = try request(ctx, statement, false);
     defer response.deinit(ctx.alloc);
-    if (response.status != 400) std.debug.print("routine rejection status={d} sql={s} body={s}\n", .{ response.status, statement, response.body });
-    try std.testing.expectEqual(@as(u16, 400), response.status);
+    const expected_status: u16 = if (std.mem.eql(u8, code, "0A000")) 501 else 400;
+    if (response.status != expected_status) std.debug.print("routine rejection status={d} sql={s} body={s}\n", .{ response.status, statement, response.body });
+    try std.testing.expectEqual(expected_status, response.status);
     var parsed = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(code, parsed.value.code);
@@ -79,15 +80,15 @@ fn observeAs(ctx: *fixture.Context, statement: []const u8, expected: Output, rea
 // Lose the ACK only after the real Raft mutation returns, then make the
 // producer's first read-only observation unavailable. Never retry the mutation.
 pub fn lostAck(ctx: *fixture.Context, procedure: bool) !void {
-    return lostAckOperation(ctx, procedure, false, false);
+    return lostAckOperation(ctx, procedure, false, false, false);
 }
 pub fn lostCommentAck(ctx: *fixture.Context) !void {
-    return lostAckOperation(ctx, true, true, false);
+    return lostAckOperation(ctx, true, true, false, false);
 }
 pub fn lostAggregateAck(ctx: *fixture.Context) !void {
-    return lostAckOperation(ctx, false, false, true);
+    return lostAckOperation(ctx, false, false, true, false);
 }
-fn lostAckOperation(ctx: *fixture.Context, procedure: bool, comment: bool, aggregate: bool) !void {
+fn lostAckOperation(ctx: *fixture.Context, procedure: bool, comment: bool, aggregate: bool, trigger: bool) !void {
     const http = @import("http_server.zig");
     const Call = @import("../system_catalog/server_call.zig").Call;
     const Context = local.api_operation.RequestContext;
@@ -125,6 +126,8 @@ fn lostAckOperation(ctx: *fixture.Context, procedure: bool, comment: bool, aggre
         try std.fmt.allocPrint(ctx.alloc, "CREATE AGGREGATE lost_ack_aggregate(text)(SFUNC=first_sfunc,STYPE=text,INITCOND='{s}')", .{padding})
     else if (comment)
         try std.fmt.allocPrint(ctx.alloc, "COMMENT ON PROCEDURE lost_ack_procedure(text) IS '{s}'", .{padding})
+    else if (trigger)
+        try std.fmt.allocPrint(ctx.alloc, "CREATE FUNCTION lost_ack_trigger() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; /*{s}*/ END$$", .{padding})
     else if (procedure)
         try std.fmt.allocPrint(ctx.alloc, "CREATE PROCEDURE lost_ack_procedure(text) LANGUAGE plpgsql AS $$BEGIN NULL; /*{s}*/ END$$", .{padding})
     else
@@ -233,4 +236,67 @@ test "mounted SQL original routine declarations preserve typed calls overloads m
         try std.testing.expectEqualStrings((try corpus.get(id)).sql, entry.sql);
     }
     try fixture.runWithState(Campaign, .{ .reference = reference.value });
+}
+
+const TriggerReference = struct {
+    entries: []const struct { id: []const u8, sql: []const u8, command_tag: []const u8 },
+    probes: []const struct { sql: []const u8, sqlstate: []const u8 },
+};
+const TriggerCampaign = struct {
+    pub const native_auth = true;
+    pub const cold_catalog = true;
+    reference: TriggerReference,
+    credentials: client.ApiKeyHeaders = .{},
+    pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
+        try Campaign.configureAuth(manager);
+    }
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.credentials.activateWithCatalog(ctx, true);
+        try lostAckOperation(ctx, false, false, false, true);
+        for (self.reference.entries) |entry| {
+            var response = try request(ctx, entry.sql, false);
+            defer response.deinit(ctx.alloc);
+            if (response.status != 200) std.debug.print("trigger declaration sql={s} body={s}\n", .{ entry.sql, response.body });
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+            defer result.deinit();
+            try std.testing.expectEqualStrings(entry.command_tag, result.value.command_tag);
+        }
+        for (self.reference.probes) |probe| try rejected(ctx, probe.sql, probe.sqlstate);
+        // Existing routine ownership applies to trigger functions too.
+        var denied = try request(ctx, "DROP FUNCTION audit_body()", true);
+        defer denied.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 403), denied.status);
+        try command(ctx, "CREATE OR REPLACE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN OLD; END$$");
+        try command(ctx, "COMMENT ON FUNCTION audit_body() IS 'trigger contract'");
+    }
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        // An existing declaration must survive the actual cold metadata reopen;
+        // a missing object would instead return 42883.
+        for (self.reference.probes[0..6]) |probe| try rejected(ctx, probe.sql, probe.sqlstate);
+        try rejected(ctx, self.reference.entries[0].sql, "42723");
+        try rejected(ctx, self.reference.probes[7].sql, "42P13");
+        inline for (.{ "audit_body", "audit_old_body", "audit_null_body", "audit_notice_body", "audit_perform_body", "audit_perform_arg_body" }) |name| {
+            try command(ctx, "DROP FUNCTION " ++ name ++ "()");
+            try rejected(ctx, "SELECT " ++ name ++ "()", "42883");
+            try command(ctx, "DROP FUNCTION IF EXISTS " ++ name ++ "()");
+        }
+        try command(ctx, self.reference.entries[0].sql);
+        try rejected(ctx, self.reference.probes[0].sql, "0A000");
+    }
+};
+
+test "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards" {
+    const a = std.testing.allocator;
+    var reference = try std.json.parseFromSlice(TriggerReference, a, local.sql_parity_fixtures.trigger_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    var corpus = try local.sql_parity_fixtures.Corpus.init(a);
+    defer corpus.deinit();
+    const ids = [_][]const u8{ "sql-0405", "sql-0406", "sql-0407", "sql-0408", "sql-0409", "sql-0410" };
+    try std.testing.expectEqual(ids.len, reference.value.entries.len);
+    for (ids, reference.value.entries) |id, entry| {
+        try std.testing.expectEqualStrings(id, entry.id);
+        try std.testing.expectEqualStrings((try corpus.get(id)).sql, entry.sql);
+    }
+    try fixture.runWithState(TriggerCampaign, .{ .reference = reference.value });
 }

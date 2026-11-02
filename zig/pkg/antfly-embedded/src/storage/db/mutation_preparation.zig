@@ -116,6 +116,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return struct {
                 pub const Entry = struct {
                     json_null_fields: []const []const u8 = &.{},
+                    prepared_domain: ?*const @import("../../schema/domain_handoff.zig").Contract = null,
                     key: []const u8,
                     value: ?[]const u8 = null,
                     kind: enum { write, delete },
@@ -327,7 +328,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !CoalescedKeyValueRequest(T) {
             // SQL mutations lower to complete replacements. A document transform
             // cannot retain the provenance of JSON null after reconstructing JSON.
-            if (transforms.len != 0) for (writes) |write| if (write.json_null_fields.len != 0) return error.UnsupportedTransformOperation;
+            if (transforms.len != 0) for (writes) |write| if (write.json_null_fields.len != 0 or write.prepared_domain != null) return error.UnsupportedTransformOperation;
             var result = CoalescedKeyValueRequest(T){};
             var order = std.ArrayListUnmanaged(CoalescedKeyValueRequest(T).Entry).empty;
             defer order.deinit(alloc);
@@ -353,6 +354,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .key = write.key,
                         .value = write.value,
                         .json_null_fields = write.json_null_fields,
+                        .prepared_domain = write.prepared_domain,
                         .kind = .write,
                     });
                     continue;
@@ -523,6 +525,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             .key = entry.key,
                             .value = entry.value.?,
                             .json_null_fields = entry.json_null_fields,
+                            .prepared_domain = entry.prepared_domain,
                         };
                         write_index += 1;
                     },
@@ -665,6 +668,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 entry.owned_value = false;
             }
             entry.value = null;
+            entry.prepared_domain = null;
             entry.kind = .delete;
         }
 
@@ -672,6 +676,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             entry.key = write.key;
             entry.value = write.value;
             entry.json_null_fields = write.json_null_fields;
+            entry.prepared_domain = write.prepared_domain;
             entry.kind = .write;
             entry.owned_key = false;
             entry.owned_value = false;
@@ -1999,9 +2004,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     while (!ctx.failed.load(.acquire)) {
                         const index = ctx.next.fetchAdd(1, .monotonic);
                         if (index >= ctx.writes.len) return;
-                        var prepared = (if (ctx.writes[index].json_null_fields.len != 0)
-                            mapper.PreparedRelationalWrite.initTypedInSharedRegion(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout, ctx.writes[index].json_null_fields, ctx.preserve_logical_values)
-                        else if (ctx.preserve_logical_values)
+                        const preserve = @import("../../schema/domain_handoff.zig").preserveFor(ctx.validator, ctx.writes[index].prepared_domain, ctx.preserve_logical_values) catch |err| {
+                            ctx.fail(err);
+                            return;
+                        };
+                        var prepared = (if (ctx.writes[index].json_null_fields.len != 0 or ctx.writes[index].prepared_domain != null)
+                            mapper.PreparedRelationalWrite.initTypedInSharedRegion(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout, ctx.writes[index].json_null_fields, preserve)
+                        else if (preserve)
                             mapper.PreparedRelationalWrite.initInSharedRegionPreserved(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout)
                         else
                             mapper.PreparedRelationalWrite.initInSharedRegionFromIntent(

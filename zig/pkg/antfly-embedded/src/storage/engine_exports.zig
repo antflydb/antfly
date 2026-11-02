@@ -787,6 +787,10 @@ fn relationalSessionNormalizeRows(session: *@import("db/relational_read_session.
     return .{ .value = session.normalizeRows(alloc, writes) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn relationalSessionNormalizeDomainRows(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, writes: []const types.BatchWrite, admissions: []const ?@import("../schema/domain_row.zig").Admission, contract: *@import("../schema/domain_handoff.zig").Contract) engine.Outcome([]types.BatchWrite) {
+    return .{ .value = session.normalizeDomainRows(alloc, writes, admissions, contract) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn documentSessionDeinit(self: *@import("db/document_rows.zig").Session) engine.Outcome(void) {
     return .{ .value = self.deinit() };
 }
@@ -1432,6 +1436,14 @@ fn beginTransaction(self: *DB, timestamp_ns: u64) engine.Outcome(@import("transa
 
 fn beginTransactionWithParticipants(self: *DB, timestamp_ns: u64, participants: []const []const u8) engine.Outcome(@import("transactions.zig").TxnId) {
     return .{ .value = self.beginTransactionWithParticipants(timestamp_ns, participants) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn beginExternalTransaction(self: *DB, request: types.ExternalTransactionBegin) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginExternalTransaction(request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn resolveExternalTransaction(self: *DB, request: types.ExternalTransactionResolution) engine.Outcome(void) {
+    return .{ .value = self.resolveExternalTransaction(request) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn writeReplicatedTransactionAtOrderedReceipt(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: db.OrderedApplyReceipt) engine.Outcome(void) {

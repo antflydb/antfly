@@ -32,7 +32,16 @@ const max_resource_bytes = 512 << 10;
 pub const ttl_ms: u64 = 60 * 60 * 1000;
 
 pub const Binding = struct {
-    kind: enum { table, view, sequence, function, procedure, operator, aggregate, cast } = .table,
+    kind: enum { table, view, sequence, function, procedure, operator, aggregate, cast, named_type } = .table,
+    /// A prepared cast retains identity independently of namespace spelling.
+    /// Executable enum generations are append-only, so additive generations
+    /// may advance while drop/recreate and catalog replacement remain fenced.
+    named_type: ?struct {
+        lookup: []const u8,
+        incarnation: [16]u8,
+        namespace_id: u64,
+        origin_id: [16]u8,
+    } = null,
     cast_database_id: ?u64 = null,
     cast_pair: ?@import("antfly_local_sources").sql_catalog.casts.Pair = null,
     sequence_incarnation: ?[16]u8 = null,

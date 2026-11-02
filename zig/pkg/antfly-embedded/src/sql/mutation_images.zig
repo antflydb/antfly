@@ -21,7 +21,7 @@ const catalog = @import("catalog.zig");
 pub fn writes(comptime Write: type, alloc: std.mem.Allocator, input: []const catalog.Mutation) ![]Write {
     var result: std.ArrayList(Write) = .empty;
     for (input) |mutation| if (mutation.row) |row| {
-        try result.append(alloc, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(alloc, row, .{}), .json_null_fields = mutation.json_null_fields });
+        try result.append(alloc, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(alloc, row, .{}), .json_null_fields = mutation.json_null_fields, .prepared_domain = mutation.prepared_domain });
     };
     return result.toOwnedSlice(alloc);
 }
@@ -36,6 +36,7 @@ pub fn merge(alloc: std.mem.Allocator, input: []const catalog.Mutation, normaliz
         if (value != .object) return error.InvalidSqlBackendResponse;
         mutation.row = value;
         mutation.json_null_fields = write.json_null_fields;
+        mutation.prepared_domain = write.prepared_domain;
         index += 1;
     };
     if (index != normalized.len) return error.InvalidSqlBackendResponse;

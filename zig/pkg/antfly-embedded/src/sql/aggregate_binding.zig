@@ -486,7 +486,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
     builder.inference = true;
     const source_columns = if (table) |definition| blk: {
         const result = try alloc.alloc(scalar.Column, definition.columns.len + 1);
-        for (definition.columns, result[0..definition.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
+        for (definition.columns, result[0..definition.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = column.nullable };
         result[definition.columns.len] = .{ .name = "_id", .type = .string, .nullable = false };
         break :blk result;
     } else &.{};
@@ -523,13 +523,14 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
     for (columns[0..grouped_width], 0..) |*column, index| column.* = .{ .name = try std.fmt.allocPrint(alloc, "$grouped_{d}", .{index}), .type = .string };
     for (builder.constants, columns[grouped_width..], 0..) |name, *column, index| {
         const definition = try (table orelse return error.InvalidSqlBackendResponse).column(name);
-        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$constant_{d}", .{index}), .type = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier, .enum_view = definition.enum_view, .temporal_kind = definition.temporal_kind, .nullable = definition.nullable };
+        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$constant_{d}", .{index}), .type = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier, .enum_view = definition.enum_view, .domain_view = scalar.domainViewOf(definition), .temporal_kind = definition.temporal_kind, .nullable = definition.nullable };
     }
     for (columns[0..groups.len], input.projections[0..groups.len]) |*column, program| {
         column.type = program.?.output_type.kind orelse .string;
         column.element_type = program.?.output_type.element_type;
         column.numeric_modifier = program.?.output_type.numeric_modifier;
         column.enum_view = program.?.output_type.enum_view;
+        column.domain_view = scalar.domainViewOf(program.?.output_type);
         column.temporal_kind = program.?.output_type.temporal_kind;
     }
     const specs = try alloc.alloc(operators.AggregateSpec, builder.aggregates.items.len);
@@ -543,6 +544,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
                 column.temporal_kind = aggregate.output.temporal_kind;
                 column.numeric_modifier = aggregate.output.numeric_modifier;
                 column.enum_view = aggregate.output.enum_view;
+                column.domain_view = scalar.domainViewOf(aggregate.output);
             } else if (std.mem.eql(u8, functionName(node.call.name), "string_agg")) {
                 for (builder.collections.items) |item| if (item.index == aggregate_index) for (item.arguments) |slot_| {
                     const type_ = input.projections[slot_].?.output_type.kind;
@@ -568,6 +570,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
                 column.element_type = result.element_type;
                 column.temporal_kind = result.temporal_kind;
                 column.enum_view = result.enum_view;
+                column.domain_view = null;
                 column.numeric_modifier = if (reducer == .min or reducer == .max) null else result.numeric_modifier;
             }
             continue;
@@ -595,6 +598,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
             column.element_type = domain.element_type;
             column.temporal_kind = domain.temporal_kind;
             column.enum_view = domain.enum_view;
+            column.domain_view = null;
             column.numeric_modifier = if (kind == .min or kind == .max) null else domain.numeric_modifier;
         }
         if (kind == .array_agg and column.element_type == null) column.element_type = switch (input_type orelse .string) {

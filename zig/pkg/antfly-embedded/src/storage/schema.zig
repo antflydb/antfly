@@ -337,6 +337,8 @@ pub const TableSchema = struct {
     requires_sequence_defaults: bool = false,
     /// Document producers need public-schema authority and absent SQL NULLs.
     requires_document_expressions: bool = false,
+    requires_enum_expressions: bool = false,
+    requires_string_lengths: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -353,6 +355,9 @@ pub const TableSchema = struct {
 
 pub const schema_key = "\x00\x00__metadata__:schema";
 const schema_version_prefix = "\x00\x00__metadata__:schema_v";
+/// Owner-local validation records share a lexical prefix with layouts, but
+/// are a separate durable family and never historical row decoders.
+pub const schema_validation_job_prefix = "\x00\x00__metadata__:schema_validation_job:";
 
 // ============================================================================
 // Serialization
@@ -454,7 +459,6 @@ test "relational index system schema reader capabilities distinguish semantics f
 /// before treating its requirements as authority.
 pub fn requiredReaderVersion(schema: TableSchema) u32 {
     var version: u32 = 11;
-    if (schema.named_types.len != 0) version = 39;
     if (schema.declared_fields.len != 0 or schema.exact_fields.len != 0) version = 12;
     if (schema.storage_mode != .document or schema.requires_public_schema or schema.relational_columns.len != 0) version = 13;
     for (schema.full_text_documents) |document| {
@@ -482,6 +486,8 @@ pub fn requiredReaderVersion(schema: TableSchema) u32 {
         .{ "requires_temporal_keys", 36 },
         .{ "requires_sequence_defaults", 37 },
         .{ "requires_document_expressions", 38 },
+        .{ "requires_enum_expressions", 40 },
+        .{ "requires_string_lengths", 42 },
     }) |requirement| {
         if (@field(schema, requirement[0])) version = @max(version, requirement[1]);
     }
@@ -494,6 +500,11 @@ pub fn requiredReaderVersion(schema: TableSchema) u32 {
         if (column.named_type_id != null or column.column_type == .enumeration) version = @max(version, 39);
         if (column.column_type == .sql_array and column.sql_element_type == .jsonb) version = @max(version, 31);
     }
+    if (schema.named_types.len != 0) version = @max(version, 39);
+    for (schema.named_types) |record| if (record.definition == .domain) {
+        version = @max(version, 41);
+        break;
+    };
     return version;
 }
 
@@ -523,6 +534,8 @@ test "relational index system schema reader requirements cover every durable exp
         .{ "requires_temporal_keys", 36 },
         .{ "requires_sequence_defaults", 37 },
         .{ "requires_document_expressions", 38 },
+        .{ "requires_enum_expressions", 40 },
+        .{ "requires_string_lengths", 42 },
     };
     comptime {
         @setEvalBranchQuota(10_000);
@@ -669,7 +682,7 @@ pub fn schemasEqualForPublicBinding(alloc: Allocator, stored: TableSchema, deriv
         derived.requires_typed_expressions or derived.requires_predicate_expressions or
         derived.requires_exact_numeric_expressions or derived.requires_exact_numeric_validation or
         derived.requires_numeric_modifiers or derived.requires_array_expressions or
-        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_constraints or derived.requires_uuid_defaults or derived.requires_clock_defaults or derived.requires_range_expressions or derived.requires_temporal_keys or derived.requires_sequence_defaults or derived.requires_document_expressions) return false;
+        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_constraints or derived.requires_uuid_defaults or derived.requires_clock_defaults or derived.requires_range_expressions or derived.requires_temporal_keys or derived.requires_sequence_defaults or derived.requires_document_expressions or derived.requires_enum_expressions or derived.requires_string_lengths) return false;
     var projection = derived;
     projection.relational_columns = &.{};
     const documents = try alloc.dupe(FullTextDocument, derived.full_text_documents);
@@ -773,6 +786,8 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     projection_schema.requires_temporal_keys = false;
     projection_schema.requires_sequence_defaults = false;
     projection_schema.requires_document_expressions = false;
+    projection_schema.requires_enum_expressions = false;
+    projection_schema.requires_string_lengths = false;
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
     for (projection_documents) |*doc| {
@@ -967,6 +982,8 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version >= 36) try buf.append(alloc, @intFromBool(schema.requires_temporal_keys));
     if (format_version >= 37) try buf.append(alloc, @intFromBool(schema.requires_sequence_defaults));
     if (format_version >= 38) try buf.append(alloc, @intFromBool(schema.requires_document_expressions));
+    if (format_version >= 40) try buf.append(alloc, @intFromBool(schema.requires_enum_expressions));
+    if (format_version >= 42) try buf.append(alloc, @intFromBool(schema.requires_string_lengths));
     if (format_version >= 39) {
         try appendU32(&buf, alloc, @intCast(schema.named_types.len));
         const registry_start = buf.items.len;
@@ -988,6 +1005,9 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
     // Ownership has transferred out of the decoder's partial-allocation
     // cleanup scopes before validation can allocate or fail.
     try validateRelationalSchema(alloc, result);
+    if (result.decoded_format_version < 41) for (result.named_types) |record| {
+        if (record.definition == .domain) return error.UnsupportedVersion;
+    };
     return result;
 }
 
@@ -1392,7 +1412,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         owned.deinit(alloc);
     };
     const type_records: []named_types.Record = if (fmt_version >= 39) records: {
-        var registry_pos = pos + 20;
+        var registry_pos = pos + @as(usize, if (fmt_version >= 42) 22 else if (fmt_version >= 40) 21 else 20);
         const count = readU32(data, &registry_pos);
         const records = try alloc.alloc(named_types.Record, count);
         var initialized: usize = 0;
@@ -1403,6 +1423,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         for (records) |*record| {
             var parsed = try named_types.Record.decode(alloc, readStr(data, &registry_pos));
             defer parsed.deinit();
+            if (fmt_version < 41 and parsed.value.definition == .domain) return error.UnsupportedVersion;
             record.* = try parsed.value.cloneOwned(alloc);
             initialized += 1;
         }
@@ -1439,6 +1460,8 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         .requires_temporal_keys = if (fmt_version >= 36) data[pos + 17] == 1 else false,
         .requires_sequence_defaults = if (fmt_version >= 37) data[pos + 18] == 1 else false,
         .requires_document_expressions = if (fmt_version >= 38) data[pos + 19] == 1 else false,
+        .requires_enum_expressions = if (fmt_version >= 40) data[pos + 20] == 1 else false,
+        .requires_string_lengths = if (fmt_version >= 42) data[pos + 21] == 1 else false,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1710,6 +1733,8 @@ fn validateSerializedSchema(data: []const u8) !void {
     if (format_version >= 36) try cursor.readBool();
     if (format_version >= 37) try cursor.readBool();
     if (format_version >= 38) try cursor.readBool();
+    if (format_version >= 40) try cursor.readBool();
+    if (format_version >= 42) try cursor.readBool();
     if (format_version >= 39) {
         const count = try cursor.readU32();
         if (count > 4096) return error.InvalidSchema;
@@ -1737,6 +1762,74 @@ pub fn namedType(schema: TableSchema, id: u64) ?*const named_types.Record {
     return null;
 }
 
+/// Resolve only the immutable physical base. Domain rules and SQL provenance
+/// remain the prepared row validator's responsibility, not the byte codec's.
+pub fn namedTypeBase(table: TableSchema, id: u64) !RelationalColumn {
+    var record = namedType(table, id) orelse return error.InvalidSchema;
+    for (0..65) |depth| {
+        try record.validateHeader();
+        switch (record.definition) {
+            .labels => return .{ .name = "value", .path = "value", .column_type = .enumeration, .allows_null = true, .named_type_id = record.identity.id },
+            .domain => |definition| {
+                if (depth == 64) return error.InvalidSchema;
+                switch (definition.base) {
+                    .builtin => |kind| return builtinTypeColumn(kind, definition.numeric_modifier),
+                    .named => |reference| {
+                        record = namedType(table, reference.id) orelse return error.InvalidSchema;
+                        if (record.identity.generation != reference.generation or !std.mem.eql(u8, &record.identity.origin_id, &reference.origin_id)) return error.InvalidSchema;
+                    },
+                }
+            },
+        }
+    }
+    return error.InvalidSchema;
+}
+
+pub fn namedEnumBaseRecord(table: TableSchema, id: u64) !*const named_types.Record {
+    const base = try namedTypeBase(table, id);
+    if (base.column_type != .enumeration) return error.InvalidSchema;
+    return namedType(table, base.named_type_id orelse return error.InvalidSchema) orelse error.InvalidSchema;
+}
+
+/// Physical projections do not re-coerce a domain. They retain its identity
+/// and exact immutable base, while logical rule changes belong to activation.
+pub fn sameNamedPhysicalType(previous: TableSchema, next: TableSchema, id: u64, require_superset: bool) !bool {
+    const before = namedType(previous, id) orelse return error.InvalidSchema;
+    const after = namedType(next, id) orelse return error.InvalidSchema;
+    if (std.meta.activeTag(before.definition) != std.meta.activeTag(after.definition) or !std.mem.eql(u8, &before.identity.origin_id, &after.identity.origin_id)) return false;
+    const left = try namedTypeBase(previous, id);
+    const right = try namedTypeBase(next, id);
+    if (left.column_type != right.column_type or left.sql_element_type != right.sql_element_type or
+        !@import("../common/sql_builtin_type.zig").NumericModifier.eql(left.numeric_modifier, right.numeric_modifier)) return false;
+    if (left.column_type == .enumeration) {
+        const old = try namedEnumBaseRecord(previous, id);
+        const current = try namedEnumBaseRecord(next, id);
+        if (!old.sameValueDomain(current.*)) return false;
+        if (require_superset and old.definition.labels.len > current.definition.labels.len) return false;
+    }
+    return true;
+}
+
+pub fn builtinTypeColumn(kind: @import("../common/sql_builtin_type.zig").Type, modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier) RelationalColumn {
+    return .{
+        .name = "value",
+        .path = "value",
+        .allows_null = true,
+        .column_type = switch (kind) {
+            .text, .uuid => .string,
+            .int16, .int32, .int64 => .integer,
+            .float32, .float64 => .number,
+            .numeric => .numeric,
+            .boolean => .boolean,
+            .jsonb => .json,
+        },
+        .sql_element_type = kind,
+        .numeric_modifier = modifier,
+        .is_json = kind == .jsonb,
+        .json_kind = if (kind == .jsonb) .any else .none,
+    };
+}
+
 fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
     if (schema.named_types.len > 4096) return error.InvalidSchema;
     if (schema.named_types.len != 0 and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
@@ -1746,22 +1839,43 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
     var registry_bytes: usize = 0;
     for (schema.named_types) |record| {
         try record.validate(alloc);
-        for (record.definition.labels) |label| {
-            registry_bytes = std.math.add(usize, registry_bytes, label.text.len + label.order_key.len) catch return error.InvalidSchema;
+        if (record.definition == .labels) {
+            for (record.definition.labels) |label| {
+                registry_bytes = std.math.add(usize, registry_bytes, label.text.len + label.order_key.len) catch return error.InvalidSchema;
+                if (registry_bytes > max_named_type_bytes) return error.InvalidSchema;
+            }
+        } else {
+            const bytes = try record.encode(alloc);
+            defer alloc.free(bytes);
+            registry_bytes = std.math.add(usize, registry_bytes, bytes.len) catch return error.InvalidSchema;
             if (registry_bytes > max_named_type_bytes) return error.InvalidSchema;
         }
         if (record.identity.id <= previous_id) return error.InvalidSchema;
         previous_id = record.identity.id;
         if ((try origins.getOrPut(alloc, record.identity.origin_id)).found_existing) return error.InvalidSchema;
     }
+    const domain_values = @import("../schema/domain_value.zig");
+    var domains: ?domain_values.Registry = null;
+    defer if (domains) |*registry| registry.deinit();
+    for (schema.named_types) |record| if (record.definition == .domain) {
+        domains = domain_values.Registry.init(alloc, schema.named_types) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSchema;
+        break;
+    };
     for (schema.relational_columns) |column| {
-        if ((column.column_type == .enumeration) != (column.named_type_id != null)) return error.InvalidSchema;
         if (column.named_type_id) |id| {
-            if (namedType(schema, id) == null or column.sql_element_type != null or column.numeric_modifier != null or column.is_json or column.json_kind != .none) return error.InvalidSchema;
-        }
+            const record = namedType(schema, id) orelse return error.InvalidSchema;
+            if (record.definition == .domain) {
+                const base = (domains orelse return error.InvalidSchema).byId(id).?.executable.?.domain.column;
+                if (column.column_type != base.column_type or column.sql_element_type != base.sql_element_type or
+                    !@import("../common/sql_builtin_type.zig").NumericModifier.eql(column.numeric_modifier, base.numeric_modifier) or
+                    column.is_json != base.is_json or column.json_kind != base.json_kind) return error.InvalidSchema;
+            } else if (column.column_type != .enumeration or column.sql_element_type != null or column.numeric_modifier != null or column.is_json or column.json_kind != .none) return error.InvalidSchema;
+        } else if (column.column_type == .enumeration) return error.InvalidSchema;
     }
     if (schema.requires_document_expressions and (schema.storage_mode != .document or !schema.requires_public_schema)) return error.InvalidSchema;
     const expressions_authorized = schema.requires_public_schema and (schema.storage_mode == .relational or schema.requires_document_expressions);
+    if (schema.requires_enum_expressions and !expressions_authorized) return error.InvalidSchema;
+    if (schema.requires_string_lengths and !expressions_authorized) return error.InvalidSchema;
     if (schema.requires_sequence_defaults and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_jsonb_array_display and !expressions_authorized) return error.InvalidSchema;
     if (schema.requires_deferred_constraints and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
@@ -2286,10 +2400,10 @@ pub fn loadSchemaHistory(store: anytype, alloc: Allocator) ![]TableSchema {
         alloc.free(schemas);
     }
     for (entries) |entry| {
+        const key_version = (try schemaVersionFromKey(entry.key)) orelse continue;
         const schema = try deserializeSchema(alloc, entry.value);
         var schema_owned = true;
         errdefer if (schema_owned) freeSchema(alloc, schema);
-        const key_version = std.fmt.parseInt(u32, entry.key[schema_version_prefix.len..], 10) catch return error.InvalidSchema;
         if (key_version != schema.version) return error.InvalidSchema;
         const inserted = try seen.getOrPut(alloc, schema.version);
         if (inserted.found_existing) return error.InvalidSchema;
@@ -2297,7 +2411,7 @@ pub fn loadSchemaHistory(store: anytype, alloc: Allocator) ![]TableSchema {
         schema_owned = false;
         initialized += 1;
     }
-    return schemas;
+    return try alloc.realloc(schemas, initialized);
 }
 
 pub fn freeSchemaHistory(alloc: Allocator, schemas: []TableSchema) void {
@@ -2325,7 +2439,13 @@ pub fn copySchemas(source_store: anytype, dest_store: anytype, alloc: Allocator)
 
     const entries = try backend_scan.scanPrefixCurrent(alloc, &source_runtime.store, schema_version_prefix);
     defer backend_scan.freeResults(alloc, entries);
-    for (entries) |entry| try dest_txn.put(entry.key, entry.value);
+    for (entries) |entry| {
+        const version = (try schemaVersionFromKey(entry.key)) orelse continue;
+        const layout = try deserializeSchema(alloc, entry.value);
+        defer freeSchema(alloc, layout);
+        if (layout.version != version) return error.InvalidSchema;
+        try dest_txn.put(entry.key, entry.value);
+    }
 
     try dest_txn.commit();
 }
@@ -2366,6 +2486,18 @@ fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
         .store = try backend_erased.storeFrom(alloc, store),
         .owned = true,
     };
+}
+
+/// Decode only canonical immutable layout keys. Validation jobs own a
+/// distinct durable family despite sharing the historical lexical prefix.
+/// Unknown/malformed numeric aliases fail closed; job records are not layouts.
+pub fn schemaVersionFromKey(key: []const u8) !?u32 {
+    if (std.mem.startsWith(u8, key, schema_validation_job_prefix)) return null;
+    if (!std.mem.startsWith(u8, key, schema_version_prefix)) return error.InvalidSchema;
+    const suffix = key[schema_version_prefix.len..];
+    if (suffix.len == 0 or suffix.len > 10 or (suffix.len > 1 and suffix[0] == '0')) return error.InvalidSchema;
+    for (suffix) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidSchema;
+    return std.fmt.parseInt(u32, suffix, 10) catch return error.InvalidSchema;
 }
 
 pub fn schemaVersionKeyAlloc(alloc: Allocator, version: u32) ![]u8 {

@@ -240,6 +240,7 @@ pub const TableTopologyMutation = union(enum) {
 };
 
 pub const SystemCatalogCommand = struct {
+    pub const creation_sources_version: u16 = 8;
     version: u16 = 1,
     expected_revision: u64,
     mutation: system_catalog.Mutation,
@@ -247,13 +248,34 @@ pub const SystemCatalogCommand = struct {
     placement_update: ?struct { expected: metadata.TableRecord, replacement: metadata.TableRecord } = null,
     constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
     sql_view: ?@import("../../system_catalog/views.zig").Mutation = null,
+    sql_native_index: ?@import("../../system_catalog/native_indexes.zig").Mutation = null,
     sql_routine: ?@import("../../system_catalog/routines.zig").Mutation = null,
     sql_type: ?@import("../../system_catalog/named_types.zig").Mutation = null,
+    sql_authorization: ?@import("../../system_catalog/authorization.zig").Mutation = null,
     sql_cast: ?@import("../../system_catalog/casts.zig").Mutation = null,
     sql_sequence: ?@import("../../system_catalog/sequence_catalog.zig").Mutation = null,
     column_sequences: []const @import("antfly_local_sources").system_catalog_column_sequences.Creation = &.{},
+    creation_sources: []const system_catalog.RelationMutationGuard = &.{},
+    /// Copy native column annotations at the same linearization point as CREATE.
+    creation_comment_sources: []const u64 = &.{},
+    creation_object_comments: []const system_catalog.object_annotations.Copy = &.{},
+
+    pub fn validateCreationSources(self: SystemCatalogCommand) !void {
+        try system_catalog.validateCreationSources(self.creation_sources);
+        try system_catalog.validateCreationCommentSources(self.creation_sources, self.creation_comment_sources);
+        try system_catalog.validateCreationObjectComments(self.creation_sources, self.creation_object_comments);
+        if (self.creation_sources.len == 0) {
+            if (self.version == creation_sources_version) return error.InvalidCatalogMutation;
+            return;
+        }
+        if (self.version != creation_sources_version or self.mutation.kind != .table or self.mutation.action != .create or self.topology == null or self.topology.? != .create or self.placement_update != null or self.sql_view != null or self.sql_sequence != null or self.sql_routine != null or self.sql_type != null or self.sql_cast != null or self.sql_authorization != null or self.sql_native_index != null) return error.InvalidCatalogMutation;
+    }
 
     pub fn jsonStringify(self: SystemCatalogCommand, writer: anytype) !void {
+        if (self.sql_native_index != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_native_index = self.sql_native_index });
+        if (self.creation_object_comments.len != 0) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .column_sequences = self.column_sequences, .creation_sources = self.creation_sources, .creation_comment_sources = self.creation_comment_sources, .creation_object_comments = self.creation_object_comments });
+        if (self.creation_sources.len != 0) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .column_sequences = self.column_sequences, .creation_sources = self.creation_sources, .creation_comment_sources = self.creation_comment_sources });
+        if (self.sql_authorization != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_authorization = self.sql_authorization });
         if (self.sql_type != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_type = self.sql_type });
         if (self.sql_cast != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_cast = self.sql_cast });
         if (self.sql_routine != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_routine = self.sql_routine });
@@ -273,6 +295,7 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
     return switch (command) {
         .apply_system_catalog,
         .apply_schema_validation,
+        .apply_table_retirement,
         .apply_restore_staging,
         .create_restore_job_with_staging,
         .apply_fk_generation_publication,
@@ -317,12 +340,25 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_column_sequence_handoffs: @import("../column_sequence_handoff.zig").Request,
     sql_sequence_admission_head: void,
     sql_column_identities: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard,
+    sql_object_annotation: @import("antfly_local_sources").system_catalog_domain.ObjectAnnotationRead,
+    relation_replacement_check: struct { guard: system_catalog.RelationMutationGuard, expected: metadata.TableRecord, replacement: metadata.TableRecord },
+    sql_index_annotations: @import("antfly_local_sources").system_catalog_domain.object_annotations.IndexDescriptionsRead,
     sql_sequence_snapshot: @import("../../system_catalog/sequence_catalog.zig").SnapshotRequest,
+    /// Trusted host selected this private projection only after checking both
+    /// retirement grants. The ordinary snapshot never acquires this authority.
+    sql_sequence_retirement_snapshot: @import("../../system_catalog/sequence_catalog.zig").SnapshotRequest,
+    sql_prepared_read: @import("../../system_catalog/prepared_transactions.zig").Read,
+    sql_prepared_prepare: @import("../../system_catalog/prepared_transactions.zig").Mutation,
+    sql_prepared_outcome: @import("../../system_catalog/prepared_transactions.zig").Mutation,
+    sql_authorization_read: @import("../../system_catalog/authorization.zig").Read,
+    sql_authorization_outcome: @import("../../system_catalog/authorization.zig").Observation,
     sql_type_snapshot: @import("../../system_catalog/named_types.zig").SnapshotRequest,
     sql_type_bindings: @import("../../system_catalog/named_types.zig").BindingsRequest,
     sql_type_outcome: @import("../../system_catalog/named_types.zig").OutcomeRequest,
     sql_cast_snapshot: @import("../../system_catalog/casts.zig").SnapshotRequest,
     sql_cast_outcome: @import("../../system_catalog/casts.zig").OutcomeRequest,
+    sql_native_index_prepare: @import("../../system_catalog/native_indexes.zig").Preparation,
+    sql_native_index_outcome: @import("../../system_catalog/native_indexes.zig").OutcomeRequest,
     sql_routine_snapshot: @import("../../system_catalog/routines.zig").SnapshotRequest,
     sql_routine_outcome: @import("../../system_catalog/routines.zig").OutcomeRequest,
     sql_sequence_preflight: @import("../../system_catalog/sequence_catalog.zig").Mutation,
@@ -360,6 +396,13 @@ pub const CatalogProjectionRequest = union(enum) {
     relational_index_owner_decision: @import("../relational_index_publication.zig").OwnerRequest,
     fk_initial_create_prepare: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest,
     fk_generation_name_admission: @import("../fk_generation_publication.zig").Plan,
+    table_retirement_work: @import("../table_retirement_ledger.zig").Lookup,
+    table_retirement_queue: u64,
+    table_retirement_effects: @import("../table_retirement_ledger.zig").Lookup,
+    table_retirement_preflight: []const u8,
+    table_retirement_publication_projection: @import("../table_retirement_ledger.zig").Lookup,
+    table_retirement_receipt: @import("../table_retirement_receipt.zig").Request,
+    table_retirement_prepare: struct { guard: system_catalog.RelationMutationGuard, deadline_ns: ?u64 = null },
     relation_create_prepare: struct { request: @import("../relation_create.zig").Request, purpose: @import("../relation_create.zig").Purpose, deadline_ns: ?u64 = null },
     fk_initial_create_prepare_with_deadline: struct { request: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest, deadline_ns: ?u64 = null },
     constraint_name_prepare: struct { request: system_catalog.ConstraintNamePreparation, deadline_ns: ?u64 = null },
@@ -397,7 +440,25 @@ pub const CatalogProjectionRequest = union(enum) {
     schema_validation_owner_read: @import("../schema_validation_read.zig").OwnerReadRequest,
     schema_validation_discover: @import("../schema_validation_read.zig").DiscoveryRequest,
     schema_validation_work: @import("../schema_validation_work.zig").Query,
+    schema_validation_publication_projection: @import("../schema_validation_read.zig").Lookup,
     schema_validation_prepare: @import("../schema_validation_admission.zig").Request,
     schema_validation_status: @import("../schema_validation_admission.zig").StatusRequest,
     schema_validation_receipt_read: @import("../schema_validation_receipt.zig").Request,
 };
+
+test "system catalog creation sources have a distinct strict command version" {
+    const guard: system_catalog.RelationMutationGuard = .{ .target = .{ .name = "source" }, .logical_table = "source", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table }, .incarnation = @splat(1) };
+    var command: SystemCatalogCommand = .{ .version = SystemCatalogCommand.creation_sources_version, .expected_revision = 0, .mutation = .{ .kind = .table, .action = .create, .name = "destination" }, .topology = .{ .create = .{ .expected_transition_generation = 0, .table = .{ .name = "table:42", .table_id = 42 }, .ranges = &.{} } }, .creation_sources = &.{guard} };
+    try command.validateCreationSources();
+    command.version = 3;
+    try std.testing.expectError(error.InvalidCatalogMutation, command.validateCreationSources());
+    command.creation_sources = &.{};
+    command.version = SystemCatalogCommand.creation_sources_version;
+    try std.testing.expectError(error.InvalidCatalogMutation, command.validateCreationSources());
+    // The preceding callable/type/authorization command versions remain
+    // independent; a definition read set cannot reinterpret their envelopes.
+    for ([_]u16{ 1, 2, 3, 4, 5, 6, 7 }) |version| {
+        command.version = version;
+        try command.validateCreationSources();
+    }
+}

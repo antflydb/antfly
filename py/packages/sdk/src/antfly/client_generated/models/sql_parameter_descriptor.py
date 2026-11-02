@@ -20,11 +20,13 @@ T = TypeVar("T", bound="SQLParameterDescriptor")
 @_attrs_define
 class SQLParameterDescriptor:
     """Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it.
-    Unknown slots have no SQL constraint.
+    Unknown slots have no SQL constraint. Bytea arguments are PostgreSQL bytea input strings; use hex text (a backslash
+    followed by x and hexadecimal octets) for arbitrary binary data. SQL NULL remains a null cell.
 
         Attributes:
             type_ (SQLColumnType): Logical SQL result type. Integer values and numbers with element_type numeric are decimal
-                strings to preserve exact precision in every client.
+                strings to preserve exact precision in every client. Bytea results use PostgreSQL hex text (a backslash followed
+                by x and lowercase hex digits) in JSON and opaque bytes in PostgreSQL binary format.
             nullable (bool):
             named_type (SQLNamedTypeIdentity | Unset): Server-resolved immutable SQL type identity. Origin survives restore
                 remapping of local IDs and wire OIDs.

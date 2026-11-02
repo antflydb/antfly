@@ -56,6 +56,31 @@ pub const Admission = struct {
     }
 };
 pub const Rejection = enum {
+    SqlIndexAlreadyExists,
+    SqlIndexNotFound,
+    InvalidCatalogMutation,
+    CatalogCommandTooLarge,
+    TableTransitionActive,
+    TableNotFound,
+    InvalidTableDefinitionReplacement,
+    ExternalTransactionDecisionChanged,
+    ExternalTransactionAdmissionExpired,
+    InvalidExternalDecisionOwner,
+    InvalidPreparedTransactionId,
+    InvalidPreparedTransactionPhase,
+    SqlPreparedTransactionAlreadyExists,
+    SqlPreparedTransactionNotFound,
+    SqlPreparedTransactionWrongDatabase,
+    SqlPreparedTransactionCapacityExceeded,
+    Canceled,
+    SqlRoleNotFound,
+    SqlDuplicateRole,
+    SqlDependentRole,
+    SqlDependentGrant,
+    SqlRoleMembershipCycle,
+    SqlReservedRoleName,
+    InvalidSqlGrant,
+    Forbidden,
     CatalogGenerationChanged,
     CatalogAlreadyExists,
     SequenceNotFound,
@@ -92,6 +117,9 @@ pub const Rejection = enum {
     InvalidSqlEnumOrder,
     SqlTypeActivationRequired,
     SqlDependentType,
+    SqlDependentObjectsExist,
+    SqlIdentitySequenceOwnership,
+    SqlNotNullViolation,
 
     InvalidSqlCastRecord,
     SqlInvalidTextRepresentation,
@@ -108,7 +136,46 @@ pub const Rejection = enum {
     SqlAssignmentTypeMismatch,
     CatalogRevisionExhausted,
 };
+/// Compact reference to the existing all-owner schema job. The catalog
+/// journal never duplicates table schemas or owner arrays into retained slots.
+pub const RestoreWork = struct {
+    group: u64,
+    id: [16]u8,
+    intent_digest: [32]u8,
+    incarnation: [16]u8,
+    identity: Identity,
+    pub fn validate(self: @This()) !void {
+        try self.identity.validate();
+        if (self.group == 0 or std.mem.allEqual(u8, &self.id, 0) or std.mem.allEqual(u8, &self.intent_digest, 0) or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidSequenceOutcome;
+    }
+};
+pub const Pending = struct {
+    revision: u64,
+    identity: Identity,
+    work: union(enum) {
+        schema: @import("../metadata/schema_validation_read.zig").Lookup,
+        sequence_schema: @import("../metadata/schema_validation_read.zig").Lookup,
+        restore: RestoreWork,
+    },
+    pub fn validate(self: @This()) !void {
+        try self.identity.validate();
+        switch (self.work) {
+            .schema, .sequence_schema => |lookup| try (@import("../metadata/schema_validation_read.zig").OwnerReadRequest{ .lookup = lookup, .ordinal = 0 }).validate(),
+            .restore => |lookup| {
+                try lookup.validate();
+                if (!std.meta.eql(self.identity, lookup.identity)) return error.InvalidSequenceOutcome;
+            },
+        }
+    }
+    pub fn matchesIncarnation(self: @This(), incarnation: [16]u8) bool {
+        return switch (self.work) {
+            .schema, .sequence_schema => |lookup| std.mem.eql(u8, &lookup.metadata_incarnation, &std.fmt.bytesToHex(incarnation, .lower)),
+            .restore => |lookup| std.mem.eql(u8, &lookup.incarnation, &incarnation),
+        };
+    }
+};
 pub const Outcome = union(enum) {
+    pending: Pending,
     success: Result,
     rejected: Rejection,
 
@@ -118,6 +185,7 @@ pub const Outcome = union(enum) {
     pub fn result(self: Outcome) anyerror!Result {
         return switch (self) {
             .success => |value| value,
+            .pending => error.CatalogPublicationProofPending,
             .rejected => |reason| switch (reason) {
                 inline else => |tag| @field(anyerror, @tagName(tag)),
             },
@@ -125,9 +193,11 @@ pub const Outcome = union(enum) {
     }
     fn validate(self: Outcome) !void {
         if (self == .success) try self.success.validate();
+        if (self == .pending) try self.pending.validate();
     }
     fn validateCatalog(self: Outcome, catalog: Meta) !void {
         try self.validate();
+        if (self == .pending and (self.pending.revision > catalog.revision or self.pending.identity.id >= catalog.next_id)) return error.InvalidSequenceOutcome;
         if (self == .success) {
             if (self.success.revision > catalog.revision) return error.InvalidSequenceOutcome;
             if (self.success.identity) |value| if (value.id >= catalog.next_id) return error.InvalidSequenceOutcome;
@@ -221,7 +291,65 @@ pub fn Store(comptime Txn: type) type {
             try parsed.value.validate(self.incarnation);
             try parsed.value.outcome.validateCatalog(catalog);
             if (parsed.value.ordinal != ordinal) return error.InvalidSequenceOutcome;
+            if (parsed.value.outcome == .pending) {
+                const pending = parsed.value.outcome.pending;
+                if (!pending.matchesIncarnation(self.incarnation)) return error.InvalidSequenceOutcome;
+                if (pending.work == .restore) {
+                    parsed.value.outcome = (try self.restoreOutcomeAtCatalog(a, pending.work.restore, parsed.value.digest, catalog)) orelse return error.InvalidSequenceOutcome;
+                    try parsed.value.outcome.validateCatalog(catalog);
+                    return parsed.value;
+                }
+                const retiring = pending.work == .sequence_schema;
+                const schema_lookup = if (retiring) pending.work.sequence_schema else pending.work.schema;
+                if (schema_lookup.group != self.group) return error.InvalidSequenceOutcome;
+                const job_head = try @import("../metadata/schema_validation_ledger.zig").readHead(self.txn, schema_lookup);
+                if (retiring) {
+                    const retired = job_head.sequence_retirement orelse return error.InvalidSequenceOutcome;
+                    if (retired.id != pending.identity.id or retired.generation != pending.identity.generation or
+                        !std.mem.eql(u8, &retired.admission_digest, &parsed.value.digest)) return error.InvalidSequenceOutcome;
+                } else if (job_head.type_id != pending.identity.id or job_head.type_generation != pending.identity.generation or
+                    !std.mem.eql(u8, &job_head.type_admission_digest, &parsed.value.digest)) return error.InvalidSequenceOutcome;
+                // Project a completed job at this same read cut. The retained
+                // slot stays immutable and owns only its compact reference;
+                // callers need neither another head read nor the full plan.
+                parsed.value.outcome = switch (job_head.phase) {
+                    .succeeded => .{ .success = .{ .revision = job_head.catalog_revision, .identity = if (retiring) null else pending.identity, .removed = if (retiring) 1 else 0 } },
+                    .canceled => .{ .rejected = switch (job_head.failure) {
+                        .requested => .Canceled,
+                        .owner_failed => .CatalogGenerationChanged,
+                        .not_null_violation => .SqlNotNullViolation,
+                        else => return error.InvalidSequenceOutcome,
+                    } },
+                    else => parsed.value.outcome,
+                };
+                try parsed.value.outcome.validateCatalog(catalog);
+            }
+            if (parsed.value.ordinal != ordinal) return error.InvalidSequenceOutcome;
             return parsed.value;
+        }
+        pub fn restoreOutcome(self: @This(), a: A, work_scope: RestoreWork, digest: [32]u8) !?Outcome {
+            return self.restoreOutcomeAtCatalog(a, work_scope, digest, try self.meta(a));
+        }
+        fn restoreOutcomeAtCatalog(self: @This(), a: A, work_scope: RestoreWork, digest: [32]u8, catalog: Meta) !?Outcome {
+            try work_scope.validate();
+            if (work_scope.group != self.group or !std.mem.eql(u8, &work_scope.incarnation, &self.incarnation)) return error.InvalidSequenceOutcome;
+            const staging = @import("../metadata/restore_staging.zig");
+            var buffer: [256]u8 = undefined;
+            const encoded = (try self.optional(try staging.progressKey(&buffer, self.group, work_scope.id))) orelse return null;
+            if (encoded.len > 16 * 1024) return error.InvalidSequenceOutcome;
+            var progress = try std.json.parseFromSlice(staging.Progress, a, encoded, .{});
+            defer progress.deinit();
+            const proof = progress.value.type_retirement orelse return null;
+            if (progress.value.revision == 0 or !std.meta.eql(proof.work, work_scope) or !std.mem.eql(u8, &proof.admission_digest, &digest)) return error.InvalidSequenceOutcome;
+            if ((progress.value.state == .published) != (proof.catalog_revision != 0)) return error.InvalidSequenceOutcome;
+            if (proof.observed_revision > catalog.revision or (proof.catalog_revision != 0 and proof.catalog_revision < proof.observed_revision)) return error.InvalidSequenceOutcome;
+            const outcome: Outcome = switch (progress.value.state) {
+                .published => .{ .success = .{ .revision = proof.catalog_revision, .identity = null, .removed = 1 } },
+                .canceled => .{ .rejected = proof.failure orelse .Canceled },
+                else => if (proof.failure != null) return error.InvalidSequenceOutcome else .{ .pending = .{ .revision = proof.observed_revision, .identity = work_scope.identity, .work = .{ .restore = work_scope } } },
+            };
+            try outcome.validateCatalog(catalog);
+            return outcome;
         }
         pub fn lookup(self: @This(), a: A, admission: Admission, digest: [32]u8) !?Outcome {
             try admission.validate();
@@ -312,4 +440,190 @@ test "sequence catalog outcome requires persisted counts and rejects impossible 
     try value.validateCatalog(.{ .revision = 2, .next_id = 5 });
     try std.testing.expectError(error.InvalidSequenceOutcome, (Result{ .revision = 0, .identity = null, .removed = 1 }).validate());
     try std.testing.expectError(error.InvalidSequenceOutcome, (Result{ .revision = 0, .identity = .{ .id = 4, .generation = 1 }, .removed = 0 }).validate());
+}
+
+test "sequence catalog outcome retains compact pending type jobs without reporting committed success" {
+    const pending: Pending = .{ .revision = 1, .identity = .{ .id = 17, .generation = 2 }, .work = .{ .schema = .{ .group = 1, .table = 7, .id = @splat(1), .metadata_incarnation = @splat('1'), .plan_digest = @splat(2) } } };
+    const value: Outcome = .{ .pending = pending };
+    try value.validateCatalog(.{ .revision = 1, .next_id = 18 });
+    try std.testing.expectError(error.CatalogPublicationProofPending, value.result());
+    try std.testing.expectError(error.InvalidSequenceOutcome, value.validateCatalog(.{ .revision = 0, .next_id = 18 }));
+    try std.testing.expectError(error.InvalidSequenceOutcome, value.validateCatalog(.{ .revision = 1, .next_id = 17 }));
+    const a = std.testing.allocator;
+    const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
+    defer a.free(bytes);
+    try std.testing.expect(bytes.len < 1024);
+    var parsed = try std.json.parseFromSlice(Outcome, a, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualDeep(value, parsed.value);
+}
+
+test "SQL routine catalog pending type outcomes reject cross job substitution and retain exact cold completion" {
+    try pendingTypeOutcome(false);
+}
+
+test "schema validation publication domain NOT NULL rejection remains observable through the original cold type outcome" {
+    try pendingTypeOutcome(true);
+}
+
+fn pendingTypeOutcome(rejected: bool) !void {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const DocStore = local.storage_docstore.DocStore;
+    const ledger = @import("../metadata/schema_validation_ledger.zig");
+    const Head = @import("../metadata/schema_validation_publication.zig").Head;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/pending-type", .{temporary.sub_path}, 0);
+    defer a.free(path);
+    const group = 1;
+    const incarnation: [16]u8 = @splat(0x11);
+    const admission: Admission = .{ .nonce = @splat(3), .head = 0 };
+    const digest: [32]u8 = @splat(4);
+    // Shape fixtures only; a journal reference never grants owner execution.
+    var head: Head = .{ .metadata_group_id = group, .metadata_incarnation = @splat('1'), .table_id = 7, .id = @splat(1), .plan_digest = @splat(5), .owner_count = 1, .type_id = 17, .type_generation = 2, .type_admission_digest = digest, .participants_digest = @splat(8) };
+    const pending: Pending = .{ .revision = 1, .identity = .{ .id = 17, .generation = 2 }, .work = .{ .schema = .fromHead(head) } };
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const journal: Store(DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
+        var buffer: [192]u8 = undefined;
+        const meta = try std.json.Stringify.valueAlloc(a, Meta{ .revision = 1, .next_id = 18 }, .{});
+        defer a.free(meta);
+        try txn.put(try journal.metaKey(&buffer), meta);
+        const encoded = try head.encode();
+        try txn.put(try (ledger.Key{ .group = group, .table = head.table_id, .id = head.id, .kind = .head }).encode(&buffer), encoded.slice());
+        try journal.append(a, 1, admission, digest, .{ .pending = pending });
+        try txn.commit();
+    }
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const journal: Store(DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
+        try std.testing.expectEqualDeep(Outcome{ .pending = pending }, (try journal.lookup(a, admission, digest)).?);
+        var other = head;
+        other.id = @splat(2);
+        other.plan_digest = @splat(6);
+        other.type_admission_digest = @splat(7);
+        var buffer: [192]u8 = undefined;
+        const other_head = try other.encode();
+        try txn.put(try (ledger.Key{ .group = group, .table = other.table_id, .id = other.id, .kind = .head }).encode(&buffer), other_head.slice());
+        var forged = pending;
+        forged.work = .{ .schema = .fromHead(other) };
+        const swapped = try std.json.Stringify.valueAlloc(a, Record{ .format = 1, .ordinal = 1, .incarnation = incarnation, .admission = admission, .digest = digest, .outcome = .{ .pending = forged } }, .{});
+        defer a.free(swapped);
+        try txn.put(try journal.slotKey(&buffer, 1), swapped);
+        try std.testing.expectError(error.InvalidSequenceOutcome, journal.lookup(a, admission, digest));
+        try std.testing.expectError(error.InvalidSequenceOutcome, journal.validateCut(a));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const journal: Store(DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
+        var buffer: [192]u8 = undefined;
+        var meta = try journal.meta(a);
+        meta.revision = 2;
+        const bytes = try std.json.Stringify.valueAlloc(a, meta, .{});
+        defer a.free(bytes);
+        try txn.put(try journal.metaKey(&buffer), bytes);
+        if (rejected) {
+            head.phase = .canceled;
+            head.revision = 4;
+            head.canceled = 1;
+            head.cancellation_revision = 2;
+            head.failure = .not_null_violation;
+            head.failure_digest = @splat(14);
+            head.terminal_chain = @splat(13);
+        } else {
+            head.phase = .succeeded;
+            head.revision = 6;
+            head.ready = 1;
+            head.installed = 1;
+            head.released = 1;
+            head.install_revision = 3;
+            head.publication_revision = 5;
+            head.catalog_revision = 2;
+            head.ready_chain = @splat(11);
+            head.installed_chain = @splat(12);
+            head.terminal_chain = @splat(13);
+        }
+        const encoded = try head.encode();
+        try txn.put(try (ledger.Key{ .group = group, .table = head.table_id, .id = head.id, .kind = .head }).encode(&buffer), encoded.slice());
+        const outcome = (try journal.lookup(a, admission, digest)).?;
+        if (rejected) {
+            try std.testing.expectEqual(Rejection.SqlNotNullViolation, outcome.rejected);
+            try std.testing.expectError(error.SqlNotNullViolation, outcome.result());
+        } else {
+            try std.testing.expectEqual(@as(u64, 2), outcome.success.revision);
+            try std.testing.expectEqualDeep(pending.identity, outcome.success.identity.?);
+        }
+        try journal.validateCut(a);
+        try txn.commit();
+    }
+}
+
+test "SQL routine catalog type retirement projects exact cold restore progress and rejects substituted jobs" {
+    const a = std.testing.allocator;
+    const DocStore = @import("antfly_local_sources").storage_docstore.DocStore;
+    const staging = @import("../metadata/restore_staging.zig");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/retiring-type", .{directory.sub_path}, 0);
+    defer a.free(path);
+    const work: RestoreWork = .{ .group = 1, .id = @splat(3), .incarnation = @splat(7), .intent_digest = @splat(5), .identity = .{ .id = 17, .generation = 2 } };
+    const admission: Admission = .{ .nonce = @splat(9), .head = 0 };
+    const digest: [32]u8 = @splat(8);
+    const pending: Pending = .{ .revision = 1, .identity = work.identity, .work = .{ .restore = work } };
+    var progress: staging.Progress = .{ .state = .preparing_sources, .type_retirement = .{ .work = work, .admission_digest = digest, .observed_revision = 1 } };
+    // Protocol-shaped journal fixtures only. Physical restore authority and
+    // type/schema publication are independently checked by the real writer.
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const journal: Store(DocStore.Txn) = .{ .txn = &txn, .group = work.group, .incarnation = work.incarnation };
+        var buffer: [256]u8 = undefined;
+        const meta = try std.json.Stringify.valueAlloc(a, Meta{ .revision = 1, .next_id = 18 }, .{});
+        defer a.free(meta);
+        try txn.put(try journal.metaKey(&buffer), meta);
+        const bytes = try std.json.Stringify.valueAlloc(a, progress, .{});
+        defer a.free(bytes);
+        try txn.put(try staging.progressKey(&buffer, work.group, work.id), bytes);
+        try journal.append(a, 1, admission, digest, .{ .pending = pending });
+        try txn.commit();
+    }
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const journal: Store(DocStore.Txn) = .{ .txn = &txn, .group = work.group, .incarnation = work.incarnation };
+        try std.testing.expectEqualDeep(Outcome{ .pending = pending }, (try journal.lookup(a, admission, digest)).?);
+        var swapped = work;
+        swapped.intent_digest[0] ^= 1;
+        try std.testing.expectError(error.InvalidSequenceOutcome, journal.restoreOutcome(a, swapped, digest));
+        try std.testing.expectError(error.InvalidSequenceOutcome, journal.restoreOutcome(a, work, @splat(4)));
+        var buffer: [256]u8 = undefined;
+        progress.state = .published;
+        progress.type_retirement.?.catalog_revision = 2;
+        const meta = try std.json.Stringify.valueAlloc(a, Meta{ .revision = 3, .next_id = 18, .sequence_outcome_head = 1 }, .{});
+        defer a.free(meta);
+        try txn.put(try journal.metaKey(&buffer), meta);
+        const bytes = try std.json.Stringify.valueAlloc(a, progress, .{});
+        defer a.free(bytes);
+        try txn.put(try staging.progressKey(&buffer, work.group, work.id), bytes);
+        try std.testing.expectEqualDeep(Outcome{ .success = .{ .revision = 2, .identity = null, .removed = 1 } }, (try journal.lookup(a, admission, digest)).?);
+        progress.state = .canceled;
+        progress.type_retirement.?.catalog_revision = 0;
+        progress.type_retirement.?.failure = .CatalogGenerationChanged;
+        const canceled = try std.json.Stringify.valueAlloc(a, progress, .{});
+        defer a.free(canceled);
+        try txn.put(try staging.progressKey(&buffer, work.group, work.id), canceled);
+        try std.testing.expectEqualDeep(Outcome{ .rejected = .CatalogGenerationChanged }, (try journal.lookup(a, admission, digest)).?);
+    }
 }

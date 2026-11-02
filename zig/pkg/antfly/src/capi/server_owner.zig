@@ -409,6 +409,11 @@ pub const StorageOwnerTransactionRecovery = struct {
         ));
     }
 
+    pub fn resolveExternalParticipant(ptr: *anyopaque, txn: transactions_mod.TxnId, participant: []const u8, status: transactions_mod.TxnStatus, version: u64, owner: transactions_mod.ExternalDecisionOwner) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return @import("../storage/transaction_recovery_callback.zig").resolveExternal(self.config, txn, participant, status, version, owner);
+    }
+
     pub fn ownsRecovery(ptr: *anyopaque, owner_participant: []const u8) bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const callback = self.config.owns_recovery_fn orelse return false;
@@ -474,6 +479,7 @@ pub const StorageOwnerTransactionRecovery = struct {
             .cutoff_ns = self.config.cutoff_ns,
             .resolver_ctx = self,
             .resolve_participant_fn = resolveParticipant,
+            .resolve_external_participant_fn = if (self.config.resolve_external_participant_fn != null) resolveExternalParticipant else null,
             .replicated_metadata = self.config.replicated_metadata != 0,
             .owns_recovery_fn = if (self.config.replicated_metadata != 0) ownsRecovery else null,
             .acknowledge_participant_fn = if (self.config.replicated_metadata != 0) acknowledgeParticipant else null,
@@ -1984,6 +1990,18 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.sqlSequenceAdmissionHead(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .sql_index_annotations => |input| {
+                    const bytes = handle.store.getSqlIndexAnnotations(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, bytes);
+                },
+                .relation_replacement_check => |input| {
+                    handle.store.validateRelationReplacement(group_id, input.guard, input.expected, input.replacement) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
+                .sql_object_annotation => |input| {
+                    const bytes = handle.store.getSqlObjectAnnotation(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, bytes);
+                },
                 .sql_column_identities => |guard| {
                     var state = handle.store.getSqlColumnIdentities(a, group_id, guard) catch |err| break :blk storageOwnerStatusFromError(err);
                     defer state.deinit();
@@ -1994,6 +2012,32 @@ pub fn metadataApplyStoreProjection(
                     if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
                     const value = handle.store.sqlTypeBindings(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_prepared_prepare => |input| {
+                    const value = handle.store.prepareSqlPreparedTransaction(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_prepared_outcome => |input| {
+                    const value = handle.store.sqlPreparedOutcome(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_prepared_read => |input| {
+                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .setting_admin = true, .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+                    const value = handle.store.sqlPreparedRead(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_authorization_read => |input| {
+                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+                    const value = handle.store.sqlAuthorizationRead(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_authorization_outcome => |input| {
+                    const value = handle.store.sqlAuthorizationOutcome(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(switch (err) {
+                        error.SequenceAdmissionExpired, error.SequenceAdmissionConflict => error.MetadataMutationOutcomeUnknown,
+                        else => err,
+                    });
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .sql_type_snapshot => |input| {
@@ -2022,6 +2066,17 @@ pub fn metadataApplyStoreProjection(
                     });
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .sql_native_index_prepare => |input| {
+                    const value = handle.store.sqlNativeIndexPrepare(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_native_index_outcome => |input| {
+                    const value = handle.store.sqlNativeIndexOutcome(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(switch (err) {
+                        error.SequenceAdmissionExpired, error.SequenceAdmissionConflict => error.MetadataMutationOutcomeUnknown,
+                        else => err,
+                    });
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .sql_routine_snapshot => |input| {
                     if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
@@ -2038,6 +2093,21 @@ pub fn metadataApplyStoreProjection(
                 .sql_sequence_snapshot => |input| {
                     if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+                    const value = handle.store.sqlSequenceSnapshot(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .sql_sequence_retirement_snapshot => |input| {
+                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    // Only the trusted metadata host can select this private
+                    // projection after authorizing both retirement grants.
+                    // A distinct tag makes older kernels reject it explicitly.
+                    if (!input.prepare_retirement) break :blk storageOwnerStatusFromError(error.InvalidCatalogMutation);
+                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{
+                        .setting_admin = true,
+                        .schema_validation_authority = true,
+                        .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+                        .cancellation = ownerQueryCancellation(&request.control),
+                    };
                     const value = handle.store.sqlSequenceSnapshot(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
@@ -2183,6 +2253,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.relationalIndexOwnerDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .schema_validation_publication_projection => |input| {
+                    const value = handle.store.schemaValidationPublicationProjectionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
                 .schema_validation_work => |input| {
                     const value = handle.store.schemaValidationWork(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionBytes(alloc, out_json, value);
@@ -2284,6 +2358,34 @@ pub fn metadataApplyStoreProjection(
                 .fk_initial_create_prepare => |input| {
                     const value = handle.store.fkInitialCreatePrepareJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .table_retirement_queue => |input| {
+                    const value = handle.store.tableRetirementQueueJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
+                .table_retirement_effects => |input| {
+                    const value = handle.store.tableRetirementEffectsJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
+                .table_retirement_preflight => |input| {
+                    const value = handle.store.tableRetirementPreflightJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
+                .table_retirement_publication_projection => |input| {
+                    const value = handle.store.tableRetirementPublicationProjectionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
+                .table_retirement_receipt => |input| {
+                    const value = handle.store.tableRetirementReceiptJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
+                .table_retirement_work => |input| {
+                    const value = handle.store.tableRetirementWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
+                },
+                .table_retirement_prepare => |input| {
+                    const value = handle.store.prepareTableRetirementManifestJsonWithContext(a, group_id, input.guard, .{ .deadline_ns = input.deadline_ns }) catch |err| break :blk storageOwnerStatusFromError(if (err == error.InvalidTableRetirementManifest) error.InvalidGenerationPublication else err);
+                    break :blk metadataProjectionBytes(alloc, out_json, value);
                 },
                 .fk_generation_name_admission => |input| {
                     handle.store.preflightFkGenerationNameAdmission(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
@@ -7012,6 +7114,28 @@ pub fn storageOwnerScanNdjson(
         .ptr = ndjson.ptr,
         .len = @intCast(ndjson.len),
     };
+    return .ok;
+}
+
+pub fn storageOwnerSqlMaintenanceJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    _ = storageOwnerOperationTableName(handle, request) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const response = handle.db.sqlMaintenanceJson(handle.alloc, request.request_json.slice()) catch |err|
+        return storageOwnerQueryFailure(err, .sql_maintenance, out_failure);
+    defer handle.alloc.free(response);
+    const owned = dupBytes(response) catch return storageOwnerQueryFailure(error.OutOfMemory, .encode_internal_response, out_failure);
+    out_response.* = .{ .ptr = owned.ptr, .len = @intCast(owned.len) };
     return .ok;
 }
 

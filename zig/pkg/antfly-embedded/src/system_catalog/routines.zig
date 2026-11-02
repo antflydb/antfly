@@ -77,6 +77,7 @@ pub const FunctionUse = struct { reference: FunctionReference, arguments: []cons
 pub const Definition = struct {
     arguments: []const Argument,
     result: ?Type = null,
+    returns_trigger: bool = false,
     language: enum { sql, plpgsql } = .sql,
     body: []const u8,
     function_reference: ?FunctionReference = null,
@@ -87,6 +88,7 @@ pub const Definition = struct {
     pub fn validate(self: Definition) !void {
         if (self.arguments.len > max_arguments or (self.body.len == 0 and self.function_reference == null) or self.body.len > max_body_bytes or
             !std.unicode.utf8ValidateSlice(self.body) or std.mem.indexOfScalar(u8, self.body, 0) != null) return error.InvalidSqlRoutineRecord;
+        if (self.returns_trigger and (self.result != null or self.arguments.len != 0 or self.language != .plpgsql or self.function_reference != null or self.aggregate != null)) return error.InvalidSqlRoutineRecord;
         if (self.function_reference) |reference| try reference.validate();
         if (self.aggregate) |aggregate| try aggregate.validate();
         if (self.result) |result| try result.validate();
@@ -104,6 +106,19 @@ pub const Definition = struct {
                 if (principal.name.len == 0 or principal.name.len > 255 or std.mem.allEqual(u8, &principal.instance_id, 0)) return error.InvalidSqlRoutineRecord;
             },
         }
+    }
+    pub fn nativeJsonSkipField(self: Definition, comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "returns_trigger") and !self.returns_trigger;
+    }
+    pub fn jsonStringify(self: Definition, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Definition).@"struct".field_names) |field| {
+            if (!self.nativeJsonSkipField(field)) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
     }
     pub fn displaySignatureAlloc(self: Definition, a: A) ![]u8 {
         var text: std.ArrayList(u8) = .empty;
@@ -137,8 +152,8 @@ pub const Record = struct {
         if (self.version != 2 or self.id == 0 or self.generation == 0) return error.InvalidSqlRoutineRecord;
         try self.definition.validate();
         switch (self.kind) {
-            .function => if (self.definition.aggregate != null or self.definition.function_reference != null or self.definition.result == null or self.definition.language != .sql) return error.InvalidSqlRoutineRecord,
-            .procedure => if (self.definition.aggregate != null or self.definition.function_reference != null or self.definition.result != null or self.definition.strict or self.definition.volatility != .@"volatile") return error.InvalidSqlRoutineRecord,
+            .function => if (self.definition.aggregate != null or self.definition.function_reference != null or (self.definition.result == null and !self.definition.returns_trigger) or (self.definition.language != .sql and !self.definition.returns_trigger)) return error.InvalidSqlRoutineRecord,
+            .procedure => if (self.definition.returns_trigger or self.definition.aggregate != null or self.definition.function_reference != null or self.definition.result != null or self.definition.strict or self.definition.volatility != .@"volatile") return error.InvalidSqlRoutineRecord,
             .operator => if (self.definition.aggregate != null or self.definition.function_reference == null or self.definition.body.len != 0 or self.definition.result == null or self.definition.arguments.len != 2 or self.definition.language != .sql or self.definition.strict) return error.InvalidSqlRoutineRecord,
             .aggregate => {
                 if (self.definition.aggregate == null or self.definition.function_reference == null or self.definition.body.len != 0 or self.definition.result == null or self.definition.arguments.len == 0 or self.definition.arguments.len >= max_arguments or self.definition.language != .sql or self.definition.strict) return error.InvalidSqlRoutineRecord;

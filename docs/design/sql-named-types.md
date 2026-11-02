@@ -1,7 +1,10 @@
 # Named SQL types
 
-Status: implementation in progress. No original enum/domain case is qualified
-by this design document or by catalog-only tests.
+Status: implementation in progress. Originals 0096–0100 are qualified by public,
+native storage/cohort and PostgreSQL campaigns. Domain annotations (0150) and
+independent retirement (0309) are qualified separately. Domain row execution,
+protected-table evolution, enum arrays and retained enum-valued views remain
+unfinished; catalog-only tests do not qualify them.
 
 Named types must retain identity independently of their physical scalar family.
 An enum is not TEXT with an allowed-values check, and a domain is not a copied
@@ -141,12 +144,19 @@ before the original cases receive implementation credit:
    definitions. Public JSON schema binding, catalog dependencies and typed-row
    APIs and SQL discovery of those declared native enum columns are implemented.
    Public SQL result/parameter descriptors and scalar pgwire OIDs now retain
-   that identity. SQL type-name intents in CREATE TABLE and named scalar casts
-   remain unbound; catalog declaration syntax alone does not qualify them.
+   that identity. SQL CREATE TABLE resolves normalized type-name intents through
+   one bounded catalog cut, deduplicates executable directories, and serializes
+   owned definitions before admission. Public writes and cold reads are tested.
+   Named scalar casts now resolve through a preparation-only interface and
+   invocation-owned lookup cache. Durable prepared resources retain the original
+   lookup plus catalog incarnation, namespace ID, type ID, origin UUID and minimum
+   compatible generation. Cold execution succeeds; drop/recreate of the spelling
+   rejects the old prepared statement. Catalog syntax alone does not qualify the
+   original lifecycle cases.
 2. Complete enum expression operations, uniqueness/FK type compatibility and
    distributed integrity qualification over those public schemas.
-3. Bind named type intents in SQL columns and scalar casts, then activate enum
-   arrays. Scalar parameter/result descriptors now retain immutable identities,
+3. Activate enum arrays and retained enum-valued view outputs; named scalar
+   casts now retain immutable preparation identities. Scalar parameter/result descriptors now retain immutable identities,
    prepared witnesses and scalar OIDs; array execution remains unsupported.
 4. Activate ADD VALUE across every dependent schema through the existing
    coordinated schema/owner-ACK protocol. Pending or uncertain publication must
@@ -154,8 +164,11 @@ before the original cases receive implementation credit:
 5. Add full public row/default/index/restart/restore campaigns, dependent DROP
    RESTRICT/CASCADE, domain base/default/CHECK/NOT NULL validation and activation.
 
-The disposition ledger has not been changed for the enum/domain work. Passing
-catalog/model tests alone does not establish these remaining contracts.
+The initial ledger credited 0096–0099 after mounted execution and native
+cohort/storage qualification. Dependent enum retirement 0100 is now qualified
+by the later staged-restoration campaign. Domain CREATE/ALTER and dependent
+CASCADE originals remain unresolved; the separately qualified annotations and
+independent retirement do not establish those row-use contracts.
 
 ## Public schema and integrity binding
 
@@ -185,8 +198,9 @@ This uses the existing native integrity planner and transaction machinery.
 
 Dependent ADD VALUE and DROP CASCADE still require coordinated owner/schema
 activation. Their explicit activation barrier remains in place, while DROP
-RESTRICT reports dependent objects. Public SQL column/array descriptors, named cast resolution and domain
-activation remain unfinished. These changes do not
+RESTRICT reports dependent objects. Public scalar SQL column/parameter descriptors
+and CREATE TABLE names retain immutable type identity. Named casts, array execution
+and domain activation remain unfinished. These changes do not
 qualify the original enum/domain cases or change the disposition ledger.
 
 Creation now captures compiler-derived reader contracts before the catalog
@@ -253,7 +267,7 @@ extension columns. A Debug campaign retaining 8,192 repeated values used 14
 allocator calls, including vector growth. This is allocation evidence, not an
 end-to-end throughput claim.
 
-The reproducible PostgreSQL 18+ execution oracle contains 216 scalar probes over
+The reproducible PostgreSQL 18+ execution oracle contains 248 scalar probes over
 three labels and SQL NULL, checking exact values and SQLSTATEs. Native campaigns
 also cover disk-backed duplicate join fan-out, producer retirement, additive
 common types, malformed/truncated spill, budget failure and exhaustive allocation
@@ -261,8 +275,9 @@ failures. Compatibility JSON hashing now agrees with prepared-row hashing for
 enum labels, empty labels, NULL and absent fields.
 
 These changes establish the shared enum value/expression execution layer. SQL
-names, enum arrays, distributed dependent-schema activation, domains and original
-enum DDL qualification remain incomplete. No original inventory disposition was
+column names and scalar casts now bind immutable catalog identities. Enum arrays,
+distributed dependent-schema activation, domains and original enum DDL
+qualification remain incomplete. No original inventory disposition was
 changed for these runtime probes.
 
 ## Declared-column SQL and transport activation
@@ -300,6 +315,299 @@ conversion to TEXT uses the existing durable view contract.
 The Debug qualification commands are `sql-test -Dtest-filter='SQL named enum'`,
 `pgwire-test`, and `antfly-api-sql-enum-catalog-test`. The public campaign exercises
 native typed-row ingestion, SQL updates and RETURNING, ordered/filter/aggregate
-reads, prepared parameters and cold restart. This does not qualify SQL named
-CREATE TABLE/casts, dependent type evolution, enum arrays, domains or restore
-activation, and does not promote any original inventory disposition.
+reads, prepared parameters and cold restart. It now also exercises SQL named
+CREATE TABLE/casts and prepared identity rejection after name reuse. Dependent
+type evolution, enum arrays, domains and restore activation remain unqualified;
+these tests do not promote an original inventory disposition.
+
+## Persistent enum expressions
+
+The native scalar validator now accepts schema-bound enum literals, explicit
+TEXT/enum conversions, column reads, comparisons and conditional results.
+Programs own immutable atom directories independently of producer buffers.
+Enum literal/cast JSON carries only `named_type_id`; its definition comes from
+that schema epoch. Comparison uses stable declaration ranks, and fingerprints
+retain type ID/origin and symbol without changing after additive generations.
+Unrelated named identities cannot compare merely because labels match.
+
+SQL defaults, generated values and CHECKs lower to this existing native VM.
+Native row preparation and cold validation share the same programs. Enum
+expressions require semantic capability 40 and ASCH format 40, including when a
+program produces a boolean or TEXT. Ordinary enum columns retain their semantic
+floor 39; the current physical frame has its independent encoding requirement.
+Per-row lookup uses cached atoms and checks the referenced symbol rather than
+scanning every label. Schema-owned directory memory has a preparation quota.
+
+The focused Debug gate passes 65 enum/reader/decode tests with no skips or leaks.
+This includes native default/generated/CHECK preparation, cold validation,
+additive fingerprint stability and allocation-failure cleanup. The mounted
+public campaign exercises the same default/constraint path, explicit supplied
+values and omitted defaults, before and after restart; all three tests pass.
+This work does not qualify dependent ALTER/DROP, enum arrays or domains.
+
+
+## Dependent type activation
+
+ADD VALUE now uses one bounded immutable cohort on the existing schema-validation
+ledger. Admission captures the type incarnation, origin, generation and complete
+reverse dependency set at one catalog cut. It takes lifecycle locks for every
+participant and records owner preparation once; ACKs retain compact ordinal
+records. Discovery carries each physical table ID separately from the cohort's
+anchor. The writer checks every current owner/root and exact per-table layout;
+different participants may have different columns and schema versions.
+
+The native proof checks append-only symbol/rank preservation and unchanged
+column ordinals, generated/check fingerprints, index tuple encodings and
+integrity generations. Existing transactions drain before compatible successor
+installation. The type and all table descriptors publish atomically after every
+owner is installed; release completes the operation. No historical row scan,
+physical rewrite or index rebuild is required. The populated LSM test verifies
+zero scanned rows, unchanged primary bytes and index identity through cold
+recovery. Admission/publication fault tests cover atomic participant locks,
+aliases, schemas and type state, including heterogeneous table layouts.
+
+The SQL producer retains its actor-authorized recovery receipt before admission.
+A bounded request can return HTTP 202 with DDL PENDING and a pending catalog
+receipt. Pending carries no completed generation/catalog revision. Read-only
+observation joins the original nonce digest to the exact retained job; another
+job for the same type/generation cannot substitute for it. Cold completion
+returns the original committed revision even after later operations. Recovery
+never resubmits the mutation. Decoder floor 115 fences cohort admission.
+
+The mounted Debug campaign now passes public creation of parent/child enum
+columns with UNIQUE/FK enforcement, pending admission, denied receipt access,
+predecessor reads, cold completion, successor writes and retained FK rejection.
+PostgreSQL witnesses distinguish bare ORDER BY of a TEXT cast's output label
+from qualified ORDER BY of the enum input. These are different sort domains.
+The same campaign passes conditional ADD notice/no-install checks, dependent DROP
+RESTRICT, duplicate UNIQUE rejection, a second positioned generation and exact
+recovery of the earlier nonce after that generation. Public execution passes all
+four mounted tests; metadata catalog and shared submission each pass thirteen.
+The combined Debug snapshot additionally passes 1,596 local SQL tests (four
+existing opt-in skips), 243 server SQL tests, both 52-test publication roots and
+the populated LSM epoch gate, with no failures or leaks.
+The admission helper is shared with ordinary schema validation: report/occupancy
+lag retries the same prepared plan only before proposal; uncertainty permits
+read-only observation, never replay.
+
+Protected tables remain ineligible: an installed row-policy program binds the
+exact schema, so its successor must be prepared and attested under the same
+all-owner decision. The common policy guard remains enforced; retaining an old
+policy stamp or bypassing that writer is not an activation strategy. Enum arrays
+and retained enum-valued views also remain unsupported. Domain SET NOT NULL now
+uses executable domain directories, projected validation, write fences and
+authenticated recovery through the shared coordinator. Dependent DROP CASCADE
+uses staged rewrite machinery to remove columns/artifacts while preserving
+other columns and rows, with type retirement in the same publication. Other
+restrictive CHECK changes retain explicit guards. Catalog-only mutation does
+not qualify dependent evolution.
+
+
+## Type annotations
+
+Original `sql-0149` is independently qualified. COMMENT ON TYPE uses the shared
+resource annotation field and atomic nonce outcomes, including exact observation
+after a lost reply. Empty/NULL removes the description; unchanged descriptions
+retain a no-op outcome without rewriting the resource. Type IDs, executable
+generations and canonical row layout digests do not change. ADD VALUE preserves
+the annotation. Decoder floor 114 gates the tagged operation, including removal,
+before durable admission. Snapshot responses omit absent descriptions to retain
+the ordinary query projection. The public cold campaign passes all three tests;
+the durable catalog and decoder suite passes twelve.
+
+Dependency preparation now optionally returns the complete type/table reverse
+edge set and table records from one immutable catalog revision. Admission caps
+this cut at 128 tables and 16 MiB, rejects excess edges before schema loading,
+checks every table's canonical type witness, and computes the shared expected
+type digest once. Ordinary casts do not traverse this directory. Native tests
+exercise two real tables, an excess-edge rejection and catalog reconstruction.
+The read-only cut grants no mutation authority. ADD admission independently
+rejoins the current writer's complete dependency/owner cut; dependent DROP and
+protected-table evolution still require the additional barriers described above.
+
+
+Dependent enum retirement now uses the shared staged restore/rewrite machinery
+and an atomic type/table catalog publication. The populated public cold campaign
+covers parent/child data, namespace authority, PostgreSQL notices and complete
+column postimages, identity continuity and exact retained receipt recovery after
+name reuse. It does not certify guarded policy/view/artifact cohorts or portable
+type-catalog restore. Domain originals 0150 and 0306–0310 remain open.
+
+Cold readiness/installation ACKs retain their logical acceptance while current
+reporter/runtime authority can change. Idle workers re-attest through the same
+fully verified ACK reducer when the current signed commitment differs. Counts,
+logical chains and physical work remain unchanged; terminal records stay idle.
+The public restart test forces one old-reporter ACK before reopening stores.
+
+## Domain contract and activation boundary (2026-10-29)
+
+The native definition is now a distinct named-type union alternative. Domains
+retain their exact base identity, numeric modifier, owned native default and
+named CHECK programs. An immutable bounded registry resolves forward references,
+rejects cycles and rebound origins/generations, and prepares the base chain once.
+The chain depth is checked independently of DFS recursion depth: already prepared
+parents must not permit an arbitrarily deep execution stack. Enum physical
+identities remain enum identities when a domain uses an enum base.
+
+SQL declarations lower through the existing scalar binder and native expression
+VM. VALUE is one typed `value` slot. Source numeric lexemes remain exact. Domain
+constraint names are allocated in declaration order; a later explicit collision
+is an error. CHECK execution order is alphabetical, after NOT NULL, rather than
+source order. Both details were checked against PostgreSQL 18. NOT VALID checks
+still apply to new base-value assignments. Compiled text validation ran 100,000
+iterations with allocations disabled; three Debug whole-process probes took
+approximately 33–43 ms including process startup. This is not an end-to-end
+storage throughput result.
+
+The public layout is generated from OpenAPI for Zig and SDKs. Its domain and
+enum alternatives are checked for mutual exclusivity. Native registry ownership
+is shared by the generated-layout adapter rather than maintaining a second
+executable implementation. Existing enum layout serialization does not gain a
+null domain field, so its executable fingerprints remain stable.
+
+Builtin-based domain catalog creation, presentation-only comments and independent
+retirement use the existing catalog transaction and retained nonce outcome.
+Metadata decoder capability 117 fences the new declaration before interpretation;
+the metadata writer independently validates the executable definition. Domain
+columns, SQL domain casts, named-base catalog creation and dependent alterations
+remain guarded. The generic model or a passing catalog campaign does not qualify
+CREATE DOMAIN's complete row-use contract or dependent CASCADE.
+
+The shared row validator now owns column bindings per immutable schema epoch
+and borrows executable domain programs from that epoch's existing registry;
+CHECK/default programs are not cloned or recompiled for the row plan.
+It applies domain defaults before base normalization, gives explicit column
+defaults precedence, checks fresh base assignments before generated dependents,
+and checks generated outputs as fresh values. Domain-only tables reuse the
+parsed JSON document without allocating schema-width staging arrays per row.
+Sparse trusted input descriptors distinguish INSERT from PATCH, bind to the
+exact destination schema version, and preserve already-domain provenance only
+on submitted base inputs. Generated values cannot inherit those witnesses.
+Explicit DEFAULT requests are sparse producer instructions: PATCH applies only
+requested domain/column defaults and retains unrelated omissions. Raw values
+cannot coexist with a DEFAULT instruction, and DEFAULT cannot carry a trusted
+source-domain witness. Historical restore retains logical provenance instead of reapplying future
+NOT VALID rules. Debug tests cover these shared preparation paths and exhaust
+allocation failures during epoch compilation; this is not public activation or
+qualification of the four remaining domain originals.
+
+The scalar binder/VM now has a separate logical domain coercion boundary after
+ordinary base conversion. It uses the row validator's native programs, captures
+a complete owned ancestor registry per program, and retains independent contracts
+in prepared parameter frames. Trusted same-domain NULL values remain distinct
+from fresh client parameters. Domain checks run before NULL/cache fast paths,
+remain lazy in CASE/COALESCE, and cannot be erased by decimal templates or
+literal-input validation. Symbolic descriptors cannot execute until rebound;
+conflicting definitions under one immutable identity fail closed. Text checks
+need no evaluation allocation, and nested checks share the scalar work budget.
+PostgreSQL 18 probes verify domain preservation for CASE/COALESCE and first-value/
+lag windows, unwrapping for NULLIF/min/max, and generated domain violations before
+ON CONFLICT discards an INSERT candidate. Public descriptors, relational metadata
+propagation, native/distributed mutation provenance and coordinated activation
+remain required; these kernel results do not qualify the four open originals.
+
+### Required work to activate dependent domains
+
+This boundary must be completed as one execution/activation cohort, rather than
+lowering a domain to copied column constraints:
+
+1. Retain the named identity separately from the physical base in native schema
+   epochs, prepared SQL descriptors, casts and assignment output descriptors.
+   Domain NOT NULL must not make an outer-join output statically nonnullable.
+   Comparisons and ordinary operators use the base family; domain identity is
+   preserved only at the PostgreSQL-defined common-type/coercion boundaries.
+2. Carry trusted source-domain provenance from pinned SQL input/output types to
+   prepared mutations, with an exact origin/generation witness checked against
+   the destination epoch. Inference must come from owned compiled programs or
+   native readers. JSON input and client-supplied parameter descriptors cannot
+   mint that witness. Use per-expression/per-column metadata rather than widening
+   every ordinary row value slot.
+3. Enforce base-value coercions through the shared prepared validator for SQL,
+   typed-row writes, COPY and other ingress. Preserve PostgreSQL's distinction
+   between a fresh coercion from a base value and an already domain-typed value.
+   A PostgreSQL 18 probe confirmed that an empty scalar subquery with a NOT NULL
+   domain result can supply SQL NULL to a column of that same domain. Therefore
+   unconditional domain checks on every complete row would reject valid SQL.
+   NOT VALID checks also must not start checking untouched historical cells on
+   an unrelated-column update. Column-level NOT NULL remains an independent
+   storage invariant.
+4. Compile an activation *delta* once per predecessor/successor pair. Scan for a
+   newly enabled NOT NULL and newly added/validated CHECKs; skip unchanged rules
+   and newly NOT VALID rules. Defaults affect future assignments. The standalone `validated_contract` mode is an invariant probe, not a
+   restore API. The prepared `Activation` delta now selects newly restrictive
+   rules and retains predecessor/successor identities, but it is not yet
+   connected to the distributed job scanner/publication path. A full epoch publication must join all
+   dependent tables and named-base definitions, stage the native contracts,
+   collect current owner proofs, and atomically publish catalog, table schemas
+   and the durable outcome through the existing protocol.
+5. Keep physical/canonical restore verification distinct from re-running fresh
+   domain coercions. Restore needs the declared immutable domain/base registry
+   and provenance/activation semantics; it must not accidentally reject a
+   historically admitted domain-typed NULL or bypass table constraints. Reuse
+   the existing staged restore machinery and catalog identity remapping.
+
+Originals 0306, 0307, 0308 and 0310 now have public row/default/constraint,
+activation and fault/restart evidence for these boundaries. Parser, registry,
+generated DTO and catalog tests alone do not establish that qualification.
+Enum arrays, protected-table evolution and portable named-type catalog
+restoration remain outside the completed scope.
+
+
+### Prepared activation and row admission components
+
+The native registry now stamps exact identity witnesses on executable views.
+`validateCoercion` distinguishes fresh base input from trusted already-domain
+SQL input, rejects stale/rebound witnesses, and preserves the PostgreSQL typed
+NULL exception. This witness belongs to compiled expression/column metadata;
+ordinary value slots remain unchanged. Public input descriptors do not grant
+that trust.
+
+The owned `Activation` plan compares pinned predecessor/successor contracts,
+selects newly enabled NOT NULL and newly validated/changed CHECK programs in
+alphabetical order, and recursively includes changed base-domain rules.
+Default-only changes produce no scan work. It does not recheck an unchanged
+NOT NULL against historically admitted typed NULLs. Nested ownership and
+allocation-failure tests cover the full preparation path.
+
+`domain_row.Plan` prepares domain defaults and validates actual assigned
+columns while leaving untouched historical values alone. Its sparse JSON
+operations share the existing parsed document/null authority, emit only absent
+eligible defaults, and use epoch-bound ordinal provenance. They do not create
+schema-width value/mask arrays on each row. Explicit column defaults and
+generated expressions retain precedence; the runtime still needs to connect
+these components at the shared preparation boundaries.
+
+The physical codec resolves domains to immutable builtin/enum bases without
+compiling logical CHECK programs into every covering layout. Repeated column
+references share preparation-time physical-base lookups; covering directories
+retain transitive named bases, and transforms/hash/FK paths resolve the actual
+enum base. A codec test verifies unchanged base row bytes and ancestor retention.
+Native schema format and semantic capability 41 admit bounded immutable domain
+DAGs, validate exact physical column identities and reject old-reader admission.
+Cold decoding rebuilds the domain registry; SQL column metadata owns the registry
+past the producing schema lifetime. Public builtin-domain tables use compiler
+coercion witnesses, canonical native verification and private versioned handoffs.
+Each session owns a shared contract; raw replacements retire older authority.
+The native intent boundary consumes the contract before journaling AROW bytes.
+FK actions preserve untouched typed values and validate changed inputs. Portable
+restore preserves historical typed NULLs and still rejects fresh invalid writes.
+
+SQL casts, inferred domain parameters, retained wire metadata, CTE/derived/set
+outputs and domain-preserving windows use the owned compiled contracts. Result
+wire OIDs flatten to the physical base as PostgreSQL does; parameter wire OIDs
+retain the logical domain. Unknown/base set inputs unwrap domains. Public cast
+and prepared-parameter campaigns pass across cold restart. The original numeric
+CHECK/text DEFAULT NOT NULL declarations and dependent DROP DOMAIN CASCADE are
+qualified through PostgreSQL-backed mounted lifecycle campaigns, native FK
+cascades, cold intents and portable restore. ALTER DOMAIN SET NOT NULL now uses
+that same durable schema epoch coordinator: exact immutable postimages,
+capability-118 admission, fenced/drained owners, bounded projected bitmap scans,
+all-owner readiness, atomic type/table publication and durable release. Existing
+NULLs cancel without changing the active domain; the original retained operation
+reports SQLSTATE 23502 even after cold recovery. Rows and index tuples are not
+rewritten. Domain nullability never changes physical column nullability. Other
+restrictive CHECK/default evolutions remain guarded. Nested domain declarations
+remain guarded until
+catalog dependency closure and coordinated child-generation publication exist. Explicit window-default
+expressions also still need deferred evaluation; demand-time coercion of fresh
+unknown defaults alone does not establish general lazy-argument parity.

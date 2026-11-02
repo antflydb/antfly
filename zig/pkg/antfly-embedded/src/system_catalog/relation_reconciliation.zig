@@ -680,6 +680,16 @@ fn optionalGet(reader: anytype, key: []const u8) !?[]const u8 {
 /// must still use CAS intents: this is neither a reservation nor serving proof.
 /// There is only one protected root, so finding the oldest eligible retirement
 /// needs one seek and at most one successor, regardless of backlog size.
+/// Exact bounded incoming-FK adoption cursor. Names/schemas stay in native
+/// storage; the coordinator carries no caller-selected dependency set.
+pub const ForeignKeyBackfill = struct {
+    revision: u64 = 0,
+    after_table: u64 = 0,
+    pub fn validate(self: @This()) !void {
+        if ((self.revision == 0 and self.after_table != 0) or self.revision == std.math.maxInt(u64)) return error.InvalidCatalogRecord;
+    }
+};
+
 pub const Work = struct {
     epoch: ?Epoch,
     current: ?State,
@@ -693,6 +703,7 @@ pub const Work = struct {
     /// while its constraint-name replacement is still being built.
     published_coverage: ?Coverage = null,
     garbage: ?Retirement = null,
+    foreign_key_backfill: ?ForeignKeyBackfill = null,
 
     pub fn read(reader: anytype, group: u64, epoch: ?Epoch) !Work {
         const revision = try readSourceRevision(reader, group);

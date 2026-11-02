@@ -41,6 +41,7 @@ pub const PreparationPhase = enum { complete, candidate, selected };
 
 pub const PreparationRuntime = struct {
     io: std.Io,
+    domain_admission: ?@import("domain_row.zig").Admission = null,
     uuid_clock: ?*@import("../common/uuid.zig").Version7Clock = null,
     sequences: ?@import("../system_catalog/column_sequences.zig").Provider = null,
     sequence_scope: ?@import("../system_catalog/column_sequences.zig").Scope = null,
@@ -55,6 +56,7 @@ pub const PreparationRuntime = struct {
 };
 
 pub const Execution = struct {
+    domain_admission: ?@import("domain_row.zig").Admission = null,
     alloc: Allocator,
     bytes: *usize,
     numeric: exact.Context,
@@ -172,6 +174,9 @@ pub const PreparedInput = struct {
         try execution.charge(node.column_name.len);
         if (self.entries.get(node.column_name)) |entry| {
             if (entry.kind != node.kind or entry.sql_type != node.sql_type) return error.RelationalIndexColumnTypeMismatch;
+            if (entry.value == .enumeration) if (node.enum_view) |view| {
+                _ = try view.output(entry.value.enumeration);
+            };
             return entry.value;
         }
         if (self.roots.admission) |*admission| admission.begin();
@@ -812,7 +817,7 @@ fn numericJsonOutput(execution: *Execution, bytes: []const u8) !std.json.Value {
     return scratch.json(parsed.value) catch |err| return scratch.failure(err);
 }
 
-pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt, jsonb_typeof, jsonb_array_length, jsonb_extract_path, jsonb_extract_path_text, uuidv4, uuidv7, transaction_timestamp };
+pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt, jsonb_typeof, jsonb_array_length, jsonb_extract_path, jsonb_extract_path_text, uuidv4, uuidv7, transaction_timestamp, length, octet_length, bit_length };
 
 fn jsonFunction(op: Op) bool {
     return switch (op) {
@@ -836,9 +841,9 @@ pub fn acceptsField(op: Op, name: []const u8) bool {
         .uuidv4 => false,
         .transaction_timestamp => std.mem.eql(u8, name, "precision"),
         .uuidv7 => std.mem.eql(u8, name, "shift"),
-        .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "json_null"),
+        .literal => std.mem.eql(u8, name, "named_type_id") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "json_null"),
         .column => std.mem.eql(u8, name, "column"),
-        .cast => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "numeric_modifier"),
+        .cast => std.mem.eql(u8, name, "named_type_id") or std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "numeric_modifier"),
         .array => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
         .add, .subtract, .multiply, .divide, .modulo, .negate, .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
         else => std.mem.eql(u8, name, "args") or ((isComparison(op) or op == .in_list or op == .not_in_list) and std.mem.eql(u8, name, "collation")),
@@ -852,7 +857,7 @@ pub fn acceptsArity(op: Op, count: usize) bool {
         .array => count <= 32,
         .jsonb_typeof, .jsonb_array_length => count == 1,
         .jsonb_extract_path, .jsonb_extract_path_text => count >= 2 and count <= 32,
-        .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast, .md5, .abs, .ceil, .floor, .sign, .sqrt => count == 1,
+        .length, .octet_length, .bit_length, .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast, .md5, .abs, .ceil, .floor, .sign, .sqrt => count == 1,
         .round, .trunc => count == 1 or count == 2,
         .replace => count == 3,
         .concat, .coalesce, .@"and", .@"or" => count >= 2 and count <= 32,
@@ -871,6 +876,7 @@ const Node = struct {
     literal: Value = .null,
     sql_type: ?Numeric = null,
     numeric_modifier: ?exact.TypeModifier = null,
+    enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
     replace_pattern: ?text_kernel.Pattern = null,
     uuid_shift: ?@import("../sql/temporal_value.zig").Interval = null,
     clock_precision: u8 = 6,
@@ -1225,6 +1231,11 @@ pub const Plan = struct {
             .values => |values| if (node.ordinal < values.len) values[node.ordinal] else return error.InvalidRelationalExpressionInput,
             .json => |json| blk: {
                 const input = json.object.get(node.column_name) orelse .null;
+                if (node.kind == .enumeration) {
+                    if (input == .null) break :blk .null;
+                    if (input != .string) return error.InvalidRelationalExpressionInput;
+                    break :blk .{ .enumeration = try (node.enum_view orelse return error.InvalidRelationalExpressionInput).input(input.string) };
+                }
                 if (node.kind == .blob) break :blk try decodeBlob(execution, try BlobOperand.fromJson(input));
                 if (node.kind == .sql_array) break :blk try arrayJson(execution, node.sql_type.?, input, null);
                 if (@import("../sql/range_value.zig").kindFromType(node.kind)) |kind| break :blk try rangeJson(execution, kind, input);
@@ -1238,6 +1249,10 @@ pub const Plan = struct {
                 const cell = (try row.findCell(ordinal)) orelse break :blk .null;
                 if (cell.is_null) break :blk .null;
                 break :blk switch (node.kind) {
+                    .enumeration => enum_value: {
+                        const physical = row.layout.enumView(ordinal) orelse return error.RelationalIndexColumnTypeMismatch;
+                        break :enum_value .{ .enumeration = try physical.bySymbol(std.math.cast(u32, cell.value.i64_val) orelse return error.InvalidSqlEnumSymbol) };
+                    },
                     .string => .{ .string = cell.value.bytes_val },
                     .blob => try decodeBlob(execution, try BlobOperand.fromJson(.{ .string = cell.value.bytes_val })),
                     .integer => .{ .integer = cell.value.i64_val },
@@ -1252,6 +1267,9 @@ pub const Plan = struct {
             },
         };
         if (value != .null and !valueHasKind(value, node.kind)) return error.InvalidRelationalExpressionInput;
+        if (value == .enumeration) if (node.enum_view) |view| {
+            _ = try view.output(value.enumeration);
+        };
         if (value == .sql_array and value.sql_array.element_type != node.sql_type) return error.InvalidRelationalExpressionInput;
         if (value == .number and !std.math.isFinite(value.number)) return error.InvalidRelationalExpressionInput;
         return value;
@@ -1417,6 +1435,17 @@ pub const Plan = struct {
             if (operands[i] == .null) return .null;
         }
         const a = operands[0];
+        if (node.op == .cast and node.kind == .enumeration) {
+            const view = node.enum_view orelse return error.InvalidRelationalExpressionInput;
+            if (a == .string) return .{ .enumeration = try view.input(a.string) };
+            if (a != .enumeration) return error.InvalidRelationalExpressionInput;
+            _ = try view.output(a.enumeration);
+            return .{ .enumeration = try view.bySymbol(a.enumeration.symbol) };
+        }
+        if (node.op == .cast and a == .enumeration) {
+            if (node.kind != .string) return error.InvalidRelationalExpressionInput;
+            return .{ .string = a.enumeration.text };
+        }
         if (a == .numeric or node.kind == .numeric) return numericOperation(execution, node, operands[0..node.children.len], self.nodes[node.children[0]]);
         switch (node.op) {
             .not => return .{ .boolean = !a.boolean },
@@ -1474,6 +1503,14 @@ pub const Plan = struct {
                     offset += value.string.len;
                 }
                 return .{ .string = output };
+            },
+            .length => return .{ .integer = text_kernel.characterLength(a.string, &execution.numeric) catch |err| switch (err) {
+                error.SqlInvalidTextEncoding => return error.InvalidRelationalExpressionInput,
+                else => return executionFailure(err),
+            } },
+            .octet_length, .bit_length => {
+                const bytes = std.math.cast(i32, a.string.len) orelse return error.RelationalExpressionOverflow;
+                return .{ .integer = if (node.op == .bit_length) std.math.mul(i32, bytes, 8) catch return error.RelationalExpressionOverflow else bytes };
             },
             .lower_ascii, .upper_ascii => {
                 const output = try allocateOutput(alloc, a.string.len, budget);
@@ -2494,7 +2531,11 @@ fn valueOrder(a: Value, b: Value, fold_ascii: bool) !std.math.Order {
 fn valueOrderWithContext(a: Value, b: Value, fold_ascii: bool, context: *exact.Context) !std.math.Order {
     return switch (a) {
         .null => unreachable,
-        .enumeration => error.InvalidRelationalExpressionType,
+        .enumeration => |left| blk: {
+            if (b != .enumeration or fold_ascii) return error.InvalidRelationalExpressionType;
+            try context.charge(@max(left.order_key.len, b.enumeration.order_key.len));
+            break :blk try left.compare(b.enumeration.*);
+        },
         .string => |left| orderBytes(left, b.string, fold_ascii, context),
         .blob => |value| orderBytes(value, b.blob, false, context),
         .numeric => |bytes| blk: {
@@ -2594,7 +2635,13 @@ fn valueHasKind(value: Value, kind: Kind) bool {
 }
 
 fn sameOperandType(a: Node, b: Node) bool {
-    return a.kind == b.kind and (a.kind != .sql_array or a.sql_type == b.sql_type);
+    if (a.kind != b.kind or (a.kind == .sql_array and a.sql_type != b.sql_type)) return false;
+    if (a.kind == .enumeration) {
+        const left = a.enum_view orelse return false;
+        const right = b.enum_view orelse return false;
+        return left.record.sameValueDomain(right.record);
+    }
+    return true;
 }
 
 /// One collation contract for logical CHECKs, expression operands and ordered
@@ -2670,6 +2717,46 @@ const Compiler = struct {
     visited: usize = 0,
     allow_preparation_defaults: bool = false,
     literal_bytes: usize = 0,
+    enum_views: std.AutoHashMapUnmanaged(u64, *const @import("../common/sql_enum_value.zig").View) = .empty,
+    enum_bytes: usize = 0,
+
+    fn enumView(self: *Compiler, id: u64) !*const @import("../common/sql_enum_value.zig").View {
+        if (!self.table.requires_enum_expressions) return error.InvalidRelationalExpressionType;
+        if (self.enum_views.get(id)) |prepared| return prepared;
+        const record = schema.namedType(self.table, id) orelse return error.InvalidRelationalExpressionType;
+        if (record.definition != .labels) return error.InvalidRelationalExpressionType;
+        // Bound executable directory memory before cloning. This is preparation
+        // work; every row subsequently borrows cached atoms and stable ranks.
+        var bytes: usize = @sizeOf(@import("../common/sql_enum_value.zig").View);
+        for (record.definition.labels) |label| bytes +|= label.text.len +| label.order_key.len +|
+            @sizeOf(@import("../common/sql_enum_value.zig").Value) +| @sizeOf(@import("../system_catalog/named_types.zig").Label) +| 2 * @sizeOf(u32);
+        if (bytes > max_allocated_bytes -| self.enum_bytes) return error.RelationalExpressionBudgetExceeded;
+        self.enum_bytes += bytes;
+        const owned = try record.cloneOwned(self.alloc);
+        const view = try self.alloc.create(@import("../common/sql_enum_value.zig").View);
+        view.* = try @import("../common/sql_enum_value.zig").View.init(self.alloc, owned);
+        try self.enum_views.put(self.alloc, id, view);
+        return view;
+    }
+    fn frameEnum(self: *Compiler, view: *const @import("../common/sql_enum_value.zig").View) void {
+        self.frame("SQL enum executable domain v1");
+        var id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &id, view.record.identity.id, .little);
+        self.frame(&id);
+        self.frame(&view.record.identity.origin_id);
+    }
+    fn declaredEnum(self: *Compiler, input: std.json.Value) !*const @import("../common/sql_enum_value.zig").View {
+        const raw = input.object.get("named_type_id") orelse return error.InvalidRelationalExpressionType;
+        const id = switch (raw) {
+            .integer => |value| std.math.cast(u64, value) orelse return error.InvalidRelationalExpressionType,
+            .number_string => |value| std.fmt.parseInt(u64, value, 10) catch return error.InvalidRelationalExpressionType,
+            else => return error.InvalidRelationalExpressionType,
+        };
+        if (id == 0) return error.InvalidRelationalExpressionType;
+        const view = try self.enumView(id);
+        self.frameEnum(view);
+        return view;
+    }
 
     fn frame(self: *Compiler, bytes: []const u8) void {
         var size: [8]u8 = undefined;
@@ -2723,6 +2810,7 @@ const Compiler = struct {
                 if (kind != .string) return error.InvalidRelationalExpression;
                 node.kind = std.meta.stringToEnum(Kind, kind.string) orelse return error.InvalidRelationalExpression;
                 const value = input.object.get("value") orelse .null;
+                if (node.kind == .enumeration) node.enum_view = try self.declaredEnum(input) else if (input.object.contains("named_type_id")) return error.InvalidRelationalExpressionType;
                 const marker = input.object.get("json_null");
                 if (marker) |present| {
                     if (node.kind != .json or present != .bool or !self.table.requires_json_expressions) return error.InvalidRelationalExpressionType;
@@ -2730,7 +2818,7 @@ const Compiler = struct {
                 }
                 const json_null = if (marker) |present| present.bool else false;
                 switch (node.kind) {
-                    .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .sql_array => {},
+                    .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .sql_array, .enumeration => {},
                     .numrange, .daterange, .tsrange, .tstzrange => if (!self.table.requires_range_expressions) return error.InvalidRelationalExpressionType,
                     .json => if ((value != .null or json_null) and !self.table.requires_json_expressions) return error.InvalidRelationalExpressionType,
                     else => return error.InvalidRelationalExpressionType,
@@ -2743,7 +2831,7 @@ const Compiler = struct {
                 }
                 var json_literal: ?JsonLiteral = null;
                 if (node.kind == .json and (value != .null or json_null)) json_literal = try prepareJsonLiteral(self.execution, value);
-                node.literal = (if (json_literal) |literal| literal.value else if (node.kind == .sql_array) arrayJson(self.execution, node.sql_type.?, value, null) else if (node.kind == .numeric) numericJson(self.execution, value) else if (@import("../sql/range_value.zig").kindFromType(node.kind)) |range_kind| rangeJson(self.execution, range_kind, value) else scalarJson(self.alloc, node.kind, value, true)) catch |err| switch (err) {
+                node.literal = (if (node.kind == .enumeration) (if (value == .null) Value.null else if (value == .string) Value{ .enumeration = try node.enum_view.?.input(value.string) } else return error.InvalidRelationalExpressionType) else if (json_literal) |literal| literal.value else if (node.kind == .sql_array) arrayJson(self.execution, node.sql_type.?, value, null) else if (node.kind == .numeric) numericJson(self.execution, value) else if (@import("../sql/range_value.zig").kindFromType(node.kind)) |range_kind| rangeJson(self.execution, range_kind, value) else scalarJson(self.alloc, node.kind, value, true)) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     error.SqlProgramLimitExceeded, error.RelationalExpressionBudgetExceeded => return err,
                     else => return error.InvalidRelationalExpressionType,
@@ -2770,7 +2858,11 @@ const Compiler = struct {
                 self.frame(@tagName(node.literal));
                 var bytes: [8]u8 = undefined;
                 switch (node.literal) {
-                    .enumeration => return error.InvalidRelationalExpressionType,
+                    .enumeration => |atom| {
+                        var symbol: [4]u8 = undefined;
+                        std.mem.writeInt(u32, &symbol, atom.symbol, .little);
+                        self.frame(&symbol);
+                    },
                     .null => {},
                     .string, .blob, .numeric => |value_bytes| self.frame(value_bytes),
                     .boolean => |boolean| self.hash.update(&.{@intFromBool(boolean)}),
@@ -2805,11 +2897,15 @@ const Compiler = struct {
                     if (std.mem.eql(u8, column.name, name.string)) break @intCast(ordinal);
                 } else return error.RelationalIndexColumnNotFound;
                 node.kind = self.table.relational_columns[node.ordinal].column_type;
+                if (node.kind == .enumeration) {
+                    node.enum_view = try self.enumView((schema.namedEnumBaseRecord(self.table, self.table.relational_columns[node.ordinal].named_type_id orelse return error.InvalidRelationalExpressionType) catch return error.InvalidRelationalExpressionType).identity.id);
+                    self.frameEnum(node.enum_view.?);
+                }
                 node.sql_type = self.table.relational_columns[node.ordinal].sql_element_type;
                 if (node.kind == .numeric and node.sql_type != .numeric) return error.InvalidRelationalExpressionType;
                 if (node.kind == .sql_array and node.sql_type == null) return error.InvalidRelationalExpressionType;
                 switch (node.kind) {
-                    .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .sql_array => {},
+                    .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .sql_array, .enumeration => {},
                     .numrange, .daterange, .tsrange, .tstzrange => {},
                     .json => if (!self.table.requires_json_expressions) return error.InvalidRelationalExpressionType,
                     else => return error.InvalidRelationalExpressionType,
@@ -2862,6 +2958,7 @@ const Compiler = struct {
                 node.children = children;
                 const operand = self.nodes.items[children[if (op == .case_when) children.len - 1 else 0]];
                 node.kind = operand.kind;
+                node.enum_view = operand.enum_view;
                 if (op == .case_when) {
                     for (children[0 .. children.len - 1], 0..) |child, i| {
                         const candidate = self.nodes.items[child];
@@ -2878,6 +2975,10 @@ const Compiler = struct {
                         else => .string,
                     };
                     if (op == .jsonb_array_length) node.sql_type = .int32;
+                } else if (op == .length or op == .octet_length or op == .bit_length) {
+                    if (!self.table.requires_string_lengths or operand.kind != .string) return error.InvalidRelationalExpressionType;
+                    node.kind = .integer;
+                    node.sql_type = .int32;
                 } else if (numericFunction(op) != null) {
                     if (operand.kind != .integer and operand.kind != .number and operand.kind != .numeric) return error.InvalidRelationalExpressionType;
                     if (operand.kind == .integer and op != .abs) return error.InvalidRelationalExpressionType;
@@ -2895,16 +2996,27 @@ const Compiler = struct {
                 }
                 switch (op) {
                     .cast => {
-                        if (node.kind != .integer and node.kind != .number and node.kind != .numeric and node.kind != .sql_array) return error.InvalidRelationalExpressionType;
                         const kind = input.object.get("type") orelse return error.InvalidRelationalExpression;
                         if (kind != .string) return error.InvalidRelationalExpression;
                         node.kind = std.meta.stringToEnum(Kind, kind.string) orelse return error.InvalidRelationalExpressionType;
-                        if ((operand.kind == .sql_array) != (node.kind == .sql_array)) return error.InvalidRelationalExpressionType;
-                        if (input.object.get("sql_type") == null) return error.InvalidRelationalExpression;
+                        if (node.kind == .enumeration) {
+                            node.enum_view = try self.declaredEnum(input);
+                            if (operand.kind != .string and !sameOperandType(node, operand)) return error.InvalidRelationalExpressionType;
+                            if (input.object.contains("sql_type")) return error.InvalidRelationalExpressionType;
+                        } else if (operand.kind == .enumeration) {
+                            if (node.kind != .string or input.object.contains("named_type_id") or input.object.contains("sql_type")) return error.InvalidRelationalExpressionType;
+                            node.enum_view = null;
+                        } else {
+                            if (input.object.contains("named_type_id")) return error.InvalidRelationalExpressionType;
+                            if (operand.kind != .integer and operand.kind != .number and operand.kind != .numeric and operand.kind != .sql_array) return error.InvalidRelationalExpressionType;
+                            if ((operand.kind == .sql_array) != (node.kind == .sql_array)) return error.InvalidRelationalExpressionType;
+                            if (input.object.get("sql_type") == null) return error.InvalidRelationalExpression;
+                        }
                     },
                     .add, .subtract, .multiply, .divide, .negate, .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => if (node.kind != .integer and node.kind != .number and node.kind != .numeric) return error.InvalidRelationalExpressionType,
                     // PostgreSQL has no float4/float8 remainder operator.
                     .modulo => if (node.kind != .integer and node.kind != .numeric) return error.InvalidRelationalExpressionType,
+                    .length, .octet_length, .bit_length => {},
                     .concat, .lower_ascii, .upper_ascii, .replace, .md5 => if (node.kind != .string) return error.InvalidRelationalExpressionType,
                     .coalesce, .case_when => {
                         if (node.kind == .sql_array) node.sql_type = operand.sql_type;
@@ -4160,6 +4272,9 @@ pub const Set = struct {
     read_columns: []bool,
     generated_columns: []bool,
     modifier_ordinals: []const u32,
+    /// Borrowed from this Set's immutable programs, indexed once by physical
+    /// ordinal. No catalog lookup or directory allocation enters row execution.
+    enum_column_views: []const ?*const @import("../common/sql_enum_value.zig").View,
     pub const Binding = struct {
         ordinal: u32,
         generated: bool,
@@ -4227,6 +4342,7 @@ pub const Set = struct {
                         return error.InvalidRelationalExpressionType;
                     var owned = try @import("../system_catalog/column_sequences.zig").Binding.parse(alloc, reference);
                     errdefer owned.deinit();
+                    if (owned.value.generation != .serial and (!table.relational_columns[ordinal].required or table.relational_columns[ordinal].allows_null)) return error.InvalidRelationalExpressionType;
                     total_nodes += 1;
                     total_literal_bytes += owned.value.target.database.len + owned.value.target.namespace.len + owned.value.target.table.len + @sizeOf(@TypeOf(owned.value));
                     if (total_nodes > 4096 or total_literal_bytes > max_allocated_bytes) return error.RelationalExpressionBudgetExceeded;
@@ -4237,6 +4353,11 @@ pub const Set = struct {
                 var plan = if (mode == 0) try Plan.initDefault(alloc, table, entry.object.get("expression") orelse return error.InvalidRelationalExpression, table.relational_columns[ordinal].column_type) else try Plan.init(alloc, table, entry.object.get("expression") orelse return error.InvalidRelationalExpression, table.relational_columns[ordinal].column_type);
                 errdefer plan.deinit();
                 if (plan.result_kind == .sql_array and plan.result_sql_type != table.relational_columns[ordinal].sql_element_type) return error.InvalidRelationalExpressionType;
+                if (plan.result_kind == .enumeration) {
+                    const target = schema.namedType(table, table.relational_columns[ordinal].named_type_id orelse return error.InvalidRelationalExpressionType) orelse return error.InvalidRelationalExpressionType;
+                    const result = plan.nodes[plan.nodes.len - 1].enum_view orelse return error.InvalidRelationalExpressionType;
+                    if (!target.sameValueDomain(result.record)) return error.InvalidRelationalExpressionType;
+                }
                 total_nodes += plan.nodes.len;
                 total_literal_bytes += plan.literal_bytes;
                 if (total_nodes > 4096 or total_literal_bytes > max_allocated_bytes) return error.RelationalExpressionBudgetExceeded;
@@ -4270,8 +4391,26 @@ pub const Set = struct {
         }
         const modifier_ordinals = try constrained.toOwnedSlice(alloc);
         errdefer alloc.free(modifier_ordinals);
+        const has_enums = enums: {
+            for (bindings) |binding| {
+                if (table.relational_columns[binding.ordinal].column_type == .enumeration) break :enums true;
+                for (binding.dependencies()) |ordinal| if (table.relational_columns[ordinal].column_type == .enumeration) break :enums true;
+            }
+            break :enums false;
+        };
+        const enum_column_views = try alloc.alloc(?*const @import("../common/sql_enum_value.zig").View, if (has_enums) table.relational_columns.len else 0);
+        errdefer alloc.free(enum_column_views);
+        @memset(enum_column_views, null);
+        if (has_enums) for (bindings) |*binding| {
+            if (binding.source != .expression) continue;
+            const plan = &binding.source.expression;
+            for (plan.nodes) |node| if (node.op == .column and node.kind == .enumeration) {
+                enum_column_views[node.ordinal] = node.enum_view orelse return error.InvalidRelationalExpressionType;
+            };
+            if (plan.result_kind == .enumeration) enum_column_views[binding.ordinal] = plan.nodes[plan.nodes.len - 1].enum_view;
+        };
         const set = try alloc.create(Set);
-        set.* = .{ .alloc = alloc, .table = table, .bindings = bindings, .order = order, .read_columns = read_columns, .generated_columns = generated_columns, .modifier_ordinals = modifier_ordinals };
+        set.* = .{ .alloc = alloc, .table = table, .bindings = bindings, .order = order, .read_columns = read_columns, .generated_columns = generated_columns, .modifier_ordinals = modifier_ordinals, .enum_column_views = enum_column_views };
         return set;
     }
 
@@ -4288,6 +4427,7 @@ pub const Set = struct {
     }
 
     pub fn deinit(self: *Set) void {
+        self.alloc.free(self.enum_column_views);
         self.alloc.free(self.modifier_ordinals);
         for (self.bindings) |*binding| binding.deinit();
         self.alloc.free(self.bindings);
@@ -4317,10 +4457,11 @@ pub const Set = struct {
     }
 
     pub fn applyValuesWithExecution(self: *const Set, execution: *Execution, values: []Value, present: []bool, defaults: DefaultsPolicy, default_mask: ?[]const bool) !void {
-        return self.applyValuesPhase(execution, values, present, defaults, default_mask, .complete);
+        return self.applyValuesPhase(execution, values, present, defaults, default_mask, .complete, null);
     }
 
-    fn applyValuesPhase(self: *const Set, execution: *Execution, values: []Value, present: []bool, defaults: DefaultsPolicy, default_mask: ?[]const bool, phase: PreparationPhase) !void {
+    fn applyValuesPhase(self: *const Set, execution: *Execution, values: []Value, present: []bool, defaults: DefaultsPolicy, default_mask: ?[]const bool, phase: PreparationPhase, generated_selection: ?[]const bool) !void {
+        if (generated_selection) |mask| if (mask.len != self.table.relational_columns.len) return error.InvalidRelationalExpressionInput;
         if (values.len != self.table.relational_columns.len or present.len != values.len or (default_mask != null and default_mask.?.len != values.len)) return error.InvalidRelationalExpressionInput;
         // Base assignments must cross the target domain before any generated
         // expression reads them. Ignore submitted generated fields and keep
@@ -4332,7 +4473,11 @@ pub const Set = struct {
         for (self.order) |index| {
             const binding = &self.bindings[index];
             if (phase == .candidate and binding.generated) continue;
+            if (binding.generated and generated_selection != null and !generated_selection.?[binding.ordinal]) continue;
             if (!binding.generated and (present[binding.ordinal] or defaults == .preserve_absence or (default_mask != null and !default_mask.?[binding.ordinal]))) continue;
+            if (!binding.generated) if (execution.domain_admission orelse if (execution.preparation_runtime) |runtime| runtime.domain_admission else null) |admission| {
+                if (!admission.appliesDefault(binding.ordinal)) continue;
+            };
             values[binding.ordinal] = try self.normalizeBinding(execution, binding.ordinal, try binding.evaluate(execution, values, self.table.relational_columns[binding.ordinal].name));
             present[binding.ordinal] = true;
         }
@@ -4365,7 +4510,44 @@ pub const Set = struct {
         return self.applyTypedJsonPhase(execution, document, roots, nulls, .complete);
     }
 
+    /// Check raw DEFAULT instructions before any domain/column producer runs.
+    /// A produced default is then an ordinary present value for later phases.
+    pub fn requireDefaultInputs(self: *const Set, document: std.json.Value, admission: @import("domain_row.zig").Admission) !void {
+        if (document != .object) return error.InvalidRelationalExpressionInput;
+        if (admission.inputs) |fields| for (fields) |field| {
+            if (field.ordinal >= self.table.relational_columns.len or (field.use_default and field.source != null)) return error.InvalidRelationalExpressionInput;
+            if (field.use_default and document.object.contains(self.table.relational_columns[field.ordinal].name)) return error.InvalidRelationalExpressionInput;
+        };
+    }
+
     pub fn applyTypedJsonPhase(self: *const Set, execution: *Execution, document: *std.json.Value, roots: *@import("../sql/row_value.zig").JsonRow, nulls: *@import("../sql/row_value.zig").JsonNulls, phase: PreparationPhase) !void {
+        return self.applyTypedJsonSelected(execution, document, roots, nulls, phase, null);
+    }
+
+    /// Freeze the reverse dependency closure once per schema epoch. Generated
+    /// order is topological, so one reverse walk includes every producer needed
+    /// by the selected roots without evaluating unrelated generated fields.
+    pub fn generatedClosure(self: *const Set, alloc: Allocator, selected: []const bool) ![]const bool {
+        if (selected.len != self.table.relational_columns.len) return error.InvalidRelationalExpressionInput;
+        if (std.mem.indexOfScalar(bool, selected, true) == null) return &.{};
+        const mask = try alloc.dupe(bool, selected);
+        var index = self.order.len;
+        while (index != 0) {
+            index -= 1;
+            const binding = &self.bindings[self.order[index]];
+            if (!binding.generated or !mask[binding.ordinal]) continue;
+            for (binding.dependencies()) |dependency| if (self.generated_columns[dependency]) {
+                mask[dependency] = true;
+            };
+        }
+        return mask;
+    }
+
+    pub fn applyTypedJsonGeneratedSelection(self: *const Set, execution: *Execution, document: *std.json.Value, roots: *@import("../sql/row_value.zig").JsonRow, nulls: *@import("../sql/row_value.zig").JsonNulls, selected: []const bool) !void {
+        return self.applyTypedJsonSelected(execution, document, roots, nulls, .selected, selected);
+    }
+
+    fn applyTypedJsonSelected(self: *const Set, execution: *Execution, document: *std.json.Value, roots: *@import("../sql/row_value.zig").JsonRow, nulls: *@import("../sql/row_value.zig").JsonNulls, phase: PreparationPhase, generated_selection: ?[]const bool) !void {
         execution.numeric.charge(0) catch |err| return executionFailure(err);
         if (roots.context != &execution.numeric or nulls.context != &execution.numeric or
             roots.admission == null or nulls.admission == null or
@@ -4383,7 +4565,7 @@ pub const Set = struct {
         defer alloc.free(present);
         execution.bytes.* -= staging_bytes;
         try self.readValues(execution, document.*, values, present, true, roots, nulls);
-        try self.applyValuesPhase(execution, values, present, if (phase == .selected) .preserve_absence else .apply_to_absent, null, phase);
+        try self.applyValuesPhase(execution, values, present, if (phase == .selected) .preserve_absence else .apply_to_absent, null, phase, generated_selection);
         for (self.modifier_ordinals) |ordinal| {
             if (self.generated_columns[ordinal]) continue;
             const column = self.table.relational_columns[ordinal];
@@ -4396,8 +4578,12 @@ pub const Set = struct {
         }
         for (self.bindings) |binding| {
             if ((phase == .candidate and binding.generated) or (phase == .selected and !binding.generated)) continue;
+            if (binding.generated and generated_selection != null and !generated_selection.?[binding.ordinal]) continue;
             const name = self.table.relational_columns[binding.ordinal].name;
             if (!binding.generated and document.object.contains(name)) continue;
+            // A sparse update may deliberately preserve this omission. Do not
+            // turn an unevaluated default into an emitted SQL NULL.
+            if (!present[binding.ordinal]) continue;
             const value = values[binding.ordinal];
             if (self.table.requires_document_expressions and value == .null) {
                 if (self.table.relational_columns[binding.ordinal].column_type == .json)
@@ -4564,6 +4750,12 @@ pub const Set = struct {
     fn normalizeBinding(self: *const Set, execution: *Execution, ordinal: usize, value: Value) !Value {
         if (value == .null) return value;
         const column = self.table.relational_columns[ordinal];
+        if (column.column_type == .enumeration) {
+            if (value != .enumeration or ordinal >= self.enum_column_views.len) return error.InvalidRelationalExpressionInput;
+            const view = self.enum_column_views[ordinal] orelse return error.InvalidRelationalExpressionInput;
+            _ = try view.output(value.enumeration);
+            return value;
+        }
         if (column.column_type == .sql_array) {
             if (value != .sql_array or value.sql_array.element_type != column.sql_element_type) return error.InvalidRelationalExpressionInput;
             if (column.numeric_modifier) |modifier| return normalizeNumericArrayBinding(execution, value, modifier, false);
@@ -4596,6 +4788,12 @@ pub const Set = struct {
             // decoding. The immutable mask is compiled once per schema.
             if (!self.read_columns[ordinal] or (ignore_generated and self.generated_columns[ordinal])) continue;
             if (input) |scalar| switch (column.column_type) {
+                .enumeration => {
+                    if (scalar == .null) continue;
+                    if (scalar != .string or ordinal >= self.enum_column_views.len) return error.InvalidRelationalExpressionInput;
+                    const view = self.enum_column_views[ordinal] orelse return error.InvalidRelationalExpressionInput;
+                    value.* = .{ .enumeration = try view.input(scalar.string) };
+                },
                 .numeric => value.* = try numericJson(execution, scalar),
                 .numrange, .daterange, .tsrange, .tstzrange => value.* = try rangeJson(execution, @import("../sql/range_value.zig").kindFromType(column.column_type).?, scalar),
                 .sql_array => value.* = try arrayJson(execution, column.sql_element_type orelse return error.InvalidRelationalExpressionInput, scalar, null),
@@ -4957,8 +5155,14 @@ test "relational declarations constant folding owns output and shares sticky adm
     try std.testing.expectError(error.Canceled, foldConstantJson(&canceled, numeric.value));
 }
 
-fn boundedValueToJson(execution: *Execution, value: Value) !std.json.Value {
+pub fn boundedValueToJson(execution: *Execution, value: Value) !std.json.Value {
     return switch (value) {
+        .enumeration => |atom| blk: {
+            try execution.charge(atom.text.len);
+            const output = try allocateOutput(execution.alloc, atom.text.len, execution.bytes);
+            @memcpy(output, atom.text);
+            break :blk .{ .string = output };
+        },
         .json => |json| cloneJsonOutput(execution, json.*),
         .numeric => |bytes| numericJsonOutput(execution, bytes),
         .sql_array => |array| arrayJsonOutputLeaky(execution, array),
@@ -5033,7 +5237,7 @@ fn cloneJsonOutput(execution: *Execution, json: @import("../sql/row_value.zig").
 
 fn valueToJson(alloc: Allocator, value: Value) !std.json.Value {
     return switch (value) {
-        .enumeration => error.InvalidRelationalExpressionType,
+        .enumeration => |atom| .{ .string = try alloc.dupe(u8, atom.text) },
         .null => .null,
         .string => |bytes| .{ .string = try alloc.dupe(u8, bytes) },
         .blob => |bytes| blk: {
@@ -6582,4 +6786,118 @@ test "SQL owned sequence defaults allocate outside scalar bytecode preserve NULL
     try std.testing.expectEqual(@as(usize, 1), source.calls);
     explicit.value.object.getPtr("next_id").?.* = .{ .integer = 9 };
     try std.testing.expectError(error.InvalidRelationalGeneratedValue, validator.prepareTypedValue(explicit.arena.allocator(), a, &explicit.value, &.{}, true));
+}
+
+test "SQL named enum native immutable expressions own typed directories preserve order and reject unrelated domains" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            const types = @import("../system_catalog/named_types.zig");
+            var labels = try types.Owned.create(a, &.{ "z", "a", "" });
+            defer labels.deinit();
+            const record: types.Record = .{ .identity = try types.Identity.init(17, 2, 1, @splat(3)), .definition = labels.definition, .owner = .auth_disabled };
+            const table: schema.TableSchema = .{
+                .storage_mode = .relational,
+                .requires_public_schema = true,
+                .requires_enum_expressions = true,
+                .named_types = &.{record},
+                .relational_columns = &.{.{ .name = "state", .path = "state", .column_type = .enumeration, .named_type_id = 17 }},
+            };
+            var input = try std.json.parseFromSlice(std.json.Value, a,
+                \\{"op":"lt","args":[{"op":"literal","type":"enumeration","named_type_id":17,"value":"z"},{"op":"column","column":"state"}]}
+            , .{});
+            defer input.deinit();
+            var plan = try Plan.init(a, table, input.value, .boolean);
+            defer plan.deinit();
+            var region = std.heap.ArenaAllocator.init(a);
+            defer region.deinit();
+            var document: std.json.Value = .{ .object = .empty };
+            try document.object.put(region.allocator(), "state", .{ .string = "a" });
+            const actual = try plan.evaluateJson(std.testing.failing_allocator, document);
+            try std.testing.expect(actual.boolean);
+            // ADD VALUE preserves existing expression identity and ordered keys.
+            var expanded = try types.Owned.add(a, labels.definition, "between", .{ .before = "a" });
+            defer expanded.deinit();
+            var successor = record;
+            successor.identity.generation += 1;
+            successor.definition = expanded.definition;
+            var next = table;
+            next.named_types = &.{successor};
+            var successor_plan = try Plan.init(a, next, input.value, .boolean);
+            defer successor_plan.deinit();
+            try std.testing.expectEqualDeep(plan.fingerprint, successor_plan.fingerprint);
+            try std.testing.expectEqual(@as(u32, 40), schema.requiredReaderVersion(table));
+            const bytes = try schema.serializeSchema(a, table);
+            defer a.free(bytes);
+            const decoded = try schema.deserializeSchema(a, bytes);
+            defer schema.freeSchema(a, decoded);
+            try std.testing.expect(decoded.requires_enum_expressions);
+            try std.testing.expect(!(@import("../common/schema_readers.zig").ReaderCapabilities{ .semantic_ceiling = 39, .encoding_ceiling = 39 }).supports(schema.readerRequirementsForSchema(table)));
+        }
+    };
+    try Harness.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL named enum native programs outlive producer schemas and reject same labels from different identities" {
+    const a = std.testing.allocator;
+    const types = @import("../system_catalog/named_types.zig");
+    var owned = build: {
+        var labels = try types.Owned.create(a, &.{ "z", "a" });
+        defer labels.deinit();
+        const record: types.Record = .{ .identity = try types.Identity.init(17, 2, 1, @splat(3)), .definition = labels.definition, .owner = .auth_disabled };
+        const table: schema.TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_enum_expressions = true, .named_types = &.{record} };
+        var literal = try std.json.parseFromSlice(std.json.Value, a,
+            \\{"op":"literal","type":"enumeration","named_type_id":17,"value":"z"}
+        , .{});
+        defer literal.deinit();
+        break :build try Plan.init(a, table, literal.value, .enumeration);
+    };
+    defer owned.deinit();
+    const value = try owned.evaluate(std.testing.failing_allocator, &.{});
+    try std.testing.expectEqualStrings("z", value.enumeration.text);
+    const json_value = try valueToJson(a, value);
+    defer a.free(json_value.string);
+    try std.testing.expectEqualStrings("z", json_value.string);
+    var labels = try types.Owned.create(a, &.{ "z", "a" });
+    defer labels.deinit();
+    const left: types.Record = .{ .identity = try types.Identity.init(17, 2, 1, @splat(3)), .definition = labels.definition, .owner = .auth_disabled };
+    const right: types.Record = .{ .identity = try types.Identity.init(18, 2, 1, @splat(4)), .definition = labels.definition, .owner = .auth_disabled };
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_enum_expressions = true, .named_types = &.{ left, right } };
+    var comparison = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"op":"eq","args":[{"op":"literal","type":"enumeration","named_type_id":17,"value":"z"},{"op":"literal","type":"enumeration","named_type_id":18,"value":"z"}]}
+    , .{});
+    defer comparison.deinit();
+    try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(a, table, comparison.value, .boolean));
+}
+
+test "SQL durable string lengths enforce typed nulls UTF8 units and reader ownership" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_string_lengths = true };
+    for ([_]struct { op: []const u8, expected: i64 }{ .{ .op = "length", .expected = 3 }, .{ .op = "octet_length", .expected = 7 }, .{ .op = "bit_length", .expected = 56 } }) |case| {
+        const encoded = try std.fmt.allocPrint(a, "{{\"op\":\"{s}\",\"args\":[{{\"op\":\"literal\",\"type\":\"string\",\"value\":\"aé😀\"}}]}}", .{case.op});
+        defer a.free(encoded);
+        var expression = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+        defer expression.deinit();
+        var plan = try Plan.init(a, table, expression.value, .integer);
+        defer plan.deinit();
+        try std.testing.expectEqual(@as(?Numeric, .int32), plan.nodes[plan.nodes.len - 1].sql_type);
+        try std.testing.expectEqual(case.expected, (try plan.evaluate(a, &.{})).integer);
+        var denied = table;
+        denied.requires_string_lengths = false;
+        try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(a, denied, expression.value, .integer));
+        expression.value.object.getPtr("args").?.array.items[0].object.getPtr("value").?.* = .null;
+        var null_plan = try Plan.init(a, table, expression.value, .integer);
+        defer null_plan.deinit();
+        try std.testing.expect((try null_plan.evaluate(a, &.{})) == .null);
+    }
+    const bytes = try schema.serializeSchema(a, table);
+    defer a.free(bytes);
+    const decoded = try schema.deserializeSchema(a, bytes);
+    defer schema.freeSchema(a, decoded);
+    try std.testing.expect(decoded.requires_string_lengths);
+    try std.testing.expectEqual(@as(u32, 42), schema.requiredReaderVersion(decoded));
+    const requirements = schema.readerRequirementsForSchema(decoded);
+    const readers = @import("../common/schema_readers.zig");
+    try std.testing.expect(!(@as(readers.ReaderCapabilities, .{ .semantic_ceiling = 41, .encoding_ceiling = 41 })).supports(requirements));
+    try std.testing.expect(readers.ReaderCapabilities.current.supports(requirements));
 }

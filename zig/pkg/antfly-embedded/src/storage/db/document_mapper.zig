@@ -362,8 +362,15 @@ pub const PreparedDocumentBatch = struct {
         for (input, writes, roots) |write, *out, *root| {
             out.* = write;
             root.* = null;
+            const domain_prepared = write.prepared_domain != null;
+            if (write.prepared_domain) |contract| {
+                try validator.requirePreparedDomain(contract.*);
+                const frozen = try owned.create(@import("../../schema/domain_handoff.zig").Contract);
+                frozen.* = contract.*;
+                out.prepared_domain = frozen;
+            }
             if (write.key.len != 0 and (write.key[0] == 0 or write.key[0] == 1)) {
-                if (write.json_null_fields.len != 0) return error.InvalidBatchRequest;
+                if (write.json_null_fields.len != 0 or domain_prepared) return error.InvalidBatchRequest;
                 continue;
             }
             _ = scratch.reset(.retain_capacity);
@@ -388,7 +395,7 @@ pub const PreparedDocumentBatch = struct {
                 root.* = value;
                 continue;
             }
-            const prepared = try validator.prepareTypedValueWithNulls(owned, scratch.allocator(), &value, write.json_null_fields, preserve);
+            const prepared = try validator.prepareTypedValueWithNulls(owned, scratch.allocator(), &value, write.json_null_fields, preserve or domain_prepared);
             defer prepared.deinit(owned);
             // Document bytes encode SQL NULL by absence and JSON null by a
             // present member, so typed transport markers end at this boundary.
@@ -4724,7 +4731,7 @@ fn buildRelationalRowValueFromParsedInternal(
                 return std.mem.lessThan(u8, schema_columns[lhs.ordinal].name, schema_columns[rhs.ordinal].name);
             }
         }.lessThan);
-        const digest = try document_content_hash.hashRelationalSparseCellsCanonical(scratch, cells.items, table_schema);
+        const digest = try document_content_hash.hashRelationalSparseCellsCanonicalWithLayout(scratch, cells.items, table_schema, physical_layout);
         std.mem.sort(relational_row_codec.Cell, cells.items, {}, ordinalSort);
         break :blk digest;
     } else blk: {
@@ -4753,12 +4760,13 @@ fn buildRelationalRowValueFromParsedInternal(
             }
             target += 1;
         }
-        const digest = try document_content_hash.hashRelationalIndexedCellsCanonical(
+        const digest = try document_content_hash.hashRelationalIndexedCellsCanonicalWithLayout(
             scratch,
             cells.items,
             table_schema,
             physical_layout.hash_ordinals,
             positions,
+            physical_layout,
         );
         break :blk digest;
     };

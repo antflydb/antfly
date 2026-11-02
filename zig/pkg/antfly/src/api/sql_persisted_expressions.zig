@@ -27,16 +27,24 @@ fn check(root: *Adapter, a: A, columns: []const scalar.Column, expression: *cons
     _ = try scalar.inferTypedParametersExpected(a, expression, columns, &.{}, expected, .{ .routines = @import("sql_routine_execution.zig").persistedResolver(root), .assignment = assignment });
 }
 fn column(root: *Adapter, a: A, columns: []const scalar.Column, value: ast.Column) !void {
-    const target: scalar.Type = .{ .kind = value.type, .element_type = value.element_type, .numeric_modifier = value.numeric_modifier };
+    const target: scalar.Type = .{ .kind = value.type, .element_type = value.element_type, .numeric_modifier = value.numeric_modifier, .enum_view = value.enum_view };
     if (value.default_expression) |expression| try check(root, a, &.{}, expression, target, true);
     if (value.generated_expression) |expression| try check(root, a, columns, expression, target, true);
 }
 fn hasExpressions(change: ast.SchemaChange) bool {
     return switch (change) {
-        .set_default, .set_type, .add_check, .create_index => true,
+        .set_default, .set_type, .add_check => true,
+        .create_index => |index| expressions: {
+            if (index.predicate != null) break :expressions true;
+            for (index.keys) |key| if (key.expression != null) break :expressions true;
+            break :expressions false;
+        },
         .add_column => |value| value.default_expression != null or value.generated_expression != null,
         else => false,
     };
+}
+fn schemaChangeTarget(ddl: ast.CatalogDdl) !ast.Name {
+    return if (ddl.kind == .index and ddl.action == .create) ddl.index_table orelse error.InvalidSqlSyntax else ddl.name;
 }
 pub fn validate(raw: *anyopaque, backing: A, statement: ast.Statement) !void {
     var arena = std.heap.ArenaAllocator.init(backing);
@@ -53,7 +61,7 @@ pub fn validate(raw: *anyopaque, backing: A, statement: ast.Statement) !void {
             } else false;
             if (!needed) return;
             const columns = try a.alloc(scalar.Column, create.columns.len);
-            for (create.columns, columns) |declared, *out| out.* = .{ .name = declared.name, .type = declared.type, .element_type = declared.element_type, .numeric_modifier = declared.numeric_modifier };
+            for (create.columns, columns) |declared, *out| out.* = .{ .name = declared.name, .type = declared.type, .element_type = declared.element_type, .numeric_modifier = declared.numeric_modifier, .enum_view = declared.enum_view };
             for (create.columns) |value| try column(root, a, columns, value);
             for (create.constraints) |constraint| if (constraint == .add_check) try check(root, a, columns, constraint.add_check.expression, .{ .kind = .boolean }, false);
         },
@@ -61,7 +69,7 @@ pub fn validate(raw: *anyopaque, backing: A, statement: ast.Statement) !void {
             const change = ddl.schema_change orelse return;
             if (!hasExpressions(change)) return;
             const backend = root.backend();
-            const table = try backend.vtable.resolve(backend.ptr, a, ddl.name, .write);
+            const table = try backend.vtable.resolve(backend.ptr, a, try schemaChangeTarget(ddl), .admin);
             var columns: std.ArrayList(scalar.Column) = .empty;
             for (table.columns) |value| try columns.append(a, .{ .name = value.name, .type = value.type, .element_type = value.element_type, .numeric_modifier = value.numeric_modifier, .temporal_kind = value.temporal_kind });
             switch (change) {
@@ -89,5 +97,23 @@ pub fn validate(raw: *anyopaque, backing: A, statement: ast.Statement) !void {
             if (policy.with_check) |expression| try check(root, a, columns, expression, .{ .kind = .boolean }, false);
         },
         else => {},
+    }
+}
+
+test "SQL persisted index validation binds the owning table and skips column-only indexes" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { sql: []const u8, expressions: bool }{
+        .{ .sql = "CREATE INDEX by_status ON public.usage_records(status)", .expressions = false },
+        .{ .sql = "CREATE INDEX by_status ON public.usage_records(lower(status))", .expressions = true },
+        .{ .sql = "CREATE INDEX by_status ON public.usage_records(status) WHERE status='pending'", .expressions = true },
+    };
+    for (cases) |input| {
+        var compiled = try local.sql_compiler.compile(a, input.sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        const target = try schemaChangeTarget(ddl);
+        try std.testing.expectEqualStrings("usage_records", target.table);
+        try std.testing.expectEqualStrings("public", target.namespace.?);
+        try std.testing.expectEqual(input.expressions, hasExpressions(ddl.schema_change.?));
     }
 }

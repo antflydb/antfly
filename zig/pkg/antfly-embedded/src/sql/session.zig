@@ -22,7 +22,7 @@ const std = @import("std");
 pub const Id = [16]u8;
 pub const Isolation = enum { read_committed, repeatable_read, serializable };
 pub const ReadMode = enum { read_write, read_only };
-pub const State = enum { active, failed, committing, uncertain, committed, aborted };
+pub const State = enum { active, failed, committing, uncertain, committed, prepared, aborted };
 pub const Status = enum(u8) { idle = 'I', in_transaction = 'T', failed = 'E' };
 pub const Scope = struct { principal: []const u8, database: []const u8 = "default", namespace: []const u8 = "public" };
 pub const Begin = struct { isolation: Isolation = .serializable, mode: ReadMode = .read_write, deferrable: bool = false };
@@ -95,7 +95,7 @@ pub const Session = struct {
         const transaction = try self.owner.vtable.inspect(self.owner.ptr, self.scope, id);
         if (!std.mem.eql(u8, &transaction.id, &id)) return error.InvalidSqlBackendResponse;
         switch (transaction.state) {
-            .committed, .aborted => return error.SqlTransactionNotActive,
+            .committed, .prepared, .aborted => return error.SqlTransactionNotActive,
             else => self.transaction_id = id,
         }
     }
@@ -106,7 +106,7 @@ pub const Session = struct {
         return switch (current.state) {
             .active => .in_transaction,
             .failed, .committing, .uncertain => .failed,
-            .committed, .aborted => blk: {
+            .committed, .prepared, .aborted => blk: {
                 self.transaction_id = null;
                 break :blk .idle;
             },
@@ -187,7 +187,7 @@ pub const Session = struct {
             .active => {},
             .failed => if (!allow_failed) return error.SqlTransactionAborted,
             .committing, .uncertain => return error.SqlTransactionOutcomeUnknown,
-            .committed, .aborted => return error.SqlTransactionNotActive,
+            .committed, .prepared, .aborted => return error.SqlTransactionNotActive,
         }
         return current;
     }

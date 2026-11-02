@@ -19,6 +19,7 @@
 import argparse
 import json
 from pathlib import Path
+
 from generate_sql_postgres_reference import postgres
 
 
@@ -33,6 +34,14 @@ def reference():
     expressions += [
         "v",
         "v::text",
+        "'z'::execution_state",
+        "CAST('a' AS public.execution_state)",
+        "(v::text)::execution_state",
+        "CASE WHEN false THEN ('invalid'::text)::execution_state ELSE 'z'::execution_state END",
+        "CASE WHEN true THEN 'z'::execution_state ELSE 'a' END",
+        "CASE WHEN false THEN 'invalid'::execution_state ELSE v END",
+        "'invalid'::execution_state",
+        "(v::text) = 'z'::execution_state",
         "v = v",
         "v = NULL",
         "v IS NULL",
@@ -84,10 +93,85 @@ def reference():
                 except Error as exc:
                     entry["sqlstate"] = exc.sqlstate
                 entries.append(entry)
+        # A cast retains its input label in PostgreSQL. Bare ORDER BY resolves
+        # that output label first; qualification keeps the enum input domain.
+        db.execute(
+            "CREATE TYPE epoch_order_state AS ENUM ('queued','processing','done','archived')"
+        )
+        db.execute("CREATE TABLE enum_epoch_order(state epoch_order_state)")
+        db.execute("INSERT INTO enum_epoch_order VALUES ('queued'),('archived')")
+        ordering = []
+        for projection, order_by in (
+            ("state::text", "state"),
+            ("e.state::text", "e.state"),
+            ("e.state", "e.state"),
+        ):
+            ordering.append(
+                {
+                    "projection": projection,
+                    "order_by": order_by,
+                    "rows": [
+                        row[0]
+                        for row in db.execute(
+                            f"SELECT {projection} FROM enum_epoch_order AS e ORDER BY {order_by}"
+                        ).fetchall()
+                    ],
+                }
+            )
+        db.execute(
+            "ALTER TYPE epoch_order_state ADD VALUE 'started' BEFORE 'processing'"
+        )
+        db.execute("INSERT INTO enum_epoch_order VALUES ('started')")
+        positioned_ordering = [
+            row[0]
+            for row in db.execute(
+                "SELECT e.state FROM enum_epoch_order AS e ORDER BY e.state"
+            ).fetchall()
+        ]
+    with postgres() as db:
+        notices = []
+        db.add_notice_handler(
+            lambda d: notices.append({"code": d.sqlstate, "message": d.message_primary})
+        )
+        db.execute("CREATE TYPE usage_status AS ENUM ('queued','done')")
+        db.execute(
+            "CREATE TABLE retirement_parent (id UUID PRIMARY KEY, state usage_status UNIQUE, payload TEXT, seq BIGINT GENERATED ALWAYS AS IDENTITY)"
+        )
+        db.execute(
+            "CREATE TABLE retirement_child (id UUID PRIMARY KEY, state usage_status REFERENCES retirement_parent(state), payload TEXT)"
+        )
+        for table in ("retirement_parent", "retirement_child"):
+            db.execute(
+                f"INSERT INTO {table}(id,state,payload) VALUES('00000000-0000-0000-0000-000000000001','queued','retained')"
+            )
+        db.execute("DROP TYPE IF EXISTS usage_status CASCADE")
+        retirement = {"notices": list(notices), "rows": {}, "columns": {}}
+        for table in ("retirement_parent", "retirement_child"):
+            retirement["columns"][table] = [
+                row[0]
+                for row in db.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=%s ORDER BY ordinal_position",
+                    (table,),
+                )
+            ]
+            retirement["rows"][table] = [
+                row[0]
+                for row in db.execute(f"SELECT payload FROM {table} ORDER BY payload")
+            ]
+            db.execute(
+                f"INSERT INTO {table}(id,payload) VALUES('00000000-0000-0000-0000-000000000002','new')"
+            )
+        retirement["sequence_values"] = [
+            row[0]
+            for row in db.execute("SELECT seq FROM retirement_parent ORDER BY seq")
+        ]
     return {
         "format": 1,
         "reference": "PostgreSQL 18+ enum scalar execution",
         "entries": entries,
+        "ordering": ordering,
+        "positioned_ordering": positioned_ordering,
+        "retirement": retirement,
     }
 
 

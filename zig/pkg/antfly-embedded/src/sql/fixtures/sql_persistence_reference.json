@@ -1,0 +1,911 @@
+{
+  "format": 1,
+  "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
+  "entries": [
+    {
+      "id": "sql-0360",
+      "source_entry_sha256": "01998049ba8f18f2f4ed810de7e57256d1a793bf6d48152d3880be3c6584830b",
+      "sql": "CREATE TEMP TABLE usage_session_records (id uuid PRIMARY KEY, status text)",
+      "command_tag": "CREATE TABLE",
+      "persistence": "t",
+      "populated": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": []
+      },
+      "duplicate_sqlstate": "23505",
+      "before_disconnect": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ]
+        ]
+      },
+      "other_session_sqlstate": "42P01",
+      "other_session_qualified_sqlstate": "0A000",
+      "disconnect_removes_relation": true,
+      "clean_restart_absent": true,
+      "crash_restart_absent": true
+    },
+    {
+      "id": "sql-0361",
+      "source_entry_sha256": "1f14b443d7e499ff99ad810700d62961dfa12d83f26f142bdb348022bc09af90",
+      "sql": "CREATE TEMP TABLE IF NOT EXISTS usage_session_records (id uuid PRIMARY KEY, status text)",
+      "command_tag": "CREATE TABLE",
+      "persistence": "t",
+      "repeat_command_tag": "CREATE TABLE",
+      "repeat_preserves_identity": true,
+      "populated": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": []
+      },
+      "duplicate_sqlstate": "23505",
+      "before_disconnect": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ]
+        ]
+      },
+      "other_session_sqlstate": "42P01",
+      "other_session_qualified_sqlstate": "0A000",
+      "disconnect_removes_relation": true,
+      "clean_restart_absent": true,
+      "crash_restart_absent": true
+    },
+    {
+      "id": "sql-0362",
+      "source_entry_sha256": "d5d4c9185251e34b0e0e86784e4cb119faa4db57b501b8cf517b3f2f2c2600e2",
+      "sql": "CREATE UNLOGGED TABLE usage_ingest_records (id uuid PRIMARY KEY, payload jsonb)",
+      "command_tag": "CREATE TABLE",
+      "persistence": "u",
+      "populated": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "payload",
+            3802
+          ]
+        ],
+        "rows": []
+      },
+      "duplicate_sqlstate": "23505",
+      "before_disconnect": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "payload",
+            3802
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000009",
+            {
+              "kind": "ingest"
+            }
+          ]
+        ]
+      },
+      "other_session": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "payload",
+            3802
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000009",
+            {
+              "kind": "ingest"
+            }
+          ]
+        ]
+      },
+      "clean_restart": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "payload",
+            3802
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000009",
+            {
+              "kind": "ingest"
+            }
+          ]
+        ]
+      },
+      "crash_restart": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "payload",
+            3802
+          ]
+        ],
+        "rows": []
+      }
+    },
+    {
+      "id": "sql-0363",
+      "source_entry_sha256": "58a60712bffcdbb37f3ca6089e2c43281ea0fdb9dfb692430c4e3a8961b43593",
+      "sql": "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid PRIMARY KEY, payload jsonb)",
+      "command_tag": "CREATE TABLE",
+      "persistence": "u",
+      "repeat_command_tag": "CREATE TABLE",
+      "repeat_preserves_identity": true,
+      "populated": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "payload",
+            3802
+          ]
+        ],
+        "rows": []
+      },
+      "duplicate_sqlstate": "23505",
+      "before_disconnect": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "payload",
+            3802
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000009",
+            {
+              "kind": "ingest"
+            }
+          ]
+        ]
+      },
+      "other_session": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "payload",
+            3802
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000009",
+            {
+              "kind": "ingest"
+            }
+          ]
+        ]
+      },
+      "clean_restart": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "payload",
+            3802
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000009",
+            {
+              "kind": "ingest"
+            }
+          ]
+        ]
+      },
+      "crash_restart": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "payload",
+            3802
+          ]
+        ],
+        "rows": []
+      }
+    },
+    {
+      "id": "sql-0367",
+      "source_entry_sha256": "3dc8a1470f41dd5cb891decb37d667b09d51e3bf7e8a462ea7d14637be3bda71",
+      "sql": "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
+      "command_tag": "SELECT 2",
+      "persistence": "t",
+      "repeat_command_tag": "CREATE TABLE AS",
+      "repeat_preserves_identity": true,
+      "populated": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "closed"
+          ]
+        ]
+      },
+      "duplicate_sqlstate": null,
+      "before_disconnect": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ]
+        ]
+      },
+      "other_session_sqlstate": "42P01",
+      "other_session_qualified_sqlstate": "0A000",
+      "disconnect_removes_relation": true,
+      "clean_restart_absent": true,
+      "crash_restart_absent": true
+    },
+    {
+      "id": "sql-0368",
+      "source_entry_sha256": "b36b4ac66f028f3405331b6bc8486aa1a8948b53fe414f60cb0b44eeb73a7754",
+      "sql": "CREATE UNLOGGED TABLE usage_ingest_archive AS SELECT id, status FROM usage_records WHERE status = 'closed'",
+      "command_tag": "SELECT 2",
+      "persistence": "u",
+      "populated": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "closed"
+          ]
+        ]
+      },
+      "duplicate_sqlstate": null,
+      "before_disconnect": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ]
+        ]
+      },
+      "other_session": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ]
+        ]
+      },
+      "clean_restart": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ]
+        ]
+      },
+      "crash_restart": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": []
+      }
+    },
+    {
+      "id": "sql-0369",
+      "source_entry_sha256": "44f4ea526a019424e78f77c35add916b302c8286d930087951b7383c600be997",
+      "sql": "CREATE TABLE usage_records_copy (LIKE usage_records INCLUDING ALL)",
+      "command_tag": "CREATE TABLE",
+      "persistence": "p",
+      "populated": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": []
+      },
+      "duplicate_sqlstate": "23505",
+      "default_probe": "queued",
+      "check_sqlstate": "23514",
+      "before_disconnect": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000010",
+            "queued"
+          ]
+        ]
+      },
+      "like_semantics": {
+        "source_first": [
+          42,
+          1,
+          4
+        ],
+        "copied_security": [
+          false,
+          false,
+          0
+        ],
+        "conditional_missing_source": "CREATE TABLE",
+        "conditional_preserves_identity": true,
+        "copy_first": [
+          42,
+          2,
+          18
+        ],
+        "source_second": [
+          45,
+          3,
+          2
+        ],
+        "constraints": [
+          [
+            "c",
+            false,
+            false,
+            true,
+            "CHECK ((quantity > 0))"
+          ],
+          [
+            "n",
+            false,
+            false,
+            true,
+            "NOT NULL id"
+          ],
+          [
+            "n",
+            false,
+            false,
+            true,
+            "NOT NULL quantity"
+          ],
+          [
+            "n",
+            false,
+            false,
+            true,
+            "NOT NULL serial_id"
+          ],
+          [
+            "p",
+            false,
+            false,
+            true,
+            "PRIMARY KEY (id)"
+          ],
+          [
+            "u",
+            true,
+            true,
+            true,
+            "UNIQUE (quantity) DEFERRABLE INITIALLY DEFERRED"
+          ]
+        ],
+        "comments": [
+          null,
+          "copied quantity",
+          "copied index comment"
+        ],
+        "not_null_sqlstate": "23502",
+        "check_sqlstate": "23514",
+        "unique_sqlstate": "23505",
+        "restart_identity": {
+          "identity": 42,
+          "serial_advanced": true,
+          "generated": 16
+        },
+        "source_drop_restrict_sqlstate": "2BP01",
+        "column_select_sqlstate": "42501",
+        "table_select_command": "CREATE TABLE",
+        "table_select_visible_rows": 0,
+        "ordered_sources": {
+          "columns": [
+            [
+              "prefix",
+              16
+            ],
+            [
+              "left_id",
+              23
+            ],
+            [
+              "middle",
+              25
+            ],
+            [
+              "payload",
+              25
+            ],
+            [
+              "tail",
+              3802
+            ]
+          ],
+          "rows": [
+            [
+              null,
+              7,
+              null,
+              null,
+              null
+            ]
+          ]
+        },
+        "excluded_values": {
+          "columns": [
+            [
+              "id",
+              20
+            ],
+            [
+              "serial_id",
+              20
+            ],
+            [
+              "quantity",
+              23
+            ],
+            [
+              "doubled",
+              23
+            ]
+          ],
+          "rows": [
+            [
+              900,
+              901,
+              1,
+              123
+            ]
+          ]
+        },
+        "source_drop_after_reference_retirement": "DROP TABLE"
+      },
+      "other_session": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000010",
+            "queued"
+          ]
+        ]
+      },
+      "clean_restart": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000010",
+            "queued"
+          ]
+        ]
+      },
+      "crash_restart": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000010",
+            "queued"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-0568",
+      "source_entry_sha256": "94c2b8ccfa9646dfd875b555594f089c1ebaad2b398f10a79cae88fcce53e588",
+      "sql": "SELECT id, status INTO TEMP TABLE usage_session_archive FROM usage_records WHERE status = 'closed'",
+      "command_tag": "SELECT 2",
+      "persistence": "t",
+      "populated": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "closed"
+          ]
+        ]
+      },
+      "duplicate_sqlstate": null,
+      "before_disconnect": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ]
+        ]
+      },
+      "other_session_sqlstate": "42P01",
+      "other_session_qualified_sqlstate": "0A000",
+      "disconnect_removes_relation": true,
+      "clean_restart_absent": true,
+      "crash_restart_absent": true
+    },
+    {
+      "id": "sql-0569",
+      "source_entry_sha256": "60300d3cf89d33599232ee7b6a5e1fa0c19e23659780b2b8051a6ccaee9d2ae1",
+      "sql": "SELECT id, status INTO UNLOGGED usage_ingest_archive FROM usage_records WHERE status = 'closed'",
+      "command_tag": "SELECT 2",
+      "persistence": "u",
+      "populated": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "closed"
+          ]
+        ]
+      },
+      "duplicate_sqlstate": null,
+      "before_disconnect": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ]
+        ]
+      },
+      "other_session": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ]
+        ]
+      },
+      "clean_restart": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "closed"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000009",
+            "retained"
+          ]
+        ]
+      },
+      "crash_restart": {
+        "columns": [
+          [
+            "id",
+            2950
+          ],
+          [
+            "status",
+            25
+          ]
+        ],
+        "rows": []
+      }
+    }
+  ],
+  "postgres_major": 18
+}

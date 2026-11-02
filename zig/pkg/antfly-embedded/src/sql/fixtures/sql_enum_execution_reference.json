@@ -103,6 +103,46 @@
       "value": "z"
     },
     {
+      "expression": "'z'::execution_state",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "CAST('a' AS public.execution_state)",
+      "input": "z",
+      "value": "a"
+    },
+    {
+      "expression": "(v::text)::execution_state",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "CASE WHEN false THEN ('invalid'::text)::execution_state ELSE 'z'::execution_state END",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "CASE WHEN true THEN 'z'::execution_state ELSE 'a' END",
+      "input": "z",
+      "value": "z"
+    },
+    {
+      "expression": "CASE WHEN false THEN 'invalid'::execution_state ELSE v END",
+      "input": "z",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "'invalid'::execution_state",
+      "input": "z",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "(v::text) = 'z'::execution_state",
+      "input": "z",
+      "sqlstate": "42883"
+    },
+    {
       "expression": "v = v",
       "input": "z",
       "value": true
@@ -373,6 +413,46 @@
       "value": "a"
     },
     {
+      "expression": "'z'::execution_state",
+      "input": "a",
+      "value": "z"
+    },
+    {
+      "expression": "CAST('a' AS public.execution_state)",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "(v::text)::execution_state",
+      "input": "a",
+      "value": "a"
+    },
+    {
+      "expression": "CASE WHEN false THEN ('invalid'::text)::execution_state ELSE 'z'::execution_state END",
+      "input": "a",
+      "value": "z"
+    },
+    {
+      "expression": "CASE WHEN true THEN 'z'::execution_state ELSE 'a' END",
+      "input": "a",
+      "value": "z"
+    },
+    {
+      "expression": "CASE WHEN false THEN 'invalid'::execution_state ELSE v END",
+      "input": "a",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "'invalid'::execution_state",
+      "input": "a",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "(v::text) = 'z'::execution_state",
+      "input": "a",
+      "sqlstate": "42883"
+    },
+    {
       "expression": "v = v",
       "input": "a",
       "value": true
@@ -643,6 +723,46 @@
       "value": ""
     },
     {
+      "expression": "'z'::execution_state",
+      "input": "",
+      "value": "z"
+    },
+    {
+      "expression": "CAST('a' AS public.execution_state)",
+      "input": "",
+      "value": "a"
+    },
+    {
+      "expression": "(v::text)::execution_state",
+      "input": "",
+      "value": ""
+    },
+    {
+      "expression": "CASE WHEN false THEN ('invalid'::text)::execution_state ELSE 'z'::execution_state END",
+      "input": "",
+      "value": "z"
+    },
+    {
+      "expression": "CASE WHEN true THEN 'z'::execution_state ELSE 'a' END",
+      "input": "",
+      "value": "z"
+    },
+    {
+      "expression": "CASE WHEN false THEN 'invalid'::execution_state ELSE v END",
+      "input": "",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "'invalid'::execution_state",
+      "input": "",
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "(v::text) = 'z'::execution_state",
+      "input": "",
+      "sqlstate": "42883"
+    },
+    {
       "expression": "v = v",
       "input": "",
       "value": true
@@ -911,6 +1031,46 @@
       "expression": "v::text",
       "input": null,
       "value": null
+    },
+    {
+      "expression": "'z'::execution_state",
+      "input": null,
+      "value": "z"
+    },
+    {
+      "expression": "CAST('a' AS public.execution_state)",
+      "input": null,
+      "value": "a"
+    },
+    {
+      "expression": "(v::text)::execution_state",
+      "input": null,
+      "value": null
+    },
+    {
+      "expression": "CASE WHEN false THEN ('invalid'::text)::execution_state ELSE 'z'::execution_state END",
+      "input": null,
+      "value": "z"
+    },
+    {
+      "expression": "CASE WHEN true THEN 'z'::execution_state ELSE 'a' END",
+      "input": null,
+      "value": "z"
+    },
+    {
+      "expression": "CASE WHEN false THEN 'invalid'::execution_state ELSE v END",
+      "input": null,
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "'invalid'::execution_state",
+      "input": null,
+      "sqlstate": "22P02"
+    },
+    {
+      "expression": "(v::text) = 'z'::execution_state",
+      "input": null,
+      "sqlstate": "42883"
     },
     {
       "expression": "v = v",
@@ -1082,5 +1242,67 @@
       "input": null,
       "sqlstate": "42804"
     }
-  ]
+  ],
+  "ordering": [
+    {
+      "projection": "state::text",
+      "order_by": "state",
+      "rows": [
+        "archived",
+        "queued"
+      ]
+    },
+    {
+      "projection": "e.state::text",
+      "order_by": "e.state",
+      "rows": [
+        "queued",
+        "archived"
+      ]
+    },
+    {
+      "projection": "e.state",
+      "order_by": "e.state",
+      "rows": [
+        "queued",
+        "archived"
+      ]
+    }
+  ],
+  "positioned_ordering": [
+    "queued",
+    "started",
+    "archived"
+  ],
+  "retirement": {
+    "notices": [
+      {
+        "code": "00000",
+        "message": "drop cascades to 2 other objects"
+      }
+    ],
+    "rows": {
+      "retirement_parent": [
+        "retained"
+      ],
+      "retirement_child": [
+        "retained"
+      ]
+    },
+    "columns": {
+      "retirement_parent": [
+        "id",
+        "payload",
+        "seq"
+      ],
+      "retirement_child": [
+        "id",
+        "payload"
+      ]
+    },
+    "sequence_values": [
+      1,
+      2
+    ]
+  }
 }

@@ -43,6 +43,7 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
         .description = req.description orelse "",
         .schema_json = effectiveSchemaJson(req.schema_json),
         .indexes_json = req.indexes_json orelse default_indexes_json,
+        .sql_native_indexes_json = req.sql_native_indexes_json orelse "",
         .replication_sources_json = req.replication_sources_json orelse "[]",
         .placement_role = "data",
         .desired_replica_count = if (storage.engine == .object) 0 else 3,
@@ -86,7 +87,7 @@ pub fn validateIndexesValue(value: std.json.Value, comptime trusted_catalog: boo
 }
 
 pub fn validateStoredIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch return error.InvalidCreateTableRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCreateTableRequest;
     defer parsed.deinit();
     try validateIndexesValue(parsed.value, true);
 }

@@ -76,7 +76,7 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
         const function_cut = try calls.snapshot(root, a, .{ .targets = function_targets, .arguments = types, .expected_revision = cut.revision });
         const function = function_cut.found orelse return error.SqlUndefinedFunction;
         if (root.server.cfg.auth_enabled and function.record.definition.owner == .auth_disabled) return error.Forbidden;
-        if (function.record.kind != .function or function.record.definition.arguments.len != arguments.len) return error.SqlUndefinedFunction;
+        if (function.record.kind != .function or function.record.definition.result == null or function.record.definition.arguments.len != arguments.len) return error.SqlUndefinedFunction;
         for (arguments, function.record.definition.arguments) |requested, actual| if (!std.meta.eql(requested.type, actual.type)) return error.SqlUndefinedFunction;
         const function_scope = function_cut.scopes[function.scope];
         if (!std.mem.eql(u8, function_scope.target.database, target.database)) return error.UnsupportedSqlShape;
@@ -100,7 +100,7 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
         if (prior != null and !(if (ddl.routine) |intent| intent.replace else if (ddl.aggregate_definition) |intent| intent.replace else false)) return error.SqlDuplicateFunction;
         if (prior) |before| if (before.kind != routine_kind) return error.SqlWrongObjectType;
         if (prior) |before| {
-            if (!std.meta.eql(before.definition.result, definition.result)) return error.SqlFunctionReturnTypeChanged;
+            if (before.definition.returns_trigger != definition.returns_trigger or !std.meta.eql(before.definition.result, definition.result)) return error.SqlFunctionReturnTypeChanged;
             for (before.definition.arguments, definition.arguments) |old, new| if (old.name) |name| {
                 if (new.name == null or !std.mem.eql(u8, name, new.name.?)) return error.SqlFunctionReturnTypeChanged;
             };
@@ -143,7 +143,7 @@ fn resolveSupport(root: *execution.Adapter, a: A, name: ast.Name, types: []const
     const scope = try calls.targets(root, a, name);
     const cut = try calls.snapshot(root, a, .{ .targets = scope, .arguments = inputs, .expected_revision = revision });
     const found = cut.found orelse return error.SqlUndefinedFunction;
-    if (found.record.kind != .function or found.record.definition.arguments.len != types.len) return error.SqlUndefinedFunction;
+    if (found.record.kind != .function or found.record.definition.result == null or found.record.definition.arguments.len != types.len) return error.SqlUndefinedFunction;
     for (found.record.definition.arguments, types) |actual, expected| if (!std.meta.eql(actual.type, expected)) return error.SqlUndefinedFunction;
     if (root.server.cfg.auth_enabled and found.record.definition.owner == .auth_disabled) return error.Forbidden;
     const target = cut.scopes[found.scope];

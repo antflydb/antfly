@@ -30,6 +30,21 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .sql_index_already_exists, .err = error.SqlIndexAlreadyExists },
+    .{ .status = .sql_constraint_already_exists, .err = error.SqlConstraintAlreadyExists },
+    .{ .status = .sql_index_not_found, .err = error.SqlIndexNotFound },
+    .{ .status = .sql_constraint_not_found, .err = error.SqlConstraintNotFound },
+    .{ .status = .catalog_generation_exhausted, .err = error.CatalogGenerationExhausted },
+    .{ .status = .invalid_sequence_default_references, .err = error.InvalidSequenceDefaultReferences },
+    .{ .status = .invalid_sequence_outcome, .err = error.InvalidSequenceOutcome },
+    .{ .status = .invalid_sequence_state, .err = error.InvalidSequenceState },
+    .{ .status = .invalid_sequence_definition, .err = error.InvalidSequenceDefinition },
+    .{ .status = .maintenance_busy, .err = error.MaintenanceBusy },
+    .{ .status = .invalid_sql_backend_response, .err = error.InvalidSqlBackendResponse },
+    .{ .status = .invalid_sql_parameters, .err = error.InvalidSqlParameters },
+    .{ .status = .unknown_sql_column, .err = error.UnknownSqlColumn },
+    .{ .status = .duplicate_sql_column, .err = error.DuplicateSqlColumn },
+    .{ .status = .unsupported_sql_execution, .err = error.UnsupportedSqlExecution },
     .{ .status = .invalid_relation_population, .err = error.InvalidRelationPopulation },
     .{ .status = .relation_population_page_too_large, .err = error.RelationPopulationPageTooLarge },
     .{ .status = .relation_population_changed, .err = error.RelationPopulationChanged },
@@ -392,6 +407,18 @@ const mappings = [_]Mapping{
     .{ .status = .file_busy, .err = error.FileBusy },
     .{ .status = .version_conflict, .err = error.VersionConflict },
     .{ .status = .intent_conflict, .err = error.IntentConflict },
+    .{ .status = .invalid_external_decision_owner, .err = error.InvalidExternalDecisionOwner },
+    .{ .status = .external_transaction_decision_required, .err = error.ExternalTransactionDecisionRequired },
+    .{ .status = .external_transaction_decision_changed, .err = error.ExternalTransactionDecisionChanged },
+    .{ .status = .external_transaction_role_required, .err = error.ExternalTransactionRoleRequired },
+    .{ .status = .external_transaction_commit_not_activated, .err = error.ExternalTransactionCommitNotActivated },
+    .{ .status = .external_transaction_admission_expired, .err = error.ExternalTransactionAdmissionExpired },
+    .{ .status = .invalid_prepared_transaction_id, .err = error.InvalidPreparedTransactionId },
+    .{ .status = .invalid_prepared_transaction_phase, .err = error.InvalidPreparedTransactionPhase },
+    .{ .status = .sql_prepared_transaction_already_exists, .err = error.SqlPreparedTransactionAlreadyExists },
+    .{ .status = .sql_prepared_transaction_not_found, .err = error.SqlPreparedTransactionNotFound },
+    .{ .status = .sql_prepared_transaction_wrong_database, .err = error.SqlPreparedTransactionWrongDatabase },
+    .{ .status = .sql_prepared_transaction_capacity_exceeded, .err = error.SqlPreparedTransactionCapacityExceeded },
     .{ .status = .decision_conflict, .err = error.DecisionConflict },
     .{ .status = .transaction_not_found, .err = error.TxnNotFound },
     .{ .status = .read_only, .err = error.ReadOnly },
@@ -1300,4 +1327,14 @@ test "logical value exact sort rejection survives both compiled query boundaries
 test "materialized view write rejection survives the compiled storage owner boundary" {
     try std.testing.expectEqual(abi.Status.materialized_view_read_only, statusFromError(error.MaterializedViewReadOnly));
     try std.testing.expectError(error.MaterializedViewReadOnly, statusToError(.materialized_view_read_only));
+}
+
+test "catalog object annotation namespace diagnostics retain exact identity across compiled boundaries" {
+    for ([_]anyerror{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.SqlIndexNotFound, error.SqlConstraintNotFound, error.CatalogGenerationExhausted }) |err| {
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expect(failure.status != .internal);
+        try std.testing.expectError(err, statusToError(failure.status));
+        try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
 }

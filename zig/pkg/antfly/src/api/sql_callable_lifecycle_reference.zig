@@ -28,10 +28,65 @@ pub fn observe(ctx: *fixture.Context, step: Step, reader: bool) !void {
     authenticated.headers = if (reader) ctx.reader_headers else ctx.admin_headers;
     var response = try client.execute(&authenticated, step.sql, .write_admission);
     defer response.deinit(ctx.alloc);
+    if (response.status == 202) {
+        var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer result.deinit();
+        if (result.value.catalog_receipt) |receipt| {
+            try awaitCatalogReceipt(&authenticated, receipt, step.sqlstate);
+            if (step.sqlstate != null) {
+                const actual: []const wire.SQLNotice = result.value.notices orelse &.{};
+                try std.testing.expectEqual(step.notices.len, actual.len);
+                return;
+            }
+            return compareCompletion(ctx, step, response, true);
+        }
+    }
     return compareResponse(ctx, step, response);
 }
+/// An uncertain/pending DDL is observed through its original durable token.
+/// Never repeat the mutation to make a synchronous PostgreSQL witness fit.
+fn awaitCatalogReceipt(ctx: *fixture.Context, initial: wire.SQLCatalogOperationReceipt, expected_sqlstate: ?[]const u8) !void {
+    const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .recovery_token = initial.recovery_token }, .{});
+    defer ctx.alloc.free(body);
+    const deadline = @import("antfly_platform").time.monotonicNs() +| 60 * std.time.ns_per_s;
+    while (true) {
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/sql/operations/status", .POST, body, 5000);
+        defer response.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var receipt = try std.json.parseFromSlice(wire.SQLCatalogOperationReceipt, ctx.alloc, response.body, .{});
+        defer receipt.deinit();
+        try std.testing.expectEqual(initial.kind, receipt.value.kind);
+        try std.testing.expectEqual(initial.operation, receipt.value.operation);
+        try std.testing.expectEqualStrings(initial.database, receipt.value.database);
+        try std.testing.expectEqualStrings(initial.namespace, receipt.value.namespace);
+        try std.testing.expectEqualStrings(initial.name, receipt.value.name);
+        if (receipt.value.state == .committed) {
+            try std.testing.expect(expected_sqlstate == null);
+            try std.testing.expect(receipt.value.catalog_revision != null);
+            return;
+        }
+        if (receipt.value.state == .rejected and expected_sqlstate != null) {
+            const diagnostic = receipt.value.diagnostic orelse return error.MissingSqlDiagnostic;
+            try std.testing.expectEqualStrings(expected_sqlstate.?, diagnostic.code);
+            try std.testing.expect(diagnostic.message.len != 0);
+            return;
+        }
+        if (receipt.value.state != .pending and receipt.value.state != .unknown) {
+            std.debug.print("catalog operation did not commit: {s}\n", .{response.body});
+            return error.CatalogOperationFailed;
+        }
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.CatalogOperationTimeout;
+        try ctx.checkDrivers();
+        try ctx.io.sleep(.fromMilliseconds(20), .awake);
+    }
+}
+
 pub fn compareResponse(ctx: *fixture.Context, step: Step, response: anytype) !void {
-    const expected_status: u16 = if (step.sqlstate) |code| (if (std.mem.eql(u8, code, "0A000")) 501 else 400) else 200;
+    return compareCompletion(ctx, step, response, false);
+}
+
+fn compareCompletion(ctx: *fixture.Context, step: Step, response: anytype, deferred_catalog: bool) !void {
+    const expected_status: u16 = if (step.sqlstate) |code| (if (std.mem.eql(u8, code, "0A000")) 501 else 400) else if (deferred_catalog) 202 else 200;
     if (response.status != expected_status) std.debug.print("callable status={d} sql={s} body={s}\n", .{ response.status, step.sql, response.body });
     const notices: []const wire.SQLNotice = if (step.sqlstate) |code| rejected: {
         try std.testing.expectEqual(expected_status, response.status);
@@ -47,7 +102,7 @@ pub fn compareResponse(ctx: *fixture.Context, step: Step, response: anytype) !vo
         }
         break :rejected &.{};
     } else accepted: {
-        try std.testing.expectEqual(@as(u16, 200), response.status);
+        try std.testing.expectEqual(expected_status, response.status);
         var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
         defer result.deinit();
         if (step.output) |expected| {
@@ -74,8 +129,19 @@ pub fn compareResponse(ctx: *fixture.Context, step: Step, response: anytype) !vo
                     return error.OperatorPostimageMismatch;
                 }
             }
-        } else if (std.mem.startsWith(u8, step.command_tag.?, "INSERT")) {
-            try std.testing.expectEqual(@as(i64, 3), result.value.rows_affected);
+        } else if (std.mem.startsWith(u8, step.command_tag.?, "INSERT ") or std.mem.startsWith(u8, step.command_tag.?, "UPDATE ") or std.mem.startsWith(u8, step.command_tag.?, "DELETE ")) {
+            const tag = step.command_tag.?;
+            const delimiter = std.mem.lastIndexOfScalar(u8, tag, ' ') orelse return error.InvalidPostgresCommandTag;
+            const count = try std.fmt.parseInt(i64, tag[delimiter + 1 ..], 10);
+            try std.testing.expectEqual(count, result.value.rows_affected);
+            const verb_end = std.mem.indexOfScalar(u8, tag, ' ') orelse return error.InvalidPostgresCommandTag;
+            try std.testing.expectEqualStrings(tag[0..verb_end], result.value.command_tag);
+        } else if (deferred_catalog) {
+            try std.testing.expectEqualStrings("DDL PENDING", result.value.command_tag);
+            const receipt = result.value.catalog_receipt orelse return error.MissingCatalogReceipt;
+            const tag = step.command_tag orelse return error.InvalidPostgresCommandTag;
+            const verb_end = std.mem.indexOfScalar(u8, tag, ' ') orelse return error.InvalidPostgresCommandTag;
+            try std.testing.expect(std.ascii.eqlIgnoreCase(tag[0..verb_end], @tagName(receipt.operation)));
         } else try std.testing.expectEqualStrings(step.command_tag.?, result.value.command_tag);
         const actual = result.value.notices orelse &.{};
         try std.testing.expectEqual(step.notices.len, actual.len);

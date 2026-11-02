@@ -7102,10 +7102,10 @@ export interface components {
             revocation_confirmed: boolean;
         };
         /**
-         * @description Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
+         * @description Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client. Bytea results use PostgreSQL hex text (a backslash followed by x and lowercase hex digits) in JSON and opaque bytes in PostgreSQL binary format.
          * @enum {string}
          */
-        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "array" | "unknown" | "numrange" | "daterange" | "tsrange" | "tstzrange" | "enumeration";
+        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "array" | "unknown" | "numrange" | "daterange" | "tsrange" | "tstzrange" | "enumeration" | "bytea";
         /**
          * @description Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
          * @enum {string}
@@ -7141,7 +7141,7 @@ export interface components {
             /** @description Display label. Labels need not be unique; rows use matching ordinal positions. */
             name: string;
             type: components["schemas"]["SQLColumnType"];
-            /** @description Required for enumeration values, including NULL. Identifies the immutable catalog type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains a null cell. */
+            /** @description Required for enum and domain values, including NULL. Identifies the immutable logical catalog type and its scalar/array wire OIDs. The type and element_type fields describe the physical value; enum cells use exact label strings. Domain parameters undergo fresh constraint validation; a declared identity does not prove an already validated value. SQL NULL remains a null cell. */
             named_type?: components["schemas"]["SQLNamedTypeIdentity"];
             temporal_kind?: components["schemas"]["SQLTemporalKind"];
             /** @description Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays. */
@@ -7186,10 +7186,10 @@ export interface components {
             database: string;
             namespace: string;
         };
-        /** @description Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. */
+        /** @description Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. Bytea arguments are PostgreSQL bytea input strings; use hex text (a backslash followed by x and hexadecimal octets) for arbitrary binary data. SQL NULL remains a null cell. */
         SQLParameterDescriptor: {
             type: components["schemas"]["SQLColumnType"];
-            /** @description Required for enumeration values, including NULL. Identifies the immutable catalog type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains a null cell. */
+            /** @description Required for enum and domain values, including NULL. Identifies the immutable logical catalog type and its scalar/array wire OIDs. The type and element_type fields describe the physical value; enum cells use exact label strings. Domain parameters undergo fresh constraint validation; a declared identity does not prove an already validated value. SQL NULL remains a null cell. */
             named_type?: components["schemas"]["SQLNamedTypeIdentity"];
             temporal_kind?: components["schemas"]["SQLTemporalKind"];
             element_type?: components["schemas"]["SQLArrayElementType"];
@@ -7401,17 +7401,17 @@ export interface components {
             canceled?: number;
         };
         /**
-         * @description Native catalog resource kind; never a synthetic physical table.
+         * @description Catalog object affected by an exact recoverable operation.
          * @enum {string}
          */
-        SQLCatalogObjectKind: "sequence" | "function" | "procedure" | "operator" | "aggregate" | "cast" | "type";
+        SQLCatalogObjectKind: "sequence" | "function" | "procedure" | "operator" | "aggregate" | "cast" | "type" | "authorization" | "table" | "index";
         /** @enum {string} */
         SQLCatalogOperationKind: "create" | "alter" | "rename" | "drop";
         /**
          * @description A retained authoritative result, or an unconfirmed outcome. Unknown is never permission to replay DDL.
          * @enum {string}
          */
-        SQLCatalogOperationState: "committed" | "rejected" | "unknown";
+        SQLCatalogOperationState: "committed" | "rejected" | "unknown" | "pending";
         /**
          * @description Recovery receipt for an atomic native catalog mutation, separate from
          *     physical table/schema publication receipts. Retain recovery_token and
@@ -11227,7 +11227,7 @@ export interface components {
              * @description Durable read-only transaction outcome. outcome_unknown is not permission to replay a mutation with another ID.
              * @enum {string}
              */
-            disposition: "active" | "outcome_unknown" | "committed" | "committed_pending" | "committed_repair_required" | "aborted";
+            disposition: "active" | "prepared" | "outcome_unknown" | "committed" | "committed_pending" | "committed_repair_required" | "aborted";
             staged_table_count: number;
             staged_read_count: number;
             staged_write_count: number;
@@ -17781,9 +17781,9 @@ export interface components {
             aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
-        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array" | "replace" | "md5" | "abs" | "ceil" | "floor" | "round" | "trunc" | "sign" | "sqrt" | "jsonb_typeof" | "jsonb_array_length" | "jsonb_extract_path" | "jsonb_extract_path_text" | "uuidv4" | "uuidv7" | "transaction_timestamp";
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array" | "replace" | "md5" | "abs" | "ceil" | "floor" | "round" | "trunc" | "sign" | "sqrt" | "jsonb_typeof" | "jsonb_array_length" | "jsonb_extract_path" | "jsonb_extract_path_text" | "uuidv4" | "uuidv7" | "transaction_timestamp" | "length" | "octet_length" | "bit_length";
         /** @enum {string} */
-        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array" | "json" | "numrange" | "daterange" | "tsrange" | "tstzrange";
+        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array" | "json" | "numrange" | "daterange" | "tsrange" | "tstzrange" | "enumeration";
         /**
          * @description Exact PostgreSQL builtin identity for a relational root scalar column.
          *     SQL array columns use SQLArrayElementType for their element identity.
@@ -17907,6 +17907,12 @@ export interface components {
          *     A matching candidate wins over NULL candidates; otherwise a NULL
          *     candidate makes the result UNKNOWN. These operations require schema
          *     capability version 19.
+         *     Enumeration expressions require reader capability version 40. Enum
+         *     literals and casts declare named_type_id from the owning schema directory.
+         *     Input labels are exact and case-sensitive; comparisons retain declaration
+         *     order and reject unrelated named identities. Enum/text conversions are
+         *     explicit; stored enum values retain four-byte symbols. CHECK, generated
+         *     values, defaults, typed-row ingress and restore share the native validator.
          *     JSON expressions require reader capability version 30. The json type
          *     carries JSONB semantics, including exact numeric values and display
          *     scale. jsonb_typeof and jsonb_array_length take one JSON argument;
@@ -17920,6 +17926,11 @@ export interface components {
         RelationalScalarExpression: {
             op: components["schemas"]["RelationalExpressionOp"];
             type?: components["schemas"]["RelationalExpressionType"];
+            /**
+             * Format: uint64
+             * @description Required on enumeration literals and casts, including typed NULL. Resolved from the immutable schema-owned named-type directory; labels and executable definitions are never accepted here. Requires reader capability version 40. Other expression types reject this field.
+             */
+            named_type_id?: number;
             /** @description Numeric builtin result identity on numeric literals, arithmetic, negate, and cast (capability version 18), or required array element identity on sql_array literals including typed NULL (capability version 24). */
             sql_type?: components["schemas"]["SQLBuiltinType"];
             /** @description Optional precision/signed-scale coercion; accepted only on cast with type numeric and sql_type numeric. Requires reader capability version 23. */
@@ -18118,12 +18129,42 @@ export interface components {
             /** @description Server-managed immutable ordering key encoded as lowercase hexadecimal. */
             order_key: string;
         };
-        /** @description Server-resolved executable type layout retained by a table schema epoch. Catalog ownership is separate from value representation. */
+        /** @description Immutable named-base identity pinned by a domain definition. */
+        SQLNamedTypeReference: {
+            /** Format: uint64 */
+            id: number;
+            origin_id: string;
+            /** Format: uint32 */
+            generation: number;
+        };
+        /** @description Exactly one builtin or named base. The server resolves and verifies the complete base chain before publication. */
+        SQLNamedDomainBase: {
+            /** @enum {string} */
+            kind: "builtin" | "named";
+            builtin?: components["schemas"]["SQLBuiltinType"];
+            named?: components["schemas"]["SQLNamedTypeReference"];
+        };
+        /** @description A named CHECK over the typed VALUE input. Unvalidated constraints still enforce every new assignment. */
+        SQLNamedDomainCheck: {
+            name: string;
+            expression: components["schemas"]["RelationalScalarExpression"];
+            validated: boolean;
+        };
+        /** @description Server-resolved immutable domain contract. Defaults affect future assignments; restrictive changes require dependent-owner activation. */
+        SQLNamedDomainDefinition: {
+            base: components["schemas"]["SQLNamedDomainBase"];
+            numeric_modifier?: components["schemas"]["SQLNumericModifier"];
+            default_expression?: components["schemas"]["RelationalScalarExpression"];
+            not_null: boolean;
+            checks: components["schemas"]["SQLNamedDomainCheck"][];
+        };
+        /** @description Server-resolved executable type layout retained by a table schema epoch. Enum layouts require labels; domain layouts require domain. The alternatives are mutually exclusive. Catalog ownership is separate from value representation. */
         SQLNamedTypeLayout: {
             /** @enum {string} */
-            kind: "enum";
+            kind: "enum" | "domain";
             identity: components["schemas"]["SQLNamedTypeIdentity"];
-            labels: components["schemas"]["SQLNamedEnumLabel"][];
+            labels?: components["schemas"]["SQLNamedEnumLabel"][];
+            domain?: components["schemas"]["SQLNamedDomainDefinition"];
         };
         /**
          * @description Storage representation for the table. Omission selects "document".

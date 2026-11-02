@@ -122,6 +122,56 @@ def check():
         command("ALTER TABLE drop_policy ENABLE ROW LEVEL SECURITY")
         command("DROP TABLE drop_policy", "DROP TABLE")
         rows("SELECT polname FROM pg_policy WHERE polname='hidden'", [])
+        # The original CASCADE command must remove the root and dependent
+        # declarations, without rewriting or deleting the surviving rows.
+        command("CREATE TABLE usage_records(id BIGINT PRIMARY KEY,parent_id BIGINT)")
+        command(
+            "CREATE TABLE cascade_survivor(id BIGINT PRIMARY KEY,parent_id BIGINT REFERENCES usage_records(id))"
+        )
+        command(
+            "ALTER TABLE usage_records ADD FOREIGN KEY(parent_id) REFERENCES cascade_survivor(id)"
+        )
+        command("CREATE SEQUENCE cascade_owned OWNED BY usage_records.id")
+        command(
+            "ALTER TABLE cascade_survivor ALTER COLUMN parent_id SET DEFAULT nextval('cascade_owned')"
+        )
+        command("INSERT INTO usage_records VALUES(1,NULL)")
+        command("INSERT INTO cascade_survivor VALUES(2,1)")
+        command("CREATE VIEW cascade_view AS SELECT id FROM usage_records")
+        command("CREATE VIEW cascade_nested AS SELECT id FROM cascade_view")
+        survivor = owner("cascade_survivor")
+        physical = db.execute(
+            "SELECT ctid::text,xmin::text FROM cascade_survivor"
+        ).fetchall()
+        indexes = db.execute(
+            "SELECT indexrelid FROM pg_index WHERE indrelid='cascade_survivor'::regclass ORDER BY indexrelid"
+        ).fetchall()
+        command(originals["sql-0158"]["sql"], "DROP TABLE")
+        rows("SELECT id,parent_id FROM cascade_survivor", [(2, 1)])
+        rows("SELECT ctid::text,xmin::text FROM cascade_survivor", physical)
+        rows(
+            "SELECT indexrelid FROM pg_index WHERE indrelid='cascade_survivor'::regclass ORDER BY indexrelid",
+            indexes,
+        )
+        if owner("cascade_survivor") != survivor:
+            raise AssertionError("CASCADE replaced its surviving table")
+        rows(
+            "SELECT to_regclass('usage_records')::text,to_regclass('cascade_owned')::text,to_regclass('cascade_view')::text,to_regclass('cascade_nested')::text",
+            [(None, None, None, None)],
+        )
+        rows(
+            "SELECT count(*) FROM pg_constraint WHERE conrelid='cascade_survivor'::regclass AND contype='f'",
+            [(0,)],
+        )
+        rows(
+            "SELECT column_default FROM information_schema.columns WHERE table_name='cascade_survivor' AND column_name='parent_id'",
+            [(None,)],
+        )
+        command("INSERT INTO cascade_survivor VALUES(3,1)", "INSERT 0 1")
+        command("INSERT INTO cascade_survivor(id) VALUES(4)", "INSERT 0 1")
+        rows("SELECT parent_id FROM cascade_survivor WHERE id=4", [(None,)])
+        command("INSERT INTO cascade_survivor VALUES(2,1)", error="23505")
+        command("DROP TABLE cascade_survivor", "DROP TABLE")
         for case_id in ("sql-0157", "sql-0159"):
             entry = originals[case_id]
             if entry["params"]:
@@ -138,7 +188,7 @@ def check():
                 error="42P01" if case_id == "sql-0157" else None,
             )
     print(
-        f"Verified {assertions} PostgreSQL constrained DROP assertions and exact originals sql-0157/sql-0159"
+        f"Verified {assertions} PostgreSQL constrained DROP assertions and exact originals sql-0157/sql-0158/sql-0159"
     )
 
 

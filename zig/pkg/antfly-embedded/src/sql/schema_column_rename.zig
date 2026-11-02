@@ -187,6 +187,17 @@ pub fn apply(a: std.mem.Allocator, root: *Value, old: []const u8, new: []const u
         try rebind.declarations(root, key);
 }
 
+fn expectRenameRejection(expected: anyerror, result: anyerror!bool) !void {
+    _ = result catch |err| {
+        // Allocation campaigns must propagate injected allocation failure,
+        // while still checking the exact semantic error on ordinary runs.
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(expected, err);
+        return;
+    };
+    return error.ExpectedRejectedRename;
+}
+
 fn renameCase(backing: std.mem.Allocator) !void {
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
@@ -218,13 +229,13 @@ fn renameCase(backing: std.mem.Allocator) !void {
     var compiled = try @import("../schema/mod.zig").PreparedSchemaDefinition.init(backing, successor);
     defer compiled.deinit(backing);
     const saved = try std.json.Stringify.valueAlloc(a, schema, .{});
-    try std.testing.expectError(error.UndefinedColumn, ddl.apply(a, &schema, rename.statement.catalog_ddl));
+    try expectRenameRejection(error.UndefinedColumn, ddl.apply(a, &schema, rename.statement.catalog_ddl));
     try std.testing.expectEqualStrings(saved, try std.json.Stringify.valueAlloc(a, schema, .{}));
     var collision = try compiler.compile(a, "ALTER TABLE items RENAME state TO id", .{});
     defer collision.deinit();
-    try std.testing.expectError(error.DuplicateSqlColumn, ddl.apply(a, &schema, collision.statement.catalog_ddl));
+    try expectRenameRejection(error.DuplicateSqlColumn, ddl.apply(a, &schema, collision.statement.catalog_ddl));
     try std.testing.expectEqualStrings(saved, try std.json.Stringify.valueAlloc(a, schema, .{}));
-    try std.testing.expectError(error.SqlProgramLimitExceeded, ddl.applyWithLimits(a, &schema, blk: {
+    try expectRenameRejection(error.SqlProgramLimitExceeded, ddl.applyWithLimits(a, &schema, blk: {
         var change = rename.statement.catalog_ddl;
         change.schema_change.?.rename_column = .{ .name = "state", .new_name = "status" };
         break :blk change;

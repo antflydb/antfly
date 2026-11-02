@@ -246,7 +246,7 @@ pub fn indexesJsonSource(indexes_json: []const u8) []const u8 {
 }
 
 pub fn isReservedIndexMetadataEntry(name: []const u8) bool {
-    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments") or index_metadata.isOpaqueEntry(name);
+    return index_metadata.isReservedEntry(name);
 }
 
 fn optionalPriorContextsEqual(alloc: std.mem.Allocator, a: ?@import("../storage/db/group_sources.zig").PriorContext, b: ?@import("../storage/db/group_sources.zig").PriorContext) !bool {

@@ -167,7 +167,7 @@ pub fn requireHeaderDecisions(head: barriers.Head, header: contract.Header) !voi
     try header.validate();
     if (!std.mem.eql(u8, &head.id, &header.binding.id) or
         !std.mem.eql(u8, &head.plan_digest, &header.binding.plan_digest) or
-        head.table_id != header.binding.fence.namespace.table_id) return error.SchemaValidationJobChanged;
+        (std.mem.allEqual(u8, &head.participants_digest, 0) and head.table_id != header.binding.fence.namespace.table_id)) return error.SchemaValidationJobChanged;
     if (header.installation) |installed| {
         if (head.install_revision == 0 or !std.mem.eql(u8, &installed.decision, &try head.installDecision()))
             return error.SchemaValidationRuntimeRecoveryRequired;

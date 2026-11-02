@@ -31,10 +31,13 @@ const lifecycle = @import("table_lifecycle_lock.zig");
 const contract = local.storage_db_relational_schema_owner_contract;
 const A = std.mem.Allocator;
 pub const all_prefix = "\x00\x00__metadata__:schema_validation:";
-pub const Kind = enum(u8) { plan, head, owner, proof, preparation, active, input, parent, root_epoch, proof_history, parent_image, owner_namespace };
+pub const Kind = enum(u8) { plan, head, owner, proof, preparation, active, input, parent, root_epoch, proof_history, parent_image, owner_namespace, participants, type_active, sequence_active, sequence_namespace, sequence_database, sequence_outcome, object_rename_source, retirement_active };
 const OwnerAddress = @import("schema_validation_read.zig").OwnerAddress;
+const ParticipantAlias = barriers.Record(@import("schema_validation_read.zig").Lookup, "SVPA", 1024);
 const NamespaceOwner = struct { address: OwnerAddress, ordinal: u16 };
-const NamespaceOwnerRecord = barriers.Record(NamespaceOwner, "SVNO", 256);
+/// Canonical reverse-owner bytes shared by admission and native authority
+/// fixtures. Encoding or decoding this record grants no lifecycle authority.
+pub const NamespaceOwnerRecord = barriers.Record(NamespaceOwner, "SVNO", 256);
 const ParentImage = struct { ordinal: u16, grant: [32]u8 };
 const ParentImageRecord = barriers.Record(ParentImage, "SVPI", 256);
 pub const PreparationRecord = barriers.Record(evidence.SignedPreparation, "SVPP", evidence.SignedPreparation.max_wire_bytes);
@@ -47,6 +50,22 @@ pub fn requiresAdmissionAuthority(bytes: []const u8) bool {
     // carries immutable inputs. Keep permission classification with its codec.
     return std.mem.startsWith(u8, bytes, begin_magic);
 }
+/// Project the manifest with fixed memory before decoding raw preparation
+/// inputs. Malformed binary headers conservatively require the newest decoder;
+/// parseCommand still rejects them before any mutation is staged.
+pub fn requiredDecoderVersion(bytes: []const u8) u16 {
+    const protocol = @import("topology_protocol.zig");
+    if (!requiresAdmissionAuthority(bytes)) return protocol.schema_validation_publication_version;
+    if (bytes.len < 48) return protocol.sql_sequence_retirement_version;
+    const size: usize = std.mem.readInt(u32, bytes[8..12], .little);
+    if (size == 0 or size > bytes.len - 48 or size > plan_mod.max_bytes * 2) return protocol.sql_sequence_retirement_version;
+    if (@import("schema_reader_wire.zig").requiresRetirementCohort(bytes[16..][0..size])) return protocol.table_retirement_survivors_version;
+    if (@import("schema_reader_wire.zig").requiresObjectRenames(bytes[16..][0..size])) return protocol.sql_object_annotations_version;
+    if (@import("schema_reader_wire.zig").requiresSequenceRetirement(bytes[16..][0..size])) return protocol.sql_sequence_retirement_version;
+    if (@import("schema_reader_wire.zig").requiresSqlDomainEpoch(bytes[16..][0..size])) return protocol.sql_domain_epoch_version;
+    return if (@import("schema_reader_wire.zig").requiresTypeCohort(bytes[16..][0..size])) protocol.sql_type_epoch_version else protocol.schema_validation_publication_version;
+}
+
 pub const Decision = struct { lookup: Lookup, revision: u64 };
 pub const Begin = struct {
     plan: plan_mod.Plan,
@@ -180,13 +199,13 @@ pub const Key = struct {
 
     pub fn encode(self: Key, buf: []u8) ![]const u8 {
         if (self.group == 0 or self.table == 0 or
-            (self.kind == .active) != std.mem.allEqual(u8, &self.id, 0) or
+            (self.kind == .active or self.kind == .retirement_active or self.kind == .type_active or self.kind == .sequence_active or self.kind == .sequence_namespace or self.kind == .sequence_database or self.kind == .object_rename_source) != std.mem.allEqual(u8, &self.id, 0) or
             (self.kind != .owner and self.kind != .proof and self.kind != .preparation and self.kind != .input and self.kind != .parent and self.kind != .root_epoch and self.kind != .proof_history and self.ordinal != 0) or
             (self.kind != .proof and self.kind != .proof_history and self.stage != .ready) or self.ordinal >= barriers.max_owners)
             return error.InvalidGenerationPublication;
-        if ((self.kind == .parent or self.kind == .root_epoch or self.kind == .proof_history or self.kind == .parent_image or self.kind == .owner_namespace) != (self.grant != null)) return error.InvalidGenerationPublication;
+        if ((self.kind == .parent or self.kind == .root_epoch or self.kind == .proof_history or self.kind == .parent_image or self.kind == .owner_namespace or self.kind == .sequence_namespace or self.kind == .sequence_database) != (self.grant != null)) return error.InvalidGenerationPublication;
         if (self.grant) |grant| if (std.mem.allEqual(u8, &grant, 0)) return error.InvalidGenerationPublication;
-        if (self.kind == .root_epoch and !std.mem.allEqual(u8, self.grant.?[0..24], 0)) return error.InvalidGenerationPublication;
+        if ((self.kind == .root_epoch or self.kind == .sequence_namespace or self.kind == .sequence_database) and !std.mem.allEqual(u8, self.grant.?[0..24], 0)) return error.InvalidGenerationPublication;
         const base = try std.fmt.bufPrint(buf, all_prefix ++ "{x:0>16}:{x:0>16}:{s}:{x:0>2}:{x:0>4}:{x:0>2}", .{
             self.group, self.table, std.fmt.bytesToHex(self.id, .lower), @backingInt(self.kind), self.ordinal, @backingInt(self.stage),
         });
@@ -244,19 +263,219 @@ fn optional(txn: anytype, key: []const u8) !?[]const u8 {
 fn terminal(head: barriers.Head) bool {
     return head.phase == .succeeded or head.phase == .canceled;
 }
+/// A secondary participant retains only a compact immutable anchor. Returning
+/// it is discovery, not execution permission; owner lookup still rejoins the
+/// exact physical namespace and current enrolled root.
+pub fn resolveActiveHead(txn: anytype, group: u64, table: u64) !?barriers.Head {
+    var buffer: [192]u8 = undefined;
+    const value = (try optional(txn, try (Key{ .group = group, .table = table, .id = @splat(0), .kind = .active }).encode(&buffer))) orelse return null;
+    return if (value.len == 16) block: {
+        const id = value[0..16].*;
+        const head = try barriers.Head.decode(try txn.get(try (Key{ .group = group, .table = table, .id = id, .kind = .head }).encode(&buffer)));
+        if (head.metadata_group_id != group or head.table_id != table or !std.mem.eql(u8, &head.id, &id)) return error.InvalidCatalogRecord;
+        break :block head;
+    } else block: {
+        const alias = try ParticipantAlias.decode(value);
+        try (OwnerReadRequest{ .lookup = alias, .ordinal = 0 }).validate();
+        if (alias.group != group or alias.table == table) return error.InvalidCatalogRecord;
+        const head = try readHead(txn, alias);
+        if (std.mem.allEqual(u8, &head.participants_digest, 0)) return error.InvalidCatalogRecord;
+        break :block head;
+    };
+}
+
+pub fn resolveActive(txn: anytype, group: u64, table: u64) !?Lookup {
+    return if (try resolveActiveHead(txn, group, table)) |head| Lookup.fromHead(head) else null;
+}
+
+/// Resolve the job anchor from a physical participant, then rejoin the exact
+/// retained owner binding. An alias alone never authorizes owner work or
+/// cancellation; this remains bounded independently of table and plan size.
+pub fn activeHeadForBinding(txn: anytype, group: u64, incarnation: [32]u8, binding: contract.Binding) !barriers.Head {
+    try binding.validate();
+    const head = (try resolveActiveHead(txn, group, binding.fence.namespace.table_id)) orelse return error.GenerationPublicationChanged;
+    const lookup = Lookup.fromHead(head);
+    if (!std.mem.eql(u8, &lookup.metadata_incarnation, &incarnation) or
+        !std.mem.eql(u8, &lookup.id, &binding.id) or !std.mem.eql(u8, &lookup.plan_digest, &binding.plan_digest)) return error.SchemaValidationJobChanged;
+    try requireParticipantLock(txn, head, binding.fence.namespace.table_id);
+    const control = (try readReplayControl(txn, lookup, OwnerAddress.fromBinding(binding))) orelse return error.SchemaValidationJobChanged;
+    if (!std.meta.eql(control.owner.binding, binding)) return error.SchemaValidationJobChanged;
+    return head;
+}
+
+fn typeActiveKey(group: u64, type_id: u64) Key {
+    return .{ .group = group, .table = type_id, .id = @splat(0), .kind = .type_active };
+}
+
+const SequenceAcceptance = struct {
+    lookup: Lookup,
+    admission: @import("../system_catalog/sequence_catalog.zig").Admission,
+    digest: [32]u8,
+    revision: u64,
+    fn validate(self: @This()) !void {
+        try (@import("schema_validation_read.zig").OwnerReadRequest{ .lookup = self.lookup, .ordinal = 0 }).validate();
+        try self.admission.validate();
+        if (self.revision == 0 or std.mem.allEqual(u8, &self.digest, 0)) return error.InvalidSequenceOutcome;
+    }
+};
+const SequenceAcceptanceRecord = barriers.Record(SequenceAcceptance, "SVSQ", 2048);
+fn sequenceOutcomeKey(group: u64, sequence: u64, nonce: [16]u8) Key {
+    return .{ .group = group, .table = sequence, .id = nonce, .kind = .sequence_outcome };
+}
+fn requireSequenceAcceptance(value: SequenceAcceptance, head: barriers.Head) !void {
+    try value.validate();
+    const retired = head.sequence_retirement orelse return error.InvalidSequenceOutcome;
+    if (!std.meta.eql(value.lookup, Lookup.fromHead(head)) or !std.mem.eql(u8, &value.digest, &retired.admission_digest)) return error.InvalidSequenceOutcome;
+}
+
+/// The compact acceptance belongs to the durable job, not the short ordinary
+/// catalog outcome ring. Unrelated DDL churn cannot evict an in-flight SQL
+/// operation or its eventual terminal decision. Its lifetime follows job history.
+pub fn retainedSequenceOutcome(txn: anytype, group: u64, request: @import("../system_catalog/sequence_catalog.zig").Mutation, digest: [32]u8, catalog_revision: u64) !?@import("../system_catalog/sequence_catalog.zig").Outcome {
+    if (request.operation != .drop or !request.operation.drop.cascade) return null;
+    const expected = request.operation.drop.expected orelse return null;
+    var buffer: [192]u8 = undefined;
+    const bytes = (try optional(txn, try sequenceOutcomeKey(group, expected.id, request.admission.nonce).encode(&buffer))) orelse return null;
+    const accepted = try SequenceAcceptanceRecord.decode(bytes);
+    try accepted.validate();
+    if (!std.meta.eql(accepted.admission, request.admission) or !std.mem.eql(u8, &accepted.digest, &digest)) return error.SequenceAdmissionConflict;
+    const head = try readHead(txn, accepted.lookup);
+    try requireSequenceAcceptance(accepted, head);
+    const retired = head.sequence_retirement.?;
+    if (head.metadata_group_id != group or retired.id != expected.id or retired.generation != expected.generation or
+        !std.mem.eql(u8, &head.metadata_incarnation, &std.fmt.bytesToHex(request.incarnation, .lower)) or
+        accepted.revision > catalog_revision or head.catalog_revision > catalog_revision) return error.InvalidSequenceOutcome;
+    return switch (head.phase) {
+        .succeeded => .{ .success = .{ .revision = head.catalog_revision, .identity = null, .removed = 1 } },
+        .canceled => .{ .rejected = switch (head.failure) {
+            .requested => .Canceled,
+            .owner_failed => .CatalogGenerationChanged,
+            else => return error.InvalidSequenceOutcome,
+        } },
+        else => .{ .pending = .{ .revision = accepted.revision, .identity = expected, .work = .{ .sequence_schema = accepted.lookup } } },
+    };
+}
+
+fn sequenceActiveKey(group: u64, sequence_id: u64) Key {
+    return .{ .group = group, .table = sequence_id, .id = @splat(0), .kind = .sequence_active };
+}
+fn resourceActiveKey(head: barriers.Head) Key {
+    if (head.retirement_root) |root| return .{ .group = head.metadata_group_id, .table = root.root.table, .id = @splat(0), .kind = .retirement_active };
+    return if (head.type_id != 0) typeActiveKey(head.metadata_group_id, head.type_id) else sequenceActiveKey(head.metadata_group_id, head.sequence_retirement.?.id);
+}
+
+/// The common publication head owns sequence exclusion until durable release
+/// or cancellation. An alias is never independently sufficient authority.
+pub fn activeSequence(txn: anytype, group: u64, sequence_id: u64) !?Lookup {
+    var buffer: [192]u8 = undefined;
+    const bytes = (try optional(txn, try sequenceActiveKey(group, sequence_id).encode(&buffer))) orelse return null;
+    const lookup = try ParticipantAlias.decode(bytes);
+    if (lookup.group != group) return error.InvalidCatalogRecord;
+    const head = try readHead(txn, lookup);
+    const retirement = head.sequence_retirement orelse return error.InvalidCatalogRecord;
+    if (retirement.id != sequence_id or terminal(head)) return error.InvalidCatalogRecord;
+    try requireLock(txn, head);
+    return lookup;
+}
+
+fn sequenceContainerKey(head: barriers.Head, kind: Kind) Key {
+    const retired = head.sequence_retirement.?;
+    var grant: [32]u8 = @splat(0);
+    std.mem.writeInt(u64, grant[24..32], retired.id, .big);
+    return .{ .group = head.metadata_group_id, .table = if (kind == .sequence_namespace) retired.namespace_id else retired.database_id, .id = @splat(0), .kind = kind, .grant = grant };
+}
+fn requireContainerReservation(txn: anytype, head: barriers.Head, kind: Kind) !void {
+    var buffer: [192]u8 = undefined;
+    const bytes = try txn.get(try sequenceContainerKey(head, kind).encode(&buffer));
+    if (!std.meta.eql(try ParticipantAlias.decode(bytes), Lookup.fromHead(head))) return error.InvalidCatalogRecord;
+}
+
+/// Container lifetimes stay pinned after the counter itself is published away.
+/// A covering alias seek touches only active retirements for this container;
+/// independent sequences share the namespace without serializing their jobs.
+pub fn requireSequenceContainerFree(txn: anytype, group: u64, kind: enum { namespace, database }, container: u64) !void {
+    var buffer: [192]u8 = undefined;
+    const lane: Kind = if (kind == .namespace) .sequence_namespace else .sequence_database;
+    var grant: [32]u8 = @splat(0);
+    grant[31] = 1;
+    const probe = try (Key{ .group = group, .table = container, .id = @splat(0), .kind = lane, .grant = grant }).encode(&buffer);
+    const container_prefix = probe[0 .. probe.len - 64];
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    const row = (try cursor.seekAtOrAfter(container_prefix)) orelse return;
+    if (!std.mem.startsWith(u8, row.key, container_prefix)) return;
+    const key = (try Key.parse(row.key)) orelse return error.InvalidCatalogRecord;
+    const lookup = try ParticipantAlias.decode(row.value);
+    const head = try readHead(txn, lookup);
+    if (head.sequence_retirement == null or terminal(head) or
+        !std.meta.eql(key, sequenceContainerKey(head, lane))) return error.InvalidCatalogRecord;
+    const active = (try activeSequence(txn, group, head.sequence_retirement.?.id)) orelse return error.InvalidCatalogRecord;
+    if (!std.meta.eql(active, lookup)) return error.InvalidCatalogRecord;
+    return error.CatalogPublicationProofPending;
+}
+
+/// A type reservation blocks new dependency edges and competing executable
+/// mutations until every owner releases the coordinated epoch. Annotations
+/// remain independent and are preserved by publication.
+pub fn activeType(txn: anytype, group: u64, type_id: u64) !?Lookup {
+    var buffer: [192]u8 = undefined;
+    const bytes = (try optional(txn, try typeActiveKey(group, type_id).encode(&buffer))) orelse return null;
+    const lookup = try ParticipantAlias.decode(bytes);
+    if (lookup.group != group) return error.InvalidCatalogRecord;
+    const head = try readHead(txn, lookup);
+    if (head.type_id != type_id or terminal(head)) return error.InvalidCatalogRecord;
+    try requireLock(txn, head);
+    return lookup;
+}
+
+fn retirementCohort(head: barriers.Head) @import("table_retirement_authority.zig").Cohort {
+    return .{ .table = head.table_id, .id = head.id, .digest = head.plan_digest };
+}
+fn activeRetirement(txn: anytype, head: barriers.Head) !?Lookup {
+    var buffer: [192]u8 = undefined;
+    const bytes = (try optional(txn, try resourceActiveKey(head).encode(&buffer))) orelse return null;
+    const selected = try ParticipantAlias.decode(bytes);
+    const current = try readHead(txn, selected);
+    if (current.retirement_root == null or !std.meta.eql(current.retirement_root, head.retirement_root) or terminal(current)) return error.InvalidCatalogRecord;
+    _ = try @import("table_retirement_ledger.zig").requireCohort(txn, current.retirement_root.?, retirementCohort(current));
+    return selected;
+}
+
+fn requireCatalogReservation(txn: anytype, head: barriers.Head) !void {
+    if (!head.catalogEffect()) return;
+    const current = (if (head.retirement_root != null) try activeRetirement(txn, head) else if (head.type_id != 0) try activeType(txn, head.metadata_group_id, head.type_id) else try activeSequence(txn, head.metadata_group_id, head.sequence_retirement.?.id)) orelse return error.InvalidCatalogRecord;
+    if (!std.meta.eql(current, Lookup.fromHead(head))) return error.InvalidCatalogRecord;
+    if (head.sequence_retirement != null) {
+        try requireContainerReservation(txn, head, .sequence_namespace);
+        try requireContainerReservation(txn, head, .sequence_database);
+    }
+}
+
 pub fn discoverActive(txn: anytype, request: @import("schema_validation_read.zig").DiscoveryRequest) !?Lookup {
     try request.validate();
     const lock = (try lifecycle.read(txn, request.group, request.table)) orelse return null;
+    if (lock.kind == .table_retirement) {
+        const root_mod = @import("table_retirement_ledger.zig");
+        const selected = (try root_mod.member(txn, request.group, request.table)) orelse return error.InvalidCatalogRecord;
+        const root = (try root_mod.head(txn, selected.root)) orelse return error.InvalidCatalogRecord;
+        if (!std.mem.eql(u8, &lock.id, &root.lookup.id)) return error.InvalidCatalogRecord;
+        const candidate = root.survivor orelse return null;
+        if (root.phase != .validating_survivors) return error.InvalidCatalogRecord;
+        // Root and external parents also hold kind-6 locks, but only actual
+        // survivor participants have a common validation dispatch alias.
+        const survivor = (try resolveActiveHead(txn, request.group, request.table)) orelse return null;
+        if (terminal(survivor) or survivor.table_id != candidate.table or
+            !std.mem.eql(u8, &survivor.id, &candidate.id) or !std.mem.eql(u8, &survivor.plan_digest, &candidate.digest) or
+            !std.mem.eql(u8, &survivor.metadata_incarnation, &request.metadata_incarnation)) return error.GenerationPublicationChanged;
+        try requireParticipantLock(txn, survivor, request.table);
+        return .fromHead(survivor);
+    }
     if (lock.kind != .schema_validation) return null;
-    var buf: [192]u8 = undefined;
-    const bytes = try txn.get(try (Key{ .group = request.group, .table = request.table, .id = lock.id, .kind = .head }).encode(&buf));
-    const head = try barriers.Head.decode(bytes);
-    if (head.metadata_group_id != request.group or head.table_id != request.table or terminal(head) or
-        !std.mem.eql(u8, &head.id, &lock.id) or !std.mem.eql(u8, &head.metadata_incarnation, &request.metadata_incarnation)) return error.GenerationPublicationChanged;
-    const lookup = Lookup.fromHead(head);
-    const active = (try optional(txn, try storageKey(lookup, .active, 0, .ready).encode(&buf))) orelse return error.GenerationPublicationChanged;
-    if (!std.mem.eql(u8, active, &head.id)) return error.GenerationPublicationChanged;
-    return lookup;
+    const head = (try resolveActiveHead(txn, request.group, request.table)) orelse return error.GenerationPublicationChanged;
+    if (terminal(head) or !std.mem.eql(u8, &head.id, &lock.id) or
+        !std.mem.eql(u8, &head.metadata_incarnation, &request.metadata_incarnation)) return error.GenerationPublicationChanged;
+    if (head.table_id != request.table) try requireLock(txn, head);
+    return .fromHead(head);
 }
 
 pub fn readHead(txn: anytype, lookup: Lookup) !barriers.Head {
@@ -287,7 +506,7 @@ pub const ownerReadHttpFailure = @import("schema_validation_read.zig").ownerRead
 pub fn readOwnerControl(txn: anytype, lookup: Lookup, ordinal: u16, action: contract.Action, context: anytype) !OwnerControlRead {
     const head = try readHead(txn, lookup);
     const owner = try readOwner(txn, head, ordinal);
-    if (!terminal(head)) try requireLock(txn, head);
+    if (!terminal(head)) try requireParticipantLock(txn, head, owner.binding.fence.namespace.table_id);
     try context.authorize(txn, head, owner, action);
     return .{ .head = head, .owner = owner, .action = action, .disposition = try barriers.ownerPermission(head, owner, action) };
 }
@@ -307,8 +526,12 @@ pub fn readOwnerInputs(txn: anytype, lookup: Lookup, ordinal: u16, context: anyt
 }
 
 fn requireLock(txn: anytype, head: barriers.Head) !void {
-    const lock = (try lifecycle.read(txn, head.metadata_group_id, head.table_id)) orelse return error.GenerationPublicationChanged;
-    if (lock.kind != .schema_validation or !std.mem.eql(u8, &lock.id, &head.id)) return error.GenerationPublicationChanged;
+    if (head.retirement_root) |root| {
+        try @import("table_retirement_ledger.zig").requireBorrowedLock(txn, root, retirementCohort(head), head.table_id);
+    } else {
+        const lock = (try lifecycle.read(txn, head.metadata_group_id, head.table_id)) orelse return error.GenerationPublicationChanged;
+        if (lock.kind != .schema_validation or !std.mem.eql(u8, &lock.id, &head.id)) return error.GenerationPublicationChanged;
+    }
     var buf: [192]u8 = undefined;
     const active = (try optional(txn, try storageKey(Lookup.fromHead(head), .active, 0, .ready).encode(&buf))) orelse return error.GenerationPublicationChanged;
     if (!std.mem.eql(u8, active, &head.id)) return error.GenerationPublicationChanged;
@@ -318,14 +541,70 @@ fn writeHead(txn: anytype, head: barriers.Head) !void {
     var buf: [192]u8 = undefined;
     try txn.put(try storageKey(Lookup.fromHead(head), .head, 0, .ready).encode(&buf), encoded.slice());
 }
+pub fn readParticipants(txn: anytype, head: barriers.Head) !plan_mod.Participants {
+    if (std.mem.allEqual(u8, &head.participants_digest, 0)) {
+        var single: plan_mod.Participants = .{ .len = 1 };
+        single.tables[0] = head.table_id;
+        try single.validate();
+        return single;
+    }
+    var buffer: [192]u8 = undefined;
+    const result = try plan_mod.ParticipantsRecord.decode(try txn.get(try storageKey(Lookup.fromHead(head), .participants, 0, .ready).encode(&buffer)));
+    if (result.len != head.participant_count or result.tables[0] != head.table_id or
+        !std.mem.eql(u8, &try result.digest(), &head.participants_digest)) return error.InvalidCatalogRecord;
+    return result;
+}
+
+fn requireParticipantLock(txn: anytype, head: barriers.Head, table: u64) !void {
+    try requireLock(txn, head);
+    if (table == head.table_id) return;
+    if (std.mem.allEqual(u8, &head.participants_digest, 0)) return error.InvalidGenerationPublication;
+    if (head.retirement_root) |root| {
+        try @import("table_retirement_ledger.zig").requireBorrowedLock(txn, root, retirementCohort(head), table);
+    } else {
+        const lock = (try lifecycle.read(txn, head.metadata_group_id, table)) orelse return error.GenerationPublicationChanged;
+        if (lock.kind != .schema_validation or !std.mem.eql(u8, &lock.id, &head.id)) return error.GenerationPublicationChanged;
+    }
+    var buffer: [192]u8 = undefined;
+    const alias = try ParticipantAlias.decode(try txn.get(try (Key{ .group = head.metadata_group_id, .table = table, .id = @splat(0), .kind = .active }).encode(&buffer)));
+    if (!std.meta.eql(alias, Lookup.fromHead(head))) return error.InvalidCatalogRecord;
+}
+
 fn stageTerminal(txn: anytype, head: barriers.Head, foreign_constraints: u16) !void {
     if (!terminal(head)) return;
     try requireLock(txn, head);
     var buf: [192]u8 = undefined;
     if (foreign_constraints != 0)
         try @import("schema_validation_dependencies.zig").releaseJob(txn, head, foreign_constraints);
+    if (head.catalogEffect()) {
+        // The terminal head is staged before cleanup; validate the retained
+        // identity directly rather than treating terminal state as active work.
+        const bytes = try txn.get(try resourceActiveKey(head).encode(&buf));
+        if (!std.meta.eql(try ParticipantAlias.decode(bytes), Lookup.fromHead(head))) return error.InvalidCatalogRecord;
+        try txn.delete(try resourceActiveKey(head).encode(&buf));
+    }
+    if (head.sequence_retirement != null) {
+        for ([_]Kind{ .sequence_namespace, .sequence_database }) |kind| {
+            try requireContainerReservation(txn, head, kind);
+            try txn.delete(try sequenceContainerKey(head, kind).encode(&buf));
+        }
+    }
+    const participants = try readParticipants(txn, head);
+    for (participants.tables[0..participants.len]) |table| {
+        if (table == head.table_id) continue;
+        try requireParticipantLock(txn, head, table);
+        try txn.delete(try (Key{ .group = head.metadata_group_id, .table = table, .id = @splat(0), .kind = .active }).encode(&buf));
+        if (head.retirement_root == null or head.phase != .canceled) try lifecycle.release(txn, head.metadata_group_id, table, .{ .kind = .schema_validation, .id = head.id });
+    }
+    const rename_key = try (Key{ .group = head.metadata_group_id, .table = head.table_id, .id = @splat(0), .kind = .object_rename_source }).encode(&buf);
+    if (try optional(txn, rename_key)) |pointer| {
+        if (!std.mem.eql(u8, pointer, &head.id)) return error.InvalidGenerationPublication;
+        try txn.delete(rename_key);
+    }
     try txn.delete(try storageKey(Lookup.fromHead(head), .active, 0, .ready).encode(&buf));
-    try lifecycle.release(txn, head.metadata_group_id, head.table_id, .{ .kind = .schema_validation, .id = head.id });
+    if (head.retirement_root) |root| {
+        if (head.phase == .canceled) try @import("table_retirement_ledger.zig").finishCohort(txn, root, retirementCohort(head), false) else try lifecycle.release(txn, head.metadata_group_id, head.table_id, .{ .kind = .schema_validation, .id = head.id });
+    } else try lifecycle.release(txn, head.metadata_group_id, head.table_id, .{ .kind = .schema_validation, .id = head.id });
 }
 
 /// Context.admit MUST compare the live catalog/complete owner cover, SQL/RLS
@@ -342,12 +621,40 @@ pub fn checkBegin(alloc: A, txn: anytype, prepared: *const plan_mod.Prepared, pr
     defer alloc.free(input_digests);
     const catalog_digests = try alloc.alloc([32]u8, inputs.len);
     defer alloc.free(catalog_digests);
+    const cohort = decoded.value.cohort();
+    if (cohort) {
+        const participants = prepared.participants orelse return error.InvalidGenerationPublication;
+        if (!std.meta.eql(participants, try decoded.value.participantDirectory())) return error.InvalidGenerationPublication;
+        if (decoded.value.type_change) |actual| {
+            if (prepared.sequence_request != null) return error.InvalidGenerationPublication;
+            const types = @import("../system_catalog/named_types.zig");
+            const cached = (prepared.type_request orelse return error.InvalidGenerationPublication).value;
+            if (!std.mem.eql(u8, &try types.boundDigest(alloc, try types.observation(alloc, cached)), &try types.boundDigest(alloc, try types.observation(alloc, actual.request))) or
+                prepared.type_after == null or prepared.type_after.?.id != actual.after.identity.id or prepared.type_after.?.generation != actual.after.identity.generation) return error.InvalidGenerationPublication;
+        } else if (decoded.value.retirement_root != null) {
+            // The immutable root authority was compared by requireProgress;
+            // this cohort has no independent type/sequence mutation intent.
+            if (prepared.type_request != null or prepared.type_after != null or prepared.sequence_request != null) return error.InvalidGenerationPublication;
+        } else {
+            if (prepared.type_request != null or prepared.type_after != null) return error.InvalidGenerationPublication;
+            const sequences = @import("../system_catalog/sequence_catalog.zig");
+            const cached = (prepared.sequence_request orelse return error.InvalidGenerationPublication).value;
+            if (!std.mem.eql(u8, &try sequences.commandDigest(alloc, cached), &try sequences.commandDigest(alloc, decoded.value.sequence_change.?.request))) return error.InvalidGenerationPublication;
+        }
+    } else if (prepared.participants != null or prepared.type_request != null or prepared.type_after != null or prepared.sequence_request != null) return error.InvalidGenerationPublication;
+    const before_public = try alloc.alloc([32]u8, if (cohort) inputs.len else 0);
+    defer alloc.free(before_public);
+    const after_public = try alloc.alloc([32]u8, if (cohort) inputs.len else 0);
+    defer alloc.free(after_public);
     const columns = try decoded.value.selection.encodePayload(alloc);
     defer alloc.free(columns);
-    for (inputs, input_digests, catalog_digests) |input, *input_digest, *catalog_digest| {
+    for (inputs, input_digests, catalog_digests, 0..) |input, *input_digest, *catalog_digest, index| {
         const parts = try contract.inputParts(input);
-        if (!std.mem.eql(u8, parts[0], decoded.value.before.schema_json) or !std.mem.eql(u8, parts[1], decoded.value.after.schema_json) or
-            !std.mem.eql(u8, parts[3], columns)) return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, parts[3], columns)) return error.InvalidGenerationPublication;
+        if (cohort) {
+            before_public[index] = contract.hash(parts[0]);
+            after_public[index] = contract.hash(parts[1]);
+        } else if (!std.mem.eql(u8, parts[0], decoded.value.before.schema_json) or !std.mem.eql(u8, parts[1], decoded.value.after.schema_json)) return error.InvalidGenerationPublication;
         input_digest.* = contract.hash(input);
         catalog_digest.* = contract.hash(parts[2]);
     }
@@ -355,6 +662,8 @@ pub fn checkBegin(alloc: A, txn: anytype, prepared: *const plan_mod.Prepared, pr
         if (owner.root_epoch != 0) return error.InvalidGenerationPublication;
         if (!std.mem.eql(u8, &owner.binding.inputs, &input_digests[owner.input_ordinal]) or
             !std.mem.eql(u8, &owner.binding.fence.catalog_digest, &catalog_digests[owner.input_ordinal])) return error.InvalidGenerationPublication;
+        if (cohort and (!std.mem.eql(u8, &owner.binding.before_public, &before_public[owner.input_ordinal]) or
+            !std.mem.eql(u8, &owner.binding.after_public, &after_public[owner.input_ordinal]))) return error.InvalidGenerationPublication;
     }
     var buf: [192]u8 = undefined;
     if (try optional(txn, try storageKey(lookup, .head, 0, .ready).encode(&buf)) != null) {
@@ -372,8 +681,21 @@ pub fn checkBegin(alloc: A, txn: anytype, prepared: *const plan_mod.Prepared, pr
         try signed.verifyFor(owner.binding, owner.physical_root_incarnation);
         if (!std.mem.eql(u8, &signed.proof.identity.metadata_incarnation, &prepared.head.metadata_incarnation)) return error.MetadataIncarnationMismatch;
     }
+    if (decoded.value.sequence_change) |change| {
+        if (try optional(txn, try sequenceOutcomeKey(lookup.group, change.before.id, change.request.admission.nonce).encode(&buf)) != null) return error.GenerationPublicationChanged;
+    }
     try context.admit(txn, decoded.value, preparations);
-    if (try lifecycle.read(txn, lookup.group, lookup.table) != null) return error.GenerationPublicationChanged;
+    if (prepared.head.type_id != 0 and try activeType(txn, lookup.group, prepared.head.type_id) != null) return error.GenerationPublicationChanged;
+    if (prepared.head.sequence_retirement) |retirement| if (try activeSequence(txn, lookup.group, retirement.id) != null) return error.GenerationPublicationChanged;
+    if (prepared.participants) |directory| {
+        for (directory.tables[0..directory.len]) |table| {
+            const lock = try lifecycle.read(txn, lookup.group, table);
+            if (prepared.head.retirement_root) |root| {
+                const selected = (try @import("table_retirement_ledger.zig").member(txn, lookup.group, table)) orelse return error.GenerationPublicationChanged;
+                if (!std.meta.eql(selected.root, root.root) or lock == null or lock.?.kind != .table_retirement or !std.mem.eql(u8, &lock.?.id, &root.root.id)) return error.GenerationPublicationChanged;
+            } else if (lock != null) return error.GenerationPublicationChanged;
+        }
+    } else if (try lifecycle.read(txn, lookup.group, lookup.table) != null) return error.GenerationPublicationChanged;
     return true;
 }
 
@@ -384,7 +706,53 @@ pub fn begin(alloc: A, txn: anytype, prepared: *const plan_mod.Prepared, prepara
     const lookup = Lookup.fromHead(prepared.head);
     var buf: [192]u8 = undefined;
     // No expected admission/CAS rejection may be swallowed after this point.
-    try lifecycle.acquire(txn, lookup.group, lookup.table, .{ .kind = .schema_validation, .id = lookup.id });
+    if (prepared.type_request) |request| {
+        const Context = switch (@typeInfo(@TypeOf(context))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(context),
+        };
+        if (comptime @hasDecl(Context, "stageTypeAdmission")) {
+            try context.stageTypeAdmission(txn, request.value, prepared.type_after.?, prepared.head);
+        } else return error.InvalidGenerationPublication;
+    }
+    var sequence_revision: u64 = 0;
+    if (prepared.sequence_request) |request| {
+        const Context = switch (@typeInfo(@TypeOf(context))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(context),
+        };
+        if (comptime @hasDecl(Context, "stageSequenceAdmission")) {
+            sequence_revision = try context.stageSequenceAdmission(txn, request.value, prepared.head);
+        } else return error.InvalidGenerationPublication;
+    }
+    if (prepared.sequence_request) |request| {
+        const accepted: SequenceAcceptance = .{ .lookup = lookup, .admission = request.value.admission, .digest = prepared.head.sequence_retirement.?.admission_digest, .revision = sequence_revision };
+        try accepted.validate();
+        const encoded = try SequenceAcceptanceRecord.init(accepted);
+        try txn.put(try sequenceOutcomeKey(lookup.group, prepared.head.sequence_retirement.?.id, request.value.admission.nonce).encode(&buf), encoded.slice());
+    }
+    if (prepared.head.catalogEffect()) {
+        const reservation = try ParticipantAlias.init(lookup);
+        try txn.put(try resourceActiveKey(prepared.head).encode(&buf), reservation.slice());
+    }
+    if (prepared.head.sequence_retirement != null) {
+        const reservation = try ParticipantAlias.init(lookup);
+        for ([_]Kind{ .sequence_namespace, .sequence_database }) |kind|
+            try txn.put(try sequenceContainerKey(prepared.head, kind).encode(&buf), reservation.slice());
+    }
+    if (prepared.head.retirement_root) |root| {
+        try @import("table_retirement_ledger.zig").stageCohort(txn, root, retirementCohort(prepared.head));
+    } else try lifecycle.acquire(txn, lookup.group, lookup.table, .{ .kind = .schema_validation, .id = lookup.id });
+    if (prepared.participants) |directory| {
+        const encoded = try plan_mod.ParticipantsRecord.init(directory);
+        try txn.put(try storageKey(lookup, .participants, 0, .ready).encode(&buf), encoded.slice());
+        for (directory.tables[0..directory.len]) |table| {
+            if (table == lookup.table) continue;
+            if (prepared.head.retirement_root == null) try lifecycle.acquire(txn, lookup.group, table, .{ .kind = .schema_validation, .id = lookup.id });
+            const alias = try ParticipantAlias.init(lookup);
+            try txn.put(try (Key{ .group = lookup.group, .table = table, .id = @splat(0), .kind = .active }).encode(&buf), alias.slice());
+        }
+    }
     if (prepared.owners[0].binding.purpose == .foreign_key_source) {
         const parts = try contract.inputParts(inputs[0]);
         var source = try std.json.parseFromSlice(contract.ForeignKeySource, alloc, parts[3], .{ .ignore_unknown_fields = false });
@@ -404,6 +772,7 @@ pub fn begin(alloc: A, txn: anytype, prepared: *const plan_mod.Prepared, prepara
         const preparation = try PreparationRecord.init(signed);
         try txn.put(try storageKey(lookup, .preparation, owner.ordinal, .ready).encode(&buf), preparation.slice());
     }
+    if (prepared.owners[0].binding.purpose == .object_rename) try txn.put(try (Key{ .group = lookup.group, .table = lookup.table, .id = @splat(0), .kind = .object_rename_source }).encode(&buf), &lookup.id);
     try writeHead(txn, prepared.head);
     try txn.put(try storageKey(lookup, .active, 0, .ready).encode(&buf), &lookup.id);
 }
@@ -654,6 +1023,8 @@ fn namespaceOwnerKey(lookup: Lookup, address: OwnerAddress) Key {
 pub fn readReplayControl(txn: anytype, lookup: Lookup, address: OwnerAddress) !?@import("schema_validation_read.zig").ReplayControl {
     try (@import("schema_validation_read.zig").OwnerReadRequest{ .lookup = lookup, .ordinal = 0, .projection = .replay, .source_owner = address }).validate();
     const head = try readHead(txn, lookup);
+    if (std.mem.allEqual(u8, &head.participants_digest, 0) and std.mem.readInt(u64, address.namespace[0..8], .big) != head.table_id)
+        return error.InvalidGenerationPublication;
     var buf: [192]u8 = undefined;
     const bytes = (try optional(txn, try namespaceOwnerKey(lookup, address).encode(&buf))) orelse return null;
     const index = try NamespaceOwnerRecord.decode(bytes);
@@ -1007,7 +1378,7 @@ pub fn prepareAcknowledgement(txn: anytype, lookup: Lookup, ordinal: u16, expect
         }
     }
     const authenticated = try verified(signed, owner);
-    try requireLock(txn, head);
+    try requireParticipantLock(txn, head, owner.binding.fence.namespace.table_id);
     const checked = try context.verify(txn, owner.binding, signed, head.reader_requirements);
     if (!std.meta.eql(checked, authenticated)) return error.SchemaValidationJobChanged;
     const update = try barriers.acknowledge(head, owner, expected_revision, checked);
@@ -1081,13 +1452,21 @@ pub fn recover(alloc: A, txn: anytype, lookup: Lookup) !Recovery {
     defer alloc.free(input_digests);
     const catalog_digests = try alloc.alloc([32]u8, head.input_count);
     defer alloc.free(catalog_digests);
+    const cohort = plan.value.cohort();
+    const before_public = try alloc.alloc([32]u8, if (cohort) head.input_count else 0);
+    defer alloc.free(before_public);
+    const after_public = try alloc.alloc([32]u8, if (cohort) head.input_count else 0);
+    defer alloc.free(after_public);
     const columns = try plan.value.selection.encodePayload(alloc);
     defer alloc.free(columns);
     for (input_digests, catalog_digests, 0..) |*input_digest, *catalog_digest, ordinal| {
         const bytes = try txn.get(try storageKey(lookup, .input, @intCast(ordinal), .ready).encode(&buf));
         const parts = try contract.inputParts(bytes);
-        if (!std.mem.eql(u8, parts[0], plan.value.before.schema_json) or !std.mem.eql(u8, parts[1], plan.value.after.schema_json) or
-            !std.mem.eql(u8, parts[3], columns)) return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, parts[3], columns)) return error.InvalidGenerationPublication;
+        if (cohort) {
+            before_public[ordinal] = contract.hash(parts[0]);
+            after_public[ordinal] = contract.hash(parts[1]);
+        } else if (!std.mem.eql(u8, parts[0], plan.value.before.schema_json) or !std.mem.eql(u8, parts[1], plan.value.after.schema_json)) return error.InvalidGenerationPublication;
         input_digest.* = contract.hash(bytes);
         catalog_digest.* = contract.hash(parts[2]);
     }
@@ -1099,6 +1478,8 @@ pub fn recover(alloc: A, txn: anytype, lookup: Lookup) !Recovery {
         if (owner_index.ordinal != owner.ordinal or !std.meta.eql(owner_index.address, address)) return error.InvalidCatalogRecord;
         if (!std.mem.eql(u8, &owner.binding.inputs, &input_digests[owner.input_ordinal]) or
             !std.mem.eql(u8, &owner.binding.fence.catalog_digest, &catalog_digests[owner.input_ordinal])) return error.InvalidGenerationPublication;
+        if (cohort and (!std.mem.eql(u8, &owner.binding.before_public, &before_public[owner.input_ordinal]) or
+            !std.mem.eql(u8, &owner.binding.after_public, &after_public[owner.input_ordinal]))) return error.InvalidGenerationPublication;
         const preparation = try PreparationRecord.decode(try txn.get(try storageKey(lookup, .preparation, @intCast(i), .ready).encode(&buf)));
         try preparation.verifyFor(owner.binding, owner.initialRoot());
         if (owner.root_epoch != 0) _ = try readRootEpoch(txn, head, owner.*, owner.root_epoch);
@@ -1138,14 +1519,34 @@ pub fn recover(alloc: A, txn: anytype, lookup: Lookup) !Recovery {
         }
     }
     try plan.value.requireProgress(alloc, head, owners);
+    if (plan.value.sequence_change) |change| {
+        const accepted = try SequenceAcceptanceRecord.decode(try txn.get(try sequenceOutcomeKey(lookup.group, change.before.id, change.request.admission.nonce).encode(&buf)));
+        try requireSequenceAcceptance(accepted, head);
+        if (!std.meta.eql(accepted.admission, change.request.admission)) return error.InvalidSequenceOutcome;
+    }
     if (plan.value.selection == .foreign_keys) try @import("schema_validation_dependencies.zig").requireSource(alloc, txn, head, plan.value.selection.foreign_keys, terminal(head));
-    if (!terminal(head)) {
-        try requireLock(txn, head);
-    } else {
-        const active = try optional(txn, try storageKey(lookup, .active, 0, .ready).encode(&buf));
-        if (active) |bytes| if (std.mem.eql(u8, bytes, &head.id)) return error.InvalidGenerationPublication;
-        if (try lifecycle.read(txn, lookup.group, lookup.table)) |lock|
-            if (lock.kind == .schema_validation and std.mem.eql(u8, &lock.id, &head.id)) return error.InvalidGenerationPublication;
+    if (head.catalogEffect()) {
+        if (head.publication_revision != 0 and head.catalog_revision == 0) return error.InvalidCatalogRecord;
+        if (!terminal(head)) {
+            try requireCatalogReservation(txn, head);
+        } else if (try optional(txn, try resourceActiveKey(head).encode(&buf))) |bytes| {
+            if (std.meta.eql(try ParticipantAlias.decode(bytes), lookup)) return error.InvalidCatalogRecord;
+            _ = if (head.retirement_root != null) try activeRetirement(txn, head) else if (head.type_id != 0) try activeType(txn, lookup.group, head.type_id) else try activeSequence(txn, lookup.group, head.sequence_retirement.?.id);
+        }
+    }
+    const participants = try readParticipants(txn, head);
+    for (participants.tables[0..participants.len]) |table| {
+        if (!terminal(head)) {
+            try requireParticipantLock(txn, head, table);
+        } else {
+            const active = try optional(txn, try (Key{ .group = lookup.group, .table = table, .id = @splat(0), .kind = .active }).encode(&buf));
+            if (active) |_| {
+                const current = (try resolveActive(txn, lookup.group, table)) orelse return error.InvalidGenerationPublication;
+                if (std.meta.eql(current, lookup)) return error.InvalidGenerationPublication;
+            }
+            if (try lifecycle.read(txn, lookup.group, table)) |lock|
+                if (lock.kind == .schema_validation and std.mem.eql(u8, &lock.id, &head.id)) return error.InvalidGenerationPublication;
+        }
     }
     return .{ .alloc = alloc, .plan = plan, .head = head, .owners = owners, .proof_count = count };
 }
@@ -1172,7 +1573,19 @@ pub const PreparedPublication = struct {
     pub fn stage(self: *const @This(), txn: anytype, context: anytype) !barriers.Head {
         if (self.recovery) |value| {
             try context.publish(txn, value.plan.value);
-            try writeHead(txn, self.head);
+            var head = self.head;
+            if (head.catalogEffect()) {
+                const Context = switch (@typeInfo(@TypeOf(context))) {
+                    .pointer => |pointer| pointer.child,
+                    else => @TypeOf(context),
+                };
+                if (comptime @hasDecl(Context, "publicationCatalogRevision")) {
+                    head.catalog_revision = try context.publicationCatalogRevision(txn);
+                    if (head.catalog_revision == 0) return error.InvalidCatalogRecord;
+                } else return error.InvalidGenerationPublication;
+            }
+            try writeHead(txn, head);
+            return head;
         }
         return self.head;
     }
@@ -1258,6 +1671,7 @@ pub fn verifyGroup(alloc: A, txn: anytype, group: u64, context: anytype) !void {
             try context.restore(txn, &recovery);
             expected[@backingInt(Kind.plan)] += 1;
             expected[@backingInt(Kind.head)] += 1;
+            if (head.sequence_retirement != null) expected[@backingInt(Kind.sequence_outcome)] += 1;
             expected[@backingInt(Kind.input)] = try std.math.add(usize, expected[@backingInt(Kind.input)], head.input_count);
             expected[@backingInt(Kind.owner)] = try std.math.add(usize, expected[@backingInt(Kind.owner)], head.owner_count);
             expected[@backingInt(Kind.owner_namespace)] = try std.math.add(usize, expected[@backingInt(Kind.owner_namespace)], head.owner_count);
@@ -1266,7 +1680,21 @@ pub fn verifyGroup(alloc: A, txn: anytype, group: u64, context: anytype) !void {
             for (recovery.owners) |owner| {
                 expected[@backingInt(Kind.root_epoch)] = try std.math.add(usize, expected[@backingInt(Kind.root_epoch)], std.math.cast(usize, owner.root_epoch) orelse return error.InvalidCatalogRecord);
             }
-            if (!terminal(head)) expected[@backingInt(Kind.active)] += 1;
+            const participants = try readParticipants(txn, head);
+            if (!std.mem.allEqual(u8, &head.participants_digest, 0)) expected[@backingInt(Kind.participants)] += 1;
+            if (!terminal(head)) {
+                if (recovery.plan.value.selection == .object_rename) expected[@backingInt(Kind.object_rename_source)] += 1;
+                if (head.catalogEffect()) {
+                    expected[@backingInt(resourceActiveKey(head).kind)] += 1;
+                    if (head.sequence_retirement != null) {
+                        expected[@backingInt(Kind.sequence_namespace)] += 1;
+                        expected[@backingInt(Kind.sequence_database)] += 1;
+                    }
+                    try requireCatalogReservation(txn, head);
+                }
+                expected[@backingInt(Kind.active)] = try std.math.add(usize, expected[@backingInt(Kind.active)], participants.len);
+                for (participants.tables[0..participants.len]) |table| try requireParticipantLock(txn, head, table);
+            }
         } else if (key.kind == .root_epoch) {
             const value = try roots.EpochRecord.decode(item.value);
             const head = try readHead(txn, value.request.lookup);
@@ -1312,14 +1740,37 @@ pub fn verifyGroup(alloc: A, txn: anytype, group: u64, context: anytype) !void {
             const retained = (try readParentAuthorization(txn, lookup, index.ordinal, index.grant)) orelse return error.InvalidCatalogRecord;
             if (!std.mem.eql(u8, &try (try retained.image()).digest(), &key.grant.?)) return error.InvalidCatalogRecord;
             expected[@backingInt(Kind.parent_image)] = try std.math.add(usize, expected[@backingInt(Kind.parent_image)], 1);
-        } else if (key.kind == .active) {
+        } else if (key.kind == .sequence_outcome) {
+            const accepted = try SequenceAcceptanceRecord.decode(item.value);
+            const head = try readHead(txn, accepted.lookup);
+            try requireSequenceAcceptance(accepted, head);
+            if (!std.meta.eql(key, sequenceOutcomeKey(head.metadata_group_id, head.sequence_retirement.?.id, accepted.admission.nonce))) return error.InvalidSequenceOutcome;
+        } else if (key.kind == .sequence_namespace or key.kind == .sequence_database) {
+            const lookup = try ParticipantAlias.decode(item.value);
+            const head = try readHead(txn, lookup);
+            if (head.sequence_retirement == null or terminal(head) or !std.meta.eql(key, sequenceContainerKey(head, key.kind))) return error.InvalidCatalogRecord;
+            try requireCatalogReservation(txn, head);
+        } else if (key.kind == .retirement_active) {
+            const selected = try ParticipantAlias.decode(item.value);
+            const head = try readHead(txn, selected);
+            if (head.retirement_root == null or terminal(head) or !std.meta.eql(key, resourceActiveKey(head))) return error.InvalidCatalogRecord;
+            try requireCatalogReservation(txn, head);
+        } else if (key.kind == .sequence_active) {
+            _ = (try activeSequence(txn, key.group, key.table)) orelse return error.InvalidCatalogRecord;
+        } else if (key.kind == .type_active) {
+            _ = (try activeType(txn, key.group, key.table)) orelse return error.InvalidCatalogRecord;
+        } else if (key.kind == .object_rename_source) {
             if (item.value.len != 16 or std.mem.allEqual(u8, item.value, 0)) return error.InvalidCatalogRecord;
-            var active_head = key;
-            active_head.id = item.value[0..16].*;
-            active_head.kind = .head;
-            var key_buf: [192]u8 = undefined;
-            const head = try barriers.Head.decode(try txn.get(try active_head.encode(&key_buf)));
-            if (head.table_id != key.table or head.metadata_group_id != key.group or !std.mem.eql(u8, &head.id, &active_head.id) or terminal(head)) return error.InvalidCatalogRecord;
+            const lookup = (try resolveActive(txn, key.group, key.table)) orelse return error.InvalidCatalogRecord;
+            const head = try readHead(txn, lookup);
+            if (terminal(head) or !std.mem.eql(u8, item.value, &head.id)) return error.InvalidCatalogRecord;
+            const owner = try readOwner(txn, head, 0);
+            if (owner.binding.purpose != .object_rename) return error.InvalidCatalogRecord;
+        } else if (key.kind == .active) {
+            const lookup = (try resolveActive(txn, key.group, key.table)) orelse return error.InvalidCatalogRecord;
+            const head = try readHead(txn, lookup);
+            if (terminal(head)) return error.InvalidCatalogRecord;
+            try requireParticipantLock(txn, head, key.table);
         }
     }
     if (!std.meta.eql(expected, received)) return error.InvalidCatalogRecord;
@@ -1332,9 +1783,39 @@ const TestContext = struct {
     permission_reads: usize = 0,
     reject: bool = false,
     const table_key = "fixture:logical-schema";
+    const type_key = "fixture:named-type";
+    const sequence_key = "fixture:sequence";
+    const sequence_meta_key = "\x00\x00__metadata__:system_catalog:1:meta";
+    fn participantKey(buffer: []u8, table: u64) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "fixture:cohort-table:{d}", .{table});
+    }
+    fn requireCohort(txn: anytype, plan: plan_mod.Plan, published: bool) !void {
+        if (plan.type_change) |change| {
+            const expected = try (if (published) change.after else change.before).encode(std.testing.allocator);
+            defer std.testing.allocator.free(expected);
+            if (!std.mem.eql(u8, try txn.get(type_key), expected)) return error.CatalogGenerationChanged;
+        }
+        if (plan.sequence_change) |change| {
+            if (published) {
+                if (try optional(txn, sequence_key) != null) return error.CatalogGenerationChanged;
+            } else {
+                const expected = try change.before.encode(std.testing.allocator);
+                defer std.testing.allocator.free(expected);
+                if (!std.mem.eql(u8, try txn.get(sequence_key), expected)) return error.CatalogGenerationChanged;
+            }
+        }
+        if (plan.cohort()) {
+            var buffer: [96]u8 = undefined;
+            for (plan.additional_tables) |pair| {
+                const table = if (published) pair.after else pair.before;
+                if (!std.mem.eql(u8, try txn.get(try participantKey(&buffer, table.table_id)), table.schema_json)) return error.CatalogGenerationChanged;
+            }
+        }
+    }
     pub fn admit(self: *@This(), txn: anytype, plan: plan_mod.Plan, _: []const evidence.SignedPreparation) !void {
         if (self.reject) return error.CatalogGenerationChanged;
         if (!std.mem.eql(u8, try txn.get(table_key), plan.before.schema_json)) return error.CatalogGenerationChanged;
+        try requireCohort(txn, plan, false);
     }
     pub fn verify(self: *@This(), _: anytype, binding: contract.Binding, signed: evidence.SignedObservation, _: ?local.common_schema_readers.ReaderRequirements) !evidence.VerifiedObservation {
         self.verifies += 1;
@@ -1368,9 +1849,49 @@ const TestContext = struct {
         try signed.verifyFor(owner.binding, signed.value.physical_root_incarnation);
         if (!std.mem.eql(u8, &head.metadata_incarnation, &signed.proof.identity.metadata_incarnation)) return error.MetadataIncarnationMismatch;
     }
+    pub fn publicationCatalogRevision(_: *@This(), _: anytype) !u64 {
+        return 3;
+    }
+
+    pub fn stageTypeAdmission(_: *@This(), txn: anytype, request: @import("../system_catalog/named_types.zig").Mutation, identity: @import("../system_catalog/named_types.zig").Identity, head: barriers.Head) !void {
+        const pending: @import("../system_catalog/sequence_outcomes.zig").Pending = .{ .revision = 1, .identity = identity, .work = .{ .schema = .fromHead(head) } };
+        try pending.validate();
+        if (request.operation != .add_enum and request.operation != .set_domain_not_null) return error.InvalidGenerationPublication;
+        const record = try barriers.Record(@TypeOf(pending), "SVTA", 2048).init(pending);
+        try txn.put("fixture:type-acceptance", record.slice());
+    }
+
+    pub fn stageSequenceAdmission(_: *@This(), txn: anytype, request: @import("../system_catalog/sequence_catalog.zig").Mutation, head: barriers.Head) !u64 {
+        const sequences = @import("../system_catalog/sequence_catalog.zig");
+        const retirement = head.sequence_retirement.?;
+        const journal: sequences.outcomes.Store(@typeInfo(@TypeOf(txn)).pointer.child) = .{ .txn = txn, .group = head.metadata_group_id, .incarnation = request.incarnation };
+        const digest = try sequences.commandDigest(std.testing.allocator, request);
+        const ordinal = switch (try journal.prepare(std.testing.allocator, request.admission, digest)) {
+            .append => |value| value,
+            .replay => return error.GenerationPublicationChanged,
+        };
+        try journal.append(std.testing.allocator, ordinal, request.admission, digest, .{ .pending = .{ .revision = 1, .identity = .{ .id = retirement.id, .generation = retirement.generation }, .work = .{ .sequence_schema = .fromHead(head) } } });
+        return 1;
+    }
+
     pub fn publish(self: *@This(), txn: anytype, plan: plan_mod.Plan) !void {
         if (self.reject or !std.mem.eql(u8, try txn.get(table_key), plan.before.schema_json)) return error.CatalogGenerationChanged;
+        try requireCohort(txn, plan, false);
+        const type_bytes = if (plan.type_change) |change| try change.after.encode(std.testing.allocator) else null;
+        defer if (type_bytes) |bytes| std.testing.allocator.free(bytes);
         try txn.put(table_key, plan.after.schema_json);
+        var buffer: [96]u8 = undefined;
+        for (plan.additional_tables) |pair| try txn.put(try participantKey(&buffer, pair.after.table_id), pair.after.schema_json);
+        if (type_bytes) |bytes| try txn.put(type_key, bytes);
+        if (plan.sequence_change != null) {
+            try txn.delete(sequence_key);
+            var meta = try std.json.parseFromSlice(local.system_catalog_domain.Meta, std.testing.allocator, try txn.get(sequence_meta_key), .{});
+            defer meta.deinit();
+            meta.value.revision = 3;
+            const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, meta.value, .{});
+            defer std.testing.allocator.free(encoded);
+            try txn.put(sequence_meta_key, encoded);
+        }
         self.publishes += 1;
     }
     pub fn restore(_: *@This(), txn: anytype, recovery: *const Recovery) !void {
@@ -1378,6 +1899,7 @@ const TestContext = struct {
         const published = recovery.head.phase == .releasing;
         const expected = if (published) recovery.plan.value.after else recovery.plan.value.before;
         if (!std.mem.eql(u8, try txn.get(table_key), expected.schema_json)) return error.InvalidCatalogRecord;
+        requireCohort(txn, recovery.plan.value, published) catch return error.InvalidCatalogRecord;
     }
 };
 
@@ -1467,7 +1989,7 @@ const TestProofs = struct {
                 .signing_root = 7,
                 .physical_root = destination_root,
                 .checkpoint_digest = @splat(91),
-                .rows = .{ .header = header, .snapshot_cut = header.updated, .coverage = if (historical) .history else if (history_only) .none else .full, .records = if (history_only) 0 else header.records, .rows = if (history_only) 0 else header.rows_scanned, .cursor_digest = if (history_only) contract.hash("") else header.cursor_digest, .reference_coverage = if (owner.binding.purpose == .not_null or historical) null else .{} },
+                .rows = .{ .header = header, .snapshot_cut = header.updated, .coverage = if (historical) .history else if (history_only) .none else .full, .records = if (history_only) 0 else header.records, .rows = if (history_only) 0 else header.rows_scanned, .cursor_digest = if (history_only) contract.hash("") else header.cursor_digest, .reference_coverage = if (!owner.binding.purpose.references() or historical) null else .{} },
                 .qualification = .{
                     .origin = .{ .physical_root_incarnation = destination_root, .namespace = owner.binding.fence.namespace, .authority = .{ .kind = .native, .namespace = local.storage_db_online_source_contract.namespaceBytes(owner.binding.fence.namespace), .sequence = header.updated.native.sequence }, .applied = null, .schema_header = contract.hash(encoded), .transaction_directory = contract.hash(&try directory.encode()), .schema_outcomes = null },
                     .directory_head = directory,
@@ -1535,7 +2057,7 @@ const TestProofs = struct {
         return evidence.SignedPreparation.sign(.{ .binding = owner.binding, .physical_root_incarnation = owner.physical_root_incarnation, .position = position(owner, 1) }, try identity(head), 4, try authority(head, owner), 6, try root());
     }
     fn ready(owner: barriers.Owner) contract.Header {
-        return .{ .binding = owner.binding, .phase = .ready, .admitted = position(owner, 1), .frozen = position(owner, 2), .updated = position(owner, 3), .revision = 3, .records = 2, .rows_scanned = 2, .cursor_digest = contract.hash(""), .chain = @splat(14), .last_effect = @splat(15) };
+        return .{ .binding = owner.binding, .phase = .ready, .admitted = position(owner, 1), .frozen = position(owner, 2), .updated = position(owner, 3), .revision = 3, .records = if (owner.binding.purpose.schemaOnly()) 0 else 2, .rows_scanned = if (owner.binding.purpose.schemaOnly()) 0 else 2, .cursor_digest = contract.hash(""), .chain = @splat(14), .last_effect = @splat(15) };
     }
     fn installed(head: barriers.Head, owner: barriers.Owner) !contract.Header {
         var header = ready(owner);
@@ -3198,6 +3720,8 @@ test "schema validation publication admission frame retains raw deduplicated inp
     const request: Begin = .{ .plan = plan.value, .preparations = &preps, .inputs = &.{input} };
     const frame = try encodeBegin(a, request);
     defer a.free(frame);
+    try std.testing.expectEqual(@import("topology_protocol.zig").schema_validation_publication_version, requiredDecoderVersion(frame));
+    try std.testing.expectEqual(@import("topology_protocol.zig").sql_sequence_retirement_version, requiredDecoderVersion(frame[0..15]));
     var parsed = try parseCommand(a, frame);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.begin.inputs.len);
@@ -3633,4 +4157,499 @@ test "schema validation publication FK released root adoption retains history an
     try deps.requireSource(a, &read, completed_head, source, true);
     try deps.requireUnleased(&read, lookup.group, 7);
     try verifyGroup(a, &read, lookup.group, &context);
+}
+
+test "schema validation publication type cohort atomically retains all locks aliases schemas and type through faults cold recovery and release" {
+    try typeCohortFaults(false);
+}
+
+test "schema validation publication domain NOT NULL cohort atomically retains all locks aliases schemas and type through faults cold recovery and release" {
+    try typeCohortFaults(true);
+}
+
+fn typeCohortFaults(is_domain: bool) !void {
+    const a = std.testing.allocator;
+    const work = @import("schema_validation_work.zig");
+    var fixture = try plan_mod.test_support.TypeCohort.initKind(a, is_domain);
+    defer fixture.deinit();
+    const plan = fixture.value;
+    var prepared = try plan_mod.Prepared.init(a, plan);
+    defer prepared.deinit();
+    {
+        var decoded = try plan_mod.parse(a, prepared.encoded);
+        defer decoded.deinit();
+        const signed = try a.alloc(evidence.SignedPreparation, prepared.owners.len);
+        defer a.free(signed);
+        for (prepared.owners, signed) |owner, *proof| proof.* = try TestProofs.preparation(prepared.head, owner);
+        const frame = try encodeBegin(a, .{ .plan = decoded.value, .preparations = signed, .inputs = fixture.inputs });
+        defer a.free(frame);
+        try std.testing.expectEqual(if (is_domain) @import("topology_protocol.zig").sql_domain_epoch_version else @import("topology_protocol.zig").sql_type_epoch_version, requiredDecoderVersion(frame));
+    }
+    const lookup = Lookup.fromHead(prepared.head);
+    const preps = [_]evidence.SignedPreparation{ try TestProofs.preparation(prepared.head, prepared.owners[0]), try TestProofs.preparation(prepared.head, prepared.owners[1]) };
+    const before_type = try plan.type_change.?.before.encode(a);
+    defer a.free(before_type);
+    const after_type = try plan.type_change.?.after.encode(a);
+    defer a.free(after_type);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/type-cohort", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    const Store = local.storage_docstore.DocStore;
+    var store = try Store.open(a, path, .{});
+    var live = true;
+    defer if (live) store.close();
+    var context: TestContext = .{};
+    var buffer: [192]u8 = undefined;
+    try store.put(TestContext.table_key, plan.before.schema_json);
+    try store.put(try TestContext.participantKey(&buffer, 8), plan.additional_tables[0].before.schema_json);
+    try store.put(TestContext.type_key, before_type);
+    const admission_writes = block: {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        var counted: FaultTxn = .{ .base = &txn };
+        try begin(a, &counted, &prepared, &preps, fixture.inputs, &context);
+        break :block counted.writes;
+    };
+    for (1..admission_writes + 1) |cut| for ([_]bool{ false, true }) |after_write| {
+        var txn = try store.beginWriteTxn();
+        var failing: FaultTxn = .{ .base = &txn, .fail_write = cut, .after = after_write };
+        try std.testing.expectError(error.InjectedStorageFailure, begin(a, &failing, &prepared, &preps, fixture.inputs, &context));
+        txn.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        for ([_]u64{ 7, 8 }) |table| try std.testing.expect((try discoverActive(&read, .{ .group = lookup.group, .table = table, .metadata_incarnation = lookup.metadata_incarnation })) == null);
+        try std.testing.expectError(error.GenerationPublicationNotFound, readHead(&read, lookup));
+    };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try begin(a, &txn, &prepared, &preps, fixture.inputs, &context);
+        try txn.commit();
+    }
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        for ([_]u64{ 7, 8 }) |table| try std.testing.expectEqualDeep(lookup, (try discoverActive(&read, .{ .group = lookup.group, .table = table, .metadata_incarnation = lookup.metadata_incarnation })).?);
+        try std.testing.expectEqualDeep(lookup, (try activeType(&read, lookup.group, fixture.value.type_change.?.before.identity.id)).?);
+        for (prepared.owners) |owner| {
+            try std.testing.expectEqualDeep(prepared.head, try activeHeadForBinding(&read, lookup.group, lookup.metadata_incarnation, owner.binding));
+            var forged = owner.binding;
+            forged.after_catalog[0] ^= 1;
+            try std.testing.expectError(error.SchemaValidationJobChanged, activeHeadForBinding(&read, lookup.group, lookup.metadata_incarnation, forged));
+            forged = owner.binding;
+            forged.plan_digest[0] ^= 1;
+            try std.testing.expectError(error.SchemaValidationJobChanged, activeHeadForBinding(&read, lookup.group, lookup.metadata_incarnation, forged));
+        }
+        var counted: FaultTxn = .{ .base = &read };
+        const page = try work.read(&counted, .{ .group = lookup.group, .metadata_incarnation = lookup.metadata_incarnation });
+        try std.testing.expectEqual(@as(u8, 2), page.len);
+        try std.testing.expectEqual(@as(u64, 7), page.tasks[0].?.physicalTable());
+        try std.testing.expectEqual(@as(u64, 8), page.tasks[1].?.physicalTable());
+        try std.testing.expectEqual(@as(usize, 0), counted.plan_reads);
+        _ = try readOwnerControl(&read, lookup, 1, .begin, &context);
+        try verifyGroup(a, &read, lookup.group, &context);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        var wrong = lookup;
+        wrong.plan_digest[0] ^= 1;
+        const alias = try ParticipantAlias.init(wrong);
+        try txn.put(try (Key{ .group = lookup.group, .table = 8, .id = @splat(0), .kind = .active }).encode(&buffer), alias.slice());
+        const reads_before = context.permission_reads;
+        try std.testing.expectError(error.InvalidCatalogRecord, readOwnerControl(&txn, lookup, 1, .begin, &context));
+        try std.testing.expectEqual(reads_before, context.permission_reads);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var head = try readHead(&txn, lookup);
+        for (0..2) |ordinal| {
+            const owner = try readOwner(&txn, head, @intCast(ordinal));
+            head = try acknowledge(&txn, lookup, @intCast(ordinal), head.revision, try TestProofs.signed(head, owner, TestProofs.ready(owner)), &context);
+        }
+        _ = try decideInstall(&txn, lookup, head.revision);
+        try txn.commit();
+    }
+    store.close();
+    live = false;
+    store = try Store.open(a, path, .{});
+    live = true;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var head = try readHead(&txn, lookup);
+        for (0..2) |ordinal| {
+            const owner = try readOwner(&txn, head, @intCast(ordinal));
+            head = try acknowledge(&txn, lookup, @intCast(ordinal), head.revision, try TestProofs.signed(head, owner, try TestProofs.installed(head, owner)), &context);
+        }
+        try txn.commit();
+    }
+    const publication_writes = block: {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const head = try readHead(&txn, lookup);
+        var counted: FaultTxn = .{ .base = &txn };
+        _ = try publish(a, &counted, lookup, head.revision, &context);
+        break :block counted.writes;
+    };
+    for (1..publication_writes + 1) |cut| for ([_]bool{ false, true }) |after_write| {
+        var txn = try store.beginWriteTxn();
+        const head = try readHead(&txn, lookup);
+        var failing: FaultTxn = .{ .base = &txn, .fail_write = cut, .after = after_write };
+        try std.testing.expectError(error.InjectedStorageFailure, publish(a, &failing, lookup, head.revision, &context));
+        txn.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        var recovered = try recover(a, &read, lookup);
+        defer recovered.deinit();
+        try context.restore(&read, &recovered);
+        try std.testing.expectEqualStrings(before_type, try read.get(TestContext.type_key));
+        try std.testing.expectEqualStrings(plan.before.schema_json, try read.get(TestContext.table_key));
+        try std.testing.expectEqualStrings(plan.additional_tables[0].before.schema_json, try read.get(try TestContext.participantKey(&buffer, 8)));
+    };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const head = try readHead(&txn, lookup);
+        _ = try publish(a, &txn, lookup, head.revision, &context);
+        try txn.commit();
+    }
+    store.close();
+    live = false;
+    store = try Store.open(a, path, .{});
+    live = true;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var head = try readHead(&txn, lookup);
+        try std.testing.expectEqualStrings(after_type, try txn.get(TestContext.type_key));
+        for (0..2) |ordinal| {
+            const owner = try readOwner(&txn, head, @intCast(ordinal));
+            head = try acknowledge(&txn, lookup, @intCast(ordinal), head.revision, try TestProofs.signed(head, owner, try TestProofs.released(head, owner)), &context);
+        }
+        try std.testing.expectEqual(.succeeded, head.phase);
+        try txn.commit();
+    }
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try activeType(&read, lookup.group, prepared.head.type_id)) == null);
+        for ([_]u64{ 7, 8 }) |table| try std.testing.expect((try discoverActive(&read, .{ .group = lookup.group, .table = table, .metadata_incarnation = lookup.metadata_incarnation })) == null);
+        var history = try recover(a, &read, lookup);
+        defer history.deinit();
+        try std.testing.expectEqual(.succeeded, history.head.phase);
+        try verifyGroup(a, &read, lookup.group, &context);
+    }
+}
+
+test "schema validation publication sequence retirement journals complete cohorts and container locks through every admission publication terminal write and cold recovery" {
+    const a = std.testing.allocator;
+    const sequences = @import("../system_catalog/sequence_catalog.zig");
+    var fixture = try plan_mod.test_support.SequenceCohort.init(a);
+    defer fixture.deinit();
+    const plan = fixture.value;
+    const request = plan.sequence_change.?.request;
+    const digest = try sequences.commandDigest(a, request);
+    var prepared = try plan_mod.Prepared.init(a, plan);
+    defer prepared.deinit();
+    const lookup = Lookup.fromHead(prepared.head);
+    const proofs = [_]evidence.SignedPreparation{ try TestProofs.preparation(prepared.head, prepared.owners[0]), try TestProofs.preparation(prepared.head, prepared.owners[1]) };
+    var decoded = try plan_mod.parse(a, prepared.encoded);
+    defer decoded.deinit();
+    const frame = try encodeBegin(a, .{ .plan = decoded.value, .preparations = &proofs, .inputs = fixture.inputs });
+    defer a.free(frame);
+    try std.testing.expectEqual(@import("topology_protocol.zig").sql_sequence_retirement_version, requiredDecoderVersion(frame));
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/sequence-cohort", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    const Store = local.storage_docstore.DocStore;
+    var store = try Store.open(a, path, .{});
+    var live = true;
+    defer if (live) store.close();
+    var context: TestContext = .{};
+    var buffer: [192]u8 = undefined;
+    const descriptor = try plan.sequence_change.?.before.encode(a);
+    defer a.free(descriptor);
+    const meta = try std.json.Stringify.valueAlloc(a, local.system_catalog_domain.Meta{ .revision = 1, .next_id = 100 }, .{});
+    defer a.free(meta);
+    try store.put(TestContext.sequence_meta_key, meta);
+    try store.put(TestContext.table_key, plan.before.schema_json);
+    try store.put(try TestContext.participantKey(&buffer, 8), plan.additional_tables[0].before.schema_json);
+    try store.put(TestContext.sequence_key, descriptor);
+    const admission_writes = block: {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        var counted: FaultTxn = .{ .base = &txn };
+        try begin(a, &counted, &prepared, &proofs, fixture.inputs, &context);
+        break :block counted.writes;
+    };
+    for (1..admission_writes + 1) |cut| for ([_]bool{ false, true }) |after_write| {
+        var txn = try store.beginWriteTxn();
+        var failing: FaultTxn = .{ .base = &txn, .fail_write = cut, .after = after_write };
+        try std.testing.expectError(error.InjectedStorageFailure, begin(a, &failing, &prepared, &proofs, fixture.inputs, &context));
+        txn.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.GenerationPublicationNotFound, readHead(&read, lookup));
+        try std.testing.expect(try activeSequence(&read, 1, 17) == null);
+        try requireSequenceContainerFree(&read, 1, .namespace, 2);
+        try requireSequenceContainerFree(&read, 1, .database, 1);
+        const journal: sequences.outcomes.Store(@TypeOf(read)) = .{ .txn = &read, .group = 1, .incarnation = request.incarnation };
+        try std.testing.expect(try journal.lookup(a, request.admission, digest) == null);
+    };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try begin(a, &txn, &prepared, &proofs, fixture.inputs, &context);
+        try txn.commit();
+    }
+    for (0..@import("../system_catalog/sequence_outcomes.zig").retained + 1) |ordinal| {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const journal: sequences.outcomes.Store(@TypeOf(txn)) = .{ .txn = &txn, .group = 1, .incarnation = request.incarnation };
+        const admission: sequences.Admission = .{ .head = try journal.head(a), .nonce = @splat(@as(u8, @intCast(ordinal + 40))) };
+        const next = switch (try journal.prepare(a, admission, @splat(23))) {
+            .append => |value| value,
+            .replay => return error.UnexpectedOutcomeReplay,
+        };
+        try journal.append(a, next, admission, @splat(23), .{ .success = .{ .revision = 1, .identity = null, .removed = 0 } });
+        try txn.commit();
+    }
+    store.close();
+    live = false;
+    store = try Store.open(a, path, .{});
+    live = true;
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualDeep(lookup, (try activeSequence(&read, 1, 17)).?);
+        try std.testing.expectError(error.CatalogPublicationProofPending, requireSequenceContainerFree(&read, 1, .namespace, 2));
+        try std.testing.expectError(error.CatalogPublicationProofPending, requireSequenceContainerFree(&read, 1, .database, 1));
+        try requireSequenceContainerFree(&read, 1, .namespace, 3);
+        const journal: sequences.outcomes.Store(@TypeOf(read)) = .{ .txn = &read, .group = 1, .incarnation = request.incarnation };
+        try std.testing.expect(try journal.lookup(a, request.admission, digest) == null);
+        try std.testing.expect((try retainedSequenceOutcome(&read, 1, request, digest, 3)).? == .pending);
+        try verifyGroup(a, &read, 1, &context);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var head = try readHead(&txn, lookup);
+        for (0..2) |ordinal| {
+            const owner = try readOwner(&txn, head, @intCast(ordinal));
+            head = try acknowledge(&txn, lookup, @intCast(ordinal), head.revision, try TestProofs.signed(head, owner, TestProofs.ready(owner)), &context);
+        }
+        head = try decideInstall(&txn, lookup, head.revision);
+        for (0..2) |ordinal| {
+            const owner = try readOwner(&txn, head, @intCast(ordinal));
+            head = try acknowledge(&txn, lookup, @intCast(ordinal), head.revision, try TestProofs.signed(head, owner, try TestProofs.installed(head, owner)), &context);
+        }
+        try txn.commit();
+    }
+    const publication_writes = block: {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const head = try readHead(&txn, lookup);
+        var counted: FaultTxn = .{ .base = &txn };
+        _ = try publish(a, &counted, lookup, head.revision, &context);
+        break :block counted.writes;
+    };
+    for (1..publication_writes + 1) |cut| for ([_]bool{ false, true }) |after_write| {
+        var txn = try store.beginWriteTxn();
+        const head = try readHead(&txn, lookup);
+        var failing: FaultTxn = .{ .base = &txn, .fail_write = cut, .after = after_write };
+        try std.testing.expectError(error.InjectedStorageFailure, publish(a, &failing, lookup, head.revision, &context));
+        txn.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try TestContext.requireCohort(&read, plan, false);
+        try std.testing.expectEqualStrings(plan.before.schema_json, try read.get(TestContext.table_key));
+        try verifyGroup(a, &read, 1, &context);
+    };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const head = try readHead(&txn, lookup);
+        _ = try publish(a, &txn, lookup, head.revision, &context);
+        try txn.commit();
+    }
+    store.close();
+    live = false;
+    store = try Store.open(a, path, .{});
+    live = true;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const head = try readHead(&txn, lookup);
+        try std.testing.expectEqual(.releasing, head.phase);
+        try TestContext.requireCohort(&txn, plan, true);
+        const journal: sequences.outcomes.Store(@TypeOf(txn)) = .{ .txn = &txn, .group = 1, .incarnation = request.incarnation };
+        try std.testing.expect(try journal.lookup(a, request.admission, digest) == null);
+        try std.testing.expect((try retainedSequenceOutcome(&txn, 1, request, digest, 3)).? == .pending);
+        const owner = try readOwner(&txn, head, 0);
+        _ = try acknowledge(&txn, lookup, 0, head.revision, try TestProofs.signed(head, owner, try TestProofs.released(head, owner)), &context);
+        try txn.commit();
+    }
+    const terminal_writes = block: {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const head = try readHead(&txn, lookup);
+        const owner = try readOwner(&txn, head, 1);
+        var counted: FaultTxn = .{ .base = &txn };
+        _ = try acknowledge(&counted, lookup, 1, head.revision, try TestProofs.signed(head, owner, try TestProofs.released(head, owner)), &context);
+        break :block counted.writes;
+    };
+    for (1..terminal_writes + 1) |cut| for ([_]bool{ false, true }) |after_write| {
+        var txn = try store.beginWriteTxn();
+        const head = try readHead(&txn, lookup);
+        const owner = try readOwner(&txn, head, 1);
+        var failing: FaultTxn = .{ .base = &txn, .fail_write = cut, .after = after_write };
+        try std.testing.expectError(error.InjectedStorageFailure, acknowledge(&failing, lookup, 1, head.revision, try TestProofs.signed(head, owner, try TestProofs.released(head, owner)), &context));
+        txn.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(.releasing, (try readHead(&read, lookup)).phase);
+        try std.testing.expect(try activeSequence(&read, 1, 17) != null);
+        try std.testing.expectError(error.CatalogPublicationProofPending, requireSequenceContainerFree(&read, 1, .namespace, 2));
+        const journal: sequences.outcomes.Store(@TypeOf(read)) = .{ .txn = &read, .group = 1, .incarnation = request.incarnation };
+        try std.testing.expect(try journal.lookup(a, request.admission, digest) == null);
+        try std.testing.expect((try retainedSequenceOutcome(&read, 1, request, digest, 3)).? == .pending);
+        try verifyGroup(a, &read, 1, &context);
+    };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const head = try readHead(&txn, lookup);
+        const owner = try readOwner(&txn, head, 1);
+        _ = try acknowledge(&txn, lookup, 1, head.revision, try TestProofs.signed(head, owner, try TestProofs.released(head, owner)), &context);
+        try txn.commit();
+    }
+    store.close();
+    live = false;
+    store = try Store.open(a, path, .{});
+    live = true;
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(.succeeded, (try readHead(&read, lookup)).phase);
+        try std.testing.expect(try activeSequence(&read, 1, 17) == null);
+        try requireSequenceContainerFree(&read, 1, .namespace, 2);
+        try requireSequenceContainerFree(&read, 1, .database, 1);
+        const journal: sequences.outcomes.Store(@TypeOf(read)) = .{ .txn = &read, .group = 1, .incarnation = request.incarnation };
+        try std.testing.expect(try journal.lookup(a, request.admission, digest) == null);
+        const outcome = (try retainedSequenceOutcome(&read, 1, request, digest, 3)).?;
+        const result = try outcome.result();
+        try std.testing.expectEqual(@as(u64, 1), result.removed);
+        try std.testing.expect(result.identity == null);
+        try std.testing.expectEqual(@as(u64, 3), result.revision);
+        try journal.validateCut(a);
+        try std.testing.expectError(error.SequenceAdmissionExpired, journal.prepare(a, request.admission, digest));
+        var conflicting = request;
+        conflicting.target.table = "forged";
+        try std.testing.expectError(error.SequenceAdmissionConflict, retainedSequenceOutcome(&read, 1, conflicting, try sequences.commandDigest(a, conflicting), 3));
+        try verifyGroup(a, &read, 1, &context);
+    }
+}
+
+test "schema validation publication sequence cancellation retains exact outcome and all preimages across final ACK faults and cold recovery" {
+    const a = std.testing.allocator;
+    const sequences = @import("../system_catalog/sequence_catalog.zig");
+    var fixture = try plan_mod.test_support.SequenceCohort.init(a);
+    defer fixture.deinit();
+    const plan = fixture.value;
+    const request = plan.sequence_change.?.request;
+    const digest = try sequences.commandDigest(a, request);
+    var prepared = try plan_mod.Prepared.init(a, plan);
+    defer prepared.deinit();
+    const lookup = Lookup.fromHead(prepared.head);
+    const proofs = [_]evidence.SignedPreparation{ try TestProofs.preparation(prepared.head, prepared.owners[0]), try TestProofs.preparation(prepared.head, prepared.owners[1]) };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/sequence-cancel", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    const Store = local.storage_docstore.DocStore;
+    var store = try Store.open(a, path, .{});
+    var live = true;
+    defer if (live) store.close();
+    var context: TestContext = .{};
+    var buffer: [192]u8 = undefined;
+    const descriptor = try plan.sequence_change.?.before.encode(a);
+    defer a.free(descriptor);
+    const meta = try std.json.Stringify.valueAlloc(a, local.system_catalog_domain.Meta{ .revision = 1, .next_id = 100 }, .{});
+    defer a.free(meta);
+    try store.put(TestContext.sequence_meta_key, meta);
+    try store.put(TestContext.table_key, plan.before.schema_json);
+    try store.put(try TestContext.participantKey(&buffer, 8), plan.additional_tables[0].before.schema_json);
+    try store.put(TestContext.sequence_key, descriptor);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try begin(a, &txn, &prepared, &proofs, fixture.inputs, &context);
+        var head = try readHead(&txn, lookup);
+        head = try cancel(&txn, lookup, head.revision, .requested);
+        const owner = try readOwner(&txn, head, 0);
+        var canceled = TestProofs.ready(owner);
+        canceled.phase = .canceled;
+        _ = try acknowledge(&txn, lookup, 0, head.revision, try TestProofs.signed(head, owner, canceled), &context);
+        try txn.commit();
+    }
+    store.close();
+    live = false;
+    store = try Store.open(a, path, .{});
+    live = true;
+    const terminal_writes = block: {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const head = try readHead(&txn, lookup);
+        const owner = try readOwner(&txn, head, 1);
+        var canceled = TestProofs.ready(owner);
+        canceled.phase = .canceled;
+        var counted: FaultTxn = .{ .base = &txn };
+        _ = try acknowledge(&counted, lookup, 1, head.revision, try TestProofs.signed(head, owner, canceled), &context);
+        break :block counted.writes;
+    };
+    for (1..terminal_writes + 1) |cut| for ([_]bool{ false, true }) |after_write| {
+        var txn = try store.beginWriteTxn();
+        const head = try readHead(&txn, lookup);
+        const owner = try readOwner(&txn, head, 1);
+        var canceled = TestProofs.ready(owner);
+        canceled.phase = .canceled;
+        var failing: FaultTxn = .{ .base = &txn, .fail_write = cut, .after = after_write };
+        try std.testing.expectError(error.InjectedStorageFailure, acknowledge(&failing, lookup, 1, head.revision, try TestProofs.signed(head, owner, canceled), &context));
+        txn.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(.canceling, (try readHead(&read, lookup)).phase);
+        try std.testing.expect(try activeSequence(&read, 1, 17) != null);
+        try std.testing.expectError(error.CatalogPublicationProofPending, requireSequenceContainerFree(&read, 1, .namespace, 2));
+        try std.testing.expect((try retainedSequenceOutcome(&read, 1, request, digest, 1)).? == .pending);
+        try TestContext.requireCohort(&read, plan, false);
+        try verifyGroup(a, &read, 1, &context);
+    };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const head = try readHead(&txn, lookup);
+        const owner = try readOwner(&txn, head, 1);
+        var canceled = TestProofs.ready(owner);
+        canceled.phase = .canceled;
+        _ = try acknowledge(&txn, lookup, 1, head.revision, try TestProofs.signed(head, owner, canceled), &context);
+        try txn.commit();
+    }
+    store.close();
+    live = false;
+    store = try Store.open(a, path, .{});
+    live = true;
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(.canceled, (try readHead(&read, lookup)).phase);
+    try std.testing.expect(try activeSequence(&read, 1, 17) == null);
+    try requireSequenceContainerFree(&read, 1, .namespace, 2);
+    try requireSequenceContainerFree(&read, 1, .database, 1);
+    try TestContext.requireCohort(&read, plan, false);
+    try std.testing.expectEqual(.Canceled, (try retainedSequenceOutcome(&read, 1, request, digest, 1)).?.rejected);
+    try verifyGroup(a, &read, 1, &context);
 }

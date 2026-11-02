@@ -22299,7 +22299,9 @@ components:
     SQLColumnType:
       type: string
       description: Logical SQL result type. Integer values and numbers with element_type numeric are decimal
-        strings to preserve exact precision in every client.
+        strings to preserve exact precision in every client. Bytea results use PostgreSQL hex text (a
+        backslash followed by x and lowercase hex digits) in JSON and opaque bytes in PostgreSQL binary
+        format.
       enum:
         - string
         - uuid
@@ -22315,6 +22317,7 @@ components:
         - tsrange
         - tstzrange
         - enumeration
+        - bytea
     SQLArrayElementType:
       type: string
       description: Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC.
@@ -22414,8 +22417,10 @@ components:
           $ref: '#/components/schemas/SQLColumnType'
         named_type:
           $ref: '#/components/schemas/SQLNamedTypeIdentity'
-          description: Required for enumeration values, including NULL. Identifies the immutable catalog
-            type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains
+          description: Required for enum and domain values, including NULL. Identifies the immutable logical
+            catalog type and its scalar/array wire OIDs. The type and element_type fields describe the
+            physical value; enum cells use exact label strings. Domain parameters undergo fresh constraint
+            validation; a declared identity does not prove an already validated value. SQL NULL remains
             a null cell.
         temporal_kind:
           $ref: '#/components/schemas/SQLTemporalKind'
@@ -22526,14 +22531,18 @@ components:
         - type
         - nullable
       description: Immutable positional input contract. Element identity also preserves primitive widths;
-        array inputs require it. Unknown slots have no SQL constraint.
+        array inputs require it. Unknown slots have no SQL constraint. Bytea arguments are PostgreSQL
+        bytea input strings; use hex text (a backslash followed by x and hexadecimal octets) for arbitrary
+        binary data. SQL NULL remains a null cell.
       properties:
         type:
           $ref: '#/components/schemas/SQLColumnType'
         named_type:
           $ref: '#/components/schemas/SQLNamedTypeIdentity'
-          description: Required for enumeration values, including NULL. Identifies the immutable catalog
-            type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains
+          description: Required for enum and domain values, including NULL. Identifies the immutable logical
+            catalog type and its scalar/array wire OIDs. The type and element_type fields describe the
+            physical value; enum cells use exact label strings. Domain parameters undergo fresh constraint
+            validation; a declared identity does not prove an already validated value. SQL NULL remains
             a null cell.
         temporal_kind:
           $ref: '#/components/schemas/SQLTemporalKind'
@@ -23060,7 +23069,10 @@ components:
         - aggregate
         - cast
         - type
-      description: Native catalog resource kind; never a synthetic physical table.
+        - authorization
+        - table
+        - index
+      description: Catalog object affected by an exact recoverable operation.
     SQLCatalogOperationKind:
       type: string
       enum:
@@ -23074,6 +23086,7 @@ components:
         - committed
         - rejected
         - unknown
+        - pending
       description: A retained authoritative result, or an unconfirmed outcome. Unknown is never permission
         to replay DDL.
     SQLCatalogOperationReceipt:
@@ -29271,6 +29284,7 @@ components:
           type: string
           enum:
             - active
+            - prepared
             - outcome_unknown
             - committed
             - committed_pending
@@ -40696,6 +40710,9 @@ components:
         - uuidv4
         - uuidv7
         - transaction_timestamp
+        - length
+        - octet_length
+        - bit_length
     RelationalExpressionType:
       type: string
       enum:
@@ -40712,6 +40729,7 @@ components:
         - daterange
         - tsrange
         - tstzrange
+        - enumeration
     SQLBuiltinType:
       type: string
       description: >
@@ -40970,6 +40988,18 @@ components:
 
         capability version 19.
 
+        Enumeration expressions require reader capability version 40. Enum
+
+        literals and casts declare named_type_id from the owning schema directory.
+
+        Input labels are exact and case-sensitive; comparisons retain declaration
+
+        order and reject unrelated named identities. Enum/text conversions are
+
+        explicit; stored enum values retain four-byte symbols. CHECK, generated
+
+        values, defaults, typed-row ingress and restore share the native validator.
+
         JSON expressions require reader capability version 30. The json type
 
         carries JSONB semantics, including exact numeric values and display
@@ -40992,6 +41022,13 @@ components:
           $ref: '#/components/schemas/RelationalExpressionOp'
         type:
           $ref: '#/components/schemas/RelationalExpressionType'
+        named_type_id:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Required on enumeration literals and casts, including typed NULL. Resolved from
+            the immutable schema-owned named-type directory; labels and executable definitions are never
+            accepted here. Requires reader capability version 40. Other expression types reject this field.
         sql_type:
           $ref: '#/components/schemas/SQLBuiltinType'
           description: Numeric builtin result identity on numeric literals, arithmetic, negate, and cast
@@ -41351,20 +41388,101 @@ components:
           maxLength: 16384
           pattern: ^(?:[0-9a-f]{2})+$
           description: Server-managed immutable ordering key encoded as lowercase hexadecimal.
+    SQLNamedTypeReference:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - origin_id
+        - generation
+      description: Immutable named-base identity pinned by a domain definition.
+      properties:
+        id:
+          type: integer
+          format: uint64
+          minimum: 1
+        origin_id:
+          type: string
+          minLength: 32
+          maxLength: 32
+          pattern: ^[0-9a-f]{32}$
+        generation:
+          type: integer
+          format: uint32
+          minimum: 1
+    SQLNamedDomainBase:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+      description: Exactly one builtin or named base. The server resolves and verifies the complete base
+        chain before publication.
+      properties:
+        kind:
+          type: string
+          enum:
+            - builtin
+            - named
+        builtin:
+          $ref: '#/components/schemas/SQLBuiltinType'
+        named:
+          $ref: '#/components/schemas/SQLNamedTypeReference'
+    SQLNamedDomainCheck:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - expression
+        - validated
+      description: A named CHECK over the typed VALUE input. Unvalidated constraints still enforce every
+        new assignment.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 63
+        expression:
+          $ref: '#/components/schemas/RelationalScalarExpression'
+        validated:
+          type: boolean
+    SQLNamedDomainDefinition:
+      type: object
+      additionalProperties: false
+      required:
+        - base
+        - not_null
+        - checks
+      description: Server-resolved immutable domain contract. Defaults affect future assignments; restrictive
+        changes require dependent-owner activation.
+      properties:
+        base:
+          $ref: '#/components/schemas/SQLNamedDomainBase'
+        numeric_modifier:
+          $ref: '#/components/schemas/SQLNumericModifier'
+        default_expression:
+          $ref: '#/components/schemas/RelationalScalarExpression'
+        not_null:
+          type: boolean
+        checks:
+          type: array
+          maxItems: 128
+          items:
+            $ref: '#/components/schemas/SQLNamedDomainCheck'
     SQLNamedTypeLayout:
       type: object
       additionalProperties: false
       required:
         - kind
         - identity
-        - labels
-      description: Server-resolved executable type layout retained by a table schema epoch. Catalog ownership
-        is separate from value representation.
+      description: Server-resolved executable type layout retained by a table schema epoch. Enum layouts
+        require labels; domain layouts require domain. The alternatives are mutually exclusive. Catalog
+        ownership is separate from value representation.
       properties:
         kind:
           type: string
           enum:
             - enum
+            - domain
         identity:
           $ref: '#/components/schemas/SQLNamedTypeIdentity'
         labels:
@@ -41372,6 +41490,8 @@ components:
           maxItems: 4096
           items:
             $ref: '#/components/schemas/SQLNamedEnumLabel'
+        domain:
+          $ref: '#/components/schemas/SQLNamedDomainDefinition'
     TableStorageMode:
       type: string
       enum:

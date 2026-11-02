@@ -19,6 +19,8 @@ const std = @import("std");
 const wire = @import("antfly_schema_openapi");
 const types = @import("../system_catalog/named_types.zig");
 const values = @import("sql_enum_value.zig");
+const domain_values = @import("../schema/domain_value.zig");
+const domains = @import("../system_catalog/domain_types.zig");
 const A = std.mem.Allocator;
 pub const max_types = 4096;
 pub const max_registry_bytes = 16 * 1024 * 1024;
@@ -45,8 +47,34 @@ pub fn identityWireLeaky(comptime T: type, a: A, identity: types.Identity) !T {
     try identity.validate();
     return .{ .id = identity.id, .namespace_id = identity.namespace_id, .generation = identity.generation, .origin_id = try hexAlloc(a, &identity.origin_id), .oid = identity.oid, .array_oid = identity.array_oid };
 }
+fn expressionWireLeaky(a: A, bytes: []const u8) !wire.RelationalScalarExpression {
+    return std.json.parseFromSliceLeaky(wire.RelationalScalarExpression, a, bytes, .{ .allocate = .alloc_always }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSqlNamedType;
+}
 pub fn toWireLeaky(a: A, record: types.Record) !wire.SQLNamedTypeLayout {
     try record.validate(a);
+    if (record.definition == .domain) {
+        const definition = record.definition.domain;
+        const checks = try a.alloc(wire.SQLNamedDomainCheck, definition.checks.len);
+        for (definition.checks, checks) |check, *output| output.* = .{
+            .name = check.name,
+            .validated = check.validated,
+            .expression = try expressionWireLeaky(a, check.expression),
+        };
+        return .{
+            .kind = "domain",
+            .identity = try identityWireLeaky(wire.SQLNamedTypeIdentity, a, record.identity),
+            .domain = .{
+                .base = switch (definition.base) {
+                    .builtin => |kind| .{ .kind = "builtin", .builtin = std.meta.stringToEnum(wire.SQLBuiltinType, @tagName(kind)).? },
+                    .named => |reference| .{ .kind = "named", .named = .{ .id = reference.id, .origin_id = try hexAlloc(a, &reference.origin_id), .generation = reference.generation } },
+                },
+                .numeric_modifier = if (definition.numeric_modifier) |modifier| .{ .precision = modifier.precision, .scale = modifier.scale } else null,
+                .default_expression = if (definition.default_expression) |expression| try expressionWireLeaky(a, expression) else null,
+                .not_null = definition.not_null,
+                .checks = checks,
+            },
+        };
+    }
     const labels = try a.alloc(wire.SQLNamedEnumLabel, record.definition.labels.len);
     for (record.definition.labels, labels) |source, *label| label.* = .{ .id = source.id, .text = source.text, .order_key = try hexAlloc(a, source.order_key) };
     return .{
@@ -171,13 +199,98 @@ pub fn canonicalizeSchemaLeaky(a: A, root: *std.json.Value, records: []const typ
     try root.object.put(a, "named_types", value);
 }
 
+/// Preparation-only exact additive postimage. The accepting metadata writer
+/// and native owner must independently rejoin their current type/table cut.
+/// Nothing here reserves a table, publishes a type or grants schema authority.
+/// Every unrelated schema field is retained; only the type directory and
+/// schema version change. Rows, index tuples and logical symbols are untouched.
+pub fn additiveSchemaAlloc(a: A, before_json: []const u8, previous: types.Record, successor: types.Record) ![]u8 {
+    try previous.requireAdditiveSuccessor(successor);
+    return epochSchemaAlloc(a, before_json, previous, successor);
+}
+
+/// Exact immutable logical epoch. Restrictive rules additionally require the
+/// shared validation coordinator; deriving bytes does not authorize install.
+pub fn epochSchemaAlloc(a: A, before_json: []const u8, previous: types.Record, successor: types.Record) ![]u8 {
+    if (before_json.len == 0 or before_json.len > max_registry_bytes) return error.InvalidSchemaUpdateRequest;
+    try previous.validate(a);
+    try successor.validate(a);
+    try previous.requireEpochSuccessor(successor);
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const temporary = region.allocator();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, temporary, before_json, .{ .parse_numbers = false });
+    if (root != .object) return error.InvalidSchemaUpdateRequest;
+    const directory = root.object.get("named_types") orelse return error.InvalidSchemaUpdateRequest;
+    var registry = try Registry.parseValue(a, directory);
+    defer registry.deinit();
+    const captured = registry.recordById(previous.identity.id) orelse return error.InvalidSchemaUpdateRequest;
+    if (!std.mem.eql(u8, &try digest(a, captured.*), &try digest(a, previous))) return error.CatalogGenerationChanged;
+    const records = try temporary.dupe(types.Record, registry.records);
+    for (records) |*record| if (record.identity.id == previous.identity.id) {
+        record.* = successor;
+        break;
+    };
+    try canonicalizeSchemaLeaky(temporary, &root, records);
+    const version: u32 = if (root.object.get("version")) |value| switch (value) {
+        .integer => std.math.cast(u32, value.integer) orelse return error.InvalidSchemaUpdateRequest,
+        .number_string => std.fmt.parseInt(u32, value.number_string, 10) catch return error.InvalidSchemaUpdateRequest,
+        else => return error.InvalidSchemaUpdateRequest,
+    } else 0;
+    const next_version = std.math.add(u32, version, 1) catch return error.InvalidSchemaUpdateRequest;
+    try root.object.put(temporary, "version", .{ .integer = next_version });
+    var count = std.Io.Writer.Discarding.init(&.{});
+    try std.json.Stringify.value(root, .{}, &count.writer);
+    if (count.fullCount() > max_registry_bytes) return error.SqlProgramLimitExceeded;
+    return std.json.Stringify.valueAlloc(a, root, .{});
+}
+
 fn fromWire(a: A, input: wire.SQLNamedTypeLayout) !types.Record {
-    if (!std.mem.eql(u8, input.kind, "enum") or input.labels.len > types.max_labels) return error.InvalidSchemaUpdateRequest;
+    const is_domain = std.mem.eql(u8, input.kind, "domain");
+    const is_enum = std.mem.eql(u8, input.kind, "enum");
+    if ((!is_domain and !is_enum) or (is_domain and (input.domain == null or input.labels != null)) or (is_enum and (input.labels == null or input.domain != null))) return error.InvalidSchemaUpdateRequest;
     var origin: [16]u8 = undefined;
     try decodeHex(&origin, input.identity.origin_id);
     const identity: types.Identity = .{ .id = input.identity.id, .namespace_id = input.identity.namespace_id, .generation = input.identity.generation, .origin_id = origin, .oid = input.identity.oid, .array_oid = input.identity.array_oid };
     identity.validate() catch return error.InvalidSchemaUpdateRequest;
-    const labels = try a.alloc(types.Label, input.labels.len);
+    if (input.domain) |definition| {
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        const temporary = region.allocator();
+        const base: domains.Base = if (std.mem.eql(u8, definition.base.kind, "builtin")) base: {
+            if (definition.base.named != null) return error.InvalidSchemaUpdateRequest;
+            break :base .{ .builtin = @import("sql_builtin_type.zig").Type.fromWire(definition.base.builtin orelse return error.InvalidSchemaUpdateRequest) };
+        } else if (std.mem.eql(u8, definition.base.kind, "named")) base: {
+            if (definition.base.builtin != null) return error.InvalidSchemaUpdateRequest;
+            const reference = definition.base.named orelse return error.InvalidSchemaUpdateRequest;
+            var origin_id: [16]u8 = undefined;
+            try decodeHex(&origin_id, reference.origin_id);
+            break :base .{ .named = .{ .id = reference.id, .origin_id = origin_id, .generation = reference.generation } };
+        } else return error.InvalidSchemaUpdateRequest;
+        if (definition.checks.len > domains.max_checks) return error.InvalidSchemaUpdateRequest;
+        const checks = try temporary.alloc(domains.Check, definition.checks.len);
+        for (definition.checks, checks) |check, *output| output.* = .{
+            .name = check.name,
+            .validated = check.validated,
+            .expression = try std.json.Stringify.valueAlloc(temporary, check.expression, .{}),
+        };
+        const native: domains.Definition = .{
+            .base = base,
+            .numeric_modifier = if (definition.numeric_modifier) |modifier| .{
+                .precision = std.math.cast(u16, modifier.precision) orelse return error.InvalidSchemaUpdateRequest,
+                .scale = std.math.cast(i16, modifier.scale) orelse return error.InvalidSchemaUpdateRequest,
+            } else null,
+            .default_expression = if (definition.default_expression) |expression| try std.json.Stringify.valueAlloc(temporary, expression, .{}) else null,
+            .not_null = definition.not_null,
+            .checks = checks,
+        };
+        const record: types.Record = .{ .identity = identity, .owner = .auth_disabled, .definition = .{ .domain = native } };
+        record.validate(a) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSchemaUpdateRequest;
+        return record.cloneOwned(a);
+    }
+    const source_labels = input.labels orelse return error.InvalidSchemaUpdateRequest;
+    if (source_labels.len > types.max_labels) return error.InvalidSchemaUpdateRequest;
+    const labels = try a.alloc(types.Label, source_labels.len);
     var initialized: usize = 0;
     errdefer {
         for (labels[0..initialized]) |label| {
@@ -186,7 +299,7 @@ fn fromWire(a: A, input: wire.SQLNamedTypeLayout) !types.Record {
         }
         a.free(labels);
     }
-    for (input.labels, labels) |source, *label| {
+    for (source_labels, labels) |source, *label| {
         if (source.text.len > types.max_label_bytes or source.order_key.len == 0 or source.order_key.len > types.max_order_bytes * 2 or source.order_key.len % 2 != 0) return error.InvalidSchemaUpdateRequest;
         const text = try a.dupe(u8, source.text);
         errdefer a.free(text);
@@ -203,14 +316,14 @@ fn fromWire(a: A, input: wire.SQLNamedTypeLayout) !types.Record {
 
 pub const Registry = struct {
     records: []types.Record,
-    views: []values.View,
+    prepared: domain_values.Registry,
     alloc: A,
 
     pub fn init(a: A, input: []const wire.SQLNamedTypeLayout) !Registry {
         if (input.len > max_types) return error.InvalidSchemaUpdateRequest;
         const records = try a.alloc(types.Record, input.len);
         var records_initialized: usize = 0;
-        errdefer {
+        defer {
             for (records[0..records_initialized]) |*record| record.deinitOwned(a);
             a.free(records);
         }
@@ -228,17 +341,11 @@ pub const Registry = struct {
             total = std.math.add(usize, total, encoded.len + 4) catch return error.InvalidSchemaUpdateRequest;
             if (total > max_registry_bytes) return error.InvalidSchemaUpdateRequest;
         }
-        const views = try a.alloc(values.View, records.len);
-        var views_initialized: usize = 0;
-        errdefer {
-            for (views[0..views_initialized]) |*view| view.deinit(a);
-            a.free(views);
-        }
-        for (records, views) |record, *view| {
-            view.* = try values.View.init(a, record);
-            views_initialized += 1;
-        }
-        return .{ .alloc = a, .records = records, .views = views };
+        // Transfer through the native immutable DAG builder. Temporary wire
+        // records are freed after it captures its own stable-address directory.
+        var prepared = try domain_values.Registry.init(a, records);
+        errdefer prepared.deinit();
+        return .{ .alloc = a, .records = prepared.records, .prepared = prepared };
     }
     pub fn parseValue(a: A, input: std.json.Value) !Registry {
         if (input != .array or input.array.items.len > max_types) return error.InvalidSchemaUpdateRequest;
@@ -247,22 +354,21 @@ pub const Registry = struct {
         return init(a, parsed.value);
     }
     pub fn deinit(self: *Registry) void {
-        for (self.views) |*view| view.deinit(self.alloc);
-        self.alloc.free(self.views);
-        for (self.records) |*record| record.deinitOwned(self.alloc);
-        self.alloc.free(self.records);
+        self.prepared.deinit();
         self.* = undefined;
     }
+    /// Any immutable named type; enum execution lookup remains kind-specific.
+    pub fn recordById(self: Registry, id: u64) ?*const types.Record {
+        const entry = self.prepared.byId(id) orelse return null;
+        return entry.record;
+    }
     pub fn byId(self: Registry, id: u64) ?*const values.View {
-        var lower: usize = 0;
-        var upper = self.records.len;
-        while (lower < upper) {
-            const middle = lower + (upper - lower) / 2;
-            const current = self.records[middle].identity.id;
-            if (current == id) return &self.views[middle];
-            if (current < id) lower = middle + 1 else upper = middle;
-        }
-        return null;
+        const entry = self.prepared.byId(id) orelse return null;
+        return if (entry.executable.? == .enumeration) &entry.executable.?.enumeration else null;
+    }
+    pub fn domainById(self: Registry, id: u64) ?*const domain_values.View {
+        const entry = self.prepared.byId(id) orelse return null;
+        return if (entry.executable.? == .domain) &entry.executable.?.domain else null;
     }
     pub fn cloneRecords(self: Registry, a: A) ![]types.Record {
         const records = try a.alloc(types.Record, self.records.len);
@@ -573,7 +679,7 @@ test "SQL named enum reader contracts and dependencies retain both write and his
         try std.testing.expectEqual(@as(u64, 7), guards[0].id);
         const requirements = (try api.namedTypeReaderRequirementsForDefinitions(a, pair[0], pair[1])).?;
         try std.testing.expectEqual(@as(u32, 39), requirements.semantic_version);
-        try std.testing.expectEqual(@as(u32, 39), requirements.encoding_version);
+        try std.testing.expectEqual(@import("schema_readers.zig").current_encoding_version, requirements.encoding_version);
     }
     try std.testing.expect(try api.namedTypeReaderRequirementsForDefinitions(a, "{}", "") == null);
     var other = record;
@@ -598,4 +704,135 @@ test "SQL named enum reader contracts and dependencies retain both write and his
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ json, other_json });
+}
+
+test "SQL named enum additive schema postimages preserve exact defaults columns and unrelated type epochs" {
+    const a = std.testing.allocator;
+    var labels = try types.Owned.create(a, &.{ "z", "a" });
+    defer labels.deinit();
+    const previous: types.Record = .{ .identity = try types.Identity.init(17, 2, 1, @splat(8)), .definition = labels.definition, .owner = .auth_disabled };
+    var next_labels = try types.Owned.add(a, labels.definition, "middle", .{ .before = "a" });
+    defer next_labels.deinit();
+    var successor = previous;
+    successor.identity.generation += 1;
+    successor.definition = next_labels.definition;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var before = try std.json.parseFromSliceLeaky(std.json.Value, scratch,
+        \\{"version":4,"storage_mode":"relational","document_schemas":{"row":{"schema":{"type":"object","properties":{"state":{"type":"sql_enum","x-antfly-sql-type-id":17,"nullable":true},"amount":{"type":"number","default":12345678901234567890.1234567890123456789}}}}}}
+    , .{ .parse_numbers = false });
+    var unrelated = previous;
+    unrelated.identity = try types.Identity.init(19, 2, 1, @splat(9));
+    try canonicalizeSchemaLeaky(scratch, &before, &.{ previous, unrelated });
+    const encoded = try std.json.Stringify.valueAlloc(a, before, .{});
+    defer a.free(encoded);
+    const after = try additiveSchemaAlloc(a, encoded, previous, successor);
+    defer a.free(after);
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, scratch, after, .{ .parse_numbers = false });
+    try std.testing.expectEqualStrings("5", root.object.get("version").?.number_string);
+    var registry = try Registry.parseValue(a, root.object.get("named_types").?);
+    defer registry.deinit();
+    try std.testing.expectEqual(@as(u32, 2), registry.byId(17).?.record.identity.generation);
+    try std.testing.expectEqualDeep(try digest(a, unrelated), try digest(a, registry.byId(19).?.record));
+    const old_columns = try std.json.Stringify.valueAlloc(a, before.object.get("document_schemas").?, .{});
+    defer a.free(old_columns);
+    const new_columns = try std.json.Stringify.valueAlloc(a, root.object.get("document_schemas").?, .{});
+    defer a.free(new_columns);
+    try std.testing.expectEqualStrings(old_columns, new_columns);
+    try std.testing.expect(std.mem.indexOf(u8, after, "12345678901234567890.1234567890123456789") != null);
+    var stale = previous;
+    stale.identity.generation += 1;
+    var future = successor;
+    future.identity.generation += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, additiveSchemaAlloc(a, encoded, stale, future));
+}
+
+test "SQL domain generated layouts own cold executable base chains without enum impersonation" {
+    const a = std.testing.allocator;
+    var registry = registry: {
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        var labels = try types.Owned.create(a, &.{ "queued", "done" });
+        defer labels.deinit();
+        const parent: types.Record = .{ .identity = try types.Identity.init(9, 2, 1, @splat(4)), .owner = .auth_disabled, .definition = labels.definition };
+        const child: types.Record = .{
+            .identity = try types.Identity.init(7, 2, 1, @splat(5)),
+            .owner = .{ .role = .{ .name = "owner", .instance_id = @splat(1) } },
+            .definition = .{ .domain = .{
+                .base = .{ .named = .{ .id = 9, .origin_id = parent.identity.origin_id, .generation = 1 } },
+                .not_null = true,
+                .default_expression =
+                \\{"op":"literal","type":"enumeration","named_type_id":9,"value":"queued"}
+                ,
+            } },
+        };
+        const domain_layout = try toWireLeaky(region.allocator(), child);
+        try std.testing.expectEqualStrings("domain", domain_layout.kind);
+        try std.testing.expect(domain_layout.labels == null);
+        const enum_layout = try toWireLeaky(region.allocator(), parent);
+        try std.testing.expect(enum_layout.domain == null);
+        const canonical_enum = try canonicalAlloc(a, parent);
+        defer a.free(canonical_enum);
+        try std.testing.expect(std.mem.indexOf(u8, canonical_enum, "\"domain\"") == null);
+        var different_owner = child;
+        different_owner.owner = .auth_disabled;
+        try std.testing.expectEqualDeep(try digest(a, child), try digest(a, different_owner));
+        break :registry try Registry.init(a, &.{ domain_layout, enum_layout });
+    };
+    defer registry.deinit();
+    try std.testing.expect(registry.byId(7) == null);
+    const domain = registry.domainById(7).?;
+    try std.testing.expect(registry.domainById(9) == null);
+    try std.testing.expect(registry.records[0].owner == .auth_disabled);
+    var bytes: usize = @import("../schema/relational_expression.zig").max_allocated_bytes;
+    var execution = @import("../schema/relational_expression.zig").Execution.init(a, &bytes);
+    const value = (try domain.defaultValue(&execution)).?;
+    try std.testing.expectEqualStrings("queued", try registry.byId(9).?.output(value.enumeration));
+    try std.testing.expectEqual(@as(?domain_values.Violation, null), try domain.validate(&execution, value, .assignment));
+    const failed = (try domain.validate(&execution, .null, .assignment)).?;
+    try std.testing.expectEqual(@as(u64, 7), failed.type_id);
+    try std.testing.expectEqual(.not_null, failed.kind);
+}
+
+test "SQL domain generated layouts reject mixed kinds malformed base identities and unwind every allocation failure" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const record: types.Record = .{
+        .identity = try types.Identity.init(7, 2, 1, @splat(5)),
+        .owner = .auth_disabled,
+        .definition = .{ .domain = .{
+            .base = .{ .builtin = .text },
+            .not_null = true,
+            .default_expression =
+            \\{"op":"literal","type":"string","value":"queued"}
+            ,
+            .checks = &.{.{ .name = "state", .expression =
+            \\{"op":"in_list","args":[{"op":"column","column":"value"},{"op":"literal","type":"string","value":"queued"},{"op":"literal","type":"string","value":"done"}]}
+            }},
+        } },
+    };
+    const layout = try toWireLeaky(region.allocator(), record);
+    const Harness = struct {
+        fn run(alloc: A, input: wire.SQLNamedTypeLayout) !void {
+            var registry = try Registry.init(alloc, &.{input});
+            defer registry.deinit();
+            const bytes = try canonicalAlloc(alloc, registry.records[0]);
+            defer alloc.free(bytes);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{layout});
+    var mixed = layout;
+    mixed.labels = &.{};
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, Registry.init(a, &.{mixed}));
+    mixed = layout;
+    mixed.kind = "enum";
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, Registry.init(a, &.{mixed}));
+    mixed = layout;
+    mixed.domain.?.base.named = .{ .id = 9, .origin_id = "00000000000000000000000000000001", .generation = 1 };
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, Registry.init(a, &.{mixed}));
+    mixed = layout;
+    mixed.domain.?.base.builtin = null;
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, Registry.init(a, &.{mixed}));
 }

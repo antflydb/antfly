@@ -37,15 +37,31 @@ pub fn requested(raw: []const u8) !bool {
     return result orelse false;
 }
 
+pub const SelectionRoot = struct { name: []const u8, proposed: []const u8 = "" };
 pub fn select(alloc: std.mem.Allocator, tables: []const records.TableRecord, table_name: []const u8, proposed: []const u8) ![]records.TableRecord {
+    return selectMany(alloc, tables, &.{.{ .name = table_name, .proposed = proposed }});
+}
+pub fn selectMany(alloc: std.mem.Allocator, tables: []const records.TableRecord, roots: []const SelectionRoot) ![]records.TableRecord {
+    if (roots.len == 0 or roots.len > 128) return error.TransactionTooLarge;
     var names: std.StringHashMapUnmanaged(usize) = .empty;
     defer names.deinit(alloc);
-    for (tables, 0..) |table, index| try names.put(alloc, table.name, index);
-    const root = names.get(table_name) orelse return error.TableNotFound;
+    for (tables, 0..) |table, index| {
+        const entry = try names.getOrPut(alloc, table.name);
+        if (entry.found_existing) return error.InvalidCatalogRecord;
+        entry.value_ptr.* = index;
+    }
+    var proposed_by_table: std.AutoHashMapUnmanaged(usize, []const u8) = .empty;
+    defer proposed_by_table.deinit(alloc);
+    for (roots) |root| {
+        const index = names.get(root.name) orelse return error.TableNotFound;
+        if ((try proposed_by_table.getOrPut(alloc, index)).found_existing) return error.InvalidSchemaUpdateRequest;
+        proposed_by_table.getPtr(index).?.* = root.proposed;
+    }
     const chosen = try alloc.alloc(bool, tables.len);
     defer alloc.free(chosen);
     @memset(chosen, false);
-    chosen[root] = true;
+    var roots_iter = proposed_by_table.keyIterator();
+    while (roots_iter.next()) |index| chosen[index.*] = true;
     const Edge = struct { child: usize, parent: usize };
     var edges = std.ArrayList(Edge).empty;
     defer edges.deinit(alloc);
@@ -59,7 +75,7 @@ pub fn select(alloc: std.mem.Allocator, tables: []const records.TableRecord, tab
                 if (kind == .string and std.mem.eql(u8, kind.string, "graph")) unbounded_graph_dependencies = true;
             };
         }
-        for ([_][]const u8{ table.schema_json, table.read_schema_json, if (child == root) proposed else "" }) |json| {
+        for ([_][]const u8{ table.schema_json, table.read_schema_json, proposed_by_table.get(child) orelse "" }) |json| {
             if (json.len == 0) continue;
             var parsed = try schema.parseValidatedTableSchema(alloc, json);
             defer parsed.deinit(alloc);
@@ -72,14 +88,46 @@ pub fn select(alloc: std.mem.Allocator, tables: []const records.TableRecord, tab
     // Row-authored graph identities have no complete schema dependency index.
     // Include the catalog rather than pretending a narrower cut is proven.
     if (unbounded_graph_dependencies) @memset(chosen, true) else {
-        var changed = true;
-        while (changed) {
-            changed = false;
-            for (edges.items) |edge| {
-                if (chosen[edge.child] == chosen[edge.parent]) continue;
-                chosen[edge.child] = true;
-                chosen[edge.parent] = true;
-                changed = true;
+        // Compile the undirected closure once. Repeated full edge sweeps
+        // are quadratic on a reverse-ordered FK chain. The queue visits each
+        // selected vertex and its adjacency once, regardless of catalog order.
+        const counts = try alloc.alloc(usize, tables.len);
+        defer alloc.free(counts);
+        @memset(counts, 0);
+        for (edges.items) |edge| {
+            counts[edge.child] += 1;
+            counts[edge.parent] += 1;
+        }
+        const offsets = try alloc.alloc(usize, tables.len + 1);
+        defer alloc.free(offsets);
+        offsets[0] = 0;
+        for (counts, 0..) |count, i| offsets[i + 1] = offsets[i] + count;
+        const next = try alloc.dupe(usize, offsets[0..tables.len]);
+        defer alloc.free(next);
+        const adjacent = try alloc.alloc(usize, offsets[tables.len]);
+        defer alloc.free(adjacent);
+        for (edges.items) |edge| {
+            adjacent[next[edge.child]] = edge.parent;
+            next[edge.child] += 1;
+            adjacent[next[edge.parent]] = edge.child;
+            next[edge.parent] += 1;
+        }
+        var queue: [128]usize = undefined;
+        var length: usize = 0;
+        roots_iter = proposed_by_table.keyIterator();
+        while (roots_iter.next()) |index| {
+            queue[length] = index.*;
+            length += 1;
+        }
+        var head: usize = 0;
+        while (head < length) : (head += 1) {
+            const index = queue[head];
+            for (adjacent[offsets[index]..offsets[index + 1]]) |other| {
+                if (chosen[other]) continue;
+                if (length == queue.len) return error.TransactionTooLarge;
+                chosen[other] = true;
+                queue[length] = other;
+                length += 1;
             }
         }
     }
@@ -151,30 +199,90 @@ pub fn buildWithPolicies(alloc: std.mem.Allocator, id: stages.Id, selected: []co
 }
 
 pub fn buildWithPoliciesAndConstraintNameGuard(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, table_name: []const u8, proposed: []const u8, observer: anytype, policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies, guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard) !stages.Plan {
-    // Source ownership must stay fixed throughout the rewrite cohort. Check
-    // every member before issuing any source reads or admitting a durable job.
-    for (selected) |table| if (table.storage_migration != null) return error.TableTransitionActive;
     const current = for (selected) |table| {
         if (std.mem.eql(u8, table.name, table_name)) break table;
     } else return error.TableNotFound;
     var owned_support = try @import("relational_witness_ddl.zig").prepare(alloc, selected, table_name, proposed, current.schema_json);
     defer owned_support.deinit();
+    const replacements = try alloc.alloc(Replacement, 1 + owned_support.parents.len);
+    defer alloc.free(replacements);
+    replacements[0] = .{ .table_id = current.table_id, .schema_json = owned_support.schema_json, .policies = policies };
+    for (owned_support.parents, replacements[1..]) |parent, *replacement| replacement.* = .{ .table_id = parent.before.table_id, .schema_json = parent.after.schema_json, .indexes_json = parent.after.indexes_json };
+    return buildReplacements(alloc, id, selected, all_ranges, replacements, observer, guard);
+}
+
+/// Several schema postimages share one source cut, rewrite job and atomic
+/// publication. Unchanged dependency-cohort members retain their declarations.
+/// This is a producer primitive, never independent publication authority.
+pub const SourceObserver = struct {
+    server: *@import("http_server.zig").ApiHttpServer,
+    context: @import("antfly_local_sources").api_operation.RequestContext,
+    facts: ?std.json.Parsed(wire.AdmissionFacts) = null,
+    pub fn deinit(self: *@This()) void {
+        if (self.facts) |*parsed| parsed.deinit();
+        self.facts = null;
+    }
+    pub fn readFacts(self: *@This(), table: []const u8, request: wire.Request) !wire.AdmissionFacts {
+        try self.context.ensureActive();
+        const a = self.server.alloc;
+        const raw = try self.server.executeRewriteSource(a, table, request, self.context);
+        defer a.free(raw);
+        std.debug.assert(self.facts == null);
+        var parsed = try std.json.parseFromSlice(wire.AdmissionFacts, a, raw, .{ .allocate = .alloc_always });
+        errdefer parsed.deinit();
+        const facts = parsed.value;
+        const limits = @import("antfly_local_sources").storage_db_relational_rewrite_contract;
+        if (facts.source_schemas.len > limits.max_source_schemas) return error.RelationalRewriteBudgetExceeded;
+        var size: usize = 0;
+        for (facts.source_schemas) |definition| {
+            size +|= definition.len;
+            if (size > limits.max_schema_bytes) return error.RelationalRewriteBudgetExceeded;
+        }
+        self.facts = parsed;
+        return facts;
+    }
+    pub fn releaseFacts(self: *@This(), _: wire.AdmissionFacts) void {
+        self.deinit();
+    }
+};
+pub const Replacement = struct {
+    table_id: u64,
+    schema_json: []const u8,
+    indexes_json: ?[]const u8 = null,
+    policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies = .{},
+};
+pub fn buildReplacements(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, replacements: []const Replacement, observer: anytype, guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard) !stages.Plan {
+    if (selected.len == 0 or selected.len > 128 or replacements.len == 0 or replacements.len > selected.len) return error.InvalidSchemaUpdateRequest;
+    // Validate the complete replacement directory before any source read.
+    var directory: std.AutoHashMapUnmanaged(u64, Replacement) = .empty;
+    defer directory.deinit(alloc);
+    for (replacements) |replacement| {
+        if (replacement.table_id == 0 or replacement.schema_json.len == 0 or (try directory.getOrPut(alloc, replacement.table_id)).found_existing) return error.InvalidSchemaUpdateRequest;
+        directory.getPtr(replacement.table_id).?.* = replacement;
+        const present = for (selected) |table| {
+            if (table.table_id == replacement.table_id) break true;
+        } else false;
+        if (!present) return error.TableNotFound;
+    }
+    for (selected) |table| if (table.storage_migration != null) return error.TableTransitionActive;
     const targets = try alloc.alloc(stages.Target, selected.len);
     var range_count: usize = 0;
     var handoff_entries: usize = 0;
     var schema_bytes: usize = 0;
     for (selected, targets) |before, *target| {
         if (before.relational_retirement_json.len != 0 or before.restore_backup_id.len != 0) return error.TableTransitionActive;
-        var table = if (std.mem.eql(u8, before.name, table_name))
-            try tables_api.prepareSchemaRewriteRecord(alloc, &before, owned_support.schema_json)
-        else copy: {
-            for (owned_support.parents) |parent| if (parent.before.table_id == before.table_id) break :copy try metadata.cloneTable(alloc, parent.after);
-            break :copy try metadata.cloneTable(alloc, before);
-        };
+        const replacement = directory.get(before.table_id);
+        var table = if (replacement) |candidate| changed: {
+            // Artifact postimages, when supplied by a validated producer,
+            // participate in normal schema/index namespace validation too.
+            var source_record = before;
+            if (candidate.indexes_json) |indexes| source_record.indexes_json = indexes;
+            break :changed try tables_api.prepareSchemaRewriteRecord(alloc, &source_record, candidate.schema_json);
+        } else try metadata.cloneTable(alloc, before);
         var parsed = try schema.parseValidatedTableSchema(alloc, tables_api.effectiveSchemaJson(table.schema_json));
         defer parsed.deinit(alloc);
         const document = parsed.storage_mode == .document;
-        if (document and std.mem.eql(u8, before.name, table_name)) return error.InvalidSchemaUpdateRequest;
+        if (document and replacement != null) return error.InvalidSchemaUpdateRequest;
         const active = try alloc.dupe(u8, tables_api.effectiveSchemaJson(before.schema_json));
         const read = before.read_schema_json;
         var source_manifest: SourceSchemas = .{};
@@ -235,7 +343,7 @@ pub fn buildWithPoliciesAndConstraintNameGuard(alloc: std.mem.Allocator, id: sta
         const source_schemas = source_manifest.definitions.items;
         schema_bytes +|= source_manifest.bytes +| table.schema_json.len +| table.read_schema_json.len +| table.indexes_json.len;
         if (schema_bytes > @import("antfly_local_sources").storage_db_relational_rewrite_contract.max_schema_bytes) return error.RelationalRewriteBudgetExceeded;
-        const target_policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies = if (std.mem.eql(u8, before.name, table_name)) policies else .{};
+        const target_policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies = if (replacement) |candidate| candidate.policies else .{};
         var programs = if (document)
             try @import("antfly_local_sources").storage_db_relational_rewrite_program.ProgramSet.initDocumentPreservationWithRead(alloc, active, read)
         else
@@ -243,7 +351,7 @@ pub fn buildWithPoliciesAndConstraintNameGuard(alloc: std.mem.Allocator, id: sta
         defer programs.deinit();
         table.table_id = table_id;
         table.min_ranges = @intCast(ranges.len);
-        target.* = .{ .source_table_id = before.table_id, .table = table, .ranges = ranges, .generation_handoffs = handoffs, .rewrite = .{ .version = if (target_policies.default_clock_micros != null) 4 else if (target_policies.column_transforms.len == 0) 2 else 3, .preserve_document = document, .default_columns = target_policies.default_columns, .default_clock_micros = target_policies.default_clock_micros, .allow_column_drops = !document and target_policies.dropped_columns == .allow, .expression_schema = target_policies.expression_schema, .column_transforms = target_policies.column_transforms, .source_schemas = source_schemas, .target_schema = table.schema_json, .target_read_schema = if (document) table.read_schema_json else "", .program_digest = programs.identity }, .rewrite_sources = scopes, .replace = .{ .table = try metadata.cloneTable(alloc, before), .ranges = original_ranges.items, .fences = fences } };
+        target.* = .{ .source_table_id = before.table_id, .table = table, .ranges = ranges, .generation_handoffs = handoffs, .attribute_renames = target_policies.attribute_renames, .rewrite = .{ .version = if (target_policies.default_clock_micros != null) 4 else if (target_policies.column_transforms.len == 0) 2 else 3, .preserve_document = document, .default_columns = target_policies.default_columns, .default_clock_micros = target_policies.default_clock_micros, .allow_column_drops = !document and target_policies.dropped_columns == .allow, .expression_schema = target_policies.expression_schema, .column_transforms = target_policies.column_transforms, .source_schemas = source_schemas, .target_schema = table.schema_json, .target_read_schema = if (document) table.read_schema_json else "", .program_digest = programs.identity }, .rewrite_sources = scopes, .replace = .{ .table = try metadata.cloneTable(alloc, before), .ranges = original_ranges.items, .fences = fences } };
     }
     try stages.prepareEmptyGenerationHandoffMappingsAlloc(alloc, targets);
     var result: stages.Plan = .{ .id = id, .cohort_digest = @splat(0), .targets = targets, .preparing_sources = true, .constraint_name_guard = if (guard) |value| try value.clone(alloc) else null };
@@ -313,6 +421,20 @@ test "distributed txn rewrite admission closes current and historical dependenci
 
     try std.testing.expectEqual(@as(usize, 3), observer.calls);
     try std.testing.expectEqual(observer.calls, observer.released);
+    const root_after = for (plan.targets) |target| {
+        if (target.source_table_id == 10) break target.table.schema_json;
+    } else return error.TestUnexpectedResult;
+    const child_after = try std.mem.replaceOwned(u8, alloc, tables[1].schema_json, "\"foreign_keys\":[{\"name\":\"fk\",\"child_columns\":[\"id\"],\"parent_table\":\"parents\",\"parent_columns\":[\"id\"]}]", "\"foreign_keys\":[]");
+    const many = [_]Replacement{ .{ .table_id = 10, .schema_json = root_after }, .{ .table_id = 11, .schema_json = child_after } };
+    const coordinated = try buildReplacements(alloc, plan.id, cohort, &ranges, &many, &observer, null);
+    for (coordinated.targets) |target| if (target.source_table_id == 11) {
+        var child_schema = try schema.parseValidatedTableSchema(alloc, target.table.schema_json);
+        defer child_schema.deinit(alloc);
+        try std.testing.expect(child_schema.foreign_keys == null or child_schema.foreign_keys.?.value.len == 0);
+    };
+    const before_invalid = observer.calls;
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, buildReplacements(alloc, plan.id, cohort, &ranges, &.{ many[0], many[0] }, &observer, null));
+    try std.testing.expectEqual(before_invalid, observer.calls);
     const proposed_with_defaults = try std.mem.replaceOwned(u8, alloc, proposed, "\"generated_columns\":", "\"column_defaults\":[{\"column\":\"x\",\"expression\":{\"op\":\"literal\",\"type\":\"integer\",\"value\":9}}],\"generated_columns\":");
     const with_defaults = try buildWithPolicies(alloc, plan.id, cohort, &ranges, "parents", proposed_with_defaults, &observer, .{ .default_columns = &.{"x"} });
     for (with_defaults.targets) |target| {
@@ -420,4 +542,40 @@ test "distributed txn rewrite admission binds bounded immutable historical schem
     try std.testing.expectError(error.RelationalRewriteBudgetExceeded, unioned.add(alloc, oversized));
     unioned.bytes = @import("antfly_local_sources").storage_db_relational_rewrite_contract.max_schema_bytes;
     try std.testing.expectError(error.RelationalRewriteBudgetExceeded, unioned.add(alloc, target));
+}
+
+/// Bind identity sequences and recompile exactly the programs that will run in
+/// staging. All rewrite producers use this before immutable intent admission.
+pub fn bindSequenceHandoffs(server: *@import("http_server.zig").ApiHttpServer, alloc: std.mem.Allocator, context: @import("antfly_local_sources").api_operation.RequestContext, plan: *stages.Plan) !void {
+    var sequence_context = context;
+    sequence_context.setting_admin = true;
+    const sequence_bytes = try server.source.systemCatalog(alloc, sequence_context, .{ .sql_column_sequence_handoffs = .{ .targets = plan.targets, .restart = false } });
+    const targets = try std.json.parseFromSliceLeaky([]@import("../metadata/restore_staging.zig").Target, alloc, sequence_bytes, .{});
+    for (targets) |*target| {
+        if (target.rewrite == null) {
+            if (target.sequence_handoffs.len != 0) return error.InvalidRestoreStaging;
+            continue;
+        }
+        const rewrite = &target.rewrite.?;
+        // Borrowed defaults need new attribute references even when no owned
+        // counter moves. Seal the exact native-bound schema in that case too.
+        if (std.mem.eql(u8, rewrite.target_schema, target.table.schema_json)) continue;
+        var programs = if (rewrite.preserve_document)
+            try @import("antfly_local_sources").storage_db_relational_rewrite_program.ProgramSet.initDocumentPreservationWithRead(alloc, target.table.schema_json, target.table.read_schema_json)
+        else
+            try @import("antfly_local_sources").storage_db_relational_rewrite_program.ProgramSet.init(alloc, rewrite.source_schemas, target.table.schema_json, .{
+                .default_columns = rewrite.default_columns,
+                .default_clock_micros = rewrite.default_clock_micros,
+                .dropped_columns = if (rewrite.allow_column_drops) .allow else .reject,
+                .expression_schema = rewrite.expression_schema,
+                .column_transforms = rewrite.column_transforms,
+            });
+        defer programs.deinit();
+        target.rewrite.?.target_schema = target.table.schema_json;
+        target.rewrite.?.program_digest = programs.identity;
+    }
+    plan.targets = targets;
+    try @import("../metadata/restore_staging.zig").prepareEmptyGenerationHandoffMappingsAlloc(alloc, targets);
+    plan.cohort_digest = try plan.rewriteIntentDigest(alloc);
+    try plan.validate(alloc);
 }

@@ -67,6 +67,19 @@ pub const Options = struct {
     restart: ?struct { value: ?i64 = null } = null,
 };
 
+// Keep ordinary released definitions/descriptors byte-for-byte stable. An
+// identity descriptor has its own format and must explicitly carry provenance.
+fn writeDefinitionFields(value: anytype, writer: anytype) !void {
+    try writer.beginObject();
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |field| {
+        if (!(comptime std.mem.eql(u8, field, "internal_identity")) or value.internal_identity) {
+            try writer.objectField(field);
+            try writer.write(@field(value, field));
+        }
+    }
+    try writer.endObject();
+}
+
 pub const Definition = struct {
     generation: u64 = 1,
     integer: Integer = .int64,
@@ -77,6 +90,13 @@ pub const Definition = struct {
     cache: u64 = 1,
     cycle: bool = false,
     owned_by: ?OwnedBy = null,
+    /// An internal identity dependency is minted only by native column
+    /// creation. Ordinary CREATE SEQUENCE/OWNED BY options cannot set it.
+    internal_identity: bool = false,
+
+    pub fn jsonStringify(self: Definition, writer: anytype) !void {
+        return writeDefinitionFields(self, writer);
+    }
 
     pub fn validate(self: Definition) !void {
         if (self.generation == 0 or self.increment == 0 or self.cache == 0 or self.cache > std.math.maxInt(i64) or
@@ -84,6 +104,7 @@ pub const Definition = struct {
             self.minimum >= self.maximum or self.start < self.minimum or self.start > self.maximum)
             return error.InvalidSequenceDefinition;
         if (self.owned_by) |reference| try reference.validate();
+        if (self.internal_identity and self.owned_by == null) return error.InvalidSequenceDefinition;
     }
 
     fn defaults(self: Definition) struct { minimum: i64, maximum: i64 } {
@@ -133,7 +154,7 @@ pub const Definition = struct {
     pub fn eql(left: Definition, right: Definition) bool {
         if (left.generation != right.generation or left.integer != right.integer or left.increment != right.increment or
             left.minimum != right.minimum or left.maximum != right.maximum or left.start != right.start or
-            left.cache != right.cache or left.cycle != right.cycle or (left.owned_by == null) != (right.owned_by == null)) return false;
+            left.cache != right.cache or left.cycle != right.cycle or left.internal_identity != right.internal_identity or (left.owned_by == null) != (right.owned_by == null)) return false;
         if (left.owned_by) |reference| return std.meta.eql(reference, right.owned_by.?);
         return true;
     }
@@ -222,15 +243,20 @@ pub const Descriptor = struct {
     cache: u64,
     cycle: bool,
     owned_by: ?OwnedBy,
+    internal_identity: bool = false,
+
+    pub fn jsonStringify(self: Descriptor, writer: anytype) !void {
+        return writeDefinitionFields(self, writer);
+    }
 
     pub fn init(id: u64, value: Definition) !Descriptor {
         try value.validate();
         if (id == 0) return error.InvalidSequenceDefinition;
-        return .{ .format = 1, .id = id, .generation = value.generation, .integer = value.integer, .increment = value.increment, .minimum = value.minimum, .maximum = value.maximum, .start = value.start, .cache = value.cache, .cycle = value.cycle, .owned_by = value.owned_by };
+        return .{ .format = if (value.internal_identity) 2 else 1, .id = id, .generation = value.generation, .integer = value.integer, .increment = value.increment, .minimum = value.minimum, .maximum = value.maximum, .start = value.start, .cache = value.cache, .cycle = value.cycle, .owned_by = value.owned_by, .internal_identity = value.internal_identity };
     }
     pub fn definition(self: Descriptor) !Definition {
-        if (self.format != 1 or self.id == 0) return error.InvalidSequenceDefinition;
-        const value: Definition = .{ .generation = self.generation, .integer = self.integer, .increment = self.increment, .minimum = self.minimum, .maximum = self.maximum, .start = self.start, .cache = self.cache, .cycle = self.cycle, .owned_by = self.owned_by };
+        if (self.format != (if (self.internal_identity) @as(u8, 2) else 1) or self.id == 0) return error.InvalidSequenceDefinition;
+        const value: Definition = .{ .generation = self.generation, .integer = self.integer, .increment = self.increment, .minimum = self.minimum, .maximum = self.maximum, .start = self.start, .cache = self.cache, .cycle = self.cycle, .owned_by = self.owned_by, .internal_identity = self.internal_identity };
         try value.validate();
         return value;
     }
@@ -377,4 +403,40 @@ test "sequence catalog rejects malformed definitions leases and exhausted revisi
     try t.expectError(error.InvalidSequenceLease, malformed.value(1));
     malformed.count = 0;
     try t.expectError(error.InvalidSequenceLease, malformed.value(0));
+}
+
+test "sequence catalog identity provenance cannot be minted by ordinary ownership and survives exact descriptor counter transitions" {
+    const a = std.testing.allocator;
+    const ordinary = try Record.create(.{ .owned_by = .{ .column = .{ .table_id = 7, .column_id = 3 } }, .cache = 4 });
+    try std.testing.expect(!ordinary.definition.internal_identity);
+    const bytes = try (try Descriptor.init(19, ordinary.definition)).encode(a);
+    defer a.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "internal_identity") == null);
+    var internal = ordinary;
+    internal.definition.internal_identity = true;
+    try internal.definition.validate();
+    try std.testing.expect(!ordinary.definition.eql(internal.definition));
+    const encoded = try (try Descriptor.init(19, internal.definition)).encode(a);
+    defer a.free(encoded);
+    const decoded = try Descriptor.decode(a, encoded);
+    try std.testing.expectEqual(@as(u8, 2), decoded.format);
+    try std.testing.expect((try decoded.definition()).internal_identity);
+    var malformed = decoded;
+    malformed.internal_identity = false;
+    try std.testing.expectError(error.InvalidSequenceDefinition, malformed.definition());
+    malformed = decoded;
+    malformed.format = 1;
+    try std.testing.expectError(error.InvalidSequenceDefinition, malformed.definition());
+    var missing = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+    defer missing.deinit();
+    try std.testing.expect(missing.value.object.swapRemove("internal_identity"));
+    const absent = try std.json.Stringify.valueAlloc(a, missing.value, .{});
+    defer a.free(absent);
+    try std.testing.expectError(error.InvalidSequenceDefinition, Descriptor.decode(a, absent));
+    const changed = try internal.alter(.{ .cache = 16 });
+    try std.testing.expect(changed.definition.internal_identity);
+    try std.testing.expectEqualDeep(internal.definition.owned_by, changed.definition.owned_by);
+    try std.testing.expectError(error.InvalidSequenceDefinition, internal.alter(.{ .owned_by = .none }));
+    const reserved = try changed.state.reserve(changed.definition);
+    try std.testing.expectEqual(@as(i64, 1), reserved.lease.first);
 }

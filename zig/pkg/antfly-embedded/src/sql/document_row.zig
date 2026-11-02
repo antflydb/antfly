@@ -183,7 +183,7 @@ pub fn deriveRelationalColumnsLeaky(owned: std.mem.Allocator, temporary: std.mem
     const columns = try catalog.relationalColumnsLeaky(owned, native);
     for (native.relational_columns, columns) |column, *out| {
         out.generated = generated.contains(column.name);
-        out.defaulted = catalog.hasColumnDefault(parsed, column.name);
+        out.defaulted = out.defaulted or catalog.hasColumnDefault(parsed, column.name);
         out.clock_defaulted = catalog.columnDefaultUsesClock(parsed, column.name);
         if (parsed.column_defaults) |defaults| for (defaults.value.array.items) |entry| {
             if (!std.mem.eql(u8, entry.object.get("column").?.string, column.name)) continue;
@@ -675,7 +675,7 @@ fn coerce(alloc: std.mem.Allocator, value: Json, kind: ast.ColumnType) !Json {
             var context: ranges.Context = .{ .alloc = alloc };
             break :range .{ .string = try ranges.formatLeaky(&context, try ranges.parseLeaky(&context, ranges.kindFromType(kind).?, value.string)) };
         },
-        .array, .enumeration => error.UnsupportedSqlShape,
+        .array, .enumeration, .bytea => error.UnsupportedSqlShape,
         .json => typed_json.clone(alloc, value),
         .integer => switch (value) {
             .integer => value,

@@ -357,7 +357,15 @@ test "SQL named enum bound programs use symbolic serialization and unwind bindin
 fn runEnumProbe(a: A, fixture: *const Fixture, expression: []const u8, input: ?[]const u8) !Datum {
     var parsed = try @import("compiler.zig").compileScalar(a, expression, .{});
     defer parsed.deinit();
-    var program = try scalar.bind(a, parsed.expression, &.{.{ .name = "v", .type = .enumeration, .enum_view = &fixture.view }}, &.{}, .{});
+    const Resolver = struct {
+        fn resolve(raw: *anyopaque, _: A, name: @import("ast.zig").Name) !scalar.Type {
+            const view: *const enums.View = @ptrCast(@alignCast(raw));
+            if (!std.mem.eql(u8, name.table, "execution_state") or name.database != null or
+                (name.namespace != null and !std.mem.eql(u8, name.namespace.?, "public"))) return error.SqlNamedTypeNotFound;
+            return .{ .kind = .enumeration, .enum_view = view };
+        }
+    };
+    var program = try scalar.bind(a, parsed.expression, &.{.{ .name = "v", .type = .enumeration, .enum_view = &fixture.view }}, &.{}, .{ .named_types = .{ .ptr = @constCast(&fixture.view), .resolve = Resolver.resolve } });
     defer program.deinit();
     const result = try program.evaluate(a, &.{if (input) |text| try fixture.value(text) else .{}}, &.{}, .{});
     return operators.cloneDatum(a, result);
@@ -880,4 +888,64 @@ test "SQL named enum native column streams preserve direct projections and scala
             try std.testing.expect((try page.values.cell(page.arena.allocator(), 3, 0)).sql_null);
         }
     }
+}
+
+test "SQL named enum cast binding shares statement lookups owns directories and preserves explicit input semantics" {
+    const Harness = struct {
+        view: *const enums.View,
+        calls: usize = 0,
+        fn resolve(raw: *anyopaque, _: A, name: @import("ast.zig").Name) !scalar.Type {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.mem.eql(u8, name.table, "state") or name.namespace != null) return error.SqlNamedTypeNotFound;
+            self.calls += 1;
+            return .{ .kind = .enumeration, .enum_view = self.view };
+        }
+        fn expectRejected(expected: anyerror, result: anyerror!scalar.Program) !void {
+            if (result) |value| {
+                var program = value;
+                program.deinit();
+                return error.TestUnexpectedResult;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(expected, err);
+            }
+        }
+        fn run(a: A) !void {
+            var source = try Fixture.init(a, 5, 1);
+            defer source.deinit(a);
+            var region = std.heap.ArenaAllocator.init(a);
+            defer region.deinit();
+            const invocation = try @import("parameter_binding.zig").Invocation.initLeaky(region.allocator(), 0);
+            var resolver: @This() = .{ .view = &source.view };
+            invocation.named_type_resolver = .{ .ptr = &resolver, .resolve = resolve };
+            for ([_][]const u8{
+                "'z'::state",
+                "CAST('z' AS state)",
+                "('z'::text)::state",
+                "CASE WHEN false THEN ('invalid'::text)::state ELSE 'z'::state END",
+                "CASE WHEN true THEN 'z'::state ELSE 'a' END",
+                "coalesce(NULL::state, 'z'::state)",
+            }) |sql| {
+                var parsed = try @import("compiler.zig").compileScalar(a, sql, .{});
+                defer parsed.deinit();
+                var program = try scalar.bind(a, parsed.expression, &.{}, &.{}, .{ .invocation = invocation });
+                defer program.deinit();
+                const value = try program.evaluate(region.allocator(), &.{}, &.{}, .{});
+                try std.testing.expectEqualStrings("z", value.enumeration().?.text);
+                try std.testing.expectEqual(@as(u64, 5), value.enumeration().?.type_id);
+            }
+            try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+            var input = try @import("compiler.zig").compileScalar(a, "CASE WHEN false THEN 'invalid'::state ELSE 'z'::state END", .{});
+            defer input.deinit();
+            try expectRejected(error.SqlInvalidTextRepresentation, scalar.bind(a, input.expression, &.{}, &.{}, .{ .invocation = invocation }));
+            var absent = try @import("compiler.zig").compileScalar(a, "'z'::missing_type", .{});
+            defer absent.deinit();
+            try expectRejected(error.SqlNamedTypeNotFound, scalar.bind(a, absent.expression, &.{}, &.{}, .{ .invocation = invocation }));
+            var no_resolver = try @import("compiler.zig").compileScalar(a, "'z'::state", .{});
+            defer no_resolver.deinit();
+            try expectRejected(error.SqlNamedTypeNotFound, scalar.bind(a, no_resolver.expression, &.{}, &.{}, .{}));
+        }
+    };
+    try Harness.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

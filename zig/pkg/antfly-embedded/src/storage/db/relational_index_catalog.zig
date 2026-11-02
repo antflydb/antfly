@@ -206,6 +206,11 @@ pub const Prepared = struct {
         previous: ?*const Loaded,
         definitions: []const native.RelationalIndexDefinition,
     ) !Prepared {
+        return initWithObjectRenames(alloc, view, previous, definitions, &.{});
+    }
+
+    pub fn initWithObjectRenames(alloc: Allocator, view: registry.SchemaView, previous: ?*const Loaded, definitions: []const native.RelationalIndexDefinition, renames: []const @import("../../system_catalog/object_annotations.zig").Rename) !Prepared {
+        try @import("../../system_catalog/object_annotations.zig").validateSingleRename(renames);
         if (view.storageMode() != .relational) return error.InvalidRelationalIndexCatalog;
         if (definitions.len > max_index_count) return error.RelationalIndexCatalogLimitExceeded;
         const revision = try std.math.add(u64, if (previous) |p| p.head.revision else 0, 1);
@@ -217,12 +222,20 @@ pub const Prepared = struct {
         for (definitions, items) |definition, *item| {
             item.* = .{ .generation = revision, .slot = 0, .definition = definition, .comparison = try comparisonFingerprint(alloc, view, definition) };
             if (previous) |p| {
-                if (p.find(definition.name)) |old| {
+                var prior_name = definition.name;
+                for (renames) |rename| if (rename.kind == .index and std.mem.eql(u8, definition.name, rename.to)) {
+                    if (p.find(rename.to) != null) return error.InvalidRelationalIndexCatalog;
+                    for (definitions) |entry| if (std.mem.eql(u8, entry.name, rename.from)) return error.InvalidRelationalIndexCatalog;
+                    prior_name = rename.from;
+                };
+                if (p.find(prior_name)) |old| {
                     const dependencies_match = if (old.comparison) |prior| if (item.comparison) |next| std.mem.eql(u8, &prior, &next) else false else std.mem.eql(u8, &p.schema_digest, &schema_hash);
                     if (dependencies_match) {
                         const a = try std.json.Stringify.valueAlloc(alloc, definition, .{});
                         defer alloc.free(a);
-                        const b = try std.json.Stringify.valueAlloc(alloc, old.definition, .{});
+                        var prior_definition = old.definition;
+                        prior_definition.name = definition.name;
+                        const b = try std.json.Stringify.valueAlloc(alloc, prior_definition, .{});
                         defer alloc.free(b);
                         if (std.mem.eql(u8, a, b)) {
                             item.generation = old.generation;
@@ -362,7 +375,7 @@ const plans = @import("relational_index_plan.zig");
 const docstore = @import("../docstore.zig");
 
 fn comparisonFingerprint(alloc: Allocator, view: registry.SchemaView, definition: native.RelationalIndexDefinition) !?Digest {
-    if (definition.access_method != .ordered_tuple or definition.unique or definition.expressions.len != 0 or
+    if (definition.access_method != .ordered_tuple or definition.expressions.len != 0 or
         definition.where_expressions.len != 0 or
         definition.method_config_json != null) return null;
     var tuple = try @import("relational_index_keys.zig").TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), definition.keys);
@@ -698,13 +711,17 @@ pub const Controller = struct {
         view: registry.SchemaView,
         definitions: []const native.RelationalIndexDefinition,
     ) !PreparedPublication {
+        return self.prepareWithObjectRenames(view, definitions, &.{});
+    }
+
+    pub fn prepareWithObjectRenames(self: *Controller, view: registry.SchemaView, definitions: []const native.RelationalIndexDefinition, renames: []const @import("../../system_catalog/object_annotations.zig").Rename) !PreparedPublication {
         var previous = blk: {
             var txn = try self.store.beginReadTxn();
             defer txn.abort();
             break :blk try load(self.alloc, &txn);
         };
         defer if (previous) |*loaded| loaded.deinit();
-        var metadata = try Prepared.init(self.alloc, view, if (previous) |*loaded| loaded else null, definitions);
+        var metadata = try Prepared.initWithObjectRenames(self.alloc, view, if (previous) |*loaded| loaded else null, definitions, renames);
         errdefer metadata.deinit();
         var next = try decode(self.alloc, metadata.head, metadata.blob);
         defer next.deinit();

@@ -67,10 +67,7 @@ ORDER_OBSERVERS = {
 }
 
 
-@contextmanager
-def postgres():
-    import psycopg
-
+def postgres_binary_dir():
     configured = os.environ.get("ANTFLY_PG_BIN")
     binary = Path(configured) if configured else None
     if binary is None:
@@ -87,6 +84,19 @@ def postgres():
     match = re.search(r"PostgreSQL\) (\d+)", version)
     if not match or int(match[1]) < 18:
         raise RuntimeError("PostgreSQL 18+ is required for this campaign")
+    return binary
+
+
+@contextmanager
+def postgres(*, max_prepared_transactions=0):
+    import psycopg
+
+    if (
+        not isinstance(max_prepared_transactions, int)
+        or not 0 <= max_prepared_transactions <= 128
+    ):
+        raise ValueError("max_prepared_transactions must be between 0 and 128")
+    binary = postgres_binary_dir()
     with TemporaryDirectory(prefix="antfly-sql-pg-", dir="/tmp") as directory:
         data = Path(directory) / "data"
         subprocess.run(
@@ -112,7 +122,12 @@ def postgres():
                     "-l",
                     Path(directory) / "server.log",
                     "-o",
-                    f"-k {directory} -c listen_addresses=''",
+                    f"-k {directory} -c listen_addresses=''"
+                    + (
+                        f" -c max_prepared_transactions={max_prepared_transactions}"
+                        if max_prepared_transactions
+                        else ""
+                    ),
                     "-w",
                     "start",
                 ],
@@ -1578,11 +1593,47 @@ def document_witness_rows(identity):
         first["metadata"]["flags"] = ["rated", "hot"]
     elif identity in DOCUMENT_POSITION_IDS:
         first["status"] = "warm"
+    elif identity == "sql-0918":
+        # This original declares a closed metadata object containing only plan.
+        # Seed rows must satisfy that contract before testing the unchanged
+        # INSERT's undefined flattened metadata_plan column.
+        for ordinal, row in enumerate(rows):
+            row["value"]["metadata"] = {"plan": "basic" if ordinal == 0 else "pro"}
     elif identity == "sql-1091":
         # Absent optional property is SQL NULL; explicit JSON null is a
         # different document validation and projection contract.
         del first["status"]
     return rows
+
+
+def document_schema_seed_rows(rows, schema):
+    """Fit witness data to closed source objects without changing declarations."""
+    root = schema["document_schemas"][schema.get("default_type", "doc")]["schema"]
+
+    def project(value, declaration):
+        if not isinstance(value, dict) or not isinstance(declaration, dict):
+            return
+        props = declaration.get("properties", {})
+        patterns = declaration.get("patternProperties", {})
+        for name in list(value):
+            if name in props:
+                project(value[name], props[name])
+                continue
+            matched = [
+                rule for pattern, rule in patterns.items() if re.search(pattern, name)
+            ]
+            if matched:
+                for rule in matched:
+                    project(value[name], rule)
+            elif declaration.get("additionalProperties") is False:
+                del value[name]
+            elif isinstance(declaration.get("additionalProperties"), dict):
+                project(value[name], declaration["additionalProperties"])
+
+    result = deepcopy(rows)
+    for row in result:
+        project(row["value"], root)
+    return result
 
 
 DOCUMENT_NEGATIVE_IDS = {
@@ -1615,7 +1666,11 @@ def document_reference(db, cases, schemas, *, annotation_only=False):
     entries, excluded = [], []
     for case in cases:
         schema = schemas[case["id"]]
-        seeds = document_witness_rows(case["id"]) if annotation_only else SEEDS
+        seeds = (
+            document_schema_seed_rows(document_witness_rows(case["id"]), schema)
+            if annotation_only
+            else SEEDS
+        )
         raw = json.dumps(schema)
         generated_names = {
             name for name, prop in properties(schema).items() if "generated" in prop
@@ -1724,15 +1779,16 @@ def document_reference(db, cases, schemas, *, annotation_only=False):
                 for metadata in properties(native_schema).values():
                     if metadata.get("type") == "json":
                         metadata.update(type="object", additionalProperties=True)
-                entries.append(
-                    {
-                        "id": case["id"],
-                        "schema": schema,
-                        "native_schema": native_schema,
-                        "sqlstate": error.sqlstate,
-                        "final": deepcopy(SEEDS),
-                    }
-                )
+                entry = {
+                    "id": case["id"],
+                    "schema": schema,
+                    "native_schema": native_schema,
+                    "sqlstate": error.sqlstate,
+                    "final": deepcopy(seeds),
+                }
+                if seeds != SEEDS:
+                    entry["seeds"] = seeds
+                entries.append(entry)
             else:
                 excluded.append({"id": case["id"], "reason": str(error)})
     return {

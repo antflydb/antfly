@@ -417,7 +417,7 @@ test "SQL transaction timestamp pgwire pages preserve exact native values and re
                 try std.testing.expect((try OwnedRead.PageOwner.cell(&owner, alloc, 0, 0)).sql_null);
                 const wrong: temporal.Value = .{ .timestamp = try temporal.Timestamp.init(micros) };
                 values[0] = sources.sql_scalar.Datum.typedTemporal(&wrong);
-                try std.testing.expectError(error.UnsupportedSqlShape, OwnedRead.PageOwner.cell(&owner, alloc, 0, 0));
+                try std.testing.expectError(error.InvalidSqlBackendResponse, OwnedRead.PageOwner.cell(&owner, alloc, 0, 0));
             }
         }
     };
@@ -447,7 +447,7 @@ const OwnedRead = struct {
     view_authorities: []const *const @import("sql_read_authority.zig").Context = &.{},
     view_bindings: []const @import("sql_prepared.zig").Binding = &.{},
     detached: bool = false,
-    const Policy = struct { table: []const u8, filter: ?[]const u8, name: ?ast.Name = null, id: u64 = 0, schema_version: u32 = 0, authority_table: ?catalog.Table = null };
+    const Policy = struct { table: []const u8, filter: ?[]const u8, name: ?ast.Name = null, id: u64 = 0, schema_version: u32 = 0, authority_table: ?catalog.Table = null, sql_authorization: ?@import("transactions.zig").TableCommitRequest.SqlAuthorization = null };
 
     fn open(adapter: *Adapter, alloc: std.mem.Allocator, credential: *Credential, request: wire.Request) !?wire.ReadStream {
         const server = adapter.server;
@@ -588,7 +588,7 @@ const OwnedRead = struct {
         const policies = try arena.alloc(Policy, if (binding.relation) |relation| relation.scans.len else if (binding.table != null) 1 else 0);
         for (policies, 0..) |*policy, i| {
             const table = if (binding.relation) |relation| relation.scans[i].table else binding.table.?;
-            policy.* = .{ .table = try arena.dupe(u8, table.physical_name), .filter = try @import("sql_read_authority.zig").filter(arena, table, self.identity) };
+            policy.* = .{ .table = try arena.dupe(u8, table.physical_name), .filter = try @import("sql_read_authority.zig").filter(arena, table, self.identity), .sql_authorization = try @import("sql_authorization_runtime.zig").transactionIntent(&self.native_adapter, table) };
             if (@import("sql_read_authority.zig").context(table)) |value| {
                 var capsule = table;
                 capsule.physical_name = policy.table;
@@ -611,7 +611,8 @@ const OwnedRead = struct {
         self.policies = policies;
         const columns = try arena.alloc(wire.Column, self.stream.context.binding.columns.len);
         var enum_views: std.AutoHashMapUnmanaged(*const catalog.enum_values.View, *const catalog.enum_values.View) = .empty;
-        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(arena, &enum_views, column.enum_view), .temporal_kind = column.temporal_kind };
+        var domain_views: @import("antfly_local_sources").sql_scalar.DomainViews = .empty;
+        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(arena, &enum_views, column.enum_view), .domain_view = try @import("antfly_local_sources").sql_scalar.ownDomainView(arena, &domain_views, column.domain_view), .temporal_kind = column.temporal_kind };
         self.columns = columns;
         self.plan = plan;
         self.admission = admission;
@@ -641,6 +642,7 @@ const OwnedRead = struct {
         var current: ?http.AuthenticatedIdentity = try self.authority.credential.identity(self.adapter.server.alloc);
         defer current.?.deinit(self.adapter.server.alloc);
         for (self.view_authorities) |value| try @import("sql_read_authority.zig").validateGrants(alloc, value);
+        try self.validateSqlPolicies(alloc, request, current.?);
         try validatePolicies(self.adapter.server.alloc, &current.?, self.identity.?, self.policies);
         var authority: Authority = .{ .credential = self.authority.credential, .identity = &current, .request = request };
         var adapter: execution.Adapter = .{ .server = self.adapter.server, .identity = &current, .context = try authority.context(), .database = original.database.?, .namespace = original.namespace.? };
@@ -684,6 +686,7 @@ const OwnedRead = struct {
         var fresh = try self.authority.credential.identity(alloc);
         defer fresh.deinit(alloc);
         for (self.view_authorities) |value| try @import("sql_read_authority.zig").validateGrants(alloc, value);
+        try self.validateSqlPolicies(alloc, request, fresh);
         try validatePolicies(alloc, &fresh, self.identity.?, self.policies);
         var page = try self.stream.nextBatch(limit);
         errdefer page.deinit();
@@ -728,6 +731,25 @@ const OwnedRead = struct {
         }
     }
 
+    fn validateSqlPolicies(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request, fresh: http.AuthenticatedIdentity) !void {
+        const sessions = @import("transactions.zig");
+        var region = std.heap.ArenaAllocator.init(alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        var tables: std.ArrayList(sessions.TableCommitRequest) = .empty;
+        var bindings: std.ArrayListUnmanaged(sessions.CatalogBinding) = .empty;
+        for (self.policies) |policy| if (policy.sql_authorization) |intent| {
+            const name = policy.name orelse return error.InvalidSqlBackendResponse;
+            const logical = try (@import("antfly_local_sources").system_catalog_domain.Target{ .database = name.database.?, .namespace = name.namespace.?, .table = name.table }).resourceNameAlloc(a);
+            try tables.append(a, .{ .table_name = logical, .schema_version = policy.schema_version, .sql_authorization = intent });
+            try bindings.append(a, .{ .logical = logical, .physical = policy.table });
+        };
+        if (tables.items.len == 0) return;
+        var authority = self.authority;
+        authority.request = request;
+        _ = try @import("sql_authorization_runtime.zig").TransactionScope.init(self.adapter.server, fresh, try authority.context(), a, .{ .tables = tables.items, .catalog_bindings = bindings });
+    }
+
     fn validatePolicies(alloc: std.mem.Allocator, fresh: *http.AuthenticatedIdentity, admitted: http.AuthenticatedIdentity, policies: []const Policy) !void {
         // The catalog resolves logical resources to private physical names.
         // Reapply only the pinned aliases to fresh authority, never its old
@@ -739,7 +761,7 @@ const OwnedRead = struct {
                 try @import("sql_read_authority.zig").validateFilters(alloc, table, fresh.*, policy.filter);
                 continue;
             }
-            if (!(try http.tablePermissionCurrentlyAllowed(fresh.*, policy.table, .read))) return error.Forbidden;
+            if (policy.sql_authorization == null and !(try http.tablePermissionCurrentlyAllowed(fresh.*, policy.table, .read))) return error.Forbidden;
             const filter = try http.resolveEffectiveRowFilterJson(alloc, fresh.*, policy.table);
             defer if (filter) |value| alloc.free(value);
             if ((filter == null) != (policy.filter == null) or
@@ -767,6 +789,11 @@ const OwnedRead = struct {
                 return .{ .json_bytes = bytes, .sql_null = false };
             }
             const value = try self.page.values.cell(alloc, row, column);
+            if (value.bytes()) |bytes| {
+                try value.validateTemporal();
+                if (self.page.columns[column].type != .bytea) return error.InvalidSqlBackendResponse;
+                return .{ .bytea = bytes, .sql_null = false };
+            }
             if (value.enumeration()) |atom| {
                 try value.validateTemporal();
                 return .{ .enumeration = atom, .sql_null = false };
@@ -892,6 +919,7 @@ const Credential = struct {
     manager: *usermgr.UserManager,
     username: []u8,
     principal: []u8,
+    user_instance_id: [16]u8,
     verifier_mac: [Mac.mac_length]u8,
 
     fn sessionPrincipal(self: *const Credential) []const u8 {
@@ -914,7 +942,7 @@ const Credential = struct {
         errdefer alloc.free(principal);
         var verifier_mac: [Mac.mac_length]u8 = undefined;
         Mac.create(&verifier_mac, credential_domain, user.password_hash);
-        self.* = .{ .manager = manager, .username = name, .principal = principal, .verifier_mac = verifier_mac };
+        self.* = .{ .manager = manager, .username = name, .principal = principal, .verifier_mac = verifier_mac, .user_instance_id = user.instance_id };
         // Detect rotation/deletion between snapshot, expensive verification,
         // and session publication without retaining either password or hash.
         try self.validate();
@@ -922,6 +950,8 @@ const Credential = struct {
     }
 
     pub fn validate(self: *const Credential) !void {
+        const instance = self.manager.currentUserInstance(self.username) catch return error.Unauthorized;
+        if (!std.mem.eql(u8, &instance, &self.user_instance_id)) return error.Unauthorized;
         const current = self.manager.destinationGrantMac(self.principal, credential_domain) catch return error.Unauthorized;
         if (!std.crypto.timing_safe.eql([Mac.mac_length]u8, current, self.verifier_mac)) return error.Unauthorized;
     }
@@ -960,6 +990,7 @@ const Credential = struct {
                 .metadata_json = user.metadata_json,
                 .roles = roles,
                 .live_user_manager = self.manager,
+                .user_instance_id = user.instance_id,
             })).?;
         };
         var owned = result;
@@ -1045,7 +1076,7 @@ const Job = struct {
         const compiled = &effective;
         const write = self.kind == .execute and switch (compiled.statement) {
             .select, .explain, .copy_to, .copy_from => false,
-            .call, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction => true,
+            .call, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction, .prepared_transaction => true,
         };
         const server = self.adapter.server;
         var admission = try server.acquireSqlExecution(write);
@@ -1091,10 +1122,11 @@ const Job = struct {
             .expected_guard = self.request.binding_guard,
         };
         var enum_views: std.AutoHashMapUnmanaged(*const catalog.enum_values.View, *const catalog.enum_values.View) = .empty;
+        var domain_views: @import("antfly_local_sources").sql_scalar.DomainViews = .empty;
         self.request.parameter_descriptors = try @import("sql_type_schema.zig").parameterDescriptorsLeaky(server, self.alloc, identity, context, self.request.parameter_descriptors, self.request.parameter_oids);
         if (self.kind == .describe) {
             switch (compiled.statement) {
-                .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction => {
+                .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction, .prepared_transaction => {
                     if (self.request.parameter_types.len != 0) return error.InvalidSqlParameters;
                     self.description = .{ .columns = &.{} };
                     return;
@@ -1119,7 +1151,7 @@ const Job = struct {
             var description = try describe_sql.describe(self.request.scratch_allocator orelse self.alloc, if (copy_input) |input| input.binding_backend else describe_backend, if (copy_input) |*input| &input.compiled else compiled, if (copy_input != null) &.{} else hints);
             defer description.deinit();
             const columns = try self.alloc.alloc(wire.Column, description.binding.columns.len);
-            for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, column.enum_view), .temporal_kind = column.temporal_kind };
+            for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, column.enum_view), .domain_view = try @import("antfly_local_sources").sql_scalar.ownDomainView(self.alloc, &domain_views, column.domain_view), .temporal_kind = column.temporal_kind };
             const parameter_types = try self.alloc.alloc(wire.Type, description.binding.parameter_types.len);
             for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| try wireType(value) else .unknown;
             const copy_columns = if (copy_input) |input| blk: {
@@ -1128,14 +1160,20 @@ const Job = struct {
                 for (selected, input.compiled.statement.insert.columns) |*out, name| {
                     const column = try target.column(name);
                     if (column.generated) return error.SqlGeneratedColumnWrite;
-                    out.* = .{ .defaulted = column.defaulted, .name = try self.alloc.dupe(u8, name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, column.enum_view), .temporal_kind = column.temporal_kind };
+                    out.* = .{ .defaulted = column.defaulted, .name = try self.alloc.dupe(u8, name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, column.enum_view), .domain_view = try @import("antfly_local_sources").sql_scalar.ownDomainView(self.alloc, &domain_views, column.domain_view), .temporal_kind = column.temporal_kind };
                 }
                 break :blk selected;
             } else null;
             const owned_descriptors = try self.alloc.dupe(wire.Parameter, description.binding.parameter_descriptors);
-            for (owned_descriptors) |*descriptor| descriptor.enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, descriptor.enum_view);
+            for (owned_descriptors) |*descriptor| {
+                descriptor.enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, descriptor.enum_view);
+                if (try @import("antfly_local_sources").sql_scalar.ownDomainView(self.alloc, &domain_views, descriptor.domainView())) |view| descriptor.domain_binding = &view.type_binding;
+            }
             const filter_descriptors: []const wire.Parameter = if (description.binding.copy_filter) |filter| try self.alloc.dupe(wire.Parameter, filter.parameter_descriptors) else &.{};
-            for (@constCast(filter_descriptors)) |*descriptor| descriptor.enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, descriptor.enum_view);
+            for (@constCast(filter_descriptors)) |*descriptor| {
+                descriptor.enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, descriptor.enum_view);
+                if (try @import("antfly_local_sources").sql_scalar.ownDomainView(self.alloc, &domain_views, descriptor.domainView())) |view| descriptor.domain_binding = &view.type_binding;
+            }
             const filter_types = try self.alloc.alloc(wire.Type, filter_descriptors.len);
             for (filter_descriptors, filter_types) |descriptor, *out| out.* = if (descriptor.kind) |kind| try wireType(kind) else .unknown;
             self.description = .{
@@ -1182,7 +1220,7 @@ const Job = struct {
             }
         };
         const columns = try self.alloc.alloc(wire.Column, result.output.columns.len);
-        for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, column.enum_view), .temporal_kind = column.temporal_kind };
+        for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, column.enum_view), .domain_view = try @import("antfly_local_sources").sql_scalar.ownDomainView(self.alloc, &domain_views, column.domain_view), .temporal_kind = column.temporal_kind };
         const native_owner = if (result.output.native_rows != null) try result.state.arena.allocator().create(NativeResultCells) else null;
         if (native_owner) |owner| owner.* = .{ .result = result };
         self.result = .{
@@ -1371,6 +1409,11 @@ const NativeResultCells = struct {
         const rows = self.result.output.native_rows orelse return error.InvalidSqlBackendResponse;
         if (row >= rows.len or column >= self.result.output.columns.len or rows[row].len != self.result.output.columns.len) return error.InvalidSqlBackendResponse;
         const datum = rows[row][column];
+        if (datum.bytes()) |bytes| {
+            try datum.validateTemporal();
+            if (self.result.output.columns[column].type != .bytea) return error.InvalidSqlBackendResponse;
+            return .{ .bytea = bytes, .sql_null = false };
+        }
         if (datum.enumeration()) |atom| {
             try datum.validateTemporal();
             return .{ .enumeration = atom, .sql_null = false };

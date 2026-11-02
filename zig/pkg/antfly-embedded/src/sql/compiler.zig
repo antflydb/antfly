@@ -48,6 +48,8 @@ pub const Error = std.mem.Allocator.Error || error{
     SqlInvalidTextRepresentation,
     SqlNumericOutOfRange,
     SqlInvalidFunctionDefinition,
+    SqlTriggerDeclaredArguments,
+    SqlTriggerSqlLanguage,
 };
 
 test "compiler sequence originals preserve typed options and never bind ownership during parsing" {
@@ -245,7 +247,6 @@ test "SQL routine declaration admission consumes grammar before missing-body dia
     // A valid body is not an activated routine. Unknown languages/signatures
     // and SUPPORT names require authoritative catalog resolution, not guesses.
     for ([_][]const u8{
-        "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$",
         "CREATE FUNCTION f() RETURNS trigger LANGUAGE unknown_language",
         "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql SUPPORT missing_support",
     }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(a, sql, .{}));
@@ -836,9 +837,9 @@ const Parser = struct {
             try self.expect(.lparen);
             const operand = try self.scalar(depth + 1, 0);
             try self.expectKeyword(.as);
-            const kind = try self.castType();
+            const kind = try self.scalarCastType();
             try self.expect(.rparen);
-            left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier, .temporal_kind = kind.temporal_kind } });
+            left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind.type, .named_type = kind.named_type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier, .temporal_kind = kind.temporal_kind } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "array") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) {
             self.pos += 1;
             left = try self.arrayConstructor(depth + 1);
@@ -1095,8 +1096,8 @@ const Parser = struct {
             if (self.peek(.colon_colon)) {
                 if (minimum > 8) break;
                 self.pos += 1;
-                const kind = try self.castType();
-                left = try self.scalarNode(.{ .cast = .{ .operand = left, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier, .temporal_kind = kind.temporal_kind } });
+                const kind = try self.scalarCastType();
+                left = try self.scalarNode(.{ .cast = .{ .operand = left, .type = kind.type, .named_type = kind.named_type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier, .temporal_kind = kind.temporal_kind } });
                 continue;
             }
             // PostgreSQL's postfix spellings share the ordinary IS NULL
@@ -2274,7 +2275,7 @@ const Parser = struct {
         return self.scalarNode(.{ .call = .{ .name = "$array_pattern_quantified", .args = try self.alloc.dupe(*const ast.Scalar, &.{ operand, input, all_node, insensitive_node, negated_node }) } });
     }
 
-    const CastType = struct { type: ast.ColumnType, temporal_kind: ?@import("temporal_value.zig").Kind = null, element_type: ?@import("array_value.zig").ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
+    const CastType = struct { named_type: ?ast.Name = null, type: ast.ColumnType, temporal_kind: ?@import("temporal_value.zig").Kind = null, element_type: ?@import("array_value.zig").ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
 
     fn numericModifier(self: *Parser) Error!?@import("../common/sql_builtin_type.zig").NumericModifier {
         if (!self.take(.lparen)) return null;
@@ -2299,6 +2300,24 @@ const Parser = struct {
         const scale = if (count == 2) casts.integerText(arguments[1], .int32) catch |err| return self.fail(if (err == error.SqlNumericOutOfRange) error.SqlNumericOutOfRange else error.SqlInvalidTextRepresentation, "invalid NUMERIC scale") else 0;
         if (precision < 1 or precision > 1000 or scale < -1000 or scale > 1000) return self.fail(error.SqlInvalidParameterValue, "NUMERIC precision must be 1..1000 and scale -1000..1000");
         return .{ .precision = @intCast(precision), .scale = @intCast(scale) };
+    }
+
+    fn scalarCastType(self: *Parser) Error!CastType {
+        const start = self.pos;
+        // Qualified or quoted names are catalog identities, not builtin aliases.
+        const named = self.peek(.identifier) and (self.tokens[self.pos].owned or
+            (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .dot));
+        if (!named) return self.castType() catch |err| {
+            if (err != error.UnsupportedSqlShape) return err;
+            self.pos = start;
+            return self.namedCastType();
+        };
+        return self.namedCastType();
+    }
+    fn namedCastType(self: *Parser) Error!CastType {
+        const intent = try self.name();
+        if (self.peek(.lbracket)) return self.fail(error.UnsupportedSqlShape, "named type arrays require an executable array layout");
+        return .{ .type = .enumeration, .named_type = intent };
     }
 
     fn castType(self: *Parser) Error!CastType {
@@ -2384,7 +2403,7 @@ const Parser = struct {
             .{ "numrange", ast.ColumnType.numrange },    .{ "daterange", ast.ColumnType.daterange },
             .{ "tsrange", ast.ColumnType.tsrange },      .{ "tstzrange", ast.ColumnType.tstzrange },
             .{ "timestamptz", ast.ColumnType.datetime }, .{ "json", ast.ColumnType.json },
-            .{ "jsonb", ast.ColumnType.json },
+            .{ "jsonb", ast.ColumnType.json },           .{ "bytea", ast.ColumnType.bytea },
         };
         inline for (pairs) |pair| if (std.ascii.eqlIgnoreCase(t.text, pair[0])) return pair[1];
         if (std.ascii.eqlIgnoreCase(t.text, "double")) {
@@ -2422,7 +2441,14 @@ const Parser = struct {
                 }, .nullable = false, .sequence = .{ .column = name_value, .generation = .serial, .options = .{ .integer = width } } };
             }
         }
-        const declared = try self.castType();
+        const type_start = self.pos;
+        const declared = self.castType() catch |err| {
+            if (err != error.UnsupportedSqlShape) return err;
+            self.pos = type_start;
+            const unresolved = try self.name();
+            if (self.peek(.lbracket)) return self.fail(error.UnsupportedSqlShape, "named array columns require an executable array domain");
+            return .{ .name = name_value, .type = .enumeration, .named_type = unresolved };
+        };
         if (declared.temporal_kind != null) return self.fail(error.UnsupportedSqlShape, "persistent temporal subtype requires native storage support");
         return .{ .name = name_value, .type = declared.type, .element_type = declared.element_type, .numeric_modifier = declared.numeric_modifier };
     }
@@ -2437,10 +2463,32 @@ const Parser = struct {
         try self.expect(.lparen);
         var columns = std.ArrayList(ast.Column).empty;
         var constraints = std.ArrayList(ast.SchemaChange).empty;
+        var like_tables = std.ArrayList(ast.LikeTable).empty;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         if (!self.peek(.rparen)) {
             while (true) {
                 try self.node();
+                if (self.keyword(.like)) {
+                    var copied: ast.LikeTable = .{ .source = try self.name(), .column_offset = columns.items.len };
+                    while (true) {
+                        const include = if (self.ddlWord("INCLUDING")) true else if (self.ddlWord("EXCLUDING")) false else break;
+                        if (self.ddlWord("ALL")) {
+                            copied.options.setAll(include);
+                            continue;
+                        }
+                        var matched = false;
+                        inline for (comptime std.meta.tags(ast.LikeOption)) |option| {
+                            if (!matched and self.ddlWord(@tagName(option))) {
+                                copied.options.set(option, include);
+                                matched = true;
+                            }
+                        }
+                        if (!matched) return self.fail(error.InvalidSqlSyntax, "expected a LIKE INCLUDING or EXCLUDING option");
+                    }
+                    try like_tables.append(self.alloc, copied);
+                    if (!self.take(.comma)) break;
+                    continue;
+                }
                 if (self.keyword(.constraint)) {
                     try constraints.append(self.alloc, try self.tableConstraint());
                     if (!self.take(.comma)) break;
@@ -2514,12 +2562,12 @@ const Parser = struct {
                         definition.nullable = false;
                         break;
                     }
-                } else return self.fail(error.InvalidSqlSyntax, "primary key references an unknown column");
+                } else if (like_tables.items.len == 0) return self.fail(error.InvalidSqlSyntax, "primary key references an unknown column");
             }
         };
         try self.normalizeUniqueConstraints(&constraints);
         try self.disambiguateGeneratedConstraintLabels(constraints.items);
-        return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .constraints = try constraints.toOwnedSlice(self.alloc), .if_not_exists = if_not_exists, .tablespace = tablespace, .document = document_definition };
+        return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .constraints = try constraints.toOwnedSlice(self.alloc), .like_tables = try like_tables.toOwnedSlice(self.alloc), .if_not_exists = if_not_exists, .tablespace = tablespace, .document = document_definition };
     }
 
     const DocumentOptions = struct { enabled: bool = false, default_type: ?[]const u8 = null, enforce_types: bool = false };
@@ -3125,12 +3173,17 @@ const Parser = struct {
         if (self.keyword(.to)) {
             ddl.roles_specified = true;
             var roles: std.ArrayList([]const u8) = .empty;
+            var targets: std.ArrayList(ast.Authorization.Grantee) = .empty;
             while (true) {
                 if (roles.items.len >= 256) return self.fail(error.SqlLimitExceeded, "too many policy roles");
-                try roles.append(self.alloc, if (self.ddlWord("PUBLIC")) "PUBLIC" else try self.identifier());
+                const public = self.ddlWord("PUBLIC");
+                const role = if (public) "PUBLIC" else try self.identifier();
+                try roles.append(self.alloc, role);
+                try targets.append(self.alloc, if (public) .public else .{ .role = role });
                 if (!self.take(.comma)) break;
             }
             ddl.roles = try roles.toOwnedSlice(self.alloc);
+            ddl.role_targets = try targets.toOwnedSlice(self.alloc);
         }
         if (self.ddlWord("USING")) {
             ddl.using_specified = true;
@@ -3155,6 +3208,34 @@ const Parser = struct {
                 ddl.with_check = ddl.using orelse truth;
         }
         return ddl;
+    }
+
+    fn nativeIndexTail(self: *Parser, index_name: []const u8, table_name: ast.Name, conditional: bool, concurrently: bool) Error!ast.CatalogDdl {
+        try self.expect(.lparen);
+        const column_name = try self.identifier();
+        try self.expect(.rparen);
+        var analyzer: []const u8 = "standard";
+        var seen: u4 = 0;
+        if (self.keyword(.with)) {
+            try self.expect(.lparen);
+            while (true) {
+                const key = try self.identifier();
+                try self.expect(.eq);
+                const option_value = try self.value();
+                const bit: u4 = if (std.ascii.eqlIgnoreCase(key, "analyzer")) 1 else if (std.ascii.eqlIgnoreCase(key, "scoring")) 2 else if (std.ascii.eqlIgnoreCase(key, "highlight")) 4 else if (std.ascii.eqlIgnoreCase(key, "snippet")) 8 else return self.fail(error.UnsupportedSqlShape, "unsupported native full-text index option");
+                if (seen & bit != 0) return self.fail(error.InvalidSqlSyntax, "duplicate native index option");
+                seen |= bit;
+                if (bit == 1) {
+                    if (option_value != .string or !std.mem.eql(u8, option_value.string, "standard")) return self.fail(error.UnsupportedSqlShape, "SQL native full-text indexes currently require the standard analyzer");
+                    analyzer = option_value.string;
+                } else if (bit == 2) {
+                    if (option_value != .string or !std.ascii.eqlIgnoreCase(option_value.string, "bm25")) return self.fail(error.UnsupportedSqlShape, "native full-text scoring is BM25");
+                } else if (option_value != .boolean or !option_value.boolean) return self.fail(error.UnsupportedSqlShape, "native full-text positions support highlight and snippet together");
+                if (!self.take(.comma)) break;
+            }
+            try self.expect(.rparen);
+        }
+        return .{ .kind = .index, .action = .create, .name = .{ .table = index_name }, .index_table = table_name, .conditional = conditional, .concurrently = concurrently, .native_index = .{ .field = column_name, .analyzer = analyzer } };
     }
 
     fn indexDdl(self: *Parser, create: bool, unique: bool) Error!ast.CatalogDdl {
@@ -3185,6 +3266,21 @@ const Parser = struct {
         const index_name = try self.identifier();
         try self.expectKeyword(.on);
         const table_name = try self.tableReferenceName();
+        if (self.ddlWord("USING")) {
+            const method = try self.identifier();
+            if (std.ascii.eqlIgnoreCase(method, "antfly_full_text")) {
+                if (unique) return self.fail(error.UnsupportedSqlShape, "full-text indexes cannot enforce uniqueness");
+                return self.nativeIndexTail(index_name, table_name, conditional, concurrently);
+            }
+            if (!std.ascii.eqlIgnoreCase(method, "btree")) {
+                // Empty key lists are invalid even for unavailable methods.
+                // Other methods can have their own operator-class grammar;
+                // do not misdiagnose valid GIN syntax as malformed btree SQL.
+                try self.expect(.lparen);
+                if (self.take(.rparen)) return self.fail(error.InvalidSqlSyntax, "an index requires at least one key");
+                return self.fail(error.UnsupportedSqlShape, "unsupported index access method");
+            }
+        }
         try self.expect(.lparen);
         var keys = std.ArrayList(ast.Order).empty;
         while (true) {
@@ -3334,6 +3430,106 @@ const Parser = struct {
         if (!self.peek(.string)) return self.fail(error.InvalidSqlSyntax, "enum labels require string literals");
         return (try self.value()).string;
     }
+    fn domainCheck(self: *Parser, name_value: ?[]const u8, allow_not_valid: bool) Error!ast.DomainCheck {
+        if (!self.ddlWord("CHECK")) return self.fail(error.InvalidSqlSyntax, "domain constraints require CHECK");
+        try self.expect(.lparen);
+        const expression = try self.scalar(0, 0);
+        try self.expect(.rparen);
+        try self.checkScalarDepth(expression, 0);
+        try self.persistentExpression(expression, true);
+        var result: ast.DomainCheck = .{ .name = name_value, .expression = expression };
+        if (allow_not_valid and self.keyword(.not)) {
+            if (!self.ddlWord("VALID")) return self.fail(error.InvalidSqlSyntax, "expected VALID");
+            result.not_valid = true;
+        }
+        return result;
+    }
+
+    fn domainDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {
+        var conditional = false;
+        if (action == .drop and self.keyword(.@"if")) {
+            try self.expectKeyword(.exists);
+            conditional = true;
+        }
+        var ddl: ast.CatalogDdl = .{ .kind = .named_type, .named_type_kind = .domain, .action = action, .name = try self.name(), .conditional = conditional };
+        switch (action) {
+            .create => {
+                _ = self.keyword(.as);
+                const base = try self.scalarCastType();
+                var column: ast.Column = .{ .name = "value", .type = base.type, .named_type = base.named_type, .element_type = base.element_type, .numeric_modifier = base.numeric_modifier };
+                var checks: std.ArrayList(ast.DomainCheck) = .empty;
+                var has_default = false;
+                var null_clause: ?bool = null;
+                while (true) {
+                    if (self.keyword(.default)) {
+                        if (has_default) return self.fail(error.InvalidSqlSyntax, "multiple domain defaults");
+                        has_default = true;
+                        column.default_expression = try self.scalar(0, 0);
+                        try self.persistentExpression(column.default_expression.?, false);
+                    } else if (self.keyword(.not)) {
+                        try self.expectKeyword(.null);
+                        if (null_clause == true) return self.fail(error.InvalidSqlSyntax, "conflicting domain nullability");
+                        null_clause = false;
+                        column.nullable = false;
+                    } else if (self.keyword(.null)) {
+                        if (null_clause == false) return self.fail(error.InvalidSqlSyntax, "conflicting domain nullability");
+                        null_clause = true;
+                        column.nullable = true;
+                    } else {
+                        const named = self.ddlWord("CONSTRAINT");
+                        const name_value = if (named) try self.identifier() else null;
+                        if (!named and !self.ddlWord("CHECK")) break;
+                        if (!named) self.pos -= 1;
+                        if (checks.items.len >= @import("../system_catalog/domain_types.zig").max_checks) return self.fail(error.SqlLimitExceeded, "domain constraint count limit exceeded");
+                        try checks.append(self.alloc, try self.domainCheck(name_value, false));
+                    }
+                }
+                ddl.domain_definition = .{ .create = .{ .base = column, .checks = try checks.toOwnedSlice(self.alloc) } };
+            },
+            .alter_schema => {
+                if (self.keyword(.set)) {
+                    if (self.keyword(.not)) {
+                        try self.expectKeyword(.null);
+                        ddl.domain_definition = .{ .set_not_null = true };
+                    } else {
+                        try self.expectKeyword(.default);
+                        const expression = try self.scalar(0, 0);
+                        try self.persistentExpression(expression, false);
+                        ddl.domain_definition = .{ .set_default = expression };
+                    }
+                } else if (self.keyword(.drop)) {
+                    if (self.keyword(.not)) {
+                        try self.expectKeyword(.null);
+                        ddl.domain_definition = .{ .set_not_null = false };
+                    } else if (self.keyword(.default)) {
+                        ddl.domain_definition = .{ .set_default = null };
+                    } else {
+                        if (!self.ddlWord("CONSTRAINT")) return self.fail(error.InvalidSqlSyntax, "expected domain constraint");
+                        const if_exists = self.keyword(.@"if");
+                        if (if_exists) try self.expectKeyword(.exists);
+                        const name_value = try self.identifier();
+                        const cascade = self.ddlWord("CASCADE");
+                        if (!cascade) _ = self.ddlWord("RESTRICT");
+                        ddl.domain_definition = .{ .drop_check = .{ .name = name_value, .if_exists = if_exists, .cascade = cascade } };
+                    }
+                } else if (self.keyword(.add)) {
+                    const named = self.ddlWord("CONSTRAINT");
+                    const name_value = if (named) try self.identifier() else null;
+                    ddl.domain_definition = .{ .add_check = try self.domainCheck(name_value, true) };
+                } else if (self.ddlWord("VALIDATE")) {
+                    if (!self.ddlWord("CONSTRAINT")) return self.fail(error.InvalidSqlSyntax, "expected CONSTRAINT");
+                    ddl.domain_definition = .{ .validate_check = try self.identifier() };
+                } else return self.fail(error.UnsupportedSqlShape, "this domain alteration requires a catalog transformation");
+            },
+            .drop => {
+                ddl.cascade = self.ddlWord("CASCADE");
+                if (!ddl.cascade) _ = self.ddlWord("RESTRICT");
+            },
+            else => unreachable,
+        }
+        return ddl;
+    }
+
     fn enumDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {
         var conditional = false;
         if (action == .drop and self.keyword(.@"if")) {
@@ -3564,9 +3760,11 @@ const Parser = struct {
             try self.expect(.comma);
         };
         var result: ?ast.RoutineDefinition.Type = null;
+        var returns_trigger = false;
         if (!procedure) {
             if (!self.ddlWord("RETURNS")) return self.fail(error.InvalidSqlSyntax, "a function requires RETURNS");
-            if (!self.ddlWord("TRIGGER") and !self.ddlWord("VOID")) {
+            returns_trigger = self.ddlWord("TRIGGER");
+            if (!returns_trigger and !self.ddlWord("VOID")) {
                 const declared = try self.castType();
                 if (declared.numeric_modifier != null) return self.fail(error.UnsupportedSqlShape, "routine type modifiers require declaration notices");
                 result = .{ .kind = declared.type, .element_type = declared.element_type, .temporal_kind = declared.temporal_kind };
@@ -3576,7 +3774,7 @@ const Parser = struct {
         var body: ?[]const u8 = null;
         var strict = false;
         var volatility: @FieldType(ast.RoutineDefinition, "volatility") = .@"volatile";
-        var supported = procedure or result != null;
+        var supported = procedure or result != null or returns_trigger;
         var seen: u16 = 0;
         while (self.pos < self.tokens.len and !self.peek(.semicolon)) {
             var option: u4 = undefined;
@@ -3663,8 +3861,12 @@ const Parser = struct {
         if (language) |name_| if (std.mem.eql(u8, name_, "plpgsql") or std.mem.eql(u8, name_, "sql")) {
             if (body == null) return self.fail(error.SqlInvalidFunctionDefinition, "no function body specified");
         };
-        if (supported and language != null and body != null and (std.mem.eql(u8, language.?, "sql") or (procedure and std.mem.eql(u8, language.?, "plpgsql"))))
-            return .{ .catalog_ddl = .{ .kind = if (procedure) .procedure else .function, .action = .create, .name = name_value, .routine = .{ .arguments = try arguments.toOwnedSlice(self.alloc), .result = result, .language = if (std.mem.eql(u8, language.?, "sql")) .sql else .plpgsql, .body = try self.alloc.dupe(u8, body.?), .replace = replace, .strict = strict, .volatility = volatility } } };
+        if (returns_trigger and language != null) {
+            if (std.mem.eql(u8, language.?, "sql")) return self.fail(error.SqlTriggerSqlLanguage, "SQL functions cannot return type trigger");
+            if (std.mem.eql(u8, language.?, "plpgsql") and arguments.items.len != 0) return self.fail(error.SqlTriggerDeclaredArguments, "trigger functions cannot have declared arguments");
+        }
+        if (supported and language != null and body != null and (std.mem.eql(u8, language.?, "sql") or ((procedure or returns_trigger) and std.mem.eql(u8, language.?, "plpgsql"))))
+            return .{ .catalog_ddl = .{ .kind = if (procedure) .procedure else .function, .action = .create, .name = name_value, .routine = .{ .arguments = try arguments.toOwnedSlice(self.alloc), .result = result, .returns_trigger = returns_trigger, .language = if (std.mem.eql(u8, language.?, "sql")) .sql else .plpgsql, .body = try self.alloc.dupe(u8, body.?), .replace = replace, .strict = strict, .volatility = volatility } } };
         return self.fail(error.UnsupportedSqlShape, "routine language or execution options are not supported");
     }
 
@@ -3839,6 +4041,12 @@ const Parser = struct {
         return .{ .add_foreign_key = foreign };
     }
 
+    fn preparedGid(self: *Parser) Error![]const u8 {
+        const value_ = try self.value();
+        if (value_ != .string) return self.fail(error.InvalidSqlSyntax, "prepared transaction requires a string GID");
+        return value_.string;
+    }
+
     fn copyString(self: *Parser) Error![]const u8 {
         const value_ = try self.value();
         if (value_ != .string) return self.fail(error.InvalidSqlSyntax, "COPY option requires a string");
@@ -3986,6 +4194,54 @@ const Parser = struct {
         return .{ .copy_to = .{ .query = query, .options = options, .implicit_columns = implicit_columns } };
     }
 
+    fn maintenance(self: *Parser, operation: @FieldType(ast.Maintenance, "operation")) Error!ast.CatalogDdl {
+        var intent: ast.Maintenance = .{ .operation = operation };
+        var kind: @FieldType(ast.CatalogDdl, "kind") = .table;
+        var concurrent = false;
+        if (operation == .vacuum) {
+            if (self.take(.lparen)) {
+                var seen: u8 = 0;
+                while (true) {
+                    const flag: u8 = if (self.ddlWord("FULL")) 1 else if (self.ddlWord("VERBOSE")) 2 else if (self.ddlWord("ANALYZE")) 4 else return self.fail(error.UnsupportedSqlShape, "unsupported VACUUM option");
+                    if (seen & flag != 0) return self.fail(error.InvalidSqlSyntax, "duplicate VACUUM option");
+                    seen |= flag;
+                    const enabled = try self.explainBoolean();
+                    switch (flag) {
+                        1 => intent.full = enabled,
+                        2 => intent.verbose = enabled,
+                        4 => intent.analyze = enabled,
+                        else => unreachable,
+                    }
+                    if (self.take(.rparen)) break;
+                    try self.expect(.comma);
+                }
+            } else {
+                intent.full = self.ddlWord("FULL");
+                intent.verbose = self.ddlWord("VERBOSE");
+                intent.analyze = self.ddlWord("ANALYZE");
+            }
+        } else if (operation == .analyze) {
+            intent.verbose = self.ddlWord("VERBOSE");
+        } else {
+            if (self.ddlWord("INDEX")) kind = .index else if (!self.ddlWord("TABLE")) return self.fail(error.UnsupportedSqlShape, "REINDEX requires TABLE or INDEX");
+            concurrent = self.ddlWord("CONCURRENTLY");
+        }
+        const target = try self.name();
+        if (operation == .analyze or intent.analyze) if (self.take(.lparen)) {
+            var columns: std.ArrayList([]const u8) = .empty;
+            while (true) {
+                if (columns.items.len >= 1024) return error.SqlLimitExceeded;
+                const column = try self.identifier();
+                for (columns.items) |prior| if (std.mem.eql(u8, prior, column)) return error.DuplicateSqlColumn;
+                try columns.append(self.alloc, column);
+                if (self.take(.rparen)) break;
+                try self.expect(.comma);
+            }
+            intent.columns = try columns.toOwnedSlice(self.alloc);
+        };
+        return .{ .kind = kind, .action = .maintenance, .name = target, .concurrently = concurrent, .maintenance = intent };
+    }
+
     fn explainBoolean(self: *Parser) Error!bool {
         if (self.keyword(.on) or self.keyword(.true)) return true;
         if (self.keyword(.off) or self.keyword(.false)) return false;
@@ -4005,6 +4261,8 @@ const Parser = struct {
     }
 
     fn statement(self: *Parser) Error!ast.Statement {
+        if (self.ddlWord("GRANT")) return .{ .catalog_ddl = try self.authorizationDdl(false, null) };
+        if (self.ddlWord("REVOKE")) return .{ .catalog_ddl = try self.authorizationDdl(true, null) };
         if (self.ddlWord("CALL")) {
             const name_value = try self.name();
             try self.expect(.lparen);
@@ -4021,6 +4279,9 @@ const Parser = struct {
         }
         try self.node();
         if (self.ddlWord("COPY")) return self.copyTo();
+        if (self.ddlWord("VACUUM")) return .{ .catalog_ddl = try self.maintenance(.vacuum) };
+        if (self.ddlWord("ANALYZE")) return .{ .catalog_ddl = try self.maintenance(.analyze) };
+        if (self.ddlWord("REINDEX")) return .{ .catalog_ddl = try self.maintenance(.reindex) };
         if (self.keyword(.explain)) {
             const inner = try self.alloc.create(ast.Statement);
             var options: ast.Explain = .{ .statement = inner, .analyze = self.keyword(.analyze) };
@@ -4207,8 +4468,13 @@ const Parser = struct {
                 ddl.comment_value = if (annotation_text == .string) annotation_text.string else null;
                 return .{ .catalog_ddl = ddl };
             }
+            const domain_comment = self.ddlWord("DOMAIN");
             const column_comment = self.keyword(.column);
-            const kind: @FieldType(ast.CatalogDdl, "kind") = if (column_comment or self.keyword(.table)) .table else if (self.keyword(.schema)) .namespace else if (self.keyword(.database)) .database else return self.fail(error.UnsupportedSqlShape, "this comment target requires catalog annotation support");
+            const constraint_comment = self.ddlWord("CONSTRAINT");
+            const constraint_name = if (constraint_comment) try self.identifier() else null;
+            if (constraint_comment) try self.expectKeyword(.on);
+            const index_comment = !constraint_comment and self.keyword(.index);
+            const kind: @FieldType(ast.CatalogDdl, "kind") = if (constraint_comment) .table else if (index_comment) .index else if (column_comment or self.keyword(.table)) .table else if (self.keyword(.schema)) .namespace else if (self.keyword(.database)) .database else if (domain_comment or self.ddlWord("TYPE")) .named_type else return self.fail(error.UnsupportedSqlShape, "this comment target requires catalog annotation support");
             var comment_column: ?[]const u8 = null;
             const target = if (column_comment) column_target: {
                 var parts: [4][]const u8 = undefined;
@@ -4223,16 +4489,18 @@ const Parser = struct {
                 comment_column = parts[count - 1];
                 break :column_target ast.Name{ .database = if (count == 4) parts[0] else null, .namespace = if (count >= 3) parts[count - 3] else null, .table = parts[count - 2] };
             } else try self.name();
-            if (kind != .table and (target.namespace != null or target.database != null))
+            if (kind != .table and kind != .index and kind != .named_type and (target.namespace != null or target.database != null))
                 return self.fail(error.InvalidSqlSyntax, "schema and database comments require a single identifier");
             try self.expectKeyword(.is);
             if (!self.peek(.string) and !(self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.null)))
                 return self.fail(error.InvalidSqlSyntax, "COMMENT requires a string literal or NULL");
             const text = try self.value();
-            return .{ .catalog_ddl = .{ .kind = kind, .action = .comment, .name = target, .comment_value = if (text == .string) text.string else null, .comment_column = comment_column } };
+            return .{ .catalog_ddl = .{ .kind = kind, .action = .comment, .name = target, .comment_value = if (text == .string) text.string else null, .comment_column = comment_column, .comment_object = if (constraint_name) |label| .{ .kind = .constraint, .name = label } else if (index_comment) .{ .kind = .index, .name = target.table } else null, .named_type_kind = if (domain_comment) .domain else .enumeration } };
         }
         if (self.keyword(.create)) {
+            if (self.ddlWord("ROLE")) return .{ .catalog_ddl = try self.roleDdl(false) };
             if (self.ddlWord("TYPE")) return .{ .catalog_ddl = try self.enumDdl(.create) };
+            if (self.ddlWord("DOMAIN")) return .{ .catalog_ddl = try self.domainDdl(.create) };
             if (self.ddlWord("CAST")) return .{ .catalog_ddl = try self.castDdl(true) };
             if (self.ddlWord("AGGREGATE")) return .{ .catalog_ddl = try self.aggregateDdl(true, false) };
             if (self.ddlWord("OPERATOR")) return .{ .catalog_ddl = try self.operatorDdl(true) };
@@ -4263,6 +4531,14 @@ const Parser = struct {
                 return .{ .create_table = create };
             }
             if (persistence != .permanent) return self.fail(error.InvalidSqlSyntax, "table persistence requires TABLE");
+            if (self.ddlWord("TEXT")) {
+                if (!self.ddlWord("SEARCH")) return self.fail(error.InvalidSqlSyntax, "TEXT index declaration requires SEARCH");
+                if (self.ddlWord("CONFIGURATION") or self.ddlWord("DICTIONARY") or self.ddlWord("PARSER") or self.ddlWord("TEMPLATE")) return self.fail(error.UnsupportedSqlShape, "text-search resource catalogs require their native provider lifecycle");
+                const index_name = try self.identifier();
+                try self.expectKeyword(.on);
+                const table_name = try self.tableReferenceName();
+                return .{ .catalog_ddl = try self.nativeIndexTail(index_name, table_name, false, false) };
+            }
             const unique = self.keyword(.unique);
             if (self.keyword(.index)) return .{ .catalog_ddl = try self.indexDdl(true, unique) };
             if (unique) return self.fail(error.InvalidSqlSyntax, "UNIQUE requires INDEX");
@@ -4273,7 +4549,9 @@ const Parser = struct {
             return .{ .catalog_ddl = (try self.populationDdl(.refresh_materialized_view, .permanent)).ddl() };
         }
         if (self.keyword(.drop)) {
+            if (self.ddlWord("ROLE")) return .{ .catalog_ddl = try self.roleDdl(true) };
             if (self.ddlWord("TYPE")) return .{ .catalog_ddl = try self.enumDdl(.drop) };
+            if (self.ddlWord("DOMAIN")) return .{ .catalog_ddl = try self.domainDdl(.drop) };
             if (self.ddlWord("CAST")) return .{ .catalog_ddl = try self.castDdl(false) };
             if (self.ddlWord("AGGREGATE")) return .{ .catalog_ddl = try self.aggregateDdl(false, false) };
             if (self.ddlWord("OPERATOR")) return .{ .catalog_ddl = try self.operatorDdl(false) };
@@ -4292,10 +4570,18 @@ const Parser = struct {
             if (!self.keyword(.table)) return .{ .catalog_ddl = try self.catalogDdl(.drop) };
             const if_exists = self.keyword(.@"if");
             if (if_exists) try self.expectKeyword(.exists);
-            return .{ .drop_table = .{ .table = try self.name(), .if_exists = if_exists } };
+            const table = try self.name();
+            const cascade = self.ddlWord("CASCADE");
+            if (!cascade) _ = self.ddlWord("RESTRICT");
+            return .{ .drop_table = .{ .table = table, .if_exists = if_exists, .cascade = cascade } };
         }
         if (self.keyword(.alter)) {
+            if (self.ddlWord("DEFAULT")) {
+                if (!self.ddlWord("PRIVILEGES")) return self.fail(error.InvalidSqlSyntax, "ALTER DEFAULT requires PRIVILEGES");
+                return .{ .catalog_ddl = try self.defaultPrivilegesDdl() };
+            }
             if (self.ddlWord("TYPE")) return .{ .catalog_ddl = try self.enumDdl(.alter_schema) };
+            if (self.ddlWord("DOMAIN")) return .{ .catalog_ddl = try self.domainDdl(.alter_schema) };
             if (self.ddlWord("SEQUENCE")) return .{ .catalog_ddl = try self.sequenceDdl(.alter_sequence) };
             if (self.ddlWord("ROLE")) return .{ .catalog_ddl = try self.roleDefaultDdl() };
             if (self.ddlWord("VIEW")) return .{ .catalog_ddl = try self.viewDdl(.rename, false) };
@@ -4335,6 +4621,10 @@ const Parser = struct {
             if (!deferred and !self.ddlWord("IMMEDIATE")) return self.fail(error.InvalidSqlSyntax, "SET CONSTRAINTS requires DEFERRED or IMMEDIATE");
             return .{ .set_constraints = .{ .names = try names.toOwnedSlice(self.alloc), .deferred = deferred } };
         }
+        if (self.keyword(.prepare)) {
+            try self.expectKeyword(.transaction);
+            return .{ .prepared_transaction = .{ .action = .prepare, .gid = try self.preparedGid() } };
+        }
         if (self.keyword(.begin)) {
             _ = self.keyword(.transaction) or self.keyword(.work);
             return .{ .begin = try self.transactionOptions() };
@@ -4346,10 +4636,12 @@ const Parser = struct {
             return .{ .begin = options };
         }
         if (self.keyword(.commit)) {
+            if (self.keyword(.prepared)) return .{ .prepared_transaction = .{ .action = .commit, .gid = try self.preparedGid() } };
             _ = self.keyword(.transaction) or self.keyword(.work);
             return .commit;
         }
         if (self.keyword(.rollback)) {
+            if (self.keyword(.prepared)) return .{ .prepared_transaction = .{ .action = .rollback, .gid = try self.preparedGid() } };
             _ = self.keyword(.transaction) or self.keyword(.work);
             if (self.keyword(.to)) {
                 _ = self.keyword(.savepoint);
@@ -4363,6 +4655,120 @@ const Parser = struct {
             return .{ .release_savepoint = try self.identifier() };
         }
         return self.fail(error.UnsupportedSqlShape, "unsupported SQL statement");
+    }
+
+    fn authorizationNames(self: *Parser) Error![]const []const u8 {
+        var names: std.ArrayList([]const u8) = .empty;
+        while (true) {
+            if (names.items.len >= 256) return self.fail(error.SqlLimitExceeded, "SQL authorization principal limit exceeded");
+            try names.append(self.alloc, try self.identifier());
+            if (!self.take(.comma)) break;
+        }
+        return names.toOwnedSlice(self.alloc);
+    }
+
+    fn authorizationRecipients(self: *Parser) Error![]const ast.Authorization.Grantee {
+        var recipients: std.ArrayList(ast.Authorization.Grantee) = .empty;
+        while (true) {
+            if (recipients.items.len >= 256) return self.fail(error.SqlLimitExceeded, "SQL authorization recipient limit exceeded");
+            try recipients.append(self.alloc, if (self.ddlWord("PUBLIC")) .public else .{ .role = try self.identifier() });
+            if (!self.take(.comma)) break;
+        }
+        return recipients.toOwnedSlice(self.alloc);
+    }
+
+    fn authorizationTargets(self: *Parser) Error![]const ast.Name {
+        var names: std.ArrayList(ast.Name) = .empty;
+        while (true) {
+            if (names.items.len >= 256) return self.fail(error.SqlLimitExceeded, "SQL authorization object limit exceeded");
+            try names.append(self.alloc, try self.name());
+            if (!self.take(.comma)) break;
+        }
+        return names.toOwnedSlice(self.alloc);
+    }
+
+    fn authorizationPrivilege(self: *Parser) ?@import("../system_catalog/privileges.zig").Privilege {
+        inline for (.{ "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN" }, .{ .select, .insert, .update, .delete, .truncate, .references, .trigger, .maintain }) |word, privilege_kind| {
+            if (self.ddlWord(word)) return privilege_kind;
+        }
+        return null;
+    }
+
+    fn roleDdl(self: *Parser, dropping: bool) Error!ast.CatalogDdl {
+        const conditional = dropping and self.ddlWord("IF");
+        if (conditional and !self.ddlWord("EXISTS")) return self.fail(error.InvalidSqlSyntax, "DROP ROLE IF requires EXISTS");
+        const roles = if (dropping) try self.authorizationNames() else try self.alloc.dupe([]const u8, &.{try self.identifier()});
+        return .{ .kind = .role, .action = if (dropping) .drop else .create, .name = .{ .table = roles[0] }, .conditional = conditional, .authorization = .{ .operation = if (dropping) .drop_role else .create_role, .roles = roles } };
+    }
+
+    fn defaultPrivilegesDdl(self: *Parser) Error!ast.CatalogDdl {
+        var defaults: ast.Authorization = .{ .operation = .grant, .scope = .defaults };
+        if (self.ddlWord("FOR")) {
+            if (!self.ddlWord("ROLE") and !self.ddlWord("USER")) return self.fail(error.InvalidSqlSyntax, "default privilege owner requires ROLE or USER");
+            defaults.default_owners = try self.authorizationNames();
+        }
+        if (self.ddlWord("IN")) {
+            if (!self.ddlWord("SCHEMA")) return self.fail(error.InvalidSqlSyntax, "default privilege scope requires SCHEMA");
+            defaults.schemas = try self.authorizationTargets();
+        }
+        const revoke = self.ddlWord("REVOKE");
+        if (!revoke and !self.ddlWord("GRANT")) return self.fail(error.InvalidSqlSyntax, "default privileges require GRANT or REVOKE");
+        return self.authorizationDdl(revoke, defaults);
+    }
+
+    fn authorizationDdl(self: *Parser, revoke: bool, defaults: ?ast.Authorization) Error!ast.CatalogDdl {
+        var intent = defaults orelse ast.Authorization{ .operation = if (revoke) .revoke else .grant };
+        intent.operation = if (revoke) .revoke else .grant;
+        var admin_option = false;
+        if (revoke) {
+            if (self.ddlWord("ADMIN")) {
+                admin_option = true;
+                intent.option_only = true;
+            } else if (self.ddlWord("GRANT")) intent.option_only = true;
+            if (intent.option_only and (!self.ddlWord("OPTION") or !self.ddlWord("FOR"))) return self.fail(error.InvalidSqlSyntax, "option revocation requires OPTION FOR");
+        }
+        intent.all_privileges = self.ddlWord("ALL");
+        if (intent.all_privileges) _ = self.ddlWord("PRIVILEGES");
+        var privileges: std.ArrayList(@import("../system_catalog/privileges.zig").Privilege) = .empty;
+        if (!intent.all_privileges) {
+            if (self.authorizationPrivilege()) |first| {
+                try privileges.append(self.alloc, first);
+                while (self.take(.comma)) {
+                    if (privileges.items.len >= 256) return self.fail(error.SqlLimitExceeded, "SQL privilege limit exceeded");
+                    try privileges.append(self.alloc, self.authorizationPrivilege() orelse return self.fail(error.InvalidSqlSyntax, "unrecognized table privilege"));
+                }
+            } else intent.roles = try self.authorizationNames();
+        }
+        const objects = intent.all_privileges or privileges.items.len != 0;
+        if (objects) {
+            if (admin_option or !self.ddlWord("ON")) return self.fail(error.InvalidSqlSyntax, "object privileges require ON and GRANT OPTION");
+            intent.privileges = try privileges.toOwnedSlice(self.alloc);
+            if (defaults != null) {
+                if (!self.ddlWord("TABLES")) return self.fail(error.UnsupportedSqlShape, "default privileges currently target TABLES");
+            } else if (self.ddlWord("ALL")) {
+                if (!self.ddlWord("TABLES") or !self.ddlWord("IN") or !self.ddlWord("SCHEMA")) return self.fail(error.InvalidSqlSyntax, "ALL TABLES requires IN SCHEMA");
+                intent.scope = .all_tables;
+                intent.schemas = try self.authorizationTargets();
+            } else {
+                _ = self.ddlWord("TABLE");
+                intent.scope = .tables;
+                intent.tables = try self.authorizationTargets();
+            }
+        } else {
+            if (defaults != null or (intent.option_only and !admin_option)) return self.fail(error.InvalidSqlSyntax, "role memberships require ADMIN OPTION");
+            intent.scope = .roles;
+        }
+        if (!(if (revoke) self.ddlWord("FROM") else self.ddlWord("TO"))) return self.fail(error.InvalidSqlSyntax, "authorization requires its recipient clause");
+        intent.grantees = try self.authorizationRecipients();
+        if (!revoke and self.ddlWord("WITH")) {
+            if (!(if (objects) self.ddlWord("GRANT") else self.ddlWord("ADMIN")) or !self.ddlWord("OPTION")) return self.fail(error.InvalidSqlSyntax, "invalid authorization option");
+            intent.option = true;
+        }
+        if (revoke) {
+            intent.cascade = self.ddlWord("CASCADE");
+            if (!intent.cascade) _ = self.ddlWord("RESTRICT");
+        }
+        return .{ .kind = .role, .action = .alter_schema, .name = .{ .table = "" }, .authorization = intent };
     }
 
     fn roleDefaultDdl(self: *Parser) Error!ast.CatalogDdl {
@@ -5310,7 +5716,7 @@ test "compiler incomplete catalog definitions report EOF and release partial all
         "CREATE TABLE broken (n bigint CONSTRAINT only_name REFERENCES",
         "CREATE TABLE broken (n bigint PRIMARY KEY,",
         "CREATE TABLE broken (CONSTRAINT only_name",
-    }) |sql| try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{sql});
+    }) |sql| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{sql});
 }
 
 test "compiler preserves PostgreSQL expression labels before relational lowering" {
@@ -5932,4 +6338,302 @@ test "compiler SQL named enum original declarations retain exact labels placemen
     defer quoted.deinit();
     try std.testing.expectEqualStrings("Status", quoted.statement.catalog_ddl.name.table);
     try std.testing.expectEqualStrings("a'b", quoted.statement.catalog_ddl.enum_definition.?.create[2]);
+}
+
+test "SQL maintenance originals retain typed options columns and concurrency" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{ "VACUUM usage_records", "VACUUM (FULL, VERBOSE, ANALYZE) usage_records", "ANALYZE usage_records", "ANALYZE VERBOSE usage_records (status, amount)", "REINDEX TABLE usage_records", "REINDEX INDEX CONCURRENTLY usage_records_status_idx" };
+    for (cases, 0..) |sql, ordinal| {
+        var compiled = try compile(a, sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        try std.testing.expectEqual(.maintenance, ddl.action);
+        const intent = ddl.maintenance.?;
+        try std.testing.expectEqual(ordinal == 5, ddl.concurrently);
+        try std.testing.expectEqual(ordinal == 1, intent.full);
+        try std.testing.expectEqual(ordinal == 1 or ordinal == 3, intent.verbose);
+        try std.testing.expectEqual(@as(usize, if (ordinal == 3) 2 else 0), intent.columns.len);
+    }
+}
+
+test "compiler authorization originals preserve object membership and default privilege intent" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    const originals = [_][]const u8{ "sql-0332", "sql-0333", "sql-0334", "sql-0335", "sql-0336", "sql-0337", "sql-0338", "sql-0339", "sql-0340", "sql-0341", "sql-0342", "sql-0350" };
+    for (originals, 0..) |id, i| {
+        var prepared = try compile(a, (try corpus.get(id)).sql, .{});
+        defer prepared.deinit();
+        const ddl = prepared.statement.catalog_ddl;
+        try std.testing.expectEqual(.role, ddl.kind);
+        const intent = ddl.authorization.?;
+        if (i < 10) try std.testing.expectEqual(@as(usize, if (i == 2 or i == 3 or i == 6) 2 else 1), intent.grantees.len);
+        switch (i) {
+            0 => {
+                try std.testing.expectEqual(.tables, intent.scope);
+                try std.testing.expectEqualStrings("usage_records", intent.tables[0].table);
+                try std.testing.expectEqualSlices(@import("../system_catalog/privileges.zig").Privilege, &.{ .select, .insert }, intent.privileges);
+            },
+            1 => try std.testing.expectEqual(.revoke, intent.operation),
+            2, 3 => {
+                try std.testing.expectEqual(.roles, intent.scope);
+                try std.testing.expectEqual(@as(usize, 2), intent.roles.len);
+                try std.testing.expectEqual(i == 3, intent.option);
+            },
+            4 => try std.testing.expect(!intent.option_only),
+            5 => {
+                try std.testing.expect(intent.option_only and intent.cascade);
+                try std.testing.expectEqual(.roles, intent.scope);
+            },
+            6, 7 => {
+                try std.testing.expectEqual(.defaults, intent.scope);
+                try std.testing.expectEqualStrings("app_owner", intent.default_owners[0]);
+                try std.testing.expectEqualStrings("public", intent.schemas[0].table);
+                try std.testing.expectEqual(i == 6, intent.option);
+                try std.testing.expectEqual(i == 7, intent.option_only);
+            },
+            8, 9 => {
+                try std.testing.expectEqual(.all_tables, intent.scope);
+                try std.testing.expectEqualStrings("public", intent.schemas[0].table);
+            },
+            10 => try std.testing.expectEqual(.create_role, intent.operation),
+            11 => try std.testing.expectEqual(.drop_role, intent.operation),
+            else => unreachable,
+        }
+    }
+}
+
+test "compiler authorization rejects crossed options and owns identifiers through allocation failures" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "GRANT SELECT ON TABLE t TO r WITH ADMIN OPTION",
+        "GRANT r TO s WITH GRANT OPTION",
+        "REVOKE ADMIN OPTION FOR SELECT ON TABLE t FROM r",
+        "REVOKE GRANT OPTION FOR r FROM s",
+        "ALTER DEFAULT PRIVILEGES GRANT r TO s",
+        "GRANT SELECT ON ALL TABLES t TO r",
+        "GRANT SELECT ON TABLE t TO",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(a, sql, .{}));
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var bytes: [256]u8 = undefined;
+            const sql = try std.fmt.bufPrint(&bytes, "ALTER DEFAULT PRIVILEGES FOR ROLE \"Owner\" IN SCHEMA \"Scope\" GRANT SELECT, INSERT ON TABLES TO \"Writer\" WITH GRANT OPTION", .{});
+            var prepared = try compile(allocator, sql, .{});
+            defer prepared.deinit();
+            @memset(sql, 'x');
+            const intent = prepared.statement.catalog_ddl.authorization.?;
+            try std.testing.expectEqualStrings("Owner", intent.default_owners[0]);
+            try std.testing.expectEqualStrings("Scope", intent.schemas[0].table);
+            try std.testing.expectEqualStrings("Writer", intent.grantees[0].role);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{});
+}
+
+test "compiler authorization distinguishes PUBLIC from quoted role identities" {
+    const a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, role_name: ?[]const u8 }{
+        .{ .sql = "GRANT SELECT ON TABLE t TO PUBLIC", .role_name = null },
+        .{ .sql = "GRANT SELECT ON TABLE t TO \"PUBLIC\"", .role_name = "PUBLIC" },
+        .{ .sql = "GRANT SELECT ON TABLE t TO \"public\"", .role_name = "public" },
+        .{ .sql = "GRANT SELECT ON TABLE t TO \"Public\"", .role_name = "Public" },
+    }) |input| {
+        var prepared = try compile(a, input.sql, .{});
+        defer prepared.deinit();
+        const grantee = prepared.statement.catalog_ddl.authorization.?.grantees[0];
+        if (input.role_name) |expected| try std.testing.expectEqualStrings(expected, grantee.role) else try std.testing.expectEqual(.public, grantee);
+    }
+    var role = try compile(a, "CREATE ROLE \"PUBLIC\"", .{});
+    defer role.deinit();
+    try std.testing.expectEqualStrings("PUBLIC", role.statement.catalog_ddl.authorization.?.roles[0]);
+}
+
+test "SQL named enum declarations retain qualified type intent until catalog binding" {
+    var compiled = try compile(std.testing.allocator, "CREATE TABLE typed (id BIGINT PRIMARY KEY, state visibility, mirror public.\"Visibility\")", .{});
+    defer compiled.deinit();
+    const columns = compiled.statement.create_table.columns;
+    try std.testing.expect(columns[0].named_type == null);
+    try std.testing.expectEqual(.enumeration, columns[1].type);
+    try std.testing.expectEqualStrings("visibility", columns[1].named_type.?.table);
+    try std.testing.expect(columns[1].enum_view == null);
+    try std.testing.expectEqualStrings("public", columns[2].named_type.?.namespace.?);
+    try std.testing.expectEqualStrings("Visibility", columns[2].named_type.?.table);
+    try std.testing.expectError(error.UnsupportedSqlExecution, @import("ddl_runtime.zig").createSchemaAlloc(std.testing.allocator, compiled.statement.create_table));
+}
+
+test "compiler SQL type annotations retain qualified names and literal payloads" {
+    const a = std.testing.allocator;
+    var statement = try compile(a, "COMMENT ON TYPE app.\"state.kind\" IS 'a ''quoted'' Ω; -- text'", .{});
+    defer statement.deinit();
+    const ddl = statement.statement.catalog_ddl;
+    try std.testing.expectEqual(.named_type, ddl.kind);
+    try std.testing.expectEqual(.comment, ddl.action);
+    try std.testing.expectEqualStrings("app", ddl.name.namespace.?);
+    try std.testing.expectEqualStrings("state.kind", ddl.name.table);
+    try std.testing.expectEqualStrings("a 'quoted' Ω; -- text", ddl.comment_value.?);
+    var removed = try compile(a, "COMMENT ON TYPE state IS NULL", .{});
+    defer removed.deinit();
+    try std.testing.expect(removed.statement.catalog_ddl.comment_value == null);
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "COMMENT ON TYPE state IS 42", .{}));
+}
+
+test "SQL domain originals retain complete typed declarations and lifecycle intents" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0150", "sql-0306", "sql-0307", "sql-0308", "sql-0309", "sql-0310" }) |id| {
+        const original = try corpus.get(id);
+        var compiled = try compile(a, original.sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        try std.testing.expectEqual(.named_type, ddl.kind);
+        try std.testing.expectEqual(.domain, ddl.named_type_kind);
+        try std.testing.expectEqual(@as(u32, 0), compiled.parameter_count);
+        if (std.mem.eql(u8, id, "sql-0306")) {
+            const definition = ddl.domain_definition.?.create;
+            try std.testing.expectEqual(.numeric, definition.base.element_type.?);
+            try std.testing.expectEqual(@as(usize, 1), definition.checks.len);
+            try std.testing.expect(definition.checks[0].expression.* == .binary);
+        } else if (std.mem.eql(u8, id, "sql-0307")) {
+            try std.testing.expect(!ddl.domain_definition.?.create.base.nullable);
+            try std.testing.expectEqualStrings("queued", ddl.domain_definition.?.create.base.default_expression.?.literal.string);
+        } else if (std.mem.eql(u8, id, "sql-0308")) {
+            try std.testing.expect(ddl.domain_definition.?.set_not_null);
+        } else if (std.mem.eql(u8, id, "sql-0310")) {
+            try std.testing.expect(ddl.conditional and ddl.cascade);
+        } else if (std.mem.eql(u8, id, "sql-0150")) {
+            try std.testing.expectEqualStrings("status domain", ddl.comment_value.?);
+        }
+    }
+}
+
+test "SQL domain alteration parsing retains NOT VALID default and constraint distinctions" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "ALTER DOMAIN public.amount ADD CONSTRAINT bounded CHECK (VALUE < 100) NOT VALID",
+        "ALTER DOMAIN public.amount VALIDATE CONSTRAINT bounded",
+        "ALTER DOMAIN public.amount DROP CONSTRAINT IF EXISTS bounded CASCADE",
+        "ALTER DOMAIN public.amount SET DEFAULT NULL",
+        "ALTER DOMAIN public.amount DROP DEFAULT",
+        "ALTER DOMAIN public.amount DROP NOT NULL",
+        "CREATE DOMAIN public.child AS public.parent CHECK (VALUE IS NOT NULL)",
+    }, 0..) |sql, index| {
+        var compiled = try compile(a, sql, .{});
+        defer compiled.deinit();
+        const definition = compiled.statement.catalog_ddl.domain_definition.?;
+        switch (index) {
+            0 => try std.testing.expect(definition.add_check.not_valid),
+            1 => try std.testing.expectEqualStrings("bounded", definition.validate_check),
+            2 => try std.testing.expect(definition.drop_check.if_exists and definition.drop_check.cascade),
+            3 => try std.testing.expect(definition.set_default != null),
+            4 => try std.testing.expect(definition.set_default == null),
+            5 => try std.testing.expect(!definition.set_not_null),
+            6 => try std.testing.expectEqualStrings("parent", definition.create.base.named_type.?.table),
+            else => unreachable,
+        }
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(a, "CREATE DOMAIN invalid AS text DEFAULT $1", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE DOMAIN invalid AS text NOT NULL NULL", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE DOMAIN invalid AS text CHECK (VALUE IS NOT NULL) NOT VALID", .{}));
+}
+
+test "SQL prepared transaction commands retain exact literal GIDs independently of statement preparation" {
+    const cases = .{
+        .{ "PREPARE TRANSACTION 'usage_batch';", ast.PreparedTransaction{ .action = .prepare, .gid = "usage_batch" } },
+        .{ "COMMIT PREPARED 'usage_batch';", ast.PreparedTransaction{ .action = .commit, .gid = "usage_batch" } },
+        .{ "ROLLBACK PREPARED '';", ast.PreparedTransaction{ .action = .rollback, .gid = "" } },
+        .{ "PREPARE TRANSACTION 'a''b';", ast.PreparedTransaction{ .action = .prepare, .gid = "a'b" } },
+    };
+    inline for (cases) |item| {
+        var compiled = try compile(std.testing.allocator, item[0], .{});
+        defer compiled.deinit();
+        try std.testing.expectEqualDeep(item[1], compiled.statement.prepared_transaction);
+        try std.testing.expectEqual(@as(u32, 0), compiled.parameter_count);
+    }
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "PREPARE TRANSACTION $1", .{}));
+}
+
+test "SQL LIKE declarations preserve ordered sources complete options and original identity" {
+    const a = std.testing.allocator;
+    var original = try compile(a, "CREATE TABLE usage_records_copy (LIKE usage_records INCLUDING ALL)", .{});
+    defer original.deinit();
+    const declaration = original.statement.create_table;
+    try std.testing.expectEqual(@as(usize, 0), declaration.columns.len);
+    try std.testing.expectEqual(@as(usize, 1), declaration.like_tables.len);
+    try std.testing.expectEqualStrings("usage_records", declaration.like_tables[0].source.table);
+    inline for (comptime std.meta.tags(ast.LikeOption)) |option| try std.testing.expect(@field(declaration.like_tables[0].options, @tagName(option)));
+    var mixed = try compile(a, "CREATE TABLE copy (prefix bigint, LIKE public.source INCLUDING ALL EXCLUDING DEFAULTS EXCLUDING INDEXES, suffix text, LIKE other INCLUDING IDENTITY, PRIMARY KEY (source_id))", .{});
+    defer mixed.deinit();
+    const clauses = mixed.statement.create_table.like_tables;
+    try std.testing.expectEqual(@as(usize, 2), clauses.len);
+    try std.testing.expectEqual(@as(usize, 1), clauses[0].column_offset);
+    try std.testing.expectEqual(@as(usize, 2), clauses[1].column_offset);
+    try std.testing.expectEqualStrings("public", clauses[0].source.namespace.?);
+    try std.testing.expect(!clauses[0].options.defaults and !clauses[0].options.indexes and clauses[0].options.constraints);
+    try std.testing.expect(clauses[1].options.identity and !clauses[1].options.defaults);
+    var last = try compile(a, "CREATE TABLE copy (LIKE source INCLUDING ALL EXCLUDING ALL INCLUDING DEFAULTS)", .{});
+    defer last.deinit();
+    const flags = last.statement.create_table.like_tables[0].options;
+    inline for (comptime std.meta.tags(ast.LikeOption)) |option| try std.testing.expectEqual(option == .defaults, @field(flags, @tagName(option)));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE copy (LIKE source INCLUDING unknown)", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE copy (LIKE source INCLUDING \"INDEXES\")", .{}));
+}
+
+test "compiler SQL COMMENT index and constraint bind original identities qualified paths and null without schema mutation" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0144", "sql-0145" }) |id| {
+        var compiled = try compile(a, (try corpus.get(id)).sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        try std.testing.expectEqual(.comment, ddl.action);
+        try std.testing.expect(ddl.schema_change == null and ddl.comment_column == null);
+        const key = ddl.comment_object.?;
+        if (key.kind == .constraint) {
+            try std.testing.expectEqualStrings("usage_records", ddl.name.table);
+            try std.testing.expectEqualStrings("usage_records_status_check", key.name);
+        } else {
+            try std.testing.expectEqualStrings("usage_records_status_idx", ddl.name.table);
+            try std.testing.expectEqualStrings(ddl.name.table, key.name);
+        }
+    }
+    var quoted = try compile(a, "COMMENT ON CONSTRAINT \"c Ω\" ON db.public.\"quoted table\" IS NULL", .{});
+    defer quoted.deinit();
+    try std.testing.expectEqualStrings("c Ω", quoted.statement.catalog_ddl.comment_object.?.name);
+    try std.testing.expectEqualStrings("db", quoted.statement.catalog_ddl.name.database.?);
+    try std.testing.expect(quoted.statement.catalog_ddl.comment_value == null);
+    var indexed = try compile(a, "COMMENT ON INDEX db.public.\"idx Ω\" IS 'quoted '' Ω'", .{});
+    defer indexed.deinit();
+    try std.testing.expectEqualStrings("idx Ω", indexed.statement.catalog_ddl.comment_object.?.name);
+    try std.testing.expectEqualStrings("quoted ' Ω", indexed.statement.catalog_ddl.comment_value.?);
+}
+
+test "SQL native index original full-text declarations retain typed intent and reject unsupported options" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0696", "sql-0697" }) |id| {
+        const original = try corpus.get(id);
+        var compiled = try compile(a, original.sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        try std.testing.expect(ddl.kind == .index and ddl.action == .create);
+        try std.testing.expect(ddl.schema_change == null);
+        try std.testing.expectEqualStrings("usage_records", ddl.index_table.?.table);
+        try std.testing.expectEqualStrings("status", ddl.native_index.?.field);
+        try std.testing.expectEqualStrings("standard", ddl.native_index.?.analyzer);
+    }
+    for ([_][]const u8{
+        "CREATE INDEX i ON t USING antfly_full_text (body) WITH (backend='lucene')",
+        "CREATE INDEX i ON t USING antfly_full_text (body) WITH (highlight='true')",
+        "CREATE UNIQUE INDEX i ON t USING antfly_full_text (body)",
+        "CREATE INDEX i ON t USING antfly_full_text (body) WITH (scoring='tfidf')",
+    }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(a, sql, .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE INDEX i ON t USING antfly_full_text (body) WITH (analyzer='standard',analyzer='standard')", .{}));
+    // Guard unavailable PostgreSQL methods without claiming their execution.
+    for ([_][]const u8{ "sql-0719", "sql-0720", "sql-0721" }) |id| {
+        const original = try corpus.get(id);
+        try std.testing.expectError(error.UnsupportedSqlShape, compile(a, original.sql, .{}));
+    }
 }

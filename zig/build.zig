@@ -1078,6 +1078,25 @@ pub fn create(b: *std.Build) ?Artifacts {
         standalone_initial_fk_tests.root_module.linkLibrary(runtime_library_artifacts[@backingInt(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     const run_standalone_initial_fk_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_initial_fk_tests);
     b.step("antfly-standalone-initial-fk-test", "Run linked native standalone initial-FK owner publication tests").dependOn(&run_standalone_initial_fk_tests.step);
+    const sql_connection_admission_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/sql_connection_admission.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.step("antfly-sql-connection-admission-test", "Verify bounded per-connection execution and safe lease reuse").dependOn(&b.addRunArtifact(sql_connection_admission_tests).step);
+    const pessimistic_lock_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/storage/pessimistic_lock_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.step("antfly-pessimistic-lock-contract-test", "Verify PostgreSQL lock modes, reentrance and savepoint-owned grants").dependOn(&b.addRunArtifact(pessimistic_lock_tests).step);
+    const pessimistic_ledger_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/storage/pessimistic_lock_ledger.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.step("antfly-pessimistic-lock-ledger-test", "Verify exact lock effects, atomic ownership and bounded receipts").dependOn(&b.addRunArtifact(pessimistic_ledger_tests).step);
+
     const graph_transfer_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/graph_transfer_test.zig"),
         .target = target,

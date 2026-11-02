@@ -44,6 +44,7 @@ test "UUIDv7 interval pgwire parameters retain OID binary identity and result de
 
 pub fn parameterOid(descriptor: Parameter) !u32 {
     try @import("antfly_local_sources").sql_scalar.validateParameterType(descriptor);
+    if (descriptor.domainView()) |view| return view.identity.?.oid;
     if (descriptor.enum_view) |view| {
         try view.record.identity.validate();
         return view.record.identity.oid;
@@ -63,6 +64,7 @@ pub fn parameterKind(descriptor: Parameter) !Type {
     } else .unknown;
 }
 pub fn parameterFromColumn(column: Column) !Parameter {
+    if (column.domain_view) |view| return @import("antfly_local_sources").sql_scalar.domainType(view);
     if (column.enum_view) |view| {
         _ = try columnOid(column);
         return .{ .kind = .enumeration, .enum_view = view };
@@ -79,7 +81,9 @@ pub fn decodeColumnNative(a: std.mem.Allocator, column: Column, format: u16, byt
         if (format > 1) return error.UnsupportedParameterFormat;
         return .typedEnum(try view.input(bytes));
     }
-    return decodeNative(a, try columnOid(column), format, bytes);
+    var physical = column;
+    physical.domain_view = null;
+    return decodeNative(a, try columnOid(physical), format, bytes);
 }
 pub fn decodeNativeDescriptor(a: std.mem.Allocator, descriptor: Parameter, format: u16, bytes: []const u8, parent: *@import("antfly_local_sources").sql_numeric_value.Context) !@import("antfly_local_sources").sql_scalar.Datum {
     if (descriptor.enum_view) |view| {
@@ -90,7 +94,7 @@ pub fn decodeNativeDescriptor(a: std.mem.Allocator, descriptor: Parameter, forma
         try parent.charge(atom.order_key.len + atom.text.len + 1);
         return .typedEnum(try atom.clone(a));
     }
-    return decodeNativeWithContext(a, try parameterOid(descriptor), format, bytes, parent);
+    return decodeNativeWithContext(a, try parameterOid(descriptor.baseType()), format, bytes, parent);
 }
 
 pub fn parameterFromOid(value: u32) !Parameter {
@@ -125,6 +129,7 @@ pub fn parameterFromOid(value: u32) !Parameter {
 
 pub fn oid(kind: Type) !u32 {
     return switch (kind) {
+        .bytea => 17,
         .boolean => 16,
         .integer => 20,
         .number => 701,
@@ -141,6 +146,9 @@ pub fn oid(kind: Type) !u32 {
 }
 
 pub fn columnOid(column: Column) !u32 {
+    // PostgreSQL RowDescription flattens domains to the physical base OID.
+    // ParameterDescription retains the logical domain OID instead.
+    if (column.domain_view) |view| try view.identity.?.validate();
     if (column.enum_view) |view| {
         if (column.type != .enumeration or column.element_type != null or column.temporal_kind != null or column.numeric_modifier != null) return error.InvalidResult;
         try view.record.identity.validate();
@@ -264,7 +272,23 @@ pub fn encodeColumnInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Co
 }
 
 /// Native pages retain typed arrays and numerics through the wire boundary.
+fn writeBytea(writer: *std.Io.Writer, format: u16, bytes: []const u8, limit: usize) !void {
+    if (format > 1) return error.UnsupportedResultFormat;
+    if (format == 1) {
+        if (bytes.len > limit) return error.ProgramLimitExceeded;
+        return writer.writeAll(bytes);
+    }
+    return @import("antfly_local_sources").sql_scalar.Bytea.writeHex(writer, bytes, limit) catch |err| switch (err) {
+        error.SqlProgramLimitExceeded => error.ProgramLimitExceeded,
+        else => err,
+    };
+}
+
 pub fn encodeCellInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, cell: @import("backend.zig").Cell, wire_bytes: usize) !void {
+    if (cell.bytea) |bytes| {
+        if (format > 1 or column.type != .bytea or cell.sql_null or cell.value != .null or cell.array != null or cell.numeric != null or cell.range != null or cell.enumeration != null or cell.json_bytes != null or cell.frozen_json != null) return error.InvalidResult;
+        return writeBytea(writer, format, bytes, wire_bytes);
+    }
     if (cell.enumeration) |atom| {
         if (format > 1 or column.type != .enumeration or cell.sql_null or cell.value != .null or cell.array != null or cell.numeric != null or cell.range != null or cell.json_bytes != null or cell.frozen_json != null) return error.InvalidResult;
         const view = column.enum_view orelse return error.InvalidResult;
@@ -368,6 +392,7 @@ pub fn fromOid(value: u32) !Type {
         3912 => .daterange,
         3908 => .tsrange,
         3910 => .tstzrange,
+        17 => .bytea,
         16 => .boolean,
         20, 21, 23 => .integer,
         700, 701, 1700 => .number,
@@ -397,11 +422,32 @@ pub fn decodeNative(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes
     return decodeNativeWithContext(alloc, param_oid, format, bytes, &context);
 }
 
+/// Share byte admission without making the JSON and typed adapters recursive.
+fn decodeByteaAlloc(alloc: std.mem.Allocator, format: u16, bytes: []const u8, parent: *@import("antfly_local_sources").sql_numeric_value.Context) ![]u8 {
+    if (format > 1) return error.UnsupportedParameterFormat;
+    try parent.charge(bytes.len + 1);
+    if (bytes.len > parent.max_input_bytes or (format == 1 and bytes.len > parent.max_output_bytes)) return parent.limit();
+    if (format == 1) return alloc.dupe(u8, bytes);
+    if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.SqlInvalidCharacterEncoding;
+    return @import("antfly_local_sources").sql_scalar.Bytea.parseAlloc(alloc, bytes, parent.max_output_bytes) catch |err| switch (err) {
+        error.SqlProgramLimitExceeded => parent.limit(),
+        else => err,
+    };
+}
+
 pub fn decodeNativeWithContext(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []const u8, parent: *@import("antfly_local_sources").sql_numeric_value.Context) !@import("antfly_local_sources").sql_scalar.Datum {
     try parent.charge(0);
     const src = @import("antfly_local_sources");
     const descriptor = try parameterFromOid(param_oid);
     if (format > 1) return error.UnsupportedParameterFormat;
+    if (descriptor.kind == .bytea) {
+        const bytes_owned = try decodeByteaAlloc(alloc, format, bytes, parent);
+        errdefer alloc.free(bytes_owned);
+        try parent.charge(@sizeOf(src.sql_scalar.Bytea.Value));
+        const value = try alloc.create(src.sql_scalar.Bytea.Value);
+        value.* = .{ .bytes = bytes_owned };
+        return src.sql_scalar.Datum.typedBytes(value);
+    }
     if (descriptor.kind != null) if (src.sql_range_value.kindFromType(descriptor.kind.?)) |kind| {
         var context: src.sql_range_value.Context = .{ .alloc = alloc, .parent = parent, .max_input_bytes = parent.max_input_bytes, .max_output_bytes = parent.max_output_bytes };
         const value = try alloc.create(src.sql_range_value.Value);
@@ -454,6 +500,12 @@ pub fn decode(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []co
 /// The allocator belongs to the retained portal region, never to this context.
 pub fn decodeWithContext(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []const u8, context: *@import("antfly_local_sources").sql_numeric_value.Context) !std.json.Value {
     try context.charge(0);
+    if (param_oid == 17) {
+        const owned = try decodeByteaAlloc(alloc, format, bytes, context);
+        defer alloc.free(owned);
+        if (try @import("antfly_local_sources").sql_scalar.Bytea.formattedSize(owned) > context.max_output_bytes) return context.limit();
+        return .{ .string = try @import("antfly_local_sources").sql_scalar.Bytea.formatAlloc(alloc, owned, context.max_output_bytes) };
+    }
     var offset: usize = 0;
     while (offset < bytes.len) {
         const end = offset + @min(bytes.len - offset, 256);
@@ -590,6 +642,12 @@ pub fn integer(value: std.json.Value) !i64 {
 }
 
 pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json.Value) ![]const u8 {
+    if (kind == .bytea) {
+        var output: std.Io.Writer.Allocating = .init(alloc);
+        errdefer output.deinit();
+        try encodeInto(alloc, &output.writer, kind, format, value);
+        return output.toOwnedSlice();
+    }
     if (@import("antfly_local_sources").sql_range_value.kindFromType(kind) != null) {
         var output: std.Io.Writer.Allocating = .init(alloc);
         errdefer output.deinit();
@@ -613,7 +671,7 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
         else => if (value == .string) try alloc.dupe(u8, value.string) else try std.json.Stringify.valueAlloc(alloc, value, .{}),
     };
     return switch (kind) {
-        .numrange, .daterange, .tsrange, .tstzrange, .enumeration => unreachable,
+        .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea => unreachable,
         .array => error.InvalidResult,
         .boolean => if (value == .bool) try alloc.dupe(u8, &.{@intFromBool(value.bool)}) else error.InvalidResult,
         .integer => try encodeInteger(alloc, try integer(value)),
@@ -662,6 +720,12 @@ fn encodeRangeInto(a: std.mem.Allocator, writer: *std.Io.Writer, value: @import(
 }
 
 pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, format: u16, value: std.json.Value) !void {
+    if (kind == .bytea) {
+        if (value != .string or format > 1) return error.InvalidResult;
+        const bytes = try @import("antfly_local_sources").sql_scalar.Bytea.parseAlloc(a, value.string, 16 * 1024 * 1024);
+        defer a.free(bytes);
+        return writeBytea(writer, format, bytes, 16 * 1024 * 1024);
+    }
     if (@import("antfly_local_sources").sql_range_value.kindFromType(kind)) |range_kind| {
         if (value != .string) return error.InvalidResult;
         var arena = std.heap.ArenaAllocator.init(a);
@@ -673,7 +737,7 @@ pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
     if (format > 1) return error.UnsupportedResultFormat;
     if (format == 0) {
         switch (kind) {
-            .numrange, .daterange, .tsrange, .tstzrange, .enumeration => unreachable,
+            .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea => unreachable,
             .boolean => {
                 if (value != .bool) return error.InvalidResult;
                 try writer.writeAll(if (value.bool) "t" else "f");
@@ -697,7 +761,7 @@ pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
         return;
     }
     switch (kind) {
-        .numrange, .daterange, .tsrange, .tstzrange, .enumeration => unreachable,
+        .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea => unreachable,
         .array => return error.InvalidResult,
         .boolean => {
             if (value != .bool) return error.InvalidResult;
@@ -1502,4 +1566,65 @@ test "SQL named enum pgwire identities text binary and COPY share immutable type
     defer out.deinit();
     try std.testing.expectError(error.ProgramLimitExceeded, encodeCellInto(a, &out.writer, column, 1, .{ .enumeration = try view.input("z"), .sql_null = false }, 0));
     try std.testing.expectError(error.InvalidResult, encodeCellInto(a, &out.writer, .{ .name = "text", .type = .string }, 0, .{ .enumeration = try view.input("z"), .sql_null = false }, 63));
+}
+
+test "pgwire SQL domain retained metadata owns contracts and separates logical OIDs from physical codecs" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    var owner = std.heap.ArenaAllocator.init(a);
+    defer owner.deinit();
+    const retained = owner.allocator();
+    const identity = try local.sql_catalog.named_types.Identity.init(7, 2, 1, @splat(8));
+    const columns = build: {
+        var registry = try local.sql_catalog.domain_values.Registry.init(a, &.{.{ .identity = identity, .owner = .auth_disabled, .definition = .{ .domain = .{ .base = .{ .builtin = .int32 }, .not_null = true } } }});
+        defer registry.deinit();
+        break :build try @import("backend.zig").cloneColumnsLeaky(retained, &.{.{ .name = "n", .type = .integer, .element_type = .int32, .domain_view = &registry.byId(7).?.executable.?.domain }});
+    };
+    const column = columns[0];
+    try std.testing.expectEqual(@as(u32, 23), try columnOid(column));
+    const descriptor = try parameterFromColumn(column);
+    try std.testing.expectEqual(identity.oid, try parameterOid(descriptor));
+    try std.testing.expect(!@import("backend.zig").sameColumnType(column, .{ .name = "n", .type = .integer, .element_type = .int32 }));
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(i32, &bytes, 42, .big);
+    var work: local.sql_numeric_value.Context = .{ .alloc = retained };
+    const value = try decodeNativeDescriptor(retained, descriptor, 1, &bytes, &work);
+    try std.testing.expectEqual(@as(i64, 42), value.value.integer);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    try encodeColumnInto(retained, &output.writer, column, 1, .{ .integer = 42 }, 4);
+    try std.testing.expectEqualSlices(u8, &bytes, output.written());
+    var frame = try local.sql_parameter_frame.Frame.prepare(a, &.{descriptor}, &.{.{ .datum = value }}, .{});
+    defer frame.deinit();
+    try std.testing.expectEqual(@as(i64, 42), frame.values[0].value.integer);
+    try std.testing.expectError(error.SqlNotNullViolation, local.sql_parameter_frame.Frame.prepare(a, &.{descriptor}, &.{.{ .datum = .{} }}, .{}));
+}
+
+test "pgwire bytea parameters and result cells preserve opaque binary and canonical hex" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    try std.testing.expectEqual(@as(u32, 17), try parameterOid(try parameterFromOid(17)));
+    try std.testing.expectEqual(@as(u32, 17), try columnOid(.{ .name = "bytes", .type = .bytea }));
+    const raw = "\x00\xff\x80hi";
+    for ([_][]const u8{ "\x00", "\xff" }) |invalid| try std.testing.expectError(error.SqlInvalidCharacterEncoding, decodeNative(alloc, 17, 0, invalid));
+    var quota: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = std.testing.failing_allocator, .max_input_bytes = 1 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, decodeNativeWithContext(std.testing.failing_allocator, 17, 1, raw, &quota));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, quota.charge(0));
+    for ([_]u16{ 0, 1 }) |format| {
+        const input = try decodeNative(alloc, 17, format, if (format == 0) "\\x00ff806869" else raw);
+        try std.testing.expectEqualSlices(u8, raw, input.bytes().?);
+        const json = try decode(a, 17, format, if (format == 0) "\\x00ff806869" else raw);
+        defer a.free(json.string);
+        try std.testing.expectEqualStrings("\\x00ff806869", json.string);
+        const encoded = try encode(a, .bytea, format, json);
+        defer a.free(encoded);
+        try std.testing.expectEqualSlices(u8, if (format == 0) "\\x00ff806869" else raw, encoded);
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        try encodeCellInto(alloc, &out.writer, .{ .name = "bytes", .type = .bytea }, format, .{ .bytea = input.bytes().?, .sql_null = false }, 64);
+        try std.testing.expectEqualSlices(u8, if (format == 0) "\\x00ff806869" else raw, out.written());
+        try std.testing.expectError(error.ProgramLimitExceeded, encodeCellInto(alloc, &out.writer, .{ .name = "bytes", .type = .bytea }, format, .{ .bytea = input.bytes().?, .sql_null = false }, 1));
+    }
 }

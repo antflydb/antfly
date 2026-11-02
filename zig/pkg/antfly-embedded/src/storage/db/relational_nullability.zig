@@ -43,6 +43,7 @@ pub const Plan = struct {
     names: []const []const u8,
     /// Logical projection identity, separate from owner/schema authority.
     identity: [32]u8,
+    aggregate_failure: bool = false,
 
     pub fn init(alloc: Allocator, table: schema.TableSchema, layout: *const codec.PhysicalLayout, fields: []const []const u8, context: Control) !Plan {
         try context.ensureActive();
@@ -87,7 +88,7 @@ pub const Plan = struct {
             try context.ensureActive();
             ordinal.* = if (layout.ordinalForName(table.relational_columns, name)) |index| @intCast(index) else null;
         }
-        return .{ .alloc = alloc, .layout = layout, .columns = table.relational_columns, .ordinals = ordinals };
+        return .{ .alloc = alloc, .layout = layout, .columns = table.relational_columns, .ordinals = ordinals, .aggregate_failure = self.aggregate_failure };
     }
 
     /// A reader may evict historical bindings between rows. Probe through its
@@ -98,8 +99,8 @@ pub const Plan = struct {
         try requireLayout(row.table_schema, row.layout);
         for (self.names, 0..) |name, i| {
             if (i % 256 == 0) try context.ensureActive();
-            const ordinal = row.ordinalForName(name) orelse return i;
-            if (try row.isSqlNull(ordinal)) return i;
+            const ordinal = row.ordinalForName(name) orelse return if (self.aggregate_failure) 0 else i;
+            if (try row.isSqlNull(ordinal)) return if (self.aggregate_failure) 0 else i;
         }
         return null;
     }
@@ -115,6 +116,7 @@ pub const Source = struct {
     layout: *const codec.PhysicalLayout,
     columns: []const schema.RelationalColumn,
     ordinals: []const ?u32,
+    aggregate_failure: bool = false,
 
     pub fn deinit(self: *Source) void {
         self.alloc.free(self.ordinals);
@@ -132,7 +134,7 @@ pub const Source = struct {
             return error.RelationalRowSchemaMismatch;
         for (self.ordinals, 0..) |ordinal, i| {
             if (i % 256 == 0) try context.ensureActive();
-            if (ordinal == null or try row.isSqlNull(ordinal.?)) return i;
+            if (ordinal == null or try row.isSqlNull(ordinal.?)) return if (self.aggregate_failure) 0 else i;
         }
         return null;
     }

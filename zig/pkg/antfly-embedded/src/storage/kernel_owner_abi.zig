@@ -20,7 +20,7 @@ const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
 // Main owns published job projections 72..74. Schema preflight appends at 75.
-pub const abi_version: u32 = 110;
+pub const abi_version: u32 = 112;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -241,6 +241,7 @@ pub const LocalQueryOperation = enum(u32) {
     preflight = 23,
     graph_metric_maintenance = 24,
     scan_stream = 25,
+    sql_maintenance = 26,
 };
 
 pub const LocalQueryReturnMode = enum(u32) {
@@ -928,6 +929,15 @@ pub const TransactionRecoveryResolveFn = *const fn (
     TxnStatus,
     u64,
 ) callconv(.c) Status;
+/// External resolution carries the canonical fixed-width decision admission.
+pub const TransactionRecoveryResolveExternalFn = *const fn (
+    ?*anyopaque,
+    *const TxnId,
+    BorrowedBytes,
+    TxnStatus,
+    u64,
+    BorrowedBytes,
+) callconv(.c) Status;
 pub const TransactionRecoveryOwnsFn = *const fn (?*anyopaque, BorrowedBytes) callconv(.c) u8;
 pub const TransactionRecoveryAcknowledgeFn = *const fn (
     ?*anyopaque,
@@ -967,6 +977,7 @@ pub const TransactionRecoveryConfig = extern struct {
     acknowledge_participant_fn: ?TransactionRecoveryAcknowledgeFn = null,
     acknowledge_participants_fn: ?TransactionRecoveryAcknowledgeManyFn = null,
     cleanup_transaction_fn: ?TransactionRecoveryCleanupFn = null,
+    resolve_external_participant_fn: ?TransactionRecoveryResolveExternalFn = null,
 };
 
 /// One candidate entity borrowed for a synchronous resolution callback.
@@ -2467,6 +2478,13 @@ pub extern fn antfly_storage_owner_scan_stream(
 pub extern fn antfly_storage_owner_scan_ndjson(
     owner: ?*anyopaque,
     request: *const ControlledJsonOperationRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_sql_maintenance_json(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;

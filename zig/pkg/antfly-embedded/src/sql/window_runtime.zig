@@ -870,8 +870,12 @@ pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: bindin
             .lag, .lead => blk: {
                 const distance = if (spec.arguments.len > 1) (try integer(try getCell(cells, row, spec.arguments[1]))) orelse break :blk Datum{} else 1;
                 const target: i128 = @as(i128, @intCast(position)) + (if (spec.kind == .lag) -@as(i128, distance) else @as(i128, distance));
-                if (target < 0 or target >= indices.len) break :blk if (spec.arguments.len > 2) try getCell(cells, row, spec.arguments[2]) else Datum{};
-                break :blk try getCell(cells, try at(indices, @intCast(target)), spec.arguments[0]);
+                if (target < 0 or target >= indices.len) {
+                    const value = if (spec.arguments.len > 2) try getCell(cells, row, spec.arguments[2]) else Datum{};
+                    break :blk if (spec.default_coercion) |program| try context.evaluate(a, program.*, &.{value}) else value;
+                }
+                const value = try getCell(cells, try at(indices, @intCast(target)), spec.arguments[0]);
+                break :blk if (spec.input_coercion) |program| try context.evaluate(a, program.*, &.{value}) else value;
             },
             .first_value, .last_value, .nth_value => blk: {
                 const index: usize = if (spec.kind == .last_value) last: {

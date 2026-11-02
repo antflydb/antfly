@@ -62,6 +62,25 @@ fn appendChain(comptime domain: []const u8, previous: Digest, owner: Owner, head
     return result;
 }
 
+/// One catalog-owned physical cover, reused by typed catalog finalizers.
+pub const OwnerCut = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: [32]u8,
+    authority: local.storage_source_authority.Kind,
+    ranges: []const local.common_topology_records.RangeRecord,
+};
+
+pub const SequenceRetirement = struct {
+    id: u64,
+    generation: u64,
+    namespace_id: u64,
+    database_id: u64,
+    admission_digest: Digest,
+    pub fn validate(self: @This()) !void {
+        if (self.id == 0 or self.generation == 0 or self.namespace_id == 0 or self.database_id == 0 or !nonzero(&self.admission_digest)) return error.InvalidGenerationPublication;
+    }
+};
+
 pub const Head = struct {
     metadata_group_id: u64,
     metadata_incarnation: local.metadata_incarnation.MetadataClusterIncarnation,
@@ -70,6 +89,14 @@ pub const Head = struct {
     table_id: u64,
     owner_count: u16,
     input_count: u16 = 1,
+    type_id: u64 = 0,
+    type_generation: u32 = 0,
+    type_admission_digest: Digest = @splat(0),
+    catalog_revision: u64 = 0,
+    sequence_retirement: ?SequenceRetirement = null,
+    retirement_root: ?@import("table_retirement_authority.zig").Authority = null,
+    participant_count: u16 = 1,
+    participants_digest: Digest = @splat(0),
     /// Derived once from the immutable before/after layouts. The accepting
     /// writer checks current owner capabilities without reparsing that plan.
     reader_requirements: ?local.common_schema_readers.ReaderRequirements = null,
@@ -88,8 +115,45 @@ pub const Head = struct {
     terminal_chain: Digest = @splat(0),
     failure_digest: Digest = @splat(0),
 
+    pub fn catalogEffect(self: Head) bool {
+        return self.type_id != 0 or self.sequence_retirement != null or self.retirement_root != null;
+    }
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            const ordinary = self.participant_count == 1 and !nonzero(&self.participants_digest);
+            const absent_type = self.type_id == 0 and (comptime std.mem.eql(u8, field, "type_id") or std.mem.eql(u8, field, "type_generation") or std.mem.eql(u8, field, "type_admission_digest"));
+            const absent_catalog = !self.catalogEffect() and (comptime std.mem.eql(u8, field, "catalog_revision"));
+            const absent_sequence = self.sequence_retirement == null and (comptime std.mem.eql(u8, field, "sequence_retirement"));
+            const absent_root = self.retirement_root == null and (comptime std.mem.eql(u8, field, "retirement_root"));
+            if (!absent_type and !absent_catalog and !absent_sequence and !absent_root and
+                !(ordinary and (comptime std.mem.eql(u8, field, "participant_count") or std.mem.eql(u8, field, "participants_digest"))))
+            {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validate(self: Head) !void {
         if (self.reader_requirements) |required| if (!required.valid()) return error.InvalidGenerationPublication;
+        if (self.retirement_root) |root| {
+            try root.validate();
+            if (self.type_id != 0 or self.sequence_retirement != null or root.root.group != self.metadata_group_id or
+                root.effects.survivors != self.participant_count or root.root.table == self.table_id or
+                std.mem.eql(u8, &root.root.id, &self.id) or !nonzero(&self.participants_digest)) return error.InvalidGenerationPublication;
+        }
+        if (self.sequence_retirement) |retirement| {
+            try retirement.validate();
+            if (self.type_id != 0 or !nonzero(&self.participants_digest)) return error.InvalidGenerationPublication;
+        }
+        if ((self.type_id == 0) != (self.type_generation == 0) or (self.type_id != 0) != nonzero(&self.type_admission_digest) or
+            (self.type_id != 0 and !nonzero(&self.participants_digest)) or
+            (self.catalog_revision != 0 and (!self.catalogEffect() or self.publication_revision == 0))) return error.InvalidGenerationPublication;
+        if (self.participant_count == 0 or self.participant_count > 128 or self.participant_count > self.owner_count or
+            (self.participant_count != 1 and !nonzero(&self.participants_digest))) return error.InvalidGenerationPublication;
         if (self.metadata_group_id == 0 or self.table_id == 0 or self.revision == 0 or
             !local.metadata_incarnation.isValid(self.metadata_incarnation) or !nonzero(&self.id) or !nonzero(&self.plan_digest) or
             self.owner_count == 0 or self.owner_count > max_owners or self.input_count == 0 or self.input_count > self.owner_count or
@@ -223,7 +287,7 @@ pub const Owner = struct {
         try self.binding.validate();
         if (self.ordinal >= head.owner_count or self.input_ordinal >= head.input_count or self.physical_root_incarnation == 0 or
             !std.mem.eql(u8, &self.binding.id, &head.id) or !eq(self.binding.plan_digest, head.plan_digest) or
-            self.binding.fence.namespace.table_id != head.table_id) return error.InvalidGenerationPublication;
+            (!nonzero(&head.participants_digest) and self.binding.fence.namespace.table_id != head.table_id)) return error.InvalidGenerationPublication;
         if ((self.root_epoch != 0) != (self.root_origin != 0) or
             (self.root_epoch != 0) != nonzero(&self.root_digest)) return error.InvalidGenerationPublication;
         for (self.proof_epochs, 0..) |epoch, i| {
@@ -334,6 +398,26 @@ pub fn nextOwnerWork(head: Head, owner: Owner, physical: ?contract.Header, direc
     return if (try ownerPermission(head, owner, action) == .execute) .{ .execute = action } else .idle;
 }
 
+/// Planning only: accepted logical work can need a fresh current runtime
+/// proof after restart/lease change on the SAME physical root. The metadata
+/// ACK writer still verifies signatures, source cut and exact logical identity.
+pub fn nextOwnerWorkWithProof(head: Head, owner: Owner, physical: ?contract.Header, directory: ?contract.TransactionDebtObservation, current_proof: Digest) !OwnerWork {
+    const work = try nextOwnerWork(head, owner, physical, directory);
+    if (work != .idle or head.phase == .succeeded or head.phase == .canceled) return work;
+    const header = physical orelse return work;
+    const stage: Stage = switch (header.phase) {
+        .ready => .ready,
+        .installed => .installed,
+        else => return work,
+    };
+    if (!owner.has(stage) or owner.latest().? != stage) return work;
+    const index = @backingInt(stage);
+    if (!nonzero(&current_proof)) return error.InvalidGenerationPublication;
+    if (eq(owner.proofs[index], current_proof)) return work;
+    if (!eq(owner.headers[index], try header.digest()) or !eq(owner.logical[index], try evidence.logicalHeaderDigest(header))) return error.SchemaValidationRuntimeRecoveryRequired;
+    return .{ .ack = stage };
+}
+
 pub fn ownerPermission(head: Head, owner: Owner, action: contract.Action) !OwnerPermission {
     try owner.validate(head);
     switch (action) {
@@ -370,7 +454,10 @@ pub fn ownerPermission(head: Head, owner: Owner, action: contract.Action) !Owner
 
 /// Canonical, checksummed fixed-capacity records. ACK apply can stage bounded
 /// stack-owned postimages without a heap allocation or re-encoding the plan.
-pub const HeadRecord = Record(Head, "SVPH", 2048);
+// The complete retirement authority and terminal digest chains must fit for
+// full-width IDs and worst-case decimal byte encodings, not only fixture IDs.
+// This is a fixed-size per-job record, independent of owner/table cardinality.
+pub const HeadRecord = Record(Head, "SVPH", 4096);
 pub const OwnerRecord = Record(Owner, "SVPO", 16 * 1024);
 pub fn Record(comptime T: type, comptime magic: *const [4]u8, comptime max_body: usize) type {
     return struct {
@@ -508,12 +595,32 @@ pub fn acknowledge(head: Head, owner: Owner, expected_revision: u64, observed: e
 pub fn validateCohort(head: Head, owners: []const Owner) !void {
     try head.validate();
     if (owners.len != head.owner_count) return error.InvalidGenerationPublication;
+    var table_base: usize = 0;
+    var tables: usize = 0;
+    var previous_table: u64 = 0;
     for (owners, 0..) |owner, ordinal| {
         try owner.validate(head);
         if (owner.ordinal != ordinal) return error.InvalidGenerationPublication;
+        if (head.catalogEffect()) {
+            const table = owner.binding.fence.namespace.table_id;
+            if (table < previous_table or (if (head.retirement_root != null) owner.binding.purpose != .dependent_object_retirement else if (head.sequence_retirement != null) owner.binding.purpose != .sequence_default_removal else owner.binding.purpose != .enum_epoch and owner.binding.purpose != .domain_not_null) or
+                owner.binding.purpose != owners[0].binding.purpose or
+                owner.binding.columns != owners[0].binding.columns or
+                !std.mem.eql(u8, &owner.binding.projection_identity, &owners[0].binding.projection_identity)) return error.InvalidGenerationPublication;
+            if (table != previous_table) {
+                tables += 1;
+                table_base = ordinal;
+                previous_table = table;
+            }
+        }
+        // Ordinary jobs have one immutable layout. A type epoch has one
+        // layout PER table, with potentially different schema versions, keys
+        // and FK declarations. Owners of the same table still agree exactly;
+        // the immutable plan independently binds every table's postimage.
         inline for (.{ "before_version", "after_version", "columns", "before_schema", "after_schema", "before_public", "after_public", "projection_identity" }) |field|
-            if (!std.meta.eql(@field(owner.binding, field), @field(owners[0].binding, field))) return error.InvalidGenerationPublication;
+            if (!std.meta.eql(@field(owner.binding, field), @field(owners[table_base].binding, field))) return error.InvalidGenerationPublication;
     }
+    if (head.catalogEffect() and tables != head.participant_count) return error.InvalidGenerationPublication;
     var ordinals: [max_owners]u16 = undefined;
     for ([_]Stage{ .ready, .installed, .released, .canceled, .failed }) |stage| {
         const index = @backingInt(stage);
@@ -977,4 +1084,79 @@ test "schema validation publication FK release preserves accepted native transac
     try std.testing.expectEqualSlices(u8, &accepted.headers[@backingInt(Stage.installed)], &owner.headers[@backingInt(Stage.installed)]);
     try std.testing.expectEqual(@as(u64, 0), owner.proof_epochs[@backingInt(Stage.installed)]);
     try std.testing.expectEqual(@as(u64, 1), owner.proof_epochs[@backingInt(Stage.released)]);
+}
+
+test "schema validation publication idle owners refresh runtime proofs without repeating physical work" {
+    // Reducer/planning fixture, not fabricated native execution authority.
+    var head = Fixture.head();
+    var owners = [_]Owner{ Fixture.owner(0), Fixture.owner(1) };
+    for (&owners) |*owner| try Fixture.apply(&head, owner, Fixture.ready(owner.*));
+    const ready = Fixture.ready(owners[0]);
+    const original = try Fixture.proof(owners[0], ready);
+    try std.testing.expectEqual(OwnerWork.idle, try nextOwnerWorkWithProof(head, owners[0], ready, null, original.root_commitment));
+    var refreshed = original;
+    refreshed.root_commitment[0] ^= 1;
+    try std.testing.expectEqualDeep(OwnerWork{ .ack = .ready }, try nextOwnerWorkWithProof(head, owners[0], ready, null, refreshed.root_commitment));
+    var changed = ready;
+    changed.chain[0] ^= 1;
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, nextOwnerWorkWithProof(head, owners[0], changed, null, refreshed.root_commitment));
+    const updated = try acknowledge(head, owners[0], head.revision, refreshed);
+    head = updated.head;
+    owners[0] = updated.owner;
+    try std.testing.expectEqual(@as(u16, 2), head.ready);
+    try std.testing.expectEqual(@as(u16, 0), head.installed);
+    try std.testing.expectEqual(OwnerWork.idle, try nextOwnerWorkWithProof(head, owners[0], ready, null, refreshed.root_commitment));
+    head = try head.decideInstall(head.revision);
+    for (&owners) |*owner| try Fixture.apply(&head, owner, try Fixture.installed(owner.*, head));
+    var installed = try Fixture.proof(owners[0], try Fixture.installed(owners[0], head));
+    installed.root_commitment[0] ^= 1;
+    try std.testing.expectEqualDeep(OwnerWork{ .ack = .installed }, try nextOwnerWorkWithProof(head, owners[0], installed.header, null, installed.root_commitment));
+    const before_chain = head.installed_chain;
+    const retained = try acknowledge(head, owners[0], head.revision, installed);
+    head = retained.head;
+    owners[0] = retained.owner;
+    try std.testing.expectEqual(@as(u16, 2), head.installed);
+    try std.testing.expectEqualSlices(u8, &before_chain, &head.installed_chain);
+    head = try head.publish(head.revision);
+    for (&owners) |*owner| try Fixture.apply(&head, owner, try Fixture.released(owner.*, head));
+    try std.testing.expectEqual(OwnerWork.idle, try nextOwnerWorkWithProof(head, owners[0], try Fixture.released(owners[0], head), null, installed.root_commitment));
+    try validateCohort(head, &owners);
+}
+
+test "schema validation publication retirement head fits full-width admission and terminal proofs" {
+    var head: Head = .{
+        .metadata_group_id = std.math.maxInt(u64),
+        .metadata_incarnation = @splat('f'),
+        .id = @splat(255),
+        .plan_digest = @splat(255),
+        .table_id = std.math.maxInt(u64),
+        .owner_count = max_owners,
+        .input_count = max_owners,
+        .participant_count = 128,
+        .participants_digest = @splat(255),
+        .retirement_root = .{
+            .root = .{ .group = std.math.maxInt(u64), .table = std.math.maxInt(u64) - 1, .id = @splat(254) },
+            .effects = .{ .digest = @splat(255), .root_table = std.math.maxInt(u64) - 1, .survivors = 128, .counters = 256, .views = 256 },
+            .physical_plan = @splat(255),
+        },
+    };
+    const admission = try head.encode();
+    try std.testing.expectEqualDeep(head, try Head.decode(admission.slice()));
+    head.phase = .succeeded;
+    head.ready = max_owners;
+    head.installed = max_owners;
+    head.released = max_owners;
+    head.install_revision = std.math.maxInt(u64) - 2;
+    head.publication_revision = std.math.maxInt(u64) - 1;
+    head.revision = std.math.maxInt(u64);
+    head.catalog_revision = std.math.maxInt(u64);
+    head.ready_chain = @splat(255);
+    head.installed_chain = @splat(255);
+    head.terminal_chain = @splat(255);
+    // Reproduce the old persistence failure with a valid complete head. No
+    // positive owner evidence is inferred from this codec-only boundary test.
+    try head.validate();
+    try std.testing.expectError(error.InvalidGenerationPublication, Record(Head, "SVPH", 2048).init(head));
+    const terminal = try head.encode();
+    try std.testing.expectEqualDeep(head, try Head.decode(terminal.slice()));
 }

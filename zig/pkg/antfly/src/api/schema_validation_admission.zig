@@ -26,12 +26,12 @@ const catalog = local.sql_catalog;
 const operation = local.api_operation;
 const max_observation_bytes = 16 * 1024;
 
-const BeginAttempt = union(enum) { reply: []u8, rejected: anyerror };
+pub const BeginAttempt = union(enum) { reply: []u8, rejected: anyerror };
 
 /// A source/report lag is a definite pre-proposal rejection, not an uncertain
 /// admission. Keep the SAME owned plan and signed physical cuts while waiting
 /// for authority reports to catch up. An unknown delivery is never retried.
-fn beginWhenReady(source: anytype, a: std.mem.Allocator, io: std.Io, input: operation.RequestContext, command: []const u8) !BeginAttempt {
+pub fn beginWhenReady(source: anytype, a: std.mem.Allocator, io: std.Io, input: operation.RequestContext, command: []const u8) !BeginAttempt {
     var context = input.platformDeadline() catch |err| return .{ .rejected = err };
     const deadline = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s);
     context.deadline_ns = deadline;
@@ -188,25 +188,28 @@ test "system catalog schema validation admission waits for known nonsends with o
     const Source = struct {
         mode: enum { lag, unknown, lag_then_unknown },
         calls: usize = 0,
+        lag_error: anyerror = error.IndexOwnerReceiptChanged,
         pub fn systemCatalog(self: *@This(), a: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try std.testing.expect(call == .schema_validation_submit);
             try std.testing.expectEqualStrings("same-owned-command", call.schema_validation_submit);
             self.calls += 1;
-            if (self.mode != .unknown and self.calls == 1) return error.IndexOwnerReceiptChanged;
+            if (self.mode != .unknown and self.calls == 1) return self.lag_error;
             if (self.mode != .lag) return error.MetadataMutationOutcomeUnknown;
             return a.dupe(u8, "accepted");
         }
     };
     const a = std.testing.allocator;
-    for ([_]@FieldType(Source, "mode"){ .lag, .unknown, .lag_then_unknown }) |mode| {
-        var source: Source = .{ .mode = mode };
-        if (mode == .lag) {
-            const attempt = try beginWhenReady(&source, a, std.testing.io, .{}, "same-owned-command");
-            try std.testing.expect(attempt == .reply);
-            defer a.free(attempt.reply);
-            try std.testing.expectEqualStrings("accepted", attempt.reply);
-        } else try std.testing.expectError(error.MetadataMutationOutcomeUnknown, beginWhenReady(&source, a, std.testing.io, .{}, "same-owned-command"));
-        try std.testing.expectEqual(@as(usize, if (mode == .unknown) 1 else 2), source.calls);
+    for ([_]anyerror{ error.IndexOwnerReceiptChanged, error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady }) |lag_error| {
+        for ([_]@FieldType(Source, "mode"){ .lag, .unknown, .lag_then_unknown }) |mode| {
+            var source: Source = .{ .mode = mode, .lag_error = lag_error };
+            if (mode == .lag) {
+                const attempt = try beginWhenReady(&source, a, std.testing.io, .{}, "same-owned-command");
+                try std.testing.expect(attempt == .reply);
+                defer a.free(attempt.reply);
+                try std.testing.expectEqualStrings("accepted", attempt.reply);
+            } else try std.testing.expectError(error.MetadataMutationOutcomeUnknown, beginWhenReady(&source, a, std.testing.io, .{}, "same-owned-command"));
+            try std.testing.expectEqual(@as(usize, if (mode == .unknown) 1 else 2), source.calls);
+        }
     }
     var expired: Source = .{ .mode = .lag };
     const attempt = try beginWhenReady(&expired, a, std.testing.io, .{ .deadline_ns = 0 }, "same-owned-command");

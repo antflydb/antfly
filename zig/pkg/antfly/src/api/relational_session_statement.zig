@@ -79,7 +79,11 @@ pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionComm
         // These are observations of the live rows used to derive the staged
         // result, not observations of the staged result itself. Keep them even
         // for read-only dependencies and across subsequent statements.
+        const authorization = for (candidate.tables) |table| {
+            if (std.mem.eql(u8, candidate.physicalName(table.table_name), update.table_name)) break table.sql_authorization;
+        } else null;
         var entry = [_]sessions.TableCommitRequest{.{
+            .sql_authorization = authorization,
             .table_name = @constCast(label),
             .relational_schema_version = update.relational_schema_version,
             .schema_version = update.schema_version,
@@ -204,4 +208,22 @@ test "distributed txn session normalization retains bounded physical observation
     try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(7)), &tables[0].predicates[0].expected_content_digest.?);
     try std.testing.expectError(error.VersionConflict, apply(alloc, &candidate, &.{.{ .table_name = "table:child", .predicates = &.{.{ .key = "child", .expected_version = 43 }} }}));
     try std.testing.expectError(error.VersionConflict, apply(alloc, &candidate, &.{.{ .table_name = "table:child", .predicates = &.{.{ .key = "child", .expected_version = 42, .expected_content_digest = @splat(8) }} }}));
+}
+
+test "SQL privileges integrity normalization preserves admitted intent and discovered native participants" {
+    const a = std.testing.allocator;
+    const Access = @import("antfly_local_sources").system_catalog_privileges.Access;
+    var candidate = try sessions.parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{\"id\":1}}}}}");
+    defer candidate.deinit(a);
+    try candidate.bind(a, "docs", "table:9");
+    candidate.tables[0].sql_authorization = .{ .row_filter_digest = @splat(0), .principal_instance = @splat(7), .table_id = 9, .required = Access.bit(.insert), .native_rights = 0 };
+    const updates = [_]contract.TableCommitRequest{
+        .{ .table_name = "table:9", .writes = &.{.{ .key = "a", .value = "{\"id\":1,\"default\":true}" }} },
+        .{ .table_name = "other", .writes = &.{.{ .key = "b", .value = "{}" }} },
+    };
+    try apply(a, &candidate, &updates);
+    try std.testing.expectEqual(@as(usize, 2), candidate.tables.len);
+    try std.testing.expectEqual(Access.bit(.insert), candidate.tables[0].sql_authorization.?.required);
+    try std.testing.expect(!candidate.tables[0].sql_authorization.?.native_write);
+    try std.testing.expect(candidate.tables[1].sql_authorization == null);
 }

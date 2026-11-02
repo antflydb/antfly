@@ -83,7 +83,42 @@ fn writeFields(value: anytype, writer: anytype) @TypeOf(writer.*).Error!void {
     try writer.endObject();
 }
 
-pub const Purpose = enum { not_null, foreign_key_source, foreign_key_parent, foreign_key_dual };
+pub const Purpose = enum {
+    not_null,
+    foreign_key_source,
+    foreign_key_parent,
+    foreign_key_dual,
+    enum_epoch,
+    domain_not_null,
+    sequence_default_removal,
+    object_rename,
+    dependent_object_retirement,
+    pub fn schemaOnly(self: @This()) bool {
+        return self == .enum_epoch or self == .sequence_default_removal or self == .object_rename or self == .dependent_object_retirement;
+    }
+    pub fn references(self: @This()) bool {
+        return self == .foreign_key_source or self == .foreign_key_parent or self == .foreign_key_dual;
+    }
+};
+/// The complete definitions remain in the exact before/after schema inputs.
+/// This fixed-size selector cannot substitute caller-provided labels or ranks.
+pub const EnumEpoch = struct {
+    type_id: u64,
+    generation: u32,
+    origin_id: [16]u8,
+    pub fn validate(self: @This()) !void {
+        if (self.type_id == 0 or self.generation == 0 or std.mem.allEqual(u8, &self.origin_id, 0)) return error.InvalidSchemaValidationJob;
+    }
+    pub fn fingerprint(self: @This()) !Digest {
+        try self.validate();
+        var state = std.Io.Writer.Hashing(std.crypto.hash.Blake3).initHasher(std.crypto.hash.Blake3.init(.{}), &.{});
+        try state.writer.writeAll("antfly/compatible-enum-epoch/v1\x00");
+        try std.json.Stringify.value(self, .{}, &state.writer);
+        var result: Digest = undefined;
+        state.hasher.final(&result);
+        return result;
+    }
+};
 pub const ForeignKeyParent = struct {
     constraint_name: []const u8,
     declared_parent: []const u8,
@@ -135,13 +170,20 @@ pub const ForeignKeySource = struct {
 pub const Selection = union(enum) {
     not_null: []const []const u8,
     foreign_keys: []const []const u8,
+    object_rename: []const @import("../../system_catalog/object_annotations.zig").Rename,
 
     pub fn names(self: @This()) []const []const u8 {
         return switch (self) {
+            .object_rename => &.{},
             inline else => |value| value,
         };
     }
     pub fn validate(self: @This()) !void {
+        if (self == .object_rename) {
+            if (self.object_rename.len == 0) return error.InvalidSchemaValidationJob;
+            @import("../../system_catalog/object_annotations.zig").validateSingleRename(self.object_rename) catch return error.InvalidSchemaValidationJob;
+            return;
+        }
         if (self == .foreign_keys and self.foreign_keys.len > 256) return error.InvalidSchemaValidationJob;
         var projection = ProjectionHasher.init();
         for (self.names(), 0..) |name, i| {
@@ -157,43 +199,72 @@ pub const Selection = union(enum) {
 pub const InputSelection = union(enum) {
     not_null: []const []const u8,
     foreign_keys: ForeignKeySource,
+    enum_epoch: EnumEpoch,
+    domain_not_null: EnumEpoch,
+    sequence_default_removal: @import("../../system_catalog/column_sequences.zig").DefaultRetirement,
+    object_rename: []const @import("../../system_catalog/object_annotations.zig").Rename,
+    dependent_object_retirement: @import("../../system_catalog/dependency_retirement.zig").Selection,
 
     pub fn validate(self: @This()) !void {
         switch (self) {
             .not_null => |names| try (Selection{ .not_null = names }).validate(),
             .foreign_keys => |source| try source.validate(),
+            .enum_epoch, .domain_not_null => |epoch| try epoch.validate(),
+            .sequence_default_removal => |value| try value.validate(),
+            .dependent_object_retirement => |value| try value.validate(),
+            .object_rename => |value| try (Selection{ .object_rename = value }).validate(),
         }
     }
     pub fn count(self: @This()) usize {
         return switch (self) {
             .not_null => |names| names.len,
             .foreign_keys => |source| source.parents.len,
+            .enum_epoch, .domain_not_null, .sequence_default_removal, .object_rename, .dependent_object_retirement => 1,
         };
     }
     pub fn purpose(self: @This()) Purpose {
         return switch (self) {
             .not_null => .not_null,
             .foreign_keys => .foreign_key_source,
+            .enum_epoch => .enum_epoch,
+            .domain_not_null => .domain_not_null,
+            .sequence_default_removal => .sequence_default_removal,
+            .dependent_object_retirement => .dependent_object_retirement,
+            .object_rename => .object_rename,
         };
     }
     pub fn name(self: @This(), index: usize) []const u8 {
         return switch (self) {
             .not_null => |names| names[index],
             .foreign_keys => |source| source.parents[index].constraint_name,
+            .enum_epoch => "$enum_epoch",
+            .domain_not_null => "$domain_not_null",
+            .sequence_default_removal => "$sequence_default_removal",
+            .dependent_object_retirement => "$dependent_object_retirement",
+            .object_rename => "$object_rename",
         };
     }
     pub fn requireSelection(self: @This(), selection: Selection) !void {
         try self.validate();
         try selection.validate();
+        if (self == .object_rename or selection == .object_rename) {
+            if (self != .object_rename or selection != .object_rename or self.object_rename.len != selection.object_rename.len) return error.InvalidSchemaValidationJob;
+            for (self.object_rename, selection.object_rename) |left, right| if (left.kind != right.kind or !std.mem.eql(u8, left.from, right.from) or !std.mem.eql(u8, left.to, right.to)) return error.InvalidSchemaValidationJob;
+            return;
+        }
+        if (self == .enum_epoch or self == .domain_not_null or self == .sequence_default_removal or self == .dependent_object_retirement) return error.InvalidSchemaValidationJob;
         if ((self == .not_null) != (selection == .not_null) or self.count() != selection.names().len) return error.InvalidSchemaValidationJob;
         for (selection.names(), 0..) |selected, i| if (!std.mem.eql(u8, self.name(i), selected)) return error.InvalidSchemaValidationJob;
     }
     pub fn logical(self: @This(), a: A) !Selection {
+        if (self == .object_rename) return .{ .object_rename = self.object_rename };
+        if (self == .enum_epoch or self == .domain_not_null or self == .sequence_default_removal or self == .dependent_object_retirement) return error.SqlTypeActivationRequired;
         const names = try a.alloc([]const u8, self.count());
         for (names, 0..) |*value, i| value.* = self.name(i);
         return switch (self) {
             .not_null => .{ .not_null = names },
             .foreign_keys => .{ .foreign_keys = names },
+            .enum_epoch, .domain_not_null, .sequence_default_removal, .object_rename, .dependent_object_retirement => unreachable,
         };
     }
     pub fn encodePayload(self: @This(), a: A) ![]u8 {
@@ -221,7 +292,7 @@ pub const ReferenceCoverage = struct {
         try self.expected.validate();
         try self.observed.validate();
         const maximum = std.math.mul(u64, rows, columns) catch return error.InvalidSchemaValidationJob;
-        if (purpose == .not_null or self.expected.count > maximum or self.observed.count > records or
+        if (!purpose.references() or self.expected.count > maximum or self.observed.count > records or
             (purpose == .foreign_key_source and self.observed.count != 0) or
             (purpose == .foreign_key_parent and self.expected.count != 0)) return error.InvalidSchemaValidationJob;
     }
@@ -315,11 +386,13 @@ pub const Header = struct {
     }
     pub fn validate(self: Header) !void {
         try self.binding.validate();
+        if (self.binding.purpose.schemaOnly() and (self.records != 0 or self.rows_scanned != 0 or self.failure_column != null or
+            !eq(self.cursor_digest, hash("")))) return error.InvalidSchemaValidationJob;
         if (self.transaction_coverage) |coverage| {
             if (self.binding.purpose != .foreign_key_source or self.reference_coverage != null or
                 std.mem.allEqual(u8, &coverage.record, 0) or ((self.binding.authority == .native) != (coverage.physical_root != 0)))
                 return error.InvalidSchemaValidationJob;
-        } else if ((self.binding.purpose == .not_null) != (self.reference_coverage == null)) return error.InvalidSchemaValidationJob;
+        } else if ((!self.binding.purpose.references()) != (self.reference_coverage == null)) return error.InvalidSchemaValidationJob;
         if (self.reference_coverage) |coverage| try coverage.validate(self.binding.purpose, self.records, self.rows_scanned, self.binding.columns);
         inline for (.{ "cursor_digest", "chain", "last_effect" }) |field|
             if (std.mem.allEqual(u8, &@field(self, field), 0)) return error.InvalidSchemaValidationJob;
@@ -459,7 +532,9 @@ pub const PageCommand = struct {
     pub fn validate(self: @This()) !void {
         try self.binding.validate();
         try self.boundary.validate();
-        if ((self.binding.purpose == .not_null) != (self.reference_coverage == null)) return error.InvalidSchemaValidationPageCommand;
+        if (self.binding.purpose.schemaOnly() and (self.boundary.records_examined != 0 or self.boundary.rows_examined != 0 or
+            self.boundary.more or self.boundary.violation_column != null or self.boundary.after.len != 0)) return error.InvalidSchemaValidationPageCommand;
+        if ((!self.binding.purpose.references()) != (self.reference_coverage == null)) return error.InvalidSchemaValidationPageCommand;
         if (self.reference_coverage) |coverage| try coverage.validate(self.binding.purpose, self.boundary.records_examined, self.boundary.rows_examined, self.binding.columns);
         if (std.mem.allEqual(u8, &self.expected, 0) or
             (self.boundary.violation_column != null and self.boundary.violation_column.? >= self.binding.columns)) return error.InvalidSchemaValidationPageCommand;
@@ -964,4 +1039,50 @@ test "foreign key validation source accepts initial parent epoch without weakeni
         @field(parents[0], field) = @splat(0);
         try std.testing.expectError(error.InvalidSchemaValidationJob, source.validate());
     }
+}
+
+test "SQL named enum compatible owner proofs admit no rows cursors failures or reference claims" {
+    var binding = ValidationContractFixture.binding();
+    binding.purpose = .enum_epoch;
+    var ready = ValidationContractFixture.ready(binding);
+    ready.records = 0;
+    ready.rows_scanned = 0;
+    ready.cursor_digest = hash("");
+    try ready.validate();
+    var forged = ready;
+    forged.records = 1;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, forged.validate());
+    forged = ready;
+    forged.reference_coverage = .{};
+    try std.testing.expectError(error.InvalidSchemaValidationJob, forged.validate());
+    var command: PageCommand = .{ .binding = binding, .expected = try ready.digest(), .boundary = .{ .records_examined = 0, .rows_examined = 0, .violation_column = null, .after = &.{}, .more = false } };
+    try command.validate();
+    command.boundary.after = "cursor";
+    try std.testing.expectError(error.InvalidSchemaValidationPageCommand, command.validate());
+    command.boundary.after = &.{};
+    command.boundary.records_examined = 1;
+    try std.testing.expectError(error.InvalidSchemaValidationPageCommand, command.validate());
+}
+
+test "column sequence defaults require exact zero-row owner proofs" {
+    var binding = ValidationContractFixture.binding();
+    binding.purpose = .sequence_default_removal;
+    var ready = ValidationContractFixture.ready(binding);
+    ready.records = 0;
+    ready.rows_scanned = 0;
+    ready.cursor_digest = hash("");
+    try ready.validate();
+    var forged = ready;
+    forged.records = 1;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, forged.validate());
+    forged = ready;
+    forged.reference_coverage = .{};
+    try std.testing.expectError(error.InvalidSchemaValidationJob, forged.validate());
+    var command: PageCommand = .{ .binding = binding, .expected = try ready.digest(), .boundary = .{ .records_examined = 0, .rows_examined = 0, .violation_column = null, .after = &.{}, .more = false } };
+    try command.validate();
+    command.boundary.after = "cursor";
+    try std.testing.expectError(error.InvalidSchemaValidationPageCommand, command.validate());
+    command.boundary.after = &.{};
+    command.boundary.records_examined = 1;
+    try std.testing.expectError(error.InvalidSchemaValidationPageCommand, command.validate());
 }

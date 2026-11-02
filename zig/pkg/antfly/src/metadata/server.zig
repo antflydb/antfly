@@ -337,6 +337,15 @@ pub const MetadataServer = struct {
             // make remote restore work. Explicit host overrides stay intact.
             if (api_server_cfg.session_router == null) api_server_cfg.session_router = data_router;
             if (api_server_cfg.session_executor == null) api_server_cfg.session_executor = svc.raft.host.http_host.request_executor;
+            api_server_cfg.prepared_transaction_leadership = .{
+                .ptr = svc,
+                .vtable = &.{ .is_local_leader = struct {
+                    fn owns(raw: *anyopaque, group: u64) bool {
+                        const owner: *service.MetadataHttpService = @ptrCast(@alignCast(raw));
+                        return group == owner.metadata_group_id and owner.localMetadataLeadershipTerm() != null;
+                    }
+                }.owns },
+            };
             api_server_cfg.restore_validation = .{ .status = public_api_http_server.StatusSource.fromMetadataHttpService(svc), .factory = @import("../api/restore_catalog.zig").ValidationPort.SourceFactory.hosted(public_read_source, public_write_source) };
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();

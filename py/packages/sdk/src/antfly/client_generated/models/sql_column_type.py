@@ -4,6 +4,7 @@ from enum import StrEnum
 class SQLColumnType(StrEnum):
     ARRAY = "array"
     BOOLEAN = "boolean"
+    BYTEA = "bytea"
     DATERANGE = "daterange"
     DATETIME = "datetime"
     ENUMERATION = "enumeration"

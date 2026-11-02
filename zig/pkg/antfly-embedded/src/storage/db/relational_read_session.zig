@@ -78,10 +78,23 @@ pub const Session = struct {
     /// Each returned key/value and the outer slice belong to alloc.
     pub fn normalizeRows(session: *Session, alloc: Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionNormalizeRows", .{ session, alloc, writes });
+        return session.normalizeRowsImpl(alloc, writes, null, null);
+    }
+
+    /// Compiler-owned provenance remains separate from row JSON. The caller
+    /// owns the output contract storage, which must outlive returned writes.
+    pub fn normalizeDomainRows(session: *Session, alloc: Allocator, writes: []const types.BatchWrite, admissions: []const ?@import("../../schema/domain_row.zig").Admission, contract: *@import("../../schema/domain_handoff.zig").Contract) ![]types.BatchWrite {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionNormalizeDomainRows", .{ session, alloc, writes, admissions, contract });
+        if (admissions.len != writes.len) return error.InvalidArgument;
+        return session.normalizeRowsImpl(alloc, writes, admissions, contract);
+    }
+
+    fn normalizeRowsImpl(session: *Session, alloc: Allocator, writes: []const types.BatchWrite, admissions: ?[]const ?@import("../../schema/domain_row.zig").Admission, contract: ?*@import("../../schema/domain_handoff.zig").Contract) ![]types.BatchWrite {
         if (writes.len > 4096) return error.InvalidArgument;
         try session.checkpoint();
         const view = session.reader.active;
         const validator = if (view.validator()) |compiled| (if (session.preparation_runtime) |runtime| compiled.forPreparation(try runtime.withClock(view.tableSchema().requires_clock_defaults)) else compiled) else null;
+        if (contract) |destination| destination.* = (validator orelse return error.InvalidBatchRequest).preparedDomainContract() orelse return error.InvalidBatchRequest;
         const normalized = try alloc.alloc(types.BatchWrite, writes.len);
         var initialized: usize = 0;
         errdefer {
@@ -94,9 +107,13 @@ pub const Session = struct {
             alloc.free(normalized);
         }
         var output_bytes: usize = 0;
-        for (writes, normalized) |write, *out| {
+        for (writes, normalized, 0..) |write, *out, index| {
+            const admission = if (admissions) |inputs| inputs[index] else null;
+            if (admission != null and write.prepared_domain != null) return error.InvalidBatchRequest;
+            const row_validator = if (validator) |compiled| compiled.forDomainAdmission(admission) else null;
             try session.checkpoint();
-            var prepared = try mapper.PreparedRelationalWrite.initTyped(alloc, alloc, alloc, false, write.key, write.value, validator, view.tableSchema().*, view.physicalLayout(), write.json_null_fields, false);
+            const preserve = try @import("../../schema/domain_handoff.zig").preserveFor(validator, write.prepared_domain, false);
+            var prepared = try mapper.PreparedRelationalWrite.initTyped(alloc, alloc, alloc, false, write.key, write.value, row_validator, view.tableSchema().*, view.physicalLayout(), write.json_null_fields, preserve);
             defer prepared.deinit(alloc);
             try prepared.requireLogicalRoot();
             const value = try std.json.Stringify.valueAlloc(alloc, prepared.parsedValue(), .{});
@@ -123,7 +140,7 @@ pub const Session = struct {
                     try null_names.append(alloc, column.name);
             }
             const nulls = try types.cloneJsonNullFields(alloc, null_names.items);
-            out.* = .{ .key = key, .value = value, .json_null_fields = nulls };
+            out.* = .{ .key = key, .value = value, .json_null_fields = nulls, .prepared_domain = contract orelse write.prepared_domain };
             initialized += 1;
         }
         try session.checkpoint();

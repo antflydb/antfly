@@ -5,6 +5,7 @@ const arities: Record<RelationalExpressionOp, readonly [number, number]> = {
   column: [0, 0],
   uuidv4: [0, 0],
   uuidv7: [0, 0],
+  transaction_timestamp: [0, 0],
   array: [0, 32],
   add: [2, 2],
   subtract: [2, 2],
@@ -87,6 +88,11 @@ const types: Record<RelationalExpressionType, true> = {
   numeric: true,
   sql_array: true,
   json: true,
+  numrange: true,
+  daterange: true,
+  tsrange: true,
+  tstzrange: true,
+  enumeration: true,
 };
 const typeNames = new Set(Object.keys(types));
 const arrayTypes: Record<SQLBuiltinType, true> = {
@@ -273,20 +279,33 @@ export function validateRelationalExpression(
         ? ["op"]
         : op === "uuidv7"
           ? ["op", "shift"]
-          : op === "literal"
-            ? ["op", "type", "value", "sql_type", "json_null"]
-            : op === "column"
-              ? ["op", "column"]
-              : op === "cast"
-                ? ["op", "type", "sql_type", "numeric_modifier", "args"]
-                : numericOperations.has(op) || op === "array"
-                  ? ["op", "args", "sql_type"]
-                  : comparisons.has(op)
-                    ? ["op", "args", "collation"]
-                    : ["op", "args"]
+          : op === "transaction_timestamp"
+            ? ["op", "precision"]
+            : op === "literal"
+              ? ["op", "type", "value", "sql_type", "json_null", "named_type_id"]
+              : op === "column"
+                ? ["op", "column"]
+                : op === "cast"
+                  ? ["op", "type", "sql_type", "numeric_modifier", "args", "named_type_id"]
+                  : numericOperations.has(op) || op === "array"
+                    ? ["op", "args", "sql_type"]
+                    : comparisons.has(op)
+                      ? ["op", "args", "collation"]
+                      : ["op", "args"]
     );
     for (const key of Object.keys(node))
       if (!allowed.has(key)) throw new TypeError(`${location}.${key} is not valid for ${op}`);
+    if (op === "transaction_timestamp") {
+      if (
+        hasOwn.call(node, "precision") &&
+        (typeof node.precision !== "number" ||
+          !Number.isInteger(node.precision) ||
+          node.precision < 0 ||
+          node.precision > 6)
+      )
+        throw new TypeError(`${location}.precision requires an integer from 0 through 6`);
+      return;
+    }
     if (op === "uuidv4" || op === "uuidv7") {
       if (
         hasOwn.call(node, "shift") &&
@@ -296,6 +315,19 @@ export function validateRelationalExpression(
       // The server binds canonical interval syntax and permits volatile UUID
       // generation only in column defaults, never immutable schema expressions.
       return;
+    }
+    const enumDomain = (op === "literal" || op === "cast") && node.type === "enumeration";
+    if (enumDomain) {
+      if (
+        typeof node.named_type_id !== "number" ||
+        !Number.isSafeInteger(node.named_type_id) ||
+        node.named_type_id <= 0
+      )
+        throw new TypeError(`${location}.named_type_id requires a positive exact catalog ID`);
+    } else if (hasOwn.call(node, "named_type_id")) {
+      throw new TypeError(
+        `${location}.named_type_id is only valid for enumeration literals and casts`
+      );
     }
     const arrayLiteral = op === "literal" && node.type === "sql_array";
     const arrayDomain =
@@ -317,7 +349,7 @@ export function validateRelationalExpression(
       )
         throw new TypeError(`${location}.sql_type must match a supported numeric builtin identity`);
     }
-    if (op === "cast" && node.sql_type === undefined)
+    if (op === "cast" && !enumDomain && node.type !== "string" && node.sql_type === undefined)
       throw new TypeError(`${location}.sql_type is required for a numeric cast`);
     if (hasOwn.call(node, "numeric_modifier")) {
       const modifier = node.numeric_modifier;
@@ -350,6 +382,8 @@ export function validateRelationalExpression(
         );
     }
     if (op === "literal") {
+      if (enumDomain && node.value != null && typeof node.value !== "string")
+        throw new TypeError(`${location}.value requires an exact enum label or null`);
       if (!isRelationalExpressionType(node.type))
         throw new TypeError(`${location}.type is required for a literal`);
       if (

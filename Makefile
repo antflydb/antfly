@@ -194,6 +194,9 @@ sql-parity-evidence-check: ## Audit SQL parity evidence.
 sql-parity-release-check: ## Audit SQL parity release readiness.
 	python3 scripts/check_sql_parity_inventory.py --release
 
+sql-prepared-transaction-oracle-check: ## Check PostgreSQL prepared GID restart, commit and rollback contracts.
+	$(SCRIPTS_PY) scripts/generate_sql_prepared_transaction_reference.py --check
+
 sql-catalog-lifecycle-oracle-check: ## Check PostgreSQL catalog lifecycle contracts.
 	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_catalog_lifecycle.py
 

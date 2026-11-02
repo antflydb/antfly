@@ -34788,32 +34788,7 @@ fn appendObservedFieldAnalyzers(
     cfg: *introducer_mod.TextAnalysisConfig,
     observed: []const mapper.ObservedFieldAnalyzer,
 ) !void {
-    if (observed.len == 0) return;
-
-    const FieldAnalyzer = std.meta.Child(@TypeOf(cfg.field_analyzers));
-    const original_len = cfg.field_analyzers.len;
-    const combined = try alloc.alloc(FieldAnalyzer, original_len + observed.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (combined[original_len..initialized]) |item| {
-            alloc.free(item.field_name);
-            alloc.free(item.analyzer_name);
-        }
-        alloc.free(combined);
-    }
-
-    for (cfg.field_analyzers, 0..) |item, i| combined[i] = item;
-    initialized = original_len;
-    for (observed) |item| {
-        combined[initialized] = .{
-            .field_name = try alloc.dupe(u8, item.field_name),
-            .analyzer_name = try alloc.dupe(u8, item.analyzer_name),
-        };
-        initialized += 1;
-    }
-
-    if (cfg.field_analyzers.len > 0) alloc.free(cfg.field_analyzers);
-    cfg.field_analyzers = combined;
+    try text_analysis_config.appendObservedFieldAnalyzers(alloc, cfg, observed);
 }
 
 fn mergeObservedTextFieldAnalyzers(
@@ -34891,33 +34866,21 @@ fn mergeObservedTextFieldAnalyzers(
         observed_initialized += 1;
     }
 
-    const FieldAnalyzer = std.meta.Child(@TypeOf(entry.text_analysis.field_analyzers));
-    const original_analysis_len = entry.text_analysis.field_analyzers.len;
-    const expanded_analysis = try self.alloc.alloc(FieldAnalyzer, original_analysis_len + additions.items.len);
-    var analysis_initialized = original_analysis_len;
-    var analysis_published = false;
-    defer if (!analysis_published) {
-        for (expanded_analysis[original_analysis_len..analysis_initialized]) |item| {
-            self.alloc.free(item.field_name);
-            self.alloc.free(item.analyzer_name);
-        }
-        self.alloc.free(expanded_analysis);
-    };
-    for (entry.text_analysis.field_analyzers, 0..) |item, i| expanded_analysis[i] = item;
-    for (additions.items, 0..) |item, i| {
-        const field_name = try self.alloc.dupe(u8, item.field_name);
-        errdefer self.alloc.free(field_name);
-        const analyzer_name = try self.alloc.dupe(u8, item.analyzer_name);
-        errdefer self.alloc.free(analyzer_name);
-        expanded_analysis[original_analysis_len + i] = .{
-            .field_name = field_name,
-            .analyzer_name = analyzer_name,
-        };
-        analysis_initialized += 1;
-    }
-
+    // Recompose against the immutable declaration, rather than appending raw
+    // observed mappings to the live analysis. Observations may inherit a
+    // schema analyzer that an explicit index configuration overrides.
+    var composed_analysis = try parseTextAnalysisForIndexConfig(self.alloc, entry.config.config_json, entry.runtime_schema);
+    defer introducer_mod.freeTextAnalysisConfig(self.alloc, composed_analysis);
+    try appendObservedFieldAnalyzers(self.alloc, &composed_analysis, expanded_observed);
+    // Prepared projections can retain pointers to custom analyzer objects.
+    // Observations change only field mappings, not those immutable resources.
     var candidate_analysis = entry.text_analysis;
-    candidate_analysis.field_analyzers = expanded_analysis;
+    candidate_analysis.field_analyzers = composed_analysis.field_analyzers;
+    composed_analysis.field_analyzers = &.{};
+    var analysis_published = false;
+    defer if (!analysis_published) introducer_mod.freeTextAnalysisConfig(self.alloc, .{
+        .field_analyzers = candidate_analysis.field_analyzers,
+    });
     try publishFullTextMetadata(
         store,
         self.alloc,
@@ -34927,13 +34890,15 @@ fn mergeObservedTextFieldAnalyzers(
     );
 
     const previous_observed = entry.observed_field_analyzers;
-    const previous_analysis = entry.text_analysis.field_analyzers;
+    const previous_analysis = entry.text_analysis;
     entry.observed_field_analyzers = expanded_observed;
-    entry.text_analysis.field_analyzers = expanded_analysis;
+    entry.text_analysis = candidate_analysis;
     observed_published = true;
     analysis_published = true;
     if (previous_observed.len > 0) self.alloc.free(previous_observed);
-    if (previous_analysis.len > 0) self.alloc.free(previous_analysis);
+    introducer_mod.freeTextAnalysisConfig(self.alloc, .{
+        .field_analyzers = previous_analysis.field_analyzers,
+    });
 }
 
 fn containsObservedFieldAnalyzer(
@@ -41079,6 +41044,44 @@ test "full text dictionary publication rejects duplicate semantic owners" {
     defer registry_entry.deinit(alloc);
     try std.testing.expectEqualStrings("algebraic:path-promotion", registry_entry.owner);
     try std.testing.expectEqual(algebraic_mod.lexical.DictionaryLayoutKind.lexicon_postings_rows, registry_entry.layout);
+}
+
+test "observed analyzer publication preserves custom analyzer resources" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    const config =
+        \\{"analysis_config":{"field_analyzers":{"title":"tri_edge_analyzer"},"token_filters":{"tri_edge":{"type":"edge_ngram","config":{"min":3,"max":5}}},"analyzers":{"tri_edge_analyzer":{"type":"custom","config":{"tokenizer":"unicode","token_filters":["to_lower","tri_edge"]}}}}}
+    ;
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "ft_v1", .kind = .full_text, .config_json = config }});
+    const entry = manager.textIndexEntry("ft_v1").?;
+    const pinned = introducer_mod.resolveAnalyzerName("tri_edge_analyzer", entry.text_analysis).?;
+    const filters = pinned.filters.ptr;
+    for ([_][]const u8{ "body", "summary" }) |field| {
+        const observed = [_]mapper.ObservedFieldAnalyzer{.{
+            .field_name = @constCast(field),
+            .analyzer_name = @constCast("standard"),
+        }};
+        try mergeObservedTextFieldAnalyzers(&manager, &store, entry, &observed);
+        try std.testing.expect(pinned == introducer_mod.resolveAnalyzerName("tri_edge_analyzer", entry.text_analysis).?);
+        try std.testing.expect(filters == pinned.filters.ptr);
+        const tokens = try pinned.analyze(alloc, "Mixed");
+        defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
+        try std.testing.expectEqual(@as(usize, 3), tokens.len);
+        try std.testing.expectEqualStrings("mix", tokens[0].term);
+        try std.testing.expectEqualStrings("mixe", tokens[1].term);
+        try std.testing.expectEqualStrings("mixed", tokens[2].term);
+    }
+    try std.testing.expectEqual(@as(usize, 3), entry.text_analysis.field_analyzers.len);
 }
 
 test "observed full text analyzers publish shared dictionary ownership" {

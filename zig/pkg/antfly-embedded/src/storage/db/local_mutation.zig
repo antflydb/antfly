@@ -1015,7 +1015,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub fn scheduleDurableReplicationOutboxRecovery(_: *@This()) void {}
 
             pub fn resolveTransaction(self: *@This(), txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
-                try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .propose, .none, null, null);
+                try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .propose, .none, null, null, null);
             }
 
             pub fn waitForResolvedTransactionSyncWithCancellation(self: *@This(), sync_level: types.SyncLevel, _: u64, _: types.CancellationToken) !void {

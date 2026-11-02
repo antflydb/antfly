@@ -49,6 +49,7 @@ const Entry = struct {
 const Slot = struct { entry: ?*Entry = null, building: bool = false };
 pub const Cache = struct {
     allocator: std.mem.Allocator,
+    statistics: @import("sql_statistics_cache.zig").Cache = .{},
     mutex: std.Io.Mutex = .init,
     slots: [32]Slot = @splat(.{}),
     clock: u64 = 0,
@@ -62,6 +63,7 @@ pub const Cache = struct {
     }
     // Owner drains requests before destruction.
     pub fn deinit(self: *Cache) void {
+        self.statistics.deinit(self.allocator);
         std.debug.assert(self.builds == 0);
         for (self.slots) |slot| if (slot.entry) |entry| {
             std.debug.assert(entry.refs == 0);

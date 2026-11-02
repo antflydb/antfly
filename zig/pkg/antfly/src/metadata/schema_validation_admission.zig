@@ -31,7 +31,7 @@ pub const Request = struct {
 
     pub fn validate(self: @This()) !void {
         try self.guard.validate();
-        if (self.guard.owner.kind != .table or self.guard.constraint_name_admission != null) return error.InvalidCatalogMutation;
+        if (self.guard.owner.kind != .table or self.guard.hasDefinitionIntent()) return error.InvalidCatalogMutation;
         try self.selection.validate();
     }
 };
@@ -45,7 +45,7 @@ pub const StatusRequest = struct {
     pub fn validate(self: @This()) !void {
         try self.guard.validate();
         try (@import("schema_validation_read.zig").OwnerReadRequest{ .lookup = self.lookup, .ordinal = 0 }).validate();
-        if (self.guard.owner.kind != .table or self.guard.constraint_name_admission != null or
+        if (self.guard.owner.kind != .table or self.guard.hasDefinitionIntent() or
             self.guard.owner.table_id != self.lookup.table or !std.mem.eql(u8, &std.fmt.bytesToHex(self.guard.incarnation, .lower), &self.lookup.metadata_incarnation)) return error.CatalogGenerationChanged;
     }
 };
@@ -82,7 +82,7 @@ pub const Cut = struct {
             !std.mem.eql(u8, actual.target.database, expected.target.database) or
             !std.mem.eql(u8, actual.target.namespace, expected.target.namespace) or
             !std.mem.eql(u8, actual.target.name, expected.target.name) or
-            !std.mem.eql(u8, actual.logical_table, expected.logical_table) or actual.constraint_name_admission != null or
+            !std.mem.eql(u8, actual.logical_table, expected.logical_table) or actual.hasDefinitionIntent() or
             self.before.table_id != expected.owner.table_id or self.before.name.len == 0 or
             !std.mem.eql(u8, &contract.hash(self.before.schema_json), &expected.owner.schema_digest)) return error.CatalogGenerationChanged;
         var incarnation: [16]u8 = undefined;

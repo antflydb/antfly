@@ -45,6 +45,37 @@ pub const Owner = struct {
 
 pub const OverlayEntry = struct { identity: Identity, value: Value };
 
+const sync_levels = @import("../common/sync_level.zig");
+pub const native_sync_identity = durable.native_sync_identity;
+pub const native_sync_name = durable.native_sync_name;
+const native_sync_definition: Definition = .{ .identity = native_sync_identity, .name = native_sync_name, .kind = .string, .session_writable = true, .default = .{ .string = "write" } };
+
+pub fn normalizeDefinedValue(definition: Definition, value: Value) !Value {
+    try validateValue(definition.kind, value);
+    if (definition.identity.id == native_sync_identity.id) {
+        if (!std.meta.eql(definition.identity, native_sync_identity) or value != .string) return error.InvalidSettingValue;
+        inline for (std.enums.values(sync_levels.SyncLevel)) |level| {
+            const name = sync_levels.publicSyncLevelText(level);
+            if (std.ascii.eqlIgnoreCase(value.string, name)) return .{ .string = name };
+        }
+        return error.InvalidSettingValue;
+    }
+    return value;
+}
+
+/// Reads a native control without a metadata RPC or per-row allocation. SQL
+/// mutations retain a write-durability floor even when SET displays propose.
+pub fn mutationSyncLevel(overlay: []const OverlayEntry) !sync_levels.SyncLevel {
+    var result: sync_levels.SyncLevel = .write;
+    var seen = false;
+    for (overlay) |entry| if (entry.identity.id == native_sync_identity.id) {
+        if (seen or !std.meta.eql(entry.identity, native_sync_identity) or entry.value != .string) return error.InvalidSettingOverlay;
+        seen = true;
+        result = sync_levels.parsePublicSyncLevelText(entry.value.string) orelse return error.InvalidSettingValue;
+    };
+    return if (result == .propose) .write else result;
+}
+
 test "SQL role defaults keep existing login baselines and RESET while future logins observe publication" {
     const Fake = struct {
         definition: Definition = .{ .identity = .{ .id = 7, .generation = 1 }, .name = "app.mode", .kind = .string, .session_writable = true, .default = .{ .string = "base" }, .role_default = .{ .string = "old" } },
@@ -122,6 +153,7 @@ pub const Baseline = struct {
         var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
         var names: std.StringHashMapUnmanaged(void) = .empty;
         for (raw.definitions, entries) |definition, *entry| {
+            if (definition.identity.id == native_sync_identity.id or std.ascii.eqlIgnoreCase(definition.name, native_sync_name)) return error.InvalidSettingCatalogSnapshot;
             try validateDefinition(definition);
             const folded = try std.ascii.allocLowerString(a, definition.name);
             if (ids.contains(definition.identity.id) or names.contains(folded)) return error.InvalidSettingCatalogSnapshot;
@@ -280,11 +312,11 @@ pub const OverlayState = struct {
         } else self.session.deinit(self.alloc);
     }
     pub fn set(self: *OverlayState, owner: Owner, scope: Scope, name: []const u8, raw: []const u8, local: bool) !void {
-        if (local and !self.in_transaction) return error.NoActiveSqlTransaction;
         var view = try View.capture(self.alloc, owner, scope, self.values());
         defer view.deinit();
         const definition = try view.writable(name);
-        const value = try parseValue(definition.kind, raw);
+        const value = try normalizeDefinedValue(definition, try parseValue(definition.kind, raw));
+        if (local and !self.in_transaction) return;
         const entry: OverlayEntry = .{ .identity = definition.identity, .value = value };
         if (self.in_transaction) {
             var active = try self.active.preparePut(self.alloc, entry);
@@ -310,10 +342,10 @@ pub const OverlayState = struct {
     }
 
     pub fn resetLocal(self: *OverlayState, owner: Owner, scope: Scope, name: []const u8) !void {
-        if (!self.in_transaction) return error.NoActiveSqlTransaction;
         var view = try View.capture(self.alloc, owner, scope, self.values());
         defer view.deinit();
         const definition = try view.writable(name);
+        if (!self.in_transaction) return;
         self.active.remove(self.alloc, definition.identity.id);
     }
 };
@@ -352,17 +384,23 @@ pub const View = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
         const raw = try owner.load(owner.ptr, alloc, scope);
+        if (raw.definitions.len > 1024) return error.SettingLimitExceeded;
         if (!std.mem.eql(u8, raw.scope.principal, scope.principal) or
             !std.mem.eql(u8, raw.scope.database, scope.database) or raw.epoch == 0)
             return error.InvalidSettingCatalogSnapshot;
-        if (raw.definitions.len > 1024 or overlay.len > 1024) return error.SettingLimitExceeded;
-        const definitions = try alloc.alloc(Definition, raw.definitions.len);
-        const values = try alloc.alloc(Value, raw.definitions.len);
+        if (overlay.len > 1024) return error.SettingLimitExceeded;
+        // Append the immutable control while building the owned view. A
+        // separate augmented raw array would copy the entire catalog twice.
+        const count = raw.definitions.len + 1;
+        const definitions = try alloc.alloc(Definition, count);
+        const values = try alloc.alloc(Value, count);
         var by_id: std.AutoHashMapUnmanaged(u64, usize) = .empty;
         var by_name: std.StringHashMapUnmanaged(usize) = .empty;
-        try by_id.ensureTotalCapacity(alloc, @intCast(raw.definitions.len));
-        try by_name.ensureTotalCapacity(alloc, @intCast(raw.definitions.len));
-        for (raw.definitions, 0..) |source, i| {
+        try by_id.ensureTotalCapacity(alloc, @intCast(count));
+        try by_name.ensureTotalCapacity(alloc, @intCast(count));
+        for (0..count) |i| {
+            const source = if (i == raw.definitions.len) native_sync_definition else raw.definitions[i];
+            if (i != raw.definitions.len and (source.identity.id == native_sync_identity.id or std.ascii.eqlIgnoreCase(source.name, native_sync_name))) return error.InvalidSettingCatalogSnapshot;
             try validateDefinition(source);
             const folded_name = try std.ascii.allocLowerString(alloc, source.name);
             if (by_id.contains(source.identity.id) or by_name.contains(folded_name)) return error.InvalidSettingCatalogSnapshot;
@@ -387,8 +425,8 @@ pub const View = struct {
                 if (seen_baseline[index]) return error.InvalidSettingOverlay;
                 seen_baseline[index] = true;
                 if (!std.meta.eql(definitions[index].identity, entry.identity)) return error.SettingCatalogChanged;
-                try validateValue(definitions[index].kind, entry.value);
-                values[index] = try copyValue(alloc, entry.value);
+                const value = try normalizeDefinedValue(definitions[index], entry.value);
+                values[index] = try copyValue(alloc, value);
             }
         }
         const seen_overlay = try alloc.alloc(bool, definitions.len);
@@ -400,8 +438,8 @@ pub const View = struct {
             const def = definitions[index];
             if (def.identity.generation != entry.identity.generation) return error.SettingCatalogChanged;
             if (!def.session_writable or def.policy_sensitive) return error.SettingWriteForbidden;
-            try validateValue(def.kind, entry.value);
-            values[index] = try copyValue(alloc, entry.value);
+            const value = try normalizeDefinedValue(def, entry.value);
+            values[index] = try copyValue(alloc, value);
         }
         const owned_scope: Scope = .{
             .principal = try alloc.dupe(u8, scope.principal),
@@ -636,7 +674,7 @@ test "SET LOCAL DEFAULT restores catalog value only until transaction end" {
     var state = OverlayState.init(std.testing.allocator);
     defer state.deinit();
     try state.set(owner, scope, "app.limit", "5", false);
-    try std.testing.expectError(error.NoActiveSqlTransaction, state.resetLocal(owner, scope, "app.limit"));
+    try state.resetLocal(owner, scope, "app.limit");
     try state.begin();
     var point = try state.savepoint();
     defer point.deinit(std.testing.allocator);
@@ -751,4 +789,71 @@ test "SQL current_setting evaluates from one authorized pinned view" {
     var dynamic = try compiler.compileScalar(std.testing.allocator, "current_setting($1)", .{});
     defer dynamic.deinit();
     try std.testing.expectError(error.UnsupportedSqlShape, scalar.bindExpectedWithSettings(std.testing.allocator, dynamic.expression, &.{}, &.{.string}, null, .{}, &view));
+}
+
+test "SQL native sync control shares overlays savepoints and immutable definition authority" {
+    const Fixture = struct {
+        scope: Scope = .{ .principal = "alice", .database = "main" },
+        definitions: []const Definition = &.{},
+        fn load(ptr: *anyopaque, _: std.mem.Allocator, scope: Scope) !RawSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .scope = scope, .epoch = 1, .definitions = self.definitions };
+        }
+        fn expectCode(expected: anyerror, result: anytype) !void {
+            if (result) |_| return error.TestExpectedError else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(expected, err);
+            }
+        }
+        fn run(a: std.mem.Allocator) !void {
+            var fixture: @This() = .{};
+            const owner: Owner = .{ .ptr = &fixture, .load = load };
+            var state = OverlayState.init(a);
+            defer state.deinit();
+            var base = try View.capture(a, owner, fixture.scope, &.{});
+            defer base.deinit();
+            try std.testing.expectEqualStrings("write", (try base.resolve("ANTFLY.SYNC_LEVEL")).value.string);
+            for (std.enums.values(sync_levels.SyncLevel)) |level| {
+                const name = sync_levels.publicSyncLevelText(level);
+                try state.set(owner, fixture.scope, native_sync_name, name, false);
+                try std.testing.expectEqual(if (level == .propose) .write else level, try mutationSyncLevel(state.values()));
+            }
+            try state.set(owner, fixture.scope, native_sync_name, "FuLl_InDeX", false);
+            for ([_][]const u8{ "aknn", "", "remote_write", "full-index", " write" }) |invalid| {
+                try expectCode(error.InvalidSettingValue, state.set(owner, fixture.scope, native_sync_name, invalid, false));
+                try std.testing.expectEqual(.full_index, try mutationSyncLevel(state.values()));
+            }
+            try state.set(owner, fixture.scope, native_sync_name, "propose", true);
+            try std.testing.expectEqual(.full_index, try mutationSyncLevel(state.values()));
+            try state.begin();
+            try state.set(owner, fixture.scope, native_sync_name, "full_text", false);
+            var point = try state.savepoint();
+            defer point.deinit(a);
+            try state.set(owner, fixture.scope, native_sync_name, "propose", true);
+            try std.testing.expectEqual(.write, try mutationSyncLevel(state.values()));
+            try state.rollbackTo(point);
+            try std.testing.expectEqual(.full_text, try mutationSyncLevel(state.values()));
+            try state.set(owner, fixture.scope, native_sync_name, "enrichments", true);
+            state.finish(true);
+            try std.testing.expectEqual(.full_text, try mutationSyncLevel(state.values()));
+            try state.begin();
+            try state.set(owner, fixture.scope, native_sync_name, "write", false);
+            state.finish(false);
+            try std.testing.expectEqual(.full_text, try mutationSyncLevel(state.values()));
+            try state.reset(owner, fixture.scope, native_sync_name);
+            try std.testing.expectEqual(.write, try mutationSyncLevel(state.values()));
+            var forged = native_sync_definition;
+            forged.identity.id -= 1;
+            fixture.definitions = &.{forged};
+            try expectCode(error.InvalidSettingCatalogSnapshot, View.capture(a, owner, fixture.scope, &.{}));
+            forged = native_sync_definition;
+            forged.name = "app.forged";
+            fixture.definitions = &.{forged};
+            try expectCode(error.InvalidSettingCatalogSnapshot, View.capture(a, owner, fixture.scope, &.{}));
+            try expectCode(error.InvalidSettingOverlay, mutationSyncLevel(&.{.{ .identity = .{ .id = native_sync_identity.id, .generation = 2 }, .value = .{ .string = "write" } }}));
+            try expectCode(error.InvalidSettingOverlay, mutationSyncLevel(&.{ .{ .identity = native_sync_identity, .value = .{ .string = "write" } }, .{ .identity = native_sync_identity, .value = .{ .string = "full_index" } } }));
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

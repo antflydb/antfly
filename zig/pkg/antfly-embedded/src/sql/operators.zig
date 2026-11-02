@@ -3447,6 +3447,12 @@ pub const Grouped = struct {
 
 pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
     try value.validateTemporal();
+    if (value.bytes()) |bytes| {
+        const owned = try alloc.create(@import("bytea_value.zig").Value);
+        errdefer alloc.destroy(owned);
+        owned.* = .{ .bytes = try alloc.dupe(u8, bytes) };
+        return Datum.typedBytes(owned);
+    }
     if (value.enumeration()) |atom| return Datum.typedEnum(try atom.clone(alloc));
     if (value.range()) |range| {
         const ranges = @import("range_value.zig");
@@ -3660,6 +3666,7 @@ pub fn datumBytes(value: Datum) anyerror!usize {
     if (value.enumeration()) |atom| return @sizeOf(Datum) + @sizeOf(@import("../common/sql_enum_value.zig").Value) + atom.text.len + atom.order_key.len;
     if (value.range()) |range| return @sizeOf(Datum) + @import("range_value.zig").retainedSize(range.*);
     if (value.temporal() != null) return @sizeOf(Datum) + @sizeOf(@import("temporal_value.zig").Value);
+    if (value.bytes()) |bytes| return @sizeOf(Datum) + @sizeOf(scalar.Bytea.Value) + bytes.len;
     if (value.numeric) |number| return @sizeOf(Datum) + @sizeOf(@import("numeric_value.zig").Value) + number.digits.len * 2;
     if (value.array) |array| return @sizeOf(Datum) +| try array.retainedBytes();
     return jsonBytes(value.value, 0);

@@ -24,6 +24,7 @@ pub const Method = enum {
     post,
     put,
     delete,
+    patch,
 };
 
 pub const Request = struct {

@@ -2450,6 +2450,45 @@ pub const ApiHttpClient = struct {
         return self.fetchGroupGraphMetricMaintenanceWithCancellation(base_uri, group_id, table_name, body, null);
     }
 
+    pub fn fetchGroupSqlMaintenanceWithCancellation(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.sql_maintenance_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+            .cancellation = cancellation,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            400 => return error.InvalidSqlParameters,
+            404 => return error.UnknownGroup,
+            405 => return error.UnsupportedOperation,
+            409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
+            else => return error.UnexpectedHttpStatus,
+        }
+        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
     pub fn fetchGroupGraphMetricMaintenanceWithCancellation(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -3740,6 +3779,14 @@ pub const ApiHttpClient = struct {
         return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, null, null);
     }
 
+    pub fn fetchGroupTxnAcknowledgeWithTimeout(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: u32) !EmptyResponse {
+        return fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, timeout_ms, null);
+    }
+
+    pub fn fetchGroupTxnAcknowledgeManyWithTimeout(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: u32) !EmptyResponse {
+        return fetchInternalPostEmptyWithCapabilities(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_many_suffix, body, timeout_ms, null, true);
+    }
+
     pub fn fetchGroupTxnAcknowledgeMany(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8) !EmptyResponse {
         // This private capability route is absent on v0.2.x. Only a definite
         // unsupported response enables the worker's idempotent single-ACK path.
@@ -4528,6 +4575,7 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 }
 
 fn remoteGroupConflictError(body: []const u8) anyerror {
+    if (@import("external_transaction_errors.zig").decode(body)) |reason| return reason;
     if (@import("relational_integrity_errors.zig").decode(body)) |reason| return reason;
     if (std.mem.eql(u8, body, "DocumentArtifactPublicationFailed")) return error.DocumentArtifactPublicationFailed;
     if (std.mem.eql(u8, body, "IndexGenerationMismatch")) return error.IndexGenerationMismatch;
@@ -4731,6 +4779,7 @@ fn isTxnPreDecisionNotProposedResponse(resp: http_common.HttpResponse) bool {
 }
 
 fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
+    if (@import("external_transaction_errors.zig").decode(body)) |reason| return reason;
     if (@import("relational_integrity_errors.zig").decode(body)) |err| return err;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
@@ -4740,6 +4789,7 @@ fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
 }
 
 fn remoteGroupTxnResolveConflictError(body: []const u8) anyerror {
+    if (@import("external_transaction_errors.zig").decode(body)) |reason| return reason;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "topology changed") or std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
@@ -7035,4 +7085,18 @@ test "public graph metric borrowed wire edge batch endpoint capability" {
     var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
     try std.testing.expectError(error.GraphEdgesBatchUnsupported, client.fetchGroupGraphEdgesBatchWithControl("http://example.test", 7, "docs", "{}", null, null));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "raft batch round trips external transaction rejection identities across owner HTTP phases" {
+    const errors = @import("external_transaction_errors.zig");
+    inline for (@typeInfo(errors.Error).error_set.error_names.?) |name| {
+        const expected = @field(errors.Error, name);
+        try std.testing.expectEqual(expected, errors.classify(expected).?);
+        try std.testing.expectEqual(expected, errors.decode(name).?);
+        try std.testing.expectEqual(expected, remoteGroupConflictError(name));
+        try std.testing.expectEqual(expected, remoteGroupTxnPrepareConflictError(name));
+        try std.testing.expectEqual(expected, remoteGroupTxnResolveConflictError(name));
+    }
+    try std.testing.expect(errors.classify(error.OutOfMemory) == null);
+    try std.testing.expect(errors.decode("forged outcome") == null);
 }

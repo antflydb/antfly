@@ -120,6 +120,12 @@ class RelationalScalarExpression:
     A matching candidate wins over NULL candidates; otherwise a NULL
     candidate makes the result UNKNOWN. These operations require schema
     capability version 19.
+    Enumeration expressions require reader capability version 40. Enum
+    literals and casts declare named_type_id from the owning schema directory.
+    Input labels are exact and case-sensitive; comparisons retain declaration
+    order and reject unrelated named identities. Enum/text conversions are
+    explicit; stored enum values retain four-byte symbols. CHECK, generated
+    values, defaults, typed-row ingress and restore share the native validator.
     JSON expressions require reader capability version 30. The json type
     carries JSONB semantics, including exact numeric values and display
     scale. jsonb_typeof and jsonb_array_length take one JSON argument;
@@ -133,6 +139,9 @@ class RelationalScalarExpression:
         Attributes:
             op (RelationalExpressionOp):
             type_ (RelationalExpressionType | Unset):
+            named_type_id (int | Unset): Required on enumeration literals and casts, including typed NULL. Resolved from the
+                immutable schema-owned named-type directory; labels and executable definitions are never accepted here. Requires
+                reader capability version 40. Other expression types reject this field.
             sql_type (SQLBuiltinType | Unset): Exact PostgreSQL builtin identity for a relational root scalar column.
                 SQL array columns use SQLArrayElementType for their element identity.
                 Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
@@ -172,6 +181,7 @@ class RelationalScalarExpression:
 
     op: RelationalExpressionOp
     type_: RelationalExpressionType | Unset = UNSET
+    named_type_id: int | Unset = UNSET
     sql_type: SQLBuiltinType | Unset = UNSET
     numeric_modifier: SQLNumericModifier | Unset = UNSET
     value: Any | Unset = UNSET
@@ -188,6 +198,8 @@ class RelationalScalarExpression:
         type_: str | Unset = UNSET
         if not isinstance(self.type_, Unset):
             type_ = self.type_.value
+
+        named_type_id = self.named_type_id
 
         sql_type: str | Unset = UNSET
         if not isinstance(self.sql_type, Unset):
@@ -225,6 +237,8 @@ class RelationalScalarExpression:
         )
         if type_ is not UNSET:
             field_dict["type"] = type_
+        if named_type_id is not UNSET:
+            field_dict["named_type_id"] = named_type_id
         if sql_type is not UNSET:
             field_dict["sql_type"] = sql_type
         if numeric_modifier is not UNSET:
@@ -259,6 +273,8 @@ class RelationalScalarExpression:
             type_ = UNSET
         else:
             type_ = RelationalExpressionType(_type_)
+
+        named_type_id = d.pop("named_type_id", UNSET)
 
         _sql_type = d.pop("sql_type", UNSET)
         sql_type: SQLBuiltinType | Unset
@@ -298,6 +314,7 @@ class RelationalScalarExpression:
         relational_scalar_expression = cls(
             op=op,
             type_=type_,
+            named_type_id=named_type_id,
             sql_type=sql_type,
             numeric_modifier=numeric_modifier,
             value=value,

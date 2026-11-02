@@ -32,6 +32,7 @@ from generate_sql_postgres_reference import (
     FIXTURES,
     main,
     document_reference,
+    document_schema_seed_rows,
     execute,
     postgres,
     read_reference,
@@ -4594,6 +4595,59 @@ class PostgresReferenceTest(unittest.TestCase):
         self.assertIn("archived_at", entry["final"][0]["value"])
         self.assertIsNone(entry["final"][0]["value"]["archived_at"])
         self.assertNotIn("archived_at", entry["final"][1]["value"])
+
+    def test_closed_document_profile_seeds_preserve_only_declared_root_fields(self):
+        schema = {
+            "default_type": "doc",
+            "document_schemas": {
+                "doc": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"status": {"type": "keyword"}},
+                        "additionalProperties": False,
+                    }
+                }
+            },
+        }
+        rows = document_schema_seed_rows(SEEDS, schema)
+        self.assertEqual(len(SEEDS), len(rows))
+        for source, row in zip(SEEDS, rows, strict=True):
+            self.assertEqual({"status": source["value"]["status"]}, row["value"])
+            self.assertIn("metadata", source["value"])
+
+    def test_negative_document_contract_retains_its_valid_case_specific_seeds(self):
+        schema = {
+            "default_type": "doc",
+            "storage_mode": "document",
+            "document_schemas": {
+                "doc": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "metadata": {
+                                "type": "object",
+                                "properties": {"plan": {"type": "keyword"}},
+                                "additionalProperties": False,
+                            }
+                        },
+                        "additionalProperties": True,
+                    }
+                }
+            },
+        }
+        case = self.case(
+            "INSERT INTO docs (_id, metadata_plan) VALUES ('doc:a', 'pro')"
+        )
+        case["id"] = "sql-0918"
+        result = document_reference(
+            self.db, [case], {case["id"]: schema}, annotation_only=True
+        )
+        entry = result["entries"][0]
+        self.assertEqual("42703", entry["sqlstate"])
+        self.assertEqual(entry["seeds"], entry["final"])
+        self.assertNotEqual(SEEDS, entry["seeds"])
+        for seed in entry["seeds"]:
+            self.assertEqual({"plan"}, set(seed["value"]["metadata"]))
 
     def test_current_document_profile_retains_source_schema_without_granting_proofs(
         self,

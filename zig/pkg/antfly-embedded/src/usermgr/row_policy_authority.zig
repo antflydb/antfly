@@ -22,6 +22,20 @@ const std = @import("std");
 pub const ttl_seconds: i64 = 30;
 pub const maximum_token_bytes: usize = 16 * 1024;
 pub const maximum_roles: usize = 128;
+
+/// Private staged-intent witness, not a credential. Unfiltered statements keep
+/// an allocation-free sentinel; a changed resolved predicate fences commit.
+pub const no_filter_digest: [32]u8 = @splat(0);
+pub fn filterDigest(resolved: ?[]const u8) [32]u8 {
+    const bytes = resolved orelse return no_filter_digest;
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("antfly:mandatory-row-filter:v1\x00");
+    hash.update(bytes);
+    var result: [32]u8 = undefined;
+    hash.final(&result);
+    return result;
+}
+
 /// Private service transport only; never put principal capabilities in URLs.
 pub const principal_header = "X-Antfly-Row-Policy-Principal";
 pub const database_header = "X-Antfly-Row-Policy-Database";
@@ -117,6 +131,9 @@ pub const PinnedRoles = struct {
     policy_principal: ?[]const u8 = null,
     setting_principal: ?[]const u8 = null,
     roles: []const []const u8,
+    /// Canonical UUID hex authenticated by SQL catalog admission. Native
+    /// Casbin role strings cannot manufacture these typed claims.
+    sql_roles: []const []const u8 = &.{},
     auth_revision: u64,
 };
 
@@ -125,6 +142,9 @@ pub const Payload = struct {
     policy_principal: ?[]const u8 = null,
     setting_principal: ?[]const u8 = null,
     roles: []const []const u8,
+    /// Canonical UUID hex authenticated by SQL catalog admission. Native
+    /// Casbin role strings cannot manufacture these typed claims.
+    sql_roles: []const []const u8 = &.{},
     auth_revision: u64,
     table_id: u64,
     table: []const u8,
@@ -136,6 +156,22 @@ pub const Payload = struct {
     purpose: Purpose = .ordinary,
 
     pub fn jsonStringify(self: Payload, writer: anytype) !void {
+        if (self.sql_roles.len != 0) return writer.write(.{
+            .principal = self.principal,
+            .policy_principal = self.policy_principal,
+            .setting_principal = self.setting_principal,
+            .roles = self.roles,
+            .sql_roles = self.sql_roles,
+            .auth_revision = self.auth_revision,
+            .table_id = self.table_id,
+            .table = self.table,
+            .database = self.database,
+            .policy_generation = self.policy_generation,
+            .catalog_epoch = self.catalog_epoch,
+            .access = self.access,
+            .expires = self.expires,
+            .purpose = self.purpose,
+        });
         if (self.purpose != .ordinary) return writer.write(.{
             .principal = self.principal,
             .policy_principal = self.policy_principal,
@@ -198,6 +234,7 @@ pub fn sign(
         scope.policy_generation == 0 or scope.catalog_epoch == 0)
         return error.InvalidRowPolicyPrincipal;
     for (pinned.roles) |role| if (!validName(role)) return error.InvalidRowPolicyPrincipal;
+    if (!validRoleClaims(pinned.roles, pinned.sql_roles)) return error.InvalidRowPolicyPrincipal;
     if (pinned.policy_principal) |principal| {
         if (!validName(principal) or scope.access != .read) return error.InvalidRowPolicyPrincipal;
     }
@@ -208,6 +245,7 @@ pub fn sign(
         .policy_principal = pinned.policy_principal,
         .setting_principal = pinned.setting_principal,
         .roles = pinned.roles,
+        .sql_roles = pinned.sql_roles,
         .auth_revision = pinned.auth_revision,
         .table_id = scope.table_id,
         .table = scope.table,
@@ -273,11 +311,37 @@ pub fn verify(
         value.expires < now_seconds or value.expires > now_seconds +| ttl_seconds)
         return error.Forbidden;
     for (value.roles) |role| if (!validName(role)) return error.Forbidden;
+    if (!validRoleClaims(value.roles, value.sql_roles)) return error.Forbidden;
     if (value.policy_principal) |principal| {
         if (!validName(principal) or value.access != .read) return error.Forbidden;
     }
     if (value.setting_principal) |principal| if (!validName(principal)) return error.Forbidden;
     return parsed;
+}
+
+fn validRoleClaims(roles: []const []const u8, instances: []const []const u8) bool {
+    if (instances.len > maximum_roles or instances.len > roles.len) return false;
+    for (instances, 0..) |instance, i| {
+        if (instance.len != 32 or std.mem.allEqual(u8, instance, '0')) return false;
+        for (instance) |byte| if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return false;
+        if (i != 0 and std.mem.order(u8, instances[i - 1], instance) != .lt) return false;
+    }
+    var seen: [maximum_roles]bool = @splat(false);
+    var count: usize = 0;
+    const prefix = @import("../system_catalog/privileges.zig").role_alias_prefix;
+    for (roles) |role| if (std.mem.startsWith(u8, role, prefix)) {
+        const instance = role[prefix.len..];
+        var lower: usize = 0;
+        var upper = instances.len;
+        while (lower < upper) {
+            const middle = lower + (upper - lower) / 2;
+            if (std.mem.order(u8, instances[middle], instance) == .lt) lower = middle + 1 else upper = middle;
+        }
+        if (lower == instances.len or !std.mem.eql(u8, instances[lower], instance) or seen[lower]) return false;
+        seen[lower] = true;
+        count += 1;
+    };
+    return count == instances.len;
 }
 
 fn validName(name: []const u8) bool {
@@ -345,4 +409,37 @@ test "view role proof authenticates policy selection separately and cannot autho
     var invalid = roles;
     invalid.policy_principal = "";
     try std.testing.expectError(error.InvalidRowPolicyPrincipal, sign(a, key, "cluster", invalid, scope, 100));
+}
+
+test "SQL privileges signed role instances reject native aliases even from a valid legacy signer" {
+    const a = std.testing.allocator;
+    const graph = @import("../system_catalog/privileges.zig");
+    const role: graph.Role = .{ .id = 3, .name = "reader", .instance = @splat(7), .creator = .bootstrap };
+    const alias = try graph.roleAlias(a, role);
+    defer a.free(alias);
+    const instance = alias[graph.role_alias_prefix.len..];
+    const secret = "1234567890abcdef1234567890abcdef";
+    const scope: Scope = .{ .table_id = 9, .table = "table:9", .database = "default", .policy_generation = 3, .catalog_epoch = 4 };
+    const native: PinnedRoles = .{ .principal = "reader", .roles = &.{alias}, .auth_revision = 1 };
+    try std.testing.expectError(error.InvalidRowPolicyPrincipal, sign(a, secret, "cluster", native, scope, 100));
+    var typed = native;
+    typed.sql_roles = &.{instance};
+    const signed = try sign(a, secret, "cluster", typed, scope, 100);
+    defer a.free(signed);
+    var verified = try verify(a, secret, "cluster", scope, 100, signed);
+    defer verified.deinit();
+    try std.testing.expectEqualStrings(instance, verified.value.sql_roles[0]);
+    // Reproduce an older issuer's valid signature over its ordinary payload.
+    // Storage must reject this despite accepting its signature and scope.
+    const payload = try std.json.Stringify.valueAlloc(a, Payload{ .principal = "reader", .roles = &.{alias}, .auth_revision = 1, .table_id = scope.table_id, .table = scope.table, .database = scope.database, .policy_generation = scope.policy_generation, .catalog_epoch = scope.catalog_epoch, .access = scope.access, .expires = 130 }, .{});
+    defer a.free(payload);
+    const encoded = try a.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(payload.len));
+    defer a.free(encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, payload);
+    const mac = std.fmt.bytesToHex(digest(secret, "cluster", encoded), .lower);
+    const legacy = try std.fmt.allocPrint(a, "v1:{s}:{s}", .{ encoded, &mac });
+    defer a.free(legacy);
+    try std.testing.expectError(error.Forbidden, verify(a, secret, "cluster", scope, 100, legacy));
+    typed.sql_roles = &.{ "07070707070707070707070707070707", "07070707070707070707070707070707" };
+    try std.testing.expectError(error.InvalidRowPolicyPrincipal, sign(a, secret, "cluster", typed, scope, 100));
 }

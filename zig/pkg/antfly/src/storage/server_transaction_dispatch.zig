@@ -21,7 +21,6 @@ const local_transaction_contract = @import("antfly_local_sources").api_local_tra
 const local_write = @import("antfly_local_sources").storage_local_write;
 const validateTableBatchAgainstLocalSchema = local_write.validateTableBatchAgainstLocalSchema;
 const runTestBeforeBatchExecutionHook = @import("antfly_local_sources").api_local_write_test_hooks.runTestBeforeBatchExecutionHook;
-const batchWritesAsTransactionWrites = local_write.batchWritesAsTransactionWrites;
 
 pub fn applyStorageKernelReplicatedBatch(
     alloc: std.mem.Allocator,
@@ -92,7 +91,20 @@ pub fn applyReplicatedTransactionMutationInternal(
             // follower tracks itself, making successful cleanup O(N) rather
             // than every participant retrying every other participant.
             const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
-            if (raft_entry) |entry|
+            if (begin.external_decision_owner) |owner| {
+                if (!begin.retain_terminal) return error.InvalidBatchRequest;
+                _ = try db.beginExternalTransaction(.{
+                    .txn_id = begin.txn_id,
+                    .owner = owner,
+                    .begin_timestamp = begin.begin_timestamp,
+                    .created_at_ns = begin.created_at_ns,
+                    .participants = durable_participants,
+                    .coordinator = coordinator,
+                    .restore_staging_scope = req.restore_staging_scope,
+                    .ordered_receipt = raft_entry,
+                    .admission_timestamp_ns = req.timestamp_ns,
+                });
+            } else if (raft_entry) |entry|
                 _ = try db.beginReplicatedTransactionScoped(
                     begin.txn_id,
                     begin.begin_timestamp,
@@ -115,27 +127,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                 );
         },
         .prepare => |prepare| {
-            const intents: db_mod.types.TransactionIntentRequest = .{
-                .row_policy_principal_proof = req.row_policy_principal_proof,
-                .row_policy_database = req.row_policy_database,
-                .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
-                .writes = batchWritesAsTransactionWrites(req.writes),
-                .deletes = req.deletes,
-                .transforms = req.transforms,
-                .predicates = req.predicates,
-                .integrity = req.integrity,
-                .integrity_commands = req.integrity_commands,
-                .range_guards = req.range_guards,
-                .relational_activation = req.relational_activation,
-                .relational_retirement = req.relational_retirement,
-                .relational_index_maintenance = req.relational_index_maintenance,
-                .schema_version = req.schema_version,
-                .relational_schema_version = req.relational_schema_version,
-                .relational_integrity_generation_set = req.relational_integrity_generation_set,
-                .restore_staging_scope = req.restore_staging_scope,
-                .restore_staging_plan_id = req.restore_staging_plan_id,
-                .relational_repair = req.relational_repair,
-            };
+            const intents = try db_mod.types.TransactionIntentRequest.fromBatch(req);
             if (raft_entry) |entry|
                 try db.writeReplicatedTransactionAtOrderedReceipt(prepare.txn_id, intents, entry)
             else
@@ -153,7 +145,9 @@ pub fn applyReplicatedTransactionMutationInternal(
                     transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
                     else => return err,
                 };
-                try db.resolveReplicatedTransactionAtOrderedReceipt(
+                if (resolve.external_decision_owner) |owner| {
+                    try db.resolveExternalTransaction(.{ .txn_id = resolve.txn_id, .owner = owner, .status = resolve.status, .commit_version = resolve.commit_version, .sync_level = req.sync_level, .visibility_cancellation = visibility_cancellation, .ordered_receipt = entry, .resolved_participant = if (defer_coordinator_ack) null else local_participant });
+                } else try db.resolveReplicatedTransactionAtOrderedReceipt(
                     resolve.txn_id,
                     resolve.status,
                     resolve.commit_version,
@@ -163,7 +157,9 @@ pub fn applyReplicatedTransactionMutationInternal(
                     if (defer_coordinator_ack) null else local_participant,
                 );
             } else {
-                try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
+                if (resolve.external_decision_owner) |owner| {
+                    try db.resolveExternalTransaction(.{ .txn_id = resolve.txn_id, .owner = owner, .status = resolve.status, .commit_version = resolve.commit_version, .sync_level = req.sync_level, .visibility_cancellation = visibility_cancellation });
+                } else try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
                     resolve.txn_id,
                     resolve.status,
                     resolve.commit_version,

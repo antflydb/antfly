@@ -40,6 +40,8 @@ const table_participant_v3_prefix = @import("antfly_local_sources").api_local_tr
 pub const group_participant_marker = @import("antfly_local_sources").api_local_transaction_contract.group_participant_marker;
 
 pub const TxnBeginRequest = struct {
+    external_decision_owner: ?@import("antfly_local_sources").storage_transactions.ExternalDecisionOwner = null,
+    route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
     txn_id: db_mod.types.TxnId,
     begin_timestamp: u64,
     topology_epoch: u64 = 0,
@@ -99,23 +101,13 @@ pub const TxnPrepareRequest = struct {
     req: db_mod.types.TransactionIntentRequest,
     /// Internal parser ownership only; never serialized as a request field.
     integrity_commands_owner: ?std.json.Parsed([]const integrity_wire.Command) = null,
+    prepared_domain_owner: ?@import("antfly_local_sources").api_batch.DomainHandoff.Owned = null,
     relational_activation_owner: ?std.json.Parsed(integrity_activation.Command) = null,
     relational_retirement_owner: ?std.json.Parsed(integrity_retirement.Command) = null,
     relational_index_maintenance_owner: ?std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Command) = null,
 };
 
-pub const TxnResolveRequest = struct {
-    restore_staging_scope: ?[32]u8 = null,
-    restore_staging_plan_id: ?[16]u8 = null,
-    txn_id: db_mod.types.TxnId,
-    status: db_mod.types.TxnStatus,
-    commit_version: u64,
-    /// Non-zero only during the initial commit-resolution pass. Participant
-    /// recovery and aborts must remain possible after a topology transition
-    /// has already published.
-    topology_epoch: u64 = 0,
-    sync_level: db_mod.types.SyncLevel = .propose,
-};
+pub const TxnResolveRequest = contract.TxnResolveRequest;
 
 pub const TxnStatusResponse = struct {
     status: db_mod.types.TxnStatus,
@@ -184,12 +176,12 @@ pub fn resolveGroupLocalWithRequest(writes: table_writes.TableWriteSource, alloc
             .restore_staging_scope = req.restore_staging_scope,
             .restore_staging_plan_id = req.restore_staging_plan_id,
             .sync_level = req.sync_level,
-            .transaction = .{ .resolve = .{ .txn_id = req.txn_id, .status = req.status, .commit_version = req.commit_version } },
+            .transaction = .{ .resolve = .{ .txn_id = req.txn_id, .status = req.status, .commit_version = req.commit_version, .external_decision_owner = req.external_decision_owner } },
         });
         try cancellation.check();
         return result;
     }
-    return writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, cancellation);
+    return writes.txnResolveGroupLocalWithRequest(alloc, group_id, table_name, req, cancellation);
 }
 
 pub const TableCommitRequest = @import("antfly_local_sources").api_local_transaction_contract.TableCommitRequest;
@@ -402,6 +394,8 @@ pub const HostedParticipantWorker = struct {
         server_budget_ms: u32,
     };
 
+    /// Shared native monotonic budget for a background recovery pass.
+    recovery_deadline_ns: ?u64 = null,
     catalog: table_catalog.CatalogSource,
     router: table_router.HostedGroupRouter,
     writes: table_writes.TableWriteSource,
@@ -484,6 +478,8 @@ pub const HostedParticipantWorker = struct {
                 };
                 context.restore_staging_scope = req.restore_staging_scope;
                 context.restore_staging_plan_id = req.restore_staging_plan_id;
+                context.external_decision_owner = req.external_decision_owner;
+                context.route_fence = req.route_fence;
                 const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
                     if (!isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_begin_group_local_with_pre_decision_context != null)) return err;
                     return try self.beginGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline_ns);
@@ -634,6 +630,8 @@ pub const HostedParticipantWorker = struct {
             };
             context.restore_staging_scope = req.restore_staging_scope;
             context.restore_staging_plan_id = req.restore_staging_plan_id;
+            context.external_decision_owner = req.external_decision_owner;
+            context.route_fence = req.route_fence;
             const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
                 if (isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_begin_group_local_with_pre_decision_context != null)) return false;
                 return err;
@@ -755,7 +753,8 @@ pub const HostedParticipantWorker = struct {
     fn preDecisionDeadlineNs(self: *const HostedParticipantWorker) !u64 {
         if (self.pre_decision_timeout_ms == 0 or self.pre_decision_attempt_timeout_ms == 0)
             return error.Timeout;
-        const duration_ns = @as(u64, self.pre_decision_timeout_ms) *| std.time.ns_per_ms;
+        const ms = if (self.recovery_deadline_ns) |deadline| @min(self.pre_decision_timeout_ms, try remainingDeadlineTimeoutMs(deadline)) else self.pre_decision_timeout_ms;
+        const duration_ns = @as(u64, ms) *| std.time.ns_per_ms;
         return self.executor.monotonicNs() +| duration_ns;
     }
 
@@ -784,7 +783,8 @@ pub const HostedParticipantWorker = struct {
     }
 
     fn resolveGroupWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken) !void {
-        try resolveGroupWithin(ptr, alloc, group_id, table_name, req, cancellation, null);
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        try resolveGroupWithin(ptr, alloc, group_id, table_name, req, cancellation, self.recovery_deadline_ns);
     }
 
     fn resolveGroupUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64) !void {
@@ -883,16 +883,19 @@ pub const HostedParticipantWorker = struct {
 
     fn acknowledgeManyGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest) !void {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        if (self.recovery_deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
+        var bound = DecisionRecoveryCancellation{ .deadline_ns = self.recovery_deadline_ns orelse 0 };
+        const cancellation = if (self.recovery_deadline_ns != null) bound.token() else db_mod.types.CancellationToken.none;
         try validateAcknowledgementMany(req);
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         switch (route) {
-            .local => _ = (try acknowledgeManyGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .none)) orelse return error.UnknownGroup,
+            .local => _ = (try acknowledgeManyGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, cancellation)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnAcknowledgeManyRequest(alloc, req);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnAcknowledgeMany(remote.base_uri, group_id, table_name, body);
+                var response = if (self.recovery_deadline_ns) |deadline| try client.fetchGroupTxnAcknowledgeManyWithTimeout(remote.base_uri, group_id, table_name, body, try remainingDeadlineTimeoutMs(deadline)) else try client.fetchGroupTxnAcknowledgeMany(remote.base_uri, group_id, table_name, body);
                 response.deinit(alloc);
             },
         }
@@ -900,15 +903,18 @@ pub const HostedParticipantWorker = struct {
 
     fn acknowledgeGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        if (self.recovery_deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
+        var bound = DecisionRecoveryCancellation{ .deadline_ns = self.recovery_deadline_ns orelse 0 };
+        const cancellation = if (self.recovery_deadline_ns != null) bound.token() else db_mod.types.CancellationToken.none;
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         switch (route) {
-            .local => _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .none)) orelse return error.UnknownGroup,
+            .local => _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, cancellation)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnAcknowledgeRequest(alloc, req);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnAcknowledge(remote.base_uri, group_id, table_name, body);
+                var response = if (self.recovery_deadline_ns) |deadline| try client.fetchGroupTxnAcknowledgeWithTimeout(remote.base_uri, group_id, table_name, body, try remainingDeadlineTimeoutMs(deadline)) else try client.fetchGroupTxnAcknowledge(remote.base_uri, group_id, table_name, body);
                 response.deinit(alloc);
             },
         }
@@ -1039,6 +1045,7 @@ fn remainingPreDecisionTimeoutMs(deadline_ns: u64, now_ns: u64) !u32 {
 }
 
 pub const LocalTableWriteParticipantWorker = struct {
+    recovery_deadline_ns: ?u64 = null,
     writes: table_writes.TableWriteSource,
 
     pub fn init(writes: table_writes.TableWriteSource) LocalTableWriteParticipantWorker {
@@ -1064,11 +1071,14 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn beginGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, .{ .restore_staging_scope = req.restore_staging_scope, .restore_staging_plan_id = req.restore_staging_plan_id })) orelse return error.UnknownGroup;
+        _ = (try self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, .{ .restore_staging_scope = req.restore_staging_scope, .restore_staging_plan_id = req.restore_staging_plan_id, .external_decision_owner = req.external_decision_owner, .route_fence = req.route_fence })) orelse return error.UnknownGroup;
     }
 
     fn prepareGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        if (self.recovery_deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
+        var bound = DecisionRecoveryCancellation{ .deadline_ns = self.recovery_deadline_ns orelse 0 };
+        const cancellation = if (self.recovery_deadline_ns != null) bound.token() else db_mod.types.CancellationToken.none;
         _ = (try self.writes.txnPrepareGroupLocalWithPreDecisionContext(
             alloc,
             group_id,
@@ -1076,7 +1086,7 @@ pub const LocalTableWriteParticipantWorker = struct {
             req.txn_id,
             req.topology_epoch,
             req.req,
-            .{ .route_fence = req.route_fence },
+            .{ .route_fence = req.route_fence, .deadline_ns = self.recovery_deadline_ns, .cancellation = cancellation },
         )) orelse return error.UnknownGroup;
     }
 
@@ -1119,7 +1129,10 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn acknowledgeGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .none)) orelse return error.UnknownGroup;
+        if (self.recovery_deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
+        var bound = DecisionRecoveryCancellation{ .deadline_ns = self.recovery_deadline_ns orelse 0 };
+        const cancellation = if (self.recovery_deadline_ns != null) bound.token() else db_mod.types.CancellationToken.none;
+        _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, cancellation)) orelse return error.UnknownGroup;
     }
 };
 
@@ -1179,6 +1192,7 @@ test "distributed txn local participant prepare preserves the guarded catalog ro
 pub const ExecuteResult = contract.ExecuteResult;
 
 pub const ExecuteOptions = struct {
+    external_deadline_ns: ?u64 = null,
     /// Preserve the terminal coordinator decision for an externally supplied
     /// transaction ID's retry window.
     retain_terminal: bool = false,
@@ -1195,6 +1209,245 @@ pub const ExecuteOptions = struct {
     /// transaction mutation is durable, never during begin or prepare.
     post_commit_cancellation: db_mod.types.CancellationToken = .none,
 };
+
+/// Hosted activation keeps a one-second response reserve. A recovery slice
+/// must leave an additional native admission budget after that reserve.
+pub const external_recovery_pass_timeout_ns: u64 = 2 * std.time.ns_per_s;
+
+/// Metadata is the decision authority for SQL GIDs. Callbacks must use a
+/// linearizable read and durable CAS; `admit` also requires the API owner to
+/// have durably sealed the exact execution plan and external purpose first.
+/// Returned records borrow the supplied allocator's lifetime.
+pub const ExternalAuthority = struct {
+    ptr: *anyopaque,
+    read: *const fn (*anyopaque, std.mem.Allocator, [16]u8) anyerror!?ExternalRecord,
+    admit: *const fn (*anyopaque, std.mem.Allocator, ExternalIdentity, []const ExternalParticipant) anyerror!ExternalRecord,
+    advance: *const fn (*anyopaque, std.mem.Allocator, ExternalRecord, ExternalAction) anyerror!ExternalRecord,
+    next_version: *const fn (*anyopaque, u64) anyerror!u64,
+};
+const external_registry = @import("../system_catalog/prepared_transactions.zig");
+const ExternalRecord = external_registry.Record;
+const ExternalIdentity = external_registry.Identity;
+const ExternalParticipant = external_registry.Participant;
+const ExternalAction = external_registry.Action;
+
+/// Borrowed row inputs and owned routing/list buffers, shared with ordinary
+/// commits. All allocation and manifest validation precede the first BEGIN.
+pub const ExternalPreparation = struct {
+    participants: std.ArrayListUnmanaged(ParticipantTxn),
+    manifest: []ExternalParticipant,
+    participant_ids: [][]const u8,
+
+    pub fn init(a: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest) !ExternalPreparation {
+        var participants = try buildParticipantTxns(a, catalog, tables, true);
+        errdefer {
+            for (participants.items) |*participant| participant.deinit(a);
+            participants.deinit(a);
+        }
+        if (participants.items.len > external_registry.max_participants) return error.CatalogCommandTooLarge;
+        const manifest = try a.alloc(ExternalParticipant, participants.items.len);
+        errdefer a.free(manifest);
+        const ids = try a.alloc([]const u8, manifest.len);
+        errdefer a.free(ids);
+        var initialized: usize = 0;
+        errdefer for (ids[0..initialized]) |id| a.free(id);
+        for (participants.items, manifest, ids) |participant, *entry, *id| {
+            // SQL prepared transactions cannot borrow an unpublished restore
+            // namespace whose independent owner may discard its staged root.
+            if (participant.restore_staging_scope != null) return error.InvalidTxnRequest;
+            entry.* = .{ .table_name = participant.table_name, .route = participant.route_fence orelse return error.TopologyChanged, .schema_version = participant.schema_version };
+            id.* = try participantIdForGroupScoped(a, participant.table_name, participant.group_id, null, null);
+            initialized += 1;
+        }
+        return .{ .participants = participants, .manifest = manifest, .participant_ids = ids };
+    }
+
+    pub fn deinit(self: *ExternalPreparation, a: std.mem.Allocator) void {
+        for (self.participants.items) |*participant| participant.deinit(a);
+        self.participants.deinit(a);
+        for (self.participant_ids) |id| a.free(id);
+        a.free(self.participant_ids);
+        a.free(self.manifest);
+        self.* = undefined;
+    }
+
+    /// A lost BEGIN/vote/publication reply leaves the immutable metadata job
+    /// pending. Only its durable decision may authorize subsequent cleanup;
+    /// ordinary coordinator status probes and best-effort aborts are forbidden.
+    pub fn prepare(self: *const ExternalPreparation, a: std.mem.Allocator, worker: ParticipantWorker, authority: ExternalAuthority, identity: ExternalIdentity, options: ExecuteOptions) !ExternalRecord {
+        try identity.validate();
+        if (!std.mem.eql(u8, &identity.manifest_digest, &try external_registry.manifestDigest(a, self.manifest, identity.metadata_incarnation))) return error.InvalidCatalogMutation;
+        const owner = try identity.owner(a);
+        var record = try authority.admit(authority.ptr, a, identity, self.manifest);
+        try record.validate(a);
+        if (!(try record.identity.owner(a)).eql(owner)) return error.ExternalTransactionDecisionChanged;
+        if (record.phase == .prepared) return record;
+        if (record.phase != .preparing) return error.InvalidPreparedTransactionPhase;
+        var slots: [external_registry.max_participants]ExternalFanoutTask.Slot = undefined;
+        try runExternalFanout(a, worker, record, self, .begin, &slots, options);
+        try runExternalFanout(a, worker, record, self, .vote, &slots, options);
+        record = try authority.advance(authority.ptr, a, record, .prepare);
+        try record.validate(a);
+        if (!(try record.identity.owner(a)).eql(owner) or record.phase != .prepared) return error.ExternalTransactionDecisionChanged;
+        return record;
+    }
+};
+
+const ExternalFanoutTask = struct {
+    const Operation = enum { begin, vote, activate, resolve };
+    const Slot = struct { err: ?anyerror = null, completed: bool = false };
+
+    fn run(worker: ParticipantWorker, record: ExternalRecord, preparation: ?*const ExternalPreparation, operation: Operation, index: usize, owner: transactions_mod.ExternalDecisionOwner, deadline: ?u64, slot: *Slot) void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        execute(arena.allocator(), worker, record, preparation, operation, index, owner, deadline) catch |err| {
+            slot.err = err;
+            return;
+        };
+        slot.completed = true;
+    }
+
+    fn execute(a: std.mem.Allocator, worker: ParticipantWorker, record: ExternalRecord, preparation: ?*const ExternalPreparation, operation: Operation, index: usize, owner: transactions_mod.ExternalDecisionOwner, deadline: ?u64) !void {
+        if (deadline) |limit| try ensureDecisionRecoveryDeadline(limit);
+        const p = record.participants[index];
+        switch (operation) {
+            .begin => try worker.beginGroup(a, p.route.route.group_id, p.table_name, .{
+                .txn_id = record.identity.txn_id,
+                .begin_timestamp = record.identity.begin_timestamp,
+                .topology_epoch = p.route.topology_epoch,
+                .route_fence = p.route,
+                .retain_terminal = true,
+                .participants = preparation.?.participant_ids,
+                .external_decision_owner = owner,
+            }),
+            .vote => {
+                var intent = preparation.?.participants.items[index].intent();
+                intent.external_decision_owner = owner;
+                try worker.prepareGroup(a, p.route.route.group_id, p.table_name, .{ .txn_id = record.identity.txn_id, .topology_epoch = p.route.topology_epoch, .route_fence = p.route, .req = intent });
+            },
+            .activate => try worker.prepareGroup(a, p.route.route.group_id, p.table_name, .{
+                .txn_id = record.identity.txn_id,
+                .topology_epoch = p.route.topology_epoch,
+                .route_fence = p.route,
+                .req = .{ .external_decision_owner = owner, .external_activation = true },
+            }),
+            .resolve => {
+                const request: TxnResolveRequest = .{
+                    .txn_id = record.identity.txn_id,
+                    .status = if (record.decision.?.status == .committed) .committed else .aborted,
+                    .commit_version = record.decision.?.version,
+                    .sync_level = record.decision.?.sync_level,
+                    // Native enlistment and the exact immutable decision owner
+                    // authorize phase two. Never replan a durable decision or
+                    // wait on a mutable full-catalog projection to deliver it.
+                    .topology_epoch = 0,
+                    .external_decision_owner = owner,
+                };
+                if (deadline) |limit| try worker.resolveGroupUntil(a, p.route.route.group_id, p.table_name, request, limit) else try worker.resolveGroupWithCancellation(a, p.route.route.group_id, p.table_name, request, .none);
+            },
+        }
+    }
+};
+
+fn runExternalFanout(a: std.mem.Allocator, worker: ParticipantWorker, record: ExternalRecord, preparation: ?*const ExternalPreparation, operation: ExternalFanoutTask.Operation, slots: *[external_registry.max_participants]ExternalFanoutTask.Slot, options: ExecuteOptions) !void {
+    const owner = try record.identity.owner(a);
+    for (slots) |*slot| slot.* = .{};
+    const skip = switch (operation) {
+        .activate => record.activations,
+        .resolve => record.resolutions,
+        else => 0,
+    };
+    const width = fanoutWidth(options, record.participants.len);
+    var start: usize = 0;
+    while (start < record.participants.len) : (start += width) {
+        if (options.external_deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
+        const end = @min(start + width, record.participants.len);
+        var group: std.Io.Group = .init;
+        for (start..end) |i| {
+            if (skip & (@as(u64, 1) << @intCast(i)) != 0) continue;
+            if (options.fanout_io) |io| {
+                group.concurrent(io, ExternalFanoutTask.run, .{ worker, record, preparation, operation, i, owner, options.external_deadline_ns, &slots[i] }) catch ExternalFanoutTask.run(worker, record, preparation, operation, i, owner, options.external_deadline_ns, &slots[i]);
+            } else ExternalFanoutTask.run(worker, record, preparation, operation, i, owner, options.external_deadline_ns, &slots[i]);
+        }
+        if (options.fanout_io) |io| awaitFanout(&group, io);
+    }
+    for (slots[0..record.participants.len]) |slot| if (slot.err) |err| return err;
+}
+
+/// Resumes solely from metadata and native journals, without loading, parsing,
+/// or re-executing SQL. A bounded pass crosses at most the four remaining
+/// barriers. Prepared votes have no timeout; only an unfinished admission may
+/// be aborted by expiry. Every failed delivery remains explicit recovery debt.
+pub fn recoverExternalTransaction(a: std.mem.Allocator, worker: ParticipantWorker, authority: ExternalAuthority, operation_id: [16]u8, now_ns: u64, options: ExecuteOptions) !ExternalRecord {
+    var record = (try authority.read(authority.ptr, a, operation_id)) orelse return error.SqlPreparedTransactionNotFound;
+    try record.validate(a);
+    if (!std.mem.eql(u8, &operation_id, &record.identity.operation_id)) return error.ExternalTransactionDecisionChanged;
+    const owner = try record.identity.owner(a);
+    if (external_registry.recoveryDecision(record, now_ns)) |decision| {
+        const version = try authority.next_version(authority.ptr, record.identity.begin_timestamp);
+        record = try authority.advance(authority.ptr, a, record, switch (decision) {
+            .abort => .{ .abort = version },
+            .commit => .{ .commit = .{ .version = version, .sync_level = record.identity.commit_sync_level } },
+        });
+    } else if (record.phase == .preparing) return record;
+    var slots: [external_registry.max_participants]ExternalFanoutTask.Slot = undefined;
+    for (0..4) |_| {
+        try record.validate(a);
+        if (!(try record.identity.owner(a)).eql(owner)) return error.ExternalTransactionDecisionChanged;
+        switch (record.phase) {
+            .preparing, .prepared, .retired => return record,
+            .decided, .active => {
+                const operation: ExternalFanoutTask.Operation = if (record.decision.?.status == .committed and record.phase == .decided) .activate else .resolve;
+                const failure: ?anyerror = failure: {
+                    runExternalFanout(a, worker, record, null, operation, &slots, options) catch |err| break :failure err;
+                    break :failure null;
+                };
+                var completed: u64 = 0;
+                for (slots[0..record.participants.len], 0..) |slot, i| if (slot.completed) {
+                    completed |= @as(u64, 1) << @intCast(i);
+                };
+                if (completed != 0) record = try authority.advance(authority.ptr, a, record, if (operation == .activate) .{ .activate = completed } else .{ .resolve = completed });
+                if (failure) |err| return err;
+            },
+            .resolved => {
+                if (options.external_deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
+                if (record.participants.len != 0) {
+                    // A missing ACK capability is recovery debt, never proof
+                    // that native retention may be released.
+                    if (worker.vtable.acknowledge_many_group == null and worker.vtable.acknowledge_group == null) return error.UnsupportedOperation;
+                    const ids = try a.alloc([]const u8, record.participants.len);
+                    var initialized: usize = 0;
+                    defer {
+                        for (ids[0..initialized]) |id| a.free(id);
+                        a.free(ids);
+                    }
+                    for (record.participants, ids) |p, *id| {
+                        id.* = try participantIdForGroupScoped(a, p.table_name, p.route.route.group_id, null, null);
+                        initialized += 1;
+                    }
+                    const coordinator = record.participants[0];
+                    // The durable resolved record is the metadata handoff.
+                    // Include the coordinator only after every primary ACK.
+                    const batch: TxnAcknowledgeManyRequest = .{ .txn_id = record.identity.txn_id, .participants = ids };
+                    const batched = batched: {
+                        const callback = worker.vtable.acknowledge_many_group orelse break :batched false;
+                        callback(worker.ptr, a, coordinator.route.route.group_id, coordinator.table_name, batch) catch |err| switch (err) {
+                            error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion => break :batched false,
+                            else => return err,
+                        };
+                        break :batched true;
+                    };
+                    if (!batched) {
+                        const callback = worker.vtable.acknowledge_group orelse return error.UnsupportedOperation;
+                        for (ids) |id| try callback(worker.ptr, a, coordinator.route.route.group_id, coordinator.table_name, .{ .txn_id = record.identity.txn_id, .participant = id });
+                    }
+                }
+                record = try authority.advance(authority.ptr, a, record, .handoff);
+            },
+        }
+    }
+    return error.CommitDecisionUnknown;
+}
 
 const ParticipantFanoutSlot = struct {
     err: ?anyerror = null,
@@ -1333,34 +1586,50 @@ pub fn executeMultiTableCommitWithOptions(
     return executeMultiTableCommitOnce(alloc, catalog, worker, txn_id, begin_timestamp, commit_version, tables, sync_level, trace_writer, options);
 }
 
-fn executeMultiTableCommitOnce(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    worker: ParticipantWorker,
-    txn_id: db_mod.types.TxnId,
-    begin_timestamp: u64,
-    commit_version: u64,
-    tables: []const TableCommitRequest,
-    sync_level: db_mod.types.SyncLevel,
-    trace_writer: ?tracing.AntflyTraceWriter,
-    options: ExecuteOptions,
-) !CommitOutcome {
+// Ordinary legacy callers retain their admin provider; external admission
+// requires the compact linearizable projection, with one capture per table.
+const ParticipantRouting = struct {
+    admin: ?table_catalog.TransactionRoutingSnapshot = null,
+    compact: ?table_catalog.AuthoritativeTableRoutingSnapshot = null,
+    ranges: []const *const @import("../metadata/table_manager.zig").RangeRecord,
+    topology_epoch: u64,
+    metadata_group_id: u64,
+    metadata_incarnation: ?[32]u8,
+
+    fn init(a: std.mem.Allocator, catalog: table_catalog.CatalogSource, name: []const u8, frozen: bool) !?ParticipantRouting {
+        if (frozen) {
+            const cut = (try table_catalog.authoritativeTableRoutingSnapshot(a, catalog, name, null)) orelse return null;
+            return .{ .compact = cut, .ranges = cut.ranges, .topology_epoch = cut.topology_epoch, .metadata_group_id = cut.snapshot.value.metadata_group_id, .metadata_incarnation = cut.snapshot.value.metadata_incarnation };
+        }
+        const cut = (try table_catalog.transactionRoutingSnapshot(a, catalog, name)) orelse return null;
+        return .{ .admin = cut, .ranges = cut.ranges, .topology_epoch = cut.topology_epoch, .metadata_group_id = cut.snapshot.status.metadata_group_id, .metadata_incarnation = cut.snapshot.status.metadata_incarnation };
+    }
+    fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        if (self.admin) |*cut| cut.deinit(a);
+        if (self.compact) |*cut| cut.deinit(a);
+    }
+    fn resolveGroupForKey(self: *const @This(), key: []const u8) ?u64 {
+        return table_catalog.resolveGroupForKeyFromRanges(self.ranges, key);
+    }
+};
+
+fn buildParticipantTxns(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest, freeze_routes: bool) !std.ArrayListUnmanaged(ParticipantTxn) {
     var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
-    defer {
+    errdefer {
         for (participants.items) |*participant| participant.deinit(alloc);
         participants.deinit(alloc);
     }
 
     for (tables) |table| {
-        var routing = (try table_catalog.transactionRoutingSnapshot(alloc, catalog, table.table_name)) orelse return error.TableNotFound;
+        var routing = (try ParticipantRouting.init(alloc, catalog, table.table_name, freeze_routes)) orelse return error.TableNotFound;
         defer routing.deinit(alloc);
         const topology_epoch = routing.topology_epoch;
 
         try @import("antfly_local_sources").api_range_read_guards.validate(table.range_guards);
         for (table.range_guards) |owner| {
             const fence = owner.fence;
-            if (routing.snapshot.status.metadata_group_id != fence.metadata_group_id or
-                !std.meta.eql(routing.snapshot.status.metadata_incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
+            if (routing.metadata_group_id != fence.metadata_group_id or
+                !std.meta.eql(routing.metadata_incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
                 return error.TopologyChanged;
             const range = for (routing.ranges) |candidate| {
                 if (candidate.group_id == fence.route.group_id) break candidate;
@@ -1459,7 +1728,36 @@ fn executeMultiTableCommitOnce(
                 if (!std.mem.eql(u8, &existing, &requested)) return error.RestoreStagingChanged;
             } else participant.restore_staging_plan_id = routed_restore_plan;
             try validateRestorePlan(participant.restore_staging_scope, participant.restore_staging_plan_id);
+            if (freeze_routes) {
+                const range = for (routing.ranges) |candidate| {
+                    if (candidate.group_id == participant.group_id) break candidate;
+                } else return error.TopologyChanged;
+                const manager = @import("../metadata/table_manager.zig");
+                const range_id = manager.rangeDocIdentityRangeId(range.*);
+                participant.route_fence = routing.compact.?.fenceForRoute(.{ .group_id = participant.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = range.table_id, .shard_id = manager.rangeDocIdentityShardId(range.*), .range_id = range_id } });
+            }
         }
+    }
+
+    return participants;
+}
+
+fn executeMultiTableCommitOnce(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    begin_timestamp: u64,
+    commit_version: u64,
+    tables: []const TableCommitRequest,
+    sync_level: db_mod.types.SyncLevel,
+    trace_writer: ?tracing.AntflyTraceWriter,
+    options: ExecuteOptions,
+) !CommitOutcome {
+    var participants = try buildParticipantTxns(alloc, catalog, tables, false);
+    defer {
+        for (participants.items) |*participant| participant.deinit(alloc);
+        participants.deinit(alloc);
     }
 
     const participant_ids = try alloc.alloc([]const u8, participants.items.len);
@@ -2007,6 +2305,30 @@ const ParticipantTxn = struct {
     relational_retirement: ?integrity_retirement.Command = null,
     relational_index_maintenance: ?@import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Command = null,
 
+    fn intent(self: ParticipantTxn) db_mod.types.TransactionIntentRequest {
+        return .{
+            .row_policy_principal_proof = self.row_policy_principal_proof,
+            .row_policy_database = self.row_policy_database,
+            .row_policy_admitted_at_seconds = self.row_policy_admitted_at_seconds,
+            .writes = self.writes.items,
+            .deletes = self.deletes.items,
+            .transforms = self.transforms.items,
+            .predicates = self.predicates.items,
+            .integrity = self.integrity.items,
+            .integrity_commands = self.integrity_commands.items,
+            .range_guards = self.range_guards.items,
+            .relational_activation = self.relational_activation,
+            .relational_retirement = self.relational_retirement,
+            .relational_index_maintenance = self.relational_index_maintenance,
+            .relational_schema_version = self.relational_schema_version,
+            .schema_version = self.schema_version,
+            .relational_integrity_generation_set = self.relational_integrity_generation_set,
+            .restore_staging_scope = self.restore_staging_scope,
+            .restore_staging_plan_id = self.restore_staging_plan_id,
+            .relational_repair = self.relational_repair,
+        };
+    }
+
     fn statusRequest(self: ParticipantTxn, txn_id: db_mod.types.TxnId) TxnStatusRequest {
         return .{ .txn_id = txn_id, .restore_staging_scope = self.restore_staging_scope, .restore_staging_plan_id = self.restore_staging_plan_id };
     }
@@ -2118,27 +2440,7 @@ const PrepareFanoutTask = struct {
             .route_fence = participant.route_fence,
             .txn_id = txn_id,
             .topology_epoch = participant.topology_epoch,
-            .req = .{
-                .row_policy_principal_proof = participant.row_policy_principal_proof,
-                .row_policy_database = participant.row_policy_database,
-                .row_policy_admitted_at_seconds = participant.row_policy_admitted_at_seconds,
-                .writes = participant.writes.items,
-                .deletes = participant.deletes.items,
-                .transforms = participant.transforms.items,
-                .predicates = participant.predicates.items,
-                .integrity = participant.integrity.items,
-                .integrity_commands = participant.integrity_commands.items,
-                .range_guards = participant.range_guards.items,
-                .relational_activation = participant.relational_activation,
-                .relational_retirement = participant.relational_retirement,
-                .relational_index_maintenance = participant.relational_index_maintenance,
-                .relational_schema_version = participant.relational_schema_version,
-                .schema_version = participant.schema_version,
-                .relational_integrity_generation_set = participant.relational_integrity_generation_set,
-                .restore_staging_scope = participant.restore_staging_scope,
-                .restore_staging_plan_id = participant.restore_staging_plan_id,
-                .relational_repair = participant.relational_repair,
-            },
+            .req = participant.intent(),
         }) catch |err| {
             slot.err = err;
         };
@@ -2323,6 +2625,10 @@ pub fn resolveParticipant(
     status: db_mod.types.TxnStatus,
     commit_version: u64,
 ) !void {
+    return resolveParticipantWithOwner(alloc, worker, participant, txn_id, status, commit_version, null);
+}
+
+pub fn resolveParticipantWithOwner(alloc: std.mem.Allocator, worker: ParticipantWorker, participant: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, owner: ?@import("antfly_local_sources").storage_transactions.ExternalDecisionOwner) !void {
     const ref = parseParticipantRef(participant) orelse return error.InvalidParticipant;
     try worker.resolveGroup(alloc, ref.group_id, ref.table_name, .{
         .restore_staging_scope = ref.restore_staging_scope,
@@ -2330,6 +2636,7 @@ pub fn resolveParticipant(
         .txn_id = txn_id,
         .status = status,
         .commit_version = commit_version,
+        .external_decision_owner = owner,
         // Recovery acknowledges this participant immediately after the call.
         // It therefore requires a committed/applied decision, not mere Raft
         // proposal acceptance.
@@ -2358,9 +2665,14 @@ pub fn parseTxnIdHex(text: []const u8) !db_mod.types.TxnId {
 
 pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]u8 {
     try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
+    if (req.external_decision_owner) |owner| {
+        try owner.validate();
+        if (!req.retain_terminal) return error.InvalidTxnRequest;
+    }
     const txn_hex = encodeTxnIdHex(req.txn_id);
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
+    if (req.external_decision_owner != null) try out.appendSlice(alloc, "[\"external-begin-v1\",");
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
     try out.appendSlice(alloc, "\",\"begin_timestamp\":");
@@ -2388,25 +2700,45 @@ pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
+    if (req.external_decision_owner) |owner| {
+        const encoded = try std.fmt.allocPrint(alloc, ",\"external_decision_owner\":{f}", .{std.json.fmt(owner, .{})});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+    if (req.route_fence) |fence| {
+        const encoded = try std.fmt.allocPrint(alloc, ",\"route_fence\":{f}", .{std.json.fmt(fence, .{})});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
     try out.appendSlice(alloc, "}");
+    if (req.external_decision_owner != null) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
 pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest) ![]u8 {
     try validateRestorePlan(req.req.restore_staging_scope, req.req.restore_staging_plan_id);
+    if (req.req.external_decision_owner) |owner| try owner.validate();
+    if (req.req.external_activation and req.req.external_decision_owner == null) return error.InvalidTxnRequest;
     const policy = try validatePreparePolicyAuthority(req.req.row_policy_principal_proof, req.req.row_policy_database, req.req.row_policy_admitted_at_seconds);
     const txn_hex = encodeTxnIdHex(req.txn_id);
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     const guarded = req.req.range_guards.len != 0;
     const row_semantics = @import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
-    if (policy) try out.appendSlice(alloc, "[\"row-policy-prepare-v1\",") else if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
+    const handoff = @import("antfly_local_sources").api_batch.DomainHandoff;
+    const domains = handoff.present(req.req.writes);
+    try handoff.requireUniqueKeys(alloc, req.req.writes);
+    if (req.req.external_decision_owner != null) try out.appendSlice(alloc, "[\"external-prepare-v1\",") else if (domains and policy) try out.appendSlice(alloc, "[\"row-policy-prepare-v2\",") else if (domains) try out.appendSlice(alloc, "[\"row-semantics-prepare-v2\",") else if (policy) try out.appendSlice(alloc, "[\"row-policy-prepare-v1\",") else if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
     try out.appendSlice(alloc, "\",\"topology_epoch\":");
     const epoch = try std.fmt.allocPrint(alloc, "{d}", .{req.topology_epoch});
     defer alloc.free(epoch);
     try out.appendSlice(alloc, epoch);
+    if (req.req.external_decision_owner) |owner| {
+        try out.print(alloc, ",\"_external_prepare\":{f}", .{std.json.fmt(.{ .owner = owner, .activation = req.req.external_activation, .policy = policy, .row_semantics = row_semantics or domains or policy, .domains = domains }, .{})});
+    }
+    if (req.req.timestamp_ns != 0) try out.print(alloc, ",\"timestamp_ns\":{d}", .{req.req.timestamp_ns});
     if (policy) {
         const encoded = try std.fmt.allocPrint(alloc, ",\"row_policy_principal_proof\":{f},\"row_policy_database\":{f},\"row_policy_admitted_at_seconds\":{d}", .{
             std.json.fmt(req.req.row_policy_principal_proof, .{}),
@@ -2440,7 +2772,14 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         }
         try out.append(alloc, '}');
     }
-    try out.appendSlice(alloc, "],\"deletes\":[");
+    try out.append(alloc, ']');
+    if (domains) {
+        var sidecar: std.Io.Writer.Allocating = .init(alloc);
+        defer sidecar.deinit();
+        try handoff.writeSidecar(&sidecar.writer, req.req.writes);
+        try out.appendSlice(alloc, sidecar.written());
+    }
+    try out.appendSlice(alloc, ",\"deletes\":[");
     for (req.req.deletes, 0..) |key, i| {
         if (i > 0) try out.append(alloc, ',');
         const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(key, .{})});
@@ -2536,7 +2875,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         try out.appendSlice(alloc, encoded);
     }
     try out.append(alloc, '}');
-    if (policy or guarded or row_semantics) try out.append(alloc, ']');
+    if (req.req.external_decision_owner != null or policy or guarded or row_semantics) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -2556,7 +2895,12 @@ pub fn encodeTxnResolveRequest(alloc: std.mem.Allocator, req: TxnResolveRequest)
     defer alloc.free(base);
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
+    if (req.external_decision_owner != null) try out.appendSlice(alloc, "[\"external-resolve-v1\",");
     try out.appendSlice(alloc, base);
+    if (req.external_decision_owner) |owner| {
+        try owner.validate();
+        try out.print(alloc, ",\"_external_decision_owner\":{f}", .{std.json.fmt(owner, .{})});
+    }
     try appendRestorePlan(alloc, &out, req.restore_staging_plan_id);
     if (req.restore_staging_scope) |scope| {
         try out.appendSlice(alloc, ",\"restore_staging_scope\":");
@@ -2565,6 +2909,7 @@ pub fn encodeTxnResolveRequest(alloc: std.mem.Allocator, req: TxnResolveRequest)
         try out.appendSlice(alloc, encoded);
     }
     try out.append(alloc, '}');
+    if (req.external_decision_owner != null) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -2656,10 +3001,22 @@ pub fn encodeTxnStatusResponse(alloc: std.mem.Allocator, response: TxnStatusResp
 pub fn parseTxnBeginRequest(alloc: std.mem.Allocator, body: []const u8) !TxnBeginRequest {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
-    const obj = switch (parsed.value) {
+    var root_value = parsed.value;
+    const external = root_value == .array;
+    if (external) {
+        if (root_value.array.items.len != 2 or root_value.array.items[0] != .string or !std.mem.eql(u8, root_value.array.items[0].string, "external-begin-v1")) return error.InvalidTxnRequest;
+        root_value = root_value.array.items[1];
+    }
+    const obj = switch (root_value) {
         .object => |obj| obj,
         else => return error.InvalidTxnRequest,
     };
+    if (external != obj.contains("external_decision_owner")) return error.InvalidTxnRequest;
+    var owner = if (obj.get("external_decision_owner")) |item| try std.json.parseFromValue(@import("antfly_local_sources").storage_transactions.ExternalDecisionOwner, alloc, item, .{}) else null;
+    defer if (owner) |*held| held.deinit();
+    if (owner) |held| try held.value.validate();
+    var route = if (obj.get("route_fence")) |item| try std.json.parseFromValue(@import("../metadata/api.zig").CatalogRouteFence, alloc, item, .{}) else null;
+    defer if (route) |*held| held.deinit();
     const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
     const begin_timestamp = try requireU64(obj, "begin_timestamp");
     const participants_value = obj.get("participants") orelse return error.InvalidTxnRequest;
@@ -2681,7 +3038,10 @@ pub fn parseTxnBeginRequest(alloc: std.mem.Allocator, body: []const u8) !TxnBegi
         initialized += 1;
     }
     const restore_scope = if (obj.get("restore_staging_scope")) |value| try integrity_wire.parseGenerationSet(value) else null;
+    if (external and (obj.get("retain_terminal") == null or obj.get("retain_terminal").? != .bool or !obj.get("retain_terminal").?.bool)) return error.InvalidTxnRequest;
     return .{
+        .external_decision_owner = if (owner) |held| held.value else null,
+        .route_fence = if (route) |held| held.value else null,
         .txn_id = txn_id,
         .begin_timestamp = begin_timestamp,
         .restore_staging_scope = restore_scope,
@@ -2716,20 +3076,49 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
     const wrapped = parsed.value == .array;
+    var external = false;
     var row_semantics = false;
     var policy = false;
+    var domains = false;
     const root = if (wrapped) blk: {
         const entries = parsed.value.array.items;
         if (entries.len != 2 or entries[0] != .string) return error.InvalidTxnRequest;
-        policy = std.mem.eql(u8, entries[0].string, "row-policy-prepare-v1");
-        row_semantics = policy or std.mem.eql(u8, entries[0].string, "row-semantics-prepare-v1");
-        if (!row_semantics and !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
+        external = std.mem.eql(u8, entries[0].string, "external-prepare-v1");
+        domains = std.mem.eql(u8, entries[0].string, "row-policy-prepare-v2") or std.mem.eql(u8, entries[0].string, "row-semantics-prepare-v2");
+        policy = std.mem.eql(u8, entries[0].string, "row-policy-prepare-v1") or std.mem.eql(u8, entries[0].string, "row-policy-prepare-v2");
+        row_semantics = domains or policy or std.mem.eql(u8, entries[0].string, "row-semantics-prepare-v1");
+        if (!external and !row_semantics and !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
         break :blk entries[1];
     } else parsed.value;
     const obj = switch (root) {
         .object => |obj| obj,
         else => return error.InvalidTxnRequest,
     };
+    const ExternalPrepare = struct {
+        owner: @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner,
+        activation: bool,
+        policy: bool,
+        row_semantics: bool,
+        domains: bool,
+    };
+    if (external != obj.contains("_external_prepare")) return error.InvalidTxnRequest;
+    var external_owner: ?@import("antfly_local_sources").storage_transactions.ExternalDecisionOwner = null;
+    var external_activation = false;
+    if (external) {
+        var wire = std.json.parseFromValue(ExternalPrepare, alloc, obj.get("_external_prepare").?, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidTxnRequest,
+        };
+        defer wire.deinit();
+        try wire.value.owner.validate();
+        if ((wire.value.policy or wire.value.domains) and !wire.value.row_semantics) return error.InvalidTxnRequest;
+        external_owner = wire.value.owner;
+        external_activation = wire.value.activation;
+        policy = wire.value.policy;
+        domains = wire.value.domains;
+        row_semantics = wire.value.row_semantics;
+    }
+    if (domains != obj.contains("_prepared_domain_rows")) return error.InvalidTxnRequest;
     const proof_value = obj.get("row_policy_principal_proof");
     const database_value = obj.get("row_policy_database");
     const admitted_value = obj.get("row_policy_admitted_at_seconds");
@@ -2752,6 +3141,15 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
     const writes = try parseTxnWrites(alloc, obj.get("writes") orelse return error.InvalidTxnRequest);
     errdefer freeTxnWrites(alloc, writes);
+    var prepared_domain_owner: ?@import("antfly_local_sources").api_batch.DomainHandoff.Owned = null;
+    errdefer if (prepared_domain_owner) |*owner| owner.deinit();
+    if (obj.get("_prepared_domain_rows")) |value| {
+        const handoff = @import("antfly_local_sources").api_batch.DomainHandoff;
+        var wire = try std.json.parseFromValue(handoff.Wire, alloc, value, .{});
+        defer wire.deinit();
+        prepared_domain_owner = try handoff.attach(alloc, writes, wire.value);
+    }
+
     const deletes = try parseTxnDeletes(alloc, obj.get("deletes") orelse return error.InvalidTxnRequest);
     errdefer freeTxnDeletes(alloc, deletes);
     const transforms = try parseTxnTransforms(alloc, obj.get("transforms") orelse return error.InvalidTxnRequest);
@@ -2791,13 +3189,16 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     if (range_guards_owner != null and range_guards_owner.?.value.len != 0 and route_fence == null) return error.InvalidTxnRequest;
     const has_guards = range_guards_owner != null and range_guards_owner.?.value.len != 0;
     if (has_guards and !wrapped) return error.InvalidTxnRequest;
-    if (wrapped and !row_semantics and !has_guards) return error.InvalidTxnRequest;
+    if (wrapped and !external and !row_semantics and !has_guards) return error.InvalidTxnRequest;
     if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics) return error.InvalidTxnRequest;
     return .{
         .route_fence = if (route_fence) |fence| fence.value else null,
         .txn_id = txn_id,
         .topology_epoch = try optionalU64(obj, "topology_epoch"),
         .req = .{
+            .timestamp_ns = try optionalU64(obj, "timestamp_ns"),
+            .external_decision_owner = external_owner,
+            .external_activation = external_activation,
             .row_policy_principal_proof = owned_proof,
             .row_policy_database = owned_database,
             .row_policy_admitted_at_seconds = admitted_at,
@@ -2819,6 +3220,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
             .relational_repair = relational_repair,
         },
         .integrity_commands_owner = integrity_commands_owner,
+        .prepared_domain_owner = prepared_domain_owner,
         .range_guards_owner = range_guards_owner,
         .relational_activation_owner = relational_activation_owner,
         .relational_retirement_owner = relational_retirement_owner,
@@ -2827,6 +3229,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
 }
 
 pub fn freeTxnPrepareRequest(alloc: std.mem.Allocator, req: *TxnPrepareRequest) void {
+    if (req.prepared_domain_owner) |*owner| owner.deinit();
     alloc.free(req.req.row_policy_principal_proof);
     alloc.free(req.req.row_policy_database);
     if (req.range_guards_owner) |*owner| owner.deinit();
@@ -3145,12 +3548,30 @@ test "distributed txn scoped participant recovery survives LSM reopen without re
 pub fn parseTxnResolveRequest(alloc: std.mem.Allocator, body: []const u8) !TxnResolveRequest {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
-    const obj = switch (parsed.value) {
+    const external = parsed.value == .array;
+    const root = if (external) block: {
+        const entries = parsed.value.array.items;
+        if (entries.len != 2 or entries[0] != .string or !std.mem.eql(u8, entries[0].string, "external-resolve-v1")) return error.InvalidTxnRequest;
+        break :block entries[1];
+    } else parsed.value;
+    const obj = switch (root) {
         .object => |obj| obj,
         else => return error.InvalidTxnRequest,
     };
+    if (external != obj.contains("_external_decision_owner")) return error.InvalidTxnRequest;
+    var owner: ?@import("antfly_local_sources").storage_transactions.ExternalDecisionOwner = null;
+    if (external) {
+        var wire = std.json.parseFromValue(@import("antfly_local_sources").storage_transactions.ExternalDecisionOwner, alloc, obj.get("_external_decision_owner").?, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidTxnRequest,
+        };
+        defer wire.deinit();
+        try wire.value.validate();
+        owner = wire.value;
+    }
     const restore_scope = if (obj.get("restore_staging_scope")) |value| try integrity_wire.parseGenerationSet(value) else null;
     return .{
+        .external_decision_owner = owner,
         .restore_staging_scope = restore_scope,
         .restore_staging_plan_id = try parseRestorePlan(obj, restore_scope),
         .txn_id = try parseTxnIdHex(requireString(obj, "txn_id")),
@@ -3945,13 +4366,22 @@ fn implementationTests() type {
             });
             try db.resolveTransactionIntents(txn_id, .committed, 2_000);
 
-            var attempts: usize = 0;
-            while (attempts < 200) : (attempts += 1) {
-                const status = db.getTransactionStatus(txn_id);
-                if (status) |_| {} else |err| {
-                    if (err == transactions_mod.TxnError.TxnNotFound) break;
-                    return err;
-                }
+            // Record cleanup occurs inside recovery, before the completed
+            // page's counters are published. Wait for both observable effects
+            // rather than racing the last worker instruction after GC.
+            const deadline = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+            while (platform_time.monotonicNs() < deadline) {
+                const absent = absent: {
+                    _ = db.getTransactionStatus(txn_id) catch |err| {
+                        if (err == transactions_mod.TxnError.TxnNotFound) break :absent true;
+                        return err;
+                    };
+                    break :absent false;
+                };
+                const progress = try db.stats(alloc);
+                const published = progress.transaction_recovery.notification_successes > 0;
+                db_mod.types.freeDBStats(alloc, progress);
+                if (absent and published) break;
                 sleepNs(5 * std.time.ns_per_ms);
             }
 
@@ -7089,4 +7519,350 @@ test "distributed txn prepare JSON null and insert preconditions survive allocat
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL domain distributed prepare owns shared handoffs and rejects envelope downgrade" {
+    const a = std.testing.allocator;
+    const handoff = @import("antfly_local_sources").api_batch.DomainHandoff;
+    const prepared_contract: handoff.Contract = .{ .schema_version = 7, .domain_digest = @splat(8) };
+    for ([_]bool{ false, true }) |with_policy| {
+        const bytes = try encodeTxnPrepareRequest(a, .{ .txn_id = @splat(1), .req = .{
+            .writes = &.{ .{ .key = "a", .value = "{\"v\":null}", .prepared_domain = &prepared_contract }, .{ .key = "b", .value = "{}" } },
+            .row_policy_principal_proof = if (with_policy) "internal-proof" else "",
+            .row_policy_database = if (with_policy) "default" else "",
+            .row_policy_admitted_at_seconds = if (with_policy) 1 else 0,
+        } });
+        defer a.free(bytes);
+        const Check = struct {
+            fn run(alloc: std.mem.Allocator, encoded: []const u8) !void {
+                var request = try parseTxnPrepareRequest(alloc, encoded);
+                defer freeTxnPrepareRequest(alloc, &request);
+                try std.testing.expect(request.req.writes[0].prepared_domain != null);
+                try std.testing.expect(request.req.writes[1].prepared_domain == null);
+            }
+        };
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{bytes});
+        var parsed = try parseTxnPrepareRequest(a, bytes);
+        defer freeTxnPrepareRequest(a, &parsed);
+        try std.testing.expect(prepared_contract.eql(parsed.req.writes[0].prepared_domain.?.*));
+        try std.testing.expect(parsed.req.writes[0].prepared_domain != &prepared_contract);
+        var json = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer json.deinit();
+        json.value.array.items[0] = .{ .string = if (with_policy) "row-policy-prepare-v1" else "row-semantics-prepare-v1" };
+        const downgraded = try std.json.Stringify.valueAlloc(a, json.value, .{});
+        defer a.free(downgraded);
+        try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(a, downgraded));
+    }
+}
+
+test "distributed txn external authority envelopes retain provenance and reject downgrade under allocation failures" {
+    const Harness = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const owner: @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+            for ([_]bool{ false, true }) |activation| {
+                for ([_]bool{ false, true }) |policy| {
+                    const request: TxnPrepareRequest = .{ .txn_id = @splat(9), .topology_epoch = 7, .req = .{
+                        .external_decision_owner = owner,
+                        .external_activation = activation,
+                        .row_policy_principal_proof = if (policy) "v1:opaque:signature" else "",
+                        .row_policy_database = if (policy) "db" else "",
+                        .row_policy_admitted_at_seconds = if (policy) 100 else 0,
+                        .writes = if (activation) &.{} else &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }},
+                        .predicates = if (activation) &.{} else &.{.{ .key = "row", .expected_version = 0, .unique_absence = true }},
+                    } };
+                    const bytes = try encodeTxnPrepareRequest(a, request);
+                    defer a.free(bytes);
+                    var parsed = try parseTxnPrepareRequest(a, bytes);
+                    defer freeTxnPrepareRequest(a, &parsed);
+                    try std.testing.expect(owner.eql(parsed.req.external_decision_owner.?));
+                    try std.testing.expectEqual(activation, parsed.req.external_activation);
+                    try std.testing.expectEqual(@as(u64, 7), parsed.topology_epoch);
+                    try std.testing.expectEqualStrings(request.req.row_policy_principal_proof, parsed.req.row_policy_principal_proof);
+                    if (!activation) {
+                        try std.testing.expectEqualStrings("j", parsed.req.writes[0].json_null_fields[0]);
+                        try std.testing.expect(parsed.req.predicates[0].unique_absence);
+                    }
+                    const prefix = "[\"external-prepare-v1\",";
+                    try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(std.testing.allocator, bytes[prefix.len .. bytes.len - 1]));
+                    const downgraded = try std.mem.replaceOwned(u8, a, bytes, "external-prepare-v1", "row-semantics-prepare-v1");
+                    defer a.free(downgraded);
+                    try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(std.testing.allocator, downgraded));
+                }
+            }
+            const resolve: TxnResolveRequest = .{ .txn_id = @splat(9), .status = .committed, .commit_version = 11, .sync_level = .write, .topology_epoch = 7, .external_decision_owner = owner };
+            const bytes = try encodeTxnResolveRequest(a, resolve);
+            defer a.free(bytes);
+            try std.testing.expectEqualDeep(resolve, try parseTxnResolveRequest(a, bytes));
+            const prefix = "[\"external-resolve-v1\",";
+            try std.testing.expectError(error.InvalidTxnRequest, parseTxnResolveRequest(std.testing.allocator, bytes[prefix.len .. bytes.len - 1]));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "distributed txn external structured callback preserves topology cancellation and exact authority" {
+    const owner: @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+    const Probe = struct {
+        calls: usize = 0,
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnexpectedBatch;
+        }
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, request: TxnResolveRequest, cancellation: db_mod.types.CancellationToken) !?void {
+            try cancellation.check();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 71), group);
+            try std.testing.expectEqualStrings("rows", table);
+            try std.testing.expectEqual(@as(u64, 17), request.topology_epoch);
+            try std.testing.expect(owner.eql(request.external_decision_owner.?));
+            self.calls += 1;
+            return {};
+        }
+    };
+    var probe: Probe = .{};
+    const req: TxnResolveRequest = .{ .txn_id = @splat(9), .status = .committed, .commit_version = 11, .topology_epoch = 17, .external_decision_owner = owner };
+    const writes: table_writes.TableWriteSource = .{ .ptr = &probe, .vtable = &.{ .batch = Probe.batch, .txn_resolve_group_local_with_request = Probe.resolve } };
+    try std.testing.expect((try resolveGroupLocalWithRequest(writes, std.testing.allocator, 71, "rows", req, .none)) != null);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    const old: table_writes.TableWriteSource = .{ .ptr = &probe, .vtable = &.{ .batch = Probe.batch } };
+    try std.testing.expectError(error.ExternalTransactionDecisionRequired, resolveGroupLocalWithRequest(old, std.testing.allocator, 71, "rows", req, .none));
+}
+
+test "raft batch round trips external transaction enlistment authority without downgrading" {
+    const Harness = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const owner: @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+            const request: TxnBeginRequest = .{ .txn_id = @splat(4), .begin_timestamp = 10, .topology_epoch = 2, .retain_terminal = true, .participants = &.{"table:docs:group:2"}, .external_decision_owner = owner };
+            const encoded = try encodeTxnBeginRequest(a, request);
+            defer a.free(encoded);
+            var parsed = try parseTxnBeginRequest(a, encoded);
+            defer freeTxnBeginRequest(a, &parsed);
+            try std.testing.expectEqualDeep(request, parsed);
+            const batch: db_mod.types.BatchRequest = .{ .transaction = .{ .begin = .{ .txn_id = request.txn_id, .begin_timestamp = 10, .created_at_ns = 11, .topology_epoch = 2, .retain_terminal = true, .participants = request.participants, .external_decision_owner = owner } } };
+            const wire = @import("antfly_local_sources").api_batch;
+            const bytes = try wire.encodeBatchRequest(a, batch);
+            defer a.free(bytes);
+            var decoded = try wire.parseInternalBatchRequest(a, bytes);
+            defer decoded.deinit(a);
+            try std.testing.expectEqualDeep(batch.transaction.?, decoded.req.transaction.?);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    const a = std.testing.allocator;
+    const owner: @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+    const encoded = try encodeTxnBeginRequest(a, .{ .txn_id = @splat(4), .begin_timestamp = 10, .retain_terminal = true, .participants = &.{"table:docs:group:2"}, .external_decision_owner = owner });
+    defer a.free(encoded);
+    const prefix = "[\"external-begin-v1\",";
+    try std.testing.expect(std.mem.startsWith(u8, encoded, prefix));
+    try std.testing.expectError(error.InvalidTxnRequest, parseTxnBeginRequest(a, encoded[prefix.len .. encoded.len - 1]));
+}
+test "distributed txn external recovery pass retains a sendable hosted budget" {
+    const deadline = platform_time.monotonicNs() +| external_recovery_pass_timeout_ns;
+    const worker: HostedParticipantWorker = .{
+        .catalog = undefined,
+        .router = undefined,
+        .writes = undefined,
+        .executor = .{ .ptr = undefined, .vtable = undefined },
+        .recovery_deadline_ns = deadline,
+    };
+    const attempt = try worker.preDecisionDeadlineNs();
+    const context = try worker.localPreDecisionContext(attempt);
+    const native_budget = context.deadline_ns.? -| platform_time.monotonicNs();
+    try std.testing.expect(native_budget > contract.pre_decision_server_response_reserve_ms * std.time.ns_per_ms);
+    try std.testing.expect(context.deadline_ns.? <= deadline);
+}
+
+test "distributed txn external coordinator freezes authority and resumes every lost phase reply" {
+    const Harness = struct {
+        record: ExternalRecord,
+        fail_advance: ?ExternalAction = null,
+        fail_activation: bool = false,
+        unsupported_ack: bool = false,
+        activated: u64 = 0,
+        resolved: u64 = 0,
+        acknowledgements: usize = 0,
+        begins: usize = 0,
+        votes: usize = 0,
+
+        fn authority(self: *@This()) ExternalAuthority {
+            return .{ .ptr = self, .read = read, .admit = admit, .advance = advance, .next_version = nextVersion };
+        }
+        fn read(raw: *anyopaque, _: std.mem.Allocator, id: [16]u8) anyerror!?ExternalRecord {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.record.identity.operation_id, id);
+            return self.record;
+        }
+        fn admit(raw: *anyopaque, a: std.mem.Allocator, identity: ExternalIdentity, manifest: []const ExternalParticipant) anyerror!ExternalRecord {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect((try identity.owner(a)).eql(try self.record.identity.owner(a)));
+            try std.testing.expectEqualDeep(self.record.participants, manifest);
+            return self.record;
+        }
+        fn advance(raw: *anyopaque, a: std.mem.Allocator, prior: ExternalRecord, action: ExternalAction) anyerror!ExternalRecord {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.record = try external_registry.advance(a, self.record, prior.revision, try prior.identity.owner(a), action);
+            if (self.fail_advance) |selected| if (std.meta.activeTag(selected) == std.meta.activeTag(action)) {
+                self.fail_advance = null;
+                return error.ConnectionResetByPeer;
+            };
+            return self.record;
+        }
+        fn nextVersion(_: *anyopaque, floor: u64) anyerror!u64 {
+            return floor + 1;
+        }
+        fn begin(raw: *anyopaque, a: std.mem.Allocator, _: u64, _: []const u8, request: TxnBeginRequest) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualDeep(self.record.identity.txn_id, request.txn_id);
+            try std.testing.expectEqual(@as(usize, 2), request.participants.len);
+            try std.testing.expect(request.retain_terminal);
+            try std.testing.expect((try self.record.identity.owner(a)).eql(request.external_decision_owner.?));
+            self.begins += 1;
+        }
+        fn prepare(raw: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: TxnPrepareRequest) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualDeep(self.record.identity.txn_id, request.txn_id);
+            try std.testing.expect((try self.record.identity.owner(a)).eql(request.req.external_decision_owner.?));
+            try std.testing.expectEqual(group, request.route_fence.?.route.group_id);
+            if (request.req.external_activation) {
+                try std.testing.expect(self.record.decision.?.status == .committed);
+                self.activated |= @as(u64, 1) << @intCast(group - 1);
+                if (group == 2 and self.fail_activation) {
+                    self.fail_activation = false;
+                    return error.ConnectionResetByPeer;
+                }
+            } else {
+                try std.testing.expectEqual(@as(usize, 1), request.req.writes.len);
+                try std.testing.expectEqualStrings("policy-proof", request.req.row_policy_principal_proof);
+                try std.testing.expectEqualStrings("db", request.req.row_policy_database);
+                try std.testing.expectEqual(@as(i64, 12), request.req.row_policy_admitted_at_seconds);
+                self.votes += 1;
+            }
+        }
+        fn resolve(raw: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: TxnResolveRequest) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (request.status == .committed) {
+                try std.testing.expectEqual(self.record.mask(), self.activated);
+                try std.testing.expectEqual(self.record.mask(), self.record.activations);
+            } else try std.testing.expect(self.record.decision.?.status == .aborted);
+            try std.testing.expect((try self.record.identity.owner(a)).eql(request.external_decision_owner.?));
+            try std.testing.expectEqual(self.record.decision.?.version, request.commit_version);
+            try std.testing.expectEqual(self.record.decision.?.sync_level, request.sync_level);
+            try std.testing.expectEqual(@as(u64, 0), request.topology_epoch);
+            self.resolved |= @as(u64, 1) << @intCast(group - 1);
+        }
+        fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) anyerror!db_mod.types.TxnStatus {
+            // Bare native status must never become authority for external IDs.
+            return error.TestUnexpectedStatusProbe;
+        }
+        fn acknowledge(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, request: TxnAcknowledgeManyRequest) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.record.mask(), self.resolved);
+            try std.testing.expect(self.record.phase == .resolved);
+            try std.testing.expectEqual(@as(usize, 2), request.participants.len);
+            if (self.unsupported_ack) return error.UnsupportedOperation;
+            self.acknowledgements += 1;
+        }
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status, .acknowledge_many_group = acknowledge } };
+        }
+    };
+    const a = std.testing.allocator;
+    var manifest: [2]ExternalParticipant = undefined;
+    for (&manifest, 1..) |*p, group| p.* = .{ .table_name = "docs", .route = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 7, .topology_epoch = 3, .route = .{ .group_id = group, .range_id = group, .identity_namespace = .{ .table_id = 7, .shard_id = group, .range_id = group } } } };
+    const identity: ExternalIdentity = .{ .gid = "external", .database_id = 1, .principal = .bootstrap, .txn_id = @splat(2), .operation_id = @splat(3), .metadata_incarnation = @splat('1'), .begin_timestamp = 10, .expires_at_unix_ns = 100, .plan_digest = @splat(5), .manifest_digest = try external_registry.manifestDigest(a, &manifest, @splat('1')) };
+    var participants = [_]ParticipantTxn{
+        .{ .table_name = "docs", .group_id = 1, .topology_epoch = 3, .route_fence = manifest[0].route },
+        .{ .table_name = "docs", .group_id = 2, .topology_epoch = 3, .route_fence = manifest[1].route },
+    };
+    defer for (&participants) |*p| p.deinit(a);
+    for (&participants) |*p| {
+        p.row_policy_principal_proof = "policy-proof";
+        p.row_policy_database = "db";
+        p.row_policy_admitted_at_seconds = 12;
+        try p.writes.append(a, .{ .key = "key", .value = "{}" });
+    }
+    var ids = [_][]const u8{ "table:docs:group:1", "table:docs:group:2" };
+    var participant_list: std.ArrayListUnmanaged(ParticipantTxn) = .empty;
+    participant_list.items = &participants;
+    participant_list.capacity = 2;
+    const preparation: ExternalPreparation = .{ .participants = participant_list, .manifest = &manifest, .participant_ids = &ids };
+    const losses = [_]?ExternalAction{ null, .prepare, .{ .activate = 3 }, .{ .resolve = 3 }, .handoff };
+    for (losses) |loss| {
+        var harness: Harness = .{ .record = .{ .identity = identity, .participants = &manifest }, .fail_advance = loss };
+        const prepared = preparation.prepare(a, harness.worker(), harness.authority(), identity, .{});
+        if (loss != null and loss.? == .prepare) {
+            try std.testing.expectError(error.ConnectionResetByPeer, prepared);
+        } else _ = try prepared;
+        try std.testing.expectEqual(@as(usize, 2), harness.begins);
+        try std.testing.expectEqual(@as(usize, 2), harness.votes);
+        // Expiration is never permission to abort a durable prepared vote.
+        _ = try recoverExternalTransaction(a, harness.worker(), harness.authority(), identity.operation_id, 1000, .{});
+        try std.testing.expect(harness.record.phase == .prepared);
+        harness.record = try external_registry.advance(a, harness.record, harness.record.revision, try identity.owner(a), .{ .commit = .{ .version = 20, .sync_level = .full_index } });
+        const first = recoverExternalTransaction(a, harness.worker(), harness.authority(), identity.operation_id, 1000, .{});
+        if (loss != null and loss.? != .prepare) try std.testing.expectError(error.ConnectionResetByPeer, first) else _ = try first;
+        _ = try recoverExternalTransaction(a, harness.worker(), harness.authority(), identity.operation_id, 1000, .{});
+        try std.testing.expect(harness.record.phase == .retired);
+        try std.testing.expect(harness.acknowledgements >= 1);
+    }
+    var session_identity = identity;
+    session_identity.kind = .session_commit;
+    session_identity.commit_sync_level = .full_index;
+    session_identity.gid = "";
+    session_identity.session = .{ .owner_node_id = 9, .connection_id = @splat('2') };
+    const commit_losses = [_]?ExternalAction{ null, .prepare, .{ .commit = .{ .version = 20 } }, .{ .activate = 3 }, .{ .resolve = 3 }, .handoff };
+    for (commit_losses) |loss| {
+        var harness: Harness = .{ .record = .{ .identity = session_identity, .participants = &manifest }, .fail_advance = loss };
+        const prepared = preparation.prepare(a, harness.worker(), harness.authority(), session_identity, .{});
+        if (loss != null and loss.? == .prepare) try std.testing.expectError(error.ConnectionResetByPeer, prepared) else _ = try prepared;
+        const first = recoverExternalTransaction(a, harness.worker(), harness.authority(), session_identity.operation_id, 1000, .{});
+        if (loss != null and loss.? != .prepare) try std.testing.expectError(error.ConnectionResetByPeer, first) else _ = try first;
+        _ = try recoverExternalTransaction(a, harness.worker(), harness.authority(), session_identity.operation_id, 1000, .{});
+        try std.testing.expectEqual(.retired, harness.record.phase);
+        try std.testing.expectEqual(.committed, harness.record.decision.?.status);
+        try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, harness.record.decision.?.sync_level);
+        try std.testing.expectEqual(@as(usize, 2), harness.begins);
+        try std.testing.expectEqual(@as(usize, 2), harness.votes);
+        try std.testing.expectEqual(@as(u64, 3), harness.activated);
+        try std.testing.expectEqual(@as(u64, 3), harness.resolved);
+        try std.testing.expect(harness.acknowledgements != 0);
+    }
+    var unvoted: Harness = .{ .record = .{ .identity = session_identity, .participants = &manifest } };
+    _ = try recoverExternalTransaction(a, unvoted.worker(), unvoted.authority(), session_identity.operation_id, 1000, .{});
+    try std.testing.expectEqual(.retired, unvoted.record.phase);
+    try std.testing.expectEqual(.aborted, unvoted.record.decision.?.status);
+    try std.testing.expectEqual(@as(u64, 0), unvoted.activated);
+    try std.testing.expectEqual(@as(usize, 0), unvoted.begins);
+    var private_activation_loss: Harness = .{ .record = .{ .identity = session_identity, .participants = &manifest }, .fail_activation = true };
+    _ = try preparation.prepare(a, private_activation_loss.worker(), private_activation_loss.authority(), session_identity, .{});
+    try std.testing.expectError(error.ConnectionResetByPeer, recoverExternalTransaction(a, private_activation_loss.worker(), private_activation_loss.authority(), session_identity.operation_id, 1000, .{}));
+    try std.testing.expectEqual(@as(u64, 1), private_activation_loss.record.activations);
+    try std.testing.expectEqual(@as(u64, 0), private_activation_loss.resolved);
+    _ = try recoverExternalTransaction(a, private_activation_loss.worker(), private_activation_loss.authority(), session_identity.operation_id, 1000, .{});
+    try std.testing.expectEqual(.retired, private_activation_loss.record.phase);
+    var partial: Harness = .{ .record = .{ .identity = identity, .participants = &manifest }, .fail_activation = true };
+    _ = try preparation.prepare(a, partial.worker(), partial.authority(), identity, .{});
+    partial.record = try external_registry.advance(a, partial.record, partial.record.revision, try identity.owner(a), .{ .commit = .{ .version = 20 } });
+    try std.testing.expectError(error.ConnectionResetByPeer, recoverExternalTransaction(a, partial.worker(), partial.authority(), identity.operation_id, 1000, .{}));
+    try std.testing.expectEqual(@as(u64, 1), partial.record.activations);
+    try std.testing.expectEqual(@as(u64, 0), partial.resolved);
+    _ = try recoverExternalTransaction(a, partial.worker(), partial.authority(), identity.operation_id, 1000, .{});
+    try std.testing.expect(partial.record.phase == .retired);
+    var unfinished: Harness = .{ .record = .{ .identity = identity, .participants = &manifest } };
+    _ = try recoverExternalTransaction(a, unfinished.worker(), unfinished.authority(), identity.operation_id, 99, .{});
+    try std.testing.expect(unfinished.record.phase == .preparing);
+    _ = try recoverExternalTransaction(a, unfinished.worker(), unfinished.authority(), identity.operation_id, 100, .{});
+    try std.testing.expect(unfinished.record.phase == .retired);
+    try std.testing.expectEqual(@as(usize, 0), unfinished.begins);
+    try std.testing.expectEqual(@as(usize, 0), unfinished.votes);
+    try std.testing.expectEqual(@as(u64, 3), unfinished.resolved);
+    var unsupported: Harness = .{ .record = .{ .identity = identity, .participants = &manifest }, .unsupported_ack = true };
+    try std.testing.expectError(error.UnsupportedOperation, recoverExternalTransaction(a, unsupported.worker(), unsupported.authority(), identity.operation_id, 100, .{}));
+    try std.testing.expect(unsupported.record.phase == .resolved);
+    unsupported.unsupported_ack = false;
+    _ = try recoverExternalTransaction(a, unsupported.worker(), unsupported.authority(), identity.operation_id, 100, .{});
+    try std.testing.expect(unsupported.record.phase == .retired);
+    // Instantiate the shared allocation/routing owner on an empty cohort too.
+    var empty = try ExternalPreparation.init(a, .{ .ptr = &unfinished, .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined } }, &.{});
+    defer empty.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), empty.manifest.len);
 }

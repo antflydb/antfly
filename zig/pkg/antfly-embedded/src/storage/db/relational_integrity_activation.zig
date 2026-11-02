@@ -104,6 +104,44 @@ pub fn stageSchema(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catalog,
     if (previous == null or !std.mem.eql(u8, previous.?, encoded)) try txn.put(key, encoded);
 }
 
+/// Rebind only a proven subtractive successor. Incomplete coverage restarts at
+/// the first remaining phase; a cursor in a removed FK cannot prove UNIQUE
+/// coverage. Invalid coverage remains invalid until explicitly retried.
+fn carriedWithdrawalProgress(alloc: Allocator, before: catalog_mod.Catalog, after: catalog_mod.Catalog, owner: integrity.Digest, previous: ?[]const u8) !Progress {
+    try @import("relational_nullability_job.zig").Candidate.requireCatalogWithdrawal(alloc, before, after);
+    var next: Progress = .{ .generation_set = generationSet(after), .owner = owner, .schema_version = after.schema_version, .phase = firstPhase(after) };
+    if (previous) |bytes| {
+        const old = try Progress.decode(bytes);
+        if (old.matches(before, owner) and old.schema_version == before.schema_version) {
+            next.state = old.state;
+            next.failure = old.failure;
+            if (old.state == .enforced) next.rows_scanned = old.rows_scanned;
+        }
+    }
+    return next;
+}
+
+/// The authenticated retirement installer calls this inside the schema,
+/// catalog, installed-receipt and outbox transaction. A schema-only FK/default
+/// withdrawal must not invalidate existing UNIQUE proofs or rescan user rows.
+pub fn stageDependencyRetirement(alloc: Allocator, txn: anytype, predecessor: []const u8, catalog: catalog_mod.Catalog, binding: @import("relational_schema_owner_contract.zig").Binding) !void {
+    if (binding.purpose != .dependent_object_retirement or catalog.schema_version != binding.after_version or
+        !std.mem.eql(u8, &digest(predecessor), &binding.fence.catalog_digest)) return error.SchemaValidationJobChanged;
+    var before = try catalog_mod.decode(alloc, predecessor);
+    defer before.deinit();
+    if (before.schema_version != binding.before_version) return error.SchemaValidationJobChanged;
+    const owner = try ownership(txn);
+    if (!std.mem.eql(u8, &owner, &binding.owner)) return error.SchemaValidationJobChanged;
+    const next = try carriedWithdrawalProgress(alloc, before, catalog, owner, try optional(txn, key));
+    if (!hasActive(catalog)) {
+        try txn.delete(key);
+        return;
+    }
+    const bytes = try next.encode(alloc);
+    defer alloc.free(bytes);
+    try txn.put(key, bytes);
+}
+
 pub fn requireReady(txn: anytype, catalog: catalog_mod.Catalog) !void {
     if (!hasActive(catalog)) return;
     switch ((try status(txn, catalog)).state) {
@@ -512,6 +550,42 @@ test "relational integrity activation coverage binds generation owner phase and 
     try std.testing.expect(!decoded.matches(catalog.catalog, @splat(6)));
     bytes[bytes.len - 1] ^= 1;
     try std.testing.expectError(error.InvalidConstraintActivation, Progress.decode(bytes));
+}
+
+test "dependency retirement preserves proven coverage without promoting incomplete or stale owners" {
+    const a = std.testing.allocator;
+    const definitions = [_]catalog_mod.Definition{
+        .{ .kind = .unique, .name = "id", .fingerprint = @splat(3) },
+        .{ .kind = .foreign_key, .name = "parent", .fingerprint = @splat(4) },
+    };
+    var before = try catalog_mod.prepareWithChecks(a, null, @splat(1), 1, @splat(2), &definitions, @splat(9));
+    defer before.deinit();
+    var after = try catalog_mod.prepareWithChecks(a, before.value, @splat(1), 2, @splat(6), definitions[0..1], @splat(9));
+    defer after.deinit();
+    const owner: integrity.Digest = @splat(7);
+    for ([_]State{ .enforced, .invalid, .validating }) |state| {
+        const old: Progress = .{ .generation_set = generationSet(before.catalog), .owner = owner, .schema_version = 1, .state = state, .phase = .foreign_key, .rows_scanned = 11, .cursor = if (state == .enforced) "" else "row11", .failure = if (state == .invalid) "ForeignKeyParentMissing" else "" };
+        const bytes = try old.encode(a);
+        defer a.free(bytes);
+        const next = try carriedWithdrawalProgress(a, before.catalog, after.catalog, owner, bytes);
+        try std.testing.expect(next.matches(after.catalog, owner));
+        try std.testing.expectEqual(@as(u32, 2), next.schema_version);
+        try std.testing.expectEqual(state, next.state);
+        try std.testing.expectEqual(Phase.unique, next.phase);
+        try std.testing.expectEqualStrings("", next.cursor);
+        try std.testing.expectEqualStrings(old.failure, next.failure);
+        const changed_owner = try carriedWithdrawalProgress(a, before.catalog, after.catalog, @splat(8), bytes);
+        try std.testing.expectEqual(State.validating, changed_owner.state);
+        try std.testing.expectEqual(@as(u64, 0), changed_owner.rows_scanned);
+    }
+    const missing = try carriedWithdrawalProgress(a, before.catalog, after.catalog, owner, null);
+    try std.testing.expectEqual(State.validating, missing.state);
+    var unrelated = try catalog_mod.prepareWithChecks(a, before.value, @splat(1), 2, @splat(6), definitions[0..1], @splat(10));
+    defer unrelated.deinit();
+    try std.testing.expectError(error.InvalidSchemaValidationJob, carriedWithdrawalProgress(a, before.catalog, unrelated.catalog, owner, null));
+    var unique_removed = try catalog_mod.prepareWithChecks(a, before.value, @splat(1), 2, @splat(6), definitions[1..2], @splat(9));
+    defer unique_removed.deinit();
+    try std.testing.expectError(error.InvalidSchemaValidationJob, carriedWithdrawalProgress(a, before.catalog, unique_removed.catalog, owner, null));
 }
 
 test "relational index build pages activation preserves older enforced invalid and partial coverage" {

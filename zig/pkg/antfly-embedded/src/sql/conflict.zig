@@ -28,6 +28,7 @@ pub const Bound = struct {
     assignments: []const ?scalar.Program,
     // Dense target ordinals eliminate assignment-name scans for every row.
     column_assignments: []const ?usize,
+    domain_admission: ?@import("../schema/domain_row.zig").Admission = null,
     document_assignment: ?usize = null,
     required_cells: []const bool = &.{},
     deferred: []const ?Deferred = &.{},
@@ -188,6 +189,18 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
         }
     } else if (needsOldDocument(table, clause, result)) required[table.columns.len + 1] = true;
     result.required_cells = required;
+    const provenance = try @import("domain_mutation.zig").Builder.init(alloc, table, true);
+    if (provenance.inputs.len != 0) for (table.columns, column_assignments) |column, assigned| if (assigned) |index| {
+        const assignment = clause.assignments[index];
+        const source_view = if (assignments[index]) |program| program.output_type.domainView() else if (assignment.deferred_scalar)
+            scalar.domainViewOf(deferred[index].?.binding.columns[0])
+        else if (assignment.capture_ordinal) |ordinal|
+            scalar.domainViewOf(columns[count * 3 + ordinal])
+        else
+            null;
+        try provenance.set(column, source_view, assignment.use_default);
+    };
+    result.domain_admission = provenance.admission();
     return result;
 }
 
@@ -622,6 +635,8 @@ fn installPostimage(context: anytype, table: catalog.Table, clause: ast.Conflict
     }
     mutation.row = .{ .object = row };
     mutation.json_null_fields = nulls.items;
+    mutation.domain_admission = binding.domain_admission;
+    mutation.prepared_domain = null;
 }
 
 fn conflictArrayOwnershipScenario(backing: std.mem.Allocator) !void {

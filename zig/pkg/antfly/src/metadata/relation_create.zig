@@ -51,11 +51,13 @@ pub const Request = struct {
     candidate: records.TableRecord,
     /// Trusted compiler provenance, never a flag inside the public schema.
     generated_constraint_names: []const []const u8 = &.{},
+    creation_copy: ?@import("initial_creation_copy.zig").Input = null,
+    column_sequences: []const @import("antfly_local_sources").system_catalog_column_sequences.Creation = &.{},
 
     pub fn jsonStringify(self: Request, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Request).@"struct".field_names) |field_name| {
-            if ((!std.mem.eql(u8, field_name, "expected_view") or self.expected_view != null) and (!std.mem.eql(u8, field_name, "materialized_view") or self.materialized_view) and (!std.mem.eql(u8, field_name, "generated_constraint_names") or self.generated_constraint_names.len != 0) and (!std.mem.eql(u8, field_name, "physical_name") or self.physical_name != null)) {
+            if ((!std.mem.eql(u8, field_name, "creation_copy") or self.creation_copy != null) and (!std.mem.eql(u8, field_name, "column_sequences") or self.column_sequences.len != 0) and (!std.mem.eql(u8, field_name, "expected_view") or self.expected_view != null) and (!std.mem.eql(u8, field_name, "materialized_view") or self.materialized_view) and (!std.mem.eql(u8, field_name, "generated_constraint_names") or self.generated_constraint_names.len != 0) and (!std.mem.eql(u8, field_name, "physical_name") or self.physical_name != null)) {
                 try writer.objectField(field_name);
                 try writer.write(@field(self, field_name));
             }
@@ -78,6 +80,8 @@ pub const Prepared = struct {
     min_ranges_explicit: bool,
     child: records.TableRecord,
     child_ranges: []const records.RangeRecord,
+    copy_effects: ?@import("initial_creation_copy.zig").Effects = null,
+    counter_effects: ?@import("initial_column_sequences.zig").Effects = null,
     transition_generation: u64,
     metadata_incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation,
     metadata_epoch: u64,
@@ -86,7 +90,7 @@ pub const Prepared = struct {
     pub fn jsonStringify(self: Prepared, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Prepared).@"struct".field_names) |field_name| {
-            if ((!std.mem.eql(u8, field_name, "previous") or self.previous != null) and (!std.mem.eql(u8, field_name, "constraint_name_admission") or self.constraint_name_admission != null) and (!std.mem.eql(u8, field_name, "creation_guard") or self.creation_guard != null)) {
+            if ((!std.mem.eql(u8, field_name, "copy_effects") or self.copy_effects != null) and (!std.mem.eql(u8, field_name, "counter_effects") or self.counter_effects != null) and (!std.mem.eql(u8, field_name, "previous") or self.previous != null) and (!std.mem.eql(u8, field_name, "constraint_name_admission") or self.constraint_name_admission != null) and (!std.mem.eql(u8, field_name, "creation_guard") or self.creation_guard != null)) {
                 try writer.objectField(field_name);
                 try writer.write(@field(self, field_name));
             }
@@ -94,3 +98,22 @@ pub const Prepared = struct {
         try writer.endObject();
     }
 };
+
+/// Resolve only the self edge after metadata has reserved the candidate's
+/// physical identity. External edges have already been bound at DDL ingress.
+pub fn bindReservedSelf(alloc: std.mem.Allocator, schema_json: []const u8, logical_name: []const u8, physical_name: []const u8) ![]const u8 {
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, schema_json, .{ .allocate = .alloc_always, .parse_numbers = false });
+    if (value != .object) return error.InvalidGenerationPublication;
+    const fks = value.object.getPtr("foreign_keys") orelse return schema_json;
+    if (fks.* != .array) return error.InvalidGenerationPublication;
+    var changed = false;
+    for (fks.array.items) |*fk| {
+        if (fk.* != .object) return error.InvalidGenerationPublication;
+        const parent = fk.object.getPtr("parent_table") orelse return error.InvalidGenerationPublication;
+        if (parent.* != .string) return error.InvalidGenerationPublication;
+        if (!std.mem.eql(u8, parent.string, logical_name)) continue;
+        parent.* = .{ .string = physical_name };
+        changed = true;
+    }
+    return if (changed) try std.json.Stringify.valueAlloc(alloc, value, .{}) else schema_json;
+}

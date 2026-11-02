@@ -14,6 +14,10 @@
 // limitations under the License.
 
 test {
+    _ = @import("antfly_local_sources").system_catalog_privileges;
+    _ = @import("api/sql_statistics_cache.zig");
+    _ = @import("api/sql_persisted_expressions.zig");
+    _ = @import("antfly_local_sources").api_sql_maintenance_contract;
     _ = @import("sql/test_root.zig");
     _ = @import("sql/subquery_shape_test.zig");
     _ = @import("sql/joined_mutation_test.zig");
@@ -21,6 +25,7 @@ test {
     _ = @import("antfly_local_sources").storage_db_row_policy_bundle;
     _ = @import("antfly_local_sources").storage_db_table_catalog;
     _ = @import("antfly_local_sources").system_catalog_domain;
+    _ = @import("usermgr/mod.zig");
     // Keep SQL schema lowering and native uniqueness/conflict admission in
     // one qualification gate; the build selects the cross-layer contract.
     _ = @import("antfly_local_sources").api_relational_integrity;
@@ -32,6 +37,7 @@ test {
     _ = @import("antfly_local_sources").storage_portable_backup;
     _ = @import("antfly_local_sources").schema_relational_expression;
     _ = @import("antfly_local_sources").storage_db_relational_nullability;
+    _ = @import("antfly_local_sources").storage_db_relational_nullability_job;
     _ = @import("antfly_local_sources").storage_db_relational_predicate;
     _ = @import("antfly_local_sources").storage_db_relational_predicate_implication;
     _ = @import("antfly_local_sources").storage_db_relational_index_predicate;
@@ -39,3 +45,16 @@ test {
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+// Focused filters must discover these contracts without executing the unnamed
+// reachability test, just as the pgwire test root discovers its codec modules.
+comptime {
+    _ = @import("system_catalog/native_indexes.zig");
+    _ = @import("antfly_local_sources").storage_db_text_analysis_config;
+    _ = @import("metadata/column_sequence_handoff.zig");
+    _ = @import("metadata/schema_reader_wire.zig");
+    _ = @import("sql/trigger_contract_test.zig");
+    _ = @import("antfly_local_sources").sql_runtime;
+    _ = @import("antfly_local_sources").sql_typed_store;
+    _ = @import("antfly_local_sources").sql_catalog.routines.procedures;
+}

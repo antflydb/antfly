@@ -29,7 +29,7 @@ class SQLCatalogOperationReceipt:
     lost with an entire response. All identity integers are exact decimal strings.
 
         Attributes:
-            kind (SQLCatalogObjectKind): Native catalog resource kind; never a synthetic physical table.
+            kind (SQLCatalogObjectKind): Catalog object affected by an exact recoverable operation.
             operation (SQLCatalogOperationKind):
             database (str):
             namespace (str):

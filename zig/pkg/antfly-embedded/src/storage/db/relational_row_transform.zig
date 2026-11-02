@@ -36,6 +36,8 @@ pub const Policies = struct {
     dropped_columns: enum(u8) { reject, allow } = .reject,
     expression_schema: []const u8 = "",
     column_transforms: []const @import("relational_rewrite_contract.zig").ColumnTransform = &.{},
+    /// Metadata identity intent, independently verified against the row IR.
+    attribute_renames: []const @import("../../system_catalog/column_identities.zig").Rename = &.{},
 };
 
 /// Hard per-program/row ceilings supplement the scalar evaluator's shared
@@ -244,13 +246,7 @@ pub const Program = struct {
                 if (previous.column_type != column.column_type or previous.is_json != column.is_json or previous.json_kind != column.json_kind or previous.sql_element_type != column.sql_element_type or previous.named_type_id != column.named_type_id)
                     return error.RelationalRewriteTypeChange;
                 if (column.named_type_id) |id| {
-                    const left = schema.namedType(source.tableSchema().*, id) orelse return error.RelationalRewriteTypeChange;
-                    const right = schema.namedType(target.tableSchema().*, id) orelse return error.RelationalRewriteTypeChange;
-                    if (!std.mem.eql(u8, &left.identity.origin_id, &right.identity.origin_id)) return error.RelationalRewriteTypeChange;
-                    for (left.definition.labels) |label| {
-                        const candidate = right.definition.byId(label.id) catch return error.RelationalRewriteTypeChange;
-                        if (!std.mem.eql(u8, label.text, candidate.text) or !std.mem.eql(u8, label.order_key, candidate.order_key)) return error.RelationalRewriteTypeChange;
-                    }
+                    if (!((schema.sameNamedPhysicalType(source.tableSchema().*, target.tableSchema().*, id, true) catch return error.RelationalRewriteTypeChange))) return error.RelationalRewriteTypeChange;
                 }
             }
         }
@@ -432,7 +428,7 @@ pub const Program = struct {
         // physical checksum directory would push it over the output limit.
         encoded_bound = std.math.add(usize, encoded_bound, encoded_bound / 256 + 64) catch return error.RelationalRewriteBudgetExceeded;
         if (encoded_bound > max_row_bytes) return error.RelationalRewriteBudgetExceeded;
-        const semantic_hash = try content.hashRelationalCellsWithOrdinals(arena, cells, to, self.target.physicalLayout().hash_ordinals);
+        const semantic_hash = try content.hashRelationalCellsCanonicalWithLayout(arena, cells, to, self.target.physicalLayout().hash_ordinals, self.target.physicalLayout());
         const encoded = try codec.serializePreparedOrdinalDeferredHash(alloc, to.version, to.relational_columns, packed_cells[0..count], self.target.physicalLayout());
         errdefer alloc.free(encoded);
         if (encoded.len > max_row_bytes) return error.RelationalRewriteBudgetExceeded;

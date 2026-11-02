@@ -1,0 +1,89 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18 domain annotation, independent retirement and object-kind diagnostics",
+  "before": [
+    {
+      "sql": "CREATE DOMAIN usage_status AS text CHECK (VALUE IN ('queued','done'))",
+      "command_tag": "CREATE DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "COMMENT ON DOMAIN usage_status IS 'status domain';",
+      "id": "sql-0150",
+      "source_entry_sha256": "5a5df5ed96d43035df2867b21ee71cff505c01fe769113b39522a5ef3b90af57",
+      "command_tag": "COMMENT",
+      "notices": []
+    },
+    {
+      "sql": "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)",
+      "command_tag": "CREATE DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "DROP DOMAIN positive_amount",
+      "id": "sql-0309",
+      "source_entry_sha256": "740ed270e3c48a7b21c8da57467bd80463a6dcff0c46393c640b3f518763cbfa",
+      "command_tag": "DROP DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "DROP DOMAIN positive_amount",
+      "sqlstate": "42704",
+      "notices": []
+    },
+    {
+      "sql": "CREATE TYPE enum_wrong AS ENUM ('a')",
+      "command_tag": "CREATE TYPE",
+      "notices": []
+    },
+    {
+      "sql": "COMMENT ON DOMAIN enum_wrong IS 'wrong kind'",
+      "sqlstate": "42809",
+      "notices": []
+    },
+    {
+      "sql": "DROP DOMAIN enum_wrong",
+      "sqlstate": "42809",
+      "notices": []
+    }
+  ],
+  "cold": [
+    {
+      "sql": "COMMENT ON DOMAIN usage_status IS NULL",
+      "command_tag": "COMMENT",
+      "notices": []
+    },
+    {
+      "sql": "COMMENT ON DOMAIN usage_status IS 'status domain'",
+      "command_tag": "COMMENT",
+      "notices": []
+    }
+  ],
+  "after": [
+    {
+      "sql": "DROP DOMAIN usage_status",
+      "command_tag": "DROP DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "CREATE DOMAIN usage_status AS text",
+      "command_tag": "CREATE DOMAIN",
+      "notices": []
+    },
+    {
+      "sql": "COMMENT ON TYPE usage_status IS 'type annotation'",
+      "command_tag": "COMMENT",
+      "notices": []
+    },
+    {
+      "sql": "DROP TYPE usage_status",
+      "command_tag": "DROP TYPE",
+      "notices": []
+    },
+    {
+      "sql": "DROP TYPE enum_wrong",
+      "command_tag": "DROP TYPE",
+      "notices": []
+    }
+  ]
+}

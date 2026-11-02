@@ -6910,6 +6910,12 @@ pub const MetadataAdminVoprSource = struct {
             // newly added Call remains visible to exhaustive compilation.
             .lake_index_lifecycle_read,
             .sql_view_mutate,
+            .sql_prepared_read,
+            .sql_prepared_mutate,
+            .sql_prepared_outcome,
+            .sql_authorization_read,
+            .sql_authorization_mutate,
+            .sql_authorization_outcome,
             .sql_type_mutate,
             .sql_type_snapshot,
             .sql_type_bindings,

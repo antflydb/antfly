@@ -74,7 +74,7 @@ pub fn parameterDescriptorsLeaky(server: *http.ApiHttpServer, a: A, identity: ?h
     if (oids.len != 0 and oids.len != input.len) return error.InvalidSqlParameters;
     var ids: std.ArrayList(u64) = .empty;
     for (input, 0..) |descriptor, ordinal| {
-        const id: ?u64 = if (descriptor.enum_view) |view| view.record.identity.id else if (descriptor.enum_reference) |reference| reference.id else if (oids.len != 0 and oids[ordinal] >= 16386) candidate: {
+        const id: ?u64 = if (descriptor.domainView()) |view| view.identity.?.id else if (descriptor.domainReference()) |reference| reference.id else if (descriptor.enum_view) |view| view.record.identity.id else if (descriptor.enum_reference) |reference| reference.id else if (oids.len != 0 and oids[ordinal] >= 16386) candidate: {
             if (oids[ordinal] % 2 != 0) return error.UnsupportedParameterType;
             break :candidate (oids[ordinal] - 16384) / 2;
         } else null;
@@ -91,17 +91,27 @@ pub fn parameterDescriptorsLeaky(server: *http.ApiHttpServer, a: A, identity: ?h
     }
     ids.items.len = unique;
     const records = try recordsForIdsLeaky(server, a, identity, context, ids.items);
-    var views: std.AutoHashMapUnmanaged(u64, *const local.sql_catalog.enum_values.View) = .empty;
-    for (records) |record| {
-        const view = try a.create(local.sql_catalog.enum_values.View);
-        view.* = try local.sql_catalog.enum_values.View.init(a, record);
-        try views.put(a, record.identity.id, view);
-    }
+    const domains = try a.create(local.sql_catalog.domain_values.Registry);
+    domains.* = try local.sql_catalog.domain_values.Registry.init(a, records);
     const result = try a.dupe(local.sql_scalar.Type, input);
     for (result, 0..) |*descriptor, ordinal| {
-        const reference: ?local.sql_scalar.EnumReference = if (descriptor.enum_reference) |value| value.* else if (descriptor.enum_view) |view| .{ .id = view.record.identity.id, .origin_id = view.record.identity.origin_id, .generation = view.record.identity.generation } else null;
+        const reference: ?local.sql_scalar.EnumReference = if (descriptor.domainView()) |view| local.sql_scalar.referenceOf(view) else if (descriptor.domainReference()) |value| .{ .id = value.id, .origin_id = value.origin_id, .generation = value.generation } else if (descriptor.enum_reference) |value| value.* else if (descriptor.enum_view) |view| .{ .id = view.record.identity.id, .origin_id = view.record.identity.origin_id, .generation = view.record.identity.generation } else null;
         const id = if (reference) |value| value.id else if (oids.len != 0 and oids[ordinal] >= 16386) @as(u64, (oids[ordinal] - 16384) / 2) else continue;
-        const view = views.get(id) orelse return error.SqlTypeNotFound;
+        const entry = domains.byId(id) orelse return error.SqlTypeNotFound;
+        if (entry.record.definition == .domain) {
+            const view = &entry.executable.?.domain;
+            const current = view.identity.?;
+            if (reference) |expected| if (expected.generation != current.generation or !std.mem.eql(u8, &expected.origin_id, &current.origin_id)) return error.CatalogGenerationChanged;
+            if (oids.len != 0 and oids[ordinal] != 0 and oids[ordinal] != current.oid) return error.InvalidSqlParameters;
+            const resolved = try local.sql_scalar.domainType(view);
+            // The catalog owns the physical layout; client metadata cannot
+            // substitute a different base decoder under a valid domain ID.
+            if (reference != null and (descriptor.kind != resolved.kind or descriptor.element_type != resolved.element_type or !local.sql_scalar.NumericModifier.eql(descriptor.numeric_modifier, resolved.numeric_modifier))) return error.InvalidSqlParameters;
+            descriptor.* = resolved;
+            continue;
+        }
+        if (descriptor.domainView() != null or descriptor.domainReference() != null) return error.CatalogGenerationChanged;
+        const view = &entry.executable.?.enumeration;
         if (reference) |expected| if (!std.mem.eql(u8, &expected.origin_id, &view.record.identity.origin_id) or view.record.identity.generation < expected.generation) return error.CatalogGenerationChanged;
         if (oids.len != 0 and oids[ordinal] != 0 and oids[ordinal] != view.record.identity.oid) return error.InvalidSqlParameters;
         descriptor.kind = .enumeration;
@@ -237,6 +247,34 @@ test "SQL named enum schema ingress authorizes one catalog cut and preserves ord
     var create = try @import("table_contract.zig").parseCreateTableRequest(a, bound_body);
     defer create.deinit(a);
     try std.testing.expect(create.schema_json != null);
+    {
+        const original = state.record.definition;
+        defer state.record.definition = original;
+        state.record.definition = .{ .domain = .{ .base = .{ .builtin = .text }, .not_null = true } };
+        const domain_input = try std.mem.replaceOwned(u8, a, input, "sql_enum", "text");
+        defer a.free(domain_input);
+        const domain_schema = (try bindSchemaAlloc(&server, a, actor, .{}, domain_input)).?;
+        defer a.free(domain_schema);
+        var domain_validator = try local.schema_mod.CompiledTableValidator.init(a, domain_schema);
+        defer domain_validator.deinit(a);
+        try std.testing.expect(domain_validator.execution.domains != null);
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        const arena = region.allocator();
+        const declared = try parameterDescriptorsLeaky(&server, arena, actor, .{}, &.{ .{}, .{} }, &.{ state.record.identity.oid, state.record.identity.oid });
+        try std.testing.expect(declared[0].domainView() != null);
+        try std.testing.expect(declared[0].domainView() == declared[1].domainView());
+        try std.testing.expectError(error.SqlNotNullViolation, local.sql_parameter_frame.Frame.prepare(a, declared, &.{ .{ .datum = .{} }, .{ .datum = .{} } }, .{}));
+        const bytes = try std.json.Stringify.valueAlloc(arena, declared, .{});
+        const references = try std.json.parseFromSliceLeaky([]const local.sql_scalar.Type, arena, bytes, .{});
+        try std.testing.expect(references[0].domainView() == null);
+        try std.testing.expect(references[0].domainReference() != null);
+        const rebound = try parameterDescriptorsLeaky(&server, arena, actor, .{}, references, &.{});
+        try std.testing.expectEqual(state.record.identity.id, rebound[0].domainView().?.identity.?.id);
+        state.record.identity.generation += 1;
+        defer state.record.identity.generation -= 1;
+        try std.testing.expectError(error.CatalogGenerationChanged, parameterDescriptorsLeaky(&server, arena, actor, .{}, references, &.{}));
+    }
     const Check = struct {
         fn run(alloc: A, api: *http.ApiHttpServer, identity: http.AuthenticatedIdentity, schema: []const u8) !void {
             const result = (try bindSchemaAlloc(api, alloc, identity, .{}, schema)).?;
@@ -244,4 +282,167 @@ test "SQL named enum schema ingress authorizes one catalog cut and preserves ord
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ &server, actor, input });
+}
+
+/// One request-owned catalog cut binds all declared columns. The directory and
+/// executable views are deduplicated by immutable identity; ordinary builtin
+/// declarations never allocate or make a type lookup.
+pub fn bindDeclaredColumns(raw: *anyopaque, a: A, create: local.sql_ast.CreateTable) !local.sql_ast.CreateTable {
+    const execution = @import("sql_execution.zig");
+    const root: *execution.Adapter = @ptrCast(@alignCast(raw));
+    try root.context.ensureActive();
+    if (!root.server.source.vtable.supports_sql_types) return error.UnsupportedSqlExecution;
+    if (root.server.cfg.auth_enabled and root.identity.* == null) return error.Forbidden;
+    var names: std.ArrayList([]const local.system_catalog_domain.Target) = .empty;
+    const ordinals = try a.alloc(?usize, create.columns.len);
+    @memset(ordinals, null);
+    var keys: std.StringHashMapUnmanaged(usize) = .empty;
+    for (create.columns, ordinals) |column, *ordinal| if (column.named_type) |intent| {
+        const path = @import("sql_routine_execution.zig").targets(root, a, intent) catch |err| switch (err) {
+            error.SqlUndefinedFunction => return error.SqlNamedTypeNotFound,
+            else => return err,
+        };
+        const key = try std.json.Stringify.valueAlloc(a, path, .{});
+        const slot = try keys.getOrPut(a, key);
+        if (!slot.found_existing) {
+            slot.value_ptr.* = names.items.len;
+            try names.append(a, path);
+        }
+        ordinal.* = slot.value_ptr.*;
+    };
+    if (names.items.len == 0) return create;
+    const request: types.BindingsRequest = .{ .names = names.items, .expected_revision = root.revision };
+    try request.validate();
+    var private = root.context;
+    private.setting_admin = true;
+    const bytes = try root.server.source.systemCatalog(a, private, .{ .sql_type_bindings = request });
+    const cut = try std.json.parseFromSliceLeaky(types.BindingsSnapshot, a, bytes, .{ .allocate = .alloc_always });
+    try cut.validate(a, request);
+    root.revision = cut.revision;
+    const records = try a.alloc(types.records.Record, cut.directory.len);
+    for (cut.directory, records) |entry, *record| {
+        if (!try auth.namespaceUsage(root.identity.*, a, entry.target)) return error.Forbidden;
+        record.* = entry.record;
+    }
+    const registry = try a.create(local.sql_catalog.domain_values.Registry);
+    registry.* = try local.sql_catalog.domain_values.Registry.init(a, records);
+    var result = create;
+    const columns = try a.dupe(local.sql_ast.Column, create.columns);
+    for (columns, ordinals) |*column, ordinal| if (ordinal) |position| {
+        const index = cut.named[position] orelse return error.SqlNamedTypeNotFound;
+        const entry = registry.byId(cut.directory[index].record.identity.id) orelse return error.InvalidSqlBackendResponse;
+        switch (entry.executable.?) {
+            .enumeration => |*view| column.enum_view = view,
+            .domain => |*view| {
+                const physical = try local.sql_scalar.domainType(view);
+                column.domain_view = view;
+                column.type = physical.kind orelse return error.InvalidSqlBackendResponse;
+                column.element_type = physical.element_type;
+                column.numeric_modifier = physical.numeric_modifier;
+                column.enum_view = physical.enum_view;
+            },
+        }
+    };
+    result.columns = columns;
+    return result;
+}
+
+/// Type lookup is preparation work, shared by the statement invocation. Prepared
+/// resources carry a durable identity witness; subsequent execution never
+/// resolves the old spelling to a new object or trusts client-supplied OIDs.
+pub fn bindCast(raw: *anyopaque, a: A, intent: local.sql_ast.Name) !local.sql_scalar.Type {
+    const root: *@import("sql_execution.zig").Adapter = @ptrCast(@alignCast(raw));
+    try root.context.ensureActive();
+    if (root.server.cfg.auth_enabled and root.identity.* == null) return error.Forbidden;
+    if (builtinNamedType(intent)) |builtin| return builtin;
+    const lookup = try std.json.Stringify.valueAlloc(a, intent, .{});
+    var pinned: ?@import("sql_prepared.zig").Binding = null;
+    if (root.prepared_bindings) |bindings| {
+        for (bindings) |binding| {
+            if (binding.kind != .named_type) continue;
+            const witness = binding.named_type orelse return error.InvalidSqlBackendResponse;
+            if (!std.mem.eql(u8, witness.lookup, lookup)) continue;
+            if (pinned != null) return error.InvalidSqlBackendResponse;
+            pinned = binding;
+        }
+        if (pinned == null) return error.CatalogGenerationChanged;
+    }
+    const request: types.SnapshotRequest = if (pinned) |binding| .{
+        .targets = &.{},
+        .reference = .{ .id = binding.id, .namespace_id = binding.named_type.?.namespace_id },
+        .expected_revision = root.revision,
+    } else .{
+        .targets = @import("sql_routine_execution.zig").targets(root, a, intent) catch |err| switch (err) {
+            error.SqlUndefinedFunction => return error.SqlNamedTypeNotFound,
+            else => return err,
+        },
+        .expected_revision = root.revision,
+    };
+    var private = root.context;
+    private.setting_admin = true;
+    const bytes = try root.server.source.systemCatalog(a, private, .{ .sql_type_snapshot = request });
+    const cut = try std.json.parseFromSliceLeaky(types.Snapshot, a, bytes, .{ .allocate = .alloc_always });
+    try cut.validate(a, request);
+    const found = cut.found orelse return error.SqlNamedTypeNotFound;
+    const scope = cut.scopes[found.scope];
+    if (!try auth.namespaceUsage(root.identity.*, a, scope.target)) return error.Forbidden;
+    if (pinned) |binding| {
+        const witness = binding.named_type.?;
+        if (binding.id != found.record.identity.id or binding.schema_version > found.record.identity.generation or
+            !std.mem.eql(u8, &witness.incarnation, &cut.incarnation) or
+            !std.mem.eql(u8, &witness.origin_id, &found.record.identity.origin_id)) return error.CatalogGenerationChanged;
+    }
+    root.revision = cut.revision;
+    if (root.collect_prepared_bindings) |bindings| try bindings.append(a, .{
+        .kind = .named_type,
+        .named_type = .{ .lookup = lookup, .incarnation = cut.incarnation, .namespace_id = found.record.identity.namespace_id, .origin_id = found.record.identity.origin_id },
+        .database = scope.target.database,
+        .namespace = scope.target.namespace,
+        .name = scope.target.table,
+        .physical_name = "",
+        .id = found.record.identity.id,
+        .schema_version = found.record.identity.generation,
+        .revision = cut.revision,
+    });
+    if (found.record.definition == .domain) {
+        if (pinned) |binding| if (binding.schema_version != found.record.identity.generation) return error.CatalogGenerationChanged;
+        const registry = try a.create(local.sql_catalog.domain_values.Registry);
+        registry.* = try local.sql_catalog.domain_values.Registry.init(a, &.{found.record});
+        return local.sql_scalar.domainType(&registry.byId(found.record.identity.id).?.executable.?.domain);
+    }
+    const view = try a.create(local.sql_catalog.enum_values.View);
+    view.* = try local.sql_catalog.enum_values.View.init(a, found.record);
+    return .{ .kind = .enumeration, .enum_view = view };
+}
+
+/// Quoting selects PostgreSQL's actual catalog name, not SQL alias syntax.
+/// Unquoted aliases continue through the parser's ordinary builtin path.
+fn builtinNamedType(intent: local.sql_ast.Name) ?local.sql_scalar.Type {
+    if (intent.database != null or (intent.namespace != null and !std.mem.eql(u8, intent.namespace.?, "pg_catalog"))) return null;
+    const scalar = local.sql_scalar;
+    const pairs = .{
+        .{ "text", scalar.Type{ .kind = .string, .element_type = .text } },
+        .{ "uuid", scalar.Type{ .kind = .uuid, .element_type = .uuid } },
+        .{ "int2", scalar.Type{ .kind = .integer, .element_type = .int16 } },
+        .{ "int4", scalar.Type{ .kind = .integer, .element_type = .int32 } },
+        .{ "int8", scalar.Type{ .kind = .integer, .element_type = .int64 } },
+        .{ "float4", scalar.Type{ .kind = .number, .element_type = .float32 } },
+        .{ "float8", scalar.Type{ .kind = .number, .element_type = .float64 } },
+        .{ "numeric", scalar.Type{ .kind = .number, .element_type = .numeric } },
+        .{ "bool", scalar.Type{ .kind = .boolean, .element_type = .boolean } },
+        .{ "jsonb", scalar.Type{ .kind = .json, .element_type = .jsonb } },
+        .{ "json", scalar.Type{ .kind = .json } },
+        .{ "date", scalar.Type{ .kind = .datetime, .temporal_kind = .date } },
+        .{ "timestamp", scalar.Type{ .kind = .datetime, .temporal_kind = .timestamp } },
+        .{ "timestamptz", scalar.Type{ .kind = .datetime, .temporal_kind = .timestamp_tz } },
+        .{ "time", scalar.Type{ .kind = .datetime, .temporal_kind = .time } },
+        .{ "timetz", scalar.Type{ .kind = .datetime, .temporal_kind = .time_tz } },
+        .{ "interval", scalar.Type{ .kind = .datetime, .temporal_kind = .interval } },
+        .{ "numrange", scalar.Type{ .kind = .numrange } },
+        .{ "daterange", scalar.Type{ .kind = .daterange } },
+        .{ "tsrange", scalar.Type{ .kind = .tsrange } },
+        .{ "tstzrange", scalar.Type{ .kind = .tstzrange } },
+    };
+    inline for (pairs) |pair| if (std.mem.eql(u8, intent.table, pair[0])) return pair[1];
+    return null;
 }

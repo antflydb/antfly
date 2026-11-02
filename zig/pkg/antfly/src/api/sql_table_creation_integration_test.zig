@@ -343,3 +343,602 @@ test "mounted SQL original generated and casted tables own creation enforcement 
     // schemas through the DB API or weaken their declared primary keys.
     try fixture.run(Campaign);
 }
+
+const DefinitionCopyCampaign = struct {
+    pub const native_sessions = true;
+    pub const native_auth = true;
+    pub const cold_catalog = true;
+    copied: Owner = undefined,
+    source: Owner = undefined,
+
+    pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
+        const users = @import("../usermgr/mod.zig");
+        inline for (.{ users.ResourceType.user, users.ResourceType.database, users.ResourceType.namespace }) |kind| {
+            var permission = try users.Permission.initOwned(manager.alloc, kind, "*", .admin);
+            defer permission.deinit(manager.alloc);
+            try manager.addPermissionToUser("pk-rewriter", permission);
+        }
+        try manager.removePermissionFromUser("pk-reader", "*", .table);
+        var namespace = try users.Permission.initOwned(manager.alloc, .namespace, "default.public", .read);
+        defer namespace.deinit(manager.alloc);
+        try manager.addPermissionToUser("pk-reader", namespace);
+        for ([_][]const u8{ "reader_copy", "denied_copy", "reader_identity_copy", "reader_borrowed_copy" }) |name| {
+            var permission = try users.Permission.initOwned(manager.alloc, .table, name, .admin);
+            defer permission.deinit(manager.alloc);
+            try manager.addPermissionToUser("pk-reader", permission);
+        }
+    }
+
+    fn create(ctx: *fixture.Context, sql: []const u8) !void {
+        var response = try client.execute(ctx, sql, .write_admission);
+        defer response.deinit(ctx.alloc);
+        errdefer std.debug.print("LIKE creation status={d} sql={s} body={s}\n", .{ response.status, sql, response.body });
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+    }
+    fn truncateShared(ctx: *fixture.Context, name: []const u8) !void {
+        const statement = try std.fmt.allocPrint(ctx.alloc, "TRUNCATE {s} RESTART IDENTITY", .{name});
+        defer ctx.alloc.free(statement);
+        try replaceShared(ctx, name, statement);
+        try expectColumnComment(ctx, name, "n", if (std.mem.eql(u8, name, "shared_source")) "source current" else "shared original");
+        try primaryAnnotations(ctx, name, false);
+    }
+
+    fn replaceShared(ctx: *fixture.Context, name: []const u8, statement: []const u8) !void {
+        const before = try fixture.waitServingSchema(ctx, name, 0);
+        var coordinator = ctx.*;
+        coordinator.base = ctx.metadata_uri;
+        var response = try client.execute(&coordinator, statement, .write_admission);
+        defer response.deinit(ctx.alloc);
+        errdefer std.debug.print("shared default TRUNCATE table={s} status={d} body={s}\n", .{ name, response.status, response.body });
+        try std.testing.expect(response.status == 200 or response.status == 202 or response.status == 409);
+        var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        const receipt = parsed.value.ddl_receipt orelse return error.SharedTruncateReceiptMissing;
+        if (receipt.restore_job_id) |job_id| {
+            const deadline = platform.time.monotonicNs() +| 60 * std.time.ns_per_s;
+            while (true) {
+                try ctx.checkDrivers();
+                var observed = try fixture.job(ctx.alloc, ctx.transport, ctx.headers, ctx.metadata_uri, job_id);
+                defer observed.deinit(ctx.alloc);
+                if (observed.status != 200) return error.SharedTruncateStatusUnavailable;
+                var job = try std.json.parseFromSlice(wire.RestoreJob, ctx.alloc, observed.body, .{ .ignore_unknown_fields = true });
+                defer job.deinit();
+                if (std.mem.eql(u8, job.value.phase, "succeeded")) break;
+                if (std.mem.eql(u8, job.value.phase, "failed") or std.mem.eql(u8, job.value.phase, "canceled")) {
+                    std.debug.print("shared default TRUNCATE failed table={s} body={s}\n", .{ name, observed.body });
+                    return error.SharedTruncateFailed;
+                }
+                if (platform.time.monotonicNs() >= deadline) return error.SharedTruncateTimeout;
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+            }
+        }
+        const after = try fixture.waitServingSchema(ctx, name, 0);
+        try std.testing.expect(before.table_id != after.table_id);
+        try ready(ctx, name, .{ .id = after.table_id, .version = after.version });
+    }
+
+    fn primaryAnnotations(ctx: *fixture.Context, name: []const u8, write: bool) !void {
+        return primaryAnnotationsFrom(ctx, name, name, write);
+    }
+
+    fn primaryAnnotationsFrom(ctx: *fixture.Context, name: []const u8, source: []const u8, write: bool) !void {
+        const domain = local.system_catalog_domain;
+        var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const captured = (try @import("sql_catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = name }, false, null)) orelse return error.MissingCopiedRelation;
+        const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+        const table = (try store.getTable(a, ctx.metadata.server.svc.metadata_group_id, captured.guard.owner.table_id)) orelse return error.MissingCopiedRelation;
+        const schema = try std.json.parseFromSliceLeaky(std.json.Value, a, table.schema_json, .{});
+        const declarations = schema.object.get("unique_constraints") orelse return error.MissingPrimaryDeclaration;
+        const primary = for (declarations.array.items) |declaration| {
+            const flag = declaration.object.get("primary") orelse continue;
+            if (flag == .bool and flag.bool) break declaration.object.get("name").?.string;
+        } else return error.MissingPrimaryDeclaration;
+        for ([_]domain.object_annotations.Kind{ .index, .constraint }) |kind| {
+            const expected = try std.fmt.allocPrint(a, "{s} primary {s} Ω", .{ source, @tagName(kind) });
+            if (write) {
+                const quoted = try std.mem.replaceOwned(u8, a, primary, "\"", "\"\"");
+                const statement = if (kind == .index)
+                    try std.fmt.allocPrint(a, "COMMENT ON INDEX \"{s}\" IS '{s}'", .{ quoted, expected })
+                else
+                    try std.fmt.allocPrint(a, "COMMENT ON CONSTRAINT \"{s}\" ON \"{s}\" IS '{s}'", .{ quoted, name, expected });
+                try command(ctx, statement);
+            }
+            const bytes = try store.getSqlObjectAnnotation(a, ctx.metadata.server.svc.metadata_group_id, .{ .guard = captured.guard, .key = .{ .kind = kind, .name = primary } });
+            const note = try std.json.parseFromSliceLeaky(domain.object_annotation_store.Snapshot, a, bytes, .{});
+            if (!write and !std.mem.eql(u8, source, name) and kind == .constraint) {
+                try std.testing.expect(note.annotation == null);
+            } else try std.testing.expectEqualStrings(expected, note.annotation.?.description.?);
+        }
+    }
+
+    fn expectComment(ctx: *fixture.Context, name: []const u8, expected: ?[]const u8) !void {
+        return expectColumnComment(ctx, name, "status", expected);
+    }
+
+    fn expectColumnComment(ctx: *fixture.Context, name: []const u8, column_name: []const u8, expected: ?[]const u8) !void {
+        var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const captured = (try @import("sql_catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = name }, false, null)) orelse return error.MissingCopiedRelation;
+        const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+        var attributes = try store.getSqlColumnIdentities(a, ctx.metadata.server.svc.metadata_group_id, captured.guard);
+        defer attributes.deinit();
+        const column = for (attributes.value.columns) |column| {
+            if (std.mem.eql(u8, column.name, column_name)) break column;
+        } else return error.MissingCopiedColumn;
+        if (expected) |value| try std.testing.expectEqualStrings(value, column.description.?) else try std.testing.expect(column.description == null);
+    }
+
+    fn rows(ctx: *fixture.Context) !void {
+        try expectComment(ctx, "usage_records_copy", "source status");
+        try expectComment(ctx, "mixed_copy", "source status");
+        try expectComment(ctx, "no_comments_copy", null);
+        try expectRows(ctx, "SELECT id::text AS id,status FROM usage_records_copy ORDER BY id", &.{ "id", "status" }, &.{
+            &.{ "00000000-0000-0000-0000-000000000009", "retained" },
+            &.{ "00000000-0000-0000-0000-000000000010", "queued" },
+        });
+        try expectRows(ctx, "SELECT prefix,id::text AS id,status,suffix FROM mixed_copy", &.{ "prefix", "id", "status", "suffix" }, &.{&.{ null, "00000000-0000-0000-0000-000000000011", "queued", "done" }});
+        try expectRows(ctx, "SELECT id::text AS id,status FROM policy_copy", &.{ "id", "status" }, &.{&.{ "00000000-0000-0000-0000-000000000012", "queued" }});
+        try expectRows(ctx, "SELECT prefix,id::text AS id,status,middle::text AS middle,payload,tail::text AS tail FROM ordered_copy", &.{ "prefix", "id", "status", "middle", "payload", "tail" }, &.{&.{ null, "00000000-0000-0000-0000-000000000015", "queued", null, "payload", null }});
+    }
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        ctx.headers = ctx.admin_headers;
+        try waitNamingPublication(ctx, "usage_records");
+        try create(ctx, "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text NOT NULL DEFAULT 'queued', CONSTRAINT status_nonempty CHECK (length(status)>0))");
+        self.source = try owner(ctx, "usage_records");
+        try ready(ctx, "usage_records", self.source);
+        try command(ctx, "COMMENT ON COLUMN usage_records.status IS 'source status'");
+        try command(ctx, "INSERT INTO usage_records VALUES ('00000000-0000-0000-0000-000000000001','closed')");
+        // Copied definitions/notes join the existing hidden FK publication.
+        try primaryAnnotations(ctx, "usage_records", true);
+        try create(ctx, "CREATE TABLE fk_copy_parent(id UUID PRIMARY KEY)");
+        const parent = try owner(ctx, "fk_copy_parent");
+        try ready(ctx, "fk_copy_parent", parent);
+        try command(ctx, "INSERT INTO fk_copy_parent VALUES ('00000000-0000-0000-0000-000000000001'),('00000000-0000-0000-0000-000000000002')");
+        try CopyLifetimeCampaign.createSource(ctx, "CREATE TABLE fk_usage_copy (LIKE usage_records INCLUDING ALL, FOREIGN KEY(id) REFERENCES fk_copy_parent(id))");
+        const fk_copy = try owner(ctx, "fk_usage_copy");
+        try ready(ctx, "fk_usage_copy", fk_copy);
+        try primaryAnnotationsFrom(ctx, "fk_usage_copy", "usage_records", false);
+        try expectColumnComment(ctx, "fk_usage_copy", "status", "source status");
+        try command(ctx, "INSERT INTO fk_usage_copy(id) VALUES ('00000000-0000-0000-0000-000000000001')");
+        try rejected(ctx, "INSERT INTO fk_usage_copy(id) VALUES ('00000000-0000-0000-0000-000000000099')", "23503");
+        try rejected(ctx, "INSERT INTO fk_usage_copy(id) VALUES ('00000000-0000-0000-0000-000000000001')", "23505");
+        try rejected(ctx, "INSERT INTO fk_usage_copy(id,status) VALUES ('00000000-0000-0000-0000-000000000002','')", "23514");
+
+        var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+        defer corpus.deinit();
+        const original = try corpus.get("sql-0369");
+        try std.testing.expectEqualStrings("CREATE TABLE usage_records_copy (LIKE usage_records INCLUDING ALL)", original.sql);
+        try create(ctx, original.sql);
+        self.copied = try owner(ctx, "usage_records_copy");
+        try std.testing.expect(self.source.id != self.copied.id);
+        try ready(ctx, "usage_records_copy", self.copied);
+
+        try expectRows(ctx, "SELECT id::text AS id,status FROM usage_records_copy", &.{ "id", "status" }, &.{});
+        try command(ctx, "INSERT INTO usage_records_copy VALUES ('00000000-0000-0000-0000-000000000009','retained')");
+        try command(ctx, "INSERT INTO usage_records_copy(id) VALUES ('00000000-0000-0000-0000-000000000010')");
+        try rejected(ctx, "INSERT INTO usage_records_copy VALUES ('00000000-0000-0000-0000-000000000009','duplicate')", "23505");
+        try rejected(ctx, "INSERT INTO usage_records_copy VALUES ('00000000-0000-0000-0000-000000000013','')", "23514");
+        try rejected(ctx, "INSERT INTO usage_records_copy VALUES ('00000000-0000-0000-0000-000000000013',NULL)", "23502");
+        try create(ctx, "CREATE TABLE IF NOT EXISTS usage_records_copy (LIKE missing_source INCLUDING ALL)");
+        try std.testing.expectEqualDeep(self.copied, try owner(ctx, "usage_records_copy"));
+        try create(ctx, "CREATE TABLE mixed_copy (prefix text, LIKE usage_records INCLUDING ALL EXCLUDING INDEXES, suffix text DEFAULT 'done')");
+        const mixed = try fixture.waitServingSchema(ctx, "mixed_copy", 0);
+        try ready(ctx, "mixed_copy", .{ .id = mixed.table_id, .version = mixed.version });
+        try command(ctx, "INSERT INTO mixed_copy(id) VALUES ('00000000-0000-0000-0000-000000000011')");
+        try create(ctx, "CREATE TABLE no_comments_copy (LIKE usage_records EXCLUDING ALL)");
+        const without_comments = try fixture.waitServingSchema(ctx, "no_comments_copy", 0);
+        try ready(ctx, "no_comments_copy", .{ .id = without_comments.table_id, .version = without_comments.version });
+        try create(ctx, "CREATE POLICY hidden_rows ON usage_records USING (false)");
+        try create(ctx, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY");
+        _ = try @import("sql_policy_lifecycle_integration_test.zig").waitPublication(ctx, self.source.id, .active, 0);
+        try expectRows(ctx, "SELECT id::text AS id,status FROM usage_records", &.{ "id", "status" }, &.{});
+        try create(ctx, "CREATE TABLE policy_copy (LIKE usage_records INCLUDING ALL)");
+        const policy = try owner(ctx, "policy_copy");
+        try ready(ctx, "policy_copy", policy);
+        try command(ctx, "INSERT INTO policy_copy(id) VALUES ('00000000-0000-0000-0000-000000000012')");
+        try create(ctx, "CREATE TABLE right_definition(payload text DEFAULT 'payload')");
+        _ = try fixture.waitServingSchema(ctx, "right_definition", 0);
+        try command(ctx, "INSERT INTO right_definition VALUES ('not copied')");
+        try command(ctx, "COMMENT ON COLUMN right_definition.payload IS 'payload source'");
+        try create(ctx, "CREATE TABLE ordered_copy(prefix text, LIKE usage_records INCLUDING ALL EXCLUDING INDEXES, middle int, LIKE right_definition INCLUDING DEFAULTS, tail jsonb)");
+        const ordered = try fixture.waitServingSchema(ctx, "ordered_copy", 0);
+        try ready(ctx, "ordered_copy", .{ .id = ordered.table_id, .version = ordered.version });
+        var order_response = try client.execute(ctx, "SELECT * FROM ordered_copy LIMIT 0", .read);
+        defer order_response.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), order_response.status);
+        var order = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, order_response.body, .{});
+        defer order.deinit();
+        const labels = [_][]const u8{ "prefix", "id", "status", "middle", "payload", "tail" };
+        try std.testing.expectEqual(labels.len, order.value.columns.len);
+        for (labels, order.value.columns) |label, column| try std.testing.expectEqualStrings(label, column.name);
+        try command(ctx, "INSERT INTO ordered_copy(id) VALUES ('00000000-0000-0000-0000-000000000015')");
+        try create(ctx, "CREATE ROLE definition_reader");
+        try create(ctx, "GRANT SELECT ON usage_records TO definition_reader");
+        try create(ctx, "GRANT definition_reader TO \"pk-reader\"");
+        var reader = ctx.*;
+        reader.headers = ctx.reader_headers;
+        try expectRows(&reader, "SELECT id::text AS id,status FROM usage_records", &.{ "id", "status" }, &.{});
+        try create(&reader, "CREATE TABLE reader_copy (LIKE usage_records INCLUDING ALL)");
+        const read_copy = try owner(ctx, "reader_copy");
+        try ready(ctx, "reader_copy", read_copy);
+        try command(ctx, "INSERT INTO reader_copy(id) VALUES ('00000000-0000-0000-0000-000000000014')");
+        try create(ctx, "CREATE TABLE identity_source(id BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 42 INCREMENT BY 3), quantity INT DEFAULT 4, doubled INT GENERATED ALWAYS AS (quantity * 2) STORED)");
+        _ = try fixture.waitServingSchema(ctx, "identity_source", 0);
+        try command(ctx, "INSERT INTO identity_source(quantity) VALUES (2)");
+        try command(ctx, "ALTER SEQUENCE identity_source_id_seq AS SMALLINT");
+        try create(ctx, "CREATE TABLE identity_copy (LIKE identity_source INCLUDING ALL)");
+        _ = try fixture.waitServingSchema(ctx, "identity_copy", 0);
+        try command(ctx, "INSERT INTO identity_copy(quantity) VALUES (9)");
+        try command(ctx, "INSERT INTO identity_source(quantity) VALUES (1)");
+        try expectRows(ctx, "SELECT id::text AS id,quantity::text AS quantity,doubled::text AS doubled FROM identity_source ORDER BY id", &.{ "id", "quantity", "doubled" }, &.{ &.{ "42", "2", "4" }, &.{ "45", "1", "2" } });
+        try expectRows(ctx, "SELECT id::text AS id,quantity::text AS quantity,doubled::text AS doubled FROM identity_copy ORDER BY id", &.{ "id", "quantity", "doubled" }, &.{&.{ "42", "9", "18" }});
+        try create(ctx, "GRANT SELECT ON identity_source TO definition_reader");
+        try create(&reader, "CREATE TABLE reader_identity_copy (LIKE identity_source INCLUDING ALL)");
+        _ = try fixture.waitServingSchema(ctx, "reader_identity_copy", 0);
+        try command(&reader, "INSERT INTO reader_identity_copy(quantity) VALUES (5)");
+        try expectRows(ctx, "SELECT id::text AS id,doubled::text AS doubled FROM reader_identity_copy", &.{ "id", "doubled" }, &.{&.{ "42", "10" }});
+        try create(ctx, "CREATE TABLE shared_source(id TEXT PRIMARY KEY,n BIGSERIAL)");
+        try ready(ctx, "shared_source", try owner(ctx, "shared_source"));
+        try command(ctx, "COMMENT ON COLUMN shared_source.n IS 'shared original'");
+        try command(ctx, "ALTER SEQUENCE shared_source_n_seq RENAME TO shared_counter");
+        try primaryAnnotations(ctx, "shared_source", true);
+        try create(ctx, "CREATE TABLE shared_copy(prefix TEXT,LIKE shared_source INCLUDING ALL)");
+        try ready(ctx, "shared_copy", try owner(ctx, "shared_copy"));
+        try expectColumnComment(ctx, "shared_copy", "n", "shared original");
+        try primaryAnnotationsFrom(ctx, "shared_copy", "shared_source", false);
+        try command(ctx, "COMMENT ON COLUMN shared_source.n IS 'source current'");
+        try primaryAnnotations(ctx, "shared_source", true);
+        try primaryAnnotations(ctx, "shared_copy", true);
+        try command(ctx, "INSERT INTO shared_source(id) VALUES ('source')");
+        try command(ctx, "INSERT INTO shared_copy(id) VALUES ('copy')");
+        try expectRows(ctx, "SELECT n::text AS n FROM shared_source", &.{"n"}, &.{&.{"1"}});
+        try expectRows(ctx, "SELECT n::text AS n FROM shared_copy", &.{"n"}, &.{&.{"2"}});
+        try truncateShared(ctx, "shared_copy");
+        try command(ctx, "INSERT INTO shared_copy(id) VALUES ('borrower_restart')");
+        try expectRows(ctx, "SELECT n::text AS n FROM shared_copy", &.{"n"}, &.{&.{"3"}});
+        try truncateShared(ctx, "shared_source");
+        try command(ctx, "INSERT INTO shared_copy(id) VALUES ('owner_restart')");
+        try expectRows(ctx, "SELECT n::text AS n FROM shared_copy WHERE id='owner_restart'", &.{"n"}, &.{&.{"1"}});
+        try command(ctx, "ALTER SEQUENCE shared_counter OWNED BY NONE");
+        try truncateShared(ctx, "shared_source");
+        try command(ctx, "INSERT INTO shared_source(id) VALUES ('unowned_restart')");
+        try expectRows(ctx, "SELECT n::text AS n FROM shared_source", &.{"n"}, &.{&.{"2"}});
+        try create(ctx, "GRANT SELECT ON shared_source TO definition_reader");
+        try create(&reader, "CREATE TABLE reader_borrowed_copy (LIKE shared_source INCLUDING ALL)");
+        try ready(ctx, "reader_borrowed_copy", try owner(ctx, "reader_borrowed_copy"));
+        try primaryAnnotationsFrom(ctx, "reader_borrowed_copy", "shared_source", false);
+        try ready(ctx, "reader_borrowed_copy", try owner(ctx, "reader_borrowed_copy"));
+        {
+            // CREATE LIKE needs source-table SELECT, not sequence usage.
+            // Ordinary copied defaults must still enforce sequence permission
+            // at allocation; table ownership grants no implicit identity right.
+            var denied_default = try client.execute(&reader, "INSERT INTO reader_borrowed_copy(id) VALUES ('denied')", .write_admission);
+            defer denied_default.deinit(ctx.alloc);
+            if (denied_default.status != 403) std.debug.print("borrowed counter permission status={d} body={s}\n", .{ denied_default.status, denied_default.body });
+            try std.testing.expectEqual(@as(u16, 403), denied_default.status);
+            try command(&reader, "INSERT INTO reader_borrowed_copy(id,n) VALUES ('explicit',77)");
+        }
+        try create(ctx, "CREATE TABLE rename_source(id TEXT PRIMARY KEY,n BIGSERIAL)");
+        try ready(ctx, "rename_source", try owner(ctx, "rename_source"));
+        try command(ctx, "COMMENT ON COLUMN rename_source.n IS 'rename number'");
+        try create(ctx, "CREATE TABLE rename_borrower(LIKE rename_source INCLUDING ALL)");
+        try ready(ctx, "rename_borrower", try owner(ctx, "rename_borrower"));
+        try command(ctx, "INSERT INTO rename_source(id) VALUES ('before')");
+        try command(ctx, "INSERT INTO rename_borrower(id) VALUES ('before')");
+        try replaceShared(ctx, "rename_borrower", "ALTER TABLE rename_borrower RENAME COLUMN n TO value");
+        try replaceShared(ctx, "rename_source", "ALTER TABLE rename_source RENAME COLUMN n TO value");
+        try command(ctx, "INSERT INTO rename_source(id) VALUES ('after')");
+        try command(ctx, "INSERT INTO rename_borrower(id) VALUES ('after')");
+        try expectRows(ctx, "SELECT value::text AS n FROM rename_source ORDER BY id", &.{"n"}, &.{ &.{"3"}, &.{"1"} });
+        try expectRows(ctx, "SELECT value::text AS n FROM rename_borrower ORDER BY id", &.{"n"}, &.{ &.{"4"}, &.{"2"} });
+        try expectColumnComment(ctx, "rename_source", "value", "rename number");
+        try expectColumnComment(ctx, "rename_borrower", "value", "rename number");
+        try create(ctx, "CREATE TABLE rename_identity(id TEXT PRIMARY KEY,n BIGINT GENERATED ALWAYS AS IDENTITY)");
+        try ready(ctx, "rename_identity", try owner(ctx, "rename_identity"));
+        try command(ctx, "INSERT INTO rename_identity(id) VALUES ('before')");
+        try replaceShared(ctx, "rename_identity", "ALTER TABLE rename_identity RENAME COLUMN n TO value");
+        try command(ctx, "INSERT INTO rename_identity(id) VALUES ('after')");
+        try expectRows(ctx, "SELECT value::text AS n FROM rename_identity ORDER BY id", &.{"n"}, &.{ &.{"2"}, &.{"1"} });
+        try create(ctx, "REVOKE SELECT ON usage_records FROM definition_reader");
+        var rejected_copy = try client.execute(&reader, "CREATE TABLE denied_copy (LIKE usage_records INCLUDING ALL)", .write_admission);
+        defer rejected_copy.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 403), rejected_copy.status);
+        try create(&reader, "CREATE TABLE IF NOT EXISTS reader_copy (LIKE missing_source INCLUDING ALL)");
+        try replaceShared(ctx, "right_definition", "ALTER TABLE right_definition RENAME COLUMN payload TO body");
+        try expectColumnComment(ctx, "right_definition", "body", "payload source");
+        try expectRows(ctx, "SELECT body FROM right_definition", &.{"body"}, &.{&.{"not copied"}});
+        try command(ctx, "COMMENT ON COLUMN usage_records.status IS NULL");
+        try rows(ctx);
+    }
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        ctx.headers = ctx.admin_headers;
+        try ready(ctx, "usage_records_copy", self.copied);
+        const fk_copy = try owner(ctx, "fk_usage_copy");
+        try ready(ctx, "fk_usage_copy", fk_copy);
+        try primaryAnnotationsFrom(ctx, "fk_usage_copy", "usage_records", false);
+        try expectColumnComment(ctx, "fk_usage_copy", "status", "source status");
+        try expectRows(ctx, "SELECT id::text AS id,status FROM fk_usage_copy", &.{ "id", "status" }, &.{&.{ "00000000-0000-0000-0000-000000000001", "queued" }});
+        try rejected(ctx, "INSERT INTO fk_usage_copy(id) VALUES ('00000000-0000-0000-0000-000000000099')", "23503");
+
+        try std.testing.expectEqualDeep(self.copied, try owner(ctx, "usage_records_copy"));
+        try expectColumnComment(ctx, "shared_source", "n", "source current");
+        try expectColumnComment(ctx, "shared_copy", "n", "shared original");
+        try primaryAnnotations(ctx, "shared_source", false);
+        try primaryAnnotations(ctx, "shared_copy", false);
+        try expectColumnComment(ctx, "right_definition", "body", "payload source");
+        try command(ctx, "INSERT INTO rename_source(id) VALUES ('cold')");
+        try command(ctx, "INSERT INTO rename_borrower(id) VALUES ('cold')");
+        try command(ctx, "INSERT INTO rename_identity(id) VALUES ('cold')");
+        try expectRows(ctx, "SELECT value::text AS n FROM rename_source WHERE id='cold'", &.{"n"}, &.{&.{"5"}});
+        try expectRows(ctx, "SELECT value::text AS n FROM rename_borrower WHERE id='cold'", &.{"n"}, &.{&.{"6"}});
+        try expectRows(ctx, "SELECT value::text AS n FROM rename_identity WHERE id='cold'", &.{"n"}, &.{&.{"3"}});
+        try expectColumnComment(ctx, "rename_source", "value", "rename number");
+        try expectColumnComment(ctx, "rename_borrower", "value", "rename number");
+        try command(ctx, "INSERT INTO shared_copy(id) VALUES ('cold_copy')");
+        try command(ctx, "INSERT INTO shared_source(id) VALUES ('cold_source')");
+        try expectRows(ctx, "SELECT n::text AS n FROM shared_copy WHERE id='cold_copy'", &.{"n"}, &.{&.{"3"}});
+        try expectRows(ctx, "SELECT n::text AS n FROM shared_source WHERE id='cold_source'", &.{"n"}, &.{&.{"4"}});
+        try command(ctx, "INSERT INTO identity_copy(quantity) VALUES (7)");
+        try command(ctx, "INSERT INTO identity_source(quantity) VALUES (3)");
+        try expectRows(ctx, "SELECT id::text AS id,quantity::text AS quantity,doubled::text AS doubled FROM identity_copy ORDER BY id", &.{ "id", "quantity", "doubled" }, &.{ &.{ "42", "9", "18" }, &.{ "45", "7", "14" } });
+        try expectRows(ctx, "SELECT id::text AS id,quantity::text AS quantity,doubled::text AS doubled FROM identity_source ORDER BY id", &.{ "id", "quantity", "doubled" }, &.{ &.{ "42", "2", "4" }, &.{ "45", "1", "2" }, &.{ "48", "3", "6" } });
+        try rows(ctx);
+        try rejected(ctx, "INSERT INTO usage_records_copy VALUES ('00000000-0000-0000-0000-000000000009','duplicate')", "23505");
+        try rejected(ctx, "INSERT INTO usage_records_copy VALUES ('00000000-0000-0000-0000-000000000013','')", "23514");
+    }
+};
+
+test "mounted SQL LIKE declaration copies retain grants constraints isolation and cold owners" {
+    // sql-0369 is loaded unchanged from Corpus in beforeRestart; the campaign
+    // checks its exact SQL before submitting it through the public API.
+    try fixture.run(DefinitionCopyCampaign);
+}
+
+/// The coupled ownership lifetime from the independent PostgreSQL LIKE oracle.
+/// Dropping a borrower removes only its default edge and fresh identity; the
+/// original SERIAL owner may retire only after the last borrower disappears.
+const CopyLifetimeCampaign = struct {
+    pub const native_auth = true;
+    pub const native_sessions = true;
+    pub const cold_catalog = true;
+    keys: client.ApiKeyHeaders = .{},
+    source: u64 = 0,
+    copy: u64 = 0,
+    fk_copy: u64 = 0,
+
+    pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
+        const users = @import("../usermgr/mod.zig");
+        inline for (.{ users.ResourceType.database, users.ResourceType.namespace }) |kind| {
+            var permission = try users.Permission.initOwned(manager.alloc, kind, "*", .admin);
+            defer permission.deinit(manager.alloc);
+            try manager.addPermissionToUser("pk-rewriter", permission);
+        }
+    }
+
+    fn awaitReady(ctx: *fixture.Context, name: []const u8) !u64 {
+        const current = try fixture.waitServingSchema(ctx, name, 0);
+        try ready(ctx, name, .{ .id = current.table_id, .version = current.version });
+        return current.table_id;
+    }
+
+    fn sharedCounter(ctx: *fixture.Context) !@import("../system_catalog/sequence_catalog.zig").sequence.State {
+        const sequences = @import("../system_catalog/sequence_catalog.zig");
+        var region = std.heap.ArenaAllocator.init(ctx.alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        const source = server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+        const request: sequences.SnapshotRequest = .{ .targets = &.{.{ .table = "lifetime_source_serial_id_seq" }}, .include_counters = true };
+        const bytes = try source.systemCatalog(a, .{ .setting_admin = true }, .{ .sql_sequence_snapshot = request });
+        const snapshot = try std.json.parseFromSliceLeaky(sequences.Snapshot, a, bytes, .{});
+        try snapshot.validate(request);
+        if (snapshot.entries[0].value != .sequence) return error.MissingSharedCounter;
+        return snapshot.entries[0].counter orelse error.MissingSharedCounterState;
+    }
+
+    fn drop(ctx: *fixture.Context, name: []const u8) !void {
+        var coordinator = ctx.*;
+        coordinator.base = ctx.metadata_uri;
+        const sql = try std.fmt.allocPrint(ctx.alloc, "DROP TABLE {s}", .{name});
+        defer ctx.alloc.free(sql);
+        var response = try client.execute(&coordinator, sql, .write_admission);
+        defer response.deinit(ctx.alloc);
+        errdefer std.debug.print("LIKE retirement sql={s} status={d} body={s}\n", .{ sql, response.status, response.body });
+        try std.testing.expect(response.status == 200 or response.status == 202);
+        var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(if (response.status == 200) "DROP TABLE" else "DDL PENDING", parsed.value.command_tag);
+        const source = server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+        const deadline = platform.time.monotonicNs() +| 60 * std.time.ns_per_s;
+        while (platform.time.monotonicNs() < deadline) {
+            try ctx.checkDrivers();
+            const bytes = try source.systemCatalog(ctx.alloc, .{ .deadline_ns = deadline }, .{ .resolve = .{ .table = name } });
+            defer ctx.alloc.free(bytes);
+            var resolved = try std.json.parseFromSlice(?local.system_catalog_domain.ResolvedTable, ctx.alloc, bytes, .{});
+            defer resolved.deinit();
+            if (resolved.value == null) return;
+            try ctx.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        return error.CopyRetirementTimeout;
+    }
+
+    fn createSource(ctx: *fixture.Context, statement: []const u8) !void {
+        var coordinator = ctx.*;
+        coordinator.base = ctx.metadata_uri;
+        var response = try client.execute(&coordinator, statement, .write_admission);
+        defer response.deinit(ctx.alloc);
+        errdefer std.debug.print("combined FK/counter CREATE status={d} body={s}\n", .{ response.status, response.body });
+        try std.testing.expect(response.status == 200 or response.status == 202 or response.status == 409);
+        var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer parsed.deinit();
+        const receipt = parsed.value.ddl_receipt orelse return error.MissingInitialCounterReceipt;
+        if (response.status == 409) try std.testing.expect(receipt.state == .admission_unknown);
+        const token = receipt.fk_generation_publication_id orelse return error.MissingInitialCounterToken;
+        const table_id = try std.fmt.parseInt(u64, receipt.table_id, 10);
+        const source = server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+        const deadline = platform.time.monotonicNs() +| 60 * std.time.ns_per_s;
+        while (platform.time.monotonicNs() < deadline) {
+            try ctx.checkDrivers();
+            const bytes = source.systemCatalog(ctx.alloc, .{ .deadline_ns = deadline, .fk_generation_publication_authority = true }, .{ .fk_initial_create_status = table_id }) catch |err| switch (err) {
+                error.GenerationPublicationNotFound => {
+                    try ctx.io.sleep(.fromMilliseconds(20), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+            defer ctx.alloc.free(bytes);
+            var publication = try std.json.parseFromSlice(@import("../metadata/fk_generation_publication.zig").InitialPublication, ctx.alloc, bytes, .{});
+            defer publication.deinit();
+            try publication.value.validateState(ctx.alloc);
+            try std.testing.expectEqualStrings(token, &std.fmt.bytesToHex(publication.value.plan.id, .lower));
+            if (publication.value.phase == .published) return;
+            if (publication.value.phase == .canceled) return error.InitialCounterCreateCanceled;
+            try ctx.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        return error.InitialCounterCreateTimeout;
+    }
+
+    fn read(ctx: *fixture.Context, name: []const u8, expected: []const []const ?[]const u8) !void {
+        const sql = try std.fmt.allocPrint(ctx.alloc, "SELECT id::text AS id,serial_id::text AS serial_id,doubled::text AS doubled FROM {s} ORDER BY id", .{name});
+        defer ctx.alloc.free(sql);
+        try expectRows(ctx, sql, &.{ "id", "serial_id", "doubled" }, expected);
+    }
+
+    fn indexComment(ctx: *fixture.Context) !void {
+        var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const captured = (try @import("sql_catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "lifetime_copy" }, false, null)) orelse return error.MissingCopy;
+        const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+        const table = (try store.getTable(a, ctx.metadata.server.svc.metadata_group_id, captured.guard.owner.table_id)) orelse return error.MissingCopy;
+        try std.testing.expectEqualStrings("", table.description);
+        const bytes = try store.getSqlObjectAnnotation(a, ctx.metadata.server.svc.metadata_group_id, .{ .guard = captured.guard, .key = .{ .kind = .index, .name = "lifetime_copy_quantity_key" } });
+        const note = try std.json.parseFromSliceLeaky(local.system_catalog_domain.object_annotation_store.Snapshot, a, bytes, .{});
+        try std.testing.expectEqualStrings("copied index comment", note.annotation.?.description.?);
+        try DefinitionCopyCampaign.expectColumnComment(ctx, "lifetime_copy", "quantity", "copied quantity");
+    }
+
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try self.keys.activateWithCatalog(ctx, true);
+        ctx.headers = ctx.admin_headers;
+        try waitNamingPublication(ctx, "lifetime_parent");
+        try DefinitionCopyCampaign.create(ctx, "CREATE TABLE lifetime_parent(id INT PRIMARY KEY)");
+        _ = try awaitReady(ctx, "lifetime_parent");
+        try command(ctx, "INSERT INTO lifetime_parent VALUES (1),(2)");
+        try createSource(ctx, "CREATE TABLE lifetime_source(id BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 42 INCREMENT BY 3),serial_id BIGSERIAL,quantity INT NOT NULL DEFAULT 2,doubled INT GENERATED ALWAYS AS (quantity * 2) STORED,PRIMARY KEY(id),UNIQUE(quantity) DEFERRABLE INITIALLY DEFERRED,CHECK(quantity > 0),FOREIGN KEY(quantity) REFERENCES lifetime_parent(id))");
+        self.source = try awaitReady(ctx, "lifetime_source");
+        try command(ctx, "COMMENT ON TABLE lifetime_source IS 'source table only'");
+        try command(ctx, "COMMENT ON COLUMN lifetime_source.quantity IS 'copied quantity'");
+        try command(ctx, "COMMENT ON INDEX lifetime_source_quantity_key IS 'copied index comment'");
+        try command(ctx, "INSERT INTO lifetime_source DEFAULT VALUES");
+        try DefinitionCopyCampaign.create(ctx, "CREATE TABLE lifetime_copy(LIKE lifetime_source INCLUDING ALL)");
+        self.copy = try awaitReady(ctx, "lifetime_copy");
+        try std.testing.expect(self.source != self.copy);
+        try read(ctx, "lifetime_copy", &.{});
+        try indexComment(ctx);
+        // This value is absent from the source FK parent: LIKE excludes FKs.
+        try command(ctx, "INSERT INTO lifetime_copy(quantity) VALUES (9)");
+        try command(ctx, "INSERT INTO lifetime_source(quantity) VALUES (1)");
+        try read(ctx, "lifetime_copy", &.{&.{ "42", "2", "18" }});
+        try read(ctx, "lifetime_source", &.{ &.{ "42", "1", "4" }, &.{ "45", "3", "2" } });
+        const before_prepare = try sharedCounter(ctx);
+        const prepare_body = "{\"statement\":\"INSERT INTO lifetime_copy(quantity) VALUES (NULL)\"}";
+        var prepared = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/sql/prepared", .POST, prepare_body, 15_000);
+        defer prepared.deinit(ctx.alloc);
+        try std.testing.expectEqual(@as(u16, 200), prepared.status);
+        var prepared_id = try std.json.parseFromSlice(struct { prepared_id: []const u8 }, ctx.alloc, prepared.body, .{ .ignore_unknown_fields = true });
+        defer prepared_id.deinit();
+        const prepared_path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/prepared/{s}", .{prepared_id.value.prepared_id});
+        defer ctx.alloc.free(prepared_path);
+        const execute_path = try std.fmt.allocPrint(ctx.alloc, "{s}/execute", .{prepared_path});
+        defer ctx.alloc.free(execute_path);
+        try std.testing.expectEqualDeep(before_prepare, try sharedCounter(ctx));
+        for (0..2) |attempt| {
+            var execution = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, execute_path, .POST, "{}", 15_000);
+            defer execution.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 400), execution.status);
+            var diagnostic = try std.json.parseFromSlice(struct { code: []const u8 }, ctx.alloc, execution.body, .{ .ignore_unknown_fields = true });
+            defer diagnostic.deinit();
+            if (!std.mem.eql(u8, "23502", diagnostic.value.code)) std.debug.print("prepared NULL insert status={d} body={s}\n", .{ execution.status, execution.body });
+            try std.testing.expectEqualStrings("23502", diagnostic.value.code);
+            const allocated = try sharedCounter(ctx);
+            try std.testing.expectEqual(before_prepare.last_value + @as(i64, @intCast(attempt + 1)), allocated.last_value);
+            try std.testing.expectEqual(before_prepare.revision + attempt + 1, allocated.revision);
+        }
+        var closed = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, prepared_path, .DELETE, null, 15_000);
+        defer closed.deinit(ctx.alloc);
+        try std.testing.expect(closed.status == 200 or closed.status == 204);
+        try rejected(ctx, "INSERT INTO lifetime_copy(quantity) VALUES (NULL)", "23502");
+        try rejected(ctx, "INSERT INTO lifetime_copy(quantity) VALUES (-1)", "23514");
+        try rejected(ctx, "INSERT INTO lifetime_copy(quantity) VALUES (9)", "23505");
+        try std.testing.expectEqual(@as(i64, 8), (try sharedCounter(ctx)).last_value);
+        // Reusing the cached validator must still prepare defaults per row.
+        try command(ctx, "INSERT INTO lifetime_copy(quantity) VALUES (2),(3)");
+        try std.testing.expectEqual(@as(i64, 10), (try sharedCounter(ctx)).last_value);
+        try rejected(ctx, "INSERT INTO lifetime_copy(quantity) VALUES (4),(NULL),(5)", "23502");
+        // Two defaults survive the rejected statement; its third row is never
+        // evaluated and its valid first row must not become visible.
+        try std.testing.expectEqual(@as(i64, 12), (try sharedCounter(ctx)).last_value);
+        try read(ctx, "lifetime_copy", &.{ &.{ "42", "2", "18" }, &.{ "60", "9", "4" }, &.{ "63", "10", "6" } });
+        try rejected(ctx, "DROP TABLE lifetime_source", "2BP01");
+        // The rejected retirement cannot detach either default or owner edge.
+        try read(ctx, "lifetime_source", &.{ &.{ "42", "1", "4" }, &.{ "45", "3", "2" } });
+        // One hidden publication combines a copied fresh identity, a shared
+        // SERIAL default, generated columns, deferred UNIQUE, CHECK and FK.
+        try createSource(ctx, "CREATE TABLE lifetime_fk_copy(LIKE lifetime_source INCLUDING ALL, FOREIGN KEY(quantity) REFERENCES lifetime_parent(id))");
+        self.fk_copy = try awaitReady(ctx, "lifetime_fk_copy");
+        try std.testing.expect(self.fk_copy != self.source and self.fk_copy != self.copy);
+        try read(ctx, "lifetime_fk_copy", &.{});
+        try DefinitionCopyCampaign.expectColumnComment(ctx, "lifetime_fk_copy", "quantity", "copied quantity");
+    }
+
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        ctx.headers = ctx.admin_headers;
+        try std.testing.expectEqual(self.source, try awaitReady(ctx, "lifetime_source"));
+        try std.testing.expectEqual(self.copy, try awaitReady(ctx, "lifetime_copy"));
+        try indexComment(ctx);
+        try read(ctx, "lifetime_copy", &.{ &.{ "42", "2", "18" }, &.{ "60", "9", "4" }, &.{ "63", "10", "6" } });
+        try std.testing.expectEqual(self.fk_copy, try awaitReady(ctx, "lifetime_fk_copy"));
+        try read(ctx, "lifetime_fk_copy", &.{});
+        try command(ctx, "INSERT INTO lifetime_fk_copy DEFAULT VALUES");
+        try read(ctx, "lifetime_fk_copy", &.{&.{ "42", "13", "4" }});
+        try DefinitionCopyCampaign.expectColumnComment(ctx, "lifetime_fk_copy", "quantity", "copied quantity");
+        try rejected(ctx, "DROP TABLE lifetime_source", "2BP01");
+        const with_fk = try sharedCounter(ctx);
+        try drop(ctx, "lifetime_fk_copy");
+        try std.testing.expectEqualDeep(with_fk, try sharedCounter(ctx));
+        try rejected(ctx, "SELECT nextval('lifetime_fk_copy_id_seq')", "42P01");
+        try rejected(ctx, "DROP TABLE lifetime_source", "2BP01");
+        const shared_before = try sharedCounter(ctx);
+        try drop(ctx, "lifetime_copy");
+        try std.testing.expectEqualDeep(shared_before, try sharedCounter(ctx));
+        try rejected(ctx, "SELECT nextval('lifetime_copy_id_seq')", "42P01");
+        // A copied identity is independently owned; its retirement must not
+        // remove or reset the source identity or the shared SERIAL counter.
+        try expectRows(ctx, "SELECT nextval('lifetime_source_id_seq')::text AS id", &.{"id"}, &.{&.{"48"}});
+        try read(ctx, "lifetime_source", &.{ &.{ "42", "1", "4" }, &.{ "45", "3", "2" } });
+        try drop(ctx, "lifetime_source");
+        // Both source-owned counters are retired, while the external FK
+        // parent has completed reference coverage and remains writable.
+        try rejected(ctx, "SELECT nextval('lifetime_source_serial_id_seq')", "42P01");
+        try rejected(ctx, "SELECT nextval('lifetime_source_id_seq')", "42P01");
+        try command(ctx, "DELETE FROM lifetime_parent");
+        try command(ctx, "INSERT INTO lifetime_parent VALUES (9)");
+        // Reusing the logical name must allocate a fresh catalog identity.
+        try DefinitionCopyCampaign.create(ctx, "CREATE TABLE lifetime_source(id TEXT PRIMARY KEY)");
+        const recreated = try awaitReady(ctx, "lifetime_source");
+        try std.testing.expect(recreated != self.source);
+        try command(ctx, "INSERT INTO lifetime_source VALUES ('new owner')");
+        const svc = ctx.metadata.server.svc;
+        const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+        const checkpoint = try store.snapshotBuilder().buildSnapshot(ctx.alloc, svc.metadata_group_id);
+        defer ctx.alloc.free(checkpoint);
+        try std.testing.expect(checkpoint.len != 0);
+    }
+};
+
+test "mounted SQL LIKE full ownership lifetime retires borrowed defaults and fresh identities through cold owners" {
+    try fixture.run(CopyLifetimeCampaign);
+}

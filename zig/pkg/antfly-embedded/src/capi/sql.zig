@@ -954,7 +954,7 @@ pub fn Adapter(comptime native: type) type {
                     }
                 }
                 out.generated = generated;
-                out.defaulted = catalog.hasColumnDefault(parsed, column.name);
+                out.defaulted = out.defaulted or catalog.hasColumnDefault(parsed, column.name);
                 out.clock_defaulted = catalog.columnDefaultUsesClock(parsed, column.name);
                 out.type = dependencies.sql_document_row.relationalType(parsed, column.name, out.type);
             }
@@ -1079,11 +1079,26 @@ pub fn Adapter(comptime native: type) type {
                 .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version },
             });
             defer session.deinit();
-            const normalized = try session.normalizeRows(alloc, writes);
+            var has_domains = false;
+            for (input) |mutation| has_domains = has_domains or mutation.domain_admission != null;
+            const normalized = if (has_domains) typed: {
+                const admissions = try alloc.alloc(?@import("../schema/domain_row.zig").Admission, writes.len);
+                var index: usize = 0;
+                for (input) |mutation| if (mutation.row != null) {
+                    admissions[index] = if (mutation.prepared_domain == null) mutation.domain_admission else null;
+                    index += 1;
+                };
+                const prepared_contract = try alloc.create(@import("../schema/domain_handoff.zig").Contract);
+                break :typed try session.normalizeDomainRows(alloc, writes, admissions, prepared_contract);
+            } else try session.normalizeRows(alloc, writes);
             return images.merge(alloc, input, normalized);
         }
 
-        fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, raw_mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            const needs_domain_preparation = for (raw_mutations) |mutation| {
+                if (mutation.row != null and mutation.domain_admission != null and mutation.prepared_domain == null) break true;
+            } else false;
+            const mutations = if (needs_domain_preparation) try prepareMutations(ptr, alloc, table, raw_mutations) else raw_mutations;
             const adapter_owner: *Self = @ptrCast(@alignCast(ptr));
             var selected_adapter = try adapter_owner.selected(table.physical_name);
             const self = &selected_adapter;
@@ -1101,7 +1116,7 @@ pub fn Adapter(comptime native: type) type {
                 predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest, .unique_absence = mutation.unique_absence };
                 if (mutation.predicate_only) continue;
                 if (mutation.row) |row| {
-                    try writes.append(temporary, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(temporary, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields });
+                    try writes.append(temporary, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(temporary, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields, .prepared_domain = mutation.prepared_domain });
                 } else try deletes.append(temporary, mutation.key);
             }
             const request: types.BatchRequest = .{ .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null };
@@ -1121,7 +1136,7 @@ pub fn Adapter(comptime native: type) type {
                     try commands.appendSlice(temporary, owner.guards);
                 };
                 const input_writes = try temporary.alloc(types.TransactionWrite, writes.items.len);
-                for (writes.items, input_writes) |write, *out| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
+                for (writes.items, input_writes) |write, *out| out.* = write;
                 const input: contract.TableCommitRequest = .{ .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = table.schema_version, .relational_integrity_generation_set = generation, .integrity_commands = commands.items };
                 prepared = try integrity.prepareWithRepairAdmission(scratch_alloc, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{});
                 if (self.handle) |handle| return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);

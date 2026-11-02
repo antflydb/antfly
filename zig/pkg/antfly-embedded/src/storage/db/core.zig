@@ -528,6 +528,8 @@ pub const DBCore = struct {
     relational_indexes: relational_index_catalog_mod.Controller,
     table_catalog: table_catalog_mod.Catalog,
     identity_namespace: doc_identity.Namespace,
+    /// Shared by every live DB wrapper for this physical primary owner.
+    sql_maintenance_mutex: std.Io.Mutex = .init,
     artifact_cleanup_maybe: std.atomic.Value(bool),
     identity_visibility: IdentityVisibilityState,
 
@@ -1387,13 +1389,21 @@ pub const DBCore = struct {
             versioned_public = versioned_public or historical;
         }
         if (!active_public or !versioned_public) return error.SchemaValidationJobChanged;
-        if (binding.purpose != .not_null and (binding.purpose != .foreign_key_source or ready_cut.transaction_coverage == null))
+        if (binding.purpose != .not_null and !binding.purpose.schemaOnly() and binding.purpose != .domain_not_null and (binding.purpose != .foreign_key_source or ready_cut.transaction_coverage == null))
             return error.ForeignKeyValidationRequired;
-        var prepared = try self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, binding.before_version, null, if (binding.purpose == .foreign_key_source) candidate else null);
+        const retiring_dependencies = binding.purpose == .dependent_object_retirement;
+        var prepared = try self.prepareSchemaMetadataMode(table_schema, metadata_writes, retiring_dependencies, binding.before_version, null, if (binding.purpose == .foreign_key_source or binding.purpose == .object_rename) candidate else null);
         errdefer prepared.deinit();
+        const successor_catalog = (prepared.integrity_catalog orelse return error.IntegrityCatalogChanged).value;
         if (!std.mem.eql(u8, prepared.encoded, candidate.native_after) or !prepared.generated_semantics_match or
-            !std.mem.eql(u8, (prepared.integrity_catalog orelse return error.IntegrityCatalogChanged).value, candidate.catalog_after))
+            !std.mem.eql(u8, successor_catalog, candidate.catalog_after))
             return error.SchemaValidationJobChanged;
+        var rename_region = std.heap.ArenaAllocator.init(self.alloc);
+        defer rename_region.deinit();
+        const rename_hints: []const @import("../../system_catalog/object_annotations.zig").Rename = if (binding.purpose == .object_rename) blk: {
+            const parts = try @import("relational_nullability_job.zig").Candidate.parts(candidate.inputs);
+            break :blk try std.json.parseFromSliceLeaky([]const @import("../../system_catalog/object_annotations.zig").Rename, rename_region.allocator(), parts[3], .{});
+        } else &.{};
         if (prepared.base_relational_indexes) |base| {
             const head = base.head.encode();
             const successor = prepared.relational_indexes orelse return error.SchemaValidationIndexRewriteRequired;
@@ -1401,9 +1411,16 @@ pub const DBCore = struct {
                 base.plan.boundIndexes().len != successor.plan.boundIndexes().len) return error.SchemaValidationIndexRewriteRequired;
             // Snapshot fingerprints intentionally include the schema epoch.
             // Physical identity/comparison must agree, not the runtime pin.
-            for (base.plan.boundIndexes(), successor.plan.boundIndexes()) |old, next| {
-                if (!std.meta.eql(old.id(), next.id()) or !std.mem.eql(u8, old.name, next.name) or
-                    !std.mem.eql(u8, &old.tuple.fingerprint, &next.tuple.fingerprint)) return error.SchemaValidationIndexRewriteRequired;
+            for (base.plan.boundIndexes()) |old| {
+                const next = for (successor.plan.boundIndexes()) |entry| {
+                    if (std.meta.eql(old.id(), entry.id())) break entry;
+                } else return error.SchemaValidationIndexRewriteRequired;
+                var expected_name = old.name;
+                for (rename_hints) |rename| if (rename.kind == .index and std.mem.eql(u8, old.name, rename.from)) {
+                    expected_name = rename.to;
+                    break;
+                };
+                if (!std.mem.eql(u8, expected_name, next.name) or !std.mem.eql(u8, &old.tuple.fingerprint, &next.tuple.fingerprint)) return error.SchemaValidationIndexRewriteRequired;
             }
         } else if (prepared.relational_indexes != null or !std.mem.eql(u8, &job.hash(""), &binding.physical_catalog)) {
             return error.SchemaValidationIndexRewriteRequired;
@@ -1528,6 +1545,13 @@ pub const DBCore = struct {
         // not the candidate which publication will discard. Owner startup and
         // idempotent schema retries both exercise this path.
         const index_view = if (prepared.same_version_layout_matches and !prepared.legacy_public_binding) prepared.base_schema_view.? else next_view;
+        var rename_region = std.heap.ArenaAllocator.init(self.alloc);
+        defer rename_region.deinit();
+        const object_renames: []const @import("../../system_catalog/object_annotations.zig").Rename = if (validated_foreign_key) |candidate| if (candidate.purpose == .object_rename) blk: {
+            const parts = try @import("relational_nullability_job.zig").Candidate.parts(candidate.inputs);
+            break :blk try std.json.parseFromSliceLeaky([]const @import("../../system_catalog/object_annotations.zig").Rename, rename_region.allocator(), parts[3], .{});
+        } else &.{} else &.{};
+
         prepared.relational_indexes = declarations: {
             if (reserved_index) |reserved| {
                 const binding = reserved.binding;
@@ -1538,7 +1562,7 @@ pub const DBCore = struct {
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena.deinit();
                 if (try validator.schema.relationalIndexDefinitions(arena.allocator())) |definitions|
-                    break :declarations try self.relational_indexes.prepare(index_view, definitions);
+                    break :declarations try self.relational_indexes.prepareWithObjectRenames(index_view, definitions, object_renames);
             }
             break :declarations try self.relational_indexes.prepareSchemaChange(index_view);
         };
@@ -1566,7 +1590,7 @@ pub const DBCore = struct {
             prepared.integrity_catalog = if (reserved_index) |reserved| blk: {
                 const inputs = reserved_inputs.?;
                 break :blk try integrity_catalog_mod.prepareIndexPublication(self.alloc, inputs.predecessor, previous_integrity orelse return error.IntegrityCatalogChanged, reserved.candidate.next.value, inputs.name);
-            } else if (validated_foreign_key) |candidate| blk: {
+            } else if (if (object_renames.len == 0) validated_foreign_key else null) |candidate| blk: {
                 // A validity-only successor retains every live and retired
                 // generation. Re-derive it from actual predecessor metadata;
                 // never substitute caller-provided catalog bytes.
@@ -1574,7 +1598,7 @@ pub const DBCore = struct {
                 const names = try declaration_arena.allocator().alloc([]const u8, source.rules.len);
                 for (source.rules, names) |rule, *name| name.* = rule.rule.name;
                 break :blk try integrity_catalog_mod.prepareForeignKeyValidation(self.alloc, previous_integrity orelse return error.IntegrityCatalogChanged, try integrity_catalog_mod.incarnationFromTableId(self.identity_namespace.table_id), table_schema.version, digest, definitions, names, checks_digest);
-            } else try integrity_catalog_mod.prepareWithChecks(
+            } else if (object_renames.len != 0) try integrity_catalog_mod.prepareObjectRenames(self.alloc, previous_integrity orelse return error.IntegrityCatalogChanged, try integrity_catalog_mod.incarnationFromTableId(self.identity_namespace.table_id), table_schema.version, digest, definitions, object_renames, checks_digest) else try integrity_catalog_mod.prepareWithChecks(
                 self.alloc,
                 previous_integrity,
                 try integrity_catalog_mod.incarnationFromTableId(self.identity_namespace.table_id),
@@ -2004,6 +2028,8 @@ pub const DBCore = struct {
                         const binding = participants.prepared.validated_nullability.?.binding;
                         if (binding.purpose == .foreign_key_source)
                             try @import("relational_integrity_activation.zig").stageValidatedForeignKey(participants.prepared.alloc, txn, catalog.catalog, binding)
+                        else if (binding.purpose == .dependent_object_retirement)
+                            try @import("relational_integrity_activation.zig").stageDependencyRetirement(participants.prepared.alloc, txn, catalog.expected orelse return error.IntegrityCatalogChanged, catalog.catalog, binding)
                         else
                             try @import("relational_integrity_activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);
                     } else try @import("relational_integrity_activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);

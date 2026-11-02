@@ -206,6 +206,7 @@ pub fn readPhysicalCells(a: A, cells: [physical_width]Datum, spec: operators.Agg
             .json => true,
             .array => selected.array != null,
             .enumeration => selected.enumeration() != null,
+            .bytea => selected.bytes() != null,
             .numrange, .daterange, .tsrange, .tstzrange => selected.range() != null and @import("range_value.zig").kindFromType(spec.input_type.?) == selected.range().?.kind,
         };
         if (!valid) return error.InvalidSqlSpill;
@@ -305,6 +306,7 @@ fn typeId(type_: ?@import("ast.zig").ColumnType) u8 {
         .tsrange => 11,
         .tstzrange => 12,
         .enumeration => 13,
+        .bytea => 14,
     } else 255;
 }
 
@@ -341,7 +343,7 @@ const Encoder = struct {
         try value.validateTemporal();
         if (value.patterns() != null) return error.InvalidSqlSpill;
         if (value.sql_null) return self.raw(&.{0});
-        if (value.array != null or value.numeric != null or value.temporal() != null or value.range() != null or value.enumeration() != null) {
+        if (value.array != null or value.numeric != null or value.temporal() != null or value.range() != null or value.enumeration() != null or value.bytes() != null) {
             // Reuse the portable typed-block codec; a typed value's scalar
             // JSON placeholder is not its value or its element identity.
             const encoded = try @import("spill.zig").encodeColumnarBlockAlloc(self.a, &.{.{ .values = &.{value}, .keys = &.{}, .ordinal = 0 }}, 16 << 20);
@@ -417,7 +419,7 @@ const Decoder = struct {
                 const block = try @import("spill.zig").decodeColumnarBlockInArena(self.a, try self.text(), 16 << 20);
                 if (block.count() != 1 or block.values.len != 1 or block.keys.len != 0) return error.InvalidSqlSpill;
                 const value = try block.cell(0, 0);
-                if (value.sql_null or (value.array == null and value.numeric == null and value.temporal() == null and value.range() == null and value.enumeration() == null)) return error.InvalidSqlSpill;
+                if (value.sql_null or (value.array == null and value.numeric == null and value.temporal() == null and value.range() == null and value.enumeration() == null and value.bytes() == null)) return error.InvalidSqlSpill;
                 break :blk value;
             },
             else => error.InvalidSqlSpill,
@@ -581,9 +583,10 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
             .string, .uuid => selected.value == .string,
             .datetime => selected.value == .string or (selected.temporal() != null and selected.temporal().?.kind() == .timestamp_tz),
             .numrange, .daterange, .tsrange, .tstzrange => selected.range() != null and @import("range_value.zig").kindFromType(type_) == selected.range().?.kind,
-            .json => selected.temporal() == null and selected.range() == null and selected.enumeration() == null,
+            .json => selected.temporal() == null and selected.range() == null and selected.enumeration() == null and selected.bytes() == null,
             .array => selected.array != null,
             .enumeration => selected.enumeration() != null,
+            .bytea => selected.bytes() != null,
         };
         if (!valid) return error.InvalidSqlSpill;
     };

@@ -744,7 +744,11 @@ fn awaitConstraintReceipt(ctx: *fixture.Context, receipt: wire.SQLDDLReceipt, ve
             try ctx.io.sleep(.fromMilliseconds(20), .awake);
         }
     }
-    const suffix = try std.fmt.allocPrint(ctx.alloc, "/db/v1/databases/{s}/namespaces/{s}/tables/{s}/constraints/status", .{ receipt.database, receipt.namespace, receipt.table });
+    return awaitConstraintEnforcement(ctx, receipt.database, receipt.namespace, receipt.table, version);
+}
+
+fn awaitConstraintEnforcement(ctx: *fixture.Context, database: []const u8, namespace: []const u8, table: []const u8, version: u32) !void {
+    const suffix = try std.fmt.allocPrint(ctx.alloc, "/db/v1/databases/{s}/namespaces/{s}/tables/{s}/constraints/status", .{ database, namespace, table });
     defer ctx.alloc.free(suffix);
     const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
     while (platform.time.monotonicNs() < deadline) {
@@ -1839,4 +1843,387 @@ test "mounted SQL constrained table drops drain outgoing and self references pre
     };
     for ([_]bool{ false, true }) |lost_final_reply|
         try fixture.runWithState(DropCampaign, .{ .lost_final_reply = lost_final_reply });
+}
+
+test "mounted SQL object comment renames preserve CHECK UNIQUE backing index and FK identities through cold publication" {
+    const domain = local.system_catalog_domain;
+    const AnnotationRenameCampaign = struct {
+        pub const native_sessions = true;
+        pub const cold_catalog = true;
+        credentials: client.ApiKeyHeaders = .{},
+        ids: [4]u64 = @splat(0),
+        final_rename: bool = false,
+        token: [@import("schema_validation_recovery.zig").Token.encoded_len]u8 = undefined,
+        primary: [32]u8 = undefined,
+
+        fn observe(self: *@This(), ctx: *fixture.Context) !wire.SchemaValidationStatus {
+            const headers = try ctx.alloc.alloc(@import("../raft/transport/http_common.zig").RequestHeader, ctx.admin_headers.len + 1);
+            defer ctx.alloc.free(headers);
+            @memcpy(headers[0..ctx.admin_headers.len], ctx.admin_headers);
+            headers[ctx.admin_headers.len] = .{ .name = "X-Antfly-Schema-Validation-Token", .value = &self.token };
+            var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, headers, ctx.metadata_uri, "/db/v1/databases/default/namespaces/public/tables/annotated_child/schema/publication", .GET, null, 5_000);
+            defer response.deinit(ctx.alloc);
+            if (response.status != 200) std.debug.print("rename recovery status={d} body={s}\n", .{ response.status, response.body });
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var parsed = try std.json.parseFromSlice(wire.SchemaValidationStatus, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            // Only scalar progress is returned; never lend parsed strings.
+            return .{ .schema_validation_token = &self.token, .table_id = "", .active_schema_version = parsed.value.active_schema_version, .state = parsed.value.state, .phase = parsed.value.phase, .ready = parsed.value.ready, .owner_count = parsed.value.owner_count };
+        }
+
+        fn noRowScan(self: *@This(), ctx: *fixture.Context) !void {
+            const reads = @import("../metadata/schema_validation_read.zig");
+            const manager = @import("../metadata/table_manager.zig");
+            const lookup = try @import("schema_validation_recovery.zig").Token.decode(&self.token);
+            const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+            const status = try self.observe(ctx);
+            try std.testing.expectEqual(.succeeded, status.state);
+            var region = std.heap.ArenaAllocator.init(ctx.alloc);
+            defer region.deinit();
+            const a = region.allocator();
+            const table = (try store.resolveSystemCatalogTable(a, lookup.group, .{ .table = "annotated_child" })) orelse return error.MissingCopiedRelation;
+            const source = ctx.data.kernel_owner_source orelse return error.MissingOwnerReadSource;
+            const ranges = try store.listRanges(a, lookup.group);
+            var observed: usize = 0;
+            for (ranges) |range| {
+                if (range.table_id != table.table_id) continue;
+                const address: reads.OwnerAddress = .{ .group_id = range.group_id, .namespace = local.storage_db_online_source_contract.namespaceBytes(.{ .table_id = range.table_id, .shard_id = manager.rangeDocIdentityShardId(range), .range_id = manager.rangeDocIdentityRangeId(range) }) };
+                // Historical observation grants no new execution authority.
+                // A terminal job must not request an already completed release
+                // action or require its departed preparation-root enrollment.
+                const raw = try store.schemaValidationOwnerRead(a, lookup.group, .{ .lookup = lookup, .ordinal = 0, .projection = .replay, .source_owner = address });
+                const control = (try std.json.parseFromSliceLeaky(?reads.ReplayControl, a, raw, .{})) orelse return error.MissingRetainedSchemaOwner;
+                try control.requireFor(lookup, address);
+                const binding = control.owner.binding;
+                const context: local.api_operation.RequestContext = .{ .deadline_ns = platform.time.monotonicNs() +| 5 * std.time.ns_per_s };
+                const retained_header = if (binding.authority == .native)
+                    (try source.nativeSchemaOwnerObservationAtRoot(binding.fence.owner_group_id, table.name, binding, context)).observation.header
+                else
+                    (try source.raftSchemaOwnerObservationAtRoot(binding.fence.owner_group_id, table.name, binding, context)).observation.header;
+                const header = retained_header orelse return error.MissingRetainedSchemaHeader;
+                try std.testing.expectEqual(.object_rename, header.binding.purpose);
+                try std.testing.expectEqual(@as(u64, 0), header.records);
+                try std.testing.expectEqual(@as(u64, 0), header.rows_scanned);
+                observed += 1;
+            }
+            try std.testing.expectEqual(@as(usize, @intCast(status.owner_count.?)), observed);
+            // Native snapshot verification rejoins every retained signature and
+            // reverse-counts all source pointers, rejecting terminal orphans.
+            const checkpoint = try store.snapshotBuilder().buildSnapshot(ctx.alloc, lookup.group);
+            ctx.alloc.free(checkpoint);
+        }
+
+        fn note(self: *@This(), ctx: *fixture.Context, slot: usize, kind: domain.object_annotations.Kind, name: []const u8, expected: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const bound = (try @import("sql_catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "annotated_child" }, false, null)) orelse return error.MissingSourceRelation;
+            const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+            const raw = try store.getSqlObjectAnnotation(a, 2188, .{ .guard = bound.guard, .key = .{ .kind = kind, .name = name } });
+            const value = try std.json.parseFromSliceLeaky(domain.object_annotation_store.Snapshot, a, raw, .{});
+            if (self.ids[slot] == 0) self.ids[slot] = value.object.id else try std.testing.expectEqual(self.ids[slot], value.object.id);
+            try std.testing.expectEqualStrings(expected, (value.annotation orelse return error.MissingObjectAnnotation).description.?);
+        }
+        fn verify(self: *@This(), ctx: *fixture.Context, renamed: bool) !void {
+            try self.note(ctx, 0, .constraint, if (renamed) "check_new" else "check_old", "check note");
+            try self.note(ctx, 1, .constraint, if (renamed) (if (self.final_rename) "unique_final" else "unique_new") else "unique_old", "unique note");
+            try self.note(ctx, 2, .index, if (renamed) (if (self.final_rename) "unique_final" else "unique_new") else "unique_old", "index note");
+            try self.note(ctx, 3, .constraint, if (renamed) "fk_new" else "fk_old", "fk note");
+        }
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.credentials.activate(ctx);
+            try command(ctx, "CREATE TABLE annotated_parent(id TEXT PRIMARY KEY,CONSTRAINT unique_final CHECK(id<>''),CONSTRAINT shared_check_name CHECK(id<>''))", null);
+            _ = try readyTable(ctx, "annotated_parent", 0);
+            try command(ctx, "INSERT INTO annotated_parent(id) VALUES ('p')", null);
+            try command(ctx, "CREATE TABLE annotated_child(id TEXT PRIMARY KEY,parent_id TEXT,amount BIGINT,CONSTRAINT check_old CHECK(amount>=0),CONSTRAINT unique_old UNIQUE(amount),CONSTRAINT fk_old FOREIGN KEY(parent_id) REFERENCES annotated_parent(id))", null);
+            _ = try readyTable(ctx, "annotated_child", 0);
+            try command(ctx, "INSERT INTO annotated_child(id,parent_id,amount) VALUES ('c','p',1)", null);
+            try command(ctx, "CREATE TABLE annotated_grandchild(id TEXT PRIMARY KEY,amount BIGINT REFERENCES annotated_child(amount))", null);
+            _ = try readyTable(ctx, "annotated_grandchild", 0);
+            try command(ctx, "INSERT INTO annotated_grandchild(id,amount) VALUES ('g',1)", null);
+            try command(ctx, "CREATE INDEX shared_check_name ON annotated_child(amount)", null);
+            _ = try readyTable(ctx, "annotated_child", 0);
+            try command(ctx, "COMMENT ON CONSTRAINT check_old ON annotated_child IS 'check note'", null);
+            try command(ctx, "COMMENT ON CONSTRAINT unique_old ON annotated_child IS 'unique note'", null);
+            try command(ctx, "COMMENT ON INDEX unique_old IS 'index note'", null);
+            try command(ctx, "COMMENT ON CONSTRAINT fk_old ON annotated_child IS 'fk note'", null);
+            try self.verify(ctx, false);
+            const primary_before = try primaryFingerprint(ctx, "annotated_child");
+            try command(ctx, "ALTER TABLE annotated_child RENAME CONSTRAINT check_old TO check_new", null);
+            try command(ctx, "ALTER TABLE annotated_child RENAME CONSTRAINT unique_old TO unique_new", null);
+            try command(ctx, "ALTER TABLE annotated_child RENAME CONSTRAINT fk_old TO fk_new", null);
+            _ = try readyTable(ctx, "annotated_child", 0);
+            try self.verify(ctx, true);
+            try std.testing.expectEqualSlices(u8, &primary_before, &try primaryFingerprint(ctx, "annotated_child"));
+            try command(ctx, "INSERT INTO annotated_child(id,parent_id,amount) VALUES ('bad-check','p',-1)", "23514");
+            try command(ctx, "INSERT INTO annotated_child(id,parent_id,amount) VALUES ('bad-unique','p',1)", "23505");
+            try command(ctx, "INSERT INTO annotated_child(id,parent_id,amount) VALUES ('bad-fk','missing',2)", "23503");
+            try command(ctx, "DELETE FROM annotated_child WHERE id='c'", "23503");
+            self.primary = try primaryFingerprint(ctx, "annotated_child");
+            const owner = try readyTable(ctx, "annotated_child", 0);
+            ctx.data.pauseSchemaValidationAckForTest(owner.table_id, .ready);
+            var response = try client.execute(ctx, "ALTER TABLE annotated_child RENAME CONSTRAINT unique_new TO unique_final", .write_admission);
+            defer response.deinit(ctx.alloc);
+            if (response.status != 202) std.debug.print("rename admission status={d} body={s}\n", .{ response.status, response.body });
+            try std.testing.expectEqual(@as(u16, 202), response.status);
+            var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            const token = parsed.value.ddl_receipt.?.schema_validation_token.?;
+            try std.testing.expectEqual(self.token.len, token.len);
+            @memcpy(&self.token, token);
+            const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+            while (!ctx.data.schemaValidationScanPausedForTest()) {
+                if (platform.time.monotonicNs() >= deadline) return error.RenameReadyBarrierTimeout;
+                try ctx.checkDrivers();
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+            }
+            try std.testing.expectEqual(.pending, (try self.observe(ctx)).state);
+            try command(ctx, "CREATE INDEX unique_final ON annotated_parent(id)", "42P07");
+            try self.verify(ctx, true);
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+            while (true) {
+                const state = (try self.observe(ctx)).state;
+                if (state == .succeeded) break;
+                try std.testing.expectEqual(.pending, state);
+                if (platform.time.monotonicNs() >= deadline) return error.ColdRenamePublicationTimeout;
+                try ctx.checkDrivers();
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+            }
+            self.final_rename = true;
+            const parent = try readyTable(ctx, "annotated_parent", 0);
+            const child = try readyTable(ctx, "annotated_child", 0);
+            const grandchild = try readyTable(ctx, "annotated_grandchild", 0);
+            // Serving a row schema does not yet prove recovered FK activation.
+            // Wait on read-only enforcement status; never replay a mutation
+            // merely because a cold owner returned a generic capacity error.
+            try awaitConstraintEnforcement(ctx, "default", "public", "annotated_parent", parent.version);
+            try awaitConstraintEnforcement(ctx, "default", "public", "annotated_child", child.version);
+            try awaitConstraintEnforcement(ctx, "default", "public", "annotated_grandchild", grandchild.version);
+            try self.verify(ctx, true);
+            try self.noRowScan(ctx);
+            try std.testing.expectEqualSlices(u8, &self.primary, &try primaryFingerprint(ctx, "annotated_child"));
+            try command(ctx, "INSERT INTO annotated_child(id,parent_id,amount) VALUES ('bad-fk-cold','missing',2)", "23503");
+            _ = try readyTable(ctx, "annotated_grandchild", 0);
+            try command(ctx, "DELETE FROM annotated_child WHERE id='c'", "23503");
+            try command(ctx, "INSERT INTO annotated_grandchild(id,amount) VALUES ('g-cold',1)", null);
+            // An independent declaration binds the renamed live UNIQUE, while
+            // the original grandchild keeps its previously bound generation.
+            try command(ctx, "CREATE TABLE annotated_late_child(id TEXT PRIMARY KEY,amount BIGINT REFERENCES annotated_child(amount))", null);
+            _ = try readyTable(ctx, "annotated_late_child", 0);
+            try command(ctx, "INSERT INTO annotated_late_child(id,amount) VALUES ('late',1)", null);
+            try command(ctx, "INSERT INTO annotated_late_child(id,amount) VALUES ('missing',99)", "23503");
+        }
+    };
+    try fixture.run(AnnotationRenameCampaign);
+}
+
+test "mounted SQL CASCADE retirement recovers lost source acknowledgement with a cold survivor" {
+    // sql-0158: real metadata/data RPC owners, a durable physical fence whose
+    // reply is lost before its ACK, then cold recovery without replaying SQL.
+    const root = @import("../metadata/table_retirement_ledger.zig");
+    const coordinator = @import("table_retirement_coordinator.zig");
+    const CascadeRecoveryCampaign = struct {
+        pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
+            const users = @import("../usermgr/mod.zig");
+            for ([_]users.ResourceType{ .database, .namespace }) |kind| {
+                var permission = try users.Permission.initOwned(manager.alloc, kind, "*", .admin);
+                defer permission.deinit(manager.alloc);
+                try manager.addPermissionToUser("pk-rewriter", permission);
+            }
+        }
+        pub const native_auth = true;
+        pub const native_sessions = true;
+        pub const cold_catalog = true;
+        credentials: client.ApiKeyHeaders = .{},
+        token: [8192]u8 = undefined,
+        token_len: usize = 0,
+        lookup: root.Lookup = undefined,
+        survivor: fixture.ServingSchema = undefined,
+        fn deferred(err: anyerror) bool {
+            return @import("../metadata/schema_validation_coordinator.zig").isDeferred(err) or switch (err) {
+                error.GenerationAdmissionPending, error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.StorageReadTemporarilyUnavailable, error.IndexBuildPending => true,
+                else => false,
+            };
+        }
+        fn observe(self: *@This(), ctx: *fixture.Context) !wire.SQLCatalogOperationState {
+            const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .recovery_token = self.token[0..self.token_len] }, .{});
+            defer ctx.alloc.free(body);
+            var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.metadata_uri, "/db/v1/sql/operations/status", .POST, body, 5000);
+            defer response.deinit(ctx.alloc);
+            if (response.status != 200) std.debug.print("CASCADE recovery status={d} body={s}\n", .{ response.status, response.body });
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var parsed = try std.json.parseFromSlice(wire.SQLCatalogOperationReceipt, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(wire.SQLCatalogObjectKind.table, parsed.value.kind);
+            try std.testing.expectEqualStrings(self.token[0..self.token_len], parsed.value.recovery_token);
+            if (parsed.value.state == .committed) try std.testing.expect(parsed.value.object_id == null and parsed.value.catalog_revision != null);
+            return parsed.value.state;
+        }
+        fn work(self: *@This(), ctx: *fixture.Context, context: local.api_operation.RequestContext) !std.json.Parsed(root.Work) {
+            const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+            const bytes = try source.systemCatalog(ctx.alloc, context, .{ .table_retirement_owner_work = self.lookup });
+            defer ctx.alloc.free(bytes);
+            return std.json.parseFromSlice(root.Work, ctx.alloc, bytes, .{ .allocate = .alloc_always });
+        }
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.credentials.activateWithCatalog(ctx, true);
+            try command(ctx, "CREATE TABLE usage_records(id BIGINT PRIMARY KEY)", null);
+            _ = try readyTable(ctx, "usage_records", 0);
+            try command(ctx, "CREATE TABLE cascade_survivor(id BIGINT PRIMARY KEY,parent BIGINT REFERENCES usage_records(id))", null);
+            self.survivor = try readyTable(ctx, "cascade_survivor", 0);
+            try command(ctx, "INSERT INTO usage_records VALUES(1)", null);
+            try command(ctx, "INSERT INTO cascade_survivor VALUES(2,1)", null);
+            try command(ctx, "CREATE SEQUENCE cascade_owned OWNED BY usage_records.id", null);
+            try command(ctx, "CREATE VIEW cascade_view AS SELECT id FROM usage_records", null);
+            try command(ctx, "CREATE VIEW cascade_nested AS SELECT id FROM cascade_view", null);
+            const api = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi;
+            const driver = @import("http_server.zig").ApiHttpServer.FkGenerationPublicationTestDriver;
+            try driver.pauseBackground(api, ctx.io);
+            if (ctx.data.http_server) |*data_api| try driver.pauseBackground(data_api, ctx.io);
+            var response = try execute(ctx, "DROP TABLE usage_records CASCADE;", false);
+            defer response.deinit(ctx.alloc);
+            if (response.status != 202) std.debug.print("CASCADE admission status={d} body={s}\n", .{ response.status, response.body });
+            try std.testing.expectEqual(@as(u16, 202), response.status);
+            var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            const accepted = parsed.value.catalog_receipt orelse return error.MissingSqlDropToken;
+            try std.testing.expectEqual(.pending, accepted.state);
+            try std.testing.expect(accepted.recovery_token.len <= self.token.len);
+            @memcpy(self.token[0..accepted.recovery_token.len], accepted.recovery_token);
+            self.token_len = accepted.recovery_token.len;
+            const decoder = std.base64.url_safe_no_pad.Decoder;
+            const decoded = try ctx.alloc.alloc(u8, try decoder.calcSizeForSlice(accepted.recovery_token));
+            defer ctx.alloc.free(decoded);
+            try decoder.decode(decoded, accepted.recovery_token);
+            var token = try std.json.parseFromSlice(struct { request: @import("../metadata/table_retirement_receipt.zig").Request }, ctx.alloc, decoded, .{ .ignore_unknown_fields = true });
+            defer token.deinit();
+            try token.value.request.validate();
+            self.lookup = token.value.request.lookup;
+            const deadline = platform.time.monotonicNs() +| 60 * std.time.ns_per_s;
+            const context: local.api_operation.RequestContext = .{ .deadline_ns = deadline, .setting_admin = true, .schema_validation_authority = true, .fk_generation_publication_authority = true };
+            while (platform.time.monotonicNs() < deadline) {
+                try ctx.checkDrivers();
+                var before = try self.work(ctx, context);
+                defer before.deinit();
+                if (before.value.head.phase == .retiring and before.value.head.physical.?.phase == .fencing_sources) {
+                    if (coordinator.TestDriver.loseOwnerReply(api, 0, context)) |_| return error.RetirementFaultNotObserved else |err| {
+                        if (err == error.InjectedRetirementOwnerReplyLoss) {
+                            var after = try self.work(ctx, context);
+                            defer after.deinit();
+                            try std.testing.expectEqual(before.value.head.revision, after.value.head.revision);
+                            try std.testing.expectEqualDeep(before.value.head.physical, after.value.head.physical);
+                            try std.testing.expectEqual(.pending, try self.observe(ctx));
+                            return;
+                        }
+                        if (!deferred(err)) return err;
+                    }
+                } else {
+                    _ = coordinator.step(api, 0, context) catch |err| blk: {
+                        if (!deferred(err)) return err;
+                        break :blk @as(u64, 0);
+                    };
+                }
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+            }
+            return error.CascadeSourceFaultTimeout;
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.credentials.activateWithCatalog(ctx, true);
+            const deadline = platform.time.monotonicNs() +| 60 * std.time.ns_per_s;
+            while (true) {
+                try ctx.checkDrivers();
+                const state = try self.observe(ctx);
+                if (state == .committed) break;
+                try std.testing.expect(state == .pending);
+                if (platform.time.monotonicNs() >= deadline) return error.CascadeColdRecoveryTimeout;
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+            }
+            const survivor = try readyTable(ctx, "cascade_survivor", self.survivor.version + 1);
+            try std.testing.expectEqual(self.survivor.table_id, survivor.table_id);
+            try expectAbsent(ctx, "usage_records");
+            var rows = try execute(ctx, "SELECT id::text,parent::text FROM cascade_survivor", true);
+            defer rows.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), rows.status);
+            var values = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, rows.body, .{});
+            defer values.deinit();
+            try std.testing.expectEqual(@as(usize, 1), values.value.rows.len);
+            try std.testing.expectEqualStrings("2", values.value.rows[0][0].string);
+            try std.testing.expectEqualStrings("1", values.value.rows[0][1].string);
+            try command(ctx, "INSERT INTO cascade_survivor VALUES(3,999)", null);
+            try command(ctx, "INSERT INTO cascade_survivor VALUES(2,999)", "23505");
+            const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+            const bytes = try source.systemCatalog(ctx.alloc, .{ .setting_admin = true }, .snapshot);
+            defer ctx.alloc.free(bytes);
+            var catalog = try std.json.parseFromSlice(local.system_catalog_domain.State, ctx.alloc, bytes, .{});
+            defer catalog.deinit();
+            for (catalog.value.resources) |resource| for ([_][]const u8{ "cascade_owned", "cascade_view", "cascade_nested" }) |name| try std.testing.expect(!std.mem.eql(u8, resource.name, name));
+        }
+    };
+    try fixture.runWithState(CascadeRecoveryCampaign, .{});
+}
+
+test "mounted SQL connection command admission fences concurrent close commit and statements before durable lookup" {
+    const AdmissionCampaign = struct {
+        pub const native_sessions = true;
+        pub fn beforeRestart(_: *@This(), ctx: *fixture.Context) !void {
+            var opened = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/sql/connections", .POST, "{}", 15_000);
+            defer opened.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), opened.status);
+            var parsed = try std.json.parseFromSlice(wire.SQLConnectionResponse, ctx.alloc, opened.body, .{});
+            defer parsed.deinit();
+            var id: [32]u8 = undefined;
+            try std.testing.expectEqual(id.len, parsed.value.connection_id.len);
+            @memcpy(&id, parsed.value.connection_id);
+            const api = if (ctx.data.http_server) |*value| value else return error.MissingDataPublicApi;
+            const io = api.sharedApiIo() orelse return error.MissingApiIo;
+            const store = api.txn_sessions.durable orelse return error.MissingSessionStore;
+            var connection = switch (store.backend) {
+                .docstore => |backend| blk: {
+                    var txn = try backend.beginReadTxn();
+                    defer txn.abort();
+                    break :blk try @import("sql_connection_record.zig").loadTxn(&txn, ctx.alloc, &id);
+                },
+                .runtime => |backend| blk: {
+                    var txn = try backend.beginRead();
+                    defer txn.abort();
+                    break :blk try @import("sql_connection_record.zig").loadTxn(&txn, ctx.alloc, &id);
+                },
+            };
+            defer connection.deinit();
+            const key: @import("sql_connection_admission.zig").Key = .init(id, connection.value.principal);
+            var held = try api.sql_connection_admission.acquire(api.alloc, io, key);
+            defer held.release(io);
+            var busy = try connected(ctx, &id, "BEGIN");
+            defer busy.deinit(ctx.alloc);
+            try expectDiagnostic(ctx, busy, "55006");
+            const close_path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/sql/connections/{s}", .{id});
+            defer ctx.alloc.free(close_path);
+            var busy_close = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, close_path, .DELETE, null, 15_000);
+            defer busy_close.deinit(ctx.alloc);
+            try expectDiagnostic(ctx, busy_close, "55006");
+            // Admission belongs to this connection, not the server executor.
+            var independent = try connected(ctx, null, "SELECT 2");
+            defer independent.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), independent.status);
+            held.release(io);
+            var began = try connected(ctx, &id, "BEGIN");
+            defer began.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), began.status);
+            held = try api.sql_connection_admission.acquire(api.alloc, io, key);
+            var busy_commit = try connected(ctx, &id, "COMMIT");
+            defer busy_commit.deinit(ctx.alloc);
+            try expectDiagnostic(ctx, busy_commit, "55006");
+            held.release(io);
+            var rollback = try connected(ctx, &id, "ROLLBACK");
+            defer rollback.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), rollback.status);
+            var closed = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, close_path, .DELETE, null, 15_000);
+            defer closed.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), closed.status);
+        }
+        pub fn afterRestart(_: *@This(), _: *fixture.Context) !void {}
+    };
+    try fixture.run(AdmissionCampaign);
 }

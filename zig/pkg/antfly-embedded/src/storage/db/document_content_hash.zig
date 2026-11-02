@@ -157,11 +157,12 @@ pub fn hashRelationalPreparedValuesCanonicalWithOrdinals(
 /// Hash schema-ordinal codec cells without reconstructing a JSON document.
 /// The cell type is intentionally generic to keep the logical hash layer from
 /// depending on the physical row codec.
-pub fn hashRelationalCellsWithOrdinals(
+pub fn hashRelationalCellsCanonicalWithLayout(
     alloc: std.mem.Allocator,
     cells: anytype,
     table_schema: runtime_schema.TableSchema,
     hash_ordinals: []const u32,
+    layout: *const @import("algebraic/relational_row_codec.zig").PhysicalLayout,
 ) !Digest {
     if (cells.len != table_schema.relational_columns.len or
         hash_ordinals.len != table_schema.relational_columns.len)
@@ -180,7 +181,7 @@ pub fn hashRelationalCellsWithOrdinals(
         const column = table_schema.relational_columns[ordinal];
         if (isIgnoredSystemField(column.name)) continue;
         hashBytes(&hasher, column.name);
-        try hashRelationalCellCanonical(alloc, &hasher, cell, column, table_schema.requires_jsonb_display);
+        try hashRelationalCellCanonical(alloc, &hasher, cell, column, ordinal, table_schema.requires_jsonb_display, layout);
     }
     var digest: Digest = undefined;
     hasher.final(&digest);
@@ -191,10 +192,11 @@ pub fn hashRelationalCellsWithOrdinals(
 /// by logical column name, which preserves the canonical object hash while
 /// keeping both work and scratch proportional to row density instead of schema
 /// width. JSON cell bytes must already be canonical.
-pub fn hashRelationalSparseCellsCanonical(
+pub fn hashRelationalSparseCellsCanonicalWithLayout(
     alloc: std.mem.Allocator,
     cells: anytype,
     table_schema: runtime_schema.TableSchema,
+    layout: *const @import("algebraic/relational_row_codec.zig").PhysicalLayout,
 ) !Digest {
     var count: usize = 0;
     var previous_name: ?[]const u8 = null;
@@ -214,7 +216,7 @@ pub fn hashRelationalSparseCellsCanonical(
         const column = table_schema.relational_columns[cell.ordinal];
         if (isIgnoredSystemField(column.name)) continue;
         hashBytes(&hasher, column.name);
-        try hashRelationalCellCanonical(alloc, &hasher, cell, column, table_schema.requires_jsonb_display);
+        try hashRelationalCellCanonical(alloc, &hasher, cell, column, cell.ordinal, table_schema.requires_jsonb_display, layout);
     }
     var digest: Digest = undefined;
     hasher.final(&digest);
@@ -223,12 +225,13 @@ pub fn hashRelationalSparseCellsCanonical(
 
 /// Dense preparation supplies its worker-local inverse ordinal map. Missing
 /// columns use maxInt(u32); no per-column search or extra Cell array is needed.
-pub fn hashRelationalIndexedCellsCanonical(
+pub fn hashRelationalIndexedCellsCanonicalWithLayout(
     alloc: std.mem.Allocator,
     cells: anytype,
     table_schema: runtime_schema.TableSchema,
     hash_ordinals: []const u32,
     positions: []const u32,
+    layout: *const @import("algebraic/relational_row_codec.zig").PhysicalLayout,
 ) !Digest {
     const width = table_schema.relational_columns.len;
     if (hash_ordinals.len != width or positions.len != width) return error.InvalidBatchRequest;
@@ -248,7 +251,7 @@ pub fn hashRelationalIndexedCellsCanonical(
         const column = table_schema.relational_columns[ordinal];
         if (isIgnoredSystemField(column.name)) continue;
         hashBytes(&hasher, column.name);
-        try hashRelationalCellCanonical(alloc, &hasher, cells[index], column, table_schema.requires_jsonb_display);
+        try hashRelationalCellCanonical(alloc, &hasher, cells[index], column, ordinal, table_schema.requires_jsonb_display, layout);
     }
     var digest: Digest = undefined;
     hasher.final(&digest);
@@ -260,7 +263,9 @@ fn hashRelationalCellCanonical(
     hasher: *std.crypto.hash.Blake3,
     cell: anytype,
     column: runtime_schema.RelationalColumn,
+    ordinal: usize,
     preserve_display: bool,
+    layout: *const @import("algebraic/relational_row_codec.zig").PhysicalLayout,
 ) !void {
     if (cell.is_null) {
         hasher.update("n");
@@ -273,9 +278,10 @@ fn hashRelationalCellCanonical(
     switch (column.column_type) {
         .enumeration => {
             const record = cell.enum_record orelse return error.InvalidRelationalRow;
-            if (column.named_type_id != record.identity.id) return error.InvalidRelationalRow;
+            const expected = try layout.enumRecordForColumn(column, ordinal);
+            if (expected.identity.id != record.identity.id or !std.mem.eql(u8, &expected.identity.origin_id, &record.identity.origin_id)) return error.InvalidRelationalRow;
             const symbol = std.math.cast(u32, cell.value.i64_val) orelse return error.InvalidSqlEnumSymbol;
-            _ = try record.definition.byId(symbol);
+            _ = try expected.definition.byId(symbol);
             hasher.update("antfly:sql-enum-symbol:v1\x00");
             hasher.update(&record.identity.origin_id);
             hashInt(hasher, u32, symbol);
@@ -955,7 +961,7 @@ fn hashRelationalColumnValue(
     switch (column.column_type) {
         .enumeration => {
             if (value != .string) return error.InvalidBatchRequest;
-            const record = runtime_schema.namedType(table_schema, column.named_type_id orelse return error.InvalidSchema) orelse return error.InvalidSchema;
+            const record = try runtime_schema.namedEnumBaseRecord(table_schema, column.named_type_id orelse return error.InvalidSchema);
             // The compatibility JSON hash boundary has no prepared row. Native
             // apply hashes prepared symbols directly; avoid allocating a type
             // directory merely to validate this bounded fallback label.

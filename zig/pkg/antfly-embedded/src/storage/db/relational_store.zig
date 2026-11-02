@@ -183,7 +183,7 @@ pub fn validateCanonicalValueForSchemaAndLayout(
                 return std.mem.lessThan(u8, columns[lhs.ordinal].name, columns[rhs.ordinal].name);
             }
         }.lessThan);
-        const computed_hash = try document_content_hash.hashRelationalSparseCellsCanonical(alloc, cells, table_schema);
+        const computed_hash = try document_content_hash.hashRelationalSparseCellsCanonicalWithLayout(alloc, cells, table_schema, layout);
         if (!std.mem.eql(u8, &stored_hash, &computed_hash)) return error.RelationalRowSemanticHashMismatch;
         return;
     }
@@ -201,11 +201,12 @@ pub fn validateCanonicalValueForSchemaAndLayout(
         if (!cell.is_json or cell.is_null) continue;
         try validateCanonicalJsonCell(alloc, cell.value.bytes_val, table_schema.requires_jsonb_display);
     }
-    const computed_hash = try document_content_hash.hashRelationalCellsWithOrdinals(
+    const computed_hash = try document_content_hash.hashRelationalCellsCanonicalWithLayout(
         alloc,
         cells,
         table_schema,
         layout.hash_ordinals,
+        layout,
     );
     if (!std.mem.eql(u8, &stored_hash, &computed_hash)) return error.RelationalRowSemanticHashMismatch;
 }

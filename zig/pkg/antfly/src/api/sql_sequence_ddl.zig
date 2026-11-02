@@ -128,6 +128,10 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     };
     try authorize(server, identity, a, entry.target);
     if (try knownObject(entry, creating, ddl.conditional)) return .{};
+    if (entry.value == .sequence and entry.value.sequence.internal_identity) {
+        if (ddl.action == .drop) return error.SqlDependentObjectsExist;
+        if (ddl.action == .alter_sequence and ddl.sequence_options != null and ddl.sequence_options.?.owned_by != .unchanged) return error.SqlIdentitySequenceOwnership;
+    }
     const expected: ?seq.Identity = if (entry.value == .sequence) .{ .id = entry.value.sequence.id, .generation = entry.value.sequence.generation } else null;
     var options: seq.sequence.Options = .{};
     var guard: ?domain.RelationMutationGuard = null;
@@ -198,6 +202,8 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     var receipt = try recovery.newReceipt(allocators.result, a, request, cut.revision);
     errdefer receipt.deinit(allocators.result);
     try context.ensureActive();
+    if (ddl.action == .drop and ddl.cascade and entry.value == .sequence)
+        if (try beginRetirementIfNeeded(server, identity, context, allocators, request, cut.revision, receipt)) |outcome| return outcome;
     const bytes = server.source.systemCatalog(a, private, .{ .sql_sequence_mutate = request }) catch null;
     // A successful transport may still carry an exact known rejection.
     // Every transport/decode/allocation/cancellation failure after entering
@@ -211,4 +217,55 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
         return .{ .catalog_receipt = receipt };
     }
     return .{ .mutation_outcome = null, .catalog_receipt = receipt };
+}
+
+fn beginRetirementIfNeeded(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, allocators: catalog.DdlAllocators, request: seq.Mutation, revision: u64, receipt: catalog.CatalogOperationReceipt) !?catalog.DdlOutcome {
+    const io = server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
+    var private = try context.platformDeadline();
+    private.setting_admin = true;
+    private.schema_validation_authority = true;
+    {
+        var preparation_region = std.heap.ArenaAllocator.init(allocators.scratch);
+        defer preparation_region.deinit();
+        const captured = try snapshot(server, preparation_region.allocator(), private, .{ .targets = &.{request.target}, .sequence_ids = &.{request.operation.drop.expected.?.id}, .incarnation = request.incarnation, .prepare_retirement = true });
+        if ((captured.retirement orelse return error.CatalogGenerationChanged).references.count == 0) return null;
+        var transport: @import("schema_validation_owner_transport.zig").Transport = .{ .server = server, .alloc = allocators.scratch };
+        defer transport.deinit();
+        var owned = try @import("schema_validation_plan_builder.zig").buildSequenceRetirement(&transport, allocators.scratch, io, private, captured, request);
+        defer owned.deinit();
+        try context.ensureActive();
+        const admission = @import("schema_validation_admission.zig");
+        const attempt: ?admission.BeginAttempt = admission.beginWhenReady(server.source, allocators.scratch, io, private, owned.command) catch |err| switch (err) {
+            error.MetadataReplicationPending => return error.CatalogPublicationProofPending,
+            error.Forbidden, error.CatalogGenerationChanged, error.GenerationPublicationChanged, error.MetadataIncarnationMismatch, error.TableTopologyProtocolUpgradeRequired, error.CatalogOccupancyNotReady, error.CatalogPublicationProofPending, error.UnsupportedNativeIndexOwner, error.RowPolicyUnsupported => return err,
+            else => null,
+        };
+        if (attempt) |value| switch (value) {
+            .reply => |bytes| allocators.scratch.free(bytes),
+            .rejected => |err| return err,
+        };
+    }
+    // Only bounded observation remains. Expiry returns the receipt that was
+    // allocated before admission, never a misleading retryable DDL failure.
+    var poll_context = context.platformDeadline() catch return retainedRetirement(receipt);
+    if (allocators.completion == .bounded) poll_context.deadline_ns = @min(poll_context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s);
+    var result = receipt;
+    var region = std.heap.ArenaAllocator.init(allocators.scratch);
+    defer region.deinit();
+    while (true) {
+        _ = region.reset(.retain_capacity);
+        if (recovery.observe(server, identity, poll_context, region.allocator(), request, revision)) |known| {
+            recovery.complete(&result, known);
+            if (known != .pending) {
+                _ = try known.result();
+                return .{ .catalog_receipt = result };
+            }
+        } else break;
+        poll_context.ensureActive() catch break;
+        io.sleep(.fromMilliseconds(20), .awake) catch break;
+    }
+    return retainedRetirement(result);
+}
+fn retainedRetirement(receipt: catalog.CatalogOperationReceipt) catalog.DdlOutcome {
+    return .{ .mutation_outcome = if (receipt.state == .pending) .committed_pending else null, .catalog_receipt = receipt };
 }

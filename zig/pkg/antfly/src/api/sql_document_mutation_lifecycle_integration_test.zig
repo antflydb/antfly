@@ -1389,3 +1389,180 @@ test "SQL assignment target domains distinguish composites qualifiers and quoted
     try table.validateInsertTargets(&.{ "profile", "metadata.profile" });
     try std.testing.expectError(error.SqlAssignmentTypeMismatch, table.validateInsertTargets(&.{"metadata\x00profile"}));
 }
+
+test "mounted SQL original index and constraint comments preserve schemas rows authorization and cold object identities" {
+    const domain = local.system_catalog_domain;
+    const objects = domain.object_annotations;
+    const Reference = struct {
+        format: u8,
+        cases: []const struct { id: []const u8, steps: []const struct { sql: []const u8, description: ?[]const u8 }, denied_sqlstate: []const u8 },
+        missing_index_sqlstate: []const u8,
+        missing_constraint_sqlstate: []const u8,
+    };
+    const ObjectCommentCampaign = struct {
+        pub const native_sessions = true;
+        pub const native_auth = true;
+        pub const cold_catalog = true;
+        inner: SourceCampaign,
+        reference: Reference,
+        initial: ?@import("../metadata/table_manager.zig").TableRecord = null,
+        index_id: u64 = 0,
+        constraint_id: u64 = 0,
+
+        fn command(ctx: *fixture.Context, sql: []const u8, code: ?[]const u8) !void {
+            var response = try client.execute(ctx, sql, .write_admission);
+            defer response.deinit(ctx.alloc);
+            if (code) |expected| {
+                if (response.status != 400 and response.status != 403) std.debug.print("object comment rejected sql={s} expected={s} status={d} body={s}\n", .{ sql, expected, response.status, response.body });
+                try std.testing.expect(response.status == 400 or response.status == 403);
+                var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
+                defer diagnostic.deinit();
+                try std.testing.expectEqualStrings(expected, diagnostic.value.code);
+            } else {
+                if (response.status != 200) std.debug.print("object comment sql={s} status={d} body={s}\n", .{ sql, response.status, response.body });
+                try std.testing.expectEqual(@as(u16, 200), response.status);
+                if (std.mem.startsWith(u8, sql, "COMMENT")) {
+                    var result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+                    defer result.deinit();
+                    try std.testing.expectEqualStrings("COMMENT", result.value.command_tag);
+                    try std.testing.expectEqual(@as(i64, 0), result.value.rows_affected);
+                    try std.testing.expectEqual(@as(usize, 0), result.value.rows.len);
+                }
+            }
+        }
+
+        fn verifyIndexResource(ctx: *fixture.Context, description: ?[]const u8) !void {
+            const time = @import("antfly_platform").time;
+            for ([_][]const u8{
+                "/db/v1/databases/default/namespaces/public/tables/usage_records/indexes/usage_records_status_idx",
+                "/db/v1/databases/default/namespaces/public/tables/usage_records/indexes",
+            }) |suffix| {
+                const deadline = time.monotonicNs() +| 5 * std.time.ns_per_s;
+                while (true) {
+                    var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, suffix, .GET, null, 1_000);
+                    defer response.deinit(ctx.alloc);
+                    if (response.status == 503 or response.status == 409) {
+                        if (time.monotonicNs() >= deadline) return error.IndexAnnotationReadTimeout;
+                        try ctx.checkDrivers();
+                        try ctx.io.sleep(.fromMilliseconds(20), .awake);
+                        continue;
+                    }
+                    if (response.status != 200) std.debug.print("index annotation GET status={d} body={s}\n", .{ response.status, response.body });
+                    try std.testing.expectEqual(@as(u16, 200), response.status);
+                    var parsed = try std.json.parseFromSlice(Json, ctx.alloc, response.body, .{});
+                    defer parsed.deinit();
+                    const config = if (parsed.value == .array) selected: {
+                        for (parsed.value.array.items) |resource| {
+                            const candidate = resource.object.get("config").?;
+                            if (std.mem.eql(u8, candidate.object.get("name").?.string, "usage_records_status_idx")) break :selected candidate;
+                        }
+                        return error.IndexAnnotationResourceMissing;
+                    } else parsed.value.object.get("config").?;
+                    const actual = config.object.get("description");
+                    if (description) |text| try std.testing.expectEqualStrings(text, actual.?.string) else try std.testing.expect(actual == null or actual.? == .null);
+                    break;
+                }
+            }
+        }
+
+        fn verify(self: *@This(), ctx: *fixture.Context, key: objects.Key, description: ?[]const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const captured = (try @import("sql_catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "usage_records" }, false, null)) orelse return error.MissingSourceRelation;
+            const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+            const current = (try store.getTable(a, 2188, captured.guard.owner.table_id)) orelse return error.MissingSourceRelation;
+            try std.testing.expect(@import("../metadata/table_manager.zig").tableDefinitionsEqual(self.initial.?, current));
+            const bytes = try store.getSqlObjectAnnotation(a, 2188, .{ .guard = captured.guard, .key = key });
+            const snapshot = try std.json.parseFromSliceLeaky(domain.object_annotation_store.Snapshot, a, bytes, .{});
+            const id = if (key.kind == .index) &self.index_id else &self.constraint_id;
+            if (id.* == 0) id.* = snapshot.object.id else try std.testing.expectEqual(id.*, snapshot.object.id);
+            const note = snapshot.annotation orelse return error.MissingObjectAnnotation;
+            if (description) |text| try std.testing.expectEqualStrings(text, note.description.?) else try std.testing.expect(note.description == null);
+            try self.inner.fingerprints(ctx, .prepared);
+            try self.inner.verifyRows(ctx);
+            if (key.kind == .index) {
+                try verifyIndexResource(ctx, description);
+                var reader = ctx.*;
+                reader.headers = ctx.reader_headers;
+                try verifyIndexResource(&reader, description);
+            }
+        }
+
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.inner.setup(ctx);
+            ctx.headers = ctx.admin_headers;
+            try command(ctx, "CREATE INDEX usage_records_status_idx ON usage_records(status)", null);
+            try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, "usage_records");
+            {
+                const a = self.inner.retained.allocator();
+                const captured = (try @import("sql_catalog.zig").captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "usage_records" }, false, null)) orelse return error.MissingSourceRelation;
+                const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+                _ = try fixture.waitServingSchema(ctx, "usage_records", captured.guard.owner.schema_version);
+                const time = @import("antfly_platform").time;
+                const deadline = time.monotonicNs() +| 5 * std.time.ns_per_s;
+                while (true) {
+                    const current = (try store.getTable(ctx.alloc, 2188, captured.guard.owner.table_id)) orelse return error.MissingSourceRelation;
+                    defer @import("../metadata/table_manager.zig").freeTable(ctx.alloc, current);
+                    if (current.read_schema_json.len == 0) {
+                        self.initial = try @import("../metadata/table_manager.zig").cloneTable(a, current);
+                        break;
+                    }
+                    if (time.monotonicNs() >= deadline) return error.CatalogPublicationProofPending;
+                    try ctx.checkDrivers();
+                    try ctx.io.sleep(.fromMilliseconds(10), .awake);
+                }
+            }
+            var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+            defer corpus.deinit();
+            const ids = [_][]const u8{ "sql-0144", "sql-0145" };
+            try std.testing.expectEqual(ids.len, self.reference.cases.len);
+            for (self.reference.cases, ids) |item, id| {
+                try std.testing.expectEqualStrings(id, item.id);
+                const key: objects.Key = if (std.mem.eql(u8, item.id, "sql-0144")) .{ .kind = .index, .name = "usage_records_status_idx" } else .{ .kind = .constraint, .name = "usage_records_status_check" };
+                const original = (try corpus.get(item.id)).sql;
+                try std.testing.expectEqualStrings(original, item.steps[0].sql);
+                try std.testing.expectEqual(@as(usize, 5), item.steps.len);
+                for (item.steps) |step| {
+                    try command(ctx, step.sql, null);
+                    try self.verify(ctx, key, step.description);
+                }
+                var reader = ctx.*;
+                reader.headers = ctx.reader_headers;
+                try command(&reader, original, item.denied_sqlstate);
+                try self.verify(ctx, key, item.steps[item.steps.len - 1].description);
+            }
+            try command(ctx, "COMMENT ON INDEX missing_index IS 'no'", self.reference.missing_index_sqlstate);
+            try command(ctx, "COMMENT ON CONSTRAINT missing_constraint ON usage_records IS 'no'", self.reference.missing_constraint_sqlstate);
+            try self.inner.verify(ctx, false);
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            _ = try fixture.waitServingSchema(ctx, "usage_records", 0);
+            try self.verify(ctx, .{ .kind = .index, .name = "usage_records_status_idx" }, "status lookup");
+            try self.verify(ctx, .{ .kind = .constraint, .name = "usage_records_status_check" }, "valid status");
+            try self.inner.verify(ctx, true);
+        }
+    };
+    const a = std.testing.allocator;
+    var reference = try std.json.parseFromSlice(Reference, a, local.sql_parity_fixtures.object_comment_reference, .{});
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(u8, 1), reference.value.format);
+    var retained = std.heap.ArenaAllocator.init(a);
+    defer retained.deinit();
+    const rows = [_][]const Json{ &.{ .{ .string = "u1" }, .{ .string = "before" } }, &.{ .{ .string = "u9" }, .{ .string = "untouched" } } };
+    try fixture.runWithState(ObjectCommentCampaign, .{ .reference = reference.value, .inner = .{ .retained = &retained, .entry = .{
+        .id = "sql-0144",
+        .profile = "description",
+        .command_tag = "COMMENT",
+        .affected = 0,
+        .sqlstate = null,
+        .output = .{ .columns = &.{}, .column_oids = &.{}, .rows = &.{} },
+        .tables = &.{.{
+            .name = "usage_records",
+            .create = "CREATE TABLE usage_records(id TEXT PRIMARY KEY,status TEXT,CONSTRAINT usage_records_status_check CHECK(status IN ('before','untouched')))",
+            .seed = "INSERT INTO usage_records(id,status) VALUES ('u1','before'),('u9','untouched')",
+            .read = "SELECT id,status FROM usage_records ORDER BY id",
+            .final = .{ .columns = &.{ "id", "status" }, .column_oids = &.{ 25, 25 }, .rows = &rows },
+        }},
+    } } });
+}

@@ -42,8 +42,11 @@ pub const Scalar = union(enum) {
         temporal_kind: ?@import("temporal_value.zig").Kind = null,
         element_type: ?@import("array_value.zig").ElementType = null,
         numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
+        /// Normalized declaration spelling, resolved once during preparation.
+        named_type: ?Name = null,
         /// Immutable statement-bound type; durable SQL retains its type-name intent.
         enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
+        domain_view: ?*const @import("../schema/domain_value.zig").View = null,
         /// Coercion origin controls binding diagnostics, not execution identity.
         coercion: enum { explicit, function } = .explicit,
         context: @import("../system_catalog/casts.zig").Context = .explicit,
@@ -313,7 +316,7 @@ pub const Merge = struct {
 };
 /// Array element identity belongs to the accompanying binding descriptor;
 /// an array is never represented as a JSON column or an unknown NULL type.
-pub const ColumnType = enum { string, uuid, integer, number, boolean, datetime, json, array, numrange, daterange, tsrange, tstzrange, enumeration };
+pub const ColumnType = enum { string, uuid, integer, number, boolean, datetime, json, array, numrange, daterange, tsrange, tstzrange, enumeration, bytea };
 pub const ForeignKey = struct {
     not_valid: bool = false,
     name: []const u8,
@@ -330,6 +333,11 @@ pub const ForeignKey = struct {
 pub const Column = struct {
     name: []const u8,
     type: ColumnType,
+    /// Declaration spelling resolves once before schema lowering. Executable
+    /// views borrow the statement preparation owner, never a catalog cache.
+    named_type: ?Name = null,
+    enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
+    domain_view: ?*const @import("../schema/domain_value.zig").View = null,
     /// Exact declared builtin identity, including an array's element width.
     /// Declared array dimensions are not PostgreSQL type identity and are not
     /// retained here. Durable schema admission must not infer this from rows.
@@ -348,8 +356,33 @@ pub const DocumentTable = struct {
     enforce_types: bool = false,
     schemas: []const struct { name: []const u8, schema_json: []const u8 },
 };
-pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null, document: ?*const DocumentTable = null, persistence: RelationPopulation.Persistence = .permanent };
-pub const DropTable = struct { table: Name, if_exists: bool = false };
+/// LIKE copies declarations, never live index/counter/layout ownership.
+pub const LikeOption = enum { comments, compression, constraints, defaults, generated, identity, indexes, statistics, storage };
+pub const LikeOptions = packed struct {
+    comments: bool = false,
+    compression: bool = false,
+    constraints: bool = false,
+    defaults: bool = false,
+    generated: bool = false,
+    identity: bool = false,
+    indexes: bool = false,
+    statistics: bool = false,
+    storage: bool = false,
+
+    pub fn set(self: *@This(), option: LikeOption, include: bool) void {
+        switch (option) {
+            inline else => |tag| @field(self.*, @tagName(tag)) = include,
+        }
+    }
+    pub fn setAll(self: *@This(), include: bool) void {
+        const std = @import("std");
+        inline for (comptime std.meta.tags(LikeOption)) |option| self.set(option, include);
+    }
+};
+pub const LikeTable = struct { source: Name, column_offset: usize, options: LikeOptions = .{} };
+
+pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, like_tables: []const LikeTable = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null, document: ?*const DocumentTable = null, persistence: RelationPopulation.Persistence = .permanent };
+pub const DropTable = struct { table: Name, if_exists: bool = false, cascade: bool = false };
 /// Immutable SQL intent, not a catalog identity. OWNED BY names must bind to
 /// stable relation/attribute IDs in the authoritative catalog transaction.
 pub const SequenceOptions = struct {
@@ -409,9 +442,49 @@ pub const RelationPopulation = struct {
     }
 };
 
+/// SQL maintenance intent. Physical execution is bound to a table generation
+/// by the catalog adapter, never supplied by the SQL client.
+pub const Maintenance = struct {
+    operation: enum { vacuum, analyze, reindex },
+    full: bool = false,
+    verbose: bool = false,
+    analyze: bool = false,
+    columns: []const []const u8 = &.{},
+};
+
+pub const Authorization = struct {
+    pub const Grantee = union(enum) { public, role: []const u8 };
+    operation: enum { grant, revoke, create_role, drop_role },
+    scope: enum { roles, tables, all_tables, defaults } = .roles,
+    privileges: []const @import("../system_catalog/privileges.zig").Privilege = &.{},
+    all_privileges: bool = false,
+    roles: []const []const u8 = &.{},
+    grantees: []const Grantee = &.{},
+    tables: []const Name = &.{},
+    schemas: []const Name = &.{},
+    default_owners: []const []const u8 = &.{},
+    option: bool = false,
+    option_only: bool = false,
+    cascade: bool = false,
+};
+
+pub const DomainCheck = struct {
+    name: ?[]const u8 = null,
+    expression: *const Scalar,
+    not_valid: bool = false,
+};
+pub const DomainDefinition = union(enum) {
+    create: struct { base: Column, checks: []const DomainCheck },
+    set_not_null: bool,
+    set_default: ?*const Scalar,
+    add_check: DomainCheck,
+    validate_check: []const u8,
+    drop_check: struct { name: []const u8, if_exists: bool = false, cascade: bool = false },
+};
+
 pub const CatalogDdl = struct {
     kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator, aggregate, cast, named_type },
-    action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, role_default, comment, alter_sequence, populate },
+    action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, role_default, comment, alter_sequence, populate, maintenance },
     name: Name,
     new_name: ?[]const u8 = null,
     tablespace: ?[]const u8 = null,
@@ -423,12 +496,15 @@ pub const CatalogDdl = struct {
     cascade: bool = false,
     /// Index names are namespace relations, not names of their owning table.
     index_table: ?Name = null,
+    native_index: ?struct { field: []const u8, analyzer: []const u8 = "standard" } = null,
     index_targets: []const Name = &.{},
     concurrently: bool = false,
     view_definition: ?ViewDefinition = null,
     role_setting: ?struct { name: []const u8, database: ?[]const u8, value: ?Value } = null,
+    authorization: ?Authorization = null,
     comment_value: ?[]const u8 = null,
     comment_column: ?[]const u8 = null,
+    comment_object: ?@import("../system_catalog/object_annotations.zig").Key = null,
     sequence_options: ?SequenceOptions = null,
     sequence_targets: []const Name = &.{},
     population: ?RelationPopulation = null,
@@ -436,6 +512,9 @@ pub const CatalogDdl = struct {
     routine: ?RoutineDefinition = null,
     routine_signature: ?[]const RoutineDefinition.Type = null,
     operator_function: ?Name = null,
+    maintenance: ?Maintenance = null,
+    named_type_kind: enum { enumeration, domain } = .enumeration,
+    domain_definition: ?DomainDefinition = null,
     enum_definition: ?union(enum) {
         create: []const []const u8,
         add: struct { label: []const u8, placement: @import("../system_catalog/named_types.zig").Placement = .end, if_not_exists: bool = false },
@@ -466,6 +545,7 @@ pub const RoutineDefinition = struct {
     pub const Argument = struct { name: ?[]const u8 = null, type: Type };
     arguments: []const Argument,
     result: ?Type = null,
+    returns_trigger: bool = false,
     language: enum { sql, plpgsql } = .sql,
     body: []const u8,
     replace: bool = false,
@@ -518,6 +598,7 @@ pub const PolicyDdl = struct {
     if_exists: bool = false,
     command: enum { all, select, insert, update, delete } = .all,
     roles: []const []const u8 = &.{},
+    role_targets: []const Authorization.Grantee = &.{},
     roles_specified: bool = false,
     permissive: bool = true,
     using: ?*const Scalar = null,
@@ -643,6 +724,8 @@ pub const Explain = struct {
     }
 };
 
+pub const PreparedTransaction = struct { action: enum { prepare, commit, rollback }, gid: []const u8 };
+
 pub const Statement = union(enum) {
     /// Read plan plus output contract. Ordinary execute must never silently
     /// expose this as SELECT; the COPY-capable stream owns protocol framing.
@@ -667,6 +750,7 @@ pub const Statement = union(enum) {
     release_savepoint: []const u8,
     set_constraints: struct { names: []const []const u8, deferred: bool },
     set_transaction: @import("session.zig").Characteristics,
+    prepared_transaction: PreparedTransaction,
     call: struct { name: Name, arguments: []const *const Scalar },
 };
 

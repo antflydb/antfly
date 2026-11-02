@@ -21,6 +21,7 @@ pub const RaftApplyStoreConfig = if (storage_source_options.control_only) raft_a
 pub const AppliedMetadataCheckpoint = raft_apply_store.AppliedMetadataCheckpoint;
 pub const TransitionCommand = raft_apply_store.TransitionCommand;
 pub const ColumnDescriptionCommand = raft_apply_store.ColumnDescriptionCommand;
+pub const ObjectDescriptionCommand = raft_apply_store.ObjectDescriptionCommand;
 pub const ExtensionLifecycleDelta = raft_apply_store.ExtensionLifecycleDelta;
 pub const ExtensionLifecycleTablePrecondition = raft_apply_store.ExtensionLifecycleTablePrecondition;
 pub const ExtensionMemberKey = raft_apply_store.ExtensionMemberKey;

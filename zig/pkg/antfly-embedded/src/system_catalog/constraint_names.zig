@@ -43,6 +43,7 @@ pub const Candidate = struct {
     table: []const u8,
     kind: Kind,
     sequence_label: bool = false,
+    index_label: bool = false,
     addition: [max_name_bytes * 2 + 1]u8 = undefined,
     addition_len: usize = 0,
 
@@ -55,6 +56,12 @@ pub const Candidate = struct {
     pub fn initSequence(table: []const u8, column: []const u8) !Candidate {
         var candidate = try initKind(table, &.{column}, .unique);
         candidate.sequence_label = true;
+        return candidate;
+    }
+
+    pub fn initIndex(table: []const u8, columns: []const []const u8) !Candidate {
+        var candidate = try initKind(table, columns, .unique);
+        candidate.index_label = true;
         return candidate;
     }
 
@@ -98,7 +105,7 @@ pub const Candidate = struct {
     /// numeric label and shorten table/key prefixes at UTF-8 boundaries.
     pub fn format(self: *const Candidate, attempt: u32, output: *[max_name_bytes]u8) ![]const u8 {
         var label_buffer: [15]u8 = undefined;
-        const stem = if (self.sequence_label) "seq" else switch (self.kind) {
+        const stem = if (self.sequence_label) "seq" else if (self.index_label) "idx" else switch (self.kind) {
             .primary => "pkey",
             .unique => "key",
             .check => "check",

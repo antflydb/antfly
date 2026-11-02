@@ -342,7 +342,7 @@ const State = struct {
 
 fn scalarColumns(a: A, columns: []const binding.Column) ![]const scalar.Column {
     const result = try a.alloc(scalar.Column, columns.len);
-    for (columns, result) |column, *out| out.* = .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .nullable = column.nullable };
+    for (columns, result) |column, *out| out.* = .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .nullable = column.nullable };
     return result;
 }
 

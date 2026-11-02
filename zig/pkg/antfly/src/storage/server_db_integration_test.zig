@@ -4310,3 +4310,186 @@ test "server index status reports ready for converged plural-source dense artifa
     };
     try engine.test_support.expectPluralSourceDenseConvergence(Observer.observe);
 }
+
+test "external prepared native owners retain typed MVCC across restart and activate before resolution" {
+    const a = std.testing.allocator;
+    const dispatch = @import("server_transaction_dispatch.zig");
+    const codec = @import("antfly_local_sources").api_batch;
+    const contract = @import("antfly_local_sources").api_local_transaction_contract;
+    const admission: transactions_mod.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = @import("antfly_platform").time.realtimeNs() + std.time.ns_per_min };
+    const id: types.TxnId = @splat(67);
+    const groups = [_]u64{ 72, 82 };
+    const Apply = struct {
+        fn run(db: *DB, group: u64, req: types.BatchRequest, index: u64) !void {
+            var stamped = req;
+            stamped.timestamp_ns = @max(1, platform_clock.Clock.real().nowRealtimeNs());
+            const bytes = try codec.encodeBatchRequest(std.testing.allocator, stamped);
+            defer std.testing.allocator.free(bytes);
+            var parsed = try codec.parseInternalBatchRequest(std.testing.allocator, bytes);
+            defer parsed.deinit(std.testing.allocator);
+            try dispatch.applyReplicatedTransactionMutationAtRaftEntry(std.testing.allocator, db, "rows", group, parsed.req, .{ .term = 1, .index = index });
+        }
+        fn expectRow(reader: anytype, expected: i64) !void {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const row = (try reader.lookupTypedRow(arena.allocator(), "row")).?;
+            try std.testing.expectEqual(expected, row.typed.?.object.get("n").?.integer);
+        }
+        fn options(group: u64) OpenOptions {
+            return .{ .identity_namespace = .{ .table_id = 71, .shard_id = group, .range_id = group }, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+        }
+    };
+    for ([_]types.TxnStatus{ .committed, .aborted }) |decision| {
+        var first_dir = try TestDirectory.init("external-first");
+        defer first_dir.cleanup();
+        var second_dir = try TestDirectory.init("external-second");
+        defer second_dir.cleanup();
+        const paths = [_][]const u8{ first_dir.path(), second_dir.path() };
+        const p0 = try contract.participantIdForGroup(a, "rows", groups[0]);
+        defer a.free(p0);
+        const p1 = try contract.participantIdForGroup(a, "rows", groups[1]);
+        defer a.free(p1);
+        for (paths, groups) |path, group| {
+            var db = try DB.open(a, path, Apply.options(group));
+            defer db.close();
+            const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
+            try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+            try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"n\":0}" }} });
+            try Apply.run(&db, group, .{ .transaction = .{ .begin = .{ .txn_id = id, .begin_timestamp = 10, .created_at_ns = 1, .topology_epoch = 0, .participants = &.{ p0, p1 }, .retain_terminal = true, .external_decision_owner = admission } } }, 1);
+            try Apply.run(&db, group, .{ .writes = &.{.{ .key = "row", .value = "{\"n\":1}" }}, .transaction = .{ .prepare = .{ .txn_id = id, .topology_epoch = 0, .external_decision_owner = admission } } }, 2);
+        }
+        {
+            var first = try DB.open(a, paths[0], Apply.options(groups[0]));
+            defer first.close();
+            var second = try DB.open(a, paths[1], Apply.options(groups[1]));
+            defer second.close();
+            const owners = [_]*DB{ &first, &second };
+            var before_first = try first.beginRelationalRows(a, .{ .fields = &.{"n"} });
+            defer before_first.deinit();
+            var before_second = try second.beginRelationalRows(a, .{ .fields = &.{"n"} });
+            defer before_second.deinit();
+            try Apply.expectRow(&before_first, 0);
+            try Apply.expectRow(&before_second, 0);
+            for (owners, groups) |db, group| {
+                try std.testing.expectError(error.IntentConflict, db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"n\":2}" }} }));
+                var changed = admission;
+                changed.operation_id[0] ^= 1;
+                try std.testing.expectError(error.ExternalTransactionDecisionChanged, Apply.run(db, group, .{ .transaction = .{ .prepare = .{ .txn_id = id, .topology_epoch = 0, .external_decision_owner = changed, .external_activation = true } } }, 3));
+                try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
+            }
+            if (decision == .committed) {
+                for (owners, groups) |db, group| {
+                    try std.testing.expectError(error.ExternalTransactionCommitNotActivated, Apply.run(db, group, .{ .transaction = .{ .resolve = .{ .txn_id = id, .status = .committed, .commit_version = 20, .external_decision_owner = admission } } }, 3));
+                    const activate: types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = id, .topology_epoch = 0, .external_decision_owner = admission, .external_activation = true } } };
+                    try Apply.run(db, group, activate, 3);
+                    try Apply.run(db, group, activate, 3);
+                }
+            }
+            for (owners, groups, 0..) |db, group, i| {
+                if (decision == .committed) {
+                    try std.testing.expectError(error.IntentConflict, db.beginRelationalRows(a, .{ .fields = &.{"n"} }));
+                    try std.testing.expectError(error.IntentConflict, db.captureRelationalStatementSnapshot());
+                } else {
+                    var current = try db.beginRelationalRows(a, .{ .fields = &.{"n"} });
+                    defer current.deinit();
+                    try Apply.expectRow(&current, 0);
+                }
+                const resolve: types.BatchRequest = .{ .transaction = .{ .resolve = .{ .txn_id = id, .status = decision, .commit_version = 20, .external_decision_owner = admission } } };
+                const position: u64 = if (decision == .committed) 4 else 3;
+                try Apply.run(db, group, resolve, position);
+                try Apply.run(db, group, resolve, position);
+                var after = try db.beginRelationalRows(a, .{ .fields = &.{"n"} });
+                defer after.deinit();
+                try Apply.expectRow(&after, if (decision == .committed) 1 else 0);
+                try Apply.expectRow(&before_first, 0);
+                try Apply.expectRow(&before_second, 0);
+                if (i == 0) try std.testing.expectEqual(types.TxnStatus.pending, try second.getTransactionStatus(id));
+            }
+        }
+        for (paths, groups) |path, group| {
+            var db = try DB.open(a, path, Apply.options(group));
+            defer db.close();
+            var reader = try db.beginRelationalRows(a, .{ .fields = &.{"n"} });
+            defer reader.deinit();
+            try Apply.expectRow(&reader, if (decision == .committed) 1 else 0);
+            try std.testing.expectEqual(decision, try db.getTransactionStatus(id));
+        }
+    }
+}
+
+test "external prepared document admission covers absent rows and preserves pinned scans" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("external-documents");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.setSchemaJson(a, "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}},\"required\":[\"n\"],\"additionalProperties\":false}}}}");
+    try db.batch(.{ .writes = &.{ .{ .key = "row", .value = "{\"n\":0}" }, .{ .key = "gone", .value = "{\"n\":9}" } } });
+    const id: types.TxnId = @splat(81);
+    const owner: transactions_mod.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = @import("antfly_platform").time.realtimeNs() + std.time.ns_per_min };
+    const participant = try @import("antfly_local_sources").api_local_transaction_contract.participantIdForGroup(a, "docs", 7);
+    defer a.free(participant);
+    try @import("server_transaction_dispatch.zig").applyReplicatedTransactionMutation(a, &db, "docs", 7, .{ .transaction = .{ .begin = .{ .txn_id = id, .begin_timestamp = 10, .created_at_ns = 1, .topology_epoch = 0, .participants = &.{participant}, .retain_terminal = true, .external_decision_owner = owner } } });
+    var expired = owner;
+    expired.expires_at_unix_ns = 1;
+    try std.testing.expectError(error.ExternalTransactionAdmissionExpired, db.writeTransaction(id, .{ .external_decision_owner = expired, .writes = &.{.{ .key = "new", .value = "{\"n\":10}" }} }));
+    try db.writeTransaction(id, .{ .external_decision_owner = owner, .writes = &.{ .{ .key = "row", .value = "{\"n\":1}" }, .{ .key = "new", .value = "{\"n\":10}" } }, .deletes = &.{"gone"} });
+    const options: types.ScanOptions = .{ .relational_query = .{ .fields = &.{"n"}, .schema_version = 1 } };
+    const before = try db.openDocumentReadSession(a, "", "", options);
+    defer before.deinit();
+    const old = (try db.get(a, "row")).?;
+    defer a.free(old);
+    try std.testing.expectEqualStrings("{\"n\":0}", old);
+    try std.testing.expect(try db.get(a, "new") == null);
+    try db.writeTransaction(id, .{ .external_decision_owner = owner, .external_activation = true });
+    try std.testing.expectError(error.IntentConflict, db.openDocumentReadSession(a, "", "", options));
+    try std.testing.expectError(error.IntentConflict, db.get(a, "row"));
+    try std.testing.expectError(error.IntentConflict, db.get(a, "new"));
+    try std.testing.expectError(error.IntentConflict, db.get(a, "absent"));
+    var bound = @import("antfly_local_sources").api_local_table_writes.BoundTableWriteSource.init("docs", &db);
+    try std.testing.expect((try bound.source().txnResolveGroupLocalWithRequest(a, 7, "docs", .{ .txn_id = id, .external_decision_owner = owner, .status = .committed, .commit_version = 20 }, .none)) != null);
+    var retained = try before.next(a, 128);
+    defer retained.deinit();
+    try std.testing.expectEqual(@as(usize, 2), retained.rows.len);
+    try std.testing.expectEqualStrings("gone", retained.rows[0].id);
+    try std.testing.expectEqualStrings("row", retained.rows[1].id);
+    try std.testing.expectEqual(@as(i64, 0), (try retained.rows[1].cell("n")).value.integer);
+    const after = (try db.get(a, "row")).?;
+    defer a.free(after);
+    try std.testing.expectEqualStrings("{\"n\":1}", after);
+    const inserted = (try db.get(a, "new")).?;
+    defer a.free(inserted);
+    try std.testing.expectEqualStrings("{\"n\":10}", inserted);
+    try std.testing.expect(try db.get(a, "gone") == null);
+}
+
+test "external prepared ordered enlistment replays its admitted time independently of client gates" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("external-ordered-enlistment");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const Gate = struct {
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) !void {
+            const gate: *@This() = @constCast(@as(*const @This(), @ptrCast(@alignCast(ptr))));
+            gate.calls += 1;
+            return error.ReadOnly;
+        }
+    };
+    var gate: Gate = .{};
+    db.local_execution.replication_write_gate = .{ .borrowed = .{ .ptr = &gate, .check_fn = Gate.check } };
+    const owner: transactions_mod.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+    var request: types.ExternalTransactionBegin = .{ .txn_id = @splat(87), .owner = owner, .begin_timestamp = 10, .created_at_ns = 11, .participants = &.{"owner"}, .coordinator = true, .ordered_receipt = .{ .term = 1, .index = 1 }, .admission_timestamp_ns = 100 };
+    try std.testing.expectEqualDeep(request.txn_id, try db.beginExternalTransaction(request));
+    try std.testing.expectEqualDeep(request.txn_id, try db.beginExternalTransaction(request));
+    try std.testing.expectEqual(@as(usize, 0), gate.calls);
+    request.txn_id = @splat(88);
+    request.ordered_receipt = .{ .term = 1, .index = 2 };
+    request.admission_timestamp_ns = owner.expires_at_unix_ns;
+    try std.testing.expectError(error.ExternalTransactionAdmissionExpired, db.beginExternalTransaction(request));
+    try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
+    request.ordered_receipt = null;
+    try std.testing.expectError(error.ReadOnly, db.beginExternalTransaction(request));
+    try std.testing.expectEqual(@as(usize, 1), gate.calls);
+}

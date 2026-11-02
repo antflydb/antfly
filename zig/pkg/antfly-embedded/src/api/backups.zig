@@ -1933,7 +1933,10 @@ pub fn createManifest(
     const owned_replication_sources_json = try alloc.dupe(u8, table.replication_sources_json);
     errdefer alloc.free(owned_replication_sources_json);
 
+    const owned_sql_names = try alloc.dupe(u8, table.sql_native_indexes_json);
+    errdefer alloc.free(owned_sql_names);
     const manifest: TableBackupManifest = .{
+        .sql_native_indexes_json = owned_sql_names,
         .format = format,
         .backup_id = owned_backup_id,
         .table_name = owned_table_name,
@@ -2137,6 +2140,8 @@ pub fn validateTableManifest(
     requested_backup_id: []const u8,
 ) !void {
     if (manifest.format_version != format_version) return error.UnsupportedBackupFormat;
+    var sql_indexes = @import("../system_catalog/native_indexes.zig").read(alloc, manifest.sql_native_indexes_json, manifest.indexes_json) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBackupRequest;
+    defer sql_indexes.deinit();
     if (!std.mem.eql(u8, manifest.backup_id, requested_backup_id)) return error.InvalidBackupRequest;
     var proof_count: usize = 0;
     for (manifest.shards) |shard| {
@@ -2664,15 +2669,16 @@ pub fn localArtifactStatsEqual(
 pub fn createTableRequestFromManifest(alloc: std.mem.Allocator, manifest: *const TableBackupManifest) !tables_api.CreateTableRequest {
     if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
     try tables_api.validateStoredIndexesJson(alloc, manifest.indexes_json);
-    return .{
-        // Supported backup manifests contain primary-owned artifacts. Restore
-        // must preserve that authority instead of applying fresh-table policy.
-        .storage = .{ .dense_embeddings = .primary_lsm },
-        .description = if (manifest.description.len > 0) try alloc.dupe(u8, manifest.description) else null,
-        .indexes_json = try alloc.dupe(u8, manifest.indexes_json),
-        .schema_json = if (manifest.schema_json.len > 0) try alloc.dupe(u8, manifest.schema_json) else null,
-        .replication_sources_json = if (manifest.replication_sources_json.len > 0) try alloc.dupe(u8, manifest.replication_sources_json) else null,
-    };
+    var bindings = try @import("../system_catalog/native_indexes.zig").read(alloc, manifest.sql_native_indexes_json, manifest.indexes_json);
+    defer bindings.deinit();
+    var request: tables_api.CreateTableRequest = .{ .storage = .{ .dense_embeddings = .primary_lsm } };
+    errdefer request.deinit(alloc);
+    if (manifest.description.len > 0) request.description = try alloc.dupe(u8, manifest.description);
+    request.indexes_json = try alloc.dupe(u8, manifest.indexes_json);
+    if (manifest.sql_native_indexes_json.len > 0) request.sql_native_indexes_json = try alloc.dupe(u8, manifest.sql_native_indexes_json);
+    if (manifest.schema_json.len > 0) request.schema_json = try alloc.dupe(u8, manifest.schema_json);
+    if (manifest.replication_sources_json.len > 0) request.replication_sources_json = try alloc.dupe(u8, manifest.replication_sources_json);
+    return request;
 }
 
 pub fn deriveRestoreTableRecord(
@@ -3274,6 +3280,8 @@ pub fn writeFileToLocation(
 }
 
 pub fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupManifest) !TableBackupManifest {
+    const owned_sql_names = try alloc.dupe(u8, manifest.sql_native_indexes_json);
+    errdefer alloc.free(owned_sql_names);
     const shards = try alloc.alloc(ShardSnapshot, manifest.shards.len);
     var initialized_shards: usize = 0;
     errdefer {
@@ -3307,6 +3315,7 @@ pub fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupM
     }
 
     return .{
+        .sql_native_indexes_json = owned_sql_names,
         .format_version = manifest.format_version,
         .format = manifest.format,
         .artifact_integrity_mode = manifest.artifact_integrity_mode,

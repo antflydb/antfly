@@ -296,7 +296,11 @@ const Mock = struct {
             self.result_override_executions += 1;
             return result;
         }
-        self.observed_setting = if (request.setting_overlay.len == 0) null else request.setting_overlay[0].value.integer;
+        self.observed_setting = null;
+        for (request.setting_overlay) |entry| if (entry.identity.id == 1) {
+            if (entry.value != .integer) return error.InvalidSettingValue;
+            self.observed_setting = entry.value.integer;
+        };
         try self.checkSettingEpoch(request);
         self.executions += 1;
         if (std.mem.eql(u8, request.statement, "ALTER ROLE tester SET statement_timeout='1ms'")) {
@@ -1888,6 +1892,46 @@ test "pgwire DISCARD ALL inside a transaction leaves prepared plans intact" {
     }
     try std.testing.expectEqual(@as(usize, 1), errors);
     try std.testing.expectEqual(@as(usize, 1), rows);
+}
+
+test "pgwire transaction preparation rolls back newly held cursors before reporting rejection" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "BEGIN\x00",
+        "DECLARE rows SCROLL CURSOR WITH HOLD FOR SELECT n FROM t\x00",
+        "PREPARE TRANSACTION 'held'\x00",
+        "FETCH NEXT FROM rows\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 5 };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    var messages: protocol.Cursor = .{ .bytes = output.written() };
+    var errors: usize = 0;
+    var last_status: u8 = 0;
+    while (messages.offset < messages.bytes.len) {
+        const tag = try messages.int(u8);
+        const length = try messages.int(u32);
+        const body = try messages.take(length - 4);
+        try std.testing.expect(tag != 'D');
+        if (tag == 'E') {
+            const expected = if (errors == 0) "C0A000\x00" else "C34000\x00";
+            try std.testing.expect(std.mem.indexOf(u8, body, expected) != null);
+            errors += 1;
+        }
+        if (tag == 'Z') {
+            try std.testing.expectEqual(@as(usize, 1), body.len);
+            last_status = body[0];
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), errors);
+    try std.testing.expectEqual(@as(u8, 'I'), last_status);
+    try std.testing.expectEqual(@as(usize, 2), mock.executions);
+    try std.testing.expectEqual(@as(usize, 1), mock.copy_rollbacks);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    try std.testing.expectEqual(@as(usize, 0), mock.stream_detaches);
 }
 
 test "pgwire unknown commit cannot publish held cursor rows" {
@@ -3495,4 +3539,72 @@ test "SQL named enum pgwire Parse Bind close statement and execute retain exact 
         try std.testing.expectEqual(@as(usize, 1), data);
         try std.testing.expectEqual(@as(usize, 1), mock.executions);
     };
+}
+
+test "pgwire native sync controls preserve PostgreSQL lifetime rows command tags and warning severity" {
+    const a = std.testing.allocator;
+    const Reference = struct { actions: []const struct { sql: []const u8, command_tag: []const u8, rows: []const []const []const u8, notices: []const []const u8 } };
+    var reference = try std.json.parseFromSlice(Reference, a, @import("antfly_local_sources").sql_parity_fixtures.sync_control_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    for (reference.value.actions) |action| {
+        const text = try std.fmt.allocPrint(a, "{s}\x00", .{action.sql});
+        defer a.free(text);
+        try frame(&input.writer, 'Q', text);
+    }
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    var ordinal: usize = 0;
+    var row_count: usize = 0;
+    var notice_count: usize = 0;
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        var payload: protocol.Cursor = .{ .bytes = try cursor.take(length - 4) };
+        if (tag == 'E') {
+            std.debug.print("sync pgwire error ordinal={d} payload={s}\n", .{ ordinal, payload.bytes });
+            return error.UnexpectedPgwireSyncError;
+        }
+        if (tag == 'C' or tag == 'D' or tag == 'N') {
+            try std.testing.expect(ordinal < reference.value.actions.len);
+            const action = reference.value.actions[ordinal];
+            if (tag == 'C') {
+                try std.testing.expectEqualStrings(action.command_tag, try payload.string());
+                try std.testing.expectEqual(action.rows.len, row_count);
+                try std.testing.expectEqual(action.notices.len, notice_count);
+                ordinal += 1;
+                row_count = 0;
+                notice_count = 0;
+            } else if (tag == 'D') {
+                try std.testing.expect(row_count < action.rows.len);
+                const expected = action.rows[row_count];
+                try std.testing.expectEqual(@as(u16, @intCast(expected.len)), try payload.int(u16));
+                for (expected) |text| try std.testing.expectEqualStrings(text, try payload.take(try payload.int(u32)));
+                row_count += 1;
+            } else {
+                try std.testing.expect(notice_count < action.notices.len);
+                var severity = false;
+                var code = false;
+                while (try payload.int(u8) != 0) {
+                    const field = payload.bytes[payload.offset - 1];
+                    const text = try payload.string();
+                    if (field == 'S') {
+                        try std.testing.expectEqualStrings("WARNING", text);
+                        severity = true;
+                    } else if (field == 'C') {
+                        try std.testing.expectEqualStrings(action.notices[notice_count], text);
+                        code = true;
+                    }
+                }
+                try std.testing.expect(severity and code);
+                notice_count += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(reference.value.actions.len, ordinal);
 }

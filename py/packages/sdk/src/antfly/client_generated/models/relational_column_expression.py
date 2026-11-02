@@ -125,6 +125,12 @@ class RelationalColumnExpression:
                 A matching candidate wins over NULL candidates; otherwise a NULL
                 candidate makes the result UNKNOWN. These operations require schema
                 capability version 19.
+                Enumeration expressions require reader capability version 40. Enum
+                literals and casts declare named_type_id from the owning schema directory.
+                Input labels are exact and case-sensitive; comparisons retain declaration
+                order and reject unrelated named identities. Enum/text conversions are
+                explicit; stored enum values retain four-byte symbols. CHECK, generated
+                values, defaults, typed-row ingress and restore share the native validator.
                 JSON expressions require reader capability version 30. The json type
                 carries JSONB semantics, including exact numeric values and display
                 scale. jsonb_typeof and jsonb_array_length take one JSON argument;

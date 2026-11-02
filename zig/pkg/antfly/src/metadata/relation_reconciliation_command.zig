@@ -36,14 +36,17 @@ pub const Command = union(enum(u8)) {
     advance: r.State = 3,
     garbage: r.Retirement = 4,
     publish: Publication = 5,
+    foreign_keys: r.ForeignKeyBackfill = 6,
 
     pub fn requiredDecoderVersion(self: @This()) u16 {
+        if (self == .foreign_keys) return protocol.foreign_key_directory_version;
         const occupancy = switch (self) {
             .start => |request| request.next.coverage == .constraint_names or (if (request.prior) |prior| prior.coverage == .constraint_names else false),
             .advance => |state| state.coverage == .constraint_names,
             .garbage => |retired| retired.coverage == .constraint_names,
             .publish => |request| request.state.coverage == .constraint_names,
             .adopt => |proof| proof.version == protocol.constraint_occupancy_version,
+            .foreign_keys => unreachable,
         };
         if (occupancy) return protocol.constraint_occupancy_version;
         return if (self == .publish) protocol.relation_publication_version else protocol.relation_reconciliation_version;
@@ -95,6 +98,13 @@ pub const Command = union(enum(u8)) {
                 try out.appendSlice(a, &(try state.encode()));
             },
             .garbage => |retirement| try out.appendSlice(a, &(try retirement.encode())),
+            .foreign_keys => |cut| {
+                try cut.validate();
+                var bytes: [16]u8 = undefined;
+                std.mem.writeInt(u64, bytes[0..8], cut.revision, .big);
+                std.mem.writeInt(u64, bytes[8..16], cut.after_table, .big);
+                try out.appendSlice(a, &bytes);
+            },
             .publish => |request| {
                 try validatePublication(request);
                 try out.appendSlice(a, &(try request.state.encode()));
@@ -154,6 +164,12 @@ pub const Command = union(enum(u8)) {
                 };
                 validatePublication(request) catch return error.InvalidRelationReconciliationCommand;
                 return .{ .publish = request };
+            },
+            6 => {
+                if (payload.len != 16) return error.InvalidRelationReconciliationCommand;
+                const cut: r.ForeignKeyBackfill = .{ .revision = std.mem.readInt(u64, payload[0..8], .big), .after_table = std.mem.readInt(u64, payload[8..16], .big) };
+                cut.validate() catch return error.InvalidRelationReconciliationCommand;
+                return .{ .foreign_keys = cut };
             },
             else => return error.InvalidRelationReconciliationCommand,
         }
@@ -368,4 +384,18 @@ test "system catalog relation publication command fences exact membership epoch 
         try std.testing.expectError(error.InvalidRelationReconciliationCommand, bad.encodeAlloc(a));
     }
     try std.testing.expectEqual(protocol.relation_reconciliation_version, (Command{ .advance = try r.State.init(41, try r.nextJobId(null), first.epoch) }).requiredDecoderVersion());
+}
+
+test "incoming FK directory maintenance wire is bounded canonical and cohort gated" {
+    const a = std.testing.allocator;
+    const command: Command = .{ .foreign_keys = .{ .revision = 7, .after_table = 41 } };
+    const bytes = try command.encodeAlloc(a);
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(usize, magic.len + 1 + 16), bytes.len);
+    try std.testing.expectEqualDeep(command, try Command.decode(bytes));
+    try std.testing.expectEqual(protocol.foreign_key_directory_version, command.requiredDecoderVersion());
+    for (0..bytes.len) |end| try std.testing.expectError(error.InvalidRelationReconciliationCommand, Command.decode(bytes[0..end]));
+    var invalid: Command = command;
+    invalid.foreign_keys.revision = 0;
+    try std.testing.expectError(error.InvalidCatalogRecord, invalid.encodeAlloc(a));
 }

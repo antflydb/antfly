@@ -1234,7 +1234,7 @@ pub const MetadataHttpClient = struct {
     /// Read-only retries are safe. The response proves the metadata identity;
     /// callers need no preceding status/discovery round trip on the happy path.
     pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
-        if (input == .schema_validation_submit) return error.InvalidGenerationPublication;
+        if (input == .schema_validation_submit or input == .table_retirement_submit) return error.InvalidGenerationPublication;
         if (input == .fk_initial_retirement_page) return error.InitialFkRetirementNotActivated;
         if (input.isMutation()) return error.InvalidCatalogMutation;
         if (input == .schema_validation_owner_read) try input.schema_validation_owner_read.validate();
@@ -1271,7 +1271,7 @@ pub const MetadataHttpClient = struct {
             const token = std.mem.trim(u8, media[0 .. std.mem.indexOfScalar(u8, media, ';') orelse media.len], " \t");
             if (!std.ascii.eqlIgnoreCase(token, input.responseContentType())) return error.InvalidGenerationPublication;
         }
-        if ((input == .fk_initial_create_prepare or input == .query_population_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
+        if ((input == .table_retirement_prepare or input == .fk_initial_create_prepare or input == .query_population_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
             if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
             if (response.status == 405 and std.mem.eql(u8, response.body, "ExtensionOwnedObject")) return error.ExtensionOwnedObject;
         }
@@ -1327,6 +1327,10 @@ pub const MetadataHttpClient = struct {
         if (input == .schema_validation_work) {
             if (group_id != input.schema_validation_work.group) return error.MetadataGroupMismatch;
             if (!std.mem.eql(u8, &incarnation, &input.schema_validation_work.metadata_incarnation)) return error.MetadataIncarnationMismatch;
+        }
+        if (input == .table_retirement_prepare) {
+            const expected = std.fmt.bytesToHex(input.table_retirement_prepare.incarnation, .lower);
+            if (!std.mem.eql(u8, &incarnation, &expected)) return error.MetadataIncarnationMismatch;
         }
         if (input == .schema_validation_prepare) {
             const expected = std.fmt.bytesToHex(input.schema_validation_prepare.guard.incarnation, .lower);
@@ -1463,7 +1467,18 @@ pub const MetadataHttpClient = struct {
         var parsed = ledger.parseCommand(self.alloc, command) catch |err| return if (err == error.OutOfMemory) err else error.InvalidGenerationPublication;
         defer parsed.deinit();
         _ = try ledger.commandLookup(parsed.value);
-        const uri = try join(self.alloc, base_uri, routes.Routes.internal_schema_validation);
+        const bytes = try self.executeLifecycleSubmission(base_uri, routes.Routes.internal_schema_validation, command, grant, remaining_ms, cancellation, delivery, 16 * 1024);
+        defer self.alloc.free(bytes);
+        var observed = std.json.parseFromSlice(receipts.Observation, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        defer observed.deinit();
+        const expected = ledger.commandReceipt(parsed.value, observed.value.head orelse return error.MetadataMutationOutcomeUnknown) catch return error.MetadataMutationOutcomeUnknown;
+        if (!(observed.value.isAcknowledged(expected) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+        return self.alloc.dupe(u8, bytes) catch return error.MetadataMutationOutcomeUnknown;
+    }
+
+    fn executeLifecycleSubmission(self: *MetadataHttpClient, base_uri: []const u8, path: []const u8, command: []const u8, grant: []const u8, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation, delivery: *http_common.RequestDeliveryTracker, max_response_bytes: usize) ![]u8 {
+        const authority = @import("../system_catalog/setting_authority.zig");
+        const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
         var remaining_buf: [10]u8 = undefined;
         const headers = [_]http_common.RequestHeader{
@@ -1482,7 +1497,7 @@ pub const MetadataHttpClient = struct {
             .timeout_ms = @min(default_request_timeout_ms, remaining_ms),
             .delivery_tracker = delivery,
             .cancellation = cancellation,
-            .max_response_bytes = 16 * 1024,
+            .max_response_bytes = max_response_bytes,
         }, self.internal_service) catch |err| {
             if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) {
                 delivery.markNotSent();
@@ -1502,12 +1517,28 @@ pub const MetadataHttpClient = struct {
         if (response.status < 200 or response.status >= 300 or !std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed)) return error.MetadataMutationOutcomeUnknown;
         const content_type = responseHeader(response, "content-type") orelse return error.MetadataMutationOutcomeUnknown;
         if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t"), "application/json")) return error.MetadataMutationOutcomeUnknown;
-        if (response.body.len == 0 or response.body.len > 16 * 1024) return error.MetadataMutationOutcomeUnknown;
-        var observed = std.json.parseFromSlice(receipts.Observation, self.alloc, response.body, .{}) catch return error.MetadataMutationOutcomeUnknown;
-        defer observed.deinit();
-        const expected = ledger.commandReceipt(parsed.value, observed.value.head orelse return error.MetadataMutationOutcomeUnknown) catch return error.MetadataMutationOutcomeUnknown;
-        if (!(observed.value.isAcknowledged(expected) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+        if (response.body.len == 0 or response.body.len > max_response_bytes) return error.MetadataMutationOutcomeUnknown;
         return self.alloc.dupe(u8, response.body) catch return error.MetadataMutationOutcomeUnknown;
+    }
+
+    pub fn submitTableRetirementControlled(self: *MetadataHttpClient, base_uri: []const u8, command: []const u8, remaining_ms: u32, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
+        if (!setting_admin) return error.Forbidden;
+        if (remaining_ms == 0) return error.Timeout;
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        var input = try @import("table_retirement_ledger.zig").Input.parse(self.alloc, command);
+        defer input.deinit();
+        const expected = try @import("table_retirement_receipt.zig").Request.fromInput(&input);
+        const authority = @import("../system_catalog/setting_authority.zig");
+        const grant = try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .admin, command, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+        defer self.alloc.free(grant);
+        var delivery: http_common.RequestDeliveryTracker = .{};
+        const bytes = try self.executeLifecycleSubmission(base_uri, routes.Routes.internal_table_retirement, command, grant, remaining_ms, cancellation, &delivery, 32768);
+        errdefer self.alloc.free(bytes);
+        var observed = std.json.parseFromSlice(@import("table_retirement_receipt.zig").Observation, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        defer observed.deinit();
+        observed.value.requireFor(expected) catch return error.MetadataMutationOutcomeUnknown;
+        if (!observed.value.accepted) return error.MetadataMutationOutcomeUnknown;
+        return bytes;
     }
 
     pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
@@ -1515,6 +1546,7 @@ pub const MetadataHttpClient = struct {
     }
     pub fn forwardSystemCatalogControlled(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
         if (input == .schema_validation_submit) return self.submitSchemaValidationControlled(base_uri, input.schema_validation_submit, forwarding.remaining_ms, setting_admin, cancellation);
+        if (input == .table_retirement_submit) return self.submitTableRetirementControlled(base_uri, input.table_retirement_submit, forwarding.remaining_ms, setting_admin, cancellation);
         if (input.isSchemaValidationCall()) return (try self.readSystemCatalog(base_uri, input, forwarding.remaining_ms, cancellation)).body;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         if (input.requiresAdministrativeGrant() != setting_admin) return error.Forbidden;
@@ -3399,7 +3431,7 @@ fn consumerTests() type {
                     const snapshot =
                         \\{"status":{"metadata_group_id":91,"metadata_epoch":3,"metrics":{}},"tables":[],"ranges":[],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
                     ;
-                    const headers = try alloc.alloc(http_common.Header, 2);
+                    const headers = try alloc.alloc(std.meta.Elem(@TypeOf(@as(http_common.HttpResponse, undefined).headers)), 2);
                     headers[0] = .{ .name = try alloc.dupe(u8, "X-Antfly-Snapshot-Token"), .value = try alloc.dupe(u8, "2") };
                     headers[1] = .{ .name = try alloc.dupe(u8, "X-Antfly-Snapshot-Bytes"), .value = try std.fmt.allocPrint(alloc, "{d}", .{snapshot.len}) };
                     if (self.mode == .cancel) self.cancellation.cancel();
@@ -3924,7 +3956,7 @@ fn consumerTests() type {
 
                 fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
-                    const headers = try alloc.alloc(http_common.Header, 2);
+                    const headers = try alloc.alloc(std.meta.Elem(@TypeOf(@as(http_common.HttpResponse, undefined).headers)), 2);
                     var initialized: usize = 0;
                     errdefer {
                         for (headers[0..initialized]) |*header| header.deinit(alloc);
@@ -4984,7 +5016,7 @@ test "system catalog schema validation binary submissions bind raw grants exact 
             }
             const body = try alloc.dupe(u8, self.body);
             errdefer alloc.free(body);
-            const headers = try alloc.alloc(http_common.Header, 2);
+            const headers = try alloc.alloc(std.meta.Elem(@TypeOf(@as(http_common.HttpResponse, undefined).headers)), 2);
             var initialized: usize = 0;
             errdefer {
                 for (headers[0..initialized]) |header| {
@@ -5395,6 +5427,7 @@ test "system catalog schema validation client binds exact identity projection fr
 fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call) ?usize {
     const publication = @import("relational_index_publication.zig");
     return switch (input) {
+        .sql_index_annotations => @import("antfly_local_sources").system_catalog_domain.object_annotations.max_index_description_bytes,
         .relational_index_prepare => publication.PrepareCut.max_wire_bytes,
         .relational_index_status, .relational_index_begin, .relational_index_admission_status => publication.AdmissionStatus.max_wire_bytes,
         .relational_index_publish_decide, .relational_index_publish_status => publication.DecisionStatus.max_wire_bytes,
@@ -5405,6 +5438,8 @@ fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call
         .schema_validation_discover => 1024,
         .schema_validation_work => @import("schema_validation_work.zig").max_wire_bytes,
         .schema_validation_prepare => @import("schema_validation_admission.zig").max_wire_bytes,
+        .table_retirement_prepare, .table_retirement_effects => @import("table_retirement_manifest.zig").max_bytes,
+        .sql_sequence_snapshot => |request| if (request.prepare_retirement) @import("../system_catalog/sequence_catalog.zig").Snapshot.max_retirement_bytes else null,
         .schema_validation_status => @import("schema_validation_admission.zig").Status.max_wire_bytes,
         else => null,
     };
@@ -5637,7 +5672,7 @@ test "SQL view catalog forwarded rejections preserve exact identity without admi
         .mutation = .{ .target = .{ .table = "v" }, .operation = .{ .drop = .{ .expected = null, .if_exists = false, .cascade = false } } },
     } };
     const forwarding: raft_mutation_forwarding.Context = .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true };
-    inline for (.{ error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlDependentObjectsExist, error.SqlViewCycle, error.SqlProgramLimitExceeded }) |err| {
+    inline for (.{ error.SqlIndexNotFound, error.SqlConstraintNotFound, error.CatalogGenerationExhausted, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.SqlDependentObjectsExist, error.SqlViewCycle, error.SqlProgramLimitExceeded }) |err| {
         executor.response_status = system_catalog.httpStatus(err);
         executor.response_body = @errorName(err);
         executor.outcome = routes.Routes.raft_mutation_outcome_not_proposed;
@@ -5838,4 +5873,61 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "table retirement manifest HTTP reads bind authority incarnation response limits and typed diagnostics" {
+    const a = std.testing.allocator;
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const Executor = struct {
+        status: u16 = 200,
+        body: []const u8 = "{}",
+        incarnation: []const u8 = "11111111111111111111111111111111",
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            try std.testing.expectEqual(@as(?usize, @import("table_retirement_manifest.zig").max_bytes), request.max_response_bytes);
+            try authority.verify("retirement-secret", "retirement", .admin, request.body, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
+            const headers = try alloc.alloc(http_common.Header, 2);
+            var initialized: usize = 0;
+            errdefer {
+                for (headers[0..initialized]) |*header| header.deinit(alloc);
+                alloc.free(headers);
+            }
+            const names = [_][]const u8{ "x-antfly-catalog-metadata-group", "x-antfly-catalog-metadata-incarnation" };
+            const values = [_][]const u8{ "41", self.incarnation };
+            for (headers, names, values) |*header, name, value| {
+                const owned_name = try alloc.dupe(u8, name);
+                errdefer alloc.free(owned_name);
+                header.* = .{ .name = owned_name, .value = try alloc.dupe(u8, value) };
+                initialized += 1;
+            }
+            return .{ .status = self.status, .body = try alloc.dupe(u8, self.body), .headers = headers };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .table_retirement_prepare = .{
+        .target = .{ .name = "roots" },
+        .logical_table = "roots",
+        .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table },
+        .incarnation = @splat(0x11),
+    } };
+    try std.testing.expectError(error.SettingAuthorityUnavailable, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    try std.testing.expectEqual(@as(usize, 0), executor.calls);
+    _ = client.withSettingAuthority("retirement-secret", "retirement");
+    {
+        var response = try client.readSystemCatalog("http://metadata.invalid", call, 25, null);
+        defer response.deinit(a);
+        try std.testing.expectEqual(@as(u64, 41), response.metadata_group_id);
+    }
+    executor.incarnation = "22222222222222222222222222222222";
+    try std.testing.expectError(error.MetadataIncarnationMismatch, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    inline for (.{ error.CatalogOccupancyNotReady, error.TableTransitionActive, error.SqlProgramLimitExceeded, error.ExtensionOwnedObject }) |err| {
+        executor.status = system_catalog.httpStatus(err);
+        executor.body = @errorName(err);
+        try std.testing.expectError(err, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    }
+    try std.testing.expectEqual(@as(usize, 6), executor.calls);
 }

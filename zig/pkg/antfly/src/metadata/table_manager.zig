@@ -74,7 +74,7 @@ pub const TableRecord = @import("antfly_local_sources").metadata_local_catalog.T
 pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return lhs.sql_materialized_view_id == rhs.sql_materialized_view_id and std.meta.eql(lhs.schema_reader_requirements, rhs.schema_reader_requirements) and
+    return std.mem.eql(u8, lhs.sql_native_indexes_json, rhs.sql_native_indexes_json) and lhs.sql_materialized_view_id == rhs.sql_materialized_view_id and std.meta.eql(lhs.schema_reader_requirements, rhs.schema_reader_requirements) and
         (if (lhs.full_text_read_index) |name| if (rhs.full_text_read_index) |other| std.mem.eql(u8, name, other) else false else rhs.full_text_read_index == null) and
         @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
         lhs.storage.engine == rhs.storage.engine and

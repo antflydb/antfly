@@ -526,6 +526,48 @@ fn replaceTableDefinitionGuardedWithReceipt(
     return replaceTableDefinitionGuardedWithContextReceipt(service, expected, replacement, relation_guard, .{});
 }
 
+fn commentObjectWithContextReceipt(service: anytype, context: api_operation.RequestContext, request: relation_catalog.ObjectAnnotationRead, description: ?[]const u8) !metadata_api.CatalogMutationStamp {
+    const annotations = relation_catalog.object_annotations;
+    const annotation_store = relation_catalog.object_annotation_store;
+    try context.ensureActive();
+    try request.validate();
+    try annotations.validateDescription(description);
+    // Activate before the first snapshot: all writers must retain identity
+    // history before a provisional identity can become an admission token.
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_object_annotations_version);
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    const table = (try store.getTable(service.alloc, service.metadata_group_id, request.guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
+    defer metadata_table_manager.freeTable(service.alloc, table);
+    try requireRelationMutationOwnerWithContext(service, table, request.guard, context);
+    const bytes = try store.getSqlObjectAnnotation(service.alloc, service.metadata_group_id, request);
+    defer service.alloc.free(bytes);
+    var snapshot = try std.json.parseFromSlice(annotation_store.Snapshot, service.alloc, bytes, .{});
+    defer snapshot.deinit();
+    const command: metadata_storage.ObjectDescriptionCommand = .{
+        .request = request,
+        .expected = .{ .epoch = snapshot.value.epoch, .object_id = snapshot.value.object.id },
+        .description = description,
+    };
+    try command.validate();
+    const candidate = (annotation_store_annotation: {
+        const value: annotations.Annotation = .{ .format = 1, .table_id = request.guard.owner.table_id, .object_id = snapshot.value.object.id, .description = annotations.normalized(description) };
+        break :annotation_store_annotation value.encode(service.alloc) catch |err| return if (err == error.CatalogCommandTooLarge) error.ProgramLimitExceeded else err;
+    });
+    service.alloc.free(candidate);
+    const incarnation = (try service.metadataIncarnation()) orelse return error.MissingMetadataIncarnation;
+    const receipt = try service.proposeTransitionCommandWithReceipt(.{ .comment_object = command });
+    service.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const applied_bytes = store.getSqlObjectAnnotation(service.alloc, service.metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown;
+    defer service.alloc.free(applied_bytes);
+    var applied = std.json.parseFromSlice(annotation_store.Snapshot, service.alloc, applied_bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    defer applied.deinit();
+    if (!std.meta.eql(applied.value.epoch, command.expected.epoch) or applied.value.object.id != command.expected.object_id) return error.MetadataMutationOutcomeUnknown;
+    const note = applied.value.annotation orelse return error.MetadataMutationOutcomeUnknown;
+    if (!std.meta.eql(note.description == null, annotations.normalized(description) == null)) return error.MetadataMutationOutcomeUnknown;
+    if (annotations.normalized(description)) |text| if (!std.mem.eql(u8, note.description.?, text)) return error.MetadataMutationOutcomeUnknown;
+    return .{ .metadata_group_id = service.metadata_group_id, .metadata_incarnation = incarnation, .term = receipt.term, .index = receipt.index };
+}
+
 fn commentColumnWithContextReceipt(service: anytype, context: api_operation.RequestContext, guard: relation_catalog.RelationMutationGuard, column: @import("antfly_local_sources").system_catalog_column_identities.Description) !metadata_api.CatalogMutationStamp {
     try context.ensureActive();
     column.validate() catch |err| return if (err == error.CatalogCommandTooLarge) error.ProgramLimitExceeded else err;
@@ -560,10 +602,21 @@ fn commentColumnWithContextReceipt(service: anytype, context: api_operation.Requ
 fn replaceTableDefinitionGuardedWithContextReceipt(
     service: anytype,
     expected: metadata_table_manager.TableRecord,
-    replacement: metadata_table_manager.TableRecord,
+    proposed: metadata_table_manager.TableRecord,
     relation_guard: ?relation_catalog.RelationMutationGuard,
     context: api_operation.RequestContext,
 ) !metadata_api.CatalogMutationStamp {
+    var replacement = proposed;
+    // Names are authority attached to the native configuration, not a separate
+    // lifecycle. Dropping via /indexes must withdraw the SQL relation atomically.
+    const native_names = @import("antfly_local_sources").system_catalog_relation_names.native_indexes;
+    const retained_names = proposed.sql_native_indexes_json;
+    const normalized_names = if (retained_names.len != 0) try native_names.prune(service.alloc, retained_names, proposed.indexes_json) else null;
+    defer if (normalized_names) |bytes| service.alloc.free(bytes);
+    if (normalized_names) |bytes| replacement.sql_native_indexes_json = bytes;
+    if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+        if (retained_names.len != 0 or expected.sql_native_indexes_json.len != 0) try ensureSqlNativeIndexNamespaceCapabilityWithContext(service, context);
+    }
     try context.ensureActive();
     if (expected.table_id == 0 or
         replacement.table_id != expected.table_id or
@@ -598,6 +651,15 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
         if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
             try service.ensureLinearizableReadWithContext(context);
             try store.requirePolicyIndexMutationAllowed(service.metadata_group_id, expected.table_id);
+        }
+    }
+    if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+        if (relation_guard) |guard| {
+            // Reuse indexed occupancy and the existing guarded writer rather
+            // than fencing ordinary indexes through UNIQUE publication.
+            try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.constraint_occupancy_version);
+            try service.ensureLinearizableReadWithContext(context);
+            try store.validateRelationReplacement(service.metadata_group_id, guard, expected, replacement);
         }
     }
     const baseline_fence = try store.getTableTransitionFence(
@@ -3519,7 +3581,26 @@ test "relation mutation admission projects naming capability without materializi
 }
 
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
-    return @max(resolverRequiredCoordinatedDecoderVersion(command), baseRequiredCoordinatedDecoderVersion(command), clockReadersRequiredDecoderVersion(command), nativeServiceRequiredDecoderVersion(command));
+    const envelope: ?[]const u8 = switch (command) {
+        .apply_system_catalog, .apply_fk_initial_create, .apply_fk_generation_publication, .apply_restore_staging, .begin_relational_index_publication => |bytes| bytes,
+        .create_restore_job_with_staging => |request| request.plan_json,
+        else => null,
+    };
+    if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresStrongestDecoder(bytes)) return metadata_topology_protocol.current_version;
+    if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresInitialCreationCopy(bytes)) return metadata_topology_protocol.initial_fk_creation_copy_version;
+    if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresInitialCounterEffects(bytes)) return metadata_topology_protocol.initial_fk_column_sequences_version;
+    return @max(resolverRequiredCoordinatedDecoderVersion(command), baseRequiredCoordinatedDecoderVersion(command), clockReadersRequiredDecoderVersion(command), nativeServiceRequiredDecoderVersion(command), objectRenameRequiredDecoderVersion(command));
+}
+
+fn objectRenameRequiredDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const Wire = @import("schema_reader_wire.zig");
+    const required = switch (command) {
+        .compare_and_replace_table => |cas| if (cas.relation_guard) |guard| guard.object_renames.len != 0 else false,
+        .apply_system_catalog, .apply_fk_initial_create, .apply_fk_generation_publication, .apply_restore_staging, .begin_relational_index_publication => |bytes| Wire.requiresObjectRenames(bytes),
+        .create_restore_job_with_staging => |request| Wire.requiresObjectRenames(request.plan_json),
+        else => false,
+    };
+    return if (required) metadata_topology_protocol.sql_object_annotations_version else 0;
 }
 
 fn nativeServiceRequiredDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
@@ -3647,6 +3728,27 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const native_index_names = switch (command) {
+        .upsert_table => |table| table.sql_native_indexes_json.len != 0,
+        .compare_and_replace_table => |value| value.expected.sql_native_indexes_json.len != 0 or value.replacement.sql_native_indexes_json.len != 0,
+        .apply_system_catalog => |bytes| @import("schema_reader_wire.zig").requiresSqlNativeIndex(bytes),
+        .apply_restore_staging, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_schema_validation => |bytes| @import("schema_reader_wire.zig").requiresSqlNativeIndex(bytes),
+        .create_restore_job_with_staging => |value| @import("schema_reader_wire.zig").requiresSqlNativeIndex(value.plan_json),
+        else => false,
+    };
+    if (native_index_names) return metadata_topology_protocol.sql_native_index_namespace_version;
+    if (command == .apply_sql_prepared_transaction) return metadata_topology_protocol.sql_prepared_transactions_version;
+    if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlTriggerFunction(command.apply_system_catalog)) return metadata_topology_protocol.sql_trigger_function_version;
+    const type_retirement = switch (command) {
+        .apply_restore_staging => |bytes| @import("schema_reader_wire.zig").requiresTypeRetirement(bytes),
+        .create_restore_job_with_staging => |request| @import("schema_reader_wire.zig").requiresTypeRetirement(request.plan_json),
+        else => false,
+    };
+    if (type_retirement) return metadata_topology_protocol.sql_type_retirement_version;
+    if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlDomainEpoch(command.apply_system_catalog)) return metadata_topology_protocol.sql_domain_epoch_version;
+    if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlDomain(command.apply_system_catalog)) return metadata_topology_protocol.sql_domain_version;
+    if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlTypeComments(command.apply_system_catalog)) return metadata_topology_protocol.sql_type_comment_version;
+    if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlAuthorization(command.apply_system_catalog)) return metadata_topology_protocol.sql_authorization_version;
     if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlType(command.apply_system_catalog)) return metadata_topology_protocol.sql_type_version;
     if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlCast(command.apply_system_catalog)) return metadata_topology_protocol.sql_cast_version;
     if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlRoutine(command.apply_system_catalog)) return metadata_topology_protocol.sql_routine_version;
@@ -3685,9 +3787,10 @@ fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCom
     if (command == .apply_fk_generation_publication and @import("schema_reader_wire.zig").requiresHistoricalReferences(command.apply_fk_generation_publication)) return metadata_topology_protocol.fk_historical_references_version;
     if (command == .apply_fk_initial_create and @import("schema_reader_wire.zig").requiresHistoricalReferences(command.apply_fk_initial_create)) return metadata_topology_protocol.fk_historical_references_version;
     if (command == .comment_column) return metadata_topology_protocol.sql_column_comments_version;
+    if (command == .comment_object) return metadata_topology_protocol.sql_object_annotations_version;
     if (command == .apply_sql_sequence_counter) return metadata_topology_protocol.sql_sequence_catalog_version;
     if (command == .apply_sql_settings and @import("schema_reader_wire.zig").requiresRoleDefaults(command.apply_sql_settings)) return metadata_topology_protocol.sql_role_defaults_version;
-    if (command == .apply_schema_validation) return metadata_topology_protocol.schema_validation_publication_version;
+    if (command == .apply_schema_validation) return @import("schema_validation_ledger.zig").requiredDecoderVersion(command.apply_schema_validation);
     const bound_text = switch (command) {
         .upsert_table => |table| table.full_text_read_index != null,
         .compare_and_replace_table => |cas| cas.expected.full_text_read_index != null or cas.replacement.full_text_read_index != null,
@@ -3759,7 +3862,7 @@ fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCom
     if (command == .apply_restore_staging and carriesConstraintNameAdmission(command.apply_restore_staging))
         return metadata_topology_protocol.constraint_occupancy_version;
     if (command == .compare_and_replace_table) if (command.compare_and_replace_table.relation_guard) |guard|
-        return if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version;
+        return if (guard.object_renames.len != 0) metadata_topology_protocol.sql_object_annotations_version else if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {
         const intent = @import("relation_reconciliation_command.zig").Command.decode(command.apply_relation_reconciliation) catch return metadata_topology_protocol.current_version;
         return intent.requiredDecoderVersion();
@@ -3936,7 +4039,11 @@ test "catalog projection schema reader facts require their decoder profile at fi
     try std.testing.expectEqual(protocol.clock_defaults_reader_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_store_report_baseline = &.{ 4, 0 } }));
     try std.testing.expectEqual(protocol.clock_defaults_reader_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_store_report_update = &.{255} }));
     try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .apply_store_report_update = &.{ 1, 0 } }));
-    try std.testing.expect(protocol.schema_reader_capability_version > protocol.index_publication_admission_version);
+    // Store reader facts and index admission are independent decoder lanes.
+    // Historical capability numbers are immutable; verify the actual reader
+    // requirement rather than ordering it against a later index protocol.
+    try std.testing.expect(protocol.clock_defaults_reader_version >= protocol.schema_reader_capability_version);
+    try std.testing.expect(protocol.current_version >= protocol.clock_defaults_reader_version);
 }
 
 test "relational index publication admission requires its own coordinated decoder floor" {
@@ -4157,12 +4264,34 @@ fn relationSourceDecoderFloor(service: anytype) !u16 {
 /// Existing restore/rewrite plans keep their original admission contract.
 pub fn ensureQueryPopulationDecoderWithContext(service: anytype, bytes: []const u8, context: api_operation.RequestContext) !void {
     try context.ensureActive();
-    if (@import("schema_reader_wire.zig").requiresMaterializedRefresh(bytes))
+    if (@import("schema_reader_wire.zig").requiresTypeRetirement(bytes))
+        try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_type_retirement_version)
+    else if (@import("schema_reader_wire.zig").requiresMaterializedRefresh(bytes))
         try ensureMaterializedRefreshCapabilityWithContext(service, context)
     else if (@import("schema_reader_wire.zig").requiresMaterializedView(bytes))
         try ensureMaterializedViewCapabilityWithContext(service, context)
     else if (@import("schema_reader_wire.zig").requiresPopulation(bytes))
         try ensureQueryPopulationCapabilityWithContext(service, context);
+}
+
+pub fn ensureSqlPreparedCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_prepared_transactions_version);
+}
+
+pub fn ensureSqlAuthorizationCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_authorization_version);
+}
+
+pub fn ensureSqlDomainEpochCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_domain_epoch_version);
+}
+
+pub fn ensureSqlDomainCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_domain_version);
+}
+
+pub fn ensureSqlTypeCommentCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_type_comment_version);
 }
 
 pub fn ensureSqlTypeCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
@@ -4171,6 +4300,14 @@ pub fn ensureSqlTypeCapabilityWithContext(service: anytype, context: api_operati
 
 pub fn ensureSqlCastCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
     try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_cast_version);
+}
+
+pub fn ensureSqlNativeIndexNamespaceCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_native_index_namespace_version);
+}
+
+pub fn ensureSqlTriggerFunctionCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_trigger_function_version);
 }
 
 pub fn ensureSqlRoutineCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
@@ -5043,6 +5180,13 @@ fn runRelationReconciliationRound(service: anytype) !void {
             const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
             if (work.root) |root| if (root.eql(r.Generation.of(&state))) {
                 try self.store.cancelRelationPublicationProof(self.service.metadata_group_id);
+                // Preserve the existing SQL catalog during rolling upgrades;
+                // optional dependency adoption waits for its own all-member
+                // decoder floor after the original live root is available.
+                switch (try self.prepareActivation(metadata_topology_protocol.foreign_key_directory_version, leader_cut)) {
+                    .appended => |receipt| return .{ .activated = receipt },
+                    .ready => {},
+                }
                 return .idle;
             };
             const required = @import("relation_reconciliation_command.zig").publicationVersion(state.coverage);
@@ -7532,13 +7676,17 @@ pub const MetadataService = struct {
         return self.replaceRelationTableDefinitionStampedWithContext(.{}, expected, replacement, guard);
     }
 
+    pub fn commentObjectWithContext(self: *MetadataService, context: api_operation.RequestContext, request: relation_catalog.ObjectAnnotationRead, description: ?[]const u8) !metadata_api.CatalogMutationStamp {
+        return commentObjectWithContextReceipt(self, context, request, description);
+    }
+
     pub fn commentColumnWithContext(self: *MetadataService, context: api_operation.RequestContext, guard: relation_catalog.RelationMutationGuard, column: @import("antfly_local_sources").system_catalog_column_identities.Description) !metadata_api.CatalogMutationStamp {
         return commentColumnWithContextReceipt(self, context, guard, column);
     }
 
     pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
         try requireRelationMutationOwnerWithContext(self, expected, guard, context);
-        try ensureDurableDecoderActivation(self, context, if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version);
+        try ensureDurableDecoderActivation(self, context, if (guard.object_renames.len != 0) metadata_topology_protocol.sql_object_annotations_version else if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version);
         return replaceTableDefinitionGuardedWithContextReceipt(self, expected, replacement, guard, context);
     }
 
@@ -10602,13 +10750,17 @@ pub const MetadataHttpService = struct {
         return self.replaceRelationTableDefinitionStampedWithContext(.{}, expected, replacement, guard);
     }
 
+    pub fn commentObjectWithContext(self: *MetadataHttpService, context: api_operation.RequestContext, request: relation_catalog.ObjectAnnotationRead, description: ?[]const u8) !metadata_api.CatalogMutationStamp {
+        return commentObjectWithContextReceipt(self, context, request, description);
+    }
+
     pub fn commentColumnWithContext(self: *MetadataHttpService, context: api_operation.RequestContext, guard: relation_catalog.RelationMutationGuard, column: @import("antfly_local_sources").system_catalog_column_identities.Description) !metadata_api.CatalogMutationStamp {
         return commentColumnWithContextReceipt(self, context, guard, column);
     }
 
     pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataHttpService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
         try requireRelationMutationOwnerWithContext(self, expected, guard, context);
-        try ensureDurableDecoderActivation(self, context, if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version);
+        try ensureDurableDecoderActivation(self, context, if (guard.object_renames.len != 0) metadata_topology_protocol.sql_object_annotations_version else if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version);
         return replaceTableDefinitionGuardedWithContextReceipt(self, expected, replacement, guard, context);
     }
 
@@ -19930,6 +20082,22 @@ test "relation reconciliation worker activates and publishes verified roots in r
     try std.testing.expectEqual(r.Coverage.constraint_names, rebuilt.current.?.coverage);
     try std.testing.expectEqual(metadata_topology_protocol.constraint_occupancy_version, publication_activation.version);
     try std.testing.expectEqualSlices(u8, &proof.membership_fingerprint, &publication_activation.membership_fingerprint);
+    // The first live SQL root is available at its own floor. Incoming-FK
+    // adoption then activates its stronger cohort and progresses through real
+    // Raft control rounds, without relabeling the occupancy generation.
+    var dependency_ready = false;
+    for (0..32) |_| {
+        svc.relation_reconciliation_worker.next_round_at_ns = 0;
+        try svc.runRound();
+        const durable = try store.topologyActivation(group);
+        const work = try store.relationReconciliationWork(group);
+        if (durable != null and durable.?.version >= metadata_topology_protocol.foreign_key_directory_version and work.foreign_key_backfill == null) {
+            dependency_ready = true;
+            break;
+        }
+    }
+    try std.testing.expect(dependency_ready);
+    try std.testing.expectEqualDeep(rebuilt.root, (try store.relationReconciliationWork(group)).root);
     // A live producer mutation invalidates the old candidate cut, then the
     // worker builds, verifies, swaps and collects its replacement.
     const changed = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_table = .{ .table_id = 2, .name = "two-renamed", .schema_json = "{}" } });
@@ -19965,7 +20133,7 @@ test "relation reconciliation worker activates and publishes verified roots in r
     }, .{});
     defer a.free(stale_activation);
     try std.testing.expectError(error.NotLeader, svc.proposeTopologyActivationWithReceipt(stale_activation, stale_membership));
-    try std.testing.expectEqual(metadata_topology_protocol.constraint_occupancy_version, (try store.topologyActivation(group)).?.version);
+    try std.testing.expectEqual(metadata_topology_protocol.foreign_key_directory_version, (try store.topologyActivation(group)).?.version);
     const reply = try catalog_operations.call(&svc, a, .{ .setting_admin = true }, replace_call);
     defer a.free(reply);
     var result = try std.json.parseFromSlice(catalog_calls.RelationReplacementResult, a, reply, .{});
@@ -19997,7 +20165,7 @@ test "relation reconciliation worker activates and publishes verified roots in r
     try std.testing.expect(dropped.relations[0] == null);
     // A legacy-shaped source write must inherit, never downgrade, the
     // namespace's activated occupancy floor after the index is retired.
-    try std.testing.expectEqual(metadata_topology_protocol.constraint_occupancy_version, (try store.topologyActivation(group)).?.version);
+    try std.testing.expectEqual(metadata_topology_protocol.foreign_key_directory_version, (try store.topologyActivation(group)).?.version);
     svc.lockRuntime();
     defer svc.unlockRuntime();
     try std.testing.expectEqual(@as(usize, 0), svc.raft.host.host.runtime_host.groups.getPtr(group).?.tracked_proposal_receipts.count());
@@ -24152,4 +24320,46 @@ test "relational integrity restore staging materialized view decoder covers ever
     try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_table_topology = .{ .create = .{ .expected_transition_generation = 0, .table = table, .ranges = &.{} } } }));
     try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle = .{ .upsert_tables = &.{table} } }));
     try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } }));
+}
+
+test "SQL routine catalog type annotation decoder admission precedes older type and authorization floors" {
+    const command: metadata_storage.TransitionCommand = .{ .apply_system_catalog = "{\"sql_owner\":{},\"sql_type\":{\"operation\":{\"comment\":{\"description\":null}}}}" };
+    try std.testing.expectEqual(metadata_topology_protocol.sql_type_comment_version, transitionRequiredCoordinatedDecoderVersion(command));
+    try std.testing.expect(metadata_topology_protocol.sql_type_comment_version > metadata_topology_protocol.sql_authorization_version);
+}
+
+test "system catalog schema reader publication type retirement dominates older schema floors" {
+    const protocol = metadata_topology_protocol;
+    for ([_][]const u8{
+        "{\"type_retirement\":{},\"targets\":[{\"table\":{\"schema_reader_requirements\":{}}}]}",
+        "{\"type_retir\\u0065ment\":{}}",
+    }) |json| {
+        try std.testing.expectEqual(protocol.sql_type_retirement_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = json }));
+        try std.testing.expectEqual(protocol.sql_type_retirement_version, transitionRequiredCoordinatedDecoderVersion(.{ .create_restore_job_with_staging = .{ .key = "job", .value = "{}", .plan_json = json } }));
+    }
+    try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{}" }) < protocol.sql_type_retirement_version);
+}
+
+test "presentation SQL domain declarations activate a durable decoder before type interpretation" {
+    const protocol = metadata_topology_protocol;
+    try std.testing.expect(protocol.sql_domain_version > protocol.sql_type_retirement_version);
+    const command: metadata_storage.TransitionCommand = .{ .apply_system_catalog =
+        \\{"sql_type":{"operation":{"create_domain":{}}}}
+    };
+    try std.testing.expectEqual(protocol.sql_domain_version, transitionRequiredCoordinatedDecoderVersion(command));
+}
+
+test "presentation malformed restore and catalog envelopes cannot reduce the current decoder floor" {
+    for ([_][]const u8{
+        "{",                                                    "[]", "{\"type_retirement\":{}} trailing",
+        "{\"sql_type\":{\"operation\":{\"create_domain\":{}}}",
+    }) |bytes| {
+        try std.testing.expectEqual(metadata_topology_protocol.current_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = bytes }));
+        try std.testing.expectEqual(metadata_topology_protocol.current_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = bytes }));
+    }
+}
+
+test "SQL routine catalog trigger decoder admission precedes scalar and owner floors" {
+    try std.testing.expectEqual(metadata_topology_protocol.sql_trigger_function_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"sql_owner\":{},\"sql_routine\":{\"operation\":{\"publish\":{\"definition\":{\"returns_trigger\":true}}}}}" }));
+    try std.testing.expect(metadata_topology_protocol.sql_trigger_function_version > metadata_topology_protocol.sql_routine_version);
 }

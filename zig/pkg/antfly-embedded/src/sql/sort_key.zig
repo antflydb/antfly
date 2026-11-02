@@ -38,7 +38,7 @@ pub fn encode(values: []const Datum, orders: anytype) ?Key {
     for (values, orders, 0..) |value, order, index| {
         // Extension payloads are not JSON nulls. Range endpoints may exceed
         // this bounded prefix; retain the authoritative typed comparator.
-        if (value.array != null or value.range() != null or value.enumeration() != null) return null;
+        if (value.array != null or value.range() != null or value.enumeration() != null or value.bytes() != null) return null;
         if (value.temporal()) |temporal| {
             value.validateTemporal() catch return null;
             const codec = @import("temporal_ops.zig");

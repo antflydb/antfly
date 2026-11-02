@@ -624,6 +624,7 @@ const MembershipCache = struct {
 };
 
 pub const Frame = struct {
+    domain_registry: ?@import("../schema/domain_value.zig").Registry = null,
     memberships: ?*MembershipCache = null,
     payload_owner: ?PayloadLease = null,
     arena: *std.heap.ArenaAllocator,
@@ -654,6 +655,7 @@ pub const Frame = struct {
     pub fn deinit(self: *Frame) void {
         const backing = self.budget.backing;
         if (self.memberships) |cache| cache.deinit();
+        if (self.domain_registry) |*registry| registry.deinit();
         self.arena.deinit();
         self.budget.allocator().destroy(self.arena);
         std.debug.assert(self.budget.live == 0);
@@ -715,13 +717,17 @@ pub const Frame = struct {
         arena.* = std.heap.ArenaAllocator.init(budget.allocator());
         errdefer arena.deinit();
         const decoded = prepareLeaky(arena.allocator(), descriptors, inputs, limits) catch |err| return if (err == error.OutOfMemory and budget.exhausted) error.SqlProgramLimitExceeded else err;
+        errdefer if (decoded.domain_registry) |owned| {
+            var registry = owned;
+            registry.deinit();
+        };
         const memberships = try MembershipCache.init(MemoryBudget.reclaimingAllocator(budget.allocator()), decoded.values, limits.work -| decoded.work);
         if (limits.payload_owner) |owner| owner.retain();
-        return .{ .memberships = memberships, .payload_owner = limits.payload_owner, .arena = arena, .budget = budget, .descriptors = decoded.descriptors, .values = decoded.values, .work = decoded.work };
+        return .{ .domain_registry = decoded.domain_registry, .memberships = memberships, .payload_owner = limits.payload_owner, .arena = arena, .budget = budget, .descriptors = decoded.descriptors, .values = decoded.values, .work = decoded.work };
     }
 };
 
-fn prepareLeaky(a: A, descriptors: []const scalar.Type, inputs: []const Input, limits: Limits) !struct { descriptors: []const scalar.Type, values: []const scalar.Datum, work: usize } {
+fn prepareLeaky(a: A, descriptors: []const scalar.Type, inputs: []const Input, limits: Limits) !struct { descriptors: []const scalar.Type, values: []const scalar.Datum, work: usize, domain_registry: ?@import("../schema/domain_value.zig").Registry } {
     var work: arrays.Budget = .{ .remaining = limits.work };
     var wire_bytes: usize = 0;
     for (inputs) |input| {
@@ -740,6 +746,14 @@ fn prepareLeaky(a: A, descriptors: []const scalar.Type, inputs: []const Input, l
         descriptor.enum_view = try scalar.ownEnumView(a, &views, descriptor.enum_view);
         if (descriptor.kind == null) return error.UnknownSqlParameterType;
     }
+    var domain_sources: std.ArrayList(*const @import("../schema/domain_value.zig").View) = .empty;
+    defer domain_sources.deinit(a);
+    for (types) |descriptor| if (descriptor.domainView()) |view| try domain_sources.append(a, view);
+    var domain_registry = if (domain_sources.items.len != 0) @as(?@import("../schema/domain_value.zig").Registry, try @import("domain_coercion.zig").capture(a, domain_sources.items)) else null;
+    errdefer if (domain_registry) |*registry| registry.deinit();
+    if (domain_registry) |*registry| for (types) |*descriptor| if (descriptor.domainView()) |view| {
+        descriptor.domain_binding = &registry.byId(view.identity.?.id).?.executable.?.domain.type_binding;
+    };
     const values = try a.alloc(scalar.Datum, inputs.len);
     for (types, inputs, values, 1..) |descriptor, input, *value, index| {
         value.* = decodeInput(a, descriptor, input, limits, &work, &wire_bytes) catch |err| {
@@ -748,8 +762,15 @@ fn prepareLeaky(a: A, descriptors: []const scalar.Type, inputs: []const Input, l
             };
             return err;
         };
+        if (descriptor.domainView()) |view| {
+            var available: usize = @min(limits.bytes, @import("../schema/relational_expression.zig").max_allocated_bytes);
+            var execution = @import("../schema/relational_expression.zig").Execution.init(a, &available);
+            execution.numeric.remaining = work.remaining;
+            defer work.remaining = @intCast(execution.numeric.remaining);
+            try @import("domain_coercion.zig").validate(&execution, view, value.*, null);
+        }
     }
-    return .{ .descriptors = types, .values = values, .work = limits.work - work.remaining };
+    return .{ .domain_registry = domain_registry, .descriptors = types, .values = values, .work = limits.work - work.remaining };
 }
 
 test "SQL temporal parameter ingress validates payloads before NULL normalization" {
@@ -780,6 +801,22 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
         if (input == .datum and (input.datum.array != null or input.datum.numeric != null or input.datum.patterns() != null or input.datum.value != .null)) return error.SqlTypeMismatch;
         return .{};
     }
+    if (descriptor.kind == .bytea) {
+        if (input == .array_envelope) return error.SqlTypeMismatch;
+        const owned = try a.create(@import("bytea_value.zig").Value);
+        if (input == .datum and input.datum.bytes() != null) {
+            const bytes = input.datum.bytes().?;
+            try work.consume(bytes.len);
+            owned.* = .{ .bytes = try a.dupe(u8, bytes) };
+        } else {
+            const raw = if (input == .text) input.text else if (input == .binary) input.binary else if (input.datum.extension == null and input.datum.array == null and input.datum.numeric == null and input.datum.value == .string) input.datum.value.string else return error.SqlTypeMismatch;
+            try work.consume(raw.len);
+            if (raw.len > limits.bytes) return error.SqlProgramLimitExceeded;
+            owned.* = .{ .bytes = if (input == .binary) try a.dupe(u8, raw) else try @import("bytea_value.zig").parseAlloc(a, raw, limits.bytes) };
+        }
+        return scalar.Datum.typedBytes(owned);
+    }
+    if (input == .datum and input.datum.bytes() != null) return error.SqlTypeMismatch;
     const ranges = @import("range_value.zig");
     if (descriptor.kind) |tag| if (ranges.kindFromType(tag)) |range_kind| {
         if (input == .array_envelope) return error.SqlTypeMismatch;
@@ -1559,4 +1596,24 @@ test "SQL quantified JSONB strings agree across scans indexes and all comparison
             }
         }
     }
+}
+
+test "SQL bytea frames own text binary and typed ingress across every allocation failure" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            const text_bytes = try a.dupe(u8, "\\x00ff80");
+            defer a.free(text_bytes);
+            const binary_bytes = try a.dupe(u8, "\x00\xff\x80");
+            defer a.free(binary_bytes);
+            const typed: scalar.Bytea.Value = .{ .bytes = binary_bytes };
+            var frame = try Frame.prepare(a, &.{ .{ .kind = .bytea }, .{ .kind = .bytea }, .{ .kind = .bytea }, .{ .kind = .bytea } }, &.{ .{ .text = text_bytes }, .{ .binary = binary_bytes }, .{ .datum = scalar.Datum.typedBytes(&typed) }, .sql_null }, .{});
+            defer frame.deinit();
+            @memset(text_bytes, 0);
+            @memset(binary_bytes, 0);
+            for (frame.values[0..3]) |value| try std.testing.expectEqualSlices(u8, "\x00\xff\x80", value.bytes().?);
+            try std.testing.expect(frame.values[3].sql_null and frame.values[3].bytes() == null);
+        }
+    };
+    try Probe.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }

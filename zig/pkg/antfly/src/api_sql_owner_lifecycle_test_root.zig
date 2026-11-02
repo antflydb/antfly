@@ -26,6 +26,13 @@ pub const storage_backend_erased = @import("antfly_local_sources").storage_backe
 pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 
 test {
+    _ = @import("api/sql_prepared_transaction_integration_test.zig");
+    _ = @import("api/sql_sync_control_integration_test.zig");
+    _ = @import("api/sql_authorization_runtime.zig");
+    _ = @import("api/sql_authorization_lifecycle_integration_test.zig");
+    _ = @import("api/sql_maintenance.zig");
+    _ = @import("api/sql_maintenance_lifecycle_integration_test.zig");
+    _ = @import("api/sql_statistics_cache.zig");
     _ = @import("storage/metadata_raft_apply_client.zig").consumer_tests;
     _ = @import("antfly_local_sources").api_relational_integrity_commit;
     _ = @import("api/table_reads.zig").consumer_tests;

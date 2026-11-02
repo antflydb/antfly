@@ -727,3 +727,170 @@ test "mounted SQL original serial and identity declarations preserve PostgreSQL 
         try fixture.runWithState(IdentityCampaign, .{ .entry = entry });
     }
 }
+
+const RetirementCampaign = struct {
+    pub const native_auth = true;
+    pub const native_sessions = true;
+    pub const cold_catalog = true;
+    token: [8192]u8 = undefined,
+    token_len: usize = 0,
+    owners: [2]fixture.ServingSchema = undefined,
+
+    fn linkBorrower(ctx: *fixture.Context) !void {
+        // Construct the shared reference through the existing schema ingress.
+        // This qualifies retirement; SQL borrowed-default creation and counter
+        // allocation remain independently guarded until handoff is qualified.
+        const domain = local.system_catalog_domain;
+        var region = std.heap.ArenaAllocator.init(ctx.alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        const source = http.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+        const lookup: domain.ResolveMany = .{ .relations = &.{ .{ .name = "retire_source" }, .{ .name = "retire_borrower" } }, .include_query_definitions = true };
+        const raw = try source.systemCatalog(a, .{ .setting_admin = true }, .{ .resolve_many = lookup });
+        const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, raw, .{});
+        try resolved.validateRelations(lookup);
+        const parent = resolved.relations[0].?;
+        const borrower = resolved.relations[1].?;
+        const parent_json = try std.json.parseFromSliceLeaky(Json, a, parent.table.query_definition.?.schema_json, .{});
+        var reference = (try local.system_catalog_column_sequences.referenceForColumn(a, parent_json, "n")).?;
+        defer reference.deinit();
+        const guard: domain.RelationMutationGuard = .{ .target = .{ .name = "retire_borrower" }, .logical_table = "retire_borrower", .owner = borrower.owner, .incarnation = resolved.relation_epoch.?.incarnation };
+        const request: sequence.SnapshotRequest = .{ .targets = &.{reference.value.target}, .owner = .{ .guard = guard, .column = "n" } };
+        const owner_bytes = try source.systemCatalog(a, .{ .setting_admin = true }, .{ .sql_sequence_snapshot = request });
+        const bound = try std.json.parseFromSliceLeaky(sequence.Snapshot, a, owner_bytes, .{});
+        try bound.validate(request);
+        reference.value.owner = bound.owner.?.column;
+        var schema = try std.json.parseFromSliceLeaky(Json, a, borrower.table.query_definition.?.schema_json, .{});
+        _ = schema.object.orderedRemove("version");
+        const defaults = try std.json.Stringify.valueAlloc(a, .{.{ .column = "n", .sequence = reference.value }}, .{});
+        try schema.object.put(a, "column_defaults", try std.json.parseFromSliceLeaky(Json, a, defaults, .{}));
+        const body = try std.json.Stringify.valueAlloc(a, schema, .{});
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "/db/v1/tables/retire_borrower/schema", .PUT, body, 15000);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 200) std.debug.print("borrower schema status={d} body={s}\n", .{ response.status, response.body });
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+    }
+    fn rejectIncompleteCut(ctx: *fixture.Context) !void {
+        var region = std.heap.ArenaAllocator.init(ctx.alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        const source = http.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+        const private: local.api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true, .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 15 * std.time.ns_per_s };
+        const lookup: sequence.SnapshotRequest = .{ .targets = &.{.{ .table = "retire_source_n_seq" }}, .prepare_retirement = true };
+        // The schema ingress uses the ordinary migration machinery. Wait for
+        // its real owner/index completion before starting another lifecycle;
+        // retained predecessor layouts must never be discarded by this test.
+        const raw = while (true) {
+            break source.systemCatalog(a, private, .{ .sql_sequence_snapshot = lookup }) catch |err| switch (err) {
+                error.TableTransitionActive, error.CatalogPublicationProofPending => {
+                    try private.ensureActive();
+                    try ctx.checkDrivers();
+                    try ctx.io.sleep(.fromMilliseconds(20), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+        };
+        var cut = try std.json.parseFromSliceLeaky(sequence.Snapshot, a, raw, .{});
+        try cut.validate(lookup);
+        try std.testing.expectEqual(@as(usize, 2), cut.retirement.?.dependents.len);
+        try std.testing.expectEqual(@as(u64, 2), cut.retirement.?.references.count);
+        const entry = cut.entries[0];
+        const request: sequence.Mutation = .{ .target = entry.target, .namespace_id = entry.namespace_id.?, .incarnation = cut.incarnation, .admission = .{ .head = cut.head, .nonce = @splat(19) }, .operation = .{ .drop = .{ .cascade = true, .expected = .{ .id = entry.value.sequence.id, .generation = entry.value.sequence.generation } } } };
+        // Remove one real participant while keeping the exact native summary.
+        // A signed preparation proves its own owner, not dependency closure.
+        cut.retirement.?.dependents = cut.retirement.?.dependents[0..1];
+        const table = cut.retirement.?.dependents[0].table_id;
+        var end: usize = 0;
+        const ranges = cut.retirement.?.activation.?.ranges;
+        while (end < ranges.len and ranges[end].table_id == table) : (end += 1) {}
+        cut.retirement.?.activation.?.ranges = ranges[0..end];
+        var transport: @import("schema_validation_owner_transport.zig").Transport = .{ .server = &ctx.data.http_server.?, .alloc = a };
+        defer transport.deinit();
+        var owned = try @import("schema_validation_plan_builder.zig").buildSequenceRetirement(&transport, a, ctx.io, private, cut, request);
+        defer owned.deinit();
+        const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+        try std.testing.expectError(error.CatalogGenerationChanged, store.schemaValidationPreflightJson(a, cut.metadata_group_id, owned.command));
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, store.sqlSequenceOutcome(a, cut.metadata_group_id, request));
+    }
+
+    fn observe(self: *@This(), ctx: *fixture.Context) !wire.SQLCatalogOperationState {
+        const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .recovery_token = self.token[0..self.token_len] }, .{});
+        defer ctx.alloc.free(body);
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "/db/v1/sql/operations/status", .POST, body, 5000);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 200) std.debug.print("sequence retirement observation status={d} body={s}\n", .{ response.status, response.body });
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var receipt = try std.json.parseFromSlice(wire.SQLCatalogOperationReceipt, ctx.alloc, response.body, .{});
+        defer receipt.deinit();
+        try std.testing.expectEqualStrings(self.token[0..self.token_len], receipt.value.recovery_token);
+        if (receipt.value.state == .committed) try std.testing.expect(receipt.value.object_id == null and receipt.value.generation == null and receipt.value.catalog_revision != null);
+        if (receipt.value.state == .rejected) if (receipt.value.diagnostic) |diagnostic| std.debug.print("sequence retirement rejected code={s} message={s}\n", .{ diagnostic.code, diagnostic.message });
+        return receipt.value.state;
+    }
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        ctx.headers = ctx.admin_headers;
+        try ExecutionCampaign.call(ctx, null, "CREATE TABLE retire_source(id TEXT PRIMARY KEY,n BIGSERIAL UNIQUE)", null, &.{});
+        try ExecutionCampaign.call(ctx, null, "CREATE TABLE retire_borrower(id TEXT PRIMARY KEY,n BIGINT UNIQUE)", null, &.{});
+        try ExecutionCampaign.call(ctx, null, "CREATE TABLE identity_ownership(id TEXT PRIMARY KEY,n BIGINT GENERATED ALWAYS AS IDENTITY)", null, &.{});
+        try ExecutionCampaign.call(ctx, null, "ALTER SEQUENCE identity_ownership_n_seq OWNED BY NONE", "0A000", &.{});
+        try ExecutionCampaign.call(ctx, null, "ALTER SEQUENCE identity_ownership_n_seq OWNED BY identity_ownership.n", "0A000", &.{});
+        try ExecutionCampaign.call(ctx, null, "DROP SEQUENCE identity_ownership_n_seq CASCADE", "2BP01", &.{});
+        for ([_][]const u8{ "retire_source", "retire_borrower" }, &self.owners) |name, *owner| {
+            owner.* = try fixture.waitServingSchema(ctx, name, 0);
+            try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, owner.table_id);
+            try fixture.waitRelationPublication(ctx.alloc, ctx.io, ctx.metadata, name);
+        }
+        try ExecutionCampaign.call(ctx, null, "INSERT INTO retire_source(id) VALUES('source')", null, &.{});
+        try ExecutionCampaign.call(ctx, null, "INSERT INTO retire_borrower VALUES('borrower',77)", null, &.{});
+        try linkBorrower(ctx);
+        self.owners[1] = try fixture.waitServingSchema(ctx, "retire_borrower", self.owners[1].version + 1);
+        try ExecutionCampaign.call(ctx, null, "DROP SEQUENCE retire_source_n_seq RESTRICT", "2BP01", &.{});
+        try rejectIncompleteCut(ctx);
+        ctx.data.pauseSchemaValidationAckForTest(self.owners[0].table_id, .ready);
+        var response = try client.execute(ctx, "DROP SEQUENCE retire_source_n_seq CASCADE", .write_admission);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 202) std.debug.print("sequence retirement admission status={d} body={s}\n", .{ response.status, response.body });
+        try std.testing.expectEqual(@as(u16, 202), response.status);
+        var value = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+        defer value.deinit();
+        const receipt = value.value.catalog_receipt orelse return error.MissingSequenceRetirementReceipt;
+        try std.testing.expectEqual(.pending, receipt.state);
+        try std.testing.expect(receipt.recovery_token.len <= self.token.len);
+        self.token_len = receipt.recovery_token.len;
+        @memcpy(self.token[0..self.token_len], receipt.recovery_token);
+        try std.testing.expectEqual(.pending, try self.observe(ctx));
+        try ExecutionCampaign.call(ctx, null, "SELECT n FROM retire_source WHERE id='source'", null, &.{&.{.{ .integer = 1 }}});
+        try ExecutionCampaign.call(ctx, null, "SELECT n FROM retire_borrower WHERE id='borrower'", null, &.{&.{.{ .integer = 77 }}});
+    }
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        ctx.headers = ctx.admin_headers;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s;
+        while (true) {
+            const state = try self.observe(ctx);
+            if (state == .committed) break;
+            try std.testing.expectEqual(.pending, state);
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.SequenceRetirementDidNotFinish;
+            try ctx.checkDrivers();
+            try ctx.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        for ([_][]const u8{ "retire_source", "retire_borrower" }, self.owners) |name, before| {
+            const after = try fixture.waitServingSchema(ctx, name, before.version + 1);
+            try std.testing.expectEqual(before.table_id, after.table_id);
+            try std.testing.expectEqual(before.version + 1, after.version);
+        }
+        try ExecutionCampaign.call(ctx, null, "SELECT n FROM retire_source WHERE id='source'", null, &.{&.{.{ .integer = 1 }}});
+        try ExecutionCampaign.call(ctx, null, "SELECT n FROM retire_borrower WHERE id='borrower'", null, &.{&.{.{ .integer = 77 }}});
+        try ExecutionCampaign.call(ctx, null, "INSERT INTO retire_source(id) VALUES('missing_default')", "23502", &.{});
+        try ExecutionCampaign.call(ctx, null, "INSERT INTO retire_borrower(id) VALUES('nullable')", null, &.{});
+        try ExecutionCampaign.call(ctx, null, "SELECT n FROM retire_borrower WHERE id='nullable'", null, &.{&.{.null}});
+        try ExecutionCampaign.call(ctx, null, "SELECT nextval('retire_source_n_seq')", "42P01", &.{});
+        try ExecutionCampaign.call(ctx, null, "INSERT INTO retire_source VALUES('explicit',7)", null, &.{});
+        try ExecutionCampaign.call(ctx, null, "SELECT id FROM retire_source WHERE n=7", null, &.{&.{.{ .string = "explicit" }}});
+        try std.testing.expectEqual(.committed, try self.observe(ctx));
+    }
+};
+
+test "mounted SQL sequence CASCADE retires shared defaults through cold multi-table owner publication and preserves rows constraints indexes and exact outcomes" {
+    try fixture.runWithState(RetirementCampaign, .{});
+}

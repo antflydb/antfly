@@ -38,7 +38,7 @@ const transactions = @import("../transactions.zig");
 const debt = transactions.topology_debt;
 const receipts = @import("apply_receipts.zig");
 const Digest = [32]u8;
-pub const family_prefix = "\x00\x00__metadata__:schema_validation_job:";
+pub const family_prefix = schema.schema_validation_job_prefix;
 pub const key = family_prefix ++ "v1";
 pub const inputs_key = key ++ ":inputs";
 pub const cursor_key = key ++ ":cursor";
@@ -79,6 +79,7 @@ pub const Candidate = struct {
     foreign_parent: ?foreign_validation.ParentPlan = null,
 
     pub fn projectionCount(self: *const Candidate) usize {
+        if (self.purpose.schemaOnly() or self.purpose == .domain_not_null) return 1;
         if (self.foreign_source) |source| return source.rules.len;
         if (self.foreign_parent) |parent| return parent.rules.len;
         return self.plan.names.len;
@@ -146,6 +147,204 @@ pub const Candidate = struct {
         try control.ensureActive();
         return .{ .alloc = a, .inputs = inputs, .native_before = native_before, .native_after = native_after, .catalog_after = catalog_after, .plan = plan, .before_version = before.runtime_schema.version, .after_version = after.runtime_schema.version };
     }
+    /// Compatible schema-only preparation. Existing values and tuple bytes
+    /// remain valid by an exact append-only proof; no historical row predicate
+    /// or nullability projection is created for this purpose.
+    pub fn initEnumEpoch(a: A, table_id: u64, before_json: []const u8, after_json: []const u8, predecessor: []const u8, epoch: contract.EnumEpoch, control: projection.Control) !Candidate {
+        var result = try initTypeEpoch(a, table_id, before_json, after_json, predecessor, epoch, control);
+        errdefer result.deinit();
+        if (result.purpose != .enum_epoch) return error.InvalidSchemaValidationJob;
+        return result;
+    }
+
+    /// Compatible, exact default-only publication. The immutable selector
+    /// proves the complete postimage; the ordinary owner install barrier still
+    /// drains old prepared mutations before any counter may be retired.
+    pub fn initDefaultRetirement(a: A, table_id: u64, before_json: []const u8, after_json: []const u8, predecessor: []const u8, selected: @import("../../system_catalog/column_sequences.zig").DefaultRetirement, control: projection.Control) !Candidate {
+        try control.ensureActive();
+        try selected.validate();
+        if (table_id == 0 or before_json.len == 0 or before_json.len > max_schema or after_json.len == 0 or after_json.len > max_schema or
+            predecessor.len == 0 or predecessor.len > integrity.max_catalog_bytes) return error.InvalidSchemaValidationJob;
+        const expected = try selected.schemaAlloc(a, table_id, before_json);
+        defer a.free(expected);
+        if (!std.mem.eql(u8, expected, after_json)) return error.InvalidSchemaValidationJob;
+        var before = try api.PreparedSchemaDefinition.init(a, before_json);
+        defer before.deinit(a);
+        var after = try api.PreparedSchemaDefinition.init(a, after_json);
+        defer after.deinit(a);
+        if (before.runtime_schema.storage_mode != .relational or after.runtime_schema.storage_mode != .relational or
+            before.runtime_schema.external_base_source != null or after.runtime_schema.external_base_source != null) return error.InvalidSchemaValidationJob;
+        var old_catalog = try compiler.compileCatalog(a, before.public_schema, table_id, predecessor);
+        defer old_catalog.deinit();
+        if (!std.mem.eql(u8, old_catalog.value, predecessor)) return error.IntegrityCatalogChanged;
+        var next_catalog = try compiler.compileCatalog(a, after.public_schema, table_id, predecessor);
+        defer next_catalog.deinit();
+        if (!eq(activation.generationSet(old_catalog.catalog), activation.generationSet(next_catalog.catalog))) return error.InvalidSchemaValidationJob;
+        const native_before = try schema.serializeSchema(a, before.runtime_schema);
+        errdefer a.free(native_before);
+        const native_after = try schema.serializeSchema(a, after.runtime_schema);
+        errdefer a.free(native_after);
+        const catalog_after = try a.dupe(u8, next_catalog.value);
+        errdefer a.free(catalog_after);
+        const selector = try std.json.Stringify.valueAlloc(a, selected, .{});
+        defer a.free(selector);
+        const inputs = try contract.encodeInputs(a, .{ before_json, after_json, predecessor, selector });
+        errdefer a.free(inputs);
+        try control.ensureActive();
+        return .{ .alloc = a, .inputs = inputs, .native_before = native_before, .native_after = native_after, .catalog_after = catalog_after, .plan = .{ .alloc = a, .names = &.{}, .identity = try selected.fingerprint() }, .before_version = before.runtime_schema.version, .after_version = after.runtime_schema.version, .purpose = .sequence_default_removal };
+    }
+
+    /// The owning-table cohort may withdraw FK/default dependencies, but may
+    /// neither introduce a constraint nor weaken any unrelated declaration.
+    /// Document tables cannot declare these relational dependencies.
+    pub fn initDependencyRetirement(a: A, table_id: u64, before_json: []const u8, after_json: []const u8, predecessor: []const u8, selected: @import("../../system_catalog/dependency_retirement.zig").Selection, control: projection.Control) !Candidate {
+        try control.ensureActive();
+        try selected.requireSuccessor(a, table_id, before_json, after_json);
+        if (predecessor.len > integrity.max_catalog_bytes) return error.InvalidSchemaValidationJob;
+        var before = try api.PreparedSchemaDefinition.init(a, before_json);
+        defer before.deinit(a);
+        var after = try api.PreparedSchemaDefinition.init(a, after_json);
+        defer after.deinit(a);
+        if (before.runtime_schema.storage_mode != .relational or after.runtime_schema.storage_mode != .relational or
+            before.runtime_schema.external_base_source != null or after.runtime_schema.external_base_source != null or predecessor.len == 0) return error.InvalidSchemaValidationJob;
+        var old = try compiler.compileCatalog(a, before.public_schema, table_id, predecessor);
+        defer old.deinit();
+        if (!std.mem.eql(u8, old.value, predecessor)) return error.IntegrityCatalogChanged;
+        var next = try compiler.compileCatalog(a, after.public_schema, table_id, predecessor);
+        defer next.deinit();
+        try requireCatalogWithdrawal(a, old.catalog, next.catalog);
+        const catalog_after = try a.dupe(u8, next.value);
+        errdefer a.free(catalog_after);
+        const native_before = try schema.serializeSchema(a, before.runtime_schema);
+        errdefer a.free(native_before);
+        const native_after = try schema.serializeSchema(a, after.runtime_schema);
+        errdefer a.free(native_after);
+        const selector = try std.json.Stringify.valueAlloc(a, selected, .{});
+        defer a.free(selector);
+        const inputs = try contract.encodeInputs(a, .{ before_json, after_json, predecessor, selector });
+        errdefer a.free(inputs);
+        try control.ensureActive();
+        return .{ .alloc = a, .inputs = inputs, .native_before = native_before, .native_after = native_after, .catalog_after = catalog_after, .plan = .{ .alloc = a, .names = &.{}, .identity = try selected.fingerprint() }, .before_version = before.runtime_schema.version, .after_version = after.runtime_schema.version, .purpose = .dependent_object_retirement };
+    }
+
+    pub fn requireCatalogWithdrawal(a: A, before: integrity.Catalog, after: integrity.Catalog) !void {
+        if (!std.mem.eql(u8, &before.incarnation, &after.incarnation) or !eq(before.checks_digest, after.checks_digest) or
+            before.next_generation != after.next_generation or before.bindings.len != after.bindings.len) return error.InvalidSchemaValidationJob;
+        var allocations: std.AutoHashMapUnmanaged(u64, integrity.Binding) = .empty;
+        defer allocations.deinit(a);
+        try allocations.ensureTotalCapacity(a, @intCast(before.bindings.len));
+        for (before.bindings) |binding| {
+            const result = allocations.getOrPutAssumeCapacity(binding.allocation);
+            if (result.found_existing) return error.InvalidSchemaValidationJob;
+            result.value_ptr.* = binding;
+        }
+        for (after.bindings) |next| {
+            const previous = (allocations.fetchRemove(next.allocation) orelse return error.InvalidSchemaValidationJob).value;
+            if (!std.mem.eql(u8, &previous.generation, &next.generation) or previous.definition.kind != next.definition.kind or
+                !std.mem.eql(u8, previous.definition.name, next.definition.name) or !eq(previous.definition.fingerprint, next.definition.fingerprint) or
+                !std.mem.eql(u8, previous.definition.payload, next.definition.payload) or
+                (previous.retired and !next.retired) or (!previous.retired and next.retired and previous.definition.kind != .foreign_key)) return error.InvalidSchemaValidationJob;
+        }
+    }
+
+    pub fn initObjectRename(a: A, table_id: u64, before_json: []const u8, after_json: []const u8, predecessor: []const u8, renames: []const @import("../../system_catalog/object_annotations.zig").Rename, control: projection.Control) !Candidate {
+        try control.ensureActive();
+        if (table_id == 0 or before_json.len == 0 or before_json.len > max_schema or after_json.len == 0 or after_json.len > max_schema or predecessor.len == 0 or predecessor.len > integrity.max_catalog_bytes) return error.InvalidSchemaValidationJob;
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        const rename_definitions = @import("../../system_catalog/object_definitions.zig");
+        try rename_definitions.verifySchemaRename(region.allocator(), before_json, after_json, renames);
+        var before = try api.PreparedSchemaDefinition.init(a, before_json);
+        defer before.deinit(a);
+        var after = try api.PreparedSchemaDefinition.init(a, after_json);
+        defer after.deinit(a);
+        if (after.runtime_schema.version != (std.math.add(u32, before.runtime_schema.version, 1) catch return error.InvalidSchemaValidationJob) or before.runtime_schema.storage_mode != .relational or after.runtime_schema.storage_mode != .relational or before.runtime_schema.external_base_source != null or after.runtime_schema.external_base_source != null) return error.InvalidSchemaValidationJob;
+        var old = try compiler.compileCatalog(a, before.public_schema, table_id, predecessor);
+        defer old.deinit();
+        if (!std.mem.eql(u8, old.value, predecessor)) return error.IntegrityCatalogChanged;
+        const native_before = try schema.serializeSchema(a, before.runtime_schema);
+        errdefer a.free(native_before);
+        const native_after = try schema.serializeSchema(a, after.runtime_schema);
+        errdefer a.free(native_after);
+        const declarations = try compiler.definitionFingerprints(region.allocator(), after.public_schema, after.runtime_schema);
+        var renamed = try integrity.prepareObjectRenames(a, predecessor, try integrity.incarnationFromTableId(table_id), after.runtime_schema.version, hash(native_after), declarations, renames, try compiler.checksFingerprint(a, after.public_schema));
+        defer renamed.deinit();
+        const catalog_after = try a.dupe(u8, renamed.value);
+        errdefer a.free(catalog_after);
+        const selector = try std.json.Stringify.valueAlloc(a, renames, .{});
+        defer a.free(selector);
+        const inputs = try contract.encodeInputs(a, .{ before_json, after_json, predecessor, selector });
+        errdefer a.free(inputs);
+        try control.ensureActive();
+        return .{ .alloc = a, .inputs = inputs, .native_before = native_before, .native_after = native_after, .catalog_after = catalog_after, .plan = .{ .alloc = a, .names = &.{}, .identity = try rename_definitions.renameFingerprint(renames) }, .before_version = before.runtime_schema.version, .after_version = after.runtime_schema.version, .purpose = .object_rename };
+    }
+
+    /// Exact immutable enum/domain successor. Enum additions need no row
+    /// scan; domain tightening compiles a projected NULL predicate and uses
+    /// the ordinary fenced bounded scanner, including checkpoint recovery.
+    pub fn initTypeEpoch(a: A, table_id: u64, before_json: []const u8, after_json: []const u8, predecessor: []const u8, epoch: contract.EnumEpoch, control: projection.Control) !Candidate {
+        try control.ensureActive();
+        try epoch.validate();
+        if (table_id == 0 or before_json.len == 0 or before_json.len > max_schema or after_json.len == 0 or after_json.len > max_schema or
+            predecessor.len == 0 or predecessor.len > integrity.max_catalog_bytes) return error.InvalidSchemaValidationJob;
+        var before = try api.PreparedSchemaDefinition.init(a, before_json);
+        defer before.deinit(a);
+        var after = try api.PreparedSchemaDefinition.init(a, after_json);
+        defer after.deinit(a);
+        if (before.runtime_schema.storage_mode != .relational or after.runtime_schema.storage_mode != .relational or
+            before.runtime_schema.external_base_source != null or after.runtime_schema.external_base_source != null) return error.InvalidSchemaValidationJob;
+        const previous = for (before.runtime_schema.named_types) |record| {
+            if (record.identity.id == epoch.type_id) break record;
+        } else return error.InvalidSchemaValidationJob;
+        const successor = for (after.runtime_schema.named_types) |record| {
+            if (record.identity.id == epoch.type_id) break record;
+        } else return error.InvalidSchemaValidationJob;
+        if (previous.identity.generation != epoch.generation or !std.mem.eql(u8, &previous.identity.origin_id, &epoch.origin_id)) return error.SchemaValidationJobChanged;
+        const exact = try @import("../../common/sql_named_type_layout.zig").epochSchemaAlloc(a, before_json, previous, successor);
+        defer a.free(exact);
+        if (!std.mem.eql(u8, exact, after_json)) return error.InvalidSchemaValidationJob;
+        var old_catalog = try compiler.compileCatalog(a, before.public_schema, table_id, predecessor);
+        defer old_catalog.deinit();
+        if (!std.mem.eql(u8, old_catalog.value, predecessor)) return error.IntegrityCatalogChanged;
+        var next_catalog = try compiler.compileCatalog(a, after.public_schema, table_id, predecessor);
+        defer next_catalog.deinit();
+        if (!eq(activation.generationSet(old_catalog.catalog), activation.generationSet(next_catalog.catalog))) return error.InvalidSchemaValidationJob;
+        const native_before = try schema.serializeSchema(a, before.runtime_schema);
+        errdefer a.free(native_before);
+        const native_after = try schema.serializeSchema(a, after.runtime_schema);
+        errdefer a.free(native_after);
+        const catalog_after = try a.dupe(u8, next_catalog.value);
+        errdefer a.free(catalog_after);
+        const selector = try std.json.Stringify.valueAlloc(a, epoch, .{});
+        defer a.free(selector);
+        const inputs = try contract.encodeInputs(a, .{ before_json, after_json, predecessor, selector });
+        errdefer a.free(inputs);
+        var plan: projection.Plan = .{ .alloc = a, .names = &.{}, .identity = try epoch.fingerprint() };
+        errdefer plan.deinit();
+        const is_domain = previous.definition == .domain;
+        if (is_domain) {
+            // The exact successor verifier permits only this domain's new
+            // NOT NULL rule. Do not re-coerce historical values or replay
+            // defaults/checks that were already accepted in an older epoch.
+            var names: std.ArrayList([]const u8) = .empty;
+            defer names.deinit(a);
+            for (before.runtime_schema.named_types) |record| {
+                if (record.definition == .domain and record.definition.domain.base == .named and
+                    record.definition.domain.base.named.id == epoch.type_id) return error.UnsupportedSqlExecution;
+            }
+            for (before.runtime_schema.relational_columns) |column| {
+                if (column.named_type_id == epoch.type_id) try names.append(a, column.name);
+            }
+            var layout = try codec.PhysicalLayout.init(a, before.runtime_schema);
+            defer layout.deinit();
+            plan = try projection.Plan.init(a, before.runtime_schema, &layout, names.items, control);
+            plan.aggregate_failure = true;
+            plan.identity = try epoch.fingerprint();
+        }
+        try control.ensureActive();
+        return .{ .alloc = a, .inputs = inputs, .native_before = native_before, .native_after = native_after, .catalog_after = catalog_after, .plan = plan, .before_version = before.runtime_schema.version, .after_version = after.runtime_schema.version, .purpose = if (is_domain) .domain_not_null else .enum_epoch };
+    }
+
     /// Exact child-side preparation. Parent descriptors bind tuple encoding;
     /// ordinary 2PC attachments establish parent validity, while metadata
     /// leases retain the selected target definitions through publication.
@@ -290,6 +489,25 @@ pub const Candidate = struct {
             var config = try std.json.parseFromSlice(foreign_validation.ParentConfig, a, view[3], .{ .ignore_unknown_fields = false });
             defer config.deinit();
             break :block try initForeignKeyParent(a, table_id, view[0], view[2], config.value, control);
+        } else if (purpose == .enum_epoch or purpose == .domain_not_null) block: {
+            var epoch = try std.json.parseFromSlice(contract.EnumEpoch, a, view[3], .{ .ignore_unknown_fields = false });
+            defer epoch.deinit();
+            var candidate = try initTypeEpoch(a, table_id, view[0], view[1], view[2], epoch.value, control);
+            errdefer candidate.deinit();
+            if (candidate.purpose != purpose) return error.InvalidSchemaValidationJob;
+            break :block candidate;
+        } else if (purpose == .sequence_default_removal) block: {
+            var selected = try std.json.parseFromSlice(@import("../../system_catalog/column_sequences.zig").DefaultRetirement, a, view[3], .{ .ignore_unknown_fields = false });
+            defer selected.deinit();
+            break :block try initDefaultRetirement(a, table_id, view[0], view[1], view[2], selected.value, control);
+        } else if (purpose == .dependent_object_retirement) block: {
+            var selected = try std.json.parseFromSlice(@import("../../system_catalog/dependency_retirement.zig").Selection, a, view[3], .{ .ignore_unknown_fields = false });
+            defer selected.deinit();
+            break :block try initDependencyRetirement(a, table_id, view[0], view[1], view[2], selected.value, control);
+        } else if (purpose == .object_rename) block: {
+            var renames = try std.json.parseFromSlice([]const @import("../../system_catalog/object_annotations.zig").Rename, a, view[3], .{});
+            defer renames.deinit();
+            break :block try initObjectRename(a, table_id, view[0], view[1], view[2], renames.value, control);
         } else if (purpose == .not_null) block: {
             var names = try std.json.parseFromSlice([]const []const u8, a, view[3], .{});
             defer names.deinit();
@@ -678,7 +896,7 @@ fn requireSuccessorDefinition(a: A, txn: anytype, binding: Binding) !void {
 /// No fence release, signature, public RPC or coordinator ACK occurs here.
 pub fn stageInstalled(a: A, txn: anytype, binding: Binding, ready_digest: Digest, decision: Digest, physical_catalog: Digest, entry: ?receipts.OrderedApplyReceipt) !Header {
     var header = (try load(txn)) orelse return error.SchemaValidationJobRequired;
-    if (binding.purpose != .not_null and (binding.purpose != .foreign_key_source or header.transaction_coverage == null)) return error.ForeignKeyValidationRequired;
+    if (binding.purpose != .not_null and !binding.purpose.schemaOnly() and binding.purpose != .domain_not_null and (binding.purpose != .foreign_key_source or header.transaction_coverage == null)) return error.ForeignKeyValidationRequired;
     if (header.transaction_coverage) |coverage| _ = try requireTransactionCoverage(txn, binding, coverage.record);
     try requireCommitted(txn, header);
     if (!std.meta.eql(header.binding, binding) or header.phase != .ready or
@@ -857,7 +1075,7 @@ pub fn stageBegin(a: A, txn: anytype, binding: Binding, candidate: *const Candid
     }
     if (try topology.current(txn) != null) return error.IntegrityTopologyBusy;
     const position = try nextPosition(txn, binding, entry);
-    var header: Header = .{ .binding = binding, .phase = .fencing, .admitted = position, .updated = position, .cursor_digest = hash(""), .chain = hash(candidate.inputs), .last_effect = hash("schema-validation-begin/v1"), .reference_coverage = if (binding.purpose == .not_null) null else .{} };
+    var header: Header = .{ .binding = binding, .phase = .fencing, .admitted = position, .updated = position, .cursor_digest = hash(""), .chain = hash(candidate.inputs), .last_effect = hash("schema-validation-begin/v1"), .reference_coverage = if (!binding.purpose.references()) null else .{} };
     if (binding.purpose == .foreign_key_source) {
         const record = try requireTerminalTransactionRecord(txn, binding, null);
         header.reference_coverage = null;
@@ -1032,8 +1250,11 @@ pub const RowAudit = struct {
         // A fresh reader starts at the real beginning. Projection binding is
         // deferred until its first page or authenticated checkpoint resume.
         const snapshot_cut = try currentPosition(&reader.read, binding);
-        var result: @This() = .{ .alloc = a, .reader = reader, .candidate = candidate, .header = header, .snapshot_cut = snapshot_cut, .coverage = coverage, .reference_coverage = if (binding.purpose == .not_null or coverage == .history) null else .{}, .cursor_digest = hash("") };
-        if (coverage == .none or coverage == .history) result.done = true else if (coverage == .prefix and header.records == 0) {
+        var result: @This() = .{ .alloc = a, .reader = reader, .candidate = candidate, .header = header, .snapshot_cut = snapshot_cut, .coverage = coverage, .reference_coverage = if (!binding.purpose.references() or coverage == .history) null else .{}, .cursor_digest = hash("") };
+        if (binding.purpose.schemaOnly()) {
+            if (header.records != 0 or header.rows_scanned != 0 or !eq(header.cursor_digest, hash(""))) return error.SchemaValidationRuntimeRecoveryRequired;
+            result.done = true;
+        } else if (coverage == .none or coverage == .history) result.done = true else if (coverage == .prefix and header.records == 0) {
             if (header.phase == .failed or header.rows_scanned != 0 or !eq(header.cursor_digest, hash(""))) return error.SchemaValidationRuntimeRecoveryRequired;
             result.done = true;
         }
@@ -1057,7 +1278,7 @@ pub const RowAudit = struct {
         if (self.invalid or self.records != 0 or self.reader.after.items.len != 0 or
             !std.meta.eql(self.header, progress.summary.header) or !std.meta.eql(self.snapshot_cut, progress.summary.snapshot_cut) or
             self.coverage != progress.summary.coverage) return error.SchemaValidationRuntimeRecoveryRequired;
-        if (self.coverage == .history) {
+        if (self.coverage == .history or self.header.binding.purpose.schemaOnly()) {
             if (!progress.complete or !std.meta.eql(self.snapshotSummary(), progress.summary) or progress.after.len != 0)
                 return error.SchemaValidationRuntimeRecoveryRequired;
             return;
@@ -1189,6 +1410,13 @@ pub const PreparedPage = struct {
         defer a.free(cursor);
         var candidate = try Candidate.load(a, &reader.read, binding, control);
         defer candidate.deinit();
+        if (binding.purpose.schemaOnly()) {
+            if (cursor.len != 0 or header.records != 0 or header.rows_scanned != 0) return error.SchemaValidationJobChanged;
+            const page: rows.NullabilityPage = .{ .page = .{ .arena = std.heap.ArenaAllocator.init(a), .rows = &.{}, .more = false, .records_examined = 0, .output_bytes = 0 }, .rows_examined = 0, .violation_column = null, .after = &.{} };
+            const result: PreparedPage = .{ .page = page, .expected = header };
+            if (replay_command) |expected| try expected.validate();
+            return result;
+        }
         if (candidate.foreign_source) |*source| {
             try reader.resumeForeignKeyValidationScan(source, .{ .projection_identity = binding.projection_identity, .after = cursor }, control);
             const page = if (replay_command) |expected|
@@ -1269,7 +1497,7 @@ pub fn stageCancel(a: A, txn: anytype, manager: *transactions.TxnManager, bindin
     if (try topology.completed(txn)) |done| if (done.admission_epoch >= binding.fence.admission_epoch) return error.SchemaValidationJobChanged;
     const position = try nextPosition(txn, binding, entry);
     if (previous) |prior| try precedes(prior.updated, position);
-    var header: Header = if (previous != null and std.meta.eql(previous.?.binding, binding)) previous.? else .{ .binding = binding, .phase = .canceling, .admitted = null, .updated = position, .cursor_digest = hash(""), .chain = hash("schema-validation-unvisited/v1"), .last_effect = hash("schema-validation-cancel/v1"), .reference_coverage = if (binding.purpose == .not_null) null else .{} };
+    var header: Header = if (previous != null and std.meta.eql(previous.?.binding, binding)) previous.? else .{ .binding = binding, .phase = .canceling, .admitted = null, .updated = position, .cursor_digest = hash(""), .chain = hash("schema-validation-unvisited/v1"), .last_effect = hash("schema-validation-cancel/v1"), .reference_coverage = if (!binding.purpose.references()) null else .{} };
     header.phase = .canceling;
     header.failure_column = null;
     header.updated = position;
@@ -1301,4 +1529,208 @@ pub fn stageCancel(a: A, txn: anytype, manager: *transactions.TxnManager, bindin
     header.last_effect = hash("schema-validation-cancel/v1");
     try save(a, txn, header);
     return header;
+}
+
+test "SQL named enum compatible candidates retain exact native catalogs and own zero row projections" {
+    const a = std.testing.allocator;
+    const types = @import("../../system_catalog/named_types.zig");
+    const layouts = @import("../../common/sql_named_type_layout.zig");
+    var labels = try types.Owned.create(a, &.{ "z", "a" });
+    defer labels.deinit();
+    const previous: types.Record = .{ .identity = try types.Identity.init(17, 2, 1, @splat(8)), .definition = labels.definition, .owner = .auth_disabled };
+    var next_labels = try types.Owned.add(a, labels.definition, "middle", .{ .before = "a" });
+    defer next_labels.deinit();
+    var successor = previous;
+    successor.identity.generation += 1;
+    successor.definition = next_labels.definition;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const temporary = region.allocator();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, temporary,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"state":{"type":"sql_enum","x-antfly-sql-type-id":17,"nullable":true}},"additionalProperties":false}}}}
+    , .{});
+    try layouts.canonicalizeSchemaLeaky(temporary, &root, &.{previous});
+    const before_json = try std.json.Stringify.valueAlloc(a, root, .{});
+    defer a.free(before_json);
+    const after_json = try layouts.additiveSchemaAlloc(a, before_json, previous, successor);
+    defer a.free(after_json);
+    var before = try api.PreparedSchemaDefinition.init(a, before_json);
+    defer before.deinit(a);
+    var catalog = try compiler.compileCatalog(a, before.public_schema, 71, null);
+    defer catalog.deinit();
+    const epoch: contract.EnumEpoch = .{ .type_id = 17, .generation = 1, .origin_id = @splat(8) };
+    var candidate = try Candidate.initEnumEpoch(a, 71, before_json, after_json, catalog.value, epoch, .{});
+    defer candidate.deinit();
+    try std.testing.expectEqual(.enum_epoch, candidate.purpose);
+    try std.testing.expectEqual(@as(usize, 1), candidate.projectionCount());
+    try std.testing.expectEqual(@as(usize, 0), candidate.plan.names.len);
+    try std.testing.expectEqual(@as(u32, 2), candidate.after_version);
+    try std.testing.expectEqualDeep(try epoch.fingerprint(), candidate.plan.identity);
+    var restored = try Candidate.fromPreparationInputs(a, candidate.inputs, 71, .enum_epoch, .{});
+    defer restored.deinit();
+    try std.testing.expectEqualStrings(candidate.native_after, restored.native_after);
+    var rebound = epoch;
+    rebound.origin_id = @splat(9);
+    try std.testing.expectError(error.SchemaValidationJobChanged, Candidate.initEnumEpoch(a, 71, before_json, after_json, catalog.value, rebound, .{}));
+    const F = struct {
+        fn run(backing: A, before_bytes: []const u8, after_bytes: []const u8, predecessor: []const u8, selector: contract.EnumEpoch) !void {
+            var owned = try Candidate.initEnumEpoch(backing, 71, before_bytes, after_bytes, predecessor, selector, .{});
+            defer owned.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, F.run, .{ before_json, after_json, catalog.value, epoch });
+}
+
+test "relational index system nullability job domain NOT NULL preparation binds exact rules sparse projections and retained inputs" {
+    const a = std.testing.allocator;
+    const types = @import("../../system_catalog/named_types.zig");
+    const layouts = @import("../../common/sql_named_type_layout.zig");
+    const previous: types.Record = .{ .identity = try types.Identity.init(17, 2, 1, @splat(8)), .definition = .{ .domain = .{ .base = .{ .builtin = .text } } }, .owner = .auth_disabled };
+    var successor = previous;
+    successor.identity.generation += 1;
+    successor.definition.domain.not_null = true;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const temporary = region.allocator();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, temporary,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"first":{"type":"keyword","x-antfly-sql-type-id":17,"nullable":true},"other":{"type":"integer","nullable":true},"second":{"type":"keyword","x-antfly-sql-type-id":17,"nullable":true}},"additionalProperties":false}}}}
+    , .{});
+    try layouts.canonicalizeSchemaLeaky(temporary, &root, &.{previous});
+    const before_json = try std.json.Stringify.valueAlloc(a, root, .{});
+    defer a.free(before_json);
+    const after_json = try layouts.epochSchemaAlloc(a, before_json, previous, successor);
+    defer a.free(after_json);
+    var before = try api.PreparedSchemaDefinition.init(a, before_json);
+    defer before.deinit(a);
+    var catalog = try compiler.compileCatalog(a, before.public_schema, 71, null);
+    defer catalog.deinit();
+    const epoch: contract.EnumEpoch = .{ .type_id = 17, .generation = 1, .origin_id = @splat(8) };
+    var candidate = try Candidate.initTypeEpoch(a, 71, before_json, after_json, catalog.value, epoch, .{});
+    defer candidate.deinit();
+    try std.testing.expectEqual(.domain_not_null, candidate.purpose);
+    try std.testing.expectEqual(@as(usize, 1), candidate.projectionCount());
+    try std.testing.expectEqual(@as(usize, 2), candidate.plan.names.len);
+    try std.testing.expect(candidate.plan.aggregate_failure);
+    var restored = try Candidate.fromPreparationInputs(a, candidate.inputs, 71, .domain_not_null, .{});
+    defer restored.deinit();
+    try std.testing.expectEqualStrings(candidate.native_after, restored.native_after);
+    try std.testing.expectError(error.InvalidSchemaValidationJob, Candidate.fromPreparationInputs(a, candidate.inputs, 71, .enum_epoch, .{}));
+    var forged = successor;
+    forged.definition.domain.base = .{ .builtin = .int64 };
+    try std.testing.expectError(error.InvalidSqlNamedType, layouts.epochSchemaAlloc(a, before_json, previous, forged));
+    const F = struct {
+        fn run(backing: A, before_bytes: []const u8, after_bytes: []const u8, predecessor: []const u8, selector: contract.EnumEpoch) !void {
+            var owned = try Candidate.initTypeEpoch(backing, 71, before_bytes, after_bytes, predecessor, selector, .{});
+            defer owned.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, F.run, .{ before_json, after_json, catalog.value, epoch });
+}
+
+test "column sequence defaults require exact schema-only owner preparation without row projections" {
+    const a = std.testing.allocator;
+    const sequences = @import("../../system_catalog/column_sequences.zig");
+    const selected: sequences.DefaultRetirement = .{ .sequence_id = 11, .namespace_id = 2, .incarnation = @splat(1) };
+    const binding: sequences.Binding = .{ .generation = .serial, .sequence_id = 11, .namespace_id = 2, .incarnation = @splat(1), .owner = .{ .table_id = 71, .column_id = 3 }, .target = .{ .table = "source_id_seq" } };
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const temporary = region.allocator();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, temporary,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","nullable":true},"note":{"type":"keyword","nullable":true}},"additionalProperties":false}}}}
+    , .{});
+    const defaults = try std.json.Stringify.valueAlloc(temporary, .{.{ .column = "id", .sequence = binding }}, .{});
+    try root.object.put(temporary, "column_defaults", try std.json.parseFromSliceLeaky(std.json.Value, temporary, defaults, .{}));
+    const before_json = try std.json.Stringify.valueAlloc(a, root, .{});
+    defer a.free(before_json);
+    const after_json = try selected.schemaAlloc(a, 71, before_json);
+    defer a.free(after_json);
+    var before = try api.PreparedSchemaDefinition.init(a, before_json);
+    defer before.deinit(a);
+    var catalog = try compiler.compileCatalog(a, before.public_schema, 71, null);
+    defer catalog.deinit();
+    var candidate = try Candidate.initDefaultRetirement(a, 71, before_json, after_json, catalog.value, selected, .{});
+    defer candidate.deinit();
+    try std.testing.expectEqual(.sequence_default_removal, candidate.purpose);
+    try std.testing.expect(candidate.purpose.schemaOnly());
+    try std.testing.expectEqual(@as(usize, 1), candidate.projectionCount());
+    try std.testing.expectEqual(@as(usize, 0), candidate.plan.names.len);
+    try std.testing.expectEqual(@as(u32, 2), candidate.after_version);
+    try std.testing.expectEqualDeep(try selected.fingerprint(), candidate.plan.identity);
+    var recovered = try Candidate.fromPreparationInputs(a, candidate.inputs, 71, .sequence_default_removal, .{});
+    defer recovered.deinit();
+    try std.testing.expectEqualStrings(candidate.native_after, recovered.native_after);
+    try std.testing.expectEqualStrings(candidate.catalog_after, recovered.catalog_after);
+    try std.testing.expectError(error.CatalogGenerationChanged, Candidate.initDefaultRetirement(a, 71, before_json, after_json, catalog.value, .{ .sequence_id = 12, .namespace_id = 2, .incarnation = @splat(1) }, .{}));
+    // An exact postimage rejects even otherwise valid unrelated declaration
+    // edits; no caller may smuggle a constraint/value change through this job.
+    var changed = try std.json.parseFromSlice(std.json.Value, a, after_json, .{});
+    defer changed.deinit();
+    try changed.value.object.put(changed.arena.allocator(), "version", .{ .integer = 3 });
+    const forged = try std.json.Stringify.valueAlloc(a, changed.value, .{});
+    defer a.free(forged);
+    try std.testing.expectError(error.InvalidSchemaValidationJob, Candidate.initDefaultRetirement(a, 71, before_json, forged, catalog.value, selected, .{}));
+    try std.testing.expectError(error.UnexpectedToken, Candidate.fromPreparationInputs(a, candidate.inputs, 71, .not_null, .{}));
+    const Faults = struct {
+        fn run(backing: A, previous: []const u8, next: []const u8, predecessor: []const u8, selector: sequences.DefaultRetirement) !void {
+            var owned = try Candidate.initDefaultRetirement(backing, 71, previous, next, predecessor, selector, .{});
+            defer owned.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Faults.run, .{ before_json, after_json, catalog.value, selected });
+}
+
+fn dependencyRetirementCandidate(a: A, before: []const u8, after: []const u8, predecessor: []const u8, selector: @import("../../system_catalog/dependency_retirement.zig").Selection) !void {
+    var candidate = try Candidate.initDependencyRetirement(a, 71, before, after, predecessor, selector, .{});
+    defer candidate.deinit();
+    try std.testing.expectEqual(contract.Purpose.dependent_object_retirement, candidate.purpose);
+    try std.testing.expect(candidate.purpose.schemaOnly());
+    try std.testing.expectEqual(@as(usize, 0), candidate.plan.names.len);
+    try std.testing.expectEqual(@as(usize, 1), candidate.projectionCount());
+    var restored = try Candidate.fromPreparationInputs(a, candidate.inputs, 71, .dependent_object_retirement, .{});
+    defer restored.deinit();
+    try std.testing.expectEqualStrings(candidate.native_after, restored.native_after);
+    try std.testing.expectEqualStrings(candidate.catalog_after, restored.catalog_after);
+}
+
+test "dependent retirement owner preparations retire selected FK generations and preserve all other identities" {
+    const a = std.testing.allocator;
+    const retirement = @import("../../system_catalog/dependency_retirement.zig");
+    const columns = @import("../../system_catalog/column_sequences.zig");
+    const sequence: columns.DefaultRetirement = .{ .sequence_id = 11, .namespace_id = 2, .incarnation = @splat(1) };
+    const binding: columns.Binding = .{ .generation = .serial, .sequence_id = 11, .namespace_id = 2, .incarnation = @splat(1), .owner = .{ .table_id = 71, .column_id = 3 }, .target = .{ .table = "source_seq" } };
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    const base =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","nullable":true},"note":{"type":"keyword","nullable":true}},"additionalProperties":false}}}}
+    ;
+    {
+        var root = try std.json.parseFromSliceLeaky(std.json.Value, scratch, base, .{});
+        const defaults = try std.json.Stringify.valueAlloc(scratch, .{.{ .column = "id", .sequence = binding }}, .{});
+        try root.object.put(scratch, "column_defaults", try std.json.parseFromSliceLeaky(std.json.Value, scratch, defaults, .{}));
+        try root.object.put(scratch, "foreign_keys", try std.json.parseFromSliceLeaky(std.json.Value, scratch,
+            \\[{"name":"retired_fk","child_columns":["id"],"parent_table":"retired_parent","parent_columns":["id"]},{"name":"retained_fk","child_columns":["id"],"parent_table":"retained_parent","parent_columns":["id"]}]
+        , .{}));
+        const before = try std.json.Stringify.valueAlloc(scratch, root, .{});
+        const selected: retirement.Selection = .{ .relations = &.{.{ .table_id = 101, .physical_name = "retired_parent" }}, .sequences = &.{sequence} };
+        const after = try selected.schemaAlloc(scratch, 71, before);
+        var definition = try api.PreparedSchemaDefinition.init(a, before);
+        defer definition.deinit(a);
+        var catalog = try compiler.compileCatalog(a, definition.public_schema, 71, null);
+        defer catalog.deinit();
+        const predecessor = catalog.value;
+        try dependencyRetirementCandidate(a, before, after, predecessor, selected);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, dependencyRetirementCandidate, .{ before, after, predecessor, selected });
+        var candidate = try Candidate.initDependencyRetirement(a, 71, before, after, predecessor, selected, .{});
+        defer candidate.deinit();
+        {
+            var next = try integrity.decode(a, candidate.catalog_after);
+            defer next.deinit();
+            const retired = next.findGeneration(catalog.catalog.find(.foreign_key, "retired_fk").?.generation).?;
+            const retained = next.findGeneration(catalog.catalog.find(.foreign_key, "retained_fk").?.generation).?;
+            try std.testing.expect(retired.retired);
+            try std.testing.expect(!retained.retired);
+        }
+        try std.testing.expectError(error.UnknownField, Candidate.fromPreparationInputs(a, candidate.inputs, 71, .sequence_default_removal, .{}));
+    }
 }

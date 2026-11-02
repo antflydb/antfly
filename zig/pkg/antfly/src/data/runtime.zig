@@ -1355,6 +1355,7 @@ const RaftTableApplyStateMachine = struct {
         SchemaValidationCommandRejected,
         TemporalOverlapViolation,
         TemporalEmptyRange,
+        SqlInvalidTextRepresentation,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
@@ -5599,6 +5600,7 @@ pub const DataServer = struct {
     schema_recovery_cursor: @import("../metadata/schema_validation_work.zig").Cursor = .{ .scan = 0 },
     schema_source_recovery_cursor: ?@import("../metadata/schema_validation_source_outbox.zig").RecoveryCursor = null,
     schema_recovery_discovery_at_ns: u64 = 0,
+    schema_recovery_pass_had_local_work: bool = false,
     schema_recovery_attempts: std.atomic.Value(u64) = .init(0),
     schema_recovery_adopted: std.atomic.Value(u64) = .init(0),
     schema_recovery_yields: std.atomic.Value(u64) = .init(0),
@@ -7079,6 +7081,7 @@ pub const DataServer = struct {
         const bytes = call(self.status_source.ptr, self.alloc, context, .{ .schema_validation_work = query }) catch |err| switch (err) {
             error.GenerationPublicationChanged => {
                 self.schema_recovery_cursor = .{ .scan = 0 };
+                self.schema_recovery_pass_had_local_work = false;
                 return false;
             },
             else => return err,
@@ -7091,14 +7094,20 @@ pub const DataServer = struct {
         try page.validate(query);
         if (page.len == 0) {
             self.schema_recovery_cursor = page.next orelse .{ .scan = 0 };
-            self.schema_recovery_discovery_at_ns = if (page.next == null) self.backgroundMonotonicNs() +| 5 * std.time.ns_per_s else 0;
+            // An exhausted pass may have visited active local cohorts. Their
+            // next phase must not inherit the truly idle scan's backoff.
+            if (page.next == null) {
+                self.schema_recovery_discovery_at_ns = self.backgroundMonotonicNs() +| (if (self.schema_recovery_pass_had_local_work) @as(u64, 100 * std.time.ns_per_ms) else 5 * std.time.ns_per_s);
+                self.schema_recovery_pass_had_local_work = false;
+            } else self.schema_recovery_discovery_at_ns = 0;
             return false;
         }
         // Cached immutable navigation only. There is no catalog-wide capture
         // or allocation proportional to inactive tables on this worker path.
         const catalog = self.write_source.catalog;
         const acquire = catalog.vtable.acquire_routing_generation orelse return error.CatalogRoutingUnavailable;
-        const generation = try acquire(catalog.ptr, context.deadline_ns, false);
+        const deadline = catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        const generation = try acquire(catalog.ptr, deadline, false);
         defer generation.release();
         const indexed = &generation.indexed;
         const snapshot = indexed.snapshot.value;
@@ -7107,16 +7116,18 @@ pub const DataServer = struct {
         for (page.tasks[0..page.len]) |slot| {
             try context.ensureActive();
             const task = slot.?;
+            const physical_table = task.physicalTable();
             const range_index = indexed.group_indexes.get(task.group_id) orelse continue;
-            if (snapshot.ranges[range_index].table_id != task.lookup.table) continue;
-            const table_index = indexed.table_id_indexes.get(task.lookup.table) orelse continue;
+            if (snapshot.ranges[range_index].table_id != physical_table) continue;
+            const table_index = indexed.table_id_indexes.get(physical_table) orelse continue;
             if (self.data_raft) |raft| {
                 if (!self.data_raft_mutex.tryLock()) return error.StorageBusy;
                 const leader = raft.host.http_host.host.isLocalLeader(task.group_id);
                 self.data_raft_mutex.unlock();
                 if (!leader) continue;
             }
-            if (self.schema_recovery_queue.contains(task.group_id, task.lookup.table)) continue;
+            self.schema_recovery_pass_had_local_work = true;
+            if (self.schema_recovery_queue.contains(task.group_id, physical_table)) continue;
             if (self.schema_recovery_queue.len == self.schema_recovery_queue.slots.len) {
                 // Re-read this bounded page after draining. Advancing past a
                 // task that was not admitted would silently lose discovery.
@@ -7127,12 +7138,14 @@ pub const DataServer = struct {
             errdefer self.alloc.destroy(job);
             const name = try self.alloc.dupe(u8, snapshot.tables[table_index].name);
             errdefer self.alloc.free(name);
-            job.* = .{ .server = self, .group = task.group_id, .table = name, .table_id = task.lookup.table };
+            job.* = .{ .server = self, .group = task.group_id, .table = name, .table_id = physical_table };
             const admitted = self.schema_recovery_queue.push(job);
             std.debug.assert(admitted);
         }
         self.schema_recovery_cursor = page.next orelse .{ .scan = 0 };
-        self.schema_recovery_discovery_at_ns = if (page.next == null) self.backgroundMonotonicNs() +| 5 * std.time.ns_per_s else 0;
+        // A nonempty page always has a continuation. Finish this bounded
+        // pass before choosing active versus idle discovery cadence.
+        self.schema_recovery_discovery_at_ns = 0;
         return false;
     }
 
@@ -7162,7 +7175,7 @@ pub const DataServer = struct {
         const active = try call(self.status_source.ptr, a, context, .{ .schema_validation_discover = .{ .group = identity.metadata_group_id, .metadata_incarnation = identity.metadata_incarnation, .table = table_id } });
         const lookup = (try std.json.parseFromSliceLeaky(?reads.Lookup, a, active, .{ .ignore_unknown_fields = false })) orelse return false;
         try (reads.OwnerReadRequest{ .lookup = lookup, .ordinal = 0 }).validate();
-        if (lookup.group != identity.metadata_group_id or lookup.table != table_id or !std.mem.eql(u8, &lookup.metadata_incarnation, &identity.metadata_incarnation)) return error.GenerationPublicationChanged;
+        if (lookup.group != identity.metadata_group_id or !std.mem.eql(u8, &lookup.metadata_incarnation, &identity.metadata_incarnation)) return error.GenerationPublicationChanged;
         // Inactive tables never open a cold owner merely for maintenance.
         var discovered = try source.schemaOwnerStateAtRoot(group, table, context);
         if (self.data_raft == null and self.remote_metadata == null) try self.publishNativeOwnerGroup(group, table, context);
@@ -7170,6 +7183,7 @@ pub const DataServer = struct {
         const bytes = try call(self.status_source.ptr, a, context, .{ .schema_validation_owner_read = .{ .lookup = lookup, .ordinal = 0, .projection = .replay, .source_owner = address } });
         const control = (try std.json.parseFromSliceLeaky(?reads.ReplayControl, a, bytes, .{ .ignore_unknown_fields = false })) orelse return false;
         try control.requireFor(lookup, address);
+        if (control.owner.binding.fence.namespace.table_id != table_id) return error.SchemaValidationJobChanged;
         if (control.head.phase == .succeeded or control.head.phase == .canceled) return false;
         const native = self.data_raft == null;
         if ((control.owner.binding.authority == .native) != native) return error.SchemaValidationJobChanged;
@@ -7430,7 +7444,10 @@ pub const DataServer = struct {
                     directory = value.rooted.observation.transaction_debt;
                 },
             }
-            work = try barriers.nextOwnerWork(control.head, control.owner, header, directory);
+            const current_proof = switch (signed.?) {
+                inline else => |value| try value.commitment(),
+            };
+            work = try barriers.nextOwnerWorkWithProof(control.head, control.owner, header, directory, current_proof);
         } else {
             work = try barriers.nextOwnerWork(control.head, control.owner, discovered.state.header, null);
             if (work == .idle) return false;
@@ -7456,7 +7473,16 @@ pub const DataServer = struct {
         const permission = try std.json.parseFromSliceLeaky(reads.OwnerControlRead, a, raw_permission, .{ .ignore_unknown_fields = false });
         try permission.requireFor(request);
         if (permission.owner.physical_root_incarnation != discovered.state.physical_root_incarnation or permission.owner.root_epoch != control.owner.root_epoch) return error.SchemaValidationRuntimeRecoveryRequired;
-        if (permission.disposition == .acknowledged) return false;
+        if (permission.disposition == .acknowledged) {
+            if (work != .ack) return false;
+            const current_proof = switch (signed orelse return error.SchemaValidationJobChanged) {
+                inline else => |value| try value.commitment(),
+            };
+            // A peer may already have refreshed this exact proof while the
+            // control RPC was in flight. Avoid another metadata write; a new
+            // proof still uses the ordinary fully authenticated ACK writer.
+            if (permission.owner.has(work.ack) and std.mem.eql(u8, &permission.owner.proofs[@backingInt(work.ack)], &current_proof)) return false;
+        }
         const matching_header = header != null and std.meta.eql(header.?.binding, binding);
         if (binding.purpose == .foreign_key_source and !matching_header and (action == .begin or action == .cancel)) {
             var snapshot = (try self.adminSnapshotForMaintenance()) orelse return error.MetadataUnavailable;
@@ -12715,7 +12741,7 @@ pub const DataServer = struct {
         const coverage_ready = request.action == .install and decision.historical_reference_coverage;
         if (coverage_ready) {
             const activation = @import("antfly_local_sources").storage_db_relational_integrity_activation_contract;
-            var coverage_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_activation_json = "{\"mode\":\"status\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
+            var coverage_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_activation_json = "{\"mode\":\"status\"}", .fk_generation_source_control = true }, .read_index)) orelse return error.GenerationAdmissionPending;
             defer coverage_response.deinit(scratch);
             const Coverage = struct {
                 schema_version: u32,
@@ -13015,6 +13041,10 @@ pub const DataServer = struct {
         try context.ensureActive();
         if (!context.schema_validation_authority) return error.Forbidden;
         try request.validate(group);
+        // Native preparations are usable only with synchronous publication of
+        // actual enrolled group observations. Fail before opening/compiling an
+        // owner when this required production transport is absent.
+        if (self.data_raft == null and self.native_owner_report == null) return error.UnsupportedNativeIndexOwner;
         const metadata_identity = try self.schemaRecoveryIdentity();
         if (!std.mem.eql(u8, &request.metadata_incarnation, &metadata_identity.metadata_incarnation)) return error.MetadataIncarnationMismatch;
         const source = try self.ensureKernelOwnerSource();
@@ -14141,6 +14171,7 @@ pub const DataServer = struct {
                 // Use the same leader-aware catalog discovery as ordinary
                 // table writes; topology_epoch still fences the participant.
                 .discovery = .catalog,
+                .write_route_fence = context.route_fence,
                 .cancellation = if (context.cancellation.ptr != null) &cancellation else null,
                 .visibility_cancellation = context.cancellation,
             },
@@ -14414,6 +14445,7 @@ pub const DataServer = struct {
         realtime_ns: u64,
     ) antfly.db.types.BatchRequest {
         var proposal_req = req;
+        @import("../api/internal_batch_forwarding.zig").materializeExternalVoteTimestamp(&proposal_req, realtime_ns);
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
@@ -14440,6 +14472,7 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (@import("../api/internal_batch_forwarding.zig").externalTransactionProtocol(req)) |version| return version;
         if (req.relational_topology) |command| if (command.sql_drop_control) return @import("../common/data_raft_protocol.zig").batch_sql_drop_control_protocol_version;
         if (req.relational_index_owner_control != null) return data_raft_batch.index_owner_control_protocol_version;
         if (req.artifact_publication) |command| if (command.completion) |page| if (page.group_producers) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
@@ -15300,6 +15333,7 @@ pub const DataServer = struct {
                             // Bulk ACKs have a compatible single-command path.
                             // This is a feature rejection before ACK admission,
                             // never a classification of an accepted write.
+                            if (@import("../api/internal_batch_forwarding.zig").externalTransactionProtocol(req) != null) return error.UnsupportedRaftBatchProtocolVersion;
                             if (req.transaction) |transaction| if (transaction == .acknowledge_many) return error.UnsupportedOperation;
                             if (required_protocol_version >= data_raft_batch.merge_copy_attempt_protocol_version)
                                 return error.RaftBatchMergeProtocolUnavailable;
@@ -15308,10 +15342,12 @@ pub const DataServer = struct {
                             if (required_protocol_version >= data_raft_batch.merge_transition_protocol_version)
                                 return error.RaftBatchMergeProtocolUnavailable;
                         }
+                        const proposal_time = self.dataRaftRealtimeNs();
+                        try @import("../api/internal_batch_forwarding.zig").validateExternalVoteAdmission(req, proposal_time);
                         proposal_req = raftBatchRequestForProtocol(
                             req,
                             active_protocol_version >= data_raft_batch.timestamp_protocol_version,
-                            self.dataRaftRealtimeNs(),
+                            proposal_time,
                         );
                         const proposal_term = status.hard.current_term;
                         const encoded = if (comptime linked_storage)
@@ -28424,11 +28460,13 @@ const RemoteMetadataSource = struct {
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
                 .supports_query_definitions = true,
+                .supports_index_annotations = true,
                 .supports_sql_views = true,
                 .supports_sql_sequences = true,
                 .supports_sql_routines = true,
                 .supports_sql_casts = true,
                 .supports_sql_types = true,
+                .supports_sql_authorization = true,
                 .supports_resolver_catalog_read = true,
                 .supports_resolver_authority = true,
                 .status = remoteStatus,
@@ -38944,6 +38982,7 @@ fn consumerTests() type {
                 captures: usize = 0,
                 group: u64 = 9999,
                 fail: bool = false,
+                no_tasks: bool = false,
                 failure: ?anyerror = null,
                 reported_identity: antfly.metadata_api.CatalogIdentity = identity,
                 const identity: antfly.metadata_api.CatalogIdentity = .{ .metadata_group_id = 1, .metadata_incarnation = "61616161616161616161616161616161".* };
@@ -38951,9 +38990,14 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     return self.reported_identity;
                 }
-                fn acquire(ptr: *anyopaque, _: ?u64, authoritative: bool) !*catalog_mod.RoutingGeneration {
+                fn acquire(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*catalog_mod.RoutingGeneration {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(!authoritative);
+                    // Catalogs without an I/O clock use platform monotonic.
+                    // Passing the worker's raw Threaded awake deadline here
+                    // expires immediately on Darwin despite a live quantum.
+                    try std.testing.expect(deadline_ns != null);
+                    try (catalog_mod.RoutingBudget{ .deadline_ns = deadline_ns }).checkpoint();
                     self.captures += 1;
                     self.generation.retain();
                     return self.generation;
@@ -38978,7 +39022,7 @@ fn consumerTests() type {
                     const query = input.schema_validation_work;
                     try query.validate();
                     var page: work.Page = .{};
-                    if (query.cursor == .scan and query.cursor.scan == 0) {
+                    if (query.cursor == .scan and query.cursor.scan == 0 and !self.no_tasks) {
                         // Scheduling facts only, not fabricated physical audit
                         // or metadata admission/restore qualification.
                         page.tasks[0] = .{ .lookup = .{ .group = query.group, .table = 7, .id = @splat(3), .metadata_incarnation = query.metadata_incarnation, .plan_digest = @splat(4) }, .ordinal = 0, .group_id = self.group };
@@ -39011,7 +39055,15 @@ fn consumerTests() type {
             try std.testing.expect(!try server.discoverSchemaRecoveryWork());
             try std.testing.expectEqual(@as(usize, 2), provider.calls);
             try std.testing.expectEqual(@as(usize, 1), provider.captures);
-            try std.testing.expect(server.schema_recovery_discovery_at_ns > server.backgroundMonotonicNs());
+            try std.testing.expect(server.schema_recovery_discovery_at_ns <= server.backgroundMonotonicNs() +| 100 * std.time.ns_per_ms);
+            try std.testing.expect(!server.schema_recovery_pass_had_local_work);
+            // A genuinely empty pass retains the idle backoff even if an
+            // earlier hint is still queued. Discovery facts grant no work.
+            provider.no_tasks = true;
+            try std.testing.expect(!try server.discoverSchemaRecoveryWork());
+            try std.testing.expectEqual(@as(usize, 1), server.schema_recovery_queue.len);
+            try std.testing.expect(server.schema_recovery_discovery_at_ns > server.backgroundMonotonicNs() +| std.time.ns_per_s);
+            provider.no_tasks = false;
             for (1..32) |group| {
                 const job = try a.create(DataServer.SchemaRecoveryJob);
                 job.* = .{ .server = server, .group = group, .table_id = 7, .table = try a.dupe(u8, "facts") };
@@ -44651,6 +44703,18 @@ fn consumerTests() type {
 
             const explicit = DataServer.materializeRaftBatchTimestamp(.{ .timestamp_ns = 123 }, 456);
             try std.testing.expectEqual(@as(u64, 123), explicit.timestamp_ns);
+
+            const external_owner: @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+            const external_begin: antfly.db.types.BatchRequest = .{ .timestamp_ns = 1, .transaction = .{ .begin = .{ .txn_id = @splat(4), .begin_timestamp = 10, .created_at_ns = 11, .topology_epoch = 2, .retain_terminal = true, .participants = &.{"table:rows:group:2"}, .external_decision_owner = external_owner } } };
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_external_transaction_protocol_version, DataServer.requiredRaftBatchProtocolVersion(external_begin));
+            const external_stamped = DataServer.raftBatchRequestForProtocol(external_begin, true, 456);
+            try std.testing.expectEqual(@as(u64, 456), external_stamped.timestamp_ns);
+            const external_wire = try data_raft_batch.encode(alloc, "rows", external_stamped);
+            defer alloc.free(external_wire);
+            var external_decoded = try data_raft_batch.decode(alloc, external_wire);
+            defer external_decoded.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 456), external_decoded.batch.req.timestamp_ns);
+            try std.testing.expectEqualDeep(external_owner, external_decoded.batch.req.transaction.?.begin.external_decision_owner.?);
 
             const legacy = DataServer.raftBatchRequestForProtocol(explicit, false, 456);
             try std.testing.expectEqual(@as(u64, 0), legacy.timestamp_ns);

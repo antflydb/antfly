@@ -79,25 +79,6 @@ fn settledParentSnapshot(
     }
 }
 
-/// Resolve only the self edge after metadata has reserved the candidate's
-/// physical identity. External edges have already been bound at DDL ingress.
-fn bindReservedSelf(alloc: std.mem.Allocator, schema_json: []const u8, logical_name: []const u8, physical_name: []const u8) ![]const u8 {
-    var value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, schema_json, .{ .allocate = .alloc_always, .parse_numbers = false });
-    if (value != .object) return error.InvalidGenerationPublication;
-    const fks = value.object.getPtr("foreign_keys") orelse return schema_json;
-    if (fks.* != .array) return error.InvalidGenerationPublication;
-    var changed = false;
-    for (fks.array.items) |*fk| {
-        if (fk.* != .object) return error.InvalidGenerationPublication;
-        const parent = fk.object.getPtr("parent_table") orelse return error.InvalidGenerationPublication;
-        if (parent.* != .string) return error.InvalidGenerationPublication;
-        if (!std.mem.eql(u8, parent.string, logical_name)) continue;
-        parent.* = .{ .string = physical_name };
-        changed = true;
-    }
-    return if (changed) try std.json.Stringify.valueAlloc(alloc, value, .{}) else schema_json;
-}
-
 fn namespaceId(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, target: domain.Target) !u64 {
     if (std.mem.eql(u8, target.database, domain.default_database_name) and
         std.mem.eql(u8, target.namespace, domain.default_namespace_name))
@@ -160,6 +141,35 @@ pub fn buildWithGeneratedNamesAndScratch(
     request: tables.CreateTableRequest,
     generated_constraint_names: []const []const u8,
 ) !publication.InitialCreatePlan {
+    return buildWithColumnSequencesAndScratch(server, alloc, scratch, context, identity, target, request, generated_constraint_names, &.{});
+}
+
+pub fn buildWithColumnSequencesAndScratch(
+    server: *server_mod.ApiHttpServer,
+    alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    context: operation.RequestContext,
+    identity: ?server_mod.AuthenticatedIdentity,
+    target: domain.Target,
+    request: tables.CreateTableRequest,
+    generated_constraint_names: []const []const u8,
+    column_sequences: []const @import("antfly_local_sources").system_catalog_column_sequences.Creation,
+) !publication.InitialCreatePlan {
+    return buildWithCreationCopyAndScratch(server, alloc, scratch, context, identity, target, request, generated_constraint_names, column_sequences, null);
+}
+
+pub fn buildWithCreationCopyAndScratch(
+    server: *server_mod.ApiHttpServer,
+    alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    context: operation.RequestContext,
+    identity: ?server_mod.AuthenticatedIdentity,
+    target: domain.Target,
+    request: tables.CreateTableRequest,
+    generated_constraint_names: []const []const u8,
+    column_sequences: []const @import("antfly_local_sources").system_catalog_column_sequences.Creation,
+    creation_copy: ?@import("../metadata/initial_creation_copy.zig").Input,
+) !publication.InitialCreatePlan {
     try context.ensureActive();
     const logical_child = try target.resourceNameAlloc(alloc);
     defer alloc.free(logical_child);
@@ -182,10 +192,12 @@ pub fn buildWithGeneratedNamesAndScratch(
         .min_ranges_explicit = request.num_shards != null,
         .candidate = candidate,
         .generated_constraint_names = generated_constraint_names,
+        .creation_copy = creation_copy,
+        .column_sequences = column_sequences,
     } });
     const prepared = try std.json.parseFromSliceLeaky(publication.InitialCreatePrepare, alloc, prepare_bytes, .{ .allocate = .alloc_always });
     var child = prepared.child;
-    child.schema_json = try bindReservedSelf(alloc, child.schema_json, target.table, child.name);
+    child.schema_json = try @import("../metadata/relation_create.zig").bindReservedSelf(alloc, child.schema_json, target.table, child.name);
     const routing_derived = try publication.deriveInitialTransitions(alloc, child.table_id, child.name, child.schema_json);
     if (routing_derived.len == 0) return error.InvalidGenerationPublication;
     var snapshot = try settledParentSnapshot(server, context, child.name, routing_derived);
@@ -272,10 +284,15 @@ pub fn buildWithGeneratedNamesAndScratch(
         }
     }.less);
     const plan: publication.InitialCreatePlan = .{
+        .sql_owner = try @import("sql_authorization_recovery.zig").creator(server, identity),
         .historical_reference_coverage = try publication.schemaHasUnvalidatedForeignKeys(alloc, child.schema_json),
         .id = id,
         .catalog_coverage = .checks_v1,
         .retirement_scope = retirementScopeForDeployment(server.cfg.deployment_mode),
+        .column_sequences = column_sequences,
+        .creation_copy = creation_copy,
+        .copy_effects = prepared.copy_effects,
+        .counter_effects = prepared.counter_effects,
         .catalog_id = prepared.catalog_id,
         .expected_catalog_revision = prepared.expected_catalog_revision,
         .tablespace_id = prepared.tablespace_id,

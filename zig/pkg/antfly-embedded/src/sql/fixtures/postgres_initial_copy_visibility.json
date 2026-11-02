@@ -1,0 +1,35 @@
+{
+  "format": 1,
+  "postgres_major": 18,
+  "observer_uncommitted": null,
+  "admitted_notes": {
+    "column": "quantity at admission",
+    "index": "primary at admission",
+    "check": "check at admission"
+  },
+  "first_row": [
+    1,
+    2,
+    4
+  ],
+  "source_after_commit": null,
+  "committed_notes": {
+    "column": "quantity at admission",
+    "index": "primary at admission",
+    "check": "check at admission"
+  },
+  "rows": [
+    [
+      1,
+      2,
+      4
+    ]
+  ],
+  "errors": [
+    "23503",
+    "23505",
+    "23514"
+  ],
+  "cancellation_hidden": null,
+  "cancellation_complete": null
+}

@@ -6,6 +6,7 @@ class RelationalExpressionType(StrEnum):
     BOOLEAN = "boolean"
     DATERANGE = "daterange"
     DATETIME = "datetime"
+    ENUMERATION = "enumeration"
     INTEGER = "integer"
     JSON = "json"
     NUMBER = "number"

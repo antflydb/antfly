@@ -185,6 +185,8 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     // SQL execution selects query/write admission after bounded compilation
     // or prepared-plan lookup; preparation/close do not execute data work.
     .{ .operation_id = "executeSQL", .class = .none },
+    // Observation of a durable catalog receipt performs no SQL execution.
+    .{ .operation_id = "getSQLCatalogOperation", .class = .none },
     .{ .operation_id = "prepareSQL", .class = .none },
     .{ .operation_id = "openSQLConnection", .class = .none },
     .{ .operation_id = "closeSQLConnection", .class = .none },

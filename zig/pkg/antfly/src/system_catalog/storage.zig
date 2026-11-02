@@ -170,6 +170,29 @@ pub fn loadServingPolicyInstallSnapshot(alloc: std.mem.Allocator, txn: *docstore
     return parsed;
 }
 
+fn policyReferenceGenerations(publication: ?policies.Publication) [2]?u64 {
+    const value = publication orelse return .{ null, null };
+    return .{ if (value.phase == .disabled) null else value.generation, value.serving_generation };
+}
+fn policyGenerationDependencies(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, publication: policies.Publication, generation: u64, adding: bool) !void {
+    const current = generation == publication.generation;
+    const bytes = try loadPolicyInstallSnapshotBytesForPhase(a, txn, group_id, publication.table_id, generation, if (current) publication.catalog_epoch else publication.serving_catalog_epoch orelse return error.InvalidRowPolicyPublication, if (current) publication.phase else .active);
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(policies.InstallSnapshot, a, bytes, .{});
+    defer parsed.deinit();
+    try @import("authorization_storage.zig").policyInstallDependency(a, txn, group_id, parsed.value, adding);
+}
+fn syncPolicyPublicationDependencies(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, previous: ?policies.Publication, next: ?policies.Publication) !void {
+    const before = policyReferenceGenerations(previous);
+    const after = policyReferenceGenerations(next);
+    for (before) |old| if (old) |generation| {
+        if (after[0] != generation and after[1] != generation) try policyGenerationDependencies(a, txn, group_id, previous.?, generation, false);
+    };
+    for (after) |new| if (new) |generation| {
+        if (before[0] != generation and before[1] != generation) try policyGenerationDependencies(a, txn, group_id, next.?, generation, true);
+    };
+}
+
 fn putPolicyInstallSnapshot(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, snapshot: policies.InstallSnapshot) !void {
     try snapshot.validateShape();
     const key = try policyInstallSnapshotKeyAlloc(alloc, group_id, snapshot.table_id, snapshot.policy_generation, snapshot.phase);
@@ -305,6 +328,8 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
                 if (record.id != meta.next_id or record.generation != 1) return error.RowPolicyCatalogChanged;
                 next_id = try std.math.add(u64, next_id, 1);
             }
+            if (existing) |prior| try @import("authorization_storage.zig").policyDependency(a, txn, group_id, prior, false);
+            try @import("authorization_storage.zig").policyDependency(a, txn, group_id, record, true);
             const key = try policyKeyAlloc(a, group_id, record.id);
             const encoded = try std.json.Stringify.valueAlloc(a, record, .{});
             try txn.put(key, encoded);
@@ -317,6 +342,7 @@ pub fn applyPolicyCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
                 if (record.id == identity.id) break record;
             } else return error.RowPolicyCatalogChanged;
             if (prior.generation != identity.generation or prior.table_id != identity.table_id) return error.RowPolicyCatalogChanged;
+            try @import("authorization_storage.zig").policyDependency(a, txn, group_id, prior, false);
             const key = try policyKeyAlloc(a, group_id, identity.id);
             try txn.delete(key);
         },
@@ -351,8 +377,8 @@ fn applyPolicyPublicationCommandWithNextId(alloc: std.mem.Allocator, txn: *docst
             if (incoming.acknowledged_owners.len != 0 or incoming.serving_acknowledged_owners.len != 0 or incoming.disabled_acknowledged_owners.len != 0 or incoming.catalog_epoch != try std.math.add(u64, meta.revision, 1)) return error.RowPolicyCatalogChanged;
             const table = (try getById(a, txn, group_id, .table, incoming.table_id)) orelse return error.TableNotFound;
             defer table.deinit();
-            var prior = try loadPolicyPublication(a, txn, group_id, incoming.table_id);
-            defer if (prior) |*value| value.deinit();
+            retained_prior = try loadPolicyPublication(a, txn, group_id, incoming.table_id);
+            const prior = retained_prior;
             if (prior) |value| {
                 if (value.value.phase != .active and value.value.phase != .disabled) return error.RowPolicyCatalogChanged;
                 if (value.value.phase == .disabled and value.value.disabled_acknowledged_owners.len != value.value.required_owners.len) return error.RowPolicyCatalogChanged;
@@ -445,6 +471,7 @@ fn applyPolicyPublicationCommandWithNextId(alloc: std.mem.Allocator, txn: *docst
             }
         },
     }
+    try syncPolicyPublicationDependencies(a, txn, group_id, if (retained_prior) |value| value.value else null, next);
     try next.validateShape();
     const key = try policyPublicationKeyAlloc(a, group_id, next.table_id);
     const encoded = try std.json.Stringify.valueAlloc(a, next, .{});
@@ -614,7 +641,7 @@ pub fn functionOverloads(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, grou
     return records.toOwnedSlice(a);
 }
 
-pub fn readMeta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) !Meta {
+pub fn readMeta(alloc: std.mem.Allocator, txn: anytype, group_id: u64) !Meta {
     const key = try keyAlloc(alloc, group_id, "meta");
     defer alloc.free(key);
     const bytes = txn.get(key) catch |err| switch (err) {
@@ -645,7 +672,8 @@ pub fn loadState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id
     const loaded_settings = try loadSettings(a, txn, group_id);
     const loaded_policies = try loadPolicies(a, txn, group_id);
     const loaded_publications = try loadPolicyPublications(a, txn, group_id);
-    return .{ .arena = arena, .meta = meta, .value = .{ .revision = meta.revision, .next_id = meta.next_id, .resources = resources, .settings = loaded_settings, .policies = loaded_policies, .policy_publications = loaded_publications } };
+    const loaded_privileges = try @import("authorization_storage.zig").loadAll(a, txn, group_id);
+    return .{ .arena = arena, .meta = meta, .value = .{ .revision = meta.revision, .next_id = meta.next_id, .resources = resources, .settings = loaded_settings, .policies = loaded_policies, .policy_publications = loaded_publications, .privileges = loaded_privileges } };
 }
 
 pub fn getById(alloc: std.mem.Allocator, txn: anytype, group_id: u64, kind: domain.Kind, id: u64) !?std.json.Parsed(domain.Resource) {
@@ -833,6 +861,11 @@ pub fn rebuildNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, g
         try txn.put(key, &id);
         try writeReferences(alloc, txn, group_id, resource);
     }
+    for (state.value.privileges) |record| {
+        try @import("authorization_storage.zig").rebuildIndexes(alloc, txn, group_id, record);
+    }
+    for (state.value.policies) |record| try @import("authorization_storage.zig").policyDependency(alloc, txn, group_id, record, true);
+    for (state.value.policy_publications) |publication| try syncPolicyPublicationDependencies(alloc, txn, group_id, null, publication);
     try validateNameIndex(alloc, txn, group_id);
 }
 
@@ -994,11 +1027,29 @@ pub fn validateFunctionUses(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, g
 }
 
 fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
+    try @import("authorization_storage.zig").resourceDependency(alloc, txn, group_id, r, true);
     const child_key = try childKey(alloc, group_id, r);
     defer alloc.free(child_key);
     const child_json = try std.json.Stringify.valueAlloc(alloc, r, .{});
     defer alloc.free(child_json);
     try txn.put(child_key, child_json);
+    if (r.kind == .role) {
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_privileges.Role, alloc, r.source_json, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const role = parsed.value;
+        try role.validate();
+        if (role.id != r.id or r.parent_id != 0 or !std.mem.eql(u8, role.name, r.name)) return error.InvalidCatalogRecord;
+        const role_key = try @import("authorization_storage.zig").roleOriginKey(alloc, group_id, role.instance);
+        defer alloc.free(role_key);
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, r.id, .little);
+        const previous = txn.get(role_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (previous) |value| if (!std.mem.eql(u8, value, &encoded)) return error.InvalidCatalogRecord;
+        try txn.put(role_key, &encoded);
+    }
     if (r.kind == .named_type) {
         var record = try @import("antfly_local_sources").sql_catalog.named_types.Record.decode(alloc, r.source_json);
         defer record.deinit();
@@ -1049,12 +1100,25 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     }
 }
 fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
+    try @import("authorization_storage.zig").resourceDependency(alloc, txn, group_id, r, false);
     const child_key = try childKey(alloc, group_id, r);
     defer alloc.free(child_key);
     txn.delete(child_key) catch |err| switch (err) {
         error.NotFound => {},
         else => return err,
     };
+    if (r.kind == .role) {
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_privileges.Role, alloc, r.source_json, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const role = parsed.value;
+        try role.validate();
+        const key = try @import("authorization_storage.zig").roleOriginKey(alloc, group_id, role.instance);
+        defer alloc.free(key);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
     if (r.kind == .named_type) {
         var record = try @import("antfly_local_sources").sql_catalog.named_types.Record.decode(alloc, r.source_json);
         defer record.deinit();
@@ -1106,6 +1170,13 @@ pub fn writeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, grou
     if (try getById(alloc, txn, group_id, resource.kind, resource.id)) |old_value| {
         var old = old_value;
         defer old.deinit();
+        if (resource.kind == .sequence and (resource.parent_id != old.value.parent_id or
+            !std.mem.eql(u8, resource.name, old.value.name) or !std.mem.eql(u8, resource.source_json, old.value.source_json)))
+            try @import("sequence_leases.zig").requireUnleased(txn, group_id, resource.id);
+        if (resource.kind == .view and (resource.parent_id != old.value.parent_id or
+            !std.mem.eql(u8, resource.name, old.value.name) or !std.mem.eql(u8, resource.source_json, old.value.source_json) or
+            !std.mem.eql(u8, resource.storage_name, old.value.storage_name)))
+            try @import("view_leases.zig").requireUnleased(txn, group_id, resource.id);
         try removeReferences(alloc, txn, group_id, old.value);
         const old_name_key = try resourceNameKeyAlloc(alloc, group_id, old.value);
         defer alloc.free(old_name_key);
@@ -1128,6 +1199,20 @@ pub fn writeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, grou
 }
 
 pub fn removeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, resource: domain.Resource) !void {
+    return removeResourceRow(alloc, txn, group_id, resource, true);
+}
+
+/// Unlink every old binding before inserting replacements (including swaps).
+/// A retained durable ID keeps its ACL, policy programs, namespace defaults
+/// and sequence-use summary; actual deletion retires those dependent records.
+fn removeResourceRow(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, resource: domain.Resource, retire: bool) !void {
+    if (resource.kind == .view) try @import("view_leases.zig").requireUnleased(txn, group_id, resource.id);
+    if (resource.kind == .sequence) {
+        try @import("sequence_leases.zig").requireUnleased(txn, group_id, resource.id);
+        if (retire) try @import("sequence_default_dependencies.zig").removeUnusedSummary(txn, group_id, resource.id);
+    }
+    if (retire and resource.kind == .table) try @import("authorization_storage.zig").erase(alloc, txn, group_id, .{ .table = resource.id });
+    if (retire and resource.kind == .namespace) try @import("authorization_storage.zig").eraseNamespace(alloc, txn, group_id, resource.id);
     try removeReferences(alloc, txn, group_id, resource);
     const record_key = try recordKeyAlloc(alloc, group_id, resource.kind, resource.id);
     defer alloc.free(record_key);
@@ -1170,7 +1255,7 @@ fn writeMeta(alloc: std.mem.Allocator, txn: anytype, group_id: u64, previous: Me
 
 pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, delta: domain.Delta, previous: Meta, command_hash: [32]u8) !void {
     if (delta.presentation_only and (delta.upserts.len != 1 or delta.removes.len != 0 or delta.next_id != previous.next_id or
-        (delta.upserts[0].kind != .database and delta.upserts[0].kind != .namespace))) return error.InvalidCatalogMutation;
+        (delta.upserts[0].kind != .database and delta.upserts[0].kind != .namespace and delta.upserts[0].kind != .named_type))) return error.InvalidCatalogMutation;
     if (delta.presentation_only and previous.revision != 0) {
         const resource = delta.upserts[0];
         if (try getById(alloc, txn, group_id, resource.kind, resource.id)) |existing_value| {
@@ -1187,6 +1272,22 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
             defer alloc.free(actual);
             if (!std.mem.eql(u8, expected, actual)) return error.InvalidCatalogMutation;
             return applyPresentationRecord(alloc, txn, group_id, resource, previous, command_hash);
+        }
+    }
+    var region = std.heap.ArenaAllocator.init(alloc);
+    defer region.deinit();
+    const catalog_alloc = region.allocator();
+    const Identity = struct { kind: domain.Kind, id: u64 };
+    var replacements: std.AutoHashMapUnmanaged(Identity, void) = .empty;
+    try replacements.ensureTotalCapacity(catalog_alloc, @intCast(delta.upserts.len));
+    var new_tables: std.ArrayList(domain.Resource) = .empty;
+    for (delta.upserts) |resource| {
+        if ((try replacements.getOrPut(catalog_alloc, .{ .kind = resource.kind, .id = resource.id })).found_existing) return error.InvalidCatalogMutation;
+        if (resource.sql_owner != null) {
+            const prior = try getById(catalog_alloc, txn, group_id, resource.kind, resource.id);
+            if (prior) |owned| {
+                if (!std.meta.eql(owned.value.sql_owner, resource.sql_owner)) return error.InvalidCatalogMutation;
+            } else try new_tables.append(catalog_alloc, resource);
         }
     }
     if (!delta.presentation_only) {
@@ -1209,7 +1310,7 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
         try writeResource(alloc, txn, group_id, domain.default_namespace);
     }
     var removed_tables: bool = false;
-    for (delta.removes) |resource| if (resource.kind == .table) {
+    for (delta.removes) |resource| if (resource.kind == .table and !replacements.contains(.{ .kind = resource.kind, .id = resource.id })) {
         removed_tables = true;
         break;
     };
@@ -1218,11 +1319,17 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
         defer arena.deinit();
         const a = arena.allocator();
         const policy_records = try loadPolicies(a, txn, group_id);
-        for (delta.removes) |resource| if (resource.kind == .table) {
+        for (delta.removes) |resource| if (resource.kind == .table and !replacements.contains(.{ .kind = resource.kind, .id = resource.id })) {
             for (policy_records) |record| if (record.table_id == resource.id) {
+                try @import("authorization_storage.zig").policyDependency(a, txn, group_id, record, false);
                 const policy_key = try policyKeyAlloc(a, group_id, record.id);
                 try txn.delete(policy_key);
             };
+            if (try loadPolicyPublication(a, txn, group_id, resource.id)) |value| {
+                var owned = value;
+                defer owned.deinit();
+                try syncPolicyPublicationDependencies(a, txn, group_id, owned.value, null);
+            }
             const publication_key = try policyPublicationKeyAlloc(a, group_id, resource.id);
             try txn.delete(publication_key);
             const stamp_key = try policyPublicationStampKeyAlloc(a, group_id, resource.id);
@@ -1231,14 +1338,18 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
             try txn.delete(work_key);
         };
     }
-    for (delta.removes) |resource| try removeResource(alloc, txn, group_id, resource);
+
+    for (delta.removes) |resource| try removeResourceRow(alloc, txn, group_id, resource, !replacements.contains(.{ .kind = resource.kind, .id = resource.id }));
     for (delta.upserts) |resource| try writeResource(alloc, txn, group_id, resource);
+    for (new_tables.items) |resource| try @import("authorization_storage.zig").initializeTable(catalog_alloc, txn, group_id, resource);
     try writeMeta(alloc, txn, group_id, previous, delta.next_id, command_hash);
 }
 
 /// Bootstrap a previously published standalone row journal without renumbering
 /// its logical catalog generation. Never overwrite an initialized authority.
 pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, state: domain.State) !void {
+    var validated = try domain.StateIndex.init(alloc, state);
+    defer validated.deinit(alloc);
     // The legacy logical envelope has no allocator-state lane. Never turn a
     // portable import into a sequence reset; binary metadata snapshots carry
     // definitions/counters together through their verified projection cut.
@@ -1249,6 +1360,7 @@ pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     try writeResource(alloc, txn, group_id, domain.default_database);
     try writeResource(alloc, txn, group_id, domain.default_namespace);
     for (state.resources) |resource| try writeResource(alloc, txn, group_id, resource);
+    for (state.privileges) |record| try @import("authorization_storage.zig").write(alloc, txn, group_id, record);
     for (state.settings, 0..) |record, i| {
         try record.validate();
         try settings.requireDatabaseBindings(alloc, record, null, SettingDatabaseReader{ .alloc = alloc, .txn = txn, .group = group_id });
@@ -1275,6 +1387,7 @@ pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
         const encoded = try std.json.Stringify.valueAlloc(alloc, record, .{});
         defer alloc.free(encoded);
         try txn.put(policy_key, encoded);
+        try @import("authorization_storage.zig").policyDependency(alloc, txn, group_id, record, true);
     }
     for (state.policy_publications, 0..) |publication, index| {
         try publication.validateShape();

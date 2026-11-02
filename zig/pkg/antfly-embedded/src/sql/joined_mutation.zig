@@ -215,8 +215,8 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
         group.* = projection.expression.?;
     };
     var query: ast.Select = .{ .source = source, .ctes = if (deleting) compiled.statement.delete.ctes else compiled.statement.update.ctes, .columns = projections.items, .predicate = predicate, .group_by = groups };
-    // The target was already resolved/authorized for read+write. Reuse that
-    // immutable binding; resolve every other physical source for read access.
+    // Reuse the target's immutable command authority, including write-only
+    // DEFAULT lowering. Other physical sources resolve with read authority.
     var adapter: @import("relation_binding.zig").TargetResolveAdapter = .{ .backend = backend, .table = table, .name = name, .cache_sources = true };
     try @import("relation_binding.zig").inferExpectedTypes(alloc, adapter.iface(), query, parameters, expected.items);
     const selected: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = query }, .parameter_count = compiled.parameter_count };
@@ -245,7 +245,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
         {
             scope = relation.root.columns;
             const slots = try alloc.alloc(scalar.Column, scope.len);
-            for (scope, slots) |field, *slot| slot.* = .{ .name = field.internal, .type = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier, .enum_view = field.enum_view, .temporal_kind = field.temporal_kind };
+            for (scope, slots) |field, *slot| slot.* = .{ .name = field.internal, .type = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier, .enum_view = field.enum_view, .domain_view = scalar.domainViewOf(field), .temporal_kind = field.temporal_kind };
             const authorized_scope = scope;
             var required = try alloc.alloc(bool, scope.len);
             @memset(required, false);
@@ -404,9 +404,18 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
     const sources = if (definition_.returning_sources.len == 0) null else if (execution.spill) |manager| try Capture.create(execution.alloc, manager, definition_.returning_sources.len) else try Capture.createMemory(execution.alloc, definition_.returning_sources.len, execution.limits.retained_bytes / 2);
     var sources_live = sources != null;
     defer if (sources_live) sources.?.close();
+    const domain_provenance = try @import("domain_mutation.zig").Builder.init(execution.arena, target, true);
+    if (!definition_.deleting) {
+        for (definition_.fields, definition_.input.columns[5..][0..definition_.fields.len]) |field, source|
+            try domain_provenance.set(field, source.domain_view, false);
+        for (definition_.default_paths) |path| for (target.columns) |field| {
+            if (std.mem.eql(u8, field.path, path)) try domain_provenance.set(field, null, true);
+        };
+    }
     const Collector = struct {
         context: runtime.Context,
         bound: Bound,
+        domain_admission: ?@import("../schema/domain_row.zig").Admission,
         mutations: *std.ArrayList(catalog.Mutation),
         seen: *std.StringHashMapUnmanaged(void),
         old_layout: ?*const catalog.Row.TypedLayout,
@@ -491,11 +500,11 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
                 } else try field.assignStorageValue(context.arena, &object, stored, datum.sql_null);
                 if (field.type == .json and !datum.sql_null and datum.value == .null) try json_null_fields.append(context.arena, field.path);
             };
-            try mutations.append(context.alloc, .{ .key = key, .expected_version = version, .expected_content_digest = digest, .row = if (bound.deleting) null else .{ .object = object }, .json_null_fields = json_null_fields.items, .previous = previous });
+            try mutations.append(context.alloc, .{ .key = key, .expected_version = version, .expected_content_digest = digest, .row = if (bound.deleting) null else .{ .object = object }, .json_null_fields = json_null_fields.items, .previous = previous, .domain_admission = self.domain_admission });
             if (self.sources) |capture| try Capture.append(capture, values[5 + bound.fields.len ..]);
         }
     };
-    var collector: Collector = .{ .context = execution, .bound = definition_, .mutations = &pending_mutations, .seen = &visited, .old_layout = previous_layout, .sources = sources, .scratch = std.heap.ArenaAllocator.init(execution.alloc) };
+    var collector: Collector = .{ .domain_admission = domain_provenance.admission(), .context = execution, .bound = definition_, .mutations = &pending_mutations, .seen = &visited, .old_layout = previous_layout, .sources = sources, .scratch = std.heap.ArenaAllocator.init(execution.alloc) };
     defer collector.scratch.deinit();
     // Consume the statement's one captured read directly. DELETE fanout keeps
     // one target image and one coherent source representative, not a full join

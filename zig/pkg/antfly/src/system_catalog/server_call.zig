@@ -59,9 +59,17 @@ pub const RelationDescriptionMutation = struct {
     guard: domain.RelationMutationGuard,
     description: []const u8,
     column: ?[]const u8 = null,
+    object: ?domain.object_annotations.Key = null,
 
     pub fn validate(self: @This()) !void {
         try self.guard.validate();
+        if (self.object) |key| {
+            if (self.column != null) return error.InvalidCatalogMutation;
+            try (domain.ObjectAnnotationRead{ .guard = self.guard, .key = key }).validate();
+            try domain.object_annotations.validateDescription(self.description);
+            return;
+        }
+        if (self.guard.object_renames.len != 0) return error.InvalidCatalogMutation;
         if (self.column) |name| try (@import("antfly_local_sources").system_catalog_column_identities.Description{ .name = name, .value = self.description }).validate();
         if (self.guard.owner.kind != .table or self.guard.constraint_name_admission != null) return error.InvalidCatalogMutation;
         if (self.description.len > 1024 * 1024) return error.CatalogCommandTooLarge;
@@ -97,6 +105,12 @@ pub const Call = union(enum) {
     policy_definition_mutate: @import("antfly_local_sources").system_catalog_policies.Command,
     /// Private coordinator-only transition. Never accepted from public SQL.
     policy_publication_mutate: @import("antfly_local_sources").system_catalog_policies.PublicationCommand,
+    table_retirement_prepare: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard,
+    table_retirement_submit: []const u8,
+    table_retirement_receipt: @import("../metadata/table_retirement_receipt.zig").Request,
+    table_retirement_queue: u64,
+    table_retirement_effects: @import("../metadata/table_retirement_ledger.zig").Lookup,
+    table_retirement_owner_work: @import("../metadata/table_retirement_ledger.zig").Lookup,
     fk_generation_publication_begin: @import("../metadata/fk_generation_publication.zig").Plan,
     fk_generation_publication_mutate: @import("../metadata/fk_generation_publication.zig").Command,
     fk_generation_publication_status: u64,
@@ -143,6 +157,13 @@ pub const Call = union(enum) {
     resolve: Target,
     resolve_many: ResolveMany,
     sql_view_mutate: @import("views.zig").Request,
+    sql_prepared_read: @import("prepared_transactions.zig").Read,
+    sql_prepared_mutate: @import("prepared_transactions.zig").Mutation,
+    sql_prepared_outcome: @import("prepared_transactions.zig").Mutation,
+    sql_authorization_read: @import("authorization.zig").Read,
+    sql_authorization_mutate: @import("authorization.zig").Mutation,
+    sql_authorization_outcome: @import("authorization.zig").Observation,
+    sql_index_annotations: domain.object_annotations.IndexDescriptionsRead,
     sql_type_snapshot: @import("named_types.zig").SnapshotRequest,
     sql_type_bindings: @import("named_types.zig").BindingsRequest,
     sql_type_mutate: @import("named_types.zig").Mutation,
@@ -151,6 +172,9 @@ pub const Call = union(enum) {
     sql_cast_mutate: @import("casts.zig").Mutation,
     sql_cast_outcome: @import("casts.zig").OutcomeRequest,
     sql_routine_snapshot: @import("routines.zig").SnapshotRequest,
+    sql_native_index_prepare: @import("native_indexes.zig").Preparation,
+    sql_native_index_mutate: @import("native_indexes.zig").Mutation,
+    sql_native_index_outcome: @import("native_indexes.zig").OutcomeRequest,
     sql_routine_mutate: @import("routines.zig").Mutation,
     sql_routine_outcome: @import("routines.zig").OutcomeRequest,
     /// Private body-bound operations, never public SQL-supplied admissions.
@@ -186,10 +210,11 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .mutate => |request| request.mutation.action == .comment,
-            .schema_validation_prepare, .schema_validation_status => true,
+            .resolve_many => |request| request.sql_principal != null,
+            .mutate => |request| request.mutation.action == .comment or request.mutation.sql_owner != null,
+            .schema_validation_prepare, .schema_validation_status, .table_retirement_prepare, .table_retirement_submit, .table_retirement_receipt, .table_retirement_queue, .table_retirement_effects, .table_retirement_owner_work => true,
             .schema_validation_submit => |bytes| @import("../metadata/schema_validation_ledger.zig").requiresAdmissionAuthority(bytes),
-            .sql_type_snapshot, .sql_type_bindings, .sql_type_mutate, .sql_type_outcome, .sql_cast_snapshot, .sql_cast_mutate, .sql_cast_outcome, .sql_routine_snapshot, .sql_routine_mutate, .sql_routine_outcome, .sql_column_sequence_handoffs, .sql_sequence_prepare, .sql_sequence_counter_mutate, .sql_sequence_counter_outcome, .sql_view_mutate, .sql_sequence_snapshot, .sql_sequence_admission_head, .sql_sequence_mutate, .sql_sequence_outcome, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin, .native_memory_create => true,
+            .sql_index_annotations, .sql_prepared_read, .sql_prepared_mutate, .sql_prepared_outcome, .sql_authorization_read, .sql_authorization_mutate, .sql_authorization_outcome, .sql_type_snapshot, .sql_type_bindings, .sql_type_mutate, .sql_type_outcome, .sql_cast_snapshot, .sql_cast_mutate, .sql_cast_outcome, .sql_native_index_prepare, .sql_native_index_mutate, .sql_native_index_outcome, .sql_routine_snapshot, .sql_routine_mutate, .sql_routine_outcome, .sql_column_sequence_handoffs, .sql_sequence_prepare, .sql_sequence_counter_mutate, .sql_sequence_counter_outcome, .sql_view_mutate, .sql_sequence_snapshot, .sql_sequence_admission_head, .sql_sequence_mutate, .sql_sequence_outcome, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin, .native_memory_create => true,
             .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -207,6 +232,12 @@ pub const Call = union(enum) {
             .policy_snapshot,
             .policy_install_snapshot,
             .policy_publication_work,
+            .table_retirement_prepare,
+            .table_retirement_submit,
+            .table_retirement_receipt,
+            .table_retirement_queue,
+            .table_retirement_effects,
+            .table_retirement_owner_work,
             .fk_generation_publication_status,
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
@@ -241,7 +272,7 @@ pub const Call = union(enum) {
 
     pub fn isMutation(self: @This()) bool {
         return self == .schema_validation_submit or self == .mutate or self == .fk_initial_retirement_ack or self == .relational_index_owner_ack or self == .relational_index_publish_decide or self == .relational_index_cancel or self == .relational_index_source_accept or self == .relational_index_source_complete or
-            (self != .sql_type_snapshot and self != .sql_type_bindings and self != .sql_type_outcome and self != .sql_cast_snapshot and self != .sql_cast_outcome and self != .sql_routine_snapshot and self != .sql_routine_outcome and self != .sql_column_sequence_handoffs and self != .schema_validation_prepare and self != .schema_validation_status and self != .sql_sequence_counter_outcome and self != .sql_sequence_snapshot and self != .sql_sequence_admission_head and self != .sql_sequence_outcome and self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self != .relational_index_status and self != .relational_index_prepare and self.requiresAdministrativeGrant());
+            (self != .sql_native_index_prepare and self != .sql_native_index_outcome and self != .resolve_many and self != .sql_index_annotations and self != .sql_prepared_read and self != .sql_prepared_outcome and self != .sql_authorization_read and self != .sql_authorization_outcome and self != .sql_type_snapshot and self != .sql_type_bindings and self != .sql_type_outcome and self != .sql_cast_snapshot and self != .sql_cast_outcome and self != .sql_routine_snapshot and self != .sql_routine_outcome and self != .sql_column_sequence_handoffs and self != .schema_validation_prepare and self != .table_retirement_prepare and self != .table_retirement_receipt and self != .table_retirement_queue and self != .table_retirement_effects and self != .table_retirement_owner_work and self != .schema_validation_status and self != .sql_sequence_counter_outcome and self != .sql_sequence_snapshot and self != .sql_sequence_admission_head and self != .sql_sequence_outcome and self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self != .relational_index_status and self != .relational_index_prepare and self.requiresAdministrativeGrant());
     }
 
     pub fn isRelationalIndexOwnerCall(self: @This()) bool {
@@ -262,7 +293,7 @@ pub const Call = union(enum) {
     }
 
     pub fn isSchemaValidationCall(self: @This()) bool {
-        return self == .schema_validation_prepare or self == .schema_validation_submit or self == .schema_validation_discover or self == .schema_validation_work or self.schemaValidationLookup() != null;
+        return self == .table_retirement_submit or self == .table_retirement_receipt or self == .table_retirement_queue or self == .table_retirement_effects or self == .table_retirement_owner_work or self == .schema_validation_prepare or self == .schema_validation_submit or self == .schema_validation_discover or self == .schema_validation_work or (self == .sql_sequence_snapshot and self.sql_sequence_snapshot.prepare_retirement) or self.schemaValidationLookup() != null;
     }
 };
 
@@ -277,6 +308,13 @@ test "system catalog schema validation administrative observations use the read 
         try std.testing.expect(call.isSchemaValidationCall());
         try std.testing.expect(!call.isMutation());
     }
+    const ordinary: Call = .{ .sql_sequence_snapshot = .{ .targets = &.{.{ .table = "counter" }} } };
+    var retirement = ordinary;
+    retirement.sql_sequence_snapshot.prepare_retirement = true;
+    try std.testing.expect(!ordinary.isSchemaValidationCall());
+    try std.testing.expect(retirement.isSchemaValidationCall());
+    try std.testing.expect(retirement.requiresAdministrativeGrant());
+    try std.testing.expect(!retirement.isMutation());
     const submit: Call = .{ .schema_validation_submit = "" };
     try std.testing.expect(submit.isMutation());
 }
@@ -532,4 +570,55 @@ test "system catalog resource comments require body bound admin forwarding for N
     try std.testing.expect(remove.requiresAdministrativeGrant());
     const ordinary: Call = .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "appdb" } } };
     try std.testing.expect(!ordinary.requiresAdministrativeGrant());
+}
+
+test "SQL authorization catalog transport binds principal reads and mutations to administrative grants" {
+    const testing = std.testing;
+    const calls = [_]Call{
+        .{ .sql_authorization_read = .{} },
+        .{ .sql_authorization_mutate = undefined },
+        .{ .sql_authorization_outcome = undefined },
+    };
+    for (calls, [_]bool{ false, true, false }) |call, mutates| {
+        try testing.expect(call.requiresAdministrativeGrant());
+        try testing.expectEqual(mutates, call.isMutation());
+    }
+    const owned_table: Call = .{ .mutate = .{ .mutation = .{ .kind = .table, .action = .create, .name = "rows", .sql_owner = .bootstrap } } };
+    try testing.expect(owned_table.requiresAdministrativeGrant());
+    try testing.expect(owned_table.isMutation());
+}
+
+test "distributed txn prepared registry calls bind administrative authority and classify observations" {
+    const calls = [_]Call{
+        .{ .sql_prepared_read = .{ .gid = "" } },
+        .{ .sql_prepared_read = .{ .receipt = @splat(1) } },
+        .{ .sql_prepared_mutate = undefined },
+        .{ .sql_prepared_outcome = undefined },
+    };
+    for (calls, [_]bool{ false, false, true, false }) |call, mutates| {
+        try std.testing.expect(call.requiresAdministrativeGrant());
+        try std.testing.expectEqual(mutates, call.isMutation());
+    }
+}
+
+test "catalog object index annotation reads require body bound administrative transport without mutation authority" {
+    const a = std.testing.allocator;
+    const read: Call = .{ .sql_index_annotations = .{ .table_id = 7, .name = "status_idx" } };
+    try std.testing.expect(read.requiresAdministrativeGrant());
+    try std.testing.expect(!read.isMutation());
+    try read.sql_index_annotations.validate();
+    const bytes = try std.json.Stringify.valueAlloc(a, read, .{});
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(Call, a, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("status_idx", parsed.value.sql_index_annotations.name.?);
+    try std.testing.expectError(error.InvalidCatalogMutation, (domain.object_annotations.IndexDescriptionsRead{ .table_id = 0 }).validate());
+}
+
+test "table retirement manifest preparation is a body-bound administrative read without mutation authority" {
+    const call: Call = .{ .table_retirement_prepare = undefined };
+    try std.testing.expect(call.requiresAdministrativeGrant());
+    try std.testing.expect(call.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!call.isMutation());
+    try std.testing.expect(!call.isRelationalIndexOwnerCall());
 }

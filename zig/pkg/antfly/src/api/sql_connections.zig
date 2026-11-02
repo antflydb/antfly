@@ -95,7 +95,7 @@ fn loadReconciledAt(
         };
         _ = registry.removeBeforeExecution(alloc, txn_id);
     } else if (session) |value| {
-        if (value.terminal == null and !value.terminal_abort) return owned;
+        if (value.terminal == null and !value.terminal_prepare and !value.terminal_abort) return owned;
         _ = mutate(store, .{ .terminal = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
             error.SqlConnectionBusy => return owned,
             else => return err,
@@ -387,13 +387,13 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             if (session.connection_id == null or !std.mem.eql(u8, &session.connection_id.?, &id) or
                 session.owner_node_id != owner_node_id or !std.mem.eql(u8, session.principal orelse "", principal))
                 return error.SqlTransactionOutcomeUnknown;
-            if (session.terminal_commit == null and !session.terminal_abort) return error.SqlTransactionOutcomeUnknown;
+            if (session.terminal_commit == null and !session.external_preparation_prepared and !session.terminal_abort) return error.SqlTransactionOutcomeUnknown;
             if (session.terminal_commit != null and session.terminal_abort) return error.InvalidTransactionSessionRecord;
             next.state = .idle;
             next.active_txn = null;
             if (next.revision == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
             next.revision += 1;
-            if (session.terminal_commit != null) {
+            if (session.terminal_commit != null or session.external_preparation_prepared) {
                 next.overlay = session.setting_committed.items;
                 next.lookup_path = (session.sql orelse return error.InvalidTransactionSessionRecord).search_path_committed;
             }

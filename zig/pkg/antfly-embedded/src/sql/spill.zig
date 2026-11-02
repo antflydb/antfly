@@ -593,7 +593,10 @@ const Encoder = struct {
     fn cell(self: *Encoder, value: Datum) anyerror!void {
         try value.validateTemporal();
         try self.append(&.{@intFromBool(value.sql_null)});
-        if (value.enumeration()) |atom| {
+        if (value.bytes()) |bytes| {
+            try self.append(&.{15});
+            try self.text(bytes);
+        } else if (value.enumeration()) |atom| {
             try self.append(&.{14});
             try self.word(atom.type_id);
             try self.append(&atom.origin_id);
@@ -1000,6 +1003,12 @@ const Decoder = struct {
                     else => error.InvalidSqlSpill,
                 };
                 value.* = Datum.typedArray(array);
+            } else if (self.position < self.bytes.len and self.bytes[self.position] == 15) {
+                self.position += 1;
+                if (flag != 0) return error.InvalidSqlSpill;
+                const owned = try self.a.create(scalar.Bytea.Value);
+                owned.* = .{ .bytes = try self.a.dupe(u8, try self.take(try self.count())) };
+                value.* = Datum.typedBytes(owned);
             } else if (self.position < self.bytes.len and self.bytes[self.position] == 13) {
                 self.position += 1;
                 if (flag != 0) return error.InvalidSqlSpill;
@@ -2626,7 +2635,7 @@ pub const Sequential = struct {
         return true;
     }
     fn tag(value: Datum) u8 {
-        if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null or value.enumeration() != null) return 255;
+        if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null or value.enumeration() != null or value.bytes() != null) return 255;
         return switch (value.value) {
             .null => 0,
             .bool => 1,
@@ -2682,7 +2691,7 @@ pub const Sequential = struct {
             for (rows) |row| {
                 const value = (if (keys) row.keys else row.values)[column];
                 try value.validateTemporal();
-                if (value.sql_null or (value.value == .null and value.patterns() == null and value.array == null and value.numeric == null and value.temporal() == null and value.range() == null and value.enumeration() == null)) continue;
+                if (value.sql_null or (value.value == .null and value.patterns() == null and value.array == null and value.numeric == null and value.temporal() == null and value.range() == null and value.enumeration() == null and value.bytes() == null)) continue;
                 const actual = tag(value);
                 kind = if (kind == null or kind.? == actual) actual else 255;
             }
@@ -9685,4 +9694,34 @@ test "SQL scoped spill owners share disk and descriptor admission and unwind" {
     try std.testing.expectError(error.SqlProgramLimitExceeded, parent.create());
     try std.testing.expectError(error.SqlProgramLimitExceeded, child.create());
     try std.testing.expectEqual(@as(usize, 64), parent.files);
+}
+
+test "SQL bytea spill preserves all octets nulls keys and malformed-record rejection" {
+    const a = std.testing.allocator;
+    var octets: [256]u8 = undefined;
+    for (&octets, 0..) |*byte, i| byte.* = @intCast(i);
+    const value: scalar.Bytea.Value = .{ .bytes = &octets };
+    const cells = [_]Datum{ .typedBytes(&value), .{} };
+    for ([_]ColumnarVersion{ .v1, .v2 }) |version| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const wire = try encodeColumnarBlockVersionAlloc(a, &.{.{ .values = &cells, .keys = &.{cells[0]}, .ordinal = 9 }}, 4096, version);
+        defer a.free(wire);
+        const block = try decodeColumnarBlockInArena(arena.allocator(), wire, 4096);
+        defer block.deinit();
+        const result = try block.cell(0, 0);
+        try std.testing.expectEqualSlices(u8, &octets, result.bytes().?);
+        try std.testing.expect((try block.cell(0, 1)).sql_null);
+        try std.testing.expectEqualSlices(u8, &octets, (try block.keyCell(0, 0)).bytes().?);
+        try std.testing.expectEqual(try scalar.semanticHashDatum(cells[0]), try scalar.semanticHashDatum(result));
+    }
+    const wire = try encodeDatumsAlloc(a, &cells, 4096);
+    defer a.free(wire);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for (0..wire.len) |len| try std.testing.expectError(error.InvalidSqlSpill, decodeDatumsInArena(arena.allocator(), wire[0..len], 4096));
+    const bad = try a.dupe(u8, wire);
+    defer a.free(bad);
+    bad[8] = 1; // A bytea payload cannot carry a SQL NULL flag.
+    try std.testing.expectError(error.InvalidSqlSpill, decodeDatumsInArena(arena.allocator(), bad, 4096));
 }

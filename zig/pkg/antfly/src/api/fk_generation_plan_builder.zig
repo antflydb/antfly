@@ -31,7 +31,13 @@ pub fn ownedTableForPlan(alloc: std.mem.Allocator, table: records.TableRecord) !
     return metadata.cloneTable(alloc, table);
 }
 
+const CatalogCut = struct { tables: []const records.TableRecord, ranges: []const records.RangeRecord };
+
 pub fn rangesFor(alloc: std.mem.Allocator, snapshot: @import("../metadata/api.zig").AdminSnapshot, table_id: u64) ![]records.RangeRecord {
+    return rangesForCut(alloc, .{ .tables = snapshot.tables, .ranges = snapshot.ranges }, table_id);
+}
+
+fn rangesForCut(alloc: std.mem.Allocator, snapshot: CatalogCut, table_id: u64) ![]records.RangeRecord {
     var selected: std.ArrayList(records.RangeRecord) = .empty;
     errdefer {
         for (selected.items) |range| metadata.freeRange(alloc, range);
@@ -121,6 +127,41 @@ fn buildControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
     try context.ensureActive();
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
     defer server.source.freeAdminSnapshot(&snapshot);
+    return buildFromCut(server, alloc, context, identity, .{ .tables = snapshot.tables, .ranges = snapshot.ranges }, before, proposed_schema_json, guard, sql_drop, null);
+}
+
+const RetirementRoot = struct { id: publication.Id, effects: @import("../metadata/table_retirement_manifest.zig").Reference };
+
+/// Plan only the accepted root's immutable source and outgoing parents. No
+/// whole-catalog snapshot is needed; seal rechecks this cut in the root txn.
+/// Allocations belong to the caller's preparation arena.
+pub fn buildTableRetirement(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, id: publication.Id, manifest: @import("../metadata/table_retirement_manifest.zig").Manifest) !publication.Plan {
+    try context.ensureActive();
+    try manifest.validate(alloc);
+    if (manifest.view_backings.len != 0) return error.UnsupportedOperation;
+    var selected: std.ArrayList(records.TableRecord) = .empty;
+    var ranges: std.ArrayList(records.RangeRecord) = .empty;
+    try selected.append(alloc, manifest.root);
+    try ranges.appendSlice(alloc, manifest.root_ranges);
+    for (manifest.survivors) |pair| try selected.append(alloc, pair.before);
+    try ranges.appendSlice(alloc, manifest.survivor_ranges);
+    for (manifest.external_parents) |parent| {
+        try selected.append(alloc, parent.table);
+        try ranges.appendSlice(alloc, parent.ranges);
+    }
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest.root.schema_json, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGenerationPublication;
+    _ = parsed.value.object.swapRemove("foreign_keys");
+    const target = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    const plan = try buildFromCut(server, alloc, context, null, .{ .tables = selected.items, .ranges = ranges.items }, manifest.root, target, null, manifest.guard, .{ .id = id, .effects = try manifest.reference() });
+    const physical = @import("../metadata/table_retirement_physical.zig");
+    const prepared = try physical.prepare(alloc, alloc, plan);
+    try physical.requireManifest(alloc, .{ .group = manifest.metadata_group_id, .table = manifest.root.table_id, .id = id }, prepared, manifest);
+    return plan;
+}
+
+fn buildFromCut(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, identity: ?server_mod.AuthenticatedIdentity, snapshot: CatalogCut, before: records.TableRecord, proposed_schema_json: []const u8, guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard, sql_drop: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard, root: ?RetirementRoot) !publication.Plan {
     const current = for (snapshot.tables) |table| {
         if (table.table_id == before.table_id and std.mem.eql(u8, table.name, before.name)) break table;
     } else return error.CatalogGenerationChanged;
@@ -133,12 +174,16 @@ fn buildControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
     const derived = try publication.deriveTransitions(alloc, current.table_id, current.name, current.schema_json, after.schema_json, catalog_b64);
     if (derived.len == 0 and sql_drop == null) return error.InvalidGenerationPublication;
     var id: publication.Id = undefined;
-    const io = server.restore_job_store.io orelse return error.AsyncRestoreUnavailable;
-    while (true) {
-        try io.randomSecure(&id);
-        if (std.mem.readInt(u64, id[0..8], .little) != 0 and std.mem.readInt(u64, id[8..16], .little) != 0) break;
+    if (root) |accepted| {
+        id = accepted.id;
+    } else {
+        const io = server.restore_job_store.io orelse return error.AsyncRestoreUnavailable;
+        while (true) {
+            try io.randomSecure(&id);
+            if (std.mem.readInt(u64, id[0..8], .little) != 0 and std.mem.readInt(u64, id[8..16], .little) != 0) break;
+        }
     }
-    const child_ranges = try rangesFor(alloc, snapshot, current.table_id);
+    const child_ranges = try rangesForCut(alloc, snapshot, current.table_id);
     const self_parent = for (derived) |item| {
         if (std.mem.eql(u8, item.parent_table_name, current.name)) break true;
     } else false;
@@ -166,7 +211,7 @@ fn buildControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
                     try server_mod.resolveEffectiveRowFilterJson(alloc, identity, names[0]) != null) return error.Forbidden;
             }
             const dual = parent_table.table_id == current.table_id;
-            const parent_ranges = if (dual) child_ranges else try rangesFor(alloc, snapshot, parent_table.table_id);
+            const parent_ranges = if (dual) child_ranges else try rangesForCut(alloc, snapshot, parent_table.table_id);
             try parents.append(alloc, .{
                 .table = try ownedTableForPlan(alloc, parent_table),
                 .ranges = parent_ranges,
@@ -197,6 +242,7 @@ fn buildControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
     }
     const result: publication.Plan = .{
         .historical_reference_coverage = true,
+        .table_retirement = if (root) |accepted| accepted.effects else null,
         .id = id,
         .child_before = try ownedTableForPlan(alloc, current),
         .child_after = after,
@@ -204,7 +250,8 @@ fn buildControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
         .child_ranges = child_ranges,
         .child_fences = child_fences,
         .parents = try parents.toOwnedSlice(alloc),
-        .constraint_name_guard = if (guard) |value| try value.clone(alloc) else null,
+        .constraint_name_guard = if (guard) |value| if (value.object_renames.len == 0) try value.clone(alloc) else null else null,
+        .object_rename_guard = if (guard) |value| if (value.object_renames.len != 0) try value.clone(alloc) else null else null,
         .sql_drop = if (sql_drop) |value| try value.clone(alloc) else null,
         .catalog_coverage = .checks_v1,
     };

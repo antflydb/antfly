@@ -24,6 +24,13 @@ const domain = @import("domain.zig");
 const A = std.mem.Allocator;
 const Json = std.json.Value;
 
+pub const Source = struct { binding: columns.Binding, definition: sequence.Definition };
+pub const SourceInput = struct {
+    column: []const u8,
+    reference: @typeInfo(@FieldType(columns.Creation, "source")).optional.child,
+    source: Source,
+};
+
 pub const Prepared = struct {
     column: []const u8,
     binding: columns.Binding,
@@ -33,6 +40,8 @@ pub const Plan = struct {
     schema_json: []const u8,
     sequences: []const Prepared,
     next_id: u64,
+    source_inputs: []const SourceInput = &.{},
+    destination: ?domain.Target = null,
 };
 pub const Input = struct {
     target: domain.Target,
@@ -58,6 +67,9 @@ pub fn prepare(a: A, input: Input, namespace: anytype) !Plan {
     if (schema != .object) return error.InvalidSequenceDefinition;
     const mode = schema.object.get("storage_mode") orelse return error.InvalidSequenceDefinition;
     if (mode != .string or !std.mem.eql(u8, mode.string, "relational")) return error.InvalidSequenceDefinition;
+    var attributes: std.StringHashMapUnmanaged(u64) = .empty;
+    try attributes.ensureTotalCapacity(a, @intCast(input.identities.columns.len));
+    for (input.identities.columns) |attribute| try attributes.put(a, attribute.name, attribute.id);
     var intents: std.StringHashMapUnmanaged(usize) = .empty;
     for (input.columns, 0..) |column, index| {
         try column.validate();
@@ -108,14 +120,42 @@ pub fn prepare(a: A, input: Input, namespace: anytype) !Plan {
         }
     };
     var chooser: Namespace = .{ .upstream = namespace, .selected = &selected };
-    const prepared = try a.alloc(Prepared, input.columns.len);
+    var captured: std.ArrayList(SourceInput) = .empty;
+    var prepared: std.ArrayList(Prepared) = .empty;
     var next_id = input.first_id;
-    for (input.columns, prepared, old) |column, *output, prior| {
+    for (input.columns, old) |column, prior| {
         try namespace.checkpoint();
-        try namespace.requireColumn(column.column, column.options.integer.?);
-        const attribute = for (input.identities.columns) |attribute| {
-            if (std.mem.eql(u8, attribute.name, column.column)) break attribute;
-        } else return error.UndefinedColumn;
+        try namespace.requireColumn(column.column, column.options.integer.?, column.source == null or column.generation != .serial);
+        const attribute_id = attributes.get(column.column) orelse return error.UndefinedColumn;
+        var options = column.options;
+        if (column.source != null) {
+            const source: Source = try namespace.resolveSource(column);
+            try captured.append(a, .{ .column = column.column, .reference = column.source.?, .source = source });
+            if (source.binding.generation != column.generation or !std.mem.eql(u8, &source.binding.incarnation, &input.incarnation)) return error.CatalogGenerationChanged;
+            if (column.generation == .serial) {
+                var binding = source.binding;
+                binding.owner = .{ .table_id = input.identities.table_id, .column_id = attribute_id };
+                try binding.validate();
+                if (prior) |before| {
+                    if (!std.mem.eql(u8, &before.fingerprint(), &binding.fingerprint())) return error.CatalogGenerationChanged;
+                } else if (!input.allow_unbound) return error.InvalidSequenceDefinition;
+                try defaults.append(a, try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, .{ .column = column.column, .sequence = binding }, .{}), .{}));
+                continue;
+            }
+            // LIKE identity copies configuration, never running state. Its
+            // data type follows the destination column, even if ALTER SEQUENCE
+            // changed the source counter's type independently.
+            if (!source.definition.internal_identity) return error.InvalidSequenceDefinition;
+            options = .{
+                .integer = column.options.integer,
+                .increment = source.definition.increment,
+                .minimum = .{ .value = source.definition.minimum },
+                .maximum = .{ .value = source.definition.maximum },
+                .start = source.definition.start,
+                .cache = source.definition.cache,
+                .cycle = source.definition.cycle,
+            };
+        }
         var candidate = try names.Candidate.initSequence(input.target.table, column.column);
         const name = if (prior) |before| bound: {
             const suffix = std.mem.lastIndexOf(u8, before.target.table, "_seq") orelse return error.InvalidSequenceDefinition;
@@ -133,7 +173,7 @@ pub fn prepare(a: A, input: Input, namespace: anytype) !Plan {
             .incarnation = input.incarnation,
             .sequence_id = next_id,
             .namespace_id = input.namespace_id,
-            .owner = .{ .table_id = input.identities.table_id, .column_id = attribute.id },
+            .owner = .{ .table_id = input.identities.table_id, .column_id = attribute_id },
             .target = .{ .database = input.target.database, .namespace = input.target.namespace, .table = name },
         };
         try binding.validate();
@@ -143,9 +183,11 @@ pub fn prepare(a: A, input: Input, namespace: anytype) !Plan {
                 !std.mem.eql(u8, before.target.namespace, binding.target.namespace) or
                 !std.mem.eql(u8, before.target.table, binding.target.table)) return error.CatalogGenerationChanged;
         } else if (!input.allow_unbound) return error.InvalidSequenceDefinition;
-        var options = column.options;
         options.owned_by = .{ .column = binding.owner };
-        output.* = .{ .column = column.column, .binding = binding, .definition = try sequence.Definition.prepare(null, options) };
+        var definition = try sequence.Definition.prepare(null, options);
+        definition.internal_identity = column.generation != .serial;
+        try definition.validate();
+        try prepared.append(a, .{ .column = column.column, .binding = binding, .definition = definition });
         const entry = try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, .{ .column = column.column, .sequence = binding }, .{}), .{});
         try defaults.append(a, entry);
         next_id = std.math.add(u64, next_id, 1) catch return error.CatalogIdExhausted;
@@ -154,5 +196,6 @@ pub fn prepare(a: A, input: Input, namespace: anytype) !Plan {
     try schema_value.object.put(a, "column_defaults", .{ .array = .fromOwnedSlice(a, try defaults.toOwnedSlice(a)) });
     const encoded = try std.json.Stringify.valueAlloc(a, schema_value, .{});
     if (encoded.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
-    return .{ .schema_json = encoded, .sequences = prepared, .next_id = next_id };
+    const destination: ?domain.Target = if (captured.items.len == 0) null else input.target;
+    return .{ .schema_json = encoded, .sequences = try prepared.toOwnedSlice(a), .next_id = next_id, .source_inputs = try captured.toOwnedSlice(a), .destination = destination };
 }

@@ -17,11 +17,13 @@ const storage = @import("metadata/storage/mod.zig");
 
 test {
     _ = storage.raft_apply_store;
+    _ = @import("system_catalog/foreign_key_dependencies.zig");
     _ = @import("antfly_local_sources").metadata_lake_index_catalog;
 }
 
 test {
     _ = @import("metadata/report_collection.zig");
+    _ = @import("metadata/http_client.zig");
     _ = @import("metadata/fk_generation_publication.zig");
     _ = @import("metadata/relational_index_candidate.zig");
     _ = @import("metadata/relational_index_publication.zig");

@@ -145,10 +145,17 @@ fn executeConnection(alloc: std.mem.Allocator, adapter: *execution.Adapter, comm
         return runtime.Result.empty(alloc, if (setting == .reset) "RESET" else "SET");
     }
     const setting = command.catalog;
-    if (setting == .reset_local or (setting == .set and setting.set.local)) return error.NoActiveSqlTransaction;
     const capture = adapter.settingCapture().?;
     var view = try settings.View.capture(alloc, capture.owner, capture.scope, capture.overlay);
     defer view.deinit();
+    if (setting == .reset_local or (setting == .set and setting.set.local)) {
+        if (setting == .set) {
+            const definition = try view.writable(setting.set.name);
+            _ = try settings.normalizeDefinedValue(definition, try settings.parseValue(definition.kind, setting.set.value));
+        } else _ = try view.writable(setting.reset_local);
+        if (adapter.notice_sink) |sink| try sink.emit(sink.ptr, .{ .code = "25P01", .severity = .warning, .message = "SET LOCAL can only be used in transaction blocks" });
+        return runtime.Result.empty(alloc, "SET");
+    }
     if (setting == .show) {
         const name = setting.show;
         const resolved = try view.resolve(name);
@@ -173,7 +180,7 @@ fn executeConnection(alloc: std.mem.Allocator, adapter: *execution.Adapter, comm
         .set => |value| {
             const definition = try view.writable(value.name);
             identity = definition.identity;
-            replacement = .{ .identity = identity, .value = try settings.parseValue(definition.kind, value.value) };
+            replacement = .{ .identity = identity, .value = try settings.normalizeDefinedValue(definition, try settings.parseValue(definition.kind, value.value)) };
         },
         .reset => |name| identity = (try view.writable(name)).identity,
         .show, .reset_local => unreachable,

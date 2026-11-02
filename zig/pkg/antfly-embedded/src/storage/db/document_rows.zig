@@ -73,6 +73,7 @@ pub const Session = struct {
     fn openSnapshotImpl(alloc: std.mem.Allocator, store: *store_mod.DocStore, txn: store_mod.DocStore.Txn, schema: ?registry.SchemaView, range: types.ByteRange, from: []const u8, to: []const u8, opts: types.ScanOptions, now_ns: u64, text: ?*@import("text_rows.zig").Owner) !*Session {
         var read = txn;
         errdefer read.abort();
+        try @import("../transactions.zig").checkExternalReadAdmission(&read);
         if (schema) |view| if (view.storageMode() != .document) return error.UnsupportedSqlExecution;
         if (opts.include_range_proofs) if (schema) |view| if (view.tableSchema().ttl_duration_ns != 0) return error.UnsupportedSqlExecution;
         if (opts.relational_query_json.len > 1024 * 1024 or opts.limit > 4096) return error.InvalidRelationalRowsRequest;

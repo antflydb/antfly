@@ -174,6 +174,9 @@ pub const RequestContext = struct {
     /// reconstructed from `principal`. Only ApiHttpServer may interpret this
     /// opaque capability when minting a table-scoped RLS write proof.
     row_policy_credential: ?*const anyopaque = null,
+    /// Trusted synchronous policy signer. The provider handles only its
+    /// admitted physical table identities and cannot cross serialization.
+    row_policy_proof_provider: ?RowPolicyProofProvider = null,
     admission: ?*AdmissionReservation = null,
     /// Borrowed for the duration of the operation. This is deliberately
     /// request-scoped: std.Io tasks may resume on a different worker thread.
@@ -226,6 +229,12 @@ pub const RequestContext = struct {
         normalized.deadline_io = null;
         return normalized;
     }
+};
+
+pub const RowPolicyProofProvider = struct {
+    pub const Result = union(enum) { unhandled, handled: ?[]u8 };
+    ptr: *const anyopaque,
+    sign: *const fn (*const anyopaque, std.mem.Allocator, u64, []const u8, []const u8, ?u32, @import("../usermgr/row_policy_authority.zig").Purpose) anyerror!Result,
 };
 
 pub const TableReadAuthorization = TableWriteAuthorization;

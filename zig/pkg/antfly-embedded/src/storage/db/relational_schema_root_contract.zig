@@ -57,11 +57,13 @@ pub const RowSummary = struct {
     }
     fn validateCoverage(self: @This(), comptime complete: bool) !void {
         try self.header.validate();
+        if (self.header.binding.purpose.schemaOnly() and (self.records != 0 or self.rows != 0 or
+            !std.mem.eql(u8, &self.cursor_digest, &contract.hash("")))) return error.InvalidSchemaValidationJob;
         const historical = self.coverage == .history;
         if (historical) {
             if (self.header.phase != .released or self.header.binding.purpose != .foreign_key_source or
                 self.header.transaction_coverage == null or self.reference_coverage != null) return error.InvalidSchemaValidationJob;
-        } else if ((self.header.binding.purpose == .not_null) != (self.reference_coverage == null)) return error.InvalidSchemaValidationJob;
+        } else if ((!self.header.binding.purpose.references()) != (self.reference_coverage == null)) return error.InvalidSchemaValidationJob;
         if (self.reference_coverage) |coverage| try coverage.validate(self.header.binding.purpose, self.records, self.rows, self.header.binding.columns);
         if (complete and self.coverage != .none and self.header.phase != .released and !std.meta.eql(self.reference_coverage, self.header.reference_coverage)) return error.InvalidSchemaValidationJob;
         try self.snapshot_cut.requireNamespace(self.header.binding.fence.namespace);

@@ -42,7 +42,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_metadata_test_step = b.step("antfly-metadata-test", "Run root-module metadata tests only");
     const presentation_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "SQL COMMENT table descriptions", "SQL COMMENT column", "system catalog resource comments", "system catalog merged service ownership", "system catalog definite naming diagnostics", "system catalog USING rewrite decoder", "system catalog schema reader publication", "schema validation publication text binding", "catalog projection schema reader facts", "relational topology admission rejects lifecycle proposals before encoding on mixed metadata versions", "metadata module compiles", "metadata storage module compiles" },
+        .filters = &.{ "SQL COMMENT table descriptions", "SQL COMMENT column", "system catalog resource comments", "system catalog merged service ownership", "system catalog definite naming diagnostics", "system catalog USING rewrite decoder", "system catalog schema reader publication", "schema validation publication text binding", "catalog projection schema reader facts", "relational topology admission rejects lifecycle proposals before encoding on mixed metadata versions", "metadata module compiles", "metadata storage module compiles", "presentation SQL domain", "presentation control decoder", "presentation malformed restore" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const presentation_run = addFilteredTestRunArtifact(b, presentation_tests);
@@ -75,6 +75,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const role_default_run = addFilteredTestRunArtifact(b, role_default_tests);
     role_default_run.addArg("--require-no-skips");
     b.step("antfly-metadata-sql-role-defaults-test", "Verify role default decoder admission, apply, restore and cold replay barriers").dependOn(&role_default_run.step);
+    const sql_object_annotation_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "system catalog SQL object annotations", "catalog object annotation", "catalog object rename", "system catalog object rename decoder", "catalog object index annotation reads", "compiler SQL COMMENT index and constraint", "SQL view catalog forwarded rejections preserve exact identity", "system catalog definite naming diagnostics", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_object_annotation_run = addFilteredTestRunArtifact(b, sql_object_annotation_tests);
+    sql_object_annotation_run.addArg("--require-no-skips");
+    const sql_object_model_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/object_annotations_test_root.zig"),
+        .target = target,
+        .optimize = antfly_test_mod.optimize,
+    }) });
+    const sql_object_annotation_step = b.step("antfly-metadata-sql-object-annotations-test", "Verify native object annotations, stale bindings, snapshots and cold recovery");
+    sql_object_annotation_step.dependOn(&sql_object_annotation_run.step);
+    sql_object_annotation_step.dependOn(&b.addRunArtifact(sql_object_model_tests).step);
+    const sql_index_projection_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/index_annotation_projection.zig"),
+        .target = target,
+        .optimize = antfly_test_mod.optimize,
+    }) });
+    sql_object_annotation_step.dependOn(&b.addRunArtifact(sql_index_projection_tests).step);
     const sql_column_identity_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "system catalog resource comments", "system catalog SQL column identities", "SQL column identities", "SQL view catalog", "metadata raft apply store snapshot key registry covers every durable projection class", "metadata module compiles", "metadata storage module compiles" },
@@ -86,6 +107,30 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&sql_column_identity_run.step);
     b.step("antfly-metadata-sql-view-catalog-test", "Verify view record identity, replacement and source binding contracts alongside durable source attributes")
         .dependOn(&sql_column_identity_run.step);
+    const creation_source_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "system catalog creation sources", "column sequence defaults require exact", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const creation_source_run = addFilteredTestRunArtifact(b, creation_source_tests);
+    creation_source_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-creation-sources-test", "Verify atomic schema read dependencies, decoder barriers and cold creation replay").dependOn(&creation_source_run.step);
+    const sql_prepared_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "SQL prepared transaction", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_prepared_run = addFilteredTestRunArtifact(b, sql_prepared_tests);
+    sql_prepared_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-sql-prepared-test", "Verify durable GID admission, immutable decision cohorts, native snapshots and exact retry outcomes").dependOn(&sql_prepared_run.step);
+    const sql_authorization_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "SQL authorization catalog", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_authorization_run = addFilteredTestRunArtifact(b, sql_authorization_tests);
+    sql_authorization_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-sql-authorization-test", "Verify atomic SQL role and privilege catalogs, exact outcomes and cold recovery").dependOn(&sql_authorization_run.step);
     const sql_routine_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "SQL routine catalog", "metadata module compiles", "metadata storage module compiles" },

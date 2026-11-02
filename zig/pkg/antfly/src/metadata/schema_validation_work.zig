@@ -46,7 +46,21 @@ pub const Query = struct {
         }
     }
 };
-pub const Task = struct { lookup: reads.Lookup, ordinal: u16, group_id: u64 };
+pub const Task = struct {
+    lookup: reads.Lookup,
+    ordinal: u16,
+    group_id: u64,
+    /// Physical participant, separate from the immutable job anchor. Zero
+    /// retains the ordinary single-table projection, not a mutation grant.
+    table_id: u64 = 0,
+    pub fn physicalTable(self: @This()) u64 {
+        return if (self.table_id == 0) self.lookup.table else self.table_id;
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        if (self.table_id != 0) return writer.write(.{ .lookup = self.lookup, .ordinal = self.ordinal, .group_id = self.group_id, .table_id = self.table_id });
+        return writer.write(.{ .lookup = self.lookup, .ordinal = self.ordinal, .group_id = self.group_id });
+    }
+};
 pub const Page = struct {
     /// Same immutable metadata cut as the owner hints. Coordinators can
     /// advance all-owner decisions without loading a plan or owner cohort.
@@ -75,6 +89,8 @@ pub const Page = struct {
             try (reads.OwnerReadRequest{ .lookup = task.lookup, .ordinal = task.ordinal }).validate();
             task.lookup.require(self.head.?) catch return error.InvalidCatalogRecord;
             if (task.ordinal >= self.head.?.owner_count) return error.InvalidCatalogRecord;
+            const cohort = !std.mem.allEqual(u8, &self.head.?.participants_digest, 0);
+            if ((cohort and task.table_id == 0) or (!cohort and task.physicalTable() != self.head.?.table_id)) return error.InvalidCatalogRecord;
             if (task.group_id == 0 or task.lookup.group != query.group or
                 !std.mem.eql(u8, &task.lookup.metadata_incarnation, &query.metadata_incarnation)) return error.InvalidCatalogRecord;
             if (previous) |prior| {
@@ -102,16 +118,20 @@ pub const Page = struct {
     }
 };
 
+fn requireHeadLock(txn: anytype, head: barriers.Head, table: u64, lock: lifecycle.Lock) !void {
+    if (head.retirement_root) |root| {
+        try @import("table_retirement_ledger.zig").requireBorrowedLock(txn, root, .{ .table = head.table_id, .id = head.id, .digest = head.plan_digest }, table);
+    } else if (lock.kind != .schema_validation or !std.mem.eql(u8, &lock.id, &head.id)) return error.GenerationPublicationChanged;
+}
 fn currentHead(txn: anytype, query: Query, table: u64, id: [16]u8) !barriers.Head {
-    var key: [192]u8 = undefined;
-    const head = try barriers.Head.decode(try txn.get(try (ledger.Key{ .group = query.group, .table = table, .id = id, .kind = .head }).encode(&key)));
+    // Resolve the same canonical anchor as bounded lock discovery. A replaced
+    // active alias makes an old continuation stale, rather than corrupt.
+    const head = (try ledger.resolveActiveHead(txn, query.group, table)) orelse return error.GenerationPublicationChanged;
     if (head.metadata_group_id != query.group or head.table_id != table or !std.mem.eql(u8, &head.id, &id) or
-        !std.mem.eql(u8, &head.metadata_incarnation, &query.metadata_incarnation)) return error.InvalidCatalogRecord;
+        !std.mem.eql(u8, &head.metadata_incarnation, &query.metadata_incarnation)) return error.GenerationPublicationChanged;
     if (head.phase == .succeeded or head.phase == .canceled) return error.GenerationPublicationChanged;
     const lock = (try lifecycle.read(txn, query.group, table)) orelse return error.GenerationPublicationChanged;
-    if (lock.kind != .schema_validation or !std.mem.eql(u8, &lock.id, &id)) return error.GenerationPublicationChanged;
-    const active = try txn.get(try (ledger.Key{ .group = query.group, .table = table, .id = @splat(0), .kind = .active }).encode(&key));
-    if (!std.mem.eql(u8, active, &id)) return error.InvalidCatalogRecord;
+    try requireHeadLock(txn, head, table, lock);
     return head;
 }
 
@@ -121,7 +141,7 @@ fn owners(txn: anytype, head: barriers.Head, first: u16) !Page {
     var ordinal = first;
     while (ordinal < head.owner_count and result.len < max_tasks) : (ordinal += 1) {
         const owner = try ledger.readOwner(txn, head, ordinal);
-        result.tasks[result.len] = .{ .lookup = .fromHead(head), .ordinal = ordinal, .group_id = owner.binding.fence.owner_group_id };
+        result.tasks[result.len] = .{ .lookup = .fromHead(head), .ordinal = ordinal, .group_id = owner.binding.fence.owner_group_id, .table_id = if (std.mem.allEqual(u8, &head.participants_digest, 0)) 0 else owner.binding.fence.namespace.table_id };
         result.len += 1;
     }
     result.next = if (ordinal == head.owner_count) .{ .scan = head.table_id } else .{ .owners = .{ .lookup = .fromHead(head), .ordinal = ordinal } };
@@ -164,11 +184,19 @@ pub fn read(txn: anytype, query: Query) !Page {
         const table = (try lifecycle.tableFromKey(item.key)) orelse return error.InvalidCatalogRecord;
         const lock = try lifecycle.Lock.decode(item.value);
         last = table;
-        if (lock.kind != .schema_validation) continue;
-        const head = currentHead(txn, query, table, lock.id) catch |err| return switch (@as(anyerror, err)) {
-            error.GenerationPublicationChanged, error.NotFound => error.InvalidCatalogRecord,
-            else => err,
+        if (lock.kind != .schema_validation and lock.kind != .table_retirement) continue;
+        // The cursor already authenticates this lock in the pinned read cut.
+        // Reuse it; do not point-read the same lock/head/active tuple twice.
+        const head = (try ledger.resolveActiveHead(txn, query.group, table)) orelse {
+            // Root/source and unrelated outgoing parent locks have no common
+            // schema owner work. Only survivor aliases enter this dispatcher.
+            if (lock.kind == .table_retirement) continue;
+            return error.InvalidCatalogRecord;
         };
+        if (head.metadata_group_id != query.group or !std.mem.eql(u8, &head.metadata_incarnation, &query.metadata_incarnation) or
+            head.phase == .succeeded or head.phase == .canceled) return error.InvalidCatalogRecord;
+        try requireHeadLock(txn, head, table, lock);
+        if (head.table_id != table) continue;
         const page = try owners(txn, head, 0);
         try page.validate(query);
         return page;

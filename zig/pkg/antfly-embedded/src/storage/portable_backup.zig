@@ -1756,12 +1756,7 @@ fn deinitKeyValueBatch(alloc: Allocator, batch: *std.ArrayListUnmanaged(backup_c
 }
 
 fn isPortableRuntimeSchemaVersionKey(key: []const u8) bool {
-    if (!std.mem.startsWith(u8, key, schema_version_prefix)) return false;
-    const version = key[schema_version_prefix.len..];
-    if (version.len == 0 or version.len > 10 or (version.len > 1 and version[0] == '0')) return false;
-    for (version) |byte| if (byte < '0' or byte > '9') return false;
-    _ = std.fmt.parseInt(u32, version, 10) catch return false;
-    return true;
+    return (storage_schema.schemaVersionFromKey(key) catch return false) != null;
 }
 
 pub fn isPortableMetadataKey(key: []const u8) bool {
@@ -2633,7 +2628,10 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
             if (!std.mem.startsWith(u8, kv.key, prefix)) break;
             try cancellation.check();
             if (count == max_rows or (count != 0 and platform_time.monotonicNs() >= deadline)) break;
-            const version = std.fmt.parseInt(u32, kv.key[prefix.len..], 10) catch return error.InvalidMetadataBatch;
+            const version = if (state.phase == .layouts)
+                (storage_schema.schemaVersionFromKey(kv.key) catch return error.InvalidMetadataBatch) orelse continue
+            else
+                std.fmt.parseInt(u32, kv.key[prefix.len..], 10) catch return error.InvalidMetadataBatch;
             const epoch = (try archive.epochForVersion(version)) orelse return error.InvalidSchema;
             if (epoch.validator) |validator| {
                 if (archive.active_public_validator) |active| if (active.schema.version == version) {

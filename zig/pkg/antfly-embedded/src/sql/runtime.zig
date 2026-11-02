@@ -250,7 +250,7 @@ pub fn parameterFallbackTypesNative(arena: std.mem.Allocator, parameters: []cons
     if (native.len != parameters.len) return error.InvalidSqlParameters;
     for (native) |cell| try cell.validateTemporal();
     const kinds = try arena.alloc(?ast.ColumnType, native.len);
-    for (native, kinds) |cell, *kind| kind.* = if (cell.sql_null) null else if (cell.enumeration() != null) .enumeration else if (cell.array != null) .array else if (cell.numeric != null) .number else if (cell.range()) |range| @import("range_value.zig").typeFromKind(ast.ColumnType, range.kind) else parameterFallbackType(cell.value);
+    for (native, kinds) |cell, *kind| kind.* = if (cell.sql_null) null else if (cell.enumeration() != null) .enumeration else if (cell.bytes() != null) .bytea else if (cell.array != null) .array else if (cell.numeric != null) .number else if (cell.range()) |range| @import("range_value.zig").typeFromKind(ast.ColumnType, range.kind) else parameterFallbackType(cell.value);
     return kinds;
 }
 
@@ -350,7 +350,10 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
 }
 
 fn runWithBinding(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, binding: describe.BoundStatement, parameters: []const Json, limits: Limits, sink: ?RowSink, expressions_prepared: bool) !Output {
-    if (compiled.statement == .select) if (backend.execution_binding_validator) |validator| try validator.validate(validator.ptr, alloc, binding);
+    // All statement sources have now been bound and authorized. Transaction
+    // providers may establish their immutable cut here, including scalar-only
+    // statements; denied bindings never acquire physical owner resources.
+    if (backend.execution_binding_validator) |validator| try validator.validate(validator.ptr, alloc, binding);
     var statement_backend = backend;
     statement_backend.execution_binding_validator = null;
     statement_backend.parameter_invocation = binding.parameter_invocation;
@@ -824,6 +827,11 @@ pub const Context = struct {
     /// Arrays are owned envelopes and NUMERIC values are exact decimal text,
     /// never their JSON-null placeholders.
     pub fn outputDatum(self: Context, datum: Datum, kind: ?ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !Json {
+        if (datum.bytes()) |bytes| {
+            try datum.validateTemporal();
+            if (kind != .bytea or element_type != null) return error.SqlTypeMismatch;
+            return .{ .string = try @import("bytea_value.zig").formatAlloc(self.arena, bytes, self.limits.retained_bytes) };
+        }
         if (datum.enumeration()) |atom| {
             try datum.validateTemporal();
             if (kind != .enumeration or element_type != null) return error.SqlTypeMismatch;
@@ -1675,6 +1683,7 @@ pub const Context = struct {
         } else null;
         var selected: std.ArrayList(catalog.Mutation) = .empty;
         const mutations = try self.arena.alloc(catalog.Mutation, statement.rows.len);
+        const domain_seed = try @import("domain_mutation.zig").Builder.init(self.arena, table_def, false);
         var keys: std.StringHashMapUnmanaged(void) = .empty;
         var retained: usize = 0;
         var preparation: ?catalog.MutationPreparation = null;
@@ -1704,7 +1713,10 @@ pub const Context = struct {
                     if (statement.isDefault(row_index, i) or statement.ignoresIdentity(column)) continue;
                     const datum = try self.insertValue(item, column, row_index, i, page.values[row_index - first][i]);
                     var assignment_column = column;
-                    if (filter != null) assignment_column.nullable = true;
+                    // Retain explicit SQL NULL as a candidate value. Sequence
+                    // defaults execute before row constraints, and an explicit
+                    // NULL must never be mistaken for an omitted DEFAULT.
+                    if (filter != null or stateful_defaults) assignment_column.nullable = true;
                     const typed = try self.storageDatumTyped(datum, assignment_column, column.element_type);
                     if (table_def.isDocumentRoot(column.name)) {
                         if (datum.sql_null or typed != .object) return error.SqlTypeMismatch;
@@ -1714,13 +1726,21 @@ pub const Context = struct {
                     }
                     const json_null = column.type == .json and typed == .null and !datum.sql_null;
                     if (json_null) try json_null_fields.append(self.arena, column.path);
-                    try column.assignStorageValue(self.arena, &object, typed, datum.sql_null and filter == null);
+                    try column.assignStorageValue(self.arena, &object, typed, datum.sql_null and filter == null and !stateful_defaults);
                 }
+                const domain_provenance = try domain_seed.clone(self.arena);
+                if (domain_provenance.inputs.len != 0) for (columns, 0..) |column, index| {
+                    const source_view = if (self.binding.scalars.insert_rows.len != 0)
+                        if (self.binding.scalars.insert_rows[row_index][index]) |program| program.output_type.domainView() else null
+                    else
+                        null;
+                    try domain_provenance.set(column, source_view, statement.isDefault(row_index, index) or statement.ignoresIdentity(column));
+                };
                 const document: Json = .{ .object = object };
                 retained = std.math.add(usize, retained, jsonSize(document) + key.string.len) catch return error.SqlProgramLimitExceeded;
                 if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
-                if (filter == null) try self.validateInsertRequired(table_def, object);
-                mutation.* = .{ .key = key.string, .expected_version = 0, .unique_absence = true, .row = document, .json_null_fields = json_null_fields.items };
+                if (filter == null and !stateful_defaults) try self.validateInsertRequired(table_def, object);
+                mutation.* = .{ .key = key.string, .expected_version = 0, .unique_absence = true, .row = document, .json_null_fields = json_null_fields.items, .domain_admission = domain_provenance.admission() };
                 if (filter != null) {
                     if (preparation == null) preparation = try (self.backend.vtable.open_mutation_preparation orelse return error.UnsupportedSqlExecution)(self.backend.ptr, self.arena, table_def, mutation.key, table_def.storage_mode == .document);
                     const owner = preparation.?;
@@ -1759,6 +1779,8 @@ pub const Context = struct {
 
     fn insertSelect(self: Context, statement: ast.Insert, source: ast.Select) !Output {
         const table = self.binding.table orelse return error.InvalidSqlBackendResponse;
+        var stateful_defaults = false;
+        for (table.columns) |column| stateful_defaults = stateful_defaults or column.sequence_default != null;
         try table.validateDocumentWriteColumns(statement.columns);
         const bound = self.binding.insert_source orelse return error.InvalidSqlBackendResponse;
         const target_columns = try self.arena.alloc(catalog.Column, statement.columns.len);
@@ -1777,6 +1799,8 @@ pub const Context = struct {
         if (statement.values_source_rows.len != 0 and selected.count() != statement.values_source_rows.len) return error.InvalidSqlBackendResponse;
         const mutations = try self.arena.alloc(catalog.Mutation, selected.count());
         const captured = try self.arena.alloc([]const Datum, selected.count());
+        const domain_provenance = try @import("domain_mutation.zig").Builder.init(self.arena, table, false);
+        for (target_columns, bound.columns[0..statement.columns.len]) |target, source_column| try domain_provenance.set(target, source_column.domain_view, false);
         var keys: std.StringHashMapUnmanaged(void) = .empty;
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
@@ -1800,7 +1824,9 @@ pub const Context = struct {
             for (target_columns, bound.columns[0..statement.columns.len], row[0..statement.columns.len], 0..) |target, source_column, value_, cell_index| {
                 if (statement.isDefault(row_index, cell_index) or statement.ignoresIdentity(target)) continue;
                 if (!value_.sql_null and source_column.type != target.type and target.type != .string and !@import("builtin_cast.zig").numericAssignmentAllowed(source_column.type, target.type) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json or target.type == .uuid))) return error.SqlTypeMismatch;
-                const typed = try self.storageDatumTyped(value_, target, @import("scalar.zig").assignmentSourceIdentity(source_column.type, source_column.element_type));
+                var assignment_column = target;
+                if (stateful_defaults and !table.isDocumentRoot(target.name)) assignment_column.nullable = true;
+                const typed = try self.storageDatumTyped(value_, assignment_column, @import("scalar.zig").assignmentSourceIdentity(source_column.type, source_column.element_type));
                 if (std.mem.eql(u8, target.name, "_id")) {
                     if (value_.sql_null or typed != .string or typed.string.len == 0) return error.SqlRowIdentityRequired;
                     if (!std.unicode.utf8ValidateSlice(typed.string)) return error.SqlTypeMismatch;
@@ -1811,7 +1837,7 @@ pub const Context = struct {
                     try json_null_fields.appendSlice(self.arena, try table.documentRootNulls(self.arena, typed));
                 } else {
                     if (target.type == .json and !value_.sql_null and typed == .null) try json_null_fields.append(self.arena, target.path);
-                    try target.assignStorageValue(self.arena, &object, typed, value_.sql_null);
+                    try target.assignStorageValue(self.arena, &object, typed, value_.sql_null and !stateful_defaults);
                 }
             }
             const identity = key orelse try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena);
@@ -1819,8 +1845,8 @@ pub const Context = struct {
             if ((try keys.getOrPut(self.arena, identity)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return @import("conflict.zig").duplicateRowError(statement.conflict);
             retained = std.math.add(usize, retained, jsonSize(.{ .object = object }) + identity.len) catch return error.SqlProgramLimitExceeded;
             if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
-            try self.validateInsertRequired(table, object);
-            mutation.* = .{ .key = identity, .expected_version = 0, .unique_absence = true, .row = .{ .object = object }, .json_null_fields = json_null_fields.items };
+            if (!stateful_defaults) try self.validateInsertRequired(table, object);
+            mutation.* = .{ .key = identity, .expected_version = 0, .unique_absence = true, .row = .{ .object = object }, .json_null_fields = json_null_fields.items, .domain_admission = domain_provenance.admission() };
         }
         try self.checkpoint();
         const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, mutations, captured) else mutations;
@@ -1977,6 +2003,14 @@ pub const Context = struct {
             bound.* = .{ .column = column, .value = try clone(self.arena, typed), .sql_null = sql_null, .program = program };
             try replaced.put(self.arena, column.path, {});
         };
+        const domain_provenance = try @import("domain_mutation.zig").Builder.init(self.arena, table_def, true);
+        if (assignments) |items| for (items, 0..) |item, index| {
+            const source = if (index < self.binding.scalars.assignments.len)
+                if (self.binding.scalars.assignments[index]) |program| program.output_type.domainView() else null
+            else
+                null;
+            try domain_provenance.set(try table_def.column(item.field), source, item.use_default);
+        };
         var fields: std.ArrayList([]const u8) = .empty;
         // Document updates preserve untouched fields from the pinned raw
         // postimage below, not from independently coerced SQL projections.
@@ -2118,7 +2152,7 @@ pub const Context = struct {
                         owned.* = try row.cloneWithLayout(self.arena, retained_layout);
                         break :blk owned;
                     } else null;
-                    try mutations.append(self.arena, .{ .key = key, .expected_version = row.version, .expected_content_digest = row.expected_content_digest, .row = document, .json_null_fields = json_null_fields.items, .previous = previous });
+                    try mutations.append(self.arena, .{ .key = key, .expected_version = row.version, .expected_content_digest = row.expected_content_digest, .row = document, .json_null_fields = json_null_fields.items, .previous = previous, .domain_admission = domain_provenance.admission() });
                 }
                 first = end;
             }
@@ -2252,7 +2286,10 @@ pub const Context = struct {
         const committed = try self.arena.dupe(catalog.Mutation, committed_base);
         for (committed) |*mutation| {
             if (mutation.predicate_only) continue;
-            const select_required = if (mutation.unique_absence) returning != null or self.binding.returning != null else table.sql_select_required;
+            const select_required = if (mutation.unique_absence)
+                @import("mutation_policy.zig").returningReadsColumn(returning orelse self.binding.returning_projections)
+            else
+                table.sql_select_required;
             mutation.row_policy_requirement = if (mutation.row == null)
                 (if (select_required) .delete_select else .delete)
             else if (mutation.unique_absence)
@@ -2384,7 +2421,9 @@ pub fn encodeStorageDatumTyped(arena: std.mem.Allocator, datum: Datum, column: c
     // Named SQL column binding must supply a pinned catalog domain before
     // this coarse compatibility boundary can perform enum assignments.
     if (column.enum_view != null) {
-        const checked = try describe.coerceDatumTyped(arena, datum, scalar.columnType(column));
+        // This boundary encodes the physical base. Logical domain coercion
+        // uses the compiler witness in shared row preparation below.
+        const checked = try describe.coerceDatumTyped(arena, datum, scalar.columnType(column).baseType());
         if (checked.sql_null) {
             if (!column.nullable) return error.SqlNotNullViolation;
             return .null;
@@ -8246,7 +8285,7 @@ test "SQL EXPLAIN execution releases every allocation failure" {
         }
     };
     try Check.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "SQL EXPLAIN PostgreSQL options custom plans and complete execution matrix" {
@@ -8412,4 +8451,29 @@ test "SQL result execution leases retain nested preparation owners until all bor
     try std.testing.expectEqualStrings("second", second.payload);
     result.deinit();
     try std.testing.expectEqual(@as(usize, 2), released);
+}
+
+test "SQL bytea buffered native queries match PostgreSQL across page ownership boundaries" {
+    const a = std.testing.allocator;
+    const Fixture = struct { queries: []const struct { sql: []const u8, rows: []const []const Json } };
+    var reference = try std.json.parseFromSlice(Fixture, a, @import("parity_fixtures.zig").bytea_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    for (reference.value.queries) |entry| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, entry.sql, .{});
+        defer compiled.deinit();
+        for ([_]Limits{ .{}, .{ .page_rows = 1 } }) |limits| {
+            var result = try execute(a, fixture.iface(), &compiled, &.{}, limits);
+            defer result.deinit();
+            errdefer if (std.json.Stringify.valueAlloc(a, result.output.rows, .{})) |text| {
+                defer a.free(text);
+                std.debug.print("binary native query={s} actual={s}\n", .{ entry.sql, text });
+            } else |_| {};
+            try std.testing.expectEqual(entry.rows.len, result.output.rows.len);
+            for (entry.rows, result.output.rows) |expected, actual| {
+                try std.testing.expectEqual(expected.len, actual.len);
+                for (expected, actual) |left, right| try std.testing.expectEqual(std.math.Order.eq, try scalar.compare(left, right));
+            }
+        }
+    }
 }

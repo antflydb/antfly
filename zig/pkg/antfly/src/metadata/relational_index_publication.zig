@@ -89,7 +89,7 @@ pub const StatusRequest = struct {
     pub fn validate(self: @This()) !void {
         try self.guard.validate();
         try self.admission.validate();
-        if (self.guard.owner.kind != .table or self.guard.constraint_name_admission != null or
+        if (self.guard.owner.kind != .table or self.guard.hasDefinitionIntent() or
             self.guard.owner.table_id != self.admission.table_id) return error.InvalidGenerationPublication;
         try (names.Key{ .namespace_id = 1, .name = self.index_name }).validate();
     }
@@ -2162,7 +2162,7 @@ pub const PrepareRequest = struct {
 
     pub fn validate(self: @This()) !void {
         try self.guard.validate();
-        if (self.guard.owner.kind != .table or self.guard.constraint_name_admission != null or
+        if (self.guard.owner.kind != .table or self.guard.hasDefinitionIntent() or
             !std.mem.eql(u8, self.guard.target.name, self.guard.logical_table)) return error.InvalidCatalogMutation;
         try (names.Key{ .namespace_id = 1, .name = self.index_name }).validate();
     }
@@ -2190,7 +2190,7 @@ pub const PrepareCut = struct {
             !std.mem.eql(u8, actual.target.database, expected.target.database) or
             !std.mem.eql(u8, actual.target.namespace, expected.target.namespace) or
             !std.mem.eql(u8, actual.target.name, expected.target.name) or
-            !std.mem.eql(u8, actual.logical_table, expected.logical_table) or actual.constraint_name_admission != null or
+            !std.mem.eql(u8, actual.logical_table, expected.logical_table) or actual.hasDefinitionIntent() or
             self.before.table_id != expected.owner.table_id or self.before.name.len == 0 or
             !std.mem.eql(u8, &digest(self.before.schema_json), &expected.owner.schema_digest)) return error.CatalogGenerationChanged;
         // Authority comes from the metadata snapshot. The plan retains it for
@@ -2227,7 +2227,7 @@ pub const Projection = struct {
     namespace_id: u64,
     before: Table,
     after: Table,
-    const Table = struct { table_id: u64, name: []const u8, schema_json: []const u8 };
+    const Table = struct { table_id: u64, name: []const u8, schema_json: []const u8, indexes_json: []const u8 = "{}", sql_native_indexes_json: []const u8 = "" };
 
     pub fn decode(a: Allocator, bytes: []const u8, table_id: u64) !std.json.Parsed(Projection) {
         if (bytes.len == 0 or bytes.len > max_bytes) return error.InvalidCatalogRecord;
@@ -2241,7 +2241,7 @@ pub const Projection = struct {
         return parsed;
     }
 
-    pub fn sourceDigest(self: Projection) Digest {
+    pub fn sourceDigest(self: Projection, a: Allocator) !Digest {
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("antfly.relation-index-source.v1");
         hash.update(&self.id);
@@ -2254,6 +2254,19 @@ pub const Projection = struct {
             std.mem.writeInt(u64, &number, bytes.len, .big);
             hash.update(&number);
             hash.update(bytes);
+        }
+        for ([_]Table{ self.before, self.after }) |table| {
+            if (table.sql_native_indexes_json.len == 0) continue;
+            var bindings = try local.system_catalog_relation_names.native_indexes.read(a, table.sql_native_indexes_json, table.indexes_json);
+            defer bindings.deinit();
+            hash.update("native-index-names");
+            for (bindings.entries) |binding| {
+                std.mem.writeInt(u64, &number, binding.name.len, .big);
+                hash.update(&number);
+                hash.update(binding.name);
+                std.mem.writeInt(u64, &number, binding.incarnation, .big);
+                hash.update(&number);
+            }
         }
         var out: Digest = undefined;
         hash.final(&out);
@@ -2460,7 +2473,7 @@ pub const Dispatch = struct {
             !std.mem.eql(u8, &try ownerFenceDigest(d.owner), &expected.fence_digest)) return error.InvalidCatalogRecord;
         try d.table_guard.validate();
         if (d.table_guard.owner.kind != .table or d.table_guard.owner.table_id != expected.namespace.table_id or
-            d.table_guard.constraint_name_admission != null or
+            d.table_guard.hasDefinitionIntent() or
             d.successor_schema_version != (std.math.add(u32, d.table_guard.owner.schema_version, 1) catch return error.InvalidCatalogRecord) or
             !std.mem.eql(u8, d.table_guard.target.name, d.table_guard.logical_table)) return error.InvalidCatalogRecord;
         _ = privateIndexFence(d.id, d.owner) catch return error.InvalidCatalogRecord;
@@ -2544,7 +2557,7 @@ fn prepareInputCandidate(alloc: Allocator, input: anytype) !candidate_mod.Candid
     defer scratch.deinit();
     const s = scratch.allocator();
     try input.table_guard.validate();
-    if (input.table_guard.owner.kind != .table or input.table_guard.constraint_name_admission != null or
+    if (input.table_guard.owner.kind != .table or input.table_guard.hasDefinitionIntent() or
         input.table_guard.owner.table_id != input.before.table_id or
         !std.mem.eql(u8, input.table_guard.target.name, input.table_guard.logical_table) or
         input.table_guard.owner.schema_version != try @import("../api/tables.zig").schemaVersion(input.before.schema_json) or

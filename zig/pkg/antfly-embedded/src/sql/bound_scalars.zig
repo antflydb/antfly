@@ -429,7 +429,7 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
     };
     const virtual_columns: []const catalog.Column = if (table) |bound| bound.virtualColumns() else &.{};
     const columns = try alloc.alloc(scalar.Column, table_columns.len + virtual_columns.len);
-    for (table_columns, columns[0..table_columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable, .aliases = if (qualified_names) try table.?.columnAliases(alloc, column.name) else &.{} };
+    for (table_columns, columns[0..table_columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = column.nullable, .aliases = if (qualified_names) try table.?.columnAliases(alloc, column.name) else &.{} };
     for (virtual_columns, columns[table_columns.len..]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .nullable = column.nullable, .aliases = if (qualified_names) try table.?.columnAliases(alloc, column.name) else &.{} };
     var builder: Builder = .{ .alloc = alloc, .table = table, .columns = columns, .parameters = parameters, .settings = settings, .fallbacks = fallbacks, .typed_parameters = typed_parameters, .invocation = invocation };
     var out: Bound = .{ .columns = columns, .typed_parameters = typed_parameters, .invocation = invocation };

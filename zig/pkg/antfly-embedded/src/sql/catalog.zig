@@ -20,14 +20,26 @@ const std = @import("std");
 const ast = @import("ast.zig");
 
 pub const enum_values = @import("../common/sql_enum_value.zig");
+pub const domain_definitions = @import("domain_definition.zig");
+pub const domain_rows = @import("../schema/domain_row.zig");
+pub const domain_values = @import("../schema/domain_value.zig");
+pub const domain_types = @import("../system_catalog/domain_types.zig");
 pub const named_types = @import("../system_catalog/named_types.zig");
 pub const named_layouts = @import("../common/sql_named_type_layout.zig");
+pub const type_retirement = @import("type_retirement.zig");
 
 test {
     _ = named_types;
+    _ = domain_types;
+    _ = domain_values;
+    _ = domain_rows;
+    _ = domain_definitions;
     _ = named_layouts;
+    _ = type_retirement;
     _ = enum_values;
     _ = @import("enum_execution_test.zig");
+    _ = @import("domain_execution_test.zig");
+    _ = @import("domain_mutation.zig");
     _ = @import("../storage/db/relational_enum_test.zig");
 }
 
@@ -43,6 +55,9 @@ pub const Column = struct {
     element_type: ?@import("array_value.zig").ElementType = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
+    domain_view: ?*const @import("../schema/domain_value.zig").View = null,
+    /// Physical immutable layout ordinal; SQL projections must not invent it.
+    storage_ordinal: ?u32 = null,
     nullable: bool = true,
     /// Optional document properties that reject JSON null represent SQL NULL
     /// by absence. Raw _doc values never pass through this assignment boundary.
@@ -94,6 +109,25 @@ pub const Column = struct {
         };
     }
 
+    pub fn fromRelationalDomain(column: anytype, view: *const domain_values.View) !Column {
+        const identity = view.identity orelse return error.InvalidSqlBackendResponse;
+        if (column.named_type_id != identity.id or column.column_type != view.column.column_type or column.sql_element_type != view.column.sql_element_type or
+            !@import("../common/sql_builtin_type.zig").NumericModifier.eql(column.numeric_modifier, view.column.numeric_modifier) or
+            column.is_json != view.column.is_json or column.json_kind != view.column.json_kind) return error.InvalidSqlBackendResponse;
+        var physical = column;
+        physical.named_type_id = if (view.enumeration) |enumeration| enumeration.record.identity.id else null;
+        var result = try fromRelational(physical, view.enumeration);
+        result.domain_view = view;
+        var current: ?*const domain_values.View = view;
+        while (current) |contract| : (current = contract.parent) {
+            if (contract.default != null) {
+                result.defaulted = true;
+                break;
+            }
+        }
+        return result;
+    }
+
     /// A view dependency binds a logical SQL domain, not the spelling of its
     /// name/path, nullability, generation expression, or DEFAULT clause.
     pub fn identitySignature(self: Column, _: std.mem.Allocator) ![32]u8 {
@@ -108,7 +142,7 @@ pub const Column = struct {
             .uuid => Kind.uuid,
             .boolean => Kind.boolean,
             .json => Kind.jsonb,
-            .datetime, .numrange, .daterange, .tsrange, .tstzrange => null,
+            .datetime, .numrange, .daterange, .tsrange, .tstzrange, .bytea => null,
             .array => return error.InvalidSqlBackendResponse,
             .enumeration => null,
         };
@@ -139,6 +173,14 @@ pub const Column = struct {
             hash.update(&id);
             hash.update(&view.record.identity.origin_id);
         }
+        if (self.domain_view) |view| {
+            const domain = view.identity orelse return error.InvalidSqlBackendResponse;
+            hash.update("\x00named-domain\x00");
+            var id: [8]u8 = undefined;
+            std.mem.writeInt(u64, &id, domain.id, .little);
+            hash.update(&id);
+            hash.update(&domain.origin_id);
+        }
         return hash.finalResult();
     }
 };
@@ -149,7 +191,22 @@ pub const Column = struct {
 pub fn relationalColumnsLeaky(a: std.mem.Allocator, schema: anytype) ![]Column {
     const columns = try a.alloc(Column, schema.relational_columns.len);
     var views: std.AutoHashMapUnmanaged(u64, *const enum_values.View) = .empty;
-    for (schema.relational_columns, columns) |column, *out| {
+    var domains: ?*domain_values.Registry = null;
+    for (schema.named_types) |record| if (record.definition == .domain) {
+        const registry = try a.create(domain_values.Registry);
+        registry.* = try domain_values.Registry.init(a, schema.named_types);
+        domains = registry;
+        break;
+    };
+    for (schema.relational_columns, columns, 0..) |column, *out, ordinal| {
+        if (domains) |registry| if (column.named_type_id) |id| {
+            const entry = registry.byId(id) orelse return error.InvalidSchema;
+            out.* = if (entry.executable.? == .domain) try Column.fromRelationalDomain(column, &entry.executable.?.domain) else try Column.fromRelational(column, &entry.executable.?.enumeration);
+            out.storage_ordinal = @intCast(ordinal);
+            out.name = try a.dupe(u8, column.name);
+            out.path = try a.dupe(u8, column.path);
+            continue;
+        };
         const view = if (column.column_type == .enumeration) resolve: {
             const id = column.named_type_id orelse return error.InvalidSchema;
             if (views.get(id)) |existing| break :resolve existing;
@@ -160,6 +217,7 @@ pub fn relationalColumnsLeaky(a: std.mem.Allocator, schema: anytype) ![]Column {
             break :resolve prepared;
         } else null;
         out.* = try Column.fromRelational(column, view);
+        out.storage_ordinal = @intCast(ordinal);
         out.name = try a.dupe(u8, column.name);
         out.path = try a.dupe(u8, column.path);
     }
@@ -492,6 +550,10 @@ pub const Table = struct {
     scope: ?Scope = null,
     row_policy_purpose: @import("../usermgr/row_policy_authority.zig").Purpose = .ordinary,
     sql_select_required: bool = false,
+    /// Request-owned effective rights; never stored in schema or plan caches.
+    sql_access: ?@import("../system_catalog/privileges.zig").Access = null,
+    sql_native_rights: u16 = 0,
+    sql_required_privileges: u16 = 0,
     /// Stored SQL keeps creation-time lexical names independently of the
     /// current logical scope used for catalog and authorization checks.
     binding_scope: ?Scope = null,
@@ -643,7 +705,7 @@ pub const Table = struct {
             .name = column_.name,
             .path = column_.path,
             .column_type = switch (column_.type) {
-                .enumeration => return error.UnsupportedSqlShape,
+                .enumeration, .bytea => return error.UnsupportedSqlShape,
                 .string, .uuid => .string,
                 .integer => .integer,
                 .number => if (column_.element_type == .numeric) .numeric else .number,
@@ -1315,6 +1377,10 @@ pub const StatementRead = struct {
     close: *const fn (*anyopaque) void,
 };
 pub const Mutation = struct {
+    /// Compiler-owned coercion witnesses, retained only through preparation.
+    domain_admission: ?domain_rows.Admission = null,
+    /// Completed preparation authority, never constructed from public JSON.
+    prepared_domain: ?*const @import("../schema/domain_handoff.zig").Contract = null,
     row_policy_requirement: @import("../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     /// Owned native authority envelope. The SQL engine carries but never
     /// interprets native claim keys, generation fences or commands.
@@ -1381,6 +1447,25 @@ pub const casts = @import("../system_catalog/casts.zig");
 pub const callable_dependencies = @import("../system_catalog/callable_dependencies.zig");
 pub const notices = @import("notices.zig");
 
+pub const DefinitionCopyLimits = @import("immutable_plan.zig").Limits;
+
+pub const CreateTableDefinition = struct {
+    name: ast.Name,
+    creation_sources: []const @import("../system_catalog/domain.zig").RelationMutationGuard = &.{},
+    /// Copy native column annotations at the same linearization point as CREATE.
+    creation_comment_sources: []const u64 = &.{},
+    creation_object_comments: []const @import("../system_catalog/object_annotations.zig").Copy = &.{},
+    creation_revision: ?u64 = null,
+    existing: bool = false,
+    schema_json: []const u8,
+    if_not_exists: bool,
+    tablespace: ?[]const u8 = null,
+    column_sequences: []const @import("../system_catalog/column_sequences.zig").Creation = &.{},
+    /// Compiler-owned provenance for admission-time name selection.
+    /// Explicit user names must never be included or silently renamed.
+    generated_constraint_names: []const []const u8 = &.{},
+};
+
 pub const Ddl = union(enum) {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         // Request-owned producer callbacks cannot become stored catalog data.
@@ -1394,16 +1479,7 @@ pub const Ddl = union(enum) {
         try writer.endObject();
     }
     populate: struct { intent: ast.RelationPopulation, source: ?PopulationSource = null, preparation: ?PopulationPreparation = null },
-    create_table: struct {
-        name: ast.Name,
-        schema_json: []const u8,
-        if_not_exists: bool,
-        tablespace: ?[]const u8 = null,
-        column_sequences: []const @import("../system_catalog/column_sequences.zig").Creation = &.{},
-        /// Compiler-owned provenance for admission-time name selection.
-        /// Explicit user names must never be included or silently renamed.
-        generated_constraint_names: []const []const u8 = &.{},
-    },
+    create_table: CreateTableDefinition,
     drop_table: ast.DropTable,
     catalog_ddl: ast.CatalogDdl,
     policy_ddl: ast.PolicyDdl,
@@ -1428,9 +1504,9 @@ pub const DdlReceipt = struct {
 /// Native catalog operations have no physical table/schema receipt. Identity
 /// integers stay native here and stringify as exact decimal strings on wire.
 pub const CatalogOperationReceipt = struct {
-    pub const Kind = enum { sequence, function, procedure, operator, aggregate, cast, type };
+    pub const Kind = enum { sequence, function, procedure, operator, aggregate, cast, type, authorization, table, index };
     pub const Operation = enum { create, alter, rename, drop };
-    pub const State = enum { committed, rejected, unknown };
+    pub const State = enum { committed, rejected, unknown, pending };
     pub const Diagnostic = struct { code: []const u8, message: []const u8, retryable: bool };
     kind: Kind = .sequence,
     operation: Operation,
@@ -1585,7 +1661,9 @@ pub const CopyFilter = struct {
 
 pub const Backend = struct {
     pub const PreparedRead = struct { name: ast.Name, relation: ReadRelation };
-    validate_persisted_expressions: ?*const fn (*anyopaque, std.mem.Allocator, ast.Statement) anyerror!void = null,
+    /// Bound callbacks retain their native receiver when a backend decorator
+    /// replaces ptr/vtable for authorization or prepared-read routing.
+    validate_persisted_expressions: ?struct { ptr: *anyopaque, validate: *const fn (*anyopaque, std.mem.Allocator, ast.Statement) anyerror!void } = null,
     /// Private resolver namespace. Distinct delegated view contexts must not
     /// share name bindings even when their SQL references have the same text.
     copy_filter: ?CopyFilter = null,
@@ -1617,6 +1695,14 @@ pub const Backend = struct {
     supports_expression_access_hints: bool = false,
     execution_io: ?std.Io = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
+    /// Statement preparation only; native schemas retain owned definitions.
+    resolve_declared_types: ?struct { ptr: *anyopaque, resolve: *const fn (*anyopaque, std.mem.Allocator, ast.CreateTable) anyerror!ast.CreateTable } = null,
+    /// Carries its own owner because lowering wrappers can replace Backend.ptr.
+    prepare_definition_copy: ?struct {
+        ptr: *anyopaque,
+        prepare: *const fn (*anyopaque, std.mem.Allocator, ast.CreateTable, DefinitionCopyLimits) anyerror!CreateTableDefinition,
+    } = null,
+    named_type_resolver: ?@import("scalar.zig").NamedTypeResolver = null,
     routine_resolver: ?@import("routine_bindings.zig").Resolver = null,
     procedure_resolver: ?@import("procedure.zig").Resolver = null,
     notice_sink: ?notices.Sink = null,

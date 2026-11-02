@@ -34,6 +34,14 @@ fn coerceDeclaredDatum(a: std.mem.Allocator, cell: @import("scalar.zig").Datum, 
 // Fallback plans expose owned wire cells. Re-enter the typed pipeline only
 // through the declared column identity, never through JSON shape inference.
 fn outputCellDatum(a: std.mem.Allocator, value: Json, sql_null: bool, column: describe.Column) !@import("scalar.zig").Datum {
+    if (column.type == .bytea) {
+        if (sql_null) return .{};
+        if (value != .string or column.element_type != null) return error.SqlTypeMismatch;
+        const bytes = try @import("bytea_value.zig").parseAlloc(a, value.string, (@import("array_value.zig").Limits{}).bytes);
+        const owned = try a.create(@import("bytea_value.zig").Value);
+        owned.* = .{ .bytes = bytes };
+        return @import("scalar.zig").Datum.typedBytes(owned);
+    }
     if (column.enum_view != null or @import("range_value.zig").kindFromType(column.type) != null or column.temporal_kind != null) {
         return describe.coerceDatumTyped(a, .{ .value = value, .sql_null = sql_null }, .{ .kind = column.type, .element_type = column.element_type, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind });
     }

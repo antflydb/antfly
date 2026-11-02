@@ -305,6 +305,12 @@ const JsonPayload = struct {
 const Extension = struct {
     bits: usize = 0,
     fn from(value: Datum) Extension {
+        if (value.bytes() != null) {
+            comptime std.debug.assert(@alignOf(scalar.Bytea.Value) >= 4);
+            const address = @intFromPtr(value.extension.?);
+            std.debug.assert(address & 3 == 0);
+            return .{ .bits = address | 3 };
+        }
         if (value.enumeration()) |atom| {
             comptime std.debug.assert(@alignOf(@import("../common/sql_enum_value.zig").Value) >= 4);
             const address = @intFromPtr(atom);
@@ -331,6 +337,7 @@ const Extension = struct {
             0 => Datum.typedTemporal(@ptrFromInt(self.bits)),
             1 => Datum.typedRange(@ptrFromInt(self.bits & ~@as(usize, 3))),
             2 => Datum.typedEnum(@ptrFromInt(self.bits & ~@as(usize, 3))),
+            3 => Datum.typedBytes(@ptrFromInt(self.bits & ~@as(usize, 3))),
             else => unreachable,
         };
     }
@@ -444,7 +451,7 @@ const Column = struct {
         var referenced: usize = 0;
         for (source.values, remap) |value, id| {
             if (id == std.math.maxInt(u32)) continue;
-            if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null or value.enumeration() != null) return false;
+            if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null or value.enumeration() != null or value.bytes() != null) return false;
             if (value.sql_null) continue;
             const actual = std.meta.activeTag(value.value);
             if (actual != .integer and actual != .float and actual != .string and actual != .number_string) return false;
@@ -569,7 +576,7 @@ const Column = struct {
     }
     fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum) !void {
         try value.validateTemporal();
-        if (self.extensions.items.len != 0 or value.range() != null or value.enumeration() != null or value.temporal() != null) {
+        if (self.extensions.items.len != 0 or value.range() != null or value.enumeration() != null or value.temporal() != null or value.bytes() != null) {
             if (self.extensions.items.len == 0) {
                 try self.extensions.resize(a, row);
                 @memset(self.extensions.items, .{});
@@ -1252,7 +1259,7 @@ pub const Store = struct {
                 if ((try scalar.compareDatums(Datum.typedNumeric(&number), value)) != .eq) return false;
                 continue;
             }
-            if (value.range() != null or value.enumeration() != null or value.array != null or value.numeric != null or value.temporal() != null or (stored.arrays.items.len != 0 and stored.arrays.items[row_index] != null) or (stored.numerics.items.len != 0 and stored.numerics.items[row_index] != null) or (stored.extensions.items.len != 0 and stored.extensions.items[row_index].bits != 0)) {
+            if (value.bytes() != null or value.range() != null or value.enumeration() != null or value.array != null or value.numeric != null or value.temporal() != null or (stored.arrays.items.len != 0 and stored.arrays.items[row_index] != null) or (stored.numerics.items.len != 0 and stored.numerics.items[row_index] != null) or (stored.extensions.items.len != 0 and stored.extensions.items[row_index].bits != 0)) {
                 if ((try scalar.compareDatums(try stored.cell(a, row_index), value)) != .eq) return false;
                 continue;
             }
@@ -1882,4 +1889,29 @@ test "SQL range retained columns and spill own typed endpoints and preserve obse
     try std.testing.expect((try store.cell(a, 0, 0)).sql_null);
     _ = try store.append(&.{.{}});
     try std.testing.expect((try store.cell(a, count, 0)).sql_null);
+}
+
+test "SQL bytea retained buffers own binary extensions without growing compact entries" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            comptime std.debug.assert(@sizeOf(Extension) == @sizeOf(usize));
+            var store = Store.init(a);
+            defer store.deinit();
+            _ = try store.append(&.{.{}});
+            const input = try a.dupe(u8, "\x00\x80\xff");
+            defer a.free(input);
+            const value: scalar.Bytea.Value = .{ .bytes = input };
+            _ = try store.append(&.{Datum.typedBytes(&value)});
+            @memset(input, 0);
+            const retained = try store.cell(a, 1, 0);
+            try std.testing.expectEqualSlices(u8, "\x00\x80\xff", retained.bytes().?);
+            try std.testing.expect((try store.cell(a, 0, 0)).sql_null);
+            const same: scalar.Bytea.Value = .{ .bytes = "\x00\x80\xff" };
+            const different: scalar.Bytea.Value = .{ .bytes = "\x00\x80\xfe" };
+            try std.testing.expect(try store.equal(a, 1, &.{Datum.typedBytes(&same)}, true));
+            try std.testing.expect(!try store.equal(a, 1, &.{Datum.typedBytes(&different)}, true));
+        }
+    };
+    try Probe.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }

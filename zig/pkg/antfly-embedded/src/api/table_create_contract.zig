@@ -26,6 +26,8 @@ pub const CreateTableRequest = struct {
     num_shards: ?u32 = null,
     description: ?[]u8 = null,
     indexes_json: ?[]u8 = null,
+    /// Private restore metadata; never populated by the public create decoder.
+    sql_native_indexes_json: ?[]u8 = null,
     schema_json: ?[]u8 = null,
     replication_sources_json: ?[]u8 = null,
 
@@ -33,6 +35,7 @@ pub const CreateTableRequest = struct {
         if (self.tablespace_name) |value| alloc.free(value);
         if (self.description) |value| alloc.free(value);
         if (self.indexes_json) |value| alloc.free(value);
+        if (self.sql_native_indexes_json) |value| alloc.free(value);
         if (self.schema_json) |value| alloc.free(value);
         if (self.replication_sources_json) |value| alloc.free(value);
         self.* = undefined;

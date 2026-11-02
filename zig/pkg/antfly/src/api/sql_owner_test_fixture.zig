@@ -280,7 +280,7 @@ pub fn waitServingSchemaInScope(ctx: *Context, database: []const u8, namespace: 
                     .relational_topology_json = "{\"mode\":\"public_schema\"}",
                     .execution_deadline_ns = deadline,
                 }, .read_index) catch |err| switch (err) {
-                    error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.Timeout, error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.TableNotFound, error.IntegrityCatalogChanged, error.CatalogRoutingUnavailable => null,
+                    error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.Timeout, error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.TableNotFound, error.IntegrityCatalogChanged, error.CatalogRoutingUnavailable, error.TopologyChanged => null,
                     else => return err,
                 };
                 if (observed) |value| {
@@ -354,6 +354,8 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     // production, not a mock or the legacy filesystem DocStore fallback.
     const native_sessions = if (@hasDecl(Campaign, "native_sessions")) Campaign.native_sessions else false;
     const native_auth = if (@hasDecl(Campaign, "native_auth")) Campaign.native_auth else false;
+    const public_anonymous = if (@hasDecl(Campaign, "public_anonymous")) Campaign.public_anonymous else false;
+    if (public_anonymous and native_auth) @compileError("anonymous SQL campaign cannot also require public authentication");
     const cold_catalog = if (@hasDecl(Campaign, "cold_catalog")) Campaign.cold_catalog else false;
     const session_path = try std.fmt.allocPrint(alloc, "{s}/sql-sessions", .{root});
     defer alloc.free(session_path);
@@ -395,7 +397,7 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
         .replica_root_dir = data_root,
         .replica_catalog_path = data_catalog,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{ .deployment_mode = .distributed, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
+        .api_server_cfg = .{ .deployment_mode = .distributed, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = if (public_anonymous) null else trusted_secret, .trusted_principal_issuer = issuer, .setting_authority_secret = if (public_anonymous) trusted_secret else null, .setting_authority_issuer = if (public_anonymous) issuer else null, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
     }, metadata_uri);
     var data_live = true;
     defer if (data_live) data.deinit();
@@ -497,7 +499,7 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
         .replica_root_dir = data_root,
         .replica_catalog_path = data_catalog,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{ .deployment_mode = .distributed, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
+        .api_server_cfg = .{ .deployment_mode = .distributed, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = if (public_anonymous) null else trusted_secret, .trusted_principal_issuer = issuer, .setting_authority_secret = if (public_anonymous) trusted_secret else null, .setting_authority_issuer = if (public_anonymous) issuer else null, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
     }, metadata_uri);
     data_live = true;
     try data.start();

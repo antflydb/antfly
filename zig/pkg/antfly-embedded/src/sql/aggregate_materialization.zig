@@ -30,13 +30,14 @@ pub const Key = struct {
     element_type: ?@import("array_value.zig").ElementType = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
+    domain_view: ?*const @import("../schema/domain_value.zig").View = null,
 
     pub fn fromColumn(column: catalog.Column) Key {
         const descriptor = scalar.columnType(column);
-        return .{ .path = column.path, .type = column.type, .nullable = column.nullable, .element_type = descriptor.element_type, .numeric_modifier = descriptor.numeric_modifier, .enum_view = descriptor.enum_view };
+        return .{ .path = column.path, .type = column.type, .nullable = column.nullable, .element_type = descriptor.element_type, .numeric_modifier = descriptor.numeric_modifier, .enum_view = descriptor.enum_view, .domain_view = scalar.domainViewOf(descriptor) };
     }
     pub fn definition(self: Key) scalar.Column {
-        return .{ .name = self.path, .type = self.type, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .enum_view = self.enum_view };
+        return .{ .name = self.path, .type = self.type, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .enum_view = self.enum_view, .domain_view = scalar.domainViewOf(self) };
     }
 };
 pub const Input = struct {

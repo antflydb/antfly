@@ -364,12 +364,23 @@ const Owner = struct {
     open: bool = true,
     metadata_group_id: u64 = 21,
     next_index: u64 = 1,
+    apply_index: u64 = 1,
     calls: usize = 0,
     locked: bool = false,
     lose_reply_once: bool = false,
 
     fn init(a: A, root: []const u8) !Owner {
-        return .{ .alloc = a, .root = root, .store = try storage.RaftApplyStore.init(a, .{ .root_dir = root }) };
+        var self: Owner = .{ .alloc = a, .root = root, .store = try storage.RaftApplyStore.init(a, .{ .root_dir = root }) };
+        errdefer self.deinit();
+        // This isolated single-owner fixture supplies membership authority;
+        // source adoption and root publication still execute native commands
+        // and obtain the receiver's verified source/candidate proof.
+        _ = try self.apply(.{ .initialize_metadata_incarnation = activation.incarnation });
+        const bytes = try std.json.Stringify.valueAlloc(a, activation, .{});
+        defer a.free(bytes);
+        _ = try self.apply(.{ .activate_topology_protocol = bytes });
+        try self.settlePublication();
+        return self;
     }
     fn deinit(self: *Owner) void {
         if (self.open) self.store.deinit();
@@ -418,13 +429,18 @@ const Owner = struct {
     }
     pub fn proposeTransitionCommandWithReceipt(self: *Owner, command: storage.TransitionCommand) !u64 {
         std.debug.assert(self.locked);
+        const receipt = try self.apply(command);
+        self.next_index += 1;
+        return receipt;
+    }
+    fn apply(self: *Owner, command: storage.TransitionCommand) !u64 {
         const bytes = try storage.encodeTransitionCommand(self.alloc, command);
         defer self.alloc.free(bytes);
-        const entries = try @import("../raft/state_machine/mod.zig").encodeCommittedEntries(self.alloc, &.{.{ .term = 1, .index = self.next_index, .entry_type = .normal, .data = bytes }});
+        const entries = try @import("../raft/state_machine/mod.zig").encodeCommittedEntries(self.alloc, &.{.{ .term = 1, .index = self.apply_index, .entry_type = .normal, .data = bytes }});
         defer self.alloc.free(entries);
-        try self.store.snapshotBuilder().applyBatch(.{ .group_id = self.metadata_group_id, .commit_index = self.next_index, .entries_bytes = entries });
-        const receipt = self.next_index;
-        self.next_index += 1;
+        try self.store.snapshotBuilder().applyBatch(.{ .group_id = self.metadata_group_id, .commit_index = self.apply_index, .entries_bytes = entries });
+        const receipt = self.apply_index;
+        self.apply_index += 1;
         return receipt;
     }
     pub fn waitForTransitionAppliedWithContext(_: *Owner, _: u64, context: operation.RequestContext) !void {
@@ -439,9 +455,46 @@ const Owner = struct {
             return error.TableTransitionActive;
         }
     }
+    const reconciliation = local.system_catalog_relation_reconciliation;
+    const worker = @import("../metadata/relation_reconciliation_worker.zig");
+    const activation: @import("../metadata/topology_protocol.zig").Activation = .{
+        .version = @import("../metadata/topology_protocol.zig").constraint_occupancy_version,
+        .incarnation = @splat('1'),
+        .member_count = 1,
+        .membership_fingerprint = @splat(7),
+    };
+    fn settlePublication(self: *Owner) !void {
+        defer self.store.closeRelationPublicationProof(self.metadata_group_id);
+        for (0..512) |_| {
+            const work = try self.store.relationReconciliationWork(self.metadata_group_id);
+            var intent = try worker.coverageMigration(work, self.metadata_group_id, activation);
+            if (intent == null) if (work.current) |state| {
+                if (state.phase == .ready and state.failure == .none and work.epoch != null and state.epoch.eql(work.epoch.?)) {
+                    const generation = reconciliation.Generation.of(&state);
+                    if (work.root == null or !work.root.?.eql(generation)) {
+                        _ = self.store.requireRelationPublicationProof(state, @import("antfly_platform").time.monotonicNs()) catch |err| switch (err) {
+                            error.CatalogPublicationProofPending => {
+                                try self.store.io_impl.io().sleep(.fromMilliseconds(1), .awake);
+                                continue;
+                            },
+                            else => return err,
+                        };
+                        intent = .{ .publish = .{ .state = state, .prior = work.root, .activation = activation } };
+                    } else if (work.garbage == null) return;
+                }
+            };
+            if (intent == null) intent = try worker.nextIntent(work, self.metadata_group_id, true);
+            const command = intent orelse return error.TestCatalogPublicationNotReady;
+            const bytes = try command.encodeAlloc(self.alloc);
+            defer self.alloc.free(bytes);
+            _ = try self.apply(.{ .apply_relation_reconciliation = bytes });
+        }
+        return error.TestCatalogPublicationNotReady;
+    }
     fn run(raw: *anyopaque, a: A, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const self: *Owner = @ptrCast(@alignCast(raw));
         self.calls += 1;
+        try self.settlePublication();
         const result = switch (call) {
             .mutate => |mutation| try @import("../system_catalog/operations.zig").mutate(self, a, context, mutation),
             .resolve_many => |resolution| blk: {
@@ -488,9 +541,9 @@ fn execute(a: A, handler: *handler_mod.AntflyApiHandler, sql: []const u8, tag: ?
 
 fn parent(kind: domain.Kind) u64 {
     return switch (kind) {
-        .database, .tablespace, .query_source => 0,
-        .namespace => domain.default_database_id,
-        .table, .view => domain.default_namespace_id,
+        .database, .tablespace, .query_source, .role => 0,
+        .namespace, .cast => domain.default_database_id,
+        .table, .view, .sequence, .routine, .named_type => domain.default_namespace_id,
     };
 }
 
@@ -629,7 +682,7 @@ test "httpx SQL catalog originals commit through native authority and recover to
             defer a.free(root);
             var restored = try Owner.init(a, root);
             defer restored.deinit();
-            try std.testing.expect(try restored.store.snapshotBuilder().installSnapshot(a, owner.metadata_group_id, owner.next_index - 1, bytes));
+            try std.testing.expect(try restored.store.snapshotBuilder().installSnapshot(a, owner.metadata_group_id, owner.apply_index - 1, bytes));
             try verify(a, &restored, case, prior_id);
             if (case.kind == .table and case.present) {
                 const replica_root = try std.fmt.allocPrint(a, "{s}/data-owner", .{directory.path()});

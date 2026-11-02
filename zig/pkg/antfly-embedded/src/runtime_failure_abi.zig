@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 80;
+pub const abi_version: u32 = 82;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -864,6 +864,33 @@ pub const Status = enum(u32) {
     relation_population_page_too_large = 905,
     relation_population_changed = 906,
     materialized_view_read_only = 907,
+    maintenance_busy = 908,
+    invalid_sql_backend_response = 909,
+    invalid_sql_parameters = 910,
+    unknown_sql_column = 911,
+    duplicate_sql_column = 912,
+    unsupported_sql_execution = 913,
+    invalid_external_decision_owner = 914,
+    external_transaction_decision_required = 915,
+    external_transaction_decision_changed = 916,
+    external_transaction_role_required = 917,
+    external_transaction_commit_not_activated = 918,
+    external_transaction_admission_expired = 919,
+    invalid_prepared_transaction_id = 920,
+    invalid_prepared_transaction_phase = 921,
+    sql_prepared_transaction_already_exists = 922,
+    sql_prepared_transaction_not_found = 923,
+    sql_prepared_transaction_wrong_database = 924,
+    sql_prepared_transaction_capacity_exceeded = 925,
+    invalid_sequence_default_references = 926,
+    invalid_sequence_outcome = 927,
+    invalid_sequence_state = 928,
+    invalid_sequence_definition = 929,
+    sql_index_not_found = 930,
+    sql_constraint_not_found = 931,
+    catalog_generation_exhausted = 932,
+    sql_index_already_exists = 933,
+    sql_constraint_already_exists = 934,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

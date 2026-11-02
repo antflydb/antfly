@@ -405,13 +405,7 @@
             "enabled": true,
             "note": "keep-a",
             "metadata": {
-              "source": "api",
-              "billing": {
-                "plan": "pro"
-              },
-              "flags": [
-                "rated"
-              ]
+              "plan": "basic"
             }
           }
         },
@@ -425,11 +419,7 @@
             "enabled": false,
             "note": "keep-b",
             "metadata": {
-              "source": "internal",
-              "billing": {
-                "plan": "free"
-              },
-              "flags": []
+              "plan": "pro"
             }
           }
         },
@@ -443,8 +433,51 @@
             "enabled": false,
             "note": "keep-c",
             "metadata": {
-              "source": "manual",
-              "flags": []
+              "plan": "pro"
+            }
+          }
+        }
+      ],
+      "seeds": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "plan": "basic"
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "plan": "pro"
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "plan": "pro"
             }
           }
         }
@@ -493,54 +526,39 @@
         {
           "key": "doc:a",
           "value": {
-            "title": "Launch",
-            "status": "draft",
-            "category": "release",
-            "amount": 12,
-            "enabled": true,
-            "note": "keep-a",
-            "metadata": {
-              "source": "api",
-              "billing": {
-                "plan": "pro"
-              },
-              "flags": [
-                "rated"
-              ]
-            }
+            "title": "Launch"
           }
         },
         {
           "key": "doc:b",
           "value": {
-            "title": "Other",
-            "status": "ready",
-            "category": "other",
-            "amount": 20,
-            "enabled": false,
-            "note": "keep-b",
-            "metadata": {
-              "source": "internal",
-              "billing": {
-                "plan": "free"
-              },
-              "flags": []
-            }
+            "title": "Other"
           }
         },
         {
           "key": "doc:c",
           "value": {
-            "title": "Untouched",
-            "status": "closed",
-            "category": "other",
-            "amount": 4,
-            "enabled": false,
-            "note": "keep-c",
-            "metadata": {
-              "source": "manual",
-              "flags": []
-            }
+            "title": "Untouched"
+          }
+        }
+      ],
+      "seeds": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch"
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched"
           }
         }
       ]

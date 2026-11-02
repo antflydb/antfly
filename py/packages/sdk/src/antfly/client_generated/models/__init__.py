@@ -2279,12 +2279,17 @@ from .sql_connection_open_request import SQLConnectionOpenRequest
 from .sql_connection_response import SQLConnectionResponse
 from .sql_diagnostic import SQLDiagnostic
 from .sql_mutation_outcome import SQLMutationOutcome
+from .sql_named_domain_base import SQLNamedDomainBase
+from .sql_named_domain_base_kind import SQLNamedDomainBaseKind
+from .sql_named_domain_check import SQLNamedDomainCheck
+from .sql_named_domain_definition import SQLNamedDomainDefinition
 from .sql_named_enum_column_schema import SQLNamedEnumColumnSchema
 from .sql_named_enum_column_schema_type import SQLNamedEnumColumnSchemaType
 from .sql_named_enum_label import SQLNamedEnumLabel
 from .sql_named_type_identity import SQLNamedTypeIdentity
 from .sql_named_type_layout import SQLNamedTypeLayout
 from .sql_named_type_layout_kind import SQLNamedTypeLayoutKind
+from .sql_named_type_reference import SQLNamedTypeReference
 from .sql_notice import SQLNotice
 from .sql_numeric_modifier import SQLNumericModifier
 from .sql_parameter_descriptor import SQLParameterDescriptor
@@ -4557,12 +4562,17 @@ __all__ = (
     "SQLDDLReceiptState",
     "SQLDiagnostic",
     "SQLMutationOutcome",
+    "SQLNamedDomainBase",
+    "SQLNamedDomainBaseKind",
+    "SQLNamedDomainCheck",
+    "SQLNamedDomainDefinition",
     "SQLNamedEnumColumnSchema",
     "SQLNamedEnumColumnSchemaType",
     "SQLNamedEnumLabel",
     "SQLNamedTypeIdentity",
     "SQLNamedTypeLayout",
     "SQLNamedTypeLayoutKind",
+    "SQLNamedTypeReference",
     "SQLNotice",
     "SQLNumericModifier",
     "SQLParameterDescriptor",

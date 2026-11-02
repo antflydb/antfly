@@ -408,6 +408,7 @@ pub fn tableBackupFenceWithTopology(
             table.read_schema_json,
             table.indexes_json,
             table.replication_sources_json,
+            table.sql_native_indexes_json,
         ),
         .topology_range_count = topology.range_count,
         .topology_digest = topology.digest,
@@ -18761,4 +18762,47 @@ test "current Go attempt validation matches Unicode table-name trimming" {
         error.InvalidBackupRequest,
         parseCurrentGoClusterBackupAttempt(alloc, marker, "afba-space"),
     );
+}
+
+test "restore manifest preserves trusted coverage incarnation metadata for SQL native names" {
+    const a = std.testing.allocator;
+    const manifest: TableBackupManifest = .{
+        .format = .portable,
+        .backup_id = "daily",
+        .table_name = "docs",
+        .table_id = 17,
+        .description = "SQL native index",
+        .schema_json = "{}",
+        .read_schema_json = "",
+        .indexes_json = "{\"status_fts\":{\"type\":\"full_text\",\"field\":\"status\",\"_index_incarnation\":19}}",
+        .sql_native_indexes_json = "{\"version\":1,\"names\":[\"status_fts\"]}",
+        .replication_sources_json = "[]",
+        .shards = &.{},
+    };
+    var cloned = try @import("antfly_local_sources").api_local_backups.cloneTableBackupManifest(a, manifest);
+    defer cloned.deinit(a);
+    try std.testing.expectEqualStrings(manifest.sql_native_indexes_json, cloned.sql_native_indexes_json);
+    const restored = try deriveRestoreTableRecord(a, "docs_restored", "file:///backup", &cloned);
+    defer metadata_table_manager.freeTable(a, restored);
+    try std.testing.expectEqualStrings(manifest.sql_native_indexes_json, restored.sql_native_indexes_json);
+    try std.testing.expectEqualStrings(manifest.indexes_json, restored.indexes_json);
+    const encoded = try std.json.Stringify.valueAlloc(a, cloned, .{});
+    defer a.free(encoded);
+    var parsed = try std.json.parseFromSlice(TableBackupManifest, a, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(manifest.sql_native_indexes_json, parsed.value.sql_native_indexes_json);
+    const with_names = backup_contract.tableDefinitionDigest(17, "docs", "", "{}", "", manifest.indexes_json, "[]", manifest.sql_native_indexes_json);
+    const without_names = backup_contract.tableDefinitionDigest(17, "docs", "", "{}", "", manifest.indexes_json, "[]", "");
+    try std.testing.expect(!std.mem.eql(u8, &with_names, &without_names));
+    var invalid = manifest;
+    invalid.indexes_json = "{}";
+    try std.testing.expectError(error.InvalidCatalogRecord, createTableRequestFromManifest(a, &invalid));
+    const Probe = struct {
+        fn run(alloc: std.mem.Allocator, value: *const TableBackupManifest) !void {
+            var request = try createTableRequestFromManifest(alloc, value);
+            defer request.deinit(alloc);
+            try std.testing.expectEqualStrings(value.sql_native_indexes_json, request.sql_native_indexes_json.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{&manifest});
 }

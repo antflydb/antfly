@@ -80,8 +80,8 @@ pub fn validate(alloc: std.mem.Allocator, child_json: []const u8, parent_name: [
             const right = try columnType(parent_layout, parent_column);
             if (left.column_type != right.column_type) return error.ForeignKeyTypeMismatch;
             if (left.column_type == .enumeration) {
-                const child_type = native.namedType(child_layout, left.named_type_id orelse return error.ForeignKeyTypeMismatch) orelse return error.ForeignKeyTypeMismatch;
-                const parent_type = native.namedType(parent_layout, right.named_type_id orelse return error.ForeignKeyTypeMismatch) orelse return error.ForeignKeyTypeMismatch;
+                const child_type = native.namedEnumBaseRecord(child_layout, left.named_type_id orelse return error.ForeignKeyTypeMismatch) catch return error.ForeignKeyTypeMismatch;
+                const parent_type = native.namedEnumBaseRecord(parent_layout, right.named_type_id orelse return error.ForeignKeyTypeMismatch) catch return error.ForeignKeyTypeMismatch;
                 if (!child_type.sameValueDomain(parent_type.*)) return error.ForeignKeyTypeMismatch;
             }
         }

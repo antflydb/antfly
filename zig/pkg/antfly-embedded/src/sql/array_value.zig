@@ -673,7 +673,7 @@ pub fn validateElement(kind: ElementType, element: Element, budget: *Budget) !vo
 /// Only immediate callers receive it, after full validation succeeds.
 fn validateElementHash(kind: ElementType, element: Element, budget: *Budget) !?u64 {
     try budget.consume(1);
-    if (element.patterns() != null or element.array != null or element.temporal() != null or element.range() != null or element.enumeration() != null) return error.SqlTypeMismatch;
+    if (element.patterns() != null or element.array != null or element.temporal() != null or element.range() != null or element.enumeration() != null or element.bytes() != null) return error.SqlTypeMismatch;
     if (element.numeric != null and (kind != .numeric or element.sql_null or element.value != .null)) return error.SqlTypeMismatch;
     if (element.sql_null) {
         if (element.value != .null) return error.InvalidSqlArrayShape;

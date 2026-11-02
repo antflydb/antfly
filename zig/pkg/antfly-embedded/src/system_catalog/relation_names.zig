@@ -17,13 +17,14 @@
 //! This planner deliberately does not discover owners by scanning tables, nor
 //! does it commit independently of the caller's metadata write transaction.
 const std = @import("std");
+pub const native_indexes = @import("native_indexes.zig");
 const A = std.mem.Allocator;
 pub const constraint_naming = @import("constraint_names.zig");
 pub const max_claims = 8192;
-pub const max_name_bytes = 256;
+pub const max_name_bytes = native_indexes.max_name_bytes;
 const key_prefix = "\x00\x00__metadata_derived__:sql_relation_names:v1:";
 
-pub const Kind = enum(u8) { table = 1, index = 2, constraint_index = 3, constraint_name = 4 };
+pub const Kind = enum(u8) { table = 1, index = 2, constraint_index = 3, constraint_name = 4, sequence = 5 };
 pub const Phase = enum(u8) { reserved = 1, active = 2, retiring = 3 };
 pub const Owner = struct {
     table_id: u64,
@@ -359,7 +360,14 @@ pub const TableCut = struct {
         return self.membership_claims.?;
     }
 
+    pub const ExtraRelation = struct { name: []const u8, kind: Kind };
+    pub const NativeIndexes = union(enum) {
+        parsed: []const native_indexes.Binding,
+        encoded: struct { names: []const u8, configs: []const u8 },
+    };
     pub const Definition = struct {
+        native_indexes: NativeIndexes = .{ .parsed = &.{} },
+        extra_relations: []const ExtraRelation = &.{},
         namespace_id: u64,
         table_id: u64,
         name: []const u8,
@@ -491,6 +499,34 @@ pub const TableCut = struct {
                 owner.kind = .constraint_index;
                 try append(owned, &claims, definition.namespace_id, name, owner);
             }
+        }
+        var native: ?native_indexes.Bindings = null;
+        defer if (native) |*value| value.deinit();
+        const native_bindings = switch (definition.native_indexes) {
+            .parsed => |value| value,
+            .encoded => |value| blk: {
+                native = try native_indexes.read(a, value.names, value.configs);
+                break :blk native.?.entries;
+            },
+        };
+        if (native_bindings.len > native_indexes.max_names) return error.CatalogCommandTooLarge;
+        for (native_bindings) |binding| {
+            if (binding.incarnation == 0) return error.InvalidCatalogRecord;
+            if ((try names.getOrPut(scratch.allocator(), binding.name)).found_existing) return error.CatalogAlreadyExists;
+            names.getPtr(binding.name).?.* = true;
+            var native_owner = owner;
+            native_owner.kind = .index;
+            if (definition.phase == .active) native_owner.publication_id = native_indexes.identity(binding.incarnation);
+            try append(owned, &claims, definition.namespace_id, binding.name, native_owner);
+        }
+        if (definition.extra_relations.len > 256) return error.CatalogCommandTooLarge;
+        for (definition.extra_relations) |extra| {
+            if (definition.phase != .reserved or extra.kind != .sequence) return error.InvalidCatalogRecord;
+            const found = try names.getOrPut(scratch.allocator(), extra.name);
+            if (found.found_existing) return error.CatalogAlreadyExists;
+            found.value_ptr.* = true;
+            owner.kind = .sequence;
+            try append(owned, &claims, definition.namespace_id, extra.name, owner);
         }
         var memberships: std.ArrayList(ConstraintMembership) = .empty;
         if (with_memberships) {

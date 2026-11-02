@@ -52,6 +52,15 @@ pub fn newReceipt(a: A, scratch: A, request: types.OutcomeRequest, revision: u64
 }
 pub fn decodeOutcome(a: A, bytes: []const u8, request: types.OutcomeRequest, revision: u64) ?types.Outcome {
     const outcome = (std.json.parseFromSliceLeaky(?types.Outcome, a, bytes, .{}) catch return null) orelse return null;
+    if (outcome == .pending) {
+        outcome.pending.validate() catch return null;
+        if (outcome.pending.revision < revision or !outcome.pending.matchesIncarnation(request.incarnation)) return null;
+        switch (outcome.pending.work) {
+            .sequence_schema => return null,
+            .schema => if (request.operation != .alter or request.retirement != null) return null,
+            .restore => |lookup| if (request.operation != .drop or request.retirement == null or !std.meta.eql(lookup, request.retirement.?)) return null,
+        }
+    }
     if (outcome == .success) {
         const value = outcome.success;
         value.validate() catch return null;

@@ -35,6 +35,7 @@ pub const Column = struct {
     element_type: ?@import("array_value.zig").ElementType = null,
     numeric_modifier: ?scalar.NumericModifier = null,
     enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
+    domain_view: ?*const @import("../schema/domain_value.zig").View = null,
     nullable: bool,
     visible: bool = true,
     /// Original USING keys remain available to qualified names and stars.
@@ -354,6 +355,10 @@ pub const TargetResolveAdapter = struct {
     backend: catalog.Backend,
     table: catalog.Table,
     name: ast.Name,
+    /// Only statement-owned mutation images, after the parent DML checked
+    /// its exact privileges. This adapter cannot scan or mutate those images;
+    /// other source names still resolve through ordinary catalog authority.
+    prepared_images: bool = false,
     /// A mutation statement must bind every occurrence of a source against
     /// the same authorized catalog identity, including an optimized rebind.
     cache_sources: bool = false,
@@ -378,7 +383,15 @@ pub const TargetResolveAdapter = struct {
     }
     fn resolveRead(ptr: *anyopaque, alloc: Allocator, name: ast.Name) !catalog.ReadRelation {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (std.mem.eql(u8, name.table, self.name.table) and std.mem.eql(u8, name.database orelse "", self.name.database orelse "") and std.mem.eql(u8, name.namespace orelse "", self.name.namespace orelse "")) return .{ .table = self.table };
+        if (std.mem.eql(u8, name.table, self.name.table) and std.mem.eql(u8, name.database orelse "", self.name.database orelse "") and std.mem.eql(u8, name.namespace orelse "", self.name.namespace orelse "")) {
+            var target = self.table;
+            if (self.prepared_images) {
+                target.sql_access = null;
+                target.sql_native_rights = 0;
+                target.sql_required_privileges = 0;
+            }
+            return .{ .table = target };
+        }
         if (!self.cache_sources) return self.backend.resolveRead(alloc, name);
         const key = try std.fmt.allocPrint(alloc, "{s}\x00{s}\x00{s}", .{ name.database orelse "", name.namespace orelse "", name.table });
         if (self.source_tables.get(key)) |cached| {
@@ -658,7 +671,7 @@ const Builder = struct {
                 const present = for (shape.shape_columns.items) |known| {
                     if (std.mem.eql(u8, known.name, column.internal)) break true;
                 } else false;
-                if (!present) try shape.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable });
+                if (!present) try shape.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = column.nullable });
             };
             const source = try shape.querySource(statement, scope, depth + 1);
             self.identities = shape.identities;
@@ -867,6 +880,10 @@ const Builder = struct {
     fn mergeInferredType(current: *scalar.Type, inferred: scalar.Type, first: bool) !void {
         const modifier = if (first) inferred.numeric_modifier else if (scalar.NumericModifier.eql(current.numeric_modifier, inferred.numeric_modifier)) current.numeric_modifier else null;
         defer current.numeric_modifier = modifier;
+        // The initial empty accumulator is not an SQL unknown input. Actual
+        // unknown/base inputs unwrap domains, regardless of their order.
+        const domain = if (first) inferred.domain_binding else if (scalar.sameDomain(current.domainView(), inferred.domainView())) current.domain_binding else null;
+        defer current.domain_binding = domain;
         if (inferred.kind == null) return;
         if (current.kind == null) {
             current.* = inferred;
@@ -983,12 +1000,12 @@ const Builder = struct {
     }
     fn virtualTable(self: *Builder, columns: []const Column) !catalog.Table {
         const result = try self.alloc.alloc(catalog.Column, columns.len);
-        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .path = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
+        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .path = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = column.nullable };
         return .{ .id = 0, .physical_name = virtual_table_name, .schema_version = 0, .columns = result };
     }
     fn scalarColumns(self: *Builder, columns: []const Column) ![]const scalar.Column {
         const result = try self.alloc.alloc(scalar.Column, columns.len);
-        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
+        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = column.nullable };
         return result;
     }
     fn field(columns: []const Column, name: []const u8) !Column {
@@ -1286,7 +1303,7 @@ const Builder = struct {
     }
 
     fn valuesOrigin(self: *Builder, arms: []const *const Node, index: usize, common: scalar.Type) anyerror!*const ast.Scalar {
-        if (arms.len == 1) return self.scalarNode(.{ .cast = .{ .operand = arms[0].columns[index].origin orelse return error.InvalidSqlBackendResponse, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .enum_view = common.enum_view, .temporal_kind = common.temporal_kind } });
+        if (arms.len == 1) return self.scalarNode(.{ .cast = .{ .operand = arms[0].columns[index].origin orelse return error.InvalidSqlBackendResponse, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .enum_view = common.enum_view, .domain_view = scalar.domainViewOf(common), .temporal_kind = common.temporal_kind } });
         const middle = arms.len / 2;
         const arguments = try self.alloc.dupe(*const ast.Scalar, &.{ try self.valuesOrigin(arms[0..middle], index, common), try self.valuesOrigin(arms[middle..], index, common) });
         return self.scalarNode(.{ .call = .{ .name = "coalesce", .args = arguments } });
@@ -1435,6 +1452,7 @@ const Builder = struct {
                         .element_type = kind.element_type,
                         .numeric_modifier = kind.numeric_modifier,
                         .enum_view = kind.enum_view,
+                        .domain_view = scalar.domainViewOf(kind),
                         .temporal_kind = kind.temporal_kind,
                         .nullable = true,
                         .untyped_null = kind.kind == null,
@@ -1482,6 +1500,7 @@ const Builder = struct {
                     column.element_type = inferred.element_type;
                     column.numeric_modifier = inferred.numeric_modifier;
                     column.enum_view = inferred.enum_view;
+                    column.domain_view = scalar.domainViewOf(inferred);
                     column.temporal_kind = inferred.temporal_kind;
                     column.origin = try self.valuesOrigin(arms, index, inferred);
                     try self.constraints.append(self.alloc, .{ .expression = column.origin.? });
@@ -1501,12 +1520,13 @@ const Builder = struct {
                     try mergeSetType(&common, try self.setType(column.origin.?, self.shape_columns.items), true);
                     try mergeSetType(&common, try self.setType(other.origin.?, self.shape_columns.items), false);
                     common = resolveUnknown(common);
-                    const args = try self.alloc.dupe(*const ast.Scalar, &.{ try self.scalarNode(.{ .cast = .{ .operand = column.origin.?, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .enum_view = common.enum_view, .temporal_kind = common.temporal_kind } }), try self.scalarNode(.{ .cast = .{ .operand = other.origin.?, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .enum_view = common.enum_view, .temporal_kind = common.temporal_kind } }) });
+                    const args = try self.alloc.dupe(*const ast.Scalar, &.{ try self.scalarNode(.{ .cast = .{ .operand = column.origin.?, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .enum_view = common.enum_view, .domain_view = scalar.domainViewOf(common), .temporal_kind = common.temporal_kind } }), try self.scalarNode(.{ .cast = .{ .operand = other.origin.?, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .enum_view = common.enum_view, .domain_view = scalar.domainViewOf(common), .temporal_kind = common.temporal_kind } }) });
                     column.origin = try self.scalarNode(.{ .call = .{ .name = "coalesce", .args = args } });
                     column.type = common.kind.?;
                     column.element_type = common.element_type;
                     column.numeric_modifier = common.numeric_modifier;
                     column.enum_view = common.enum_view;
+                    column.domain_view = scalar.domainViewOf(common);
                     column.temporal_kind = common.temporal_kind;
                     try self.constraints.append(self.alloc, .{ .expression = column.origin.? });
                 } else {
@@ -1581,6 +1601,7 @@ const Builder = struct {
                     .element_type = output.element_type,
                     .numeric_modifier = output.numeric_modifier,
                     .enum_view = output.enum_view,
+                    .domain_view = scalar.domainViewOf(output),
                     .temporal_kind = output.temporal_kind,
                     .nullable = true,
                     .origin = if (resolve_unknown and (output.kind == null or (expression_.* == .literal and expression_.literal == .string))) try self.scalarNode(.{ .cast = .{ .operand = expression_, .type = .string } }) else expression_,
@@ -1593,8 +1614,8 @@ const Builder = struct {
             const column_types = try self.scalarColumns(child.columns);
             for (projections, entry.expressions, entry.types) |*projection, expression_, kind| if (kind.kind) |known| {
                 const actual = try scalar.inferOutputWithInvocation(self.alloc, expression_, column_types, self.parameters, self.backend.parameter_invocation);
-                if (actual.kind != known or actual.element_type != kind.element_type or !scalar.NumericModifier.eql(actual.numeric_modifier, kind.numeric_modifier))
-                    projection.expression = try self.scalarNode(.{ .cast = .{ .operand = projection.expression orelse try self.scalarNode(.{ .column = projection.field }), .type = known, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier, .enum_view = kind.enum_view, .temporal_kind = kind.temporal_kind } });
+                if (actual.kind != known or actual.element_type != kind.element_type or !scalar.NumericModifier.eql(actual.numeric_modifier, kind.numeric_modifier) or !scalar.sameDomain(actual.domainView(), kind.domainView()))
+                    projection.expression = try self.scalarNode(.{ .cast = .{ .operand = projection.expression orelse try self.scalarNode(.{ .column = projection.field }), .type = known, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier, .enum_view = kind.enum_view, .domain_view = scalar.domainViewOf(kind), .temporal_kind = kind.temporal_kind } });
             };
             lowered.columns = projections;
         };
@@ -1621,7 +1642,7 @@ const Builder = struct {
                     untyped = untyped or source_column.untyped_null;
                 };
             }
-            out.* = .{ .name = try self.alloc.dupe(u8, if (names.len == 0) column.name else names[index]), .internal = try self.internal(), .qualifier = alias, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = true, .untyped_null = !resolve_unknown and untyped };
+            out.* = .{ .name = try self.alloc.dupe(u8, if (names.len == 0) column.name else names[index]), .internal = try self.internal(), .qualifier = alias, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = true, .untyped_null = !resolve_unknown and untyped };
         }
         const constants = try self.alloc.alloc(Node.ConstantRef, lowered.invocation_constants.len);
         for (lowered.invocation_constants, constants) |name, *reference| {
@@ -1653,7 +1674,7 @@ const Builder = struct {
         if (prepared.expressions.len != columns.len) return error.SqlTypeMismatch;
         const inputs = try self.scalarColumns(prepared.source.columns);
         for (prepared.expressions, prepared.types, columns) |expression_, *target, column| {
-            const seed: scalar.Type = .{ .kind = column.type, .element_type = scalar.columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = true };
+            const seed: scalar.Type = .{ .kind = column.type, .element_type = scalar.columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_binding = scalar.domainBindingOf(column), .temporal_kind = column.temporal_kind, .nullable = true };
             var common = seed;
             mergeInferredType(&common, try self.setType(expression_, inputs), false) catch |err| switch (err) {
                 error.SqlCannotCoerce, error.SqlTypeMismatch => return error.SqlRecursiveTypeMismatch,
@@ -1761,7 +1782,7 @@ const Builder = struct {
                         column.outer_ordinal = null;
                         column.outer_dependencies = 0;
                         column.grouped_scope = null;
-                        if (self.shape_only) try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable });
+                        if (self.shape_only) try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = column.nullable });
                     }
                     break :blk try self.node(columns, .{ .prepared_rows = names });
                 }
@@ -1843,7 +1864,7 @@ const Builder = struct {
                     var result = try self.derived(view.query, reference.alias orelse reference.name.table, names, &.{}, depth + 1);
                     if (result.columns.len != view.columns.len) return error.InvalidSqlBackendResponse;
                     for (result.columns, view.columns) |actual, expected| {
-                        const column: catalog.Column = .{ .name = actual.name, .path = actual.name, .type = actual.type, .element_type = actual.element_type, .numeric_modifier = actual.numeric_modifier, .enum_view = actual.enum_view, .temporal_kind = actual.temporal_kind };
+                        const column: catalog.Column = .{ .name = actual.name, .path = actual.name, .type = actual.type, .element_type = actual.element_type, .numeric_modifier = actual.numeric_modifier, .enum_view = actual.enum_view, .domain_view = scalar.domainViewOf(actual), .temporal_kind = actual.temporal_kind };
                         if (!std.mem.eql(u8, &try column.identitySignature(self.alloc), &try expected.identitySignature(self.alloc))) return error.CatalogGenerationChanged;
                     }
                     // Authorization uses the complete view output before a
@@ -1911,7 +1932,7 @@ const Builder = struct {
                 const source_columns = try self.alloc.alloc([]const u8, columns.len);
                 const fields = try self.alloc.alloc([]const u8, table.columns.len);
                 for (table.columns, columns[0..table.columns.len], source_columns[0..table.columns.len], fields, 0..) |column, *out, *source_name, *field_name, position| {
-                    out.* = .{ .name = try self.alloc.dupe(u8, column.name), .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
+                    out.* = .{ .name = try self.alloc.dupe(u8, column.name), .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = column.nullable };
                     source_name.* = column.name;
                     field_name.* = column.path;
                     if (self.capture_dependencies) try self.dependency_origins.put(self.alloc, out.internal, .{ .table_id = table.id, .column = column, .ordinal = @intCast(position), .virtual = false });
@@ -1925,7 +1946,7 @@ const Builder = struct {
                     columns[table.columns.len + virtual_count + i] = .{ .name = name, .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = if (i == 2) .json else .string, .nullable = i == 2, .visible = false };
                     source_columns[table.columns.len + virtual_count + i] = name;
                 }
-                if (self.shape_only) for (columns) |column| try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable });
+                if (self.shape_only) for (columns) |column| try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = column.nullable });
                 if (reference.prepared_rows) {
                     if (reference.mutation_target or reference.mutation_document or reference.mutation_presence) return error.InvalidSqlBackendResponse;
                     break :blk try self.node(columns, .{ .prepared_rows = source_columns });
@@ -2080,7 +2101,7 @@ const Builder = struct {
         for (names, merged, columns[0..names.len], projections[0..names.len]) |name, expression_, *column, *projection| {
             const symbolic = if (self.shape_only) try self.inferenceExpression(expression_, source.columns) else expression_;
             const output = try scalar.inferOutputWithInvocation(self.alloc, symbolic, if (self.shape_only) self.shape_columns.items else types, self.parameters, self.backend.parameter_invocation);
-            column.* = .{ .name = name, .internal = try self.internal(), .qualifier = alias orelse "", .type = output.kind orelse .string, .element_type = output.element_type, .numeric_modifier = output.numeric_modifier, .enum_view = output.enum_view, .temporal_kind = output.temporal_kind, .nullable = true, .origin = if (self.shape_only) symbolic else null };
+            column.* = .{ .name = name, .internal = try self.internal(), .qualifier = alias orelse "", .type = output.kind orelse .string, .element_type = output.element_type, .numeric_modifier = output.numeric_modifier, .enum_view = output.enum_view, .domain_view = scalar.domainViewOf(output), .temporal_kind = output.temporal_kind, .nullable = true, .origin = if (self.shape_only) symbolic else null };
             projection.* = .{ .expression = expression_, .alias = column.internal };
         }
         for (source.columns, columns[names.len..], projections[names.len..]) |input, *column, *projection| {
@@ -2135,13 +2156,13 @@ const Builder = struct {
             // element type. Unlike UNION/VALUES, it does not promote int2[]
             // to int8[] or float[] merely because their cells are numeric.
             if (common.kind == .array and right_column.type == .array and !right_column.untyped_null and common.element_type != right_column.element_type) return error.SqlUndefinedOperator;
-            mergeInferredType(&common, if (right_column.untyped_null) .{} else .{ .kind = right_column.type, .element_type = right_column.element_type, .numeric_modifier = right_column.numeric_modifier, .enum_view = right_column.enum_view, .temporal_kind = right_column.temporal_kind, .nullable = right_column.nullable }, false) catch |err| return switch (err) {
+            mergeInferredType(&common, if (right_column.untyped_null) .{} else .{ .kind = right_column.type, .element_type = right_column.element_type, .numeric_modifier = right_column.numeric_modifier, .enum_view = right_column.enum_view, .domain_binding = scalar.domainBindingOf(right_column), .temporal_kind = right_column.temporal_kind, .nullable = right_column.nullable }, false) catch |err| return switch (err) {
                 error.SqlTypeMismatch, error.SqlCannotCoerce => error.SqlUndefinedOperator,
                 else => err,
             };
             common = resolveUnknown(common);
-            const l = try self.scalarNode(.{ .cast = .{ .operand = left_expression, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .enum_view = common.enum_view, .temporal_kind = common.temporal_kind } });
-            const r = try self.scalarNode(.{ .cast = .{ .operand = right_expression, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .enum_view = common.enum_view, .temporal_kind = common.temporal_kind } });
+            const l = try self.scalarNode(.{ .cast = .{ .operand = left_expression, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .enum_view = common.enum_view, .domain_view = scalar.domainViewOf(common), .temporal_kind = common.temporal_kind } });
+            const r = try self.scalarNode(.{ .cast = .{ .operand = right_expression, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .enum_view = common.enum_view, .domain_view = scalar.domainViewOf(common), .temporal_kind = common.temporal_kind } });
             left_programs[index] = try scalar.bindWithSettings(self.alloc, l, left_types, self.parameters, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view);
             right_programs[index] = try scalar.bindWithSettings(self.alloc, r, right_types, self.parameters, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view);
         }
@@ -2659,7 +2680,7 @@ pub fn normalizeTargetProjection(alloc: Allocator, backend: catalog.Backend, tab
     var builder: Builder = .{ .alloc = alloc, .backend = backend, .parameters = &.{} };
     const virtual_columns = table.virtualColumns();
     const columns = try alloc.alloc(Column, table.columns.len + virtual_columns.len);
-    for (table.columns, columns[0..table.columns.len]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
+    for (table.columns, columns[0..table.columns.len]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = column.nullable };
     for (virtual_columns, columns[table.columns.len..]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .element_type = column.element_type, .nullable = column.nullable, .visible = false };
     const source: Node = .{ .columns = columns, .operation = .singleton };
     return (try builder.lower(&source, .{ .table = name, .columns = projections })).columns;

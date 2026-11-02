@@ -239,33 +239,37 @@ test "SQL named enum native sparse epochs and projected tuple loop avoid per-row
     for (&columns, 0..) |*column, ordinal| column.* = .{ .name = try std.fmt.allocPrint(a, "c{d}", .{ordinal}), .path = "unused", .column_type = .enumeration, .named_type_id = 7, .allows_null = true };
     defer for (&columns) |column| a.free(column.name);
     for (&columns) |*column| column.path = column.name;
-    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .relational_columns = &columns, .named_types = &.{record} };
-    var layout = try codec.PhysicalLayout.init(a, table);
-    defer layout.deinit();
-    try std.testing.expectEqual(@as(usize, 1), layout.enum_views.len);
-    const bytes = try encode(a, table, "{\"c63\":\"a\"}");
-    defer a.free(bytes);
-    const view = try codec.ordinalRowView(bytes, table, &layout);
-    var iterator = try codec.canonicalOrdinalCellIteratorWithLayout(bytes, table, &layout);
-    try std.testing.expect(iterator.isSparse());
-    try std.testing.expectEqual(@as(usize, 1), iterator.presentCount());
-    var plan = try keys.TuplePlan.init(a, table, &layout, &.{.{ .column = "c63" }});
-    defer plan.deinit();
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(a);
-    try out.ensureTotalCapacity(a, 128);
-    var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
-    var total: u64 = 0;
-    for (0..100_000) |_| {
-        const cell = (try view.findCell(63)).?;
-        total += @intCast(cell.value.i64_val);
-        out.clearRetainingCapacity();
-        _ = try plan.append(denied.allocator(), &out, view);
+    const domain: types.Record = .{ .identity = try types.Identity.init(9, 2, 1, @splat(4)), .owner = .auth_disabled, .definition = .{ .domain = .{ .base = .{ .named = .{ .id = record.identity.id, .origin_id = record.identity.origin_id, .generation = record.identity.generation } } } } };
+    for ([_]bool{ false, true }) |as_domain| {
+        for (&columns) |*column| column.named_type_id = if (as_domain) 9 else 7;
+        const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .relational_columns = &columns, .named_types = if (as_domain) &.{ record, domain } else &.{record} };
+        var layout = try codec.PhysicalLayout.init(a, table);
+        defer layout.deinit();
+        try std.testing.expectEqual(@as(usize, 1), layout.enum_views.len);
+        const bytes = try encode(a, table, "{\"c63\":\"a\"}");
+        defer a.free(bytes);
+        const view = try codec.ordinalRowView(bytes, table, &layout);
+        var iterator = try codec.canonicalOrdinalCellIteratorWithLayout(bytes, table, &layout);
+        try std.testing.expect(iterator.isSparse());
+        try std.testing.expectEqual(@as(usize, 1), iterator.presentCount());
+        var plan = try keys.TuplePlan.init(a, table, &layout, &.{.{ .column = "c63" }});
+        defer plan.deinit();
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(a);
+        try out.ensureTotalCapacity(a, 128);
+        var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        var total: u64 = 0;
+        for (0..100_000) |_| {
+            const cell = (try view.findCell(63)).?;
+            total += @intCast(cell.value.i64_val);
+            out.clearRetainingCapacity();
+            _ = try plan.append(denied.allocator(), &out, view);
+        }
+        try std.testing.expectEqual(@as(u64, 200_000), total);
+        try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
+        std.debug.print("SQL enum native sparse projection: domain={} rows=100000 columns=64 row_bytes={} elapsed_ns={} allocations={} value_slot_bytes={}\n", .{ as_domain, bytes.len, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started, denied.alloc_index, @sizeOf(@import("../../sql/row_value.zig").Value) });
     }
-    try std.testing.expectEqual(@as(u64, 200_000), total);
-    try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
-    std.debug.print("SQL enum native sparse projection: rows=100000 columns=64 row_bytes={} elapsed_ns={} allocations={} value_slot_bytes={}\n", .{ bytes.len, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started, denied.alloc_index, @sizeOf(@import("../../sql/row_value.zig").Value) });
 }
 
 test "SQL named enum covering indexes retain only referenced definitions and fence type identity" {
@@ -335,7 +339,7 @@ test "SQL named enum schema pins retain atom directories after producer and init
     try std.testing.expectEqual(atom, try view.decode(&encoded));
     try std.testing.expectEqualStrings("a", try view.output(atom));
     try std.testing.expectEqual(@as(u32, 39), pinned.readerRequirements().semantic_version);
-    try std.testing.expectEqual(@as(u32, 39), pinned.readerRequirements().encoding_version);
+    try std.testing.expectEqual(schema.storage_format_version, pinned.readerRequirements().encoding_version);
 }
 
 test "SQL named enum FK planners retain exact domains across column names and additive epochs" {
@@ -495,4 +499,130 @@ test "SQL named enum text projection excludes row registries and remains stable 
     const after = try schema.serializeTextProjectionSchema(a, evolved);
     defer a.free(after);
     try std.testing.expectEqualSlices(u8, projected, after);
+}
+
+test "SQL domain physical layouts preserve base bytes and retain only ancestor enum directories" {
+    const a = std.testing.allocator;
+    const domain: types.Record = .{ .identity = try types.Identity.init(7, 2, 1, @splat(3)), .owner = .auth_disabled, .definition = .{ .domain = .{ .base = .{ .builtin = .text } } } };
+    const column: schema.RelationalColumn = .{ .name = "state", .path = "state", .column_type = .string, .sql_element_type = .text, .named_type_id = 7, .allows_null = true };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .relational_columns = &.{column}, .named_types = &.{domain} };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    try std.testing.expectEqual(@as(usize, 0), layout.enum_views.len);
+    const cells = [_]codec.Cell{.{ .ordinal = 0, .path = "state", .value_type = .bytes_val, .value = .{ .bytes_val = "queued" } }};
+    const bytes = try codec.serializePreparedOrdinalWithLayout(a, 1, table.relational_columns, &cells, @splat(0), &layout);
+    defer a.free(bytes);
+    var plain_column = column;
+    plain_column.named_type_id = null;
+    const plain_table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{plain_column} };
+    var plain_layout = try codec.PhysicalLayout.init(a, plain_table);
+    defer plain_layout.deinit();
+    const plain_bytes = try codec.serializePreparedOrdinalWithLayout(a, 1, plain_table.relational_columns, &cells, @splat(0), &plain_layout);
+    defer a.free(plain_bytes);
+    try std.testing.expectEqualSlices(u8, plain_bytes, bytes);
+
+    var labels = try types.Owned.create(a, &.{ "queued", "done" });
+    defer labels.deinit();
+    const enumeration: types.Record = .{ .identity = try types.Identity.init(9, 2, 1, @splat(4)), .owner = .auth_disabled, .definition = labels.definition };
+    var enum_domain = domain;
+    enum_domain.definition.domain.base = .{ .named = .{ .id = 9, .origin_id = enumeration.identity.origin_id, .generation = 1 } };
+    const enum_column: schema.RelationalColumn = .{ .name = "state", .path = "state", .column_type = .enumeration, .named_type_id = 7, .allows_null = true };
+    const enum_table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .relational_columns = &.{enum_column}, .named_types = &.{ enum_domain, enumeration } };
+    var enum_layout = try codec.PhysicalLayout.init(a, enum_table);
+    defer enum_layout.deinit();
+    try std.testing.expectEqual(@as(usize, 1), enum_layout.enum_views.len);
+    try std.testing.expectEqual(@as(u64, 9), enum_layout.enumView(0).?.record.identity.id);
+    var wrong_leaf = enum_column;
+    wrong_leaf.named_type_id = enumeration.identity.id;
+    try std.testing.expectError(error.InvalidRelationalRow, enum_layout.enumRecordForColumn(wrong_leaf, 0));
+    for ([_]bool{ false, true }) |is_null| {
+        const enum_cells = [_]codec.Cell{.{ .ordinal = 0, .path = "state", .value_type = .i64_val, .is_null = is_null, .value = .{ .i64_val = if (is_null) 0 else 1 }, .enum_record = &enum_layout.enumView(0).?.record }};
+        const encoded = try codec.serializePreparedOrdinalWithLayout(a, 1, enum_table.relational_columns, &enum_cells, @splat(0), &enum_layout);
+        defer a.free(encoded);
+        for ([_]bool{ false, true }) |cached| {
+            const text = if (cached) try codec.reconstructOrdinalValueWithLayoutAlloc(a, encoded, enum_table, &enum_layout) else try codec.reconstructOrdinalValueAlloc(a, encoded, enum_table);
+            defer a.free(text);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+            defer parsed.deinit();
+            const state = parsed.value.object.get("state").?;
+            if (is_null) try std.testing.expect(state == .null) else try std.testing.expectEqualStrings("queued", state.string);
+        }
+        var forged_record = enumeration;
+        forged_record.identity.origin_id = @splat(6);
+        var forged_cells = enum_cells;
+        forged_cells[0].enum_record = &forged_record;
+        try std.testing.expectError(error.InvalidRelationalRow, codec.serializePreparedOrdinalWithLayout(a, 1, enum_table.relational_columns, &forged_cells, @splat(0), &enum_layout));
+    }
+    const projected = try @import("relational_index_cover.zig").Plan.init(a, enum_table, &enum_layout, &.{}, &.{"state"});
+    var covering = projected;
+    defer covering.deinit();
+    try std.testing.expectEqual(@as(usize, 2), covering.named_types.len);
+    try std.testing.expectEqual(@as(u64, 9), covering.layout.enumView(0).?.record.identity.id);
+    var rebound = enum_domain;
+    rebound.definition.domain.base.named.origin_id = @splat(6);
+    var wrong = enum_table;
+    wrong.named_types = &.{ rebound, enumeration };
+    try std.testing.expectError(error.InvalidSchema, codec.PhysicalLayout.init(a, wrong));
+}
+
+test "SQL domain native schema epochs fence readers retain cold DAGs and bind owned SQL columns" {
+    const a = std.testing.allocator;
+    const records = [_]types.Record{
+        .{ .identity = try types.Identity.init(7, 2, 1, @splat(3)), .owner = .auth_disabled, .definition = .{ .domain = .{ .base = .{ .builtin = .text }, .not_null = true, .checks = &.{.{ .name = "unblocked", .expression =
+        \\{"op":"ne","args":[{"op":"column","column":"value"},{"op":"literal","type":"string","value":"blocked"}]}
+        }} } } },
+        .{ .identity = try types.Identity.init(9, 2, 1, @splat(4)), .owner = .auth_disabled, .definition = .{ .domain = .{ .base = .{ .named = .{ .id = 7, .origin_id = @splat(3), .generation = 1 } } } } },
+    };
+    const columns = [_]schema.RelationalColumn{.{ .name = "state", .path = "state", .column_type = .string, .sql_element_type = .text, .named_type_id = 9, .allows_null = true }};
+    const table: schema.TableSchema = .{ .version = 4, .storage_mode = .relational, .requires_public_schema = true, .relational_columns = &columns, .named_types = &records };
+    const bytes = try schema.serializeSchema(a, table);
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(u32, 41), schema.requiredReaderVersion(table));
+    try std.testing.expect(!(schema.ReaderCapabilities{ .semantic_ceiling = 40, .encoding_ceiling = 40 }).supports(schema.readerRequirementsForSchema(table)));
+    // Domain semantics remain at 41, while newly serialized schemas use the
+    // current envelope even when they do not contain newer expressions.
+    try std.testing.expect((schema.ReaderCapabilities{ .semantic_ceiling = 41, .encoding_ceiling = schema.storage_format_version }).supports(schema.readerRequirementsForSchema(table)));
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const bound = build: {
+        const decoded = try schema.deserializeSchema(a, bytes);
+        defer schema.freeSchema(a, decoded);
+        const canonical = try schema.serializeSchema(a, decoded);
+        defer a.free(canonical);
+        try std.testing.expectEqualSlices(u8, bytes, canonical);
+        break :build try @import("../../sql/catalog.zig").relationalColumnsLeaky(region.allocator(), decoded);
+    };
+    try std.testing.expectEqual(@as(u64, 9), bound[0].domain_view.?.identity.?.id);
+    try std.testing.expectEqual(@as(u64, 7), bound[0].domain_view.?.parent.?.identity.?.id);
+    try std.testing.expect(bound[0].enum_view == null);
+    try std.testing.expectEqualStrings("state", bound[0].name);
+    var budget: usize = 1024 * 1024;
+    var execution = @import("../../schema/relational_expression.zig").Execution.init(region.allocator(), &budget);
+    try std.testing.expect((try bound[0].domain_view.?.validate(&execution, .null, .assignment)) != null);
+    var changed = records;
+    changed[1].definition.domain.base.named.generation += 1;
+    var wrong = table;
+    wrong.named_types = &changed;
+    try std.testing.expectError(error.InvalidSchema, schema.serializeSchema(a, wrong));
+    var wrong_columns = columns;
+    wrong_columns[0].sql_element_type = .int32;
+    wrong = table;
+    wrong.relational_columns = &wrong_columns;
+    try std.testing.expectError(error.InvalidSchema, schema.serializeSchema(a, wrong));
+    // A v40 envelope has no v42 string-length feature byte. Preserve its
+    // actual framing so this probes forbidden domain records, not misalignment.
+    const disguised = try a.alloc(u8, bytes.len - 1);
+    defer a.free(disguised);
+    var registry_bytes: usize = 4;
+    for (records) |record| {
+        const encoded = try record.encode(a);
+        defer a.free(encoded);
+        registry_bytes += 4 + encoded.len;
+    }
+    const flag_offset = bytes.len - registry_bytes - 1;
+    try std.testing.expectEqual(@as(u8, 0), bytes[flag_offset]);
+    @memcpy(disguised[0..flag_offset], bytes[0..flag_offset]);
+    @memcpy(disguised[flag_offset..], bytes[flag_offset + 1 ..]);
+    std.mem.writeInt(u32, disguised[4..8], 40, .little);
+    try std.testing.expectError(error.UnsupportedVersion, schema.deserializeSchema(a, disguised));
 }

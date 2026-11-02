@@ -202,6 +202,8 @@ pub const VTable = struct {
     restoreRuntimeRepairNeededForPathWithIo: *const fn (alloc: std.mem.Allocator, io: native.IoBorrow, path: []const u8) Outcome(bool),
     beginTransaction: *const fn (self: *DB, timestamp_ns: u64) Outcome(@import("transactions.zig").TxnId),
     beginTransactionWithParticipants: *const fn (self: *DB, timestamp_ns: u64, participants: []const []const u8) Outcome(@import("transactions.zig").TxnId),
+    beginExternalTransaction: *const fn (self: *DB, request: types.ExternalTransactionBegin) Outcome(@import("transactions.zig").TxnId),
+    resolveExternalTransaction: *const fn (self: *DB, request: types.ExternalTransactionResolution) Outcome(void),
     writeReplicatedTransactionAtOrderedReceipt: *const fn (self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: db.OrderedApplyReceipt) Outcome(void),
     getTransactionStatus: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId) Outcome(@import("transactions.zig").TxnStatus),
     transactionDefersCoordinatorAcknowledgement: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId) Outcome(bool),
@@ -358,6 +360,7 @@ pub const VTable = struct {
     relationalSessionRangeProofs: *const fn (session: *@import("db/relational_read_session.zig").Session, alloc: Allocator) Outcome([]@import("range_protection.zig").Proof),
     relationalSessionNextTypedPage: *const fn (session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) Outcome(@import("db/relational_rows.zig").Page),
     relationalSessionNormalizeRows: *const fn (session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, writes: []const types.BatchWrite) Outcome([]types.BatchWrite),
+    relationalSessionNormalizeDomainRows: *const fn (session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, writes: []const types.BatchWrite, admissions: []const ?@import("../schema/domain_row.zig").Admission, contract: *@import("../schema/domain_handoff.zig").Contract) Outcome([]types.BatchWrite),
     documentSessionDeinit: *const fn (self: *@import("db/document_rows.zig").Session) Outcome(void),
     documentSessionRangeProofs: *const fn (self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator) Outcome([]@import("range_protection.zig").Proof),
     documentSessionNormalizeRows: *const fn (self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite) Outcome([]types.BatchWrite),
@@ -536,7 +539,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 39,
+    version: u32 = 40,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -678,7 +681,7 @@ pub fn descriptorForValidation() *const Descriptor {
     return antfly_storage_engine_get_descriptor_v37();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 39 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 40 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or

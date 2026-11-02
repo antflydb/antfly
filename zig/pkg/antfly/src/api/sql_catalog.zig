@@ -313,6 +313,44 @@ fn captureTableNameMutation(server: *server_mod.ApiHttpServer, identity: ?server
     return null;
 }
 
+fn commentIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, path: ?*const SearchPath) !catalog.DdlOutcome {
+    if (ddl.action != .comment or ddl.conditional or ddl.cascade or ddl.comment_column != null) return error.InvalidSqlSyntax;
+    const key = ddl.comment_object orelse return error.InvalidSqlSyntax;
+    if (key.kind != .index or !std.mem.eql(u8, key.name, ddl.name.table)) return error.InvalidSqlSyntax;
+    if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
+    var arena = std.heap.ArenaAllocator.init(allocators.scratch);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const use_path = ddl.name.namespace == null and ddl.name.database == null and path != null;
+    const count = if (use_path) path.?.len else 1;
+    if (count > SearchPath.max_namespaces) return error.InvalidParameter;
+    if (count == 0) return error.TableNotFound;
+    var candidates: [SearchPath.max_namespaces]domain.RelationTarget = undefined;
+    for (0..count) |i| candidates[i] = .{ .database = ddl.name.database orelse database, .namespace = if (use_path) path.?.entries[i].slice() else ddl.name.namespace orelse namespace, .name = ddl.name.table };
+    const lookup: domain.ResolveMany = .{ .relations = candidates[0..count] };
+    const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = lookup });
+    const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{ .allocate = .alloc_always });
+    try resolved.validateRelations(lookup);
+    for (resolved.relations, lookup.relations) |entry, target| {
+        const owner = entry orelse continue;
+        // Constraint-only names do not occupy PostgreSQL's relation namespace.
+        if (owner.owner.kind == .constraint_name) continue;
+        try authorizeTable(identity, a, .{ .database = target.database, .namespace = target.namespace, .table = owner.logical_table });
+        if (owner.owner.kind != .index and owner.owner.kind != .constraint_index) return error.SqlWrongObjectType;
+        var private = context;
+        private.setting_admin = true;
+        const reply = server.source.systemCatalog(a, private, .{ .relation_description_mutate = .{
+            .guard = .{ .target = target, .logical_table = owner.logical_table, .owner = owner.owner, .incarnation = resolved.relation_epoch.?.incarnation },
+            .object = key,
+            .description = ddl.comment_value orelse "",
+        } }) catch |err| return if (err == error.MetadataMutationOutcomeUnknown) error.SqlMutationOutcomeUnknown else err;
+        const receipt = std.json.parseFromSliceLeaky(@import("../system_catalog/server_call.zig").RelationReplacementResult, a, reply, .{}) catch return error.SqlMutationOutcomeUnknown;
+        if (receipt.schema_version != owner.owner.schema_version) return error.SqlMutationOutcomeUnknown;
+        return .{ .mutation_outcome = .committed };
+    }
+    return error.TableNotFound;
+}
+
 fn commentResource(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, allocators: catalog.DdlAllocators, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl) !catalog.DdlOutcome {
     if ((ddl.kind != .database and ddl.kind != .namespace) or ddl.action != .comment or ddl.conditional or ddl.cascade or ddl.comment_column != null or
         ddl.name.database != null or ddl.name.namespace != null) return error.InvalidSqlSyntax;
@@ -359,7 +397,7 @@ fn commentTable(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authent
     const captured = (try captureTableAdmission(server, identity, context, a, target, ddl.name.database != null or ddl.name.namespace != null, path)) orelse return error.TableNotFound;
     var private = context;
     private.setting_admin = true;
-    const response = server.source.systemCatalog(a, private, .{ .relation_description_mutate = .{ .guard = captured.guard, .description = ddl.comment_value orelse "", .column = ddl.comment_column } }) catch |err| {
+    const response = server.source.systemCatalog(a, private, .{ .relation_description_mutate = .{ .guard = captured.guard, .description = ddl.comment_value orelse "", .column = ddl.comment_column, .object = ddl.comment_object } }) catch |err| {
         if (err == error.MetadataMutationOutcomeUnknown) return error.SqlMutationOutcomeUnknown;
         if (err == error.CatalogCommandTooLarge) return error.ProgramLimitExceeded;
         return err;
@@ -414,6 +452,21 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const declared_check_validation = validatesDeferredConstraint(schema, ddl, "checks");
     const declared_foreign_validation = validatesDeferredConstraint(schema, ddl, "foreign_keys");
     var guard = captured.guard;
+    var pending_object_renames: []const domain.object_annotations.Rename = &.{};
+    if (ddl.schema_change) |change| if (change == .rename_constraint) {
+        const rename = change.rename_constraint;
+        var intents: [2]domain.object_annotations.Rename = undefined;
+        intents[0] = .{ .kind = .constraint, .from = rename.name, .to = rename.new_name };
+        var count: usize = 1;
+        if (schema.object.get("unique_constraints")) |rules| for (rules.array.items) |rule| {
+            if (std.mem.eql(u8, rule.object.get("name").?.string, rename.name)) {
+                intents[1] = .{ .kind = .index, .from = rename.name, .to = rename.new_name };
+                count = 2;
+                break;
+            }
+        };
+        pending_object_renames = try a.dupe(domain.object_annotations.Rename, intents[0..count]);
+    };
     // FK validation owns its successor schema and transaction coverage. The
     // generic schema mutator deliberately rejects validity-only publication.
     if (declared_foreign_validation)
@@ -446,10 +499,12 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     }
     _ = schema.object.swapRemove("version");
     const proposed = try std.json.Stringify.valueAlloc(a, schema, .{});
-    const updated = try server.bindForeignKeySchema(a, target, table.name, proposed, definition.schema_json, identity, context);
+    const updated = try server.bindForeignKeySchemaWithObjectRenames(a, target, table.name, proposed, definition.schema_json, identity, context, pending_object_renames);
+    guard.object_renames = pending_object_renames;
+    try guard.validate();
     try context.ensureActive();
     if (column_transform) |transform|
-        return rewriteSchemaWithPolicies(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, .{ .dropped_columns = if (ddl.schema_change.? == .rename_column) .allow else .reject, .expression_schema = definition.schema_json, .column_transforms = &.{transform} }, null);
+        return rewriteSchemaWithPolicies(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, .{ .dropped_columns = if (ddl.schema_change.? == .rename_column) .allow else .reject, .expression_schema = definition.schema_json, .column_transforms = &.{transform}, .attribute_renames = if (ddl.schema_change.? == .rename_column) &.{.{ .from = ddl.schema_change.?.rename_column.name, .to = ddl.schema_change.?.rename_column.new_name }} else &.{} }, null);
     if (declared_check_validation)
         return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}, null);
     if (!try tables.foreignKeyDefinitionsUnchanged(a, definition.schema_json, updated)) {
@@ -470,7 +525,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         }
         const publication_id = try alloc.alloc(u8, 32);
         errdefer alloc.free(publication_id);
-        const publication = server.beginFkGenerationPublicationWithConstraintNameGuard(alloc, context, identity, before.*, updated, if (guard.constraint_name_admission != null) guard else null) catch |err| switch (err) {
+        const publication = server.beginFkGenerationPublicationWithConstraintNameGuard(alloc, context, identity, before.*, updated, if (guard.hasDefinitionIntent()) guard else null) catch |err| switch (err) {
             error.MetadataMutationOutcomeUnknown => return error.SqlMutationOutcomeUnknown,
             else => return err,
         };
@@ -501,6 +556,11 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}, if (guard.constraint_name_admission != null) guard else null),
         else => {},
     };
+    if (pending_object_renames.len == 2) {
+        var read_guard = guard;
+        read_guard.object_renames = &.{};
+        return beginSchemaValidation(server, context, allocators, target, read_guard, .{ .object_rename = pending_object_renames });
+    }
     const retirement = try requiresRetirement(a, definition.schema_json, schema);
     const validation = ddl.schema_change.? == .validate_constraint;
     const activation_required = if (ddl.schema_change) |change| switch (change) {
@@ -818,13 +878,51 @@ test "SQL catalog schema exhaustion is definite nonadmission for replacement and
     }
 }
 
+fn executeNativeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, allocators: catalog.DdlAllocators, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, guard: domain.RelationMutationGuard) !catalog.DdlOutcome {
+    if (!@import("antfly_local_sources").api_index_metadata.isValidIndexName(ddl.name.table)) return error.InvalidCatalogName;
+    const indexes = @import("../system_catalog/native_indexes.zig");
+    const recovery = @import("sql_native_index_recovery.zig");
+    var region: std.heap.ArenaAllocator = .init(allocators.scratch);
+    defer region.deinit();
+    const a = region.allocator();
+    var private = context;
+    private.setting_admin = true;
+    const prepared = try std.json.parseFromSliceLeaky(indexes.Prepared, a, try server.source.systemCatalog(a, private, .{ .sql_native_index_prepare = .{ .guard = guard } }), .{});
+    const io = server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
+    var config_json: ?[]const u8 = null;
+    if (ddl.native_index) |intent| {
+        var analyzers: std.json.ObjectMap = .empty;
+        try analyzers.put(a, intent.field, .{ .string = intent.analyzer });
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .type = "full_text", .field = intent.field, .analysis_config = .{ .field_analyzers = std.json.Value{ .object = analyzers } } }, .{});
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+        config_json = try @import("antfly_local_sources").api_coverage_policy.withFreshIncarnationAllocWithIo(a, io, value);
+    }
+    var nonce: [16]u8 = undefined;
+    try io.randomSecure(&nonce);
+    const request: indexes.Mutation = .{ .admission = .{ .nonce = nonce, .head = prepared.head }, .guard = guard, .name = ddl.name.table, .config_json = config_json };
+    const observation = try indexes.observation(a, request);
+    var receipt = try recovery.newReceipt(allocators.result, a, observation, prepared.revision);
+    errdefer receipt.deinit(allocators.result);
+    try context.ensureActive();
+    const bytes = server.source.systemCatalog(a, private, .{ .sql_native_index_mutate = request }) catch null;
+    var outcome = if (bytes) |value| recovery.decodeOutcome(a, value, observation, prepared.revision) else null;
+    if (outcome == null) outcome = recovery.observe(server, identity, context, a, observation, prepared.revision);
+    if (outcome) |known| {
+        _ = try known.result();
+        @import("sql_catalog_recovery.zig").complete(&receipt, known);
+        return .{ .catalog_receipt = receipt };
+    }
+    return .{ .mutation_outcome = null, .catalog_receipt = receipt };
+}
+
 fn executeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, path: ?*const SearchPath) !catalog.DdlOutcome {
+
     // The private UNIQUE publication protocol drains predecessor writers.
     // Nonunique indexes instead use the normal online generation: writes
     // maintain it from installation while bounded backfill catches history.
     // Never advertise the fenced UNIQUE protocol as CONCURRENTLY.
     if (ddl.cascade or ddl.index_targets.len > 1 or
-        (ddl.concurrently and ddl.action == .create and ddl.schema_change.?.create_index.unique)) return error.UnsupportedSqlShape;
+        (ddl.concurrently and ddl.action == .create and ddl.native_index == null and ddl.schema_change.?.create_index.unique)) return error.UnsupportedSqlShape;
     if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
     var arena = std.heap.ArenaAllocator.init(allocators.scratch);
     defer arena.deinit();
@@ -882,6 +980,9 @@ fn executeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authent
         .constraint_name => return error.InvalidCatalogRecord,
         else => return error.SqlWrongObjectType,
     }
+    const guard: domain.RelationMutationGuard = .{ .target = owner_target, .logical_table = owner.logical_table, .owner = owner.owner, .incarnation = resolved.relation_epoch.?.incarnation };
+    if (ddl.native_index != null or @import("../system_catalog/native_indexes.zig").names.isNativeIdentity(owner.owner.publication_id))
+        return executeNativeIndex(server, identity, context, allocators, ddl, guard);
     var transition = ddl;
     transition.kind = .table;
     transition.action = .alter_schema;
@@ -942,20 +1043,28 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     if (input == .populate) return @import("sql_population.zig").execute(server, identity, context, database, namespace, allocators, input.populate, path);
     const alloc = allocators.result;
     try context.ensureActive();
-    if (input == .catalog_ddl and (input.catalog_ddl.kind == .function or input.catalog_ddl.kind == .procedure or input.catalog_ddl.kind == .operator or input.catalog_ddl.kind == .aggregate or input.catalog_ddl.kind == .cast or input.catalog_ddl.kind == .named_type)) {
+    if (input == .catalog_ddl and (input.catalog_ddl.action == .maintenance or input.catalog_ddl.kind == .function or input.catalog_ddl.kind == .procedure or input.catalog_ddl.kind == .operator or input.catalog_ddl.kind == .aggregate or input.catalog_ddl.kind == .cast or input.catalog_ddl.kind == .named_type)) {
         var actor = identity;
         var adapter: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &actor, .context = context, .database = database, .namespace = namespace, .ddl_search_path = path };
         defer adapter.releaseExecutionOwners();
+        if (input.catalog_ddl.action == .maintenance) return @import("sql_maintenance.zig").execute(&adapter, allocators, input.catalog_ddl);
         if (input.catalog_ddl.kind == .named_type) return @import("sql_type_ddl.zig").execute(&adapter, allocators, input.catalog_ddl);
         return if (input.catalog_ddl.kind == .cast) @import("sql_cast_ddl.zig").execute(&adapter, allocators, input.catalog_ddl) else @import("sql_routine_ddl.zig").execute(&adapter, allocators, input.catalog_ddl);
     }
     if (input == .policy_ddl) return @import("sql_policy_ddl.zig").execute(server, identity, context, database, namespace, alloc, input.policy_ddl);
     if (input == .catalog_ddl and input.catalog_ddl.kind == .sequence)
         return @import("sql_sequence_ddl.zig").execute(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
+    if (input == .catalog_ddl and input.catalog_ddl.action == .comment and input.catalog_ddl.kind == .index)
+        return commentIndex(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
     if (input == .catalog_ddl and input.catalog_ddl.action == .comment and input.catalog_ddl.kind != .table)
         return commentResource(server, identity, context, database, allocators, input.catalog_ddl);
     if (input == .catalog_ddl and input.catalog_ddl.action == .comment)
         return commentTable(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
+    if (input == .catalog_ddl and input.catalog_ddl.authorization != null) {
+        var actor = identity;
+        var adapter: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = &actor, .context = context, .database = database, .namespace = namespace, .ddl_search_path = path };
+        return @import("sql_authorization_ddl.zig").execute(&adapter, allocators, input.catalog_ddl);
+    }
     if (input == .catalog_ddl and input.catalog_ddl.kind == .role)
         return @import("sql_role_ddl.zig").execute(server, identity, context, allocators, input.catalog_ddl);
     if (input == .catalog_ddl and input.catalog_ddl.kind == .index)
@@ -982,12 +1091,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     const resource = try @import("../system_catalog/routes.zig").resourceNameAlloc(alloc, route);
     defer alloc.free(resource);
     // Check logical scope before any catalog lookup, including IF EXISTS.
-    const permission_kind: @import("../usermgr/mod.zig").ResourceType = switch (kind) {
-        .query_source, .view, .sequence => .table,
-        .routine, .named_type => .namespace,
-        .cast => .database,
-        inline else => |tag| @field(@import("../usermgr/mod.zig").ResourceType, @tagName(tag)),
-    };
+    const permission_kind = @import("../system_catalog/routes.zig").permissionKind(kind);
     const table_path_mutation = kind == .table and path != null and name.namespace == null and name.database == null and
         (input == .drop_table or (input == .catalog_ddl and (input.catalog_ddl.action == .rename or input.catalog_ddl.action == .set_tablespace)));
     const alter_path_lookup = input == .catalog_ddl and input.catalog_ddl.action == .alter_schema and
@@ -1001,7 +1105,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         .create_table => .create,
         .drop_table => .drop,
         .catalog_ddl => |ddl| switch (ddl.action) {
-            .alter_schema, .truncate, .role_default, .comment, .alter_sequence => unreachable,
+            .alter_schema, .truncate, .role_default, .comment, .alter_sequence, .maintenance => unreachable,
             .populate => return error.UnsupportedSqlExecution,
             inline else => |tag| @field(domain.Action, @tagName(tag)),
         },
@@ -1027,6 +1131,9 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         request.mutation.name = target.table;
         request.binding_guard = captured.guard;
     }
+    if (input == .drop_table and input.drop_table.cascade) {
+        if (try @import("sql_table_retirement.zig").execute(server, identity, context, allocators, request.binding_guard.?)) |outcome| return outcome;
+    }
     var creation_receipt: ?catalog.DdlReceipt = null;
     const generated_names: []const []const u8 = &.{};
     var receipt_transferred = false;
@@ -1038,7 +1145,12 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     };
     switch (input) {
         .create_table => |create| {
+            request.mutation.sql_owner = try @import("sql_authorization_recovery.zig").creator(server, identity);
             request.column_sequences = create.column_sequences;
+            request.creation_sources = create.creation_sources;
+            request.creation_comment_sources = create.creation_comment_sources;
+            request.creation_object_comments = create.creation_object_comments;
+            request.creation_revision = create.creation_revision;
             request.mutation.tablespace = create.tablespace;
             request.physical_name = try server.catalogStorageNameAlloc(a);
             // Explicit empty search indexes avoids building a full-text index
@@ -1055,12 +1167,16 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             defer parsed.deinit(allocators.scratch);
             if (create.tablespace) |tablespace| parsed.tablespace_name = try allocators.scratch.dupe(u8, tablespace);
             if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema)) {
-                // Initial FK publication has a different atomic owner. Until
-                // it accepts sequence intents, reject before reserving names
-                // rather than silently publishing a table without defaults.
-                if (create.column_sequences.len != 0) return error.UnsupportedSqlShape;
+                // Native admission captures fresh values and leases continuing
+                // counter references through the same hidden publication.
+                const copy: ?@import("../metadata/initial_creation_copy.zig").Input = if (create.creation_sources.len == 0) null else .{
+                    .revision = create.creation_revision orelse return error.CatalogGenerationChanged,
+                    .sources = create.creation_sources,
+                    .column_comments = create.creation_comment_sources,
+                    .object_comments = create.creation_object_comments,
+                };
                 const generated = if (@import("../metadata/topology_protocol.zig").current_version >= @import("../metadata/topology_protocol.zig").constraint_occupancy_version) create.generated_constraint_names else &.{};
-                const plan = @import("fk_initial_create_plan_builder.zig").buildWithGeneratedNamesAndScratch(server, a, allocators.scratch, context, identity, target, parsed, generated) catch |err| switch (err) {
+                const plan = @import("fk_initial_create_plan_builder.zig").buildWithCreationCopyAndScratch(server, a, allocators.scratch, context, identity, target, parsed, generated, create.column_sequences, copy) catch |err| switch (err) {
                     error.CatalogAlreadyExists, error.TableAlreadyExists => if (create.if_not_exists) return .{} else return err,
                     else => return err,
                 };
@@ -1114,7 +1230,9 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     if (request.mutation.tablespace) |tablespace| if (identity) |authenticated| {
         if (!server_mod.permissionsAllow(authenticated.permissions, .tablespace, tablespace, .read)) return error.Forbidden;
     };
-    const response = server.source.systemCatalog(alloc, context, .{ .mutate = request }) catch |err| {
+    var mutation_context = context;
+    if (request.mutation.sql_owner != null) mutation_context.setting_admin = true;
+    const response = server.source.systemCatalog(alloc, mutation_context, .{ .mutate = request }) catch |err| {
         // Conditional DDL observes the authority's atomic outcome. Owner binding
         // never permits retrying an ambiguous durable submission.
         switch (input) {
@@ -1134,12 +1252,14 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             .database => error.SqlDuplicateDatabase,
             .namespace => error.SqlDuplicateNamespace,
             .tablespace => error.SqlDuplicateTablespace,
+            .role => error.SqlDuplicateRole,
             .table, .query_source, .view, .sequence, .routine, .cast, .named_type => err,
         };
         if (err == error.CatalogNotFound) return switch (kind) {
             .database => error.DatabaseNotFound,
             .namespace => error.NamespaceNotFound,
             .tablespace => error.TablespaceNotFound,
+            .role => error.SqlRoleNotFound,
             .table, .query_source, .view, .sequence, .routine, .cast, .named_type => err,
         };
         return err;
@@ -2575,6 +2695,7 @@ test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only o
         }
         fn run(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .setting_snapshot) return std.json.Stringify.valueAlloc(alloc, @import("antfly_local_sources").sql_setting_catalog.RawSnapshot{ .scope = call.setting_snapshot, .epoch = 1, .definitions = &.{} }, .{});
             if (call != .mutate) return error.UnexpectedCall;
             try std.testing.expect(std.mem.indexOf(u8, self.output.?.written(), "PREPARE\x00") != null);
             const request = call.mutate;

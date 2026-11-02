@@ -983,6 +983,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
+                .txn_resolve_group_local_with_request = txnResolveGroupLocalWithRequest,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
@@ -994,6 +995,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
                 .vector_migration_group_local = vectorMigrationGroupLocal,
+                .sql_maintenance_group = sqlMaintenanceGroup,
+                .sql_maintenance_group_local = sqlMaintenanceGroupLocal,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .resolver_operation_group_local = resolverOperationGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
@@ -3477,6 +3480,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .ok;
     }
 
+    fn transactionRecoveryResolveExternal(ptr: ?*anyopaque, txn_id: *const abi.TxnId, participant: abi.BorrowedBytes, status: abi.TxnStatus, version: u64, owner_bytes: abi.BorrowedBytes) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const source = self.transaction_recovery_source orelse return .invalid_argument;
+        const Owner = @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner;
+        if (owner_bytes.len != Owner.encoded_len or owner_bytes.ptr == null) return .invalid_external_decision_owner;
+        if (participant.len != 0 and participant.ptr == null) return .invalid_argument;
+        const owner = Owner.decode(owner_bytes.slice()) catch |err| return transactionRecoveryStatus(err);
+        source.resolveExternal(txn_id.bytes, participant.slice(), switch (status) {
+            .pending => return .invalid_argument,
+            .committed => .committed,
+            .aborted => .aborted,
+        }, version, owner) catch |err| return transactionRecoveryStatus(err);
+        return .ok;
+    }
+
     fn transactionRecoveryOwns(
         ptr: ?*anyopaque,
         owner_participant: abi.BorrowedBytes,
@@ -3544,6 +3562,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .callback_ctx = self,
             .owner_id = .fromSlice(options.owner_id),
             .resolve_participant_fn = transactionRecoveryResolve,
+            .resolve_external_participant_fn = transactionRecoveryResolveExternal,
             .owns_recovery_fn = if (options.replicated_metadata) transactionRecoveryOwns else null,
             .acknowledge_participant_fn = if (options.replicated_metadata) transactionRecoveryAcknowledge else null,
             .acknowledge_participants_fn = if (options.replicated_metadata) transactionRecoveryAcknowledgeMany else null,
@@ -6577,9 +6596,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!opts.fk_generation_source_control or !opts.fk_generation_source_read_index_certified or
             key.len != 0 or consistency != .stale or
             opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or
-            opts.relational_activation_json.len != 0 or opts.group_source_query_json.len != 0 or opts.relational_index_status_json.len != 0 or
+            opts.group_source_query_json.len != 0 or opts.relational_index_status_json.len != 0 or
             opts.row_policy_receipt != null or opts.restore_staging_scope != null or
             opts.include_primary_digest or opts.fields.len != 0) return false;
+        // Install completion must inspect durable reference coverage while
+        // serving admission still waits for index/schema reconciliation. This
+        // is the exact certified private status observation, never a row read.
+        if (opts.relational_activation_json.len != 0)
+            return !opts.relational_integrity_catalog and opts.relational_topology_json.len == 0 and
+                std.mem.eql(u8, opts.relational_activation_json, "{\"mode\":\"status\"}");
         if (opts.relational_integrity_catalog)
             return opts.relational_topology_json.len == 0;
         return std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"public_schema\"}") or
@@ -7477,7 +7502,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = platform_time.realtimeNs(),
                 .topology_epoch = topology_epoch,
-                .retain_terminal = retain_terminal,
+                .retain_terminal = retain_terminal or context.external_decision_owner != null,
+                .external_decision_owner = context.external_decision_owner,
                 .participants = participants,
             } },
         }, active);
@@ -7494,32 +7520,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         req: db_types.TransactionIntentRequest,
     ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        comptime std.debug.assert(@sizeOf(db_types.TransactionWrite) == @sizeOf(db_types.BatchWrite));
         if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
-        comptime std.debug.assert(@alignOf(db_types.TransactionWrite) == @alignOf(db_types.BatchWrite));
-        const writes: []const db_types.BatchWrite = @ptrCast(req.writes);
-        try self.applyTransactionGroupLocal(alloc, group_id, table_name, .{
-            .writes = writes,
-            .deletes = req.deletes,
-            .transforms = req.transforms,
-            .predicates = req.predicates,
-            .integrity = req.integrity,
-            .integrity_commands = req.integrity_commands,
-            .range_guards = req.range_guards,
-            .schema_version = req.schema_version,
-            .relational_schema_version = req.relational_schema_version,
-            .relational_integrity_generation_set = req.relational_integrity_generation_set,
-            .relational_repair = req.relational_repair,
-            .relational_activation = req.relational_activation,
-            .relational_retirement = req.relational_retirement,
-            .relational_index_maintenance = req.relational_index_maintenance,
-            .restore_staging_scope = req.restore_staging_scope,
-            .restore_staging_plan_id = req.restore_staging_plan_id,
-            .transaction = .{ .prepare = .{
-                .txn_id = txn_id,
-                .topology_epoch = topology_epoch,
-            } },
-        });
+        try self.applyTransactionGroupLocal(alloc, group_id, table_name, req.asBatch(txn_id, topology_epoch));
         return {};
     }
 
@@ -7543,6 +7545,17 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .commit_version = commit_version,
             } },
         });
+        return {};
+    }
+
+    fn txnResolveGroupLocalWithRequest(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: @import("antfly_local_sources").api_distributed_txn_contract.TxnResolveRequest, cancellation: db_types.CancellationToken) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.applyTransactionGroupLocalWithContext(alloc, group, table, .{
+            .restore_staging_scope = request.restore_staging_scope,
+            .restore_staging_plan_id = request.restore_staging_plan_id,
+            .sync_level = request.sync_level,
+            .transaction = .{ .resolve = .{ .txn_id = request.txn_id, .status = request.status, .commit_version = request.commit_version, .external_decision_owner = request.external_decision_owner } },
+        }, .{ .cancellation = cancellation });
         return {};
     }
 
@@ -7922,6 +7935,26 @@ pub const ProvisionedKernelOwnerSource = struct {
             result.accumulate(parsed.value);
         }
         return result;
+    }
+
+    fn sqlMaintenanceGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8, cancellation: db_types.CancellationToken) !?[]u8 {
+        try cancellation.check();
+        return sqlMaintenanceGroupLocal(ptr, alloc, group_id, table_name, body);
+    }
+
+    fn sqlMaintenanceGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().sqlMaintenanceJson(table_name, body);
+        defer response.deinit();
+        return try alloc.dupe(u8, response.bytes());
     }
 
     fn graphMetricMaintenanceGroupLocal(
@@ -9065,6 +9098,20 @@ test "fence-deferred owner preserves control admission without exposing stale pu
     try std.testing.expect(!Source.fkGenerationSourceDeferredLookupAllowed("row", .{ .relational_integrity_catalog = true, .fk_generation_source_control = true, .fk_generation_source_read_index_certified = true }, .stale));
     try std.testing.expect(!Source.fkGenerationSourceDeferredLookupAllowed("", .{ .relational_integrity_catalog = true, .fk_generation_source_control = true, .fk_generation_source_read_index_certified = true }, .read_index));
     try std.testing.expect(!Source.fkGenerationSourceDeferredLookupAllowed("", .{ .relational_topology_json = "{\"mode\":\"other\"}", .fk_generation_source_control = true, .fk_generation_source_read_index_certified = true }, .stale));
+    const activation: db_types.LookupOptions = .{ .relational_activation_json = "{\"mode\":\"status\"}", .fk_generation_source_control = true, .fk_generation_source_read_index_certified = true };
+    try std.testing.expect(Source.fkGenerationSourceDeferredLookupAllowed("", activation, .stale));
+    var uncertified_activation = activation;
+    uncertified_activation.fk_generation_source_read_index_certified = false;
+    try std.testing.expect(!Source.fkGenerationSourceDeferredLookupAllowed("", uncertified_activation, .stale));
+    var mixed_activation = activation;
+    mixed_activation.relational_integrity_catalog = true;
+    try std.testing.expect(!Source.fkGenerationSourceDeferredLookupAllowed("", mixed_activation, .stale));
+    mixed_activation = activation;
+    mixed_activation.relational_topology_json = "{\"mode\":\"status\"}";
+    try std.testing.expect(!Source.fkGenerationSourceDeferredLookupAllowed("", mixed_activation, .stale));
+    mixed_activation = activation;
+    mixed_activation.relational_activation_json = "{\"mode\":\"other\"}";
+    try std.testing.expect(!Source.fkGenerationSourceDeferredLookupAllowed("", mixed_activation, .stale));
     var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
     defer source.entries.deinit(std.testing.allocator);
     var entry: Source.Entry = .{
@@ -9496,4 +9543,58 @@ test "storage owner entity sink bridge preserves curation capability and missing
     const entries = [_]abi.EntityUpsert{.{ .table = .fromSlice("entities"), .storage_table = .fromSlice("table:7"), .key = .fromSlice("entity/retired"), .doc_json = .fromSlice("{}"), .skip_if_missing = 1 }};
     try std.testing.expectEqual(abi.Status.ok, hooks.entity_sink.upsert_batch_fn.?(hooks.entity_sink.callback_ctx, &entries, entries.len));
     try std.testing.expect(fixture.seen);
+}
+
+test "raft batch round trips external transaction recovery authority through native callback statuses" {
+    const Owner = @import("antfly_local_sources").storage_transactions.ExternalDecisionOwner;
+    const expected: Owner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+    const Probe = struct {
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        fn options(_: *anyopaque) transaction_recovery_source.Options {
+            return .{ .enabled = true };
+        }
+        fn owns(_: *anyopaque, _: []const u8) bool {
+            return true;
+        }
+        fn ordinary(_: *anyopaque, _: db_types.TxnId, _: []const u8, _: db_types.TxnStatus, _: u64) !void {
+            return error.UnexpectedOrdinaryResolution;
+        }
+        fn ack(_: *anyopaque, _: db_types.TxnId, _: []const u8, _: []const u8) !void {}
+        fn cleanup(_: *anyopaque, _: db_types.TxnId, _: []const u8, _: u64, _: u64) !void {}
+        fn external(ptr: *anyopaque, txn: db_types.TxnId, peer: []const u8, status: db_types.TxnStatus, version: u64, owner: Owner) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as([16]u8, @splat(4)), txn);
+            try std.testing.expectEqualStrings("peer", peer);
+            try std.testing.expectEqual(db_types.TxnStatus.committed, status);
+            try std.testing.expectEqual(@as(u64, 20), version);
+            if (!expected.eql(owner)) return error.ExternalTransactionDecisionChanged;
+            self.calls += 1;
+            if (self.failure) |err| return err;
+        }
+        const full: transaction_recovery_source.Source.VTable = .{ .options = options, .owns = owns, .resolve = ordinary, .resolve_external = external, .acknowledge = ack, .cleanup = cleanup };
+        const old: transaction_recovery_source.Source.VTable = .{ .options = options, .owns = owns, .resolve = ordinary, .acknowledge = ack, .cleanup = cleanup };
+    };
+    var probe: Probe = .{};
+    var control: ProvisionedKernelOwnerSource = undefined;
+    control.transaction_recovery_source = .{ .ptr = &probe, .vtable = &Probe.full };
+    var config = control.transactionRecoveryConfig();
+    const callback = @import("../storage/transaction_recovery_callback.zig").resolveExternal;
+    try callback(config, @splat(4), "peer", .committed, 20, expected);
+    for ([_]anyerror{ error.RaftBatchWriteOutcomeUnknown, error.Timeout }) |err| {
+        probe.failure = err;
+        try std.testing.expectError(err, callback(config, @splat(4), "peer", .committed, 20, expected));
+    }
+    var changed = expected;
+    changed.operation_id[0] ^= 1;
+    try std.testing.expectError(error.ExternalTransactionDecisionChanged, callback(config, @splat(4), "peer", .committed, 20, changed));
+    control.transaction_recovery_source = .{ .ptr = &probe, .vtable = &Probe.old };
+    try std.testing.expectError(error.ExternalTransactionDecisionRequired, callback(config, @splat(4), "peer", .committed, 20, expected));
+    const txn: abi.TxnId = .{ .bytes = @splat(4) };
+    const encoded = try expected.encode();
+    try std.testing.expectEqual(abi.Status.invalid_external_decision_owner, ProvisionedKernelOwnerSource.transactionRecoveryResolveExternal(&control, &txn, .fromSlice("peer"), .committed, 20, .fromSlice(encoded[0..79])));
+    try std.testing.expectEqual(abi.Status.invalid_external_decision_owner, ProvisionedKernelOwnerSource.transactionRecoveryResolveExternal(&control, &txn, .fromSlice("peer"), .committed, 20, .{ .len = Owner.encoded_len }));
+    config.resolve_external_participant_fn = null;
+    try std.testing.expectError(error.ExternalTransactionDecisionRequired, callback(config, @splat(4), "peer", .committed, 20, expected));
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
 }

@@ -828,3 +828,86 @@ test "foreign key validation catalog shares atomic LSM rollback commit and cold 
         }
     }
 }
+
+/// Explicit rename is a schema-only identity handoff. It cannot allocate,
+/// retire, revive or change the semantics of any claim/reference generation.
+pub fn prepareObjectRenames(a: Allocator, previous: []const u8, incarnation: integrity.Generation, version: u32, schema_digest: integrity.Digest, definitions: []const Definition, renames: []const @import("../../system_catalog/object_annotations.zig").Rename, checks: integrity.Digest) !Update {
+    const objects = @import("../../system_catalog/object_annotations.zig");
+    try objects.validateSingleRename(renames);
+    if (definitions.len > max_definitions) return error.InvalidIntegrityDefinition;
+    var before = try decode(a, previous);
+    defer before.deinit();
+    if (version != (std.math.add(u32, before.schema_version, 1) catch return error.InvalidIntegrityDefinition) or
+        !std.mem.eql(u8, &before.incarnation, &incarnation) or !std.mem.eql(u8, &before.checks_digest, &checks)) return error.InvalidIntegrityDefinition;
+    const owned = before.arena.allocator();
+    const bindings = try owned.dupe(Binding, before.bindings);
+    for (renames) |rename| {
+        if (rename.kind != .constraint) continue;
+        var found = false;
+        for (bindings) |*binding| {
+            if (binding.retired or !std.mem.eql(u8, binding.definition.name, rename.from)) continue;
+            if (found or before.find(binding.definition.kind, rename.to) != null) return error.InvalidIntegrityDefinition;
+            const next = for (definitions) |definition| {
+                if (definition.kind == binding.definition.kind and std.mem.eql(u8, definition.name, rename.to)) break definition;
+            } else return error.InvalidIntegrityDefinition;
+            var old_json = try std.json.parseFromSliceLeaky(std.json.Value, owned, binding.definition.payload, .{ .parse_numbers = false });
+            const next_json = try std.json.parseFromSliceLeaky(std.json.Value, owned, next.payload, .{ .parse_numbers = false });
+            if (old_json != .object or next_json != .object or !std.mem.eql(u8, old_json.object.get("name").?.string, rename.from) or
+                !std.mem.eql(u8, next_json.object.get("name").?.string, rename.to) or
+                !std.mem.eql(u8, &digest(binding.definition.payload), &binding.definition.fingerprint) or !std.mem.eql(u8, &digest(next.payload), &next.fingerprint)) return error.InvalidIntegrityDefinition;
+            try old_json.object.put(owned, "name", .{ .string = rename.to });
+            const canonical = @import("document_content_hash.zig").canonicalJsonValueAlloc;
+            if (!std.mem.eql(u8, try canonical(owned, old_json), try canonical(owned, next_json))) return error.InvalidIntegrityDefinition;
+            binding.definition = .{ .kind = next.kind, .name = try owned.dupe(u8, next.name), .fingerprint = next.fingerprint, .payload = try owned.dupe(u8, next.payload) };
+            found = true;
+        }
+        if (!found) return error.InvalidIntegrityDefinition;
+    }
+    before.bindings = bindings;
+    std.mem.sort(Binding, bindings, {}, lessThan);
+    const renamed = try encode(a, before);
+    defer a.free(renamed);
+    var result = try prepareWithChecks(a, renamed, incarnation, version, schema_digest, definitions, checks);
+    errdefer result.deinit();
+    if (result.catalog.next_generation != before.next_generation or result.catalog.bindings.len != before.bindings.len) return error.InvalidIntegrityDefinition;
+    var by_allocation: std.AutoHashMapUnmanaged(u64, Binding) = .empty;
+    defer by_allocation.deinit(a);
+    try by_allocation.ensureTotalCapacity(a, @intCast(result.catalog.bindings.len));
+    for (result.catalog.bindings) |binding| by_allocation.putAssumeCapacity(binding.allocation, binding);
+    for (before.bindings) |old| {
+        const next = by_allocation.get(old.allocation) orelse return error.InvalidIntegrityDefinition;
+        if (old.retired != next.retired or !std.mem.eql(u8, old.definition.name, next.definition.name) or !std.mem.eql(u8, &old.definition.fingerprint, &next.definition.fingerprint)) return error.InvalidIntegrityDefinition;
+    }
+    // CAS against the actual predecessor, never the synthetic relabeling.
+    result.catalog.arena.allocator().free(result.expected.?);
+    result.expected = try result.catalog.arena.allocator().dupe(u8, previous);
+    return result;
+}
+
+test "catalog object rename native successor retains allocations live references and historical generations without permitting semantic replacement" {
+    const a = std.testing.allocator;
+    const before_payload = "{\"domain\":\"unique\",\"name\":\"old\",\"columns\":[\"id\"]}";
+    const after_payload = "{\"domain\":\"unique\",\"name\":\"new\",\"columns\":[\"id\"]}";
+    const old: Definition = .{ .kind = .unique, .name = "old", .fingerprint = digest(before_payload), .payload = before_payload };
+    const next: Definition = .{ .kind = .unique, .name = "new", .fingerprint = digest(after_payload), .payload = after_payload };
+    const retired: Definition = .{ .kind = .unique, .name = "retired", .fingerprint = @splat(4) };
+    var original = try prepare(a, null, @splat(1), 0, @splat(1), &.{ old, retired });
+    defer original.deinit();
+    var source = try prepare(a, original.value, @splat(1), 1, @splat(2), &.{old});
+    defer source.deinit();
+    const hints = [_]@import("../../system_catalog/object_annotations.zig").Rename{ .{ .kind = .constraint, .from = "old", .to = "new" }, .{ .kind = .index, .from = "old", .to = "new" } };
+    var renamed = try prepareObjectRenames(a, source.value, @splat(1), 2, @splat(3), &.{next}, &hints, @splat(0));
+    defer renamed.deinit();
+    try std.testing.expectEqualSlices(u8, source.value, renamed.expected.?);
+    try std.testing.expectEqual(source.catalog.next_generation, renamed.catalog.next_generation);
+    try std.testing.expectEqual(source.catalog.bindings.len, renamed.catalog.bindings.len);
+    try std.testing.expectEqualSlices(u8, &source.catalog.find(.unique, "old").?.generation, &renamed.catalog.find(.unique, "new").?.generation);
+    try std.testing.expect(renamed.catalog.find(.unique, "old") == null);
+    for (source.catalog.bindings) |binding| {
+        const kept = renamed.catalog.findGeneration(binding.generation).?;
+        try std.testing.expectEqual(binding.retired, kept.retired);
+    }
+    const forged_payload = "{\"domain\":\"unique\",\"name\":\"new\",\"columns\":[\"changed\"]}";
+    const forged: Definition = .{ .kind = .unique, .name = "new", .fingerprint = digest(forged_payload), .payload = forged_payload };
+    try std.testing.expectError(error.InvalidIntegrityDefinition, prepareObjectRenames(a, source.value, @splat(1), 2, @splat(3), &.{forged}, &hints, @splat(0)));
+}

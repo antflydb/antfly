@@ -53,39 +53,11 @@ pub const GeoShapeRelation = enum {
     contains,
 };
 
-pub const SyncLevel = enum {
-    propose,
-    write,
-    full_text,
-    enrichments,
-    full_index,
-};
-
-pub fn parsePublicSyncLevelText(text: []const u8) ?SyncLevel {
-    if (std.mem.eql(u8, text, "propose")) return .propose;
-    if (std.mem.eql(u8, text, "write")) return .write;
-    if (std.mem.eql(u8, text, "full_text")) return .full_text;
-    if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, text, "full_index")) return .full_index;
-    return null;
-}
-
-pub fn parsePublicSyncLevelJson(value: std.json.Value) ?SyncLevel {
-    return switch (value) {
-        .string => |text| parsePublicSyncLevelText(text),
-        else => null,
-    };
-}
-
-pub fn publicSyncLevelText(level: SyncLevel) []const u8 {
-    return switch (level) {
-        .propose => "propose",
-        .write => "write",
-        .full_text => "full_text",
-        .enrichments => "enrichments",
-        .full_index => "full_index",
-    };
-}
+const sync_levels = @import("../../common/sync_level.zig");
+pub const SyncLevel = sync_levels.SyncLevel;
+pub const parsePublicSyncLevelText = sync_levels.parsePublicSyncLevelText;
+pub const parsePublicSyncLevelJson = sync_levels.parsePublicSyncLevelJson;
+pub const publicSyncLevelText = sync_levels.publicSyncLevelText;
 
 test "public sync level text accepts full_index and rejects removed aknn alias" {
     try std.testing.expect(parsePublicSyncLevelText("aknn") == null);
@@ -94,11 +66,32 @@ test "public sync level text accepts full_index and rejects removed aknn alias" 
 }
 
 pub const BatchWrite = struct {
+    /// Borrowed from an authenticated internal batch or owned SQL session.
+    /// Public JSON never creates this canonical-domain preparation marker.
+    prepared_domain: ?*const @import("../../schema/domain_handoff.zig").Contract = null,
     key: []const u8,
     value: []const u8,
     /// Top-level JSON-typed fields whose null datum is JSON null, not SQL NULL.
     /// Validated against the pinned relational schema before preparation.
     json_null_fields: []const []const u8 = &.{},
+
+    pub fn json_skip_field(self: @This(), field: []const u8) bool {
+        return std.mem.eql(u8, field, "prepared_domain") and self.prepared_domain == null;
+    }
+
+    /// Integrity encoders serialize the contract data, never its borrowed
+    /// process address. Unprepared writes keep their historical projection.
+    pub fn nativeJsonProjection(self: @This()) struct {
+        key: []const u8,
+        value: []const u8,
+        json_null_fields: []const []const u8,
+        prepared_domain: ?@import("../../schema/domain_handoff.zig").Contract,
+        pub fn nativeJsonSkipField(value: @This(), field: []const u8) bool {
+            return std.mem.eql(u8, field, "prepared_domain") and value.prepared_domain == null;
+        }
+    } {
+        return .{ .key = self.key, .value = self.value, .json_null_fields = self.json_null_fields, .prepared_domain = if (self.prepared_domain) |contract| contract.* else null };
+    }
 };
 
 pub fn cloneJsonNullFields(alloc: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
@@ -294,6 +287,7 @@ pub const MergeReplicationCheckpoint = struct {
 /// replay is deterministic on followers and after restart.
 pub const TransactionMutation = union(enum) {
     begin: struct {
+        external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
         txn_id: TxnId,
         begin_timestamp: u64,
         created_at_ns: u64,
@@ -307,11 +301,14 @@ pub const TransactionMutation = union(enum) {
     prepare: struct {
         txn_id: TxnId,
         topology_epoch: u64,
+        external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
+        external_activation: bool = false,
     },
     resolve: struct {
         txn_id: TxnId,
         status: TxnStatus,
         commit_version: u64,
+        external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
     },
     /// Coordinator-side acknowledgement that one participant has durably
     /// learned the terminal decision. This must be ordered by coordinator
@@ -1770,11 +1767,10 @@ pub const GraphTraversalResult = traversal_mod.TraversalResult;
 pub const GraphPathWeightMode = paths_mod.PathWeightMode;
 pub const GraphPath = paths_mod.Path;
 
-pub const TransactionWrite = struct {
-    key: []const u8,
-    value: []const u8,
-    json_null_fields: []const []const u8 = &.{},
-};
+/// Batch and transaction preparation consume the same borrowed write image.
+/// Sharing the shape prevents private provenance from disappearing in layout
+/// casts when either producer gains another preparation capability.
+pub const TransactionWrite = BatchWrite;
 
 pub const TransactionVersionPredicate = struct {
     /// Private SQL command provenance; public batch parsers never populate it.
@@ -1795,6 +1791,10 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    /// Leader-materialized time for deterministic new-vote admission.
+    timestamp_ns: u64 = 0,
+    external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
+    external_activation: bool = false,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
@@ -1814,6 +1814,30 @@ pub const TransactionIntentRequest = struct {
     predicates: []const TransactionVersionPredicate = &.{},
     integrity: []const TransactionIntegrityOperation = &.{},
     integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
+
+    /// Borrow the complete prepared contract without allocating or reparsing.
+    /// Every added intent field must have a transport mapping at compile time.
+    pub fn asBatch(self: @This(), txn_id: TxnId, topology_epoch: u64) BatchRequest {
+        var batch: BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .external_decision_owner = self.external_decision_owner, .external_activation = self.external_activation } } };
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation")) continue;
+            if (!@hasField(BatchRequest, name)) @compileError("transaction intent field requires batch transport: " ++ name);
+            @field(batch, name) = @field(self, name);
+        }
+        return batch;
+    }
+
+    pub fn fromBatch(batch: BatchRequest) !@This() {
+        const transaction = batch.transaction orelse return error.InvalidBatchRequest;
+        if (transaction != .prepare) return error.InvalidBatchRequest;
+        var request: @This() = .{ .external_decision_owner = transaction.prepare.external_decision_owner, .external_activation = transaction.prepare.external_activation };
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation")) continue;
+            if (!@hasField(BatchRequest, name)) @compileError("transaction intent field requires batch transport: " ++ name);
+            @field(request, name) = @field(batch, name);
+        }
+        return request;
+    }
 };
 
 pub const SplitState = struct {
@@ -4359,6 +4383,31 @@ pub const IndexRepairWake = union(enum) {
 };
 
 /// Exact ordered mutation receipt persisted atomically with primary effects.
+/// One borrowed, synchronous native resolution authority. Ordered replay
+/// supplies its own receipt; public commit bodies cannot construct this value.
+pub const ExternalTransactionBegin = struct {
+    txn_id: TxnId,
+    owner: @import("../transactions.zig").ExternalDecisionOwner,
+    begin_timestamp: u64,
+    created_at_ns: u64,
+    participants: []const []const u8,
+    coordinator: bool,
+    restore_staging_scope: ?[32]u8 = null,
+    ordered_receipt: ?OrderedApplyReceipt = null,
+    admission_timestamp_ns: u64 = 0,
+};
+
+pub const ExternalTransactionResolution = struct {
+    txn_id: TxnId,
+    owner: @import("../transactions.zig").ExternalDecisionOwner,
+    status: TxnStatus,
+    commit_version: u64,
+    sync_level: SyncLevel = .write,
+    visibility_cancellation: CancellationToken = .none,
+    ordered_receipt: ?OrderedApplyReceipt = null,
+    resolved_participant: ?[]const u8 = null,
+};
+
 pub const OrderedApplyReceipt = struct {
     term: u64,
     index: u64,

@@ -12544,3 +12544,358 @@ test "relational index system indexed document streams beyond top K and retains 
     try std.testing.expect(sparse != 0);
     std.debug.print("exact text native rows={d} pages={d} sparse_auth_pages={d} selector_peak_bytes={d} elapsed_ms={d}\n", .{ seen, pages, sparse, session.text.?.budget.peak, (time.monotonicNs() -| begin) / std.time.ns_per_ms });
 }
+
+test "relational index system compatible enum epoch preserves populated LSM rows index identity cold recovery and release" {
+    try populatedTypeEpoch(false);
+}
+
+test "relational index system domain NOT NULL epoch scans populated LSM rows and preserves cold index identity" {
+    try populatedTypeEpoch(true);
+}
+
+fn populatedTypeEpoch(is_domain: bool) !void {
+    const F = NullabilityJobFixture;
+    const types = @import("../../system_catalog/named_types.zig");
+    const layouts = @import("../../common/sql_named_type_layout.zig");
+    const api = @import("../../schema/mod.zig");
+    var labels = try types.Owned.create(alloc, &.{ "z", "a" });
+    defer labels.deinit();
+    const previous: types.Record = .{ .identity = try types.Identity.init(17, 2, 1, @splat(8)), .definition = if (is_domain) .{ .domain = .{ .base = .{ .builtin = .text } } } else labels.definition, .owner = .auth_disabled };
+    var next_labels = try types.Owned.add(alloc, labels.definition, "middle", .{ .before = "a" });
+    defer next_labels.deinit();
+    var successor = previous;
+    successor.identity.generation += 1;
+    if (is_domain) successor.definition.domain.not_null = true else successor.definition = next_labels.definition;
+    var region = std.heap.ArenaAllocator.init(alloc);
+    defer region.deinit();
+    const temporary = region.allocator();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, temporary,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"by_state","keys":[{"column":"state"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"state":{"type":"sql_enum","x-antfly-sql-type-id":17,"nullable":true}},"additionalProperties":false}}}}
+    , .{});
+    if (is_domain) {
+        var properties = &root.object.getPtr("document_schemas").?.object.getPtr("row").?.object.getPtr("schema").?.object.getPtr("properties").?.object;
+        try properties.getPtr("state").?.object.put(temporary, "type", .{ .string = "keyword" });
+    }
+    try layouts.canonicalizeSchemaLeaky(temporary, &root, &.{previous});
+    const before_json = try std.json.Stringify.valueAlloc(alloc, root, .{});
+    defer alloc.free(before_json);
+    const after_json = try layouts.epochSchemaAlloc(alloc, before_json, previous, successor);
+    defer alloc.free(after_json);
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("enum-epoch-populated-lsm");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), F.options);
+    var live = true;
+    defer if (live) database.close();
+    try database.setSchemaJson(alloc, before_json);
+    var writes: [128]@import("types.zig").BatchWrite = undefined;
+    for (&writes, 0..) |*entry, index| entry.* = .{ .key = try std.fmt.allocPrint(temporary, "row-{d:0>4}", .{index}), .value = if (index % 2 == 0) "{\"state\":\"z\"}" else "{\"state\":\"a\"}" };
+    try database.batch(.{ .writes = &writes });
+    for (0..16) |_| {
+        if ((try database.relationalIndexBuildStatus("by_state")).state == .ready) break;
+        try database.buildRelationalIndexStep("by_state", .{ .time_ns = std.time.ns_per_s });
+    } else return error.ExistingIndexDidNotBecomeReady;
+    const physical_before = blk: {
+        var index = database.core.relational_indexes.acquire().?;
+        defer index.deinit();
+        break :blk index.plan.boundIndexes()[0].id();
+    };
+    const primary_key = try internal.relationalRowKeyAlloc(alloc, writes[0].key);
+    defer alloc.free(primary_key);
+    const row_before = try database.core.store.get(alloc, primary_key);
+    defer alloc.free(row_before);
+    const predecessor = try database.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+    defer alloc.free(predecessor);
+    var candidate = try F.job.Candidate.initTypeEpoch(alloc, F.namespace.table_id, before_json, after_json, predecessor, .{ .type_id = 17, .generation = 1, .origin_id = @splat(8) }, .{});
+    defer candidate.deinit();
+    const binding = try F.binding(&database, &candidate, 117);
+    _ = try F.apply(&database, &candidate, binding, .begin);
+    _ = try F.apply(&database, &candidate, binding, .freeze);
+    var validated: F.job.Header = undefined;
+    var pages: usize = 0;
+    while (true) {
+        var page = try F.job.PreparedPage.prepare(alloc, database.core, binding, .{ .records = 37, .time_ns = std.time.ns_per_s }, .{});
+        defer page.deinit();
+        if (!is_domain) {
+            try std.testing.expectEqual(@as(usize, 0), page.page.page.records_examined);
+            try std.testing.expectEqual(@as(usize, 0), page.page.rows_examined);
+        }
+        var replayed_page = try F.job.PreparedPage.replay(alloc, database.core, try page.command(), .{});
+        defer replayed_page.deinit();
+        validated = try F.page(&database, &page);
+        try std.testing.expectEqualDeep(validated, try F.page(&database, &replayed_page));
+        pages += 1;
+        if (validated.phase == .ready) break;
+        try std.testing.expect(pages < 32);
+    }
+    if (is_domain) try std.testing.expect(pages > 1);
+    try std.testing.expectEqual(@as(u64, if (is_domain) 128 else 0), validated.rows_scanned);
+    var definition = try api.PreparedSchemaDefinition.init(alloc, after_json);
+    defer definition.deinit(alloc);
+    const historical = try api.versionedSchemaKeyAlloc(alloc, binding.after_version);
+    defer alloc.free(historical);
+    const metadata_writes = [_]docstore.KVPair{ .{ .key = "\x00\x00__metadata__:schema_json", .value = after_json }, .{ .key = historical, .value = after_json } };
+    const Participant = struct {
+        pub fn validateBefore(_: @This(), _: anytype) !void {}
+        pub fn stage(_: @This(), _: anytype, _: F.job.Header) !void {}
+    };
+    const installed = blk: {
+        var prepared = try database.core.prepareSchemaMetadataValidatedNullability(definition.runtime_schema, &metadata_writes, binding, &candidate);
+        defer prepared.deinit();
+        database.core.lockApply();
+        defer database.core.unlockApply();
+        break :blk try database.core.commitPreparedSchemaMetadataValidatedNullability(&prepared, &metadata_writes, @splat(91), null, Participant{});
+    };
+    try std.testing.expectEqual(.installed, installed.phase);
+    try std.testing.expectEqual(validated.records, installed.records);
+    try std.testing.expectEqual(validated.rows_scanned, installed.rows_scanned);
+    try std.testing.expectError(error.IntegrityTopologyBusy, database.batch(.{ .writes = &.{.{ .key = "not-released", .value = "{\"state\":\"middle\"}" }} }));
+    database.close();
+    live = false;
+    database = try db_mod.DB.open(alloc, directory.path(), F.options);
+    live = true;
+    {
+        var index = database.core.relational_indexes.acquire().?;
+        defer index.deinit();
+        try std.testing.expectEqualDeep(physical_before, index.plan.boundIndexes()[0].id());
+        try std.testing.expectEqual(@as(u32, 2), index.plan.schemaView().version());
+    }
+    {
+        var history_read = try database.core.store.beginReadTxn();
+        defer history_read.abort();
+        const decoded_history = try @import("../schema.zig").loadSchemaHistory(database.core.store, alloc);
+        defer @import("../schema.zig").freeSchemaHistory(alloc, decoded_history);
+        try std.testing.expectEqual(@as(usize, 2), decoded_history.len);
+        const history = try @import("relational_rewrite_manifest.zig").read(temporary, &history_read, .none);
+        try std.testing.expectEqual(@as(usize, 2), history.len);
+    }
+    const row_after = try database.core.store.get(alloc, primary_key);
+    defer alloc.free(row_after);
+    try std.testing.expectEqualSlices(u8, row_before, row_after);
+    {
+        var audit = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+        defer audit.deinit();
+        for (0..32) |_| {
+            if (try audit.step(null, .{ .records = 37, .time_ns = std.time.ns_per_s }, .{})) break;
+        } else return error.ValidationJobDidNotComplete;
+        const summary = try audit.summary();
+        try std.testing.expectEqual(installed.records, summary.records);
+        try std.testing.expectEqual(installed.rows_scanned, summary.rows);
+        try std.testing.expectEqualDeep(installed, summary.header);
+    }
+    // This unit fixture stands in for the trusted all-installed publication
+    // adapter. Production metadata must independently authenticate that cut.
+    {
+        database.core.lockApply();
+        defer database.core.unlockApply();
+        var txn = try database.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        var manager = try database.core.initTxnManager();
+        defer manager.deinit();
+        _ = try F.job.stageReleased(alloc, &txn, &manager, binding, @splat(91), try installed.digest(), @splat(92), null);
+        try txn.commit();
+    }
+    try database.batch(.{ .writes = &.{.{ .key = "released", .value = "{\"state\":\"middle\"}" }} });
+    var reader = try NullabilityScanFixture.open(&database, alloc, .{ .fields = &.{"state"} }, 0);
+    defer reader.deinit();
+    const inserted = (try reader.lookupTypedRow(temporary, "released")).?;
+    try std.testing.expectEqualStrings("middle", inserted.typed.?.object.get("state").?.string);
+}
+
+test "relational index system compatible default retirement drains zero rows and preserves LSM bytes across cold install release and cancellation" {
+    const F = NullabilityJobFixture;
+    const sequences = @import("../../system_catalog/column_sequences.zig");
+    const controls = db_mod.DB.NativeSchemaOwnerControl;
+    const Driver = struct {
+        fn apply(database: *db_mod.DB, command: controls.Command) !controls.Outcome {
+            var prepared = try database.prepareNativeSchemaOwnerControl(command, .{});
+            defer prepared.deinit();
+            return database.applyPreparedNativeSchemaOwnerControl(&prepared, null);
+        }
+    };
+    for ([_]bool{ false, true }) |cancel_only| {
+        var directory = try @import("../../common/test_directory.zig").TestDirectory.init("default-retirement-owner");
+        defer directory.cleanup();
+        var region = std.heap.ArenaAllocator.init(alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        const reference: sequences.Binding = .{ .generation = .serial, .sequence_id = 11, .namespace_id = 2, .incarnation = @splat(1), .owner = .{ .table_id = F.namespace.table_id, .column_id = 1 }, .target = .{ .table = "shared_n_seq" } };
+        const selector: sequences.DefaultRetirement = .{ .sequence_id = 11, .namespace_id = 2, .incarnation = @splat(1) };
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, a, F.before, .{});
+        const defaults = try std.json.Stringify.valueAlloc(a, .{.{ .column = "n", .sequence = reference }}, .{});
+        try value.object.put(a, "column_defaults", try std.json.parseFromSliceLeaky(std.json.Value, a, defaults, .{}));
+        const before = try std.json.Stringify.valueAlloc(a, value, .{});
+        const after = try selector.schemaAlloc(a, F.namespace.table_id, before);
+        var database = try db_mod.DB.open(alloc, directory.path(), F.options);
+        var live = true;
+        defer if (live) database.close();
+        try database.setSchemaJson(alloc, before);
+        try database.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"n\":1}" }, .{ .key = "b", .value = "{\"n\":null}" } } });
+        const row_key = try internal.relationalRowKeyAlloc(a, "a");
+        const old_row = try database.core.store.get(a, row_key);
+        const predecessor = try database.core.store.get(a, @import("relational_integrity_catalog.zig").key);
+        var candidate = try F.job.Candidate.initDefaultRetirement(alloc, F.namespace.table_id, before, after, predecessor, selector, .{});
+        defer candidate.deinit();
+        const binding = try F.binding(&database, &candidate, 67);
+        _ = try Driver.apply(&database, .{ .binding = binding, .action = .begin, .payload = candidate.inputs });
+        _ = try Driver.apply(&database, .{ .binding = binding, .action = .freeze });
+        var page = try database.prepareNativeSchemaOwnerPage(binding, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{});
+        defer page.deinit();
+        const ready_header = (try database.applyPreparedNativeSchemaOwnerControl(&page, null)).header.?;
+        try std.testing.expectEqual(.ready, ready_header.phase);
+        try std.testing.expectEqual(@as(u64, 0), ready_header.records);
+        try std.testing.expectEqual(@as(u64, 0), ready_header.rows_scanned);
+        // Zero-row progress must also pass the actual historical row audit.
+        // Restart recovery reconstructs this purpose from retained inputs.
+        database.close();
+        live = false;
+        database = try db_mod.DB.open(alloc, directory.path(), F.options);
+        live = true;
+        try std.testing.expectEqualDeep(ready_header, try F.current(&database));
+        const signing_identity = try @import("root_signing_identity.zig").loadOrCreate(alloc, std.testing.io, directory.path());
+        const audit = try F.completeAudit(&database, binding, candidate.inputs, .{ .records = 1, .time_ns = std.time.ns_per_s }, directory.path(), signing_identity.root_incarnation);
+        try std.testing.expectEqual(@as(u64, 0), audit.complete.value.rows.rows);
+        try std.testing.expectEqual(@as(u64, 0), audit.complete.value.rows.records);
+        if (cancel_only) {
+            const canceled = try Driver.apply(&database, .{ .binding = binding, .action = .cancel });
+            try std.testing.expectEqual(.canceled, canceled.header.?.phase);
+            try std.testing.expectEqual(@as(u32, 1), database.core.schema.?.version);
+        } else {
+            var install_body: [64]u8 = undefined;
+            @memset(install_body[0..32], 91);
+            @memcpy(install_body[32..64], &try ready_header.digest());
+            const installed = try Driver.apply(&database, .{ .binding = binding, .action = .install, .payload = &install_body });
+            try std.testing.expectEqual(.installed, installed.header.?.phase);
+            const clock = try F.clock(&database);
+            _ = try Driver.apply(&database, .{ .binding = binding, .action = .install, .payload = &install_body });
+            try std.testing.expectEqual(clock, try F.clock(&database));
+            var release_body: [96]u8 = undefined;
+            @memcpy(release_body[0..32], &installed.header.?.installation.?.decision);
+            @memcpy(release_body[32..64], &try installed.header.?.digest());
+            @memset(release_body[64..96], 95);
+            const released = try Driver.apply(&database, .{ .binding = binding, .action = .release, .payload = &release_body });
+            try std.testing.expectEqual(.released, released.header.?.phase);
+            try std.testing.expectEqual(@as(u32, 2), database.core.schema.?.version);
+        }
+        if (!cancel_only) {
+            const released_audit = try F.completeAudit(&database, binding, candidate.inputs, .{ .records = 1, .time_ns = std.time.ns_per_s }, directory.path(), signing_identity.root_incarnation);
+            try std.testing.expectEqual(@as(u64, 0), released_audit.complete.value.rows.rows);
+            var forged_summary = released_audit.complete.value.rows;
+            forged_summary.rows = 1;
+            forged_summary.records = 1;
+            try std.testing.expectError(error.InvalidSchemaValidationJob, forged_summary.validate());
+            try std.testing.expectError(error.InvalidSchemaValidationJob, forged_summary.validateProgress());
+        }
+        try std.testing.expect((try database.relationalTopologyStatus()).fence == null);
+        try std.testing.expectEqualSlices(u8, old_row, try database.core.store.get(a, row_key));
+        try std.testing.expectEqualStrings("{\"n\":1}", (try database.get(a, "a")).?);
+        try std.testing.expectEqualStrings("{\"n\":null}", (try database.get(a, "b")).?);
+        // Owner publication does not establish sequence metadata retirement
+        // authority. This test exercises the physical half of that barrier.
+        database.close();
+        live = false;
+        database = try db_mod.DB.open(alloc, directory.path(), F.options);
+        live = true;
+        try std.testing.expectEqual(@as(u32, if (cancel_only) 1 else 2), database.core.schema.?.version);
+        try std.testing.expectEqualSlices(u8, old_row, try database.core.store.get(a, row_key));
+    }
+}
+
+test "dependent retirement owner preserves relational LSM bytes through cold install release and cancellation" {
+    const F = NullabilityJobFixture;
+    const sequences = @import("../../system_catalog/column_sequences.zig");
+    const retirement = @import("../../system_catalog/dependency_retirement.zig");
+    const controls = db_mod.DB.NativeSchemaOwnerControl;
+    const Driver = struct {
+        fn apply(database: *db_mod.DB, command: controls.Command) !controls.Outcome {
+            var prepared = try database.prepareNativeSchemaOwnerControl(command, .{});
+            defer prepared.deinit();
+            return database.applyPreparedNativeSchemaOwnerControl(&prepared, null);
+        }
+    };
+    for ([_]bool{ false, true }) |cancel_only| {
+        var directory = try @import("../../common/test_directory.zig").TestDirectory.init("dependent-retirement-owner");
+        defer directory.cleanup();
+        var region = std.heap.ArenaAllocator.init(alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        const reference: sequences.Binding = .{ .generation = .serial, .sequence_id = 11, .namespace_id = 2, .incarnation = @splat(1), .owner = .{ .table_id = F.namespace.table_id, .column_id = 1 }, .target = .{ .table = "shared_n_seq" } };
+        const selector: retirement.Selection = .{ .relations = &.{.{ .table_id = 101, .physical_name = "retired_parent" }}, .sequences = &.{.{ .sequence_id = 11, .namespace_id = 2, .incarnation = @splat(1) }} };
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, a, F.before, .{});
+        const defaults = try std.json.Stringify.valueAlloc(a, .{.{ .column = "n", .sequence = reference }}, .{});
+        try value.object.put(a, "column_defaults", try std.json.parseFromSliceLeaky(std.json.Value, a, defaults, .{}));
+        const before = try std.json.Stringify.valueAlloc(a, value, .{});
+        const after = try selector.schemaAlloc(a, F.namespace.table_id, before);
+        var database = try db_mod.DB.open(alloc, directory.path(), F.options);
+        var live = true;
+        defer if (live) database.close();
+        try database.setSchemaJson(alloc, before);
+        try database.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"n\":1}" }, .{ .key = "b", .value = "{\"n\":null}" } } });
+        const row_key = try internal.relationalRowKeyAlloc(a, "a");
+        const old_row = try database.core.store.get(a, row_key);
+        const predecessor = try database.core.store.get(a, @import("relational_integrity_catalog.zig").key);
+        var candidate = try F.job.Candidate.initDependencyRetirement(alloc, F.namespace.table_id, before, after, predecessor, selector, .{});
+        defer candidate.deinit();
+        const binding = try F.binding(&database, &candidate, 67);
+        _ = try Driver.apply(&database, .{ .binding = binding, .action = .begin, .payload = candidate.inputs });
+        _ = try Driver.apply(&database, .{ .binding = binding, .action = .freeze });
+        var page = try database.prepareNativeSchemaOwnerPage(binding, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{});
+        defer page.deinit();
+        const ready_header = (try database.applyPreparedNativeSchemaOwnerControl(&page, null)).header.?;
+        try std.testing.expectEqual(.ready, ready_header.phase);
+        try std.testing.expectEqual(@as(u64, 0), ready_header.records);
+        try std.testing.expectEqual(@as(u64, 0), ready_header.rows_scanned);
+        // Zero-row progress must also pass the actual historical row audit.
+        // Restart recovery reconstructs this purpose from retained inputs.
+        database.close();
+        live = false;
+        database = try db_mod.DB.open(alloc, directory.path(), F.options);
+        live = true;
+        try std.testing.expectEqualDeep(ready_header, try F.current(&database));
+        const signing_identity = try @import("root_signing_identity.zig").loadOrCreate(alloc, std.testing.io, directory.path());
+        const audit = try F.completeAudit(&database, binding, candidate.inputs, .{ .records = 1, .time_ns = std.time.ns_per_s }, directory.path(), signing_identity.root_incarnation);
+        try std.testing.expectEqual(@as(u64, 0), audit.complete.value.rows.rows);
+        try std.testing.expectEqual(@as(u64, 0), audit.complete.value.rows.records);
+        if (cancel_only) {
+            const canceled = try Driver.apply(&database, .{ .binding = binding, .action = .cancel });
+            try std.testing.expectEqual(.canceled, canceled.header.?.phase);
+            try std.testing.expectEqual(@as(u32, 1), database.core.schema.?.version);
+        } else {
+            var install_body: [64]u8 = undefined;
+            @memset(install_body[0..32], 91);
+            @memcpy(install_body[32..64], &try ready_header.digest());
+            const installed = try Driver.apply(&database, .{ .binding = binding, .action = .install, .payload = &install_body });
+            try std.testing.expectEqual(.installed, installed.header.?.phase);
+            const clock = try F.clock(&database);
+            _ = try Driver.apply(&database, .{ .binding = binding, .action = .install, .payload = &install_body });
+            try std.testing.expectEqual(clock, try F.clock(&database));
+            var release_body: [96]u8 = undefined;
+            @memcpy(release_body[0..32], &installed.header.?.installation.?.decision);
+            @memcpy(release_body[32..64], &try installed.header.?.digest());
+            @memset(release_body[64..96], 95);
+            const released = try Driver.apply(&database, .{ .binding = binding, .action = .release, .payload = &release_body });
+            try std.testing.expectEqual(.released, released.header.?.phase);
+            try std.testing.expectEqual(@as(u32, 2), database.core.schema.?.version);
+        }
+        if (!cancel_only) {
+            const released_audit = try F.completeAudit(&database, binding, candidate.inputs, .{ .records = 1, .time_ns = std.time.ns_per_s }, directory.path(), signing_identity.root_incarnation);
+            try std.testing.expectEqual(@as(u64, 0), released_audit.complete.value.rows.rows);
+            var forged_summary = released_audit.complete.value.rows;
+            forged_summary.rows = 1;
+            forged_summary.records = 1;
+            try std.testing.expectError(error.InvalidSchemaValidationJob, forged_summary.validate());
+            try std.testing.expectError(error.InvalidSchemaValidationJob, forged_summary.validateProgress());
+        }
+        try std.testing.expect((try database.relationalTopologyStatus()).fence == null);
+        try std.testing.expectEqualSlices(u8, old_row, try database.core.store.get(a, row_key));
+        try std.testing.expectEqualStrings("{\"n\":1}", (try database.get(a, "a")).?);
+        try std.testing.expectEqualStrings("{\"n\":null}", (try database.get(a, "b")).?);
+        // Owner publication does not establish sequence metadata retirement
+        // authority. This test exercises the physical half of that barrier.
+        database.close();
+        live = false;
+        database = try db_mod.DB.open(alloc, directory.path(), F.options);
+        live = true;
+        try std.testing.expectEqual(@as(u32, if (cancel_only) 1 else 2), database.core.schema.?.version);
+        try std.testing.expectEqualSlices(u8, old_row, try database.core.store.get(a, row_key));
+    }
+}

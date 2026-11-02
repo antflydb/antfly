@@ -67,7 +67,8 @@ pub const Intent = struct {
         if (self.snapshot.index != self.image.index or self.snapshot.term != self.image.term or
             !std.mem.eql(u8, &(self.image.metadata_digest orelse return error.InvalidSnapshotRetention), &metadata_digest)) return error.InvalidSnapshotRetention;
         if (self.revision == 0 or self.revision == std.math.maxInt(u64) or self.root_epoch == std.math.maxInt(u64) or
-            std.mem.allEqual(u8, &self.owner_digest, 0) or self.lookup.table != self.binding.fence.namespace.table_id or
+            std.mem.allEqual(u8, &self.owner_digest, 0) or
+            (self.binding.purpose != .enum_epoch and self.binding.purpose != .domain_not_null and self.lookup.table != self.binding.fence.namespace.table_id) or
             !std.mem.eql(u8, &self.lookup.id, &self.binding.id) or !std.mem.eql(u8, &self.lookup.plan_digest, &self.binding.plan_digest) or
             !std.mem.eql(u8, &self.lookup.metadata_incarnation, &self.scope.metadata_incarnation) or
             self.image.group_id != self.scope.group_id or self.image.index > self.scope.reported_applied_index or
@@ -1484,4 +1485,40 @@ test "schema validation source outbox pending recovery only observes uncertainty
     var cursor = (try RecoveryCursor.init(a, std.testing.io, path)).?;
     defer cursor.deinit();
     try std.testing.expect(try cursor.next(.{}) == null);
+}
+
+// The anchor identifies the immutable metadata job, while namespace identifies
+// the physical checkpoint. Current metadata membership is still required when
+// granting that checkpoint; an intent is only durable recovery input.
+test "schema validation source outbox enum cohort retains secondary namespace across cold recovery" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const fixture = try TestFixture.init(a, path);
+    var intent = fixture.intent;
+    intent.binding.purpose = .enum_epoch;
+    intent.binding.fence.namespace.table_id = 8;
+    intent.binding.columns = 1;
+    intent.scope.binding_digest = try @import("schema_validation_attestation.zig").bindingDigest(intent.binding);
+    try intent.validate();
+    {
+        var store = try open(a, std.testing.io, path, fixture.root.root_incarnation, intent.namespace(), .{});
+        defer store.deinit();
+        try store.reserve(intent);
+    }
+    var recovered = try open(a, std.testing.io, path, fixture.root.root_incarnation, intent.namespace(), .{});
+    defer recovered.deinit();
+    const saved = recovered.record().?.intent;
+    try std.testing.expect(saved.eql(intent));
+    try std.testing.expectEqual(@as(u64, 7), saved.lookup.table);
+    try std.testing.expectEqual(@as(u64, 8), saved.binding.fence.namespace.table_id);
+    var forged = saved;
+    forged.binding.purpose = .not_null;
+    forged.scope.binding_digest = try @import("schema_validation_attestation.zig").bindingDigest(forged.binding);
+    try std.testing.expectError(error.SchemaValidationJobChanged, forged.validate());
+    forged = saved;
+    forged.lookup.plan_digest[0] ^= 1;
+    try std.testing.expectError(error.SchemaValidationJobChanged, forged.validate());
 }

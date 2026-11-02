@@ -338,6 +338,7 @@ pub const DocumentProperty = struct {
     sql_column_name: ?[]const u8 = null,
     named_type_id: ?u64 = null,
     enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
+    domain_view: ?*const @import("domain_value.zig").View = null,
     sql_type: ?@import("../common/sql_builtin_type.zig").Type = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     allows_null: bool = false,
@@ -580,7 +581,7 @@ const SchemaContext = struct {
 pub const CompiledValidationPlan = struct {
     const PropertyMap = std.StringHashMapUnmanaged(usize);
     const SqlColumn = struct { name: []const u8, kind: @import("../common/sql_builtin_type.zig").Type, generated: bool, defaulted: bool, is_array: bool, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
-    const Normalization = enum { base, derived, all };
+    const Normalization = enum { base, defaults, derived, all };
     /// Borrowed immutable epoch identity, stable across owner struct moves.
     schema_documents: []const DocumentSchema = &.{},
     schema_version: u32 = 0,
@@ -592,6 +593,11 @@ pub const CompiledValidationPlan = struct {
     checks: ?*@import("relational_checks.zig").Set = null,
     historical_checks: bool = false,
     expressions: ?*@import("relational_expression.zig").Set = null,
+    domains: ?@import("domain_row.zig").Plan = null,
+    /// Prepared once per epoch; no per-row schema-width allocation.
+    domain_derived: []const bool = &.{},
+    domain_candidate_generated: []const bool = &.{},
+    domain_admission: ?@import("domain_row.zig").Admission = null,
 
     pub fn init(alloc: std.mem.Allocator, schema: TableSchema) !CompiledValidationPlan {
         var plan: CompiledValidationPlan = .{ .schema_documents = schema.document_schemas, .schema_version = schema.version, .schema_mode = schema.storage_mode };
@@ -617,12 +623,31 @@ pub const CompiledValidationPlan = struct {
             };
         };
         plan.sql_columns = try sql_columns.toOwnedSlice(alloc);
+        const has_domains = blk: {
+            for (schema.document_schemas) |document| for (document.properties) |property| {
+                if (property.domain_view != null) break :blk true;
+            };
+            break :blk false;
+        };
+        if (has_domains) {
+            plan.domains = try @import("mod.zig").prepareDomainRows(alloc, schema);
+            const derived = try alloc.alloc(bool, plan.domains.?.column_count);
+            plan.domain_derived = derived;
+            @memset(derived, false);
+            if (schema.column_defaults) |declarations| for (declarations.value.array.items) |entry|
+                plan.domains.?.excludeDomainDefaults(&.{entry.object.get("column").?.string});
+            if (schema.generated_columns) |declarations| for (declarations.value.array.items) |entry|
+                try plan.domains.?.markGenerated(entry.object.get("column").?.string, derived);
+        }
         for (schema.document_schemas) |document| try plan.addProperty(alloc, makeRootDocumentProperty(document));
         if ((schema.storage_mode == .relational or hasDocumentExpressions(schema)) and (schema.column_defaults != null or schema.generated_columns != null)) {
             const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, schema);
             errdefer storage_schema.freeSchema(alloc, runtime);
             plan.expressions = try @import("relational_expression.zig").Set.createOwned(alloc, runtime, if (schema.column_defaults) |expressions| expressions.value else .null, if (schema.generated_columns) |expressions| expressions.value else .null);
         }
+        if (plan.domains != null) if (plan.expressions) |expressions| {
+            plan.domain_candidate_generated = try expressions.generatedClosure(alloc, plan.domain_derived);
+        };
         if (schema.checks) |checks| if (checks.value.len != 0) {
             const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, schema);
             errdefer storage_schema.freeSchema(alloc, runtime);
@@ -633,6 +658,9 @@ pub const CompiledValidationPlan = struct {
 
     pub fn deinit(self: *CompiledValidationPlan, alloc: std.mem.Allocator) void {
         alloc.free(self.sql_columns);
+        if (self.domains) |*domains| domains.deinit();
+        alloc.free(self.domain_derived);
+        alloc.free(self.domain_candidate_generated);
         if (self.checks) |checks| checks.deinit();
         if (self.expressions) |expressions| expressions.deinit();
         var maps = self.properties.valueIterator();
@@ -657,6 +685,7 @@ pub const CompiledValidationPlan = struct {
         const casts = @import("../sql/builtin_cast.zig");
         for (self.sql_columns) |column| {
             if (selection == .base and column.generated) continue;
+            if (selection == .defaults and (!column.defaulted or column.generated)) continue;
             if (selection == .derived and !column.generated and !column.defaulted) continue;
             try execution.charge(1);
             const cell = root.object.getPtr(column.name) orelse continue;
@@ -1232,6 +1261,7 @@ fn physicalLayoutDischargesProperty(property: DocumentProperty) bool {
             !std.mem.eql(u8, reflected_name, "numeric_modifier") and
             !std.mem.eql(u8, reflected_name, "named_type_id") and
             !std.mem.eql(u8, reflected_name, "enum_view") and
+            !std.mem.eql(u8, reflected_name, "domain_view") and
             !std.mem.eql(u8, reflected_name, "integer_only") and
             !std.mem.eql(u8, reflected_name, "allows_null"))
         {
@@ -1380,6 +1410,7 @@ pub fn prepareTypedDocumentPhase(owned_alloc: std.mem.Allocator, scratch: std.me
     var budget: usize = expressions_module.max_allocated_bytes;
     var execution = expressions_module.Execution.init(owned_alloc, &budget);
     execution.preparation_runtime = runtime;
+    execution.domain_admission = compiled.domain_admission orelse if (runtime) |resources| resources.domain_admission else null;
     var roots: operands.JsonRow = undefined;
     roots.init(owned_alloc, budget, &execution.numeric);
     defer roots.deinit();
@@ -1419,10 +1450,51 @@ pub fn prepareTypedDocumentPhase(owned_alloc: std.mem.Allocator, scratch: std.me
         };
     }
     if (!preserve) {
-        try compiled.normalizeSql(&execution, value, false, .base);
-        if (compiled.expressions) |expressions| {
-            try expressions.applyTypedJsonPhase(&execution, value, &roots, &nulls, phase);
-            if (phase != .candidate) try compiled.normalizeSql(&execution, value, false, .derived);
+        if (compiled.domains) |*domains| {
+            const admission = execution.domain_admission orelse @import("domain_row.zig").Admission{ .schema_version = schema.version };
+            // Authenticate before defaults or generated expressions can mutate
+            // the candidate. Sparse witnesses never become public input data.
+            try domains.requireAdmission(admission);
+            if (phase != .selected) {
+                if (compiled.expressions) |expressions| try expressions.requireDefaultInputs(value.*, admission);
+                try domains.prepareJsonDefaultsForAdmission(&execution, value, &nulls, admission);
+            }
+            try compiled.normalizeSql(&execution, value, false, .base);
+            if (phase != .selected) if (compiled.expressions) |expressions| {
+                try expressions.applyTypedJsonPhase(&execution, value, &roots, &nulls, .candidate);
+                try compiled.normalizeSql(&execution, value, false, .defaults);
+            };
+            if (try domains.validateJsonAdmission(&execution, value.*, &roots, &nulls, admission, compiled.domain_derived, .base)) |failure|
+                return switch (failure.violation.kind) {
+                    .not_null => error.SqlNotNullViolation,
+                    .check => error.RelationalCheckViolation,
+                };
+            if (phase == .candidate and compiled.domain_candidate_generated.len != 0) {
+                if (compiled.expressions) |expressions| try expressions.applyTypedJsonGeneratedSelection(&execution, value, &roots, &nulls, compiled.domain_candidate_generated);
+                try compiled.normalizeSql(&execution, value, false, .derived);
+                if (try domains.validateJsonAdmission(&execution, value.*, &roots, &nulls, admission, compiled.domain_derived, .derived)) |failure|
+                    return switch (failure.violation.kind) {
+                        .not_null => error.SqlNotNullViolation,
+                        .check => error.RelationalCheckViolation,
+                    };
+            }
+            if (phase != .candidate) {
+                if (compiled.expressions) |expressions| {
+                    try expressions.applyTypedJsonPhase(&execution, value, &roots, &nulls, .selected);
+                    try compiled.normalizeSql(&execution, value, false, .derived);
+                }
+                if (try domains.validateJsonAdmission(&execution, value.*, &roots, &nulls, admission, compiled.domain_derived, .derived)) |failure|
+                    return switch (failure.violation.kind) {
+                        .not_null => error.SqlNotNullViolation,
+                        .check => error.RelationalCheckViolation,
+                    };
+            }
+        } else {
+            try compiled.normalizeSql(&execution, value, false, .base);
+            if (compiled.expressions) |expressions| {
+                try expressions.applyTypedJsonPhase(&execution, value, &roots, &nulls, phase);
+                if (phase != .candidate) try compiled.normalizeSql(&execution, value, false, .derived);
+            }
         }
     }
     const names = nulls.snapshot() catch |err| return switch (err) {
@@ -3234,7 +3306,20 @@ fn bindNamedProperty(property: *DocumentProperty, registry: ?named_layouts.Regis
         if (!root) return error.InvalidSchemaUpdateRequest;
         if (!unresolved) {
             const types = registry orelse return error.InvalidSchemaUpdateRequest;
-            property.enum_view = types.byId(id) orelse return error.InvalidSchemaUpdateRequest;
+            if (types.domainById(id)) |domain| {
+                property.domain_view = domain;
+                property.enum_view = domain.enumeration;
+                const base = domain.column;
+                if (property.sql_type) |declared| {
+                    if (base.sql_element_type == null or declared != base.sql_element_type.?) return error.InvalidSchemaUpdateRequest;
+                } else property.sql_type = base.sql_element_type;
+                if (property.numeric_modifier != null and !@import("../common/sql_builtin_type.zig").NumericModifier.eql(property.numeric_modifier, base.numeric_modifier)) return error.InvalidSchemaUpdateRequest;
+                property.numeric_modifier = base.numeric_modifier;
+                if (@import("mod.zig").runtimeRelationalColumnType(property.*) != base.column_type) return error.InvalidSchemaUpdateRequest;
+            } else {
+                if (property.field_type == null or !std.mem.eql(u8, property.field_type.?, "sql_enum") or property.sql_type != null or property.numeric_modifier != null) return error.InvalidSchemaUpdateRequest;
+                property.enum_view = types.byId(id) orelse return error.InvalidSchemaUpdateRequest;
+            }
         }
     }
     const info = @typeInfo(DocumentProperty).@"struct";
@@ -4118,7 +4203,7 @@ fn parseScalarPropertyKeywords(alloc: std.mem.Allocator, numeric_domain: bool, o
         break :id number;
     } else null;
     const enum_family = if (property.field_type) |physical| std.mem.eql(u8, physical, "sql_enum") else false;
-    if (enum_family != (property.named_type_id != null) or (enum_family and (object.contains("x-antfly-sql-type") or object.contains("x-antfly-sql-numeric-modifier")))) return error.InvalidSchemaUpdateRequest;
+    if ((enum_family and property.named_type_id == null) or (enum_family and (object.contains("x-antfly-sql-type") or object.contains("x-antfly-sql-numeric-modifier")))) return error.InvalidSchemaUpdateRequest;
     property.sql_type = if (object.get("x-antfly-sql-type")) |value| blk: {
         if (value != .string) return error.InvalidSchemaUpdateRequest;
         const physical = property.field_type orelse return error.InvalidSchemaUpdateRequest;
@@ -5514,7 +5599,7 @@ fn validateDocumentFieldValueWithContext(
         return error.InvalidBatchRequest;
     }
 
-    if (property.named_type_id != null) {
+    if (property.enum_view != null) {
         if (value.* != .string) return error.InvalidBatchRequest;
         const view = property.enum_view orelse return error.InvalidBatchRequest;
         if (value.string.len > @import("../system_catalog/named_types.zig").max_label_bytes) return error.InvalidBatchRequest;

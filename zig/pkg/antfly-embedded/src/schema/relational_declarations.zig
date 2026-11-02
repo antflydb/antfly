@@ -191,6 +191,16 @@ fn columnTypesMode(alloc: std.mem.Allocator, runtime: native.TableSchema, names:
         } else return error.InvalidSchemaUpdateRequest;
         switch (column.column_type) {
             .string, .blob, .boolean, .datetime, .integer, .number => {},
+            .enumeration => {
+                const id = column.named_type_id orelse return error.InvalidSchemaUpdateRequest;
+                const record = native.namedType(runtime, id) orelse return error.InvalidSchemaUpdateRequest;
+                // A symbol carrier alone cannot distinguish unrelated enums.
+                // Bind the same immutable identity as TuplePlan, excluding
+                // executable generations and appended labels so ADD VALUE
+                // preserves existing unique/FK generation identities.
+                kind.* = try std.fmt.allocPrint(alloc, "enumeration:{d}:{s}", .{ id, std.fmt.bytesToHex(record.identity.origin_id, .lower) });
+                continue;
+            },
             .numrange, .daterange, .tsrange, .tstzrange => if (!temporal) return error.InvalidSchemaUpdateRequest,
             else => return error.InvalidSchemaUpdateRequest,
         }

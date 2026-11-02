@@ -18,7 +18,7 @@
 //! Parameters remain typed values, never interpolated into SQL text.
 const std = @import("std");
 
-pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange, enumeration };
+pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange, enumeration, bytea };
 pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
 pub const Column = struct {
     defaulted: bool = false,
@@ -27,6 +27,7 @@ pub const Column = struct {
     temporal_kind: ?@import("antfly_local_sources").sql_temporal_value.Kind = null,
     element_type: ?@import("antfly_local_sources").sql_array_value.ElementType = null,
     numeric_modifier: ?@import("antfly_local_sources").sql_scalar.NumericModifier = null,
+    domain_view: ?*const @import("antfly_local_sources").sql_catalog.domain_values.View = null,
     enum_view: ?*const @import("antfly_local_sources").sql_scalar.EnumValues.View = null,
 };
 /// Metadata survives producer/statement retirement; views are immutable and
@@ -34,8 +35,10 @@ pub const Column = struct {
 pub fn cloneColumnsLeaky(a: std.mem.Allocator, input: []const Column) ![]Column {
     const output = try a.dupe(Column, input);
     var views: std.AutoHashMapUnmanaged(*const @import("antfly_local_sources").sql_scalar.EnumValues.View, *const @import("antfly_local_sources").sql_scalar.EnumValues.View) = .empty;
+    var domains: @import("antfly_local_sources").sql_scalar.DomainViews = .empty;
     for (output) |*column| {
         column.name = try a.dupe(u8, column.name);
+        column.domain_view = try @import("antfly_local_sources").sql_scalar.ownDomainView(a, &domains, column.domain_view);
         column.enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(a, &views, column.enum_view);
     }
     return output;
@@ -46,7 +49,8 @@ pub fn sameColumnType(a: Column, b: Column) bool {
     return a.type == b.type and a.element_type == b.element_type and
         (a.type != .datetime or (a.temporal_kind orelse .timestamp_tz) == (b.temporal_kind orelse .timestamp_tz)) and
         @import("antfly_local_sources").sql_scalar.NumericModifier.eql(a.numeric_modifier, b.numeric_modifier) and
-        @import("antfly_local_sources").sql_scalar.sameEnumDomain(a.enum_view, b.enum_view);
+        @import("antfly_local_sources").sql_scalar.sameEnumDomain(a.enum_view, b.enum_view) and
+        @import("antfly_local_sources").sql_scalar.sameDomain(a.domain_view, b.domain_view);
 }
 
 pub const TransactionStatus = enum(u8) { idle = 'I', in_transaction = 'T', failed = 'E' };
@@ -257,6 +261,7 @@ pub const Cell = struct {
     numeric: ?*const @import("antfly_local_sources").sql_numeric_value.Value = null,
     range: ?*const @import("antfly_local_sources").sql_range_value.Value = null,
     enumeration: ?*const @import("antfly_local_sources").sql_scalar.EnumValues.Value = null,
+    bytea: ?[]const u8 = null,
 };
 pub const Cells = struct {
     context: *anyopaque,

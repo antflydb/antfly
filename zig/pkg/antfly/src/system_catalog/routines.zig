@@ -171,3 +171,9 @@ pub fn inputSignature(kind: ?records.Kind, signature: []const u8) ?[]const u8 {
     if (operator != (kind == .operator)) return null;
     return if (operator) signature[9..] else signature;
 }
+
+/// Every producer and native apply selects the same combined decoder floor.
+pub fn decoderVersion(request: Mutation) u16 {
+    const protocol = @import("../metadata/topology_protocol.zig");
+    return if (request.operation == .publish and request.operation.publish.definition.returns_trigger) protocol.sql_trigger_function_version else protocol.sql_routine_version;
+}

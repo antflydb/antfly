@@ -38,6 +38,7 @@ const stderr_writer = @import("../tracing/stderr_writer.zig");
 const ttl = @import("ttl.zig");
 const retained_effects = @import("retained_effects.zig");
 pub const topology_debt = @import("transaction_debt.zig");
+pub const ExternalDecisionOwner = @import("transaction_decision_owner.zig").External;
 
 // ============================================================================
 // Key prefixes
@@ -79,6 +80,86 @@ const read_guards_prefix = "\x00\x00__txn_read_guards__:";
 const read_members_prefix = "\x00\x00__txn_read_members__:";
 const read_admission_prefix = "\x00\x00__txn_read_admission__:";
 const read_guard_count_key = "\x00\x00__txn_read_guard_count";
+// Metadata admission and native read-side cohort work share one limit.
+// Intent payload count never determines snapshot admission work.
+pub const max_external_prepared_transactions = 64;
+const external_read_barrier_count_key = "\x00\x00__txn_external_read_barrier_count";
+const external_expiry_floor_key = "\x00\x00__txn_external_expiry_floor";
+
+fn externalReadBarrierCount(view: anytype) !u64 {
+    const raw = view.get(external_read_barrier_count_key) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    return decodeExternalReadBarrierCount(raw);
+}
+
+fn decodeExternalReadBarrierCount(raw: ?[]const u8) !u64 {
+    const bytes = raw orelse return 0;
+    if (bytes.len != 8) return error.InvalidTxnRecord;
+    const count = std.mem.readInt(u64, bytes[0..8], .little);
+    if (count == 0) return error.InvalidTxnRecord;
+    return count;
+}
+
+/// Check once against the exact immutable serving root, including empty scans
+/// and absent point reads. This covers insertion/deletion phantoms without
+/// looking up a lock for each returned row. Old roots remain readable.
+pub fn checkExternalReadAdmission(view: anytype) !void {
+    if (try externalReadBarrierCount(view) != 0) return error.IntentConflict;
+}
+
+/// Skip each external transaction's entire intent key range, rather than
+/// examining its rows. Fail closed at the shared admission limit, including a
+/// corrupt/missing owner record. Every observation uses one immutable root.
+fn statementReadHasDebt(read: anytype) !bool {
+    if (try externalReadBarrierCount(read) != 0) return true;
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var entry = try cursor.seekAtOrAfter(intents_prefix);
+    var cohorts: usize = 0;
+    while (entry) |item| {
+        if (!std.mem.startsWith(u8, item.key, intents_prefix)) break;
+        if (cohorts == max_external_prepared_transactions) return true;
+        if (item.key.len < intents_prefix.len + 17 or item.key[intents_prefix.len + 16] != ':') return error.InvalidTxnRecord;
+        const id: TxnId = item.key[intents_prefix.len..][0..16].*;
+        const bytes = read.get(&makeRecordKey(id)) catch |err| switch (err) {
+            error.NotFound => return error.InvalidTxnRecord,
+            else => return err,
+        };
+        const record = try decodeRecord(bytes);
+        if (record.external_decision_owner == null) return true;
+        if (record.status != .pending or !record.prepared or record.external_commit_started) return error.InvalidTxnRecord;
+        var next: [intents_prefix.len + 17]u8 = undefined;
+        @memcpy(next[0..intents_prefix.len], intents_prefix);
+        @memcpy(next[intents_prefix.len..][0..16], &id);
+        next[intents_prefix.len + 16] = ':' + 1;
+        cohorts += 1;
+        entry = try cursor.seekAtOrAfter(&next);
+    }
+    return false;
+}
+
+/// Atomic point admission preserves the no-memtable-clone serving fast path.
+/// The returned lease owns the borrowed row and must outlive its consumption.
+pub fn captureServingValue(store: *DocStore, key: []const u8, value: *?[]const u8) !DocStore.Txn {
+    const first = std.mem.order(u8, key, external_read_barrier_count_key) == .lt;
+    const keys: [2][]const u8 = if (first) .{ key, external_read_barrier_count_key } else .{ external_read_barrier_count_key, key };
+    var values: [2]?[]const u8 = undefined;
+    var lease = try store.readManyConsistent(&keys, &values);
+    errdefer lease.abort();
+    if (try decodeExternalReadBarrierCount(values[if (first) 1 else 0]) != 0) return error.IntentConflict;
+    value.* = values[if (first) 0 else 1];
+    return lease;
+}
+
+pub fn terminalRetentionElapsed(record: anytype, cutoff: u64, retained_cutoff: u64) bool {
+    // External fences may be reclaimed only after their admission window.
+    // The caller's ordinary/retained cutoff must never advance that deadline.
+    if (record.external_decision_owner) |owner| return record.finalized_at != 0 and owner.expires_at_unix_ns < cutoff;
+    return record.finalized_at < (if (record.retain_terminal) retained_cutoff else cutoff);
+}
+
 pub const max_read_guards_per_transaction = 65_536;
 // Durable epoch leases. A prepare vote and its schema identity are one atomic
 // mutation; resolution retires both. Historical immutable schemas remain
@@ -231,6 +312,9 @@ pub const TxnStatus = enum(u8) {
 };
 
 pub const WriteIntent = struct {
+    /// Transient internal origin marker, consumed by canonical AROW materialization
+    /// before voting prepared. It is never an alternative journal value format.
+    prepared_domain: ?*const @import("../schema/domain_handoff.zig").Contract = null,
     row_policy_requirement: @import("../usermgr/row_policy_authority.zig").MutationRequirement = .native,
     key: []const u8,
     value: ?[]const u8, // null for deletes
@@ -244,6 +328,10 @@ pub const WriteIntent = struct {
     /// catalog; public caller estimates are never used as admission authority.
     retained_artifact_bytes: u64 = 0,
     retained_artifact_keys: u64 = 0,
+
+    pub fn json_skip_field(self: @This(), field: []const u8) bool {
+        return std.mem.eql(u8, field, "prepared_domain") and self.prepared_domain == null;
+    }
 };
 
 pub const IntentValue = struct {
@@ -446,6 +534,8 @@ pub const TxnSummary = struct {
     coordinator: bool,
     coordinator_known: bool,
     retain_terminal: bool = false,
+    external_decision_owner: ?ExternalDecisionOwner = null,
+    external_commit_started: bool = false,
     intents_resolved: bool = false,
     intents_resolved_known: bool = false,
 };
@@ -456,6 +546,7 @@ pub const TxnSummaryPage = struct {
 };
 
 pub const ResolutionExtraBatch = struct {
+    external_decision_owner: ?ExternalDecisionOwner = null,
     /// Borrowed through this resolution attempt. Terminal-decision retries do
     /// not attach it: they must never re-certify already applied row effects.
     commit_participant: ?@import("commit_participant.zig").Participant = null,
@@ -492,6 +583,7 @@ pub const ResolutionExtraBatch = struct {
 /// transaction metadata transition. Raft apply uses this to fence the exact log
 /// entry without a crash window between the transaction and its replay marker.
 pub const MutationExtraBatch = struct {
+    external_decision_owner: ?ExternalDecisionOwner = null,
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
     /// DB preparation supplies a binding (including explicit schemaless).
@@ -584,6 +676,10 @@ const TxnRecord = struct {
     /// learned, but recovery must never presume-abort a participant that has
     /// already voted to commit.
     prepared: bool = false,
+    /// A prepared external coordinator retains its vote until the exact
+    /// metadata decision owner explicitly resolves it. Age is not a decision.
+    external_decision_owner: ?ExternalDecisionOwner = null,
+    external_commit_started: bool = false,
     /// Older encodings did not persist the prepare vote. Recovery treats
     /// distributed records from those versions conservatively rather than
     /// risking an incorrect abort during a rolling upgrade.
@@ -618,6 +714,7 @@ const txn_record_v3_size = 50;
 const txn_record_v4_size = 51;
 const txn_record_v5_size = 52;
 const txn_record_v6_size = 53;
+const txn_record_v7_size = txn_record_v6_size + ExternalDecisionOwner.encoded_len + 1;
 
 // ============================================================================
 // TxnManager
@@ -651,6 +748,17 @@ pub const IntentReadGuard = struct {
         };
         if (owner.len != @sizeOf(TxnId)) return TxnError.InvalidTxnRecord;
         if (self.exclude_txn) |txn| if (std.mem.eql(u8, owner, &txn)) return;
+        const record_key = makeRecordKey(owner[0..16].*);
+        const raw = view.get(&record_key) catch |err| switch (err) {
+            error.NotFound => return error.InvalidTxnRecord,
+            else => return err,
+        };
+        const record = try decodeRecord(raw);
+        // Externally prepared writes remain invisible while the external
+        // owner is undecided. Commit first activates these existing barriers
+        // on EVERY participant, then resolves any row effects. A pinned old
+        // snapshot keeps seeing the old record and old row together.
+        if (record.status == .pending and record.external_decision_owner != null and !record.external_commit_started) return;
         return TxnError.IntentConflict;
     }
 };
@@ -813,12 +921,21 @@ pub const TxnManager = struct {
         retain_terminal: bool,
         extra_batch: MutationExtraBatch,
     ) !void {
+        if (extra_batch.external_decision_owner) |owner| {
+            try owner.validate();
+            if (!retain_terminal) return error.ExternalTransactionDecisionRequired;
+            if (owner.expires_at_unix_ns <= try self.externalExpiryFloor()) return error.ExternalTransactionAdmissionExpired;
+        }
         const key = makeRecordKey(txn_id);
         const existing = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
             TxnError.TxnNotFound => null,
             else => return err,
         };
         if (existing) |record| {
+            if (record.external_decision_owner) |held| {
+                const requested = extra_batch.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
+                if (!held.eql(requested)) return error.ExternalTransactionDecisionChanged;
+            } else if (extra_batch.external_decision_owner != null) return error.ExternalTransactionDecisionChanged;
             if (record.status != .pending or record.begin_timestamp != timestamp) return TxnError.DecisionConflict;
             if (record.coordinator_known and record.coordinator != coordinator) return TxnError.DecisionConflict;
             if (record.retain_terminal_known and record.retain_terminal != retain_terminal) return TxnError.DecisionConflict;
@@ -847,6 +964,7 @@ pub const TxnManager = struct {
             return;
         }
         const record = TxnRecord{
+            .external_decision_owner = extra_batch.external_decision_owner,
             .status = .pending,
             .begin_timestamp = timestamp,
             .commit_version = 0,
@@ -923,9 +1041,18 @@ pub const TxnManager = struct {
         extra_batch: MutationExtraBatch,
     ) !void {
         if (extra_batch.index_span_digests.len > max_read_guards_per_transaction) return error.TransactionTooLarge;
-        for (intents) |intent| if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
+        for (intents) |intent| {
+            if (intent.prepared_domain != null or (intent.json_null_fields.len != 0 and intent.prepared_row == null)) return error.PreparedIntentRequiresMaterialization;
+        }
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
+        if (record.external_decision_owner) |owner| {
+            const requested = extra_batch.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
+            if (!owner.eql(requested)) return error.ExternalTransactionDecisionChanged;
+        } else if (extra_batch.external_decision_owner != null) return error.ExternalTransactionDecisionChanged;
+        if (record.external_decision_owner) |owner| {
+            if (owner.expires_at_unix_ns <= try self.externalExpiryFloor()) return error.ExternalTransactionAdmissionExpired;
+        }
 
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var schema_lease_value: [5]u8 = @splat(0);
@@ -1155,6 +1282,76 @@ pub const TxnManager = struct {
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
     }
 
+    /// Replicated phase-one visibility barrier for an externally committed
+    /// transaction. The metadata decision owner activates every participant
+    /// before resolving the first. Existing coordinated read fences then see
+    /// an old immutable cut, a retryable barrier, or fully committed rows.
+    pub fn activateExternalDecision(self: *TxnManager, txn_id: TxnId, owner: ExternalDecisionOwner, extra: MutationExtraBatch) !void {
+        try owner.validate();
+        var record = try self.loadTransactionRecord(txn_id);
+        const held = record.external_decision_owner orelse return error.ExternalTransactionDecisionRequired;
+        if (!held.eql(owner)) return error.ExternalTransactionDecisionChanged;
+        if (!record.prepared or record.status == .aborted) return error.DecisionConflict;
+        var barrier_value: [8]u8 = undefined;
+        const install_barrier = !record.external_commit_started;
+        if (install_barrier) {
+            var read = try self.store.beginProbe();
+            defer read.abort();
+            const count = std.math.add(u64, try externalReadBarrierCount(&read), 1) catch return error.InvalidTxnRecord;
+            std.mem.writeInt(u64, &barrier_value, count, .little);
+        }
+        record.external_commit_started = true;
+        const encoded = try self.encodeRecord(record);
+        defer self.alloc.free(encoded);
+        const key = makeRecordKey(txn_id);
+        var writes: std.ArrayList(docstore.KVPair) = .empty;
+        defer writes.deinit(self.alloc);
+        try writes.append(self.alloc, .{ .key = &key, .value = encoded });
+        if (install_barrier) try writes.append(self.alloc, .{ .key = external_read_barrier_count_key, .value = &barrier_value });
+        try writes.appendSlice(self.alloc, extra.writes);
+        try self.applyBatch(writes.items, extra.deletes, null);
+    }
+
+    fn externalExpiryFloor(self: *TxnManager) !u64 {
+        var read = try self.store.beginProbe();
+        defer read.abort();
+        const bytes = read.get(external_expiry_floor_key) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        if (bytes.len != 8) return error.InvalidTxnRecord;
+        const floor = std.mem.readInt(u64, bytes[0..8], .little);
+        if (floor == 0) return error.InvalidTxnRecord;
+        return floor;
+    }
+
+    fn fenceMissingExternalAbort(self: *TxnManager, id: TxnId, timestamp: u64, extra: ResolutionExtraBatch) !ResolutionOutcome {
+        const owner = extra.external_decision_owner.?;
+        try owner.validate();
+        if (try self.externalExpiryFloor() >= owner.expires_at_unix_ns) {
+            try self.applyBatch(extra.completion_writes, extra.completion_deletes, null);
+            return .{ .applied = false, .replay_sequence = 0 };
+        }
+        const key = makeRecordKey(id);
+        const record: TxnRecord = .{ .status = .aborted, .begin_timestamp = timestamp, .commit_version = 0, .created_at = timestamp, .finalized_at = timestamp, .retain_terminal = true, .intents_resolved = true, .intents_resolved_known = true, .external_decision_owner = owner };
+        const bytes = try self.encodeRecord(record);
+        defer self.alloc.free(bytes);
+        var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
+        defer writes.deinit(self.alloc);
+        try writes.append(self.alloc, .{ .key = &key, .value = bytes });
+        const participant_key = makeSidecarKey(participants_prefix, id);
+        const resolved_key = makeSidecarKey(resolved_participants_prefix, id);
+        const participants = if (extra.resolved_participant) |peer| try encodeParticipantList(self.alloc, &.{peer}) else null;
+        defer if (participants) |value| self.alloc.free(value);
+        if (participants) |value| {
+            try writes.append(self.alloc, .{ .key = &participant_key, .value = value });
+            try writes.append(self.alloc, .{ .key = &resolved_key, .value = value });
+        }
+        try writes.appendSlice(self.alloc, extra.completion_writes);
+        try self.applyBatch(writes.items, extra.completion_deletes, null);
+        return .{ .applied = false, .replay_sequence = 0 };
+    }
+
     /// Resolve intents: commit applies them to real keys, abort deletes them.
     /// Conflicting terminal decisions return `TxnError.DecisionConflict`; callers
     /// should treat that as a protocol inconsistency / torn-state signal rather
@@ -1172,7 +1369,11 @@ pub const TxnManager = struct {
     ) !ResolutionOutcome {
         const rec_key = makeRecordKey(txn_id);
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
-        var record = try self.loadTransactionRecord(txn_id);
+        var record = self.loadTransactionRecord(txn_id) catch |err| {
+            if (err == error.TxnNotFound and status == .aborted and extra_batch.external_decision_owner != null)
+                return self.fenceMissingExternalAbort(txn_id, timestamp, extra_batch);
+            return err;
+        };
         var resolved_participant_key: [resolved_participants_prefix.len + 16]u8 = undefined;
         var resolved_participant_value: ?[]u8 = null;
         defer if (resolved_participant_value) |value| self.alloc.free(value);
@@ -1213,6 +1414,14 @@ pub const TxnManager = struct {
             if (record.intent_revision != expected) return error.IntentSnapshotChanged;
         }
         const was_terminal = record.status != .pending;
+        if (record.external_decision_owner) |owner| {
+            if (extra_batch.external_decision_owner) |requested| {
+                try requested.validate();
+                if (!owner.eql(requested)) return error.ExternalTransactionDecisionChanged;
+            } else if (!was_terminal) return error.ExternalTransactionDecisionRequired;
+            if (!was_terminal and status == .committed and !record.external_commit_started) return error.ExternalTransactionCommitNotActivated;
+            if (!was_terminal and status == .aborted and record.external_commit_started) return error.DecisionConflict;
+        } else if (extra_batch.external_decision_owner != null) return error.ExternalTransactionDecisionChanged;
         applyResolveDecision(&record, status, timestamp) catch |err| {
             if (err == TxnError.DecisionConflict) {
                 if (self.trace_writer) |tw| {
@@ -1322,6 +1531,18 @@ pub const TxnManager = struct {
             owned_apply_keys.deinit(self.alloc);
         }
 
+        var external_barrier_value: [8]u8 = undefined;
+        if (!was_terminal and record.external_decision_owner != null and record.external_commit_started) {
+            var read = try self.store.beginProbe();
+            defer read.abort();
+            const remaining = std.math.sub(u64, try externalReadBarrierCount(&read), 1) catch return error.InvalidTxnRecord;
+            if (remaining == 0) {
+                try deletes.append(self.alloc, external_read_barrier_count_key);
+            } else {
+                std.mem.writeInt(u64, &external_barrier_value, remaining, .little);
+                try writes.append(self.alloc, .{ .key = external_read_barrier_count_key, .value = &external_barrier_value });
+            }
+        }
         var read_count_value: [8]u8 = undefined;
         if (read_entries.len != 0) {
             const remaining = std.math.sub(u64, try self.readGuardCount(), read_entries.len) catch return error.InvalidTxnRecord;
@@ -1741,14 +1962,14 @@ pub const TxnManager = struct {
         return false;
     }
 
-    /// Constant-work uncertainty check for coordinated statement snapshots.
-    /// The caller must hold primary AND replay mutation admission while using
-    /// this result. A prepared participant may otherwise resolve immediately
-    /// after the check, yielding different sides of one distributed commit.
-    pub fn hasUnresolvedWriteIntents(self: *TxnManager) !bool {
+    /// Bounded uncertainty check under primary AND replay capture admission.
+    /// Ordinary intents may resolve without an all-owner activation barrier,
+    /// so they still block. External PREPARED votes expose only old primary
+    /// rows; a durable activation counter fences their eventual publication.
+    pub fn hasStatementReadDebt(self: *TxnManager) !bool {
         var read = try self.store.beginRead();
         defer read.abort();
-        return readHasPrefix(&read, intents_prefix);
+        return statementReadHasDebt(&read);
     }
 
     pub fn listTransactionsPage(
@@ -1790,6 +2011,8 @@ pub const TxnManager = struct {
                 .coordinator = record.coordinator,
                 .coordinator_known = record.coordinator_known,
                 .retain_terminal = record.retain_terminal,
+                .external_decision_owner = record.external_decision_owner,
+                .external_commit_started = record.external_commit_started,
                 .intents_resolved = record.intents_resolved,
                 .intents_resolved_known = record.intents_resolved_known,
             });
@@ -2036,6 +2259,12 @@ pub const TxnManager = struct {
             stats.scanned_records += 1;
 
             if (summary.status == .pending) {
+                if (summary.external_decision_owner) |owner| {
+                    try owner.validate();
+                    if (!summary.coordinator_known) return error.InvalidTxnRecord;
+                    stats.kept_recent_pending += 1;
+                    continue;
+                }
                 if (summary.created_at > 0 and summary.created_at < cutoff_timestamp) {
                     if (!options.presume_abort_distributed) {
                         const participants = try self.getParticipants(self.alloc, txn_id);
@@ -2114,18 +2343,14 @@ pub const TxnManager = struct {
             }
 
             const refreshed = try self.loadTransactionRecord(txn_id);
-            const cleanup_cutoff = if (refreshed.retain_terminal)
-                options.retained_cutoff_timestamp orelse cutoff_timestamp
-            else
-                cutoff_timestamp;
             const no_intents = if (refreshed.intents_resolved_known and refreshed.intents_resolved)
                 true
             else
                 !try self.hasAnyIntents(txn_id);
-            if (refreshed.status != .pending and refreshed.finalized_at < cleanup_cutoff and
+            if (refreshed.status != .pending and terminalRetentionElapsed(refreshed, cutoff_timestamp, options.retained_cutoff_timestamp orelse cutoff_timestamp) and
                 no_intents and !try self.hasReplicationOutbox(txn_id))
             {
-                try self.deleteTransactionMetadata(txn_id);
+                try self.deleteTransactionMetadataKnownRecord(txn_id, refreshed, .{});
                 stats.cleaned_records += 1;
                 if (self.trace_writer) |tw| {
                     tw.traceEvent(&.{
@@ -2538,7 +2763,8 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
-        const buf = try self.alloc.alloc(u8, txn_record_v6_size);
+        const buf = try self.alloc.alloc(u8, if (record.external_decision_owner != null) txn_record_v7_size else txn_record_v6_size);
+        errdefer self.alloc.free(buf);
         buf[0] = @backingInt(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
@@ -2550,6 +2776,13 @@ pub const TxnManager = struct {
         buf[50] = @intFromBool(record.coordinator);
         buf[51] = @intFromBool(record.retain_terminal);
         buf[52] = @intFromBool(record.intents_resolved);
+        if (record.external_decision_owner) |owner| {
+            if ((record.external_commit_started and !record.prepared) or !record.coordinator_known or
+                (record.status == .committed and !record.external_commit_started) or
+                (record.status == .aborted and record.external_commit_started)) return error.InvalidTxnRecord;
+            @memcpy(buf[txn_record_v6_size..][0..ExternalDecisionOwner.encoded_len], &try owner.encode());
+            buf[txn_record_v7_size - 1] = @intFromBool(record.external_commit_started);
+        }
         return buf;
     }
 
@@ -2591,8 +2824,7 @@ pub const TxnManager = struct {
             try self.applyMutationExtraBatch(extra_batch);
             return false;
         }
-        const cutoff = if (record.retain_terminal) retained_cutoff_timestamp else cutoff_timestamp;
-        if (record.finalized_at >= cutoff) {
+        if (!terminalRetentionElapsed(record, cutoff_timestamp, retained_cutoff_timestamp)) {
             try self.applyMutationExtraBatch(extra_batch);
             return false;
         }
@@ -2602,7 +2834,7 @@ pub const TxnManager = struct {
             try self.applyMutationExtraBatch(extra_batch);
             return false;
         }
-        try self.deleteTransactionMetadataExtraBatch(txn_id, extra_batch);
+        try self.deleteTransactionMetadataKnownRecord(txn_id, record, extra_batch);
         return true;
     }
 
@@ -2768,6 +3000,10 @@ pub const TxnManager = struct {
         txn_id: TxnId,
         extra_batch: MutationExtraBatch,
     ) !void {
+        return self.deleteTransactionMetadataKnownRecord(txn_id, try self.loadTransactionRecord(txn_id), extra_batch);
+    }
+
+    fn deleteTransactionMetadataKnownRecord(self: *TxnManager, txn_id: TxnId, record: TxnRecord, extra_batch: MutationExtraBatch) !void {
         const record_key = makeRecordKey(txn_id);
         const participant_key = makeSidecarKey(participants_prefix, txn_id);
         const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
@@ -2789,7 +3025,15 @@ pub const TxnManager = struct {
         defer backend_scan.freeResults(self.alloc, resolutions);
         for (members) |member| try deletes.append(self.alloc, member.key);
         for (resolutions) |resolution| try deletes.append(self.alloc, resolution.key);
-        try self.applyBatch(extra_batch.writes, deletes.items, null);
+        var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
+        defer writes.deinit(self.alloc);
+        try writes.appendSlice(self.alloc, extra_batch.writes);
+        var floor_value: [8]u8 = undefined;
+        if (record.external_decision_owner) |owner| if (owner.expires_at_unix_ns > try self.externalExpiryFloor()) {
+            std.mem.writeInt(u64, &floor_value, owner.expires_at_unix_ns, .little);
+            try writes.append(self.alloc, .{ .key = external_expiry_floor_key, .value = &floor_value });
+        };
+        try self.applyBatch(writes.items, deletes.items, null);
     }
 
     fn saveParticipantSet(self: *TxnManager, comptime prefix: []const u8, txn_id: TxnId, participants: []const []const u8) !void {
@@ -3315,6 +3559,16 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
 
 fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == 0 or raw[0] > @backingInt(TxnStatus.aborted)) return TxnError.InvalidTxnRecord;
+    if (raw.len == txn_record_v7_size) {
+        var record = try decodeRecord(raw[0..txn_record_v6_size]);
+        if (raw[txn_record_v7_size - 1] > 1) return error.InvalidTxnRecord;
+        record.external_decision_owner = ExternalDecisionOwner.decode(raw[txn_record_v6_size..][0..ExternalDecisionOwner.encoded_len]) catch return error.InvalidTxnRecord;
+        record.external_commit_started = raw[txn_record_v7_size - 1] == 1;
+        if ((record.external_commit_started and !record.prepared) or
+            (record.status == .committed and !record.external_commit_started) or
+            (record.status == .aborted and record.external_commit_started)) return error.InvalidTxnRecord;
+        return record;
+    }
     if (raw.len == txn_record_v6_size) {
         if (raw[49] > 1 or raw[50] > 1 or raw[51] > 1 or raw[52] > 1) return TxnError.InvalidTxnRecord;
         return .{
@@ -6070,4 +6324,316 @@ test "transaction participant batch releases migration allocations on every fail
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "external prepared coordinator retains LSM vote across cold timeout and requires exact resolution authority" {
+    const alloc = std.testing.allocator;
+    const owner: ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+    for ([_]TxnStatus{ .committed, .aborted }) |decision| {
+        const path = try tempTestPath(alloc, if (decision == .committed) "external-prepared-commit" else "external-prepared-abort");
+        defer alloc.free(path);
+        cleanupTestDir(path);
+        defer cleanupTestDir(path);
+        const id: TxnId = @splat(7);
+        {
+            var store = try DocStore.open(alloc, path, .{});
+            defer store.close();
+            var manager = try TxnManager.init(alloc, &store);
+            defer manager.deinit();
+            try putVisibleDoc(&store, alloc, "held", "before");
+            try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 1, &.{ "coordinator", "participant" }, true, true, .{ .external_decision_owner = owner });
+            try manager.writeIntentsExtraBatch(id, &.{.{ .key = "held", .value = "committed-value" }}, &.{}, .{ .external_decision_owner = owner });
+            try std.testing.expect(!try manager.hasStatementReadDebt());
+            try std.testing.expectError(error.ExternalTransactionDecisionRequired, manager.writeIntents(id, &.{}, &.{}));
+            var other = owner;
+            other.operation_id[0] ^= 1;
+            try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.writeIntentsExtraBatch(id, &.{}, &.{}, .{ .external_decision_owner = other }));
+            const record = try manager.loadTransactionRecord(id);
+            try std.testing.expect(record.external_decision_owner.?.eql(owner));
+            const bytes = try manager.encodeRecord(record);
+            defer alloc.free(bytes);
+            try std.testing.expectEqual(@as(usize, txn_record_v7_size), bytes.len);
+            try std.testing.expect((try decodeRecord(bytes)).external_decision_owner.?.eql(owner));
+            bytes[49] = 2;
+            try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(bytes));
+        }
+        {
+            var store = try DocStore.open(alloc, path, .{});
+            defer store.close();
+            var manager = try TxnManager.init(alloc, &store);
+            defer manager.deinit();
+            const stats = try manager.recoverTransactions(1000, 2000);
+            try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
+            try std.testing.expectEqual(@as(u64, 1), stats.kept_recent_pending);
+            try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(id));
+            try std.testing.expect(!try manager.hasStatementReadDebt());
+            var guard = IntentReadGuard.init(alloc, null);
+            defer guard.deinit();
+            var old_read = try store.beginReadTxn();
+            defer old_read.abort();
+            try guard.check(&old_read, "held");
+            const before = try getVisibleDoc(&store, alloc, "held");
+            defer alloc.free(before);
+            try std.testing.expectEqualStrings("before", before);
+            if (decision == .committed) {
+                try std.testing.expectError(error.ExternalTransactionCommitNotActivated, manager.resolveIntentsWithExtraBatch(id, decision, 2001, .{ .external_decision_owner = owner }));
+                try manager.activateExternalDecision(id, owner, .{});
+                try manager.activateExternalDecision(id, owner, .{});
+                try std.testing.expect(try manager.hasStatementReadDebt());
+                try guard.check(&old_read, "held");
+                var current_read = try store.beginReadTxn();
+                defer current_read.abort();
+                try std.testing.expectError(error.IntentConflict, guard.check(&current_read, "held"));
+                try std.testing.expectError(error.DecisionConflict, manager.resolveIntentsWithExtraBatch(id, .aborted, 2001, .{ .external_decision_owner = owner }));
+            }
+            try std.testing.expectError(error.ExternalTransactionDecisionRequired, manager.resolveIntents(id, decision, 2001));
+            var other = owner;
+            other.admission_digest[0] ^= 1;
+            try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.resolveIntentsWithExtraBatch(id, decision, 2001, .{ .external_decision_owner = other }));
+            _ = try manager.resolveIntentsWithExtraBatch(id, decision, 2001, .{ .external_decision_owner = owner });
+            try std.testing.expectEqual(decision, try manager.getTransactionStatus(id));
+            try std.testing.expect(!try manager.hasStatementReadDebt());
+            // Terminal propagation/recovery is the ordinary path. It may not
+            // need the private admission again and never replays row effects.
+            try manager.resolveIntents(id, decision, 2001);
+            if (decision == .committed) {
+                const value = try getVisibleDoc(&store, alloc, "held");
+                defer alloc.free(value);
+                try std.testing.expectEqualStrings("committed-value", value);
+            } else {
+                const value = try getVisibleDoc(&store, alloc, "held");
+                defer alloc.free(value);
+                try std.testing.expectEqualStrings("before", value);
+            }
+        }
+    }
+}
+
+test "external prepared statement admission skips large intent cohorts and retains ordinary barriers" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "external-statement-admission");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    const owner: ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+    const external: TxnId = @splat(7);
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(external, 10, 1, &.{"owner"}, true, true, .{ .external_decision_owner = owner });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const intents = try arena.allocator().alloc(WriteIntent, 1024);
+    for (intents, 0..) |*intent, index| intent.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "row-{d:0>5}", .{index}), .value = "next" };
+    try manager.writeIntentsExtraBatch(external, intents, &.{}, .{ .external_decision_owner = owner });
+    try std.testing.expect(!try manager.hasStatementReadDebt());
+    // Sort after the external cohort: seeking past its rows must still find
+    // ordinary uncertainty. The separate cold-owner campaign checks reopen.
+    const ordinary: TxnId = @splat(8);
+    try manager.initTransactionWithParticipants(ordinary, 10, &.{"ordinary"});
+    try manager.writeIntents(ordinary, &.{.{ .key = "ordinary", .value = "next" }}, &.{});
+    try std.testing.expect(try manager.hasStatementReadDebt());
+    try manager.resolveIntents(ordinary, .aborted, 20);
+    try std.testing.expect(!try manager.hasStatementReadDebt());
+    var old = try store.beginReadTxn();
+    defer old.abort();
+    try manager.activateExternalDecision(external, owner, .{});
+    try std.testing.expect(try manager.hasStatementReadDebt());
+    try std.testing.expect(!try statementReadHasDebt(&old));
+    _ = try manager.resolveIntentsWithExtraBatch(external, .committed, 20, .{ .external_decision_owner = owner });
+    try std.testing.expect(!try manager.hasStatementReadDebt());
+}
+
+test "external prepared concurrent activation barriers survive restart and retire exactly once" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "external-read-barriers");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    const owner: ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+    const ids = [_]TxnId{ @splat(71), @splat(72) };
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        for (ids) |id| {
+            try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 1, &.{"owner"}, true, true, .{ .external_decision_owner = owner });
+            try manager.writeIntentsExtraBatch(id, &.{}, &.{}, .{ .external_decision_owner = owner });
+        }
+        var before = try store.beginReadTxn();
+        defer before.abort();
+        for (ids) |id| {
+            try manager.activateExternalDecision(id, owner, .{});
+            try manager.activateExternalDecision(id, owner, .{});
+        }
+        try checkExternalReadAdmission(&before);
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        try std.testing.expectEqual(@as(u64, 2), try externalReadBarrierCount(&current));
+        try std.testing.expect(try manager.hasStatementReadDebt());
+        try std.testing.expectError(error.IntentConflict, checkExternalReadAdmission(&current));
+    }
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        for (ids, 0..) |id, i| {
+            _ = try manager.resolveIntentsWithExtraBatch(id, .committed, 20, .{ .external_decision_owner = owner });
+            try manager.resolveIntents(id, .committed, 20);
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u64, 1 - i), try externalReadBarrierCount(&read));
+            try std.testing.expectEqual(i == 0, try manager.hasStatementReadDebt());
+            if (i == 0) try std.testing.expectError(error.IntentConflict, checkExternalReadAdmission(&read)) else try checkExternalReadAdmission(&read);
+            var absent: ?[]const u8 = null;
+            if (i == 0) {
+                try std.testing.expectError(error.IntentConflict, captureServingValue(&store, "absent", &absent));
+            } else {
+                var lease = try captureServingValue(&store, "absent", &absent);
+                defer lease.abort();
+                try std.testing.expect(absent == null);
+            }
+        }
+    }
+}
+
+test "external prepared abort retains BEGIN authority across timeout recovery and restart" {
+    const a = std.testing.allocator;
+    const owner: ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 1000 };
+    const id: TxnId = @splat(82);
+    for ([_]bool{ false, true }) |timed_out| {
+        const path = try tempTestPath(a, if (timed_out) "external-abort-timeout" else "external-abort-begin");
+        defer a.free(path);
+        cleanupTestDir(path);
+        defer cleanupTestDir(path);
+        {
+            var store = try DocStore.open(a, path, .{});
+            defer store.close();
+            var manager = try TxnManager.init(a, &store);
+            defer manager.deinit();
+            try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 1, &.{ "owner", "follower" }, true, true, .{ .external_decision_owner = owner });
+            if (timed_out) {
+                const stats = try manager.recoverTransactions(1000, 2000);
+                try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
+                try std.testing.expectError(error.ExternalTransactionDecisionRequired, manager.resolveIntents(id, .aborted, 20));
+            }
+            _ = try manager.resolveIntentsWithExtraBatch(id, .aborted, 20, .{ .external_decision_owner = owner });
+            _ = try manager.resolveIntentsWithExtraBatch(id, .aborted, 20, .{ .external_decision_owner = owner });
+            var other = owner;
+            other.operation_id[0] ^= 1;
+            try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.resolveIntentsWithExtraBatch(id, .aborted, 20, .{ .external_decision_owner = other }));
+        }
+        {
+            var store = try DocStore.open(a, path, .{});
+            defer store.close();
+            var manager = try TxnManager.init(a, &store);
+            defer manager.deinit();
+            const record = try manager.loadTransactionRecord(id);
+            try std.testing.expectEqual(TxnStatus.aborted, record.status);
+            try std.testing.expect(!record.prepared);
+            try std.testing.expect(record.external_decision_owner.?.eql(owner));
+            const unresolved = try manager.getUnresolvedParticipants(a, id);
+            defer freeParticipantList(a, unresolved);
+            try std.testing.expectEqual(@as(usize, 2), unresolved.len);
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try checkExternalReadAdmission(&read);
+        }
+    }
+}
+
+test "external prepared missing abort fences late enlistment and reclaims to a durable expiry floor" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "external-fence-expiry");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    const id: TxnId = @splat(83);
+    const owner: ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 100 };
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        _ = try manager.resolveIntentsWithExtraBatch(id, .aborted, 20, .{ .external_decision_owner = owner, .resolved_participant = "self", .completion_writes = &.{.{ .key = "abort-marker", .value = "first" }} });
+        try std.testing.expectError(error.ExternalTransactionDecisionRequired, manager.initTransactionWithParticipantsCreatedAtAndRole(id, 10, 1, &.{"self"}, false));
+        try std.testing.expect(!(try manager.cleanupTransactionMetadataIfEligible(id, 99, 0)));
+        // An advanced ordinary retention clock cannot retire a live admission.
+        try std.testing.expect(!(try manager.cleanupTransactionMetadataIfEligible(id, 99, 1000)));
+        try std.testing.expect(try manager.cleanupTransactionMetadataIfEligible(id, 101, 0));
+        try std.testing.expectEqual(@as(u64, 100), try manager.externalExpiryFloor());
+    }
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try std.testing.expectEqual(@as(u64, 100), try manager.externalExpiryFloor());
+        // Even BEGIN is fenced after reclamation, independent of host clocks.
+        try std.testing.expectError(error.ExternalTransactionAdmissionExpired, manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 1, &.{"self"}, false, true, .{ .external_decision_owner = owner }));
+        try std.testing.expectError(error.TxnNotFound, manager.loadTransactionRecord(id));
+        // An ordinary transaction cannot be adopted by any external decision.
+        try manager.initTransactionWithParticipantsCreatedAtAndRole(id, 10, 1, &.{"self"}, false);
+        try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.writeIntentsExtraBatch(id, &.{.{ .key = "late", .value = "{}" }}, &.{}, .{ .external_decision_owner = owner }));
+        try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.resolveIntentsWithExtraBatch(id, .aborted, 20, .{ .external_decision_owner = owner }));
+        try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(id));
+        try std.testing.expect(!(try manager.hasIntents(id)));
+        const missing: TxnId = @splat(84);
+        _ = try manager.resolveIntentsWithExtraBatch(missing, .aborted, 20, .{ .external_decision_owner = owner, .completion_writes = &.{.{ .key = "abort-marker", .value = "replay" }} });
+        try std.testing.expectError(error.TxnNotFound, manager.loadTransactionRecord(missing));
+        const marker = try manager.getAlloc(a, "abort-marker");
+        defer a.free(marker);
+        try std.testing.expectEqualStrings("replay", marker);
+        // New admissions above the floor remain available.
+        var fresh = owner;
+        fresh.operation_id[0] ^= 1;
+        fresh.expires_at_unix_ns = 200;
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(missing, 30, 30, &.{"self"}, false, true, .{ .external_decision_owner = fresh });
+        try manager.writeIntentsExtraBatch(missing, &.{.{ .key = "fresh", .value = "{}" }}, &.{}, .{ .external_decision_owner = fresh });
+        try std.testing.expect(try manager.hasIntents(missing));
+    }
+}
+
+test "external prepared enlistment survives cold recovery before the first vote" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "external-enlistment");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    const id: TxnId = @splat(86);
+    const owner: ExternalDecisionOwner = .{ .metadata_incarnation = @splat('1'), .operation_id = @splat(2), .admission_digest = @splat(3), .expires_at_unix_ns = 100 };
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 1, &.{"self"}, false, true, .{ .external_decision_owner = owner });
+    }
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        const record = try manager.loadTransactionRecord(id);
+        try std.testing.expect(!record.prepared);
+        try std.testing.expect(record.external_decision_owner.?.eql(owner));
+        const stats = try manager.recoverTransactions(1000, 2000);
+        try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
+        try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(id));
+        try std.testing.expectError(error.ExternalTransactionDecisionRequired, manager.initTransactionWithParticipantsCreatedAtAndRole(id, 10, 1, &.{"self"}, false));
+        var wrong = owner;
+        wrong.operation_id[0] ^= 1;
+        try std.testing.expectError(error.ExternalTransactionDecisionChanged, manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 1, &.{"self"}, false, true, .{ .external_decision_owner = wrong }));
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 1, &.{"self"}, false, true, .{ .external_decision_owner = owner });
+        try manager.writeIntentsExtraBatch(id, &.{.{ .key = "row", .value = "held" }}, &.{}, .{ .external_decision_owner = owner });
+        _ = try manager.resolveIntentsWithExtraBatch(id, .aborted, 2000, .{ .external_decision_owner = owner });
+        try std.testing.expect(!(try manager.hasIntents(id)));
+    }
+}
+
+comptime {
+    if (@import("builtin").is_test) _ = @import("pessimistic_lock_native_test.zig");
 }

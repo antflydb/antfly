@@ -324,7 +324,7 @@ pub const OwnerReadRequest = struct {
             (self.witness != null and self.projection != .control and self.projection != .inputs)) return error.InvalidGenerationPublication;
         if (self.source_image) |image| try image.validate();
         if (self.source_owner) |address| {
-            if (address.group_id == 0 or std.mem.readInt(u64, address.namespace[0..8], .big) != self.lookup.table or
+            if (address.group_id == 0 or std.mem.readInt(u64, address.namespace[0..8], .big) == 0 or
                 std.mem.readInt(u64, address.namespace[8..16], .big) == 0 or
                 std.mem.readInt(u64, address.namespace[16..24], .big) == 0) return error.InvalidGenerationPublication;
         }
@@ -358,3 +358,36 @@ pub fn ownerReadHttpFailure(status: u16, body: []const u8) ?anyerror {
     }) |err| if (status == local.system_catalog_domain.httpStatus(err) and std.mem.eql(u8, body, @errorName(err))) return err;
     return null;
 }
+
+/// Process-local catalog cache refresh after one accepted publication. This is
+/// a bounded affected-table/range projection, never execution authority.
+pub const PublicationProjection = struct {
+    pub const max_wire_bytes = 16 * 1024 * 1024;
+    lookup: Lookup,
+    revision: u64,
+    tables: []const local.common_topology_records.TableRecord,
+    removed_table: u64 = 0,
+    removed_ranges: []const u64 = &.{},
+    logical_revision: ?u64 = null,
+
+    pub fn requireFor(self: @This(), head: barriers.Head, revision: u64) !void {
+        try self.lookup.require(head);
+        if (revision == 0 or self.revision != revision or head.publication_revision == 0 or
+            self.tables.len != head.participant_count or self.tables.len == 0 or self.tables[0].table_id != head.table_id or
+            (self.logical_revision != null) != head.catalogEffect() or self.removed_ranges.len > 4096) return error.GenerationPublicationChanged;
+        if (self.logical_revision) |logical| if (logical < head.catalog_revision or logical == 0) return error.InvalidCatalogRecord;
+        var previous: u64 = 0;
+        for (self.tables) |table| {
+            if (table.table_id <= previous or table.table_id == self.removed_table) return error.InvalidCatalogRecord;
+            previous = table.table_id;
+        }
+        previous = 0;
+        for (self.removed_ranges) |group| {
+            if (group <= previous) return error.InvalidCatalogRecord;
+            previous = group;
+        }
+        if (head.retirement_root) |root| {
+            if (self.removed_table != root.root.table or self.removed_ranges.len == 0) return error.InvalidCatalogRecord;
+        } else if (self.removed_table != 0 or self.removed_ranges.len != 0) return error.InvalidCatalogRecord;
+    }
+};

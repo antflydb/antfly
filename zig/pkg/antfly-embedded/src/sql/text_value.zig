@@ -19,6 +19,29 @@ const std = @import("std");
 const Context = @import("numeric_value.zig").Context;
 const Allocator = std.mem.Allocator;
 
+/// Validate and count UTF-8 in one pass without allocating. Admission remains
+/// sticky, and cancellation is observed at bounded byte intervals.
+pub fn characterLength(input: []const u8, work: *Context) !i32 {
+    try work.charge(0);
+    var count: i32 = 0;
+    var offset: usize = 0;
+    var examined: usize = 0;
+    while (offset < input.len) {
+        const width = std.unicode.utf8ByteSequenceLength(input[offset]) catch return error.SqlInvalidTextEncoding;
+        if (width > input.len - offset) return error.SqlInvalidTextEncoding;
+        _ = std.unicode.utf8Decode(input[offset..][0..width]) catch return error.SqlInvalidTextEncoding;
+        offset += width;
+        examined += width;
+        count = std.math.add(i32, count, 1) catch return error.SqlNumericOutOfRange;
+        if (examined >= 256) {
+            try work.charge(examined);
+            examined = 0;
+        }
+    }
+    try work.charge(examined);
+    return count;
+}
+
 pub fn md5(input: []const u8, work: *Context) ![32]u8 {
     try work.charge(0);
     var digest = std.crypto.hash.Md5.init(.{});
@@ -305,4 +328,27 @@ test "SQL text replacement prepared matching uses no per-row heap and bounded th
     try std.testing.expect(used <= 1024 * input.len * 2);
     try std.testing.expectEqual(@as(usize, 0), none.end_index);
     std.debug.print("SQL prepared literal replacement: rows=1024 input_bytes={} work={} allocated_bytes=0 elapsed_ns={}\n", .{ input.len * 1024, used, elapsed });
+}
+
+test "SQL durable string lengths count UTF8 without allocations and preserve sticky admission" {
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var work: Context = .{ .alloc = none.allocator() };
+    try std.testing.expectEqual(@as(i32, 0), try characterLength("", &work));
+    try std.testing.expectEqual(@as(i32, 4), try characterLength("aé😀́", &work));
+    try std.testing.expectError(error.SqlInvalidTextEncoding, characterLength("\xc0\x80", &work));
+    try std.testing.expectError(error.SqlInvalidTextEncoding, characterLength("\xed\xa0\x80", &work));
+    const Control = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.Canceled;
+        }
+    };
+    var control: Control = .{};
+    var canceled: Context = .{ .alloc = none.allocator(), .checkpoint = Control.check, .ptr = &control };
+    const wide: [1024]u8 = @splat('a');
+    try std.testing.expectError(error.Canceled, characterLength(&wide, &canceled));
+    try std.testing.expectError(error.Canceled, characterLength("", &canceled));
+    try std.testing.expectEqual(@as(usize, 2), control.calls);
 }

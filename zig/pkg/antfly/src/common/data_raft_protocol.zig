@@ -40,7 +40,10 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 27;
+pub const batch_protocol_version: u16 = 28;
+/// Version 28 carries externally decided votes, admission deadlines and
+/// irreversible read activation. Old members must never ignore these fields.
+pub const batch_external_transaction_protocol_version: u16 = 28;
 /// Version 27 admits metadata-authenticated whole-table deletion fencing and
 /// retire-only FK controls under stable row policies. Older replicas must not
 /// ignore that marker or reinterpret it as an ordinary topology operation.

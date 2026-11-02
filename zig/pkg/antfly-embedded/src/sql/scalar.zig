@@ -24,8 +24,11 @@ const json_order = @import("json_order.zig");
 const setting_catalog = @import("setting_catalog.zig");
 const Allocator = std.mem.Allocator;
 const Json = std.json.Value;
+pub const Bytea = @import("bytea_value.zig");
 pub const EnumValues = @import("../common/sql_enum_value.zig");
 pub const EnumTypes = @import("../system_catalog/named_types.zig");
+const domain_values = @import("../schema/domain_value.zig");
+const domain_coercion = @import("domain_coercion.zig");
 pub const PatternSet = struct {
     ptr: *anyopaque,
     count: usize,
@@ -35,7 +38,7 @@ pub const PatternSet = struct {
 pub const Datum = struct {
     /// Immutable temporal payload owned by the pinned invocation/row region.
     /// The JSON null placeholder is never a temporal value or SQL NULL.
-    extension_kind: enum(u8) { none, patterns, temporal, range, enumeration } = .none,
+    extension_kind: enum(u8) { none, patterns, temporal, range, enumeration, bytea } = .none,
     // One tagged, pointer-sized extension; the discriminator fits existing
     // tail padding. Constructors/accessors are the only interpretation boundary.
     extension: ?*const anyopaque = null,
@@ -78,6 +81,13 @@ pub const Datum = struct {
     pub fn range(self: Datum) ?*const @import("range_value.zig").Value {
         return if (self.extension_kind == .range and self.extension != null) @ptrCast(@alignCast(self.extension.?)) else null;
     }
+    pub fn typedBytes(value: *const @import("bytea_value.zig").Value) Datum {
+        return .{ .extension_kind = .bytea, .extension = value, .sql_null = false };
+    }
+    pub fn bytes(self: Datum) ?[]const u8 {
+        const value: *const @import("bytea_value.zig").Value = if (self.extension_kind == .bytea and self.extension != null) @ptrCast(@alignCast(self.extension.?)) else return null;
+        return value.bytes;
+    }
     pub fn patterns(self: Datum) ?*PatternSet {
         return if (self.extension_kind == .patterns and self.extension != null) @constCast(@as(*const PatternSet, @ptrCast(@alignCast(self.extension.?)))) else null;
     }
@@ -91,6 +101,9 @@ pub const Datum = struct {
     }
     pub fn validateTemporal(self: Datum) !void {
         if ((self.extension_kind == .none) != (self.extension == null)) return error.SqlTypeMismatch;
+        if (self.bytes() != null) {
+            if (self.sql_null or self.numeric != null or self.array != null or self.value != .null) return error.SqlTypeMismatch;
+        }
         if (self.enumeration()) |value| {
             if (self.sql_null or self.numeric != null or self.array != null or self.value != .null) return error.SqlTypeMismatch;
             try value.validate();
@@ -327,6 +340,7 @@ pub const Type = struct {
     /// Durable descriptor only. A catalog-authorized binder must replace this
     /// witness with an owned executable view before parameter preparation.
     enum_reference: ?*const EnumReference = null,
+    domain_binding: ?*const domain_values.Binding = null,
     const Wire = struct {
         kind: ?ast.ColumnType = null,
         temporal_kind: ?@import("temporal_value.zig").Kind = null,
@@ -334,16 +348,36 @@ pub const Type = struct {
         element_type: ?arrays.ElementType = null,
         numeric_modifier: ?NumericModifier = null,
         named_type: ?EnumReference = null,
+        domain_type: ?@import("../system_catalog/domain_types.zig").Reference = null,
         pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+            if (std.mem.eql(u8, field, "domain_type")) return self.domain_type == null;
             return std.mem.eql(u8, field, "named_type") and self.named_type == null;
         }
         pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            if (self.domain_type != null) return writer.write(.{ .kind = self.kind, .temporal_kind = self.temporal_kind, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = self.named_type, .domain_type = self.domain_type });
             if (self.named_type != null) return writer.write(.{ .kind = self.kind, .temporal_kind = self.temporal_kind, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = self.named_type });
             return writer.write(.{ .kind = self.kind, .temporal_kind = self.temporal_kind, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier });
         }
     };
+    pub fn domainView(self: Type) ?*const domain_values.View {
+        const binding = self.domain_binding orelse return null;
+        return if (binding.* == .view) binding.view else null;
+    }
+
+    pub fn domainReference(self: Type) ?@import("../system_catalog/domain_types.zig").Reference {
+        const binding = self.domain_binding orelse return null;
+        return if (binding.* == .reference) binding.reference else null;
+    }
+
+    pub fn baseType(self: Type) Type {
+        var result = self;
+        result.domain_binding = null;
+        return result;
+    }
+
     pub fn nativeJsonProjection(self: Type) Wire {
-        return .{ .kind = self.kind, .temporal_kind = self.temporal_kind, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = if (self.enum_view) |view| .{ .id = view.record.identity.id, .origin_id = view.record.identity.origin_id, .generation = view.record.identity.generation } else if (self.enum_reference) |reference| reference.* else null };
+        const domain_type: ?@import("../system_catalog/domain_types.zig").Reference = if (self.domainView()) |view| .{ .id = view.identity.?.id, .origin_id = view.identity.?.origin_id, .generation = view.identity.?.generation } else self.domainReference();
+        return .{ .domain_type = domain_type, .kind = self.kind, .temporal_kind = self.temporal_kind, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = if (self.enum_view) |view| .{ .id = view.record.identity.id, .origin_id = view.record.identity.origin_id, .generation = view.record.identity.generation } else if (self.enum_reference) |reference| reference.* else null };
     }
     pub fn jsonStringify(self: Type, writer: anytype) !void {
         return writer.write(self.nativeJsonProjection());
@@ -359,6 +393,13 @@ pub const Type = struct {
             owned.* = reference;
             result.enum_reference = owned;
         }
+        if (wire.domain_type) |reference| {
+            if (wire.kind == null) return error.UnexpectedToken;
+            _ = EnumTypes.Identity.init(reference.id, 1, reference.generation, reference.origin_id) catch return error.UnexpectedToken;
+            const owned = try a.create(domain_values.Binding);
+            owned.* = .{ .reference = reference };
+            result.domain_binding = owned;
+        }
         return result;
     }
     pub fn jsonParseFromValue(a: Allocator, value: Json, options: std.json.ParseOptions) std.json.ParseFromValueError!Type {
@@ -372,14 +413,59 @@ pub const Type = struct {
             owned.* = reference;
             result.enum_reference = owned;
         }
+        if (wire.domain_type) |reference| {
+            if (wire.kind == null) return error.UnexpectedToken;
+            _ = EnumTypes.Identity.init(reference.id, 1, reference.generation, reference.origin_id) catch return error.UnexpectedToken;
+            const owned = try a.create(domain_values.Binding);
+            owned.* = .{ .reference = reference };
+            result.domain_binding = owned;
+        }
         return result;
     }
 };
+
+pub fn referenceOf(view: *const domain_values.View) EnumReference {
+    const identity = view.identity.?;
+    return .{ .id = identity.id, .origin_id = identity.origin_id, .generation = identity.generation };
+}
+
+pub fn sameDomain(left: ?*const domain_values.View, right: ?*const domain_values.View) bool {
+    if ((left == null) != (right == null)) return false;
+    if (left) |view| {
+        const lhs = view.identity orelse return false;
+        const rhs = right.?.identity orelse return false;
+        return std.meta.eql(lhs, rhs);
+    }
+    return true;
+}
+
+/// Domain NOT NULL is an assignment rule, not a nonnullable read type: a
+/// same-domain NULL produced by an outer join/subquery retains its provenance.
+pub fn domainType(view: *const domain_values.View) !Type {
+    if (view.identity == null) return error.InvalidSqlNamedType;
+    return .{
+        .domain_binding = &view.type_binding,
+        .enum_view = view.enumeration,
+        .kind = switch (view.column.column_type) {
+            .string => if (view.column.sql_element_type == .uuid) .uuid else .string,
+            .integer => .integer,
+            .number, .numeric => .number,
+            .boolean => .boolean,
+            .json => .json,
+            .enumeration => .enumeration,
+            else => return error.UnsupportedSqlExecution,
+        },
+        .element_type = view.column.sql_element_type,
+        .numeric_modifier = view.column.numeric_modifier,
+        .nullable = true,
+    };
+}
 
 pub const Column = struct {
     name: []const u8,
     type: ast.ColumnType,
     enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
+    domain_view: ?*const domain_values.View = null,
     temporal_kind: ?@import("temporal_value.zig").Kind = null,
     /// This spelling belongs to multiple visible relations. Keep it in the
     /// binding environment so unused ambiguity is harmless; reject only an
@@ -401,16 +487,30 @@ pub fn sameEnumDomain(left: ?*const @import("../common/sql_enum_value.zig").View
 /// Compare executable descriptor contracts independently of arena addresses.
 /// A durable symbolic witness must first pass through catalog rebinding.
 pub fn sameParameterType(left: Type, right: Type) bool {
-    if (left.enum_reference != null or right.enum_reference != null) return false;
+    if (left.enum_reference != null or right.enum_reference != null or left.domainReference() != null or right.domainReference() != null) return false;
+    if (!sameDomain(left.domainView(), right.domainView())) return false;
     if (!sameEnumDomain(left.enum_view, right.enum_view)) return false;
     var lhs = left;
     var rhs = right;
     lhs.enum_view = null;
     rhs.enum_view = null;
+    lhs.domain_binding = null;
+    rhs.domain_binding = null;
     return std.meta.eql(lhs, rhs);
 }
+pub fn domainViewOf(value: anytype) ?*const domain_values.View {
+    const T = @TypeOf(value);
+    if (@typeInfo(T) == .pointer) return domainViewOf(value.*);
+    if (@hasDecl(T, "domainView")) return value.domainView();
+    return if (@hasField(T, "domain_view")) value.domain_view else null;
+}
+
+pub fn domainBindingOf(value: anytype) ?*const domain_values.Binding {
+    return if (domainViewOf(value)) |view| &view.type_binding else null;
+}
+
 pub fn columnType(column: anytype) Type {
-    return .{ .kind = column.type, .enum_view = if (@hasField(@TypeOf(column), "enum_view")) column.enum_view else null, .temporal_kind = if (@hasField(@TypeOf(column), "temporal_kind")) column.temporal_kind else null, .nullable = if (@hasField(@TypeOf(column), "nullable")) column.nullable else true, .element_type = columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
+    return .{ .kind = column.type, .domain_binding = if (@hasField(@TypeOf(column), "domain_view")) (if (column.domain_view) |view| &view.type_binding else null) else null, .enum_view = if (@hasField(@TypeOf(column), "enum_view")) column.enum_view else null, .temporal_kind = if (@hasField(@TypeOf(column), "temporal_kind")) column.temporal_kind else null, .nullable = if (@hasField(@TypeOf(column), "nullable")) column.nullable else true, .element_type = columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
 }
 /// Resolve explicit and default scalar widths for expression and recipe identities.
 pub fn columnElementType(kind: ast.ColumnType, element: ?arrays.ElementType) ?arrays.ElementType {
@@ -425,10 +525,17 @@ pub fn assignmentSourceIdentity(kind: ast.ColumnType, element: ?arrays.ElementTy
         .string => .text,
         .uuid => .uuid,
         .json => .jsonb,
-        .datetime, .array, .numrange, .daterange, .tsrange, .tstzrange, .enumeration => null,
+        .datetime, .array, .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea => null,
     };
 }
+/// Preparation-only named identity lookup. Implementations return immutable
+/// owned views; executable programs never consult this resolver per row.
+pub const NamedTypeResolver = struct {
+    ptr: *anyopaque,
+    resolve: *const fn (*anyopaque, Allocator, ast.Name) anyerror!Type,
+};
 pub const BindLimits = struct {
+    named_types: ?NamedTypeResolver = null,
     routines: ?@import("routine_bindings.zig").Resolver = null,
     nodes: usize = 8192,
     depth: usize = 64,
@@ -571,6 +678,8 @@ pub const Function = enum {
     md5,
     now,
     gen_random_uuid,
+    convert_from,
+    convert_to,
     transaction_timestamp,
     @"$current_timestamp",
     @"$current_user",
@@ -597,6 +706,8 @@ pub const Function = enum {
     date_bin,
     @"$current_date",
     @"$routine",
+    soundex,
+    difference,
     pub fn volatility(self: Function) Volatility {
         return switch (self) {
             .@"$routine", .ai_decide, .ai_choice, .ai_score, .ai_probability, .gen_random_uuid, .uuidv7, .nextval, .currval, .lastval, .setval => .@"volatile",
@@ -1009,6 +1120,8 @@ pub const Cast = struct {
     element_type: ?arrays.ElementType = null,
     numeric_modifier: ?NumericModifier = null,
     enum_view: ?*const @import("../common/sql_enum_value.zig").View = null,
+    domain_check: bool = false,
+    domain_source: bool = false,
     const Wire = struct {
         operand: u32,
         type: ast.ColumnType,
@@ -1016,28 +1129,33 @@ pub const Cast = struct {
         element_type: ?arrays.ElementType = null,
         numeric_modifier: ?NumericModifier = null,
         named_type: ?EnumReference = null,
+        domain_check: bool = false,
+        domain_source: bool = false,
         pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+            if (std.mem.eql(u8, field, "domain_check")) return !self.domain_check;
+            if (std.mem.eql(u8, field, "domain_source")) return !self.domain_source;
             return std.mem.eql(u8, field, "named_type") and self.named_type == null;
         }
         pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            if (self.domain_check) return writer.write(.{ .operand = self.operand, .type = self.type, .temporal_kind = self.temporal_kind, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = self.named_type, .domain_check = self.domain_check, .domain_source = self.domain_source });
             if (self.named_type != null) return writer.write(.{ .operand = self.operand, .type = self.type, .temporal_kind = self.temporal_kind, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = self.named_type });
             return writer.write(.{ .operand = self.operand, .type = self.type, .temporal_kind = self.temporal_kind, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier });
         }
     };
     pub fn nativeJsonProjection(self: Cast) Wire {
-        return .{ .operand = self.operand, .type = self.type, .temporal_kind = self.temporal_kind, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = (Type{ .kind = self.type, .enum_view = self.enum_view }).nativeJsonProjection().named_type };
+        return .{ .domain_check = self.domain_check, .domain_source = self.domain_source, .operand = self.operand, .type = self.type, .temporal_kind = self.temporal_kind, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier, .named_type = (Type{ .kind = self.type, .enum_view = self.enum_view }).nativeJsonProjection().named_type };
     }
     pub fn jsonStringify(self: Cast, writer: anytype) !void {
         return writer.write(self.nativeJsonProjection());
     }
     pub fn jsonParse(a: Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!Cast {
         const wire = try std.json.innerParse(Wire, a, source, options);
-        if (wire.named_type != null or wire.type == .enumeration) return error.UnexpectedToken;
+        if (wire.domain_check or wire.domain_source or wire.named_type != null or wire.type == .enumeration) return error.UnexpectedToken;
         return .{ .operand = wire.operand, .type = wire.type, .temporal_kind = wire.temporal_kind, .element_type = wire.element_type, .numeric_modifier = wire.numeric_modifier };
     }
     pub fn jsonParseFromValue(a: Allocator, value: Json, options: std.json.ParseOptions) std.json.ParseFromValueError!Cast {
         const wire = try std.json.innerParseFromValue(Wire, a, value, options);
-        if (wire.named_type != null or wire.type == .enumeration) return error.UnexpectedToken;
+        if (wire.domain_check or wire.domain_source or wire.named_type != null or wire.type == .enumeration) return error.UnexpectedToken;
         return .{ .operand = wire.operand, .type = wire.type, .temporal_kind = wire.temporal_kind, .element_type = wire.element_type, .numeric_modifier = wire.numeric_modifier };
     }
 };
@@ -1068,6 +1186,7 @@ const ConstantPool = struct {
 };
 
 pub const Program = struct {
+    domain_registry: ?domain_values.Registry = null,
     decimal_plan: ?@import("decimal_program.zig").Plan = null,
     arena: *std.heap.ArenaAllocator,
     uses_sequences: bool = false,
@@ -1127,7 +1246,7 @@ pub const Program = struct {
     fn literalInstruction(self: *const Program, index: u32, earlier: []const bool) bool {
         return switch (self.instructions[index].operation) {
             .literal => true,
-            .cast => |cast| earlier[cast.operand],
+            .cast => |cast| !cast.domain_check and earlier[cast.operand],
             .unary => |unary| earlier[unary.operand],
             .call => |call| blk: {
                 if (call.function.volatility() != .immutable) break :blk false;
@@ -1262,6 +1381,7 @@ pub const Program = struct {
 
     pub fn deinit(self: *Program) void {
         self.releaseConstants();
+        if (self.domain_registry) |*registry| registry.deinit();
         const backing = self.arena.child_allocator;
         self.arena.deinit();
         backing.destroy(self.arena);
@@ -1489,6 +1609,13 @@ pub fn inferTypedParametersExpected(alloc: Allocator, expression: *const ast.Sca
 }
 
 pub fn validateParameterDescriptorWire(descriptor: Type) !void {
+    if (descriptor.domainReference()) |reference| {
+        if (descriptor.domainView() != null or descriptor.kind == null) return error.InvalidSqlParameters;
+        _ = EnumTypes.Identity.init(reference.id, 1, reference.generation, reference.origin_id) catch return error.InvalidSqlParameters;
+        var base = descriptor;
+        base.domain_binding = null;
+        return validateParameterDescriptorWire(base);
+    }
     if (descriptor.enum_reference) |reference| {
         if (descriptor.kind != .enumeration or descriptor.enum_view != null or descriptor.element_type != null or descriptor.temporal_kind != null or descriptor.numeric_modifier != null) return error.InvalidSqlParameters;
         _ = @import("../system_catalog/named_types.zig").Identity.init(reference.id, 1, reference.generation, reference.origin_id) catch return error.InvalidSqlParameters;
@@ -1497,7 +1624,11 @@ pub fn validateParameterDescriptorWire(descriptor: Type) !void {
     return validateParameterType(descriptor);
 }
 pub fn validateParameterType(descriptor: Type) !void {
-    if (descriptor.enum_reference != null) return error.InvalidSqlParameters;
+    if (descriptor.enum_reference != null or descriptor.domainReference() != null) return error.InvalidSqlParameters;
+    if (descriptor.domainView()) |view| {
+        const physical = try domainType(view);
+        if (descriptor.kind != physical.kind or descriptor.element_type != physical.element_type or descriptor.temporal_kind != physical.temporal_kind or !NumericModifier.eql(descriptor.numeric_modifier, physical.numeric_modifier) or !sameEnumDomain(descriptor.enum_view, physical.enum_view)) return error.InvalidSqlParameters;
+    }
     if ((descriptor.kind == .enumeration) != (descriptor.enum_view != null)) return error.InvalidSqlParameters;
     if (descriptor.enum_view != null and (descriptor.element_type != null or descriptor.temporal_kind != null or descriptor.numeric_modifier != null)) return error.InvalidSqlParameters;
     if (descriptor.temporal_kind != null and (descriptor.kind != .datetime or descriptor.element_type != null)) return error.InvalidSqlParameters;
@@ -1699,7 +1830,7 @@ pub fn assignArray(alloc: Allocator, datum: Datum, target: arrays.ElementType, l
 /// without turning an already typed text/JSON value into numeric input.
 pub fn assignNumeric(alloc: Allocator, datum: Datum, source_identity: ?arrays.ElementType, target: arrays.ElementType, limits: EvalLimits) !Datum {
     if (!builtin_cast.integral(target) and !builtin_cast.floating(target) and target != .numeric) return error.SqlAssignmentTypeMismatch;
-    if (datum.array != null or datum.patterns() != null or datum.temporal() != null or datum.range() != null or datum.enumeration() != null) return error.SqlAssignmentTypeMismatch;
+    if (datum.array != null or datum.patterns() != null or datum.temporal() != null or datum.range() != null or datum.enumeration() != null or datum.bytes() != null) return error.SqlAssignmentTypeMismatch;
     if (datum.sql_null) {
         if (datum.value != .null or datum.numeric != null) return error.SqlTypeMismatch;
         return datum;
@@ -1724,7 +1855,7 @@ pub fn assignNumeric(alloc: Allocator, datum: Datum, source_identity: ?arrays.El
 pub fn normalizeParameterType(descriptor: Type) !Type {
     try validateParameterType(descriptor);
     var result = descriptor;
-    if (result.kind != null and result.kind != .datetime and result.kind != .enumeration and @import("range_value.zig").kindFromType(result.kind.?) == null and result.element_type == null) result.element_type = try parameterElementType(result);
+    if (result.kind != null and result.kind != .datetime and result.kind != .enumeration and result.kind != .bytea and @import("range_value.zig").kindFromType(result.kind.?) == null and result.element_type == null) result.element_type = try parameterElementType(result);
     return result;
 }
 
@@ -1736,6 +1867,19 @@ pub fn ownEnumView(a: Allocator, views: *std.AutoHashMapUnmanaged(*const @import
     try views.put(a, view, owned);
     return owned;
 }
+/// Retained wire/cursor metadata must own executable domain programs after
+/// its producing statement is released. The caller owns this bounded region.
+pub const DomainViews = std.AutoHashMapUnmanaged(*const domain_values.View, *const domain_values.View);
+pub fn ownDomainView(a: Allocator, views: *DomainViews, source: ?*const domain_values.View) !?*const domain_values.View {
+    const view = source orelse return null;
+    if (views.get(view)) |owned| return owned;
+    const registry = try a.create(domain_values.Registry);
+    registry.* = try domain_coercion.capture(a, &.{view});
+    const owned = &registry.byId(view.identity.?.id).?.executable.?.domain;
+    try views.put(a, view, owned);
+    return owned;
+}
+
 fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const Type, expected: ?Type, limits: BindLimits, settings: ?*const setting_catalog.View, typed_parameters: bool) !Program {
     if (limits.parameters > 1024 or parameter_hints.len > limits.parameters or limits.nodes == 0) return error.SqlProgramLimitExceeded;
     if (typed_parameters) for (parameter_hints) |descriptor| try validateParameterType(descriptor);
@@ -1753,6 +1897,21 @@ fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []c
     };
     binder.parameter_count = parameter_hints.len;
     const root = if (expected != null and expected.?.enum_view != null) try binder.compileOperatorOperand(expression, expected.?, 0) else try binder.compileTypedContext(expression, if (expected) |kind| kind.kind else null, if (expected) |kind| kind.element_type else null, if (expected) |kind| kind.temporal_kind else null, 0);
+    var domain_sources: std.ArrayList(*const domain_values.View) = .empty;
+    for (binder.instructions.items) |instruction| {
+        if (instruction.type.domainView()) |view| try domain_sources.append(binder.alloc, view);
+    }
+    for (binder.parameters[0..binder.parameter_count]) |descriptor| if (descriptor.domainView()) |view| try domain_sources.append(binder.alloc, view);
+    var domain_registry: ?domain_values.Registry = if (domain_sources.items.len != 0) try domain_coercion.capture(binder.alloc, domain_sources.items) else null;
+    errdefer if (domain_registry) |*registry| registry.deinit();
+    if (domain_registry) |*registry| {
+        for (binder.instructions.items) |*instruction| {
+            if (instruction.type.domainView()) |view| instruction.type.domain_binding = &registry.byId(view.identity.?.id).?.executable.?.domain.type_binding;
+        }
+        for (binder.parameters[0..binder.parameter_count]) |*descriptor| if (descriptor.domainView()) |view| {
+            descriptor.domain_binding = &registry.byId(view.identity.?.id).?.executable.?.domain.type_binding;
+        };
+    }
     var views: std.AutoHashMapUnmanaged(*const @import("../common/sql_enum_value.zig").View, *const @import("../common/sql_enum_value.zig").View) = .empty;
     for (binder.instructions.items) |*instruction| {
         instruction.type.enum_view = try ownEnumView(binder.alloc, &views, instruction.type.enum_view);
@@ -1766,6 +1925,7 @@ fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []c
     for (parameter_types, parameter_descriptors) |*kind, descriptor| kind.* = descriptor.kind;
     const required_columns = try binder.dependencies.toOwnedSlice(binder.alloc);
     var program: Program = .{
+        .domain_registry = domain_registry,
         .arena = arena,
         .instructions = instructions,
         .uses_sequences = binder.uses_sequences,
@@ -2154,7 +2314,7 @@ test "SQL NUMERIC modifier dynamic arrays retain bounds and unwind allocation fa
             try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{}, &.{.{ .string = "{12.345}" }}, .{ .output_bytes = 0 }));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{false});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{false});
     try Faults.run(std.testing.allocator, true);
 }
 
@@ -2307,7 +2467,7 @@ test "SQL multidimensional column constructors preserve bounds and admit heap sc
             try std.testing.expectEqualStrings("é", result.flatCell(16).value.string);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
     var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "ARRAY[a,b]", .{});
     defer compiled.deinit();
     var program = try bind(std.testing.allocator, compiled.expression, &.{ .{ .name = "a", .type = .array, .element_type = .int32 }, .{ .name = "b", .type = .array, .element_type = .int32 } }, &.{}, .{});
@@ -2485,8 +2645,8 @@ test "SQL array binding retains element identity NULL provenance and bounded all
             try std.testing.expect((try program.evaluate(no_memory.allocator(), &.{}, &.{}, .{})).value.bool);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.constant, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.constant, .{});
     var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "ARRAY[1, NULL]", .{});
     defer compiled.deinit();
     var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
@@ -2532,7 +2692,7 @@ test "SQL array pattern quantifiers bound work and avoid hot loop allocations" {
             try std.testing.expect(result.value.bool);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
     var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "probe ILIKE ANY(ARRAY['ready%', 'open%'])", .{});
     defer compiled.deinit();
     var program = try bind(std.testing.allocator, compiled.expression, &.{.{ .name = "probe", .type = .string }}, &.{}, .{});
@@ -2562,7 +2722,7 @@ test "SQL text array casts prepare once and bound dynamic decoding allocation" {
             try std.testing.expect((try program.evaluate(arena.allocator(), &.{Datum.json(.{ .string = "{1,2,3,NULL}" })}, &.{}, .{})).value.bool);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
     var constant = try @import("compiler.zig").compileScalar(std.testing.allocator, "probe = ANY('{1,2,3,4}'::integer[])", .{});
     defer constant.deinit();
     var dynamic = try @import("compiler.zig").compileScalar(std.testing.allocator, "probe = ANY(raw::integer[])", .{});
@@ -2614,7 +2774,7 @@ test "SQL array cast execution preserves bounds and releases allocations on ever
             try std.testing.expectEqual(@as(i64, -3), result.flatCell(3).value.integer);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
 }
 
 test "SQL constant array preparation eliminates hot loop constructor allocation" {
@@ -2657,7 +2817,7 @@ fn arrayElementType(kind: ast.ColumnType) !arrays.ElementType {
         .number => .float64,
         .boolean => .boolean,
         .json => .jsonb,
-        .datetime, .array, .numrange, .daterange, .tsrange, .tstzrange, .enumeration => error.UnsupportedSqlShape,
+        .datetime, .array, .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea => error.UnsupportedSqlShape,
     };
 }
 fn arrayScalarType(kind: arrays.ElementType) ast.ColumnType {
@@ -2722,6 +2882,15 @@ pub fn comparisonDomain(left: Type, right: Type) !Type {
 }
 
 fn common(left: Type, right: Type) !Type {
+    if (left.domainView() != null or right.domainView() != null) {
+        var lhs = left;
+        var rhs = right;
+        lhs.domain_binding = null;
+        rhs.domain_binding = null;
+        var result = try common(lhs, rhs);
+        if (left.domainView() != null and right.domainView() != null and sameDomain(left.domainView(), right.domainView())) result.domain_binding = left.domain_binding;
+        return result;
+    }
     if (left.kind == .enumeration or right.kind == .enumeration) {
         const selected = if (left.kind == .enumeration) left else right;
         const other = if (left.kind == .enumeration) right else left;
@@ -2792,7 +2961,7 @@ fn functionId(name: []const u8) !Function {
     // PostgreSQL has starts_with(text,text), not a symmetric ends_with
     // builtin. Do not accidentally promise a nonstandard overload.
     if (std.mem.eql(u8, name, "ends_with")) return error.SqlUndefinedFunction;
-    if (std.mem.eql(u8, name, "uuidv4")) return .gen_random_uuid;
+    if (std.mem.eql(u8, name, "uuidv4") or std.mem.eql(u8, name, "uuid_generate_v4")) return .gen_random_uuid;
     if (std.mem.eql(u8, name, "antfly\x00json_patch")) return .@"$document_patch";
     if (std.mem.startsWith(u8, name, "pg_catalog\x00")) {
         const builtin = try functionId(name[11..]);
@@ -3199,6 +3368,7 @@ fn arity(function: Function, count: usize) !void {
     const valid = switch (function) {
         .@"$routine" => false,
         .numrange, .daterange, .tsrange, .tstzrange, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => unreachable,
+        .convert_from, .convert_to => count == 2,
         .lastval => count == 0,
         .nextval, .currval => count == 1,
         .setval => count == 2 or count == 3,
@@ -3220,7 +3390,7 @@ fn arity(function: Function, count: usize) !void {
         .@"$document_patch" => count == 2,
         .@"$array" => true,
         .@"$array_quantified" => count == 4,
-        .cardinality, .array_ndims, .jsonb_array_length, .initcap, .md5 => count == 1,
+        .cardinality, .array_ndims, .jsonb_array_length, .initcap, .md5, .soundex => count == 1,
         .array_length, .array_lower, .array_upper => count == 2,
         .ai_decide, .ai_probability => count == 3,
         .ai_choice, .ai_score => count == 4,
@@ -3229,7 +3399,7 @@ fn arity(function: Function, count: usize) !void {
         .concat_ws => count >= 2,
         .jsonb_build_object => count % 2 == 0,
         .jsonb_extract_path_text, .jsonb_extract_path => count >= 2,
-        .nullif, .power, .mod, .starts_with, .strpos, .repeat, .left, .right, .date_part, .extract, .date_trunc, .@"$single" => count == 2,
+        .difference, .nullif, .power, .mod, .starts_with, .strpos, .repeat, .left, .right, .date_part, .extract, .date_trunc, .@"$single" => count == 2,
         .@"$pattern_quantified", .@"$array_pattern_quantified" => count == 5,
         .substring, .lpad, .rpad => count == 2 or count == 3,
         .replace, .translate, .split_part, .date_bin => count == 3,
@@ -3238,7 +3408,7 @@ fn arity(function: Function, count: usize) !void {
         .coalesce, .greatest, .least => count > 0,
         .concat => count > 0,
     };
-    if (!valid) return if (function == .date_bin or clockFunction(function) != null or arrayCompatibleFunction(function) or function == .uuid_extract_version or function == .uuid_extract_timestamp or function == .gen_random_uuid or function == .uuidv7 or function == .starts_with or function == .md5 or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap or function == .jsonb_extract_path or function == .jsonb_extract_path_text) error.SqlUndefinedFunction else error.InvalidSqlParameters;
+    if (!valid) return if (function == .soundex or function == .difference or function == .convert_from or function == .convert_to or function == .date_bin or clockFunction(function) != null or arrayCompatibleFunction(function) or function == .uuid_extract_version or function == .uuid_extract_timestamp or function == .gen_random_uuid or function == .uuidv7 or function == .starts_with or function == .md5 or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap or function == .jsonb_extract_path or function == .jsonb_extract_path_text) error.SqlUndefinedFunction else error.InvalidSqlParameters;
 }
 
 const Binder = struct {
@@ -3311,6 +3481,8 @@ const Binder = struct {
     }
 
     fn registerColumns(self: *Binder) !void {
+        self.enum_inputs = self.enum_inputs or self.limits.named_types != null or
+            (if (self.limits.invocation) |invocation| invocation.named_type_resolver != null else false);
         for (self.columns, 0..) |column, ordinal| {
             self.enum_inputs = self.enum_inputs or column.enum_view != null;
             if (column.aliases.len > 3) return error.SqlProgramLimitExceeded;
@@ -3356,12 +3528,51 @@ const Binder = struct {
                 }
                 if (cast.type == .array) try self.typeArrayConstructors(cast.operand, cast.element_type.?, depth + 1);
                 const source = try self.infer(cast.operand, depth + 1);
-                const target: Type = .{ .kind = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier, .enum_view = cast.enum_view, .temporal_kind = cast.temporal_kind };
-                if (cast.enum_view != null) {
+                const target: Type = if (cast.named_type) |intent| named: {
+                    if (cast.enum_view != null) return error.InvalidSqlProgram;
+                    if (self.limits.named_types) |resolver| break :named try resolver.resolve(resolver.ptr, self.alloc, intent);
+                    if (self.limits.invocation) |invocation| break :named try invocation.resolveNamedType(intent);
+                    return error.SqlNamedTypeNotFound;
+                } else .{ .kind = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier, .enum_view = cast.enum_view, .domain_binding = if (cast.domain_view) |view| &view.type_binding else null, .temporal_kind = cast.temporal_kind };
+                if (target.domainView() != null) {
+                    try validateParameterType(target);
+                    if (cast.operand.* == .literal and cast.operand.literal == .parameter) {
+                        const slot = cast.operand.literal.parameter - 1;
+                        if (self.parameters[slot].kind == null) self.parameters[slot] = target;
+                    }
+                    const rebound = try self.alloc.create(ast.Scalar);
+                    var physical = cast;
+                    physical.named_type = null;
+                    physical.domain_view = null;
+                    physical.type = target.kind.?;
+                    physical.element_type = target.element_type;
+                    physical.numeric_modifier = target.numeric_modifier;
+                    physical.temporal_kind = target.temporal_kind;
+                    physical.enum_view = target.enum_view;
+                    rebound.* = .{ .cast = physical };
+                    _ = try self.infer(rebound, depth + 1);
+                    break :blk target;
+                }
+                if (target.enum_view != null) {
                     try validateParameterType(target);
                     const unknown = cast.operand.* == .literal and (cast.operand.literal == .string or cast.operand.literal == .null or cast.operand.literal == .parameter);
-                    if (!unknown) _ = try common(source, target);
+                    if (!unknown and !(cast.context == .explicit and source.kind == .string)) _ = try common(source, target);
                     break :blk target;
+                }
+                if (cast.named_type != null) {
+                    const rebound = try self.alloc.create(ast.Scalar);
+                    var value = cast;
+                    value.named_type = null;
+                    value.type = target.kind orelse return error.InvalidSqlProgram;
+                    value.element_type = target.element_type;
+                    value.temporal_kind = target.temporal_kind;
+                    value.numeric_modifier = target.numeric_modifier;
+                    rebound.* = .{ .cast = value };
+                    break :blk try self.infer(rebound, depth + 1);
+                }
+                if (cast.type == .bytea or source.kind == .bytea) {
+                    if (cast.type != source.kind and cast.type != .string and source.kind != .string and source.kind != null) return error.SqlCannotCoerce;
+                    break :blk .{ .kind = cast.type, .nullable = source.nullable };
                 }
                 if (source.kind == .enumeration) {
                     if (cast.type != .string) return error.SqlCannotCoerce;
@@ -3470,7 +3681,8 @@ const Binder = struct {
                     for (call.args) |arg| _ = try self.infer(arg, depth + 1);
                     break :blk .{ .kind = .integer, .nullable = false };
                 }
-                const function = functionId(call.name) catch {
+                const function = functionId(call.name) catch |err| {
+                    if (err == error.SqlUndefinedFunction and self.limits.routines == null and (self.limits.invocation == null or self.limits.invocation.?.routine_resolver == null)) return err;
                     break :blk (try self.resolveCallable(call.name, call.args, call.operator, depth + 1)).output;
                 };
                 try arity(function, call.args.len);
@@ -3531,6 +3743,17 @@ const Binder = struct {
                     // timestamptz is the preferred datetime overload when
                     // dates/unknowns alone cannot choose an exact timestamp.
                     break :blk .{ .kind = .datetime, .temporal_kind = stamp orelse .timestamp_tz, .nullable = nullable };
+                }
+                if (function == .convert_from or function == .convert_to) {
+                    var nullable = false;
+                    for (call.args, 0..) |arg, i| {
+                        const input = try self.infer(arg, depth + 1);
+                        const desired: ast.ColumnType = if (i == 0 and function == .convert_from) .bytea else .string;
+                        const unknown = arg.* == .literal and arg.literal == .string;
+                        if (input.kind != null and input.kind != desired and !unknown) return error.SqlUndefinedFunction;
+                        nullable = nullable or input.nullable;
+                    }
+                    break :blk .{ .kind = if (function == .convert_from) .string else .bytea, .nullable = nullable };
                 }
                 if (function == .gen_random_uuid) break :blk .{ .kind = .uuid, .element_type = .uuid, .nullable = false };
                 if (function == .uuidv7) {
@@ -3598,14 +3821,14 @@ const Binder = struct {
                     }
                     break :blk .{ .kind = if (function == .date_trunc) .datetime else .number, .element_type = if (function == .date_part) .float64 else if (function == .extract) .numeric else null, .nullable = nullable };
                 }
-                if (function == .starts_with or function == .md5) {
+                if (function == .starts_with or function == .md5 or function == .soundex or function == .difference) {
                     var nullable = false;
                     for (call.args) |arg| {
                         const actual = try self.infer(arg, depth + 1);
                         if (actual.kind != null and actual.kind != .string) return error.SqlUndefinedFunction;
                         nullable = nullable or actual.nullable;
                     }
-                    break :blk .{ .kind = if (function == .md5) .string else .boolean, .element_type = if (function == .md5) .text else .boolean, .nullable = nullable };
+                    break :blk .{ .kind = if (function == .difference) .integer else if (function == .starts_with) .boolean else .string, .element_type = if (function == .difference) .int32 else if (function == .starts_with) .boolean else .text, .nullable = nullable };
                 }
                 if (function == .jsonb_array_length or function == .initcap) {
                     const arg = call.args[0];
@@ -3829,14 +4052,20 @@ const Binder = struct {
                 if (function == .coalesce or function == .nullif or function == .greatest or function == .least) {
                     for (call.args) |arg| {
                         const actual = try self.infer(arg, depth + 1);
-                        if (actual.kind == .enumeration) merged = try common(merged, actual);
+                        if (actual.kind == .enumeration) merged = if (merged.kind == null) actual else try common(merged, actual);
                     }
                 }
+                var common_started = merged.kind != null;
                 switch (function) {
                     .@"$single" => merged = try self.infer(call.args[0], depth + 1),
                     .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt, .power, .mod => for (call.args) |arg| {
-                        if (merged.kind == .enumeration and uuidTextOperand(arg)) continue;
-                        merged = try common(merged, try self.infer(arg, depth + 1));
+                        if (merged.kind == .enumeration and uuidTextOperand(arg)) {
+                            merged = merged.baseType();
+                            continue;
+                        }
+                        const actual = try self.infer(arg, depth + 1);
+                        merged = if (!common_started) actual else try common(merged, actual);
+                        common_started = true;
                     },
                     else => for (call.args) |arg| {
                         _ = try self.infer(arg, depth + 1);
@@ -3900,6 +4129,9 @@ const Binder = struct {
                     .date_trunc, .to_timestamp => .datetime,
                     .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .@"$single" => merged.kind,
                     else => .string,
+                }, .domain_binding = switch (function) {
+                    .coalesce, .greatest, .least, .@"$single" => merged.domain_binding,
+                    else => null,
                 }, .enum_view = switch (function) {
                     .coalesce, .nullif, .greatest, .least, .@"$single" => merged.enum_view,
                     else => null,
@@ -3919,20 +4151,23 @@ const Binder = struct {
                 var enum_domain: Type = .{};
                 if (self.enum_inputs) for (case.branches) |branch| {
                     const actual = try self.infer(branch.value, depth + 1);
-                    if (actual.kind == .enumeration) enum_domain = try common(enum_domain, actual);
+                    if (actual.kind == .enumeration) enum_domain = if (enum_domain.kind == null) actual else try common(enum_domain, actual);
                 };
                 if (self.enum_inputs) if (case.otherwise) |other| {
                     const actual = try self.infer(other, depth + 1);
-                    if (actual.kind == .enumeration) enum_domain = try common(enum_domain, actual);
+                    if (actual.kind == .enumeration) enum_domain = if (enum_domain.kind == null) actual else try common(enum_domain, actual);
                 };
-                var merged: Type = if (case.otherwise) |other| if (enum_domain.kind == .enumeration and uuidTextOperand(other)) enum_domain else if (enum_domain.kind == .enumeration) try common(enum_domain, try self.infer(other, depth + 1)) else try self.infer(other, depth + 1) else enum_domain;
+                var merged: Type = if (case.otherwise) |other| if (enum_domain.kind == .enumeration and uuidTextOperand(other)) enum_domain.baseType() else if (enum_domain.kind == .enumeration) try common(enum_domain, try self.infer(other, depth + 1)) else try self.infer(other, depth + 1) else enum_domain.baseType();
                 var modifier = merged.numeric_modifier;
                 for (case.branches) |branch| {
                     const condition = try self.infer(branch.condition, depth + 1);
                     if (condition.kind != null and condition.kind != .boolean) return error.SqlTypeMismatch;
                     const actual = try self.infer(branch.value, depth + 1);
                     if (!@import("../common/sql_builtin_type.zig").NumericModifier.eql(modifier, actual.numeric_modifier)) modifier = null;
-                    if (merged.kind == .enumeration and uuidTextOperand(branch.value)) continue;
+                    if (merged.kind == .enumeration and uuidTextOperand(branch.value)) {
+                        merged = merged.baseType();
+                        continue;
+                    }
                     merged = try common(merged, actual);
                 }
                 if (merged.kind == null) merged.kind = .string;
@@ -4100,7 +4335,8 @@ const Binder = struct {
                 self.parameter_count = validator.parameter_count;
                 break :blk .{ .literal = .{ .integer = 1 } };
             }
-            const function = functionId(call.name) catch {
+            const function = functionId(call.name) catch |err| {
+                if (err == error.SqlUndefinedFunction and self.limits.routines == null and (self.limits.invocation == null or self.limits.invocation.?.routine_resolver == null)) return err;
                 const routine = try self.resolveCallable(call.name, call.args, call.operator, depth + 1);
                 const args = try self.alloc.alloc(u32, call.args.len);
                 for (call.args, args, routine.arguments) |arg, *out, target| {
@@ -4234,6 +4470,8 @@ const Binder = struct {
             const nested_constructor = function == .@"$array" and self.arrayChildren(call.args);
             for (call.args, args, 0..) |arg, *out, i| {
                 const desired: ?ast.ColumnType = switch (function) {
+                    .convert_from => if (i == 0) .bytea else .string,
+                    .convert_to => .string,
                     .@"$record_validate" => .json,
                     .@"$record_field" => if (i == 0) .json else if (i == 1) .string else kind.kind,
                     .@"$like_escape" => if (i == 3) .boolean else .string,
@@ -4254,7 +4492,7 @@ const Binder = struct {
                     .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with, .strpos, .bit_length, .reverse, .translate, .ascii => .string,
                     .concat_ws => if (i == 0) .string else null,
                     .jsonb_typeof, .jsonb_array_length => .json,
-                    .initcap, .md5 => .string,
+                    .initcap, .md5, .soundex, .difference => .string,
                     .substring, .repeat, .left, .right => if (i == 0) .string else .integer,
                     .split_part => if (i == 2) .integer else .string,
                     .overlay => if (i < 2) .string else .integer,
@@ -4319,6 +4557,12 @@ const Binder = struct {
                     const coercion = try self.alloc.create(ast.Scalar);
                     coercion.* = .{ .cast = .{ .operand = arg, .type = desired.?, .element_type = kind.element_type } };
                     out.* = try self.compileArrayContext(coercion, desired, kind.element_type, depth + 1);
+                    continue;
+                }
+                if (desired == .bytea and arg.* == .literal and arg.literal == .string) {
+                    const coercion = try self.alloc.create(ast.Scalar);
+                    coercion.* = .{ .cast = .{ .operand = arg, .type = .bytea } };
+                    out.* = try self.compile(coercion, .bytea, depth + 1);
                     continue;
                 }
                 if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(desired == .enumeration and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
@@ -4453,13 +4697,49 @@ const Binder = struct {
                 break :blk .{ .column = ordinal };
             },
             .cast => |cast| blk: {
-                if (cast.enum_view != null) {
-                    const target: Type = .{ .kind = cast.type, .enum_view = cast.enum_view };
+                if (kind.domainView()) |view| {
+                    const source = try self.infer(cast.operand, depth + 1);
+                    const rebound = try self.alloc.create(ast.Scalar);
+                    var physical = cast;
+                    physical.named_type = null;
+                    physical.domain_view = null;
+                    physical.type = kind.kind.?;
+                    physical.element_type = kind.element_type;
+                    physical.numeric_modifier = kind.numeric_modifier;
+                    physical.temporal_kind = kind.temporal_kind;
+                    physical.enum_view = kind.enum_view;
+                    rebound.* = .{ .cast = physical };
+                    const operand = try self.compileTypedContext(rebound, kind.kind, kind.element_type, kind.temporal_kind, depth + 1);
+                    const same_source = if (source.domainView()) |prior| prior.identity != null and prior.identity.?.id == view.identity.?.id else false;
+                    break :blk .{ .cast = .{ .operand = operand, .type = kind.kind.?, .domain_check = true, .domain_source = same_source } };
+                }
+                if (kind.enum_view != null) {
+                    const target = kind;
+                    const source = try self.infer(cast.operand, depth + 1);
+                    const unknown = cast.operand.* == .literal and (cast.operand.literal == .string or cast.operand.literal == .null or cast.operand.literal == .parameter);
+                    if (!unknown and cast.context == .explicit and source.kind == .string) {
+                        const operand = try self.compileTypedContext(cast.operand, source.kind, source.element_type, source.temporal_kind, depth + 1);
+                        break :blk .{ .cast = .{ .operand = operand, .type = .enumeration, .enum_view = target.enum_view } };
+                    }
                     const result = try self.compileOperatorOperand(cast.operand, target, depth + 1);
                     // The boundary appends its own topological instruction;
                     // reuse that operation at the enclosing cast's boundary.
                     const emitted = self.instructions.pop().?;
                     std.debug.assert(result == self.instructions.items.len);
+                    break :blk emitted.operation;
+                }
+                if (cast.named_type != null) {
+                    const rebound = try self.alloc.create(ast.Scalar);
+                    var value = cast;
+                    value.named_type = null;
+                    value.type = kind.kind orelse return error.InvalidSqlProgram;
+                    value.element_type = kind.element_type;
+                    value.temporal_kind = kind.temporal_kind;
+                    value.numeric_modifier = kind.numeric_modifier;
+                    rebound.* = .{ .cast = value };
+                    const index = try self.compileTypedContext(rebound, kind.kind, kind.element_type, kind.temporal_kind, depth + 1);
+                    const emitted = self.instructions.pop().?;
+                    std.debug.assert(index == self.instructions.items.len);
                     break :blk emitted.operation;
                 }
                 if (self.cast_functions.get(expression)) |optional| if (optional) |function| {
@@ -4549,7 +4829,7 @@ const Binder = struct {
             },
         };
         if (self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
-        instruction.input_function = expression.* == .cast and expression.cast.operand.* == .literal and expression.cast.operand.literal == .string;
+        instruction.input_function = instruction.type.domainView() == null and expression.* == .cast and expression.cast.operand.* == .literal and expression.cast.operand.literal == .string;
         const index: u32 = @intCast(self.instructions.items.len);
         try self.instructions.append(self.alloc, instruction);
         if (instruction.operation == .call and @import("sequence_effects.zig").function(@tagName(instruction.operation.call.function)) != null) self.uses_sequences = true;
@@ -4883,7 +5163,10 @@ const Evaluator = struct {
             if (index >= self.program.instructions.len) return false;
             switch (self.program.instructions[index].operation) {
                 .literal => |value| return value == .null,
-                .cast => |cast| index = cast.operand,
+                .cast => |cast| {
+                    if (cast.domain_check) return false;
+                    index = cast.operand;
+                },
                 else => return false,
             }
         }
@@ -4935,6 +5218,12 @@ const Evaluator = struct {
             },
             .column => |ordinal| if (ordinal < self.cells.len) self.cells[ordinal] else return error.InvalidSqlBackendResponse,
             .cast => |cast| blk: {
+                if (cast.domain_check) {
+                    const view = instruction.type.domainView() orelse return error.InvalidSqlProgram;
+                    const datum = try self.runDatum(cast.operand, depth + 1);
+                    try self.validateDomainDatum(view, datum, if (cast.domain_source) referenceOf(view) else null);
+                    break :blk datum;
+                }
                 if (cast.type == .array) if (self.program.constant_arrays.get(index)) |prepared| {
                     try self.charge(try prepared.retainedBytes());
                     break :blk Datum.typedArray(prepared);
@@ -4954,6 +5243,22 @@ const Evaluator = struct {
                 if (cast.enum_view) |view| {
                     if (cast.type != .enumeration) return error.InvalidSqlProgram;
                     break :blk try @import("describe.zig").coerceDatumTyped(self.alloc, datum, .{ .kind = .enumeration, .enum_view = view });
+                }
+                if (datum.bytes()) |bytes| {
+                    if (cast.type == .bytea) break :blk datum;
+                    if (cast.type != .string) return error.SqlCannotCoerce;
+                    const text = try @import("bytea_value.zig").formatAlloc(self.alloc, bytes, self.limits.output_bytes -| self.bytes);
+                    try self.charge(text.len);
+                    break :blk Datum.json(.{ .string = text });
+                }
+                if (cast.type == .bytea) {
+                    if (datum.value != .string) return error.SqlCannotCoerce;
+                    try self.workOwner().charge(datum.value.string.len);
+                    const bytes = try @import("bytea_value.zig").parseAlloc(self.alloc, datum.value.string, self.limits.output_bytes -| self.bytes);
+                    try self.charge(bytes.len + @sizeOf(@import("bytea_value.zig").Value));
+                    const owned = try self.alloc.create(@import("bytea_value.zig").Value);
+                    owned.* = .{ .bytes = bytes };
+                    break :blk Datum.typedBytes(owned);
                 }
                 if (datum.enumeration()) |atom| {
                     try datum.validateTemporal();
@@ -5330,6 +5635,25 @@ const Evaluator = struct {
                     const owned = try self.alloc.create(temporal.Value);
                     owned.* = .{ .timestamp_tz = timestamp };
                     break :blk Datum.typedTemporal(owned);
+                }
+                if (call.function == .convert_from or call.function == .convert_to) {
+                    const input = try self.runDatum(call.args[0], depth + 1);
+                    const encoding = try self.runDatum(call.args[1], depth + 1);
+                    if (input.sql_null or encoding.sql_null) break :blk .{};
+                    if (encoding.value != .string) return error.SqlTypeMismatch;
+                    const bytes = if (call.function == .convert_from) input.bytes() orelse return error.SqlTypeMismatch else if (input.value == .string) input.value.string else return error.SqlTypeMismatch;
+                    var work = self.workBudget();
+                    if (call.function == .convert_from) if (try @import("text_conversion.zig").borrowUtf8(bytes, encoding.value.string, self.limits.output_bytes -| self.bytes, &work)) |borrowed| {
+                        try self.charge(borrowed.len);
+                        break :blk Datum.json(.{ .string = borrowed });
+                    };
+                    const output = try @import("text_conversion.zig").convertAlloc(self.alloc, bytes, encoding.value.string, call.function == .convert_from, self.limits.output_bytes -| self.bytes, &work);
+                    try self.charge(output.len);
+                    if (call.function == .convert_from) break :blk Datum.json(.{ .string = output });
+                    try self.charge(@sizeOf(@import("bytea_value.zig").Value));
+                    const owned = try self.alloc.create(@import("bytea_value.zig").Value);
+                    owned.* = .{ .bytes = output };
+                    break :blk Datum.typedBytes(owned);
                 }
                 if (call.function == .gen_random_uuid) {
                     const io = self.limits.execution_io orelse return error.SqlEntropyUnavailable;
@@ -5813,6 +6137,15 @@ const Evaluator = struct {
         if (instruction.type.enum_view != null) {
             result = try @import("describe.zig").coerceDatumTyped(self.alloc, result, instruction.type);
         } else if (result.enumeration() != null) return error.SqlTypeMismatch;
+        if (result.bytes()) |bytes| {
+            try result.validateTemporal();
+            if (instruction.type.kind != .bytea) return error.SqlTypeMismatch;
+            if (bytes.len > self.limits.output_bytes) return self.workOwner().limit();
+        } else if (instruction.type.kind == .bytea and !result.sql_null) return error.SqlTypeMismatch;
+        // Client parameter metadata is a requested coercion, not trusted
+        // already-domain provenance. Qualify it only after fresh validation.
+        if (instruction.operation == .parameter) if (instruction.type.domainView()) |view|
+            try self.validateDomainDatum(view, result, null);
         if (instruction.operation == .call and instruction.operation.call.function.volatility() == .@"volatile")
             if (self.limits.volatile_values) |values| {
                 values[index] = result;
@@ -5924,7 +6257,7 @@ const Evaluator = struct {
         if (value == .null) return .null;
         return switch (kind) {
             .numrange, .daterange, .tsrange, .tstzrange => error.InvalidSqlProgram,
-            .array, .enumeration => error.SqlTypeMismatch,
+            .array, .enumeration, .bytea => error.SqlTypeMismatch,
             .integer => switch (value) {
                 .integer => value,
                 .float => |v| blk: {
@@ -6364,6 +6697,15 @@ const Evaluator = struct {
         return Datum.typedRange(owned);
     }
 
+    fn validateDomainDatum(self: *Evaluator, view: *const domain_values.View, datum: Datum, source: ?EnumReference) anyerror!void {
+        var available = self.limits.output_bytes -| self.bytes;
+        const before = available;
+        var execution = @import("../schema/relational_expression.zig").Execution.init(self.alloc, &available);
+        execution.numeric = self.numericContext();
+        defer self.bytes += before - available;
+        try domain_coercion.validate(&execution, view, datum, source);
+    }
+
     fn numericContext(self: *Evaluator) @import("numeric_value.zig").Context {
         return .{
             .alloc = self.alloc,
@@ -6378,7 +6720,7 @@ const Evaluator = struct {
     /// then exact decimal parsing. JSON numbers have neither a float width
     /// nor NaN/infinity payloads; PostgreSQL represents specials as strings.
     fn sqlJson(self: *Evaluator, datum: Datum, descriptor: Type) !Json {
-        if (datum.range() != null or datum.enumeration() != null) return .{ .string = try self.sqlText(datum, descriptor) };
+        if (datum.range() != null or datum.enumeration() != null or datum.bytes() != null) return .{ .string = try self.sqlText(datum, descriptor) };
         if (datum.temporal() != null) return error.UnsupportedSqlShape; // JSON temporal spelling needs exact type activation
         if (datum.sql_null) return .null;
         if (datum.numeric != null) return self.numericJson(datum);
@@ -6592,6 +6934,11 @@ const Evaluator = struct {
     /// floating object keys are text, so JSON numeric canonicalization would
     /// incorrectly expand exponents and discard the sign of negative zero.
     fn sqlText(self: *Evaluator, datum: Datum, descriptor: Type) ![]const u8 {
+        if (datum.bytes()) |bytes| {
+            const text = try @import("bytea_value.zig").formatAlloc(self.alloc, bytes, self.limits.output_bytes -| self.bytes);
+            try self.charge(text.len);
+            return text;
+        }
         if (datum.enumeration()) |atom| {
             try datum.validateTemporal();
             try self.charge(atom.text.len);
@@ -6954,6 +7301,15 @@ const Evaluator = struct {
                 }
                 break :blk .{ .bool = true };
             },
+            .soundex => blk: {
+                const code = try @import("phonetic_value.zig").soundex(text_value, self.workOwner());
+                try self.charge(code.len);
+                break :blk .{ .string = try self.alloc.dupe(u8, code.slice()) };
+            },
+            .difference => blk: {
+                if (values[1] != .string) return error.SqlTypeMismatch;
+                break :blk .{ .integer = try @import("phonetic_value.zig").difference(text_value, values[1].string, self.workOwner()) };
+            },
             .md5 => blk: {
                 // SQL's compatibility fingerprint, not a security primitive.
                 // Hash borrowed UTF-8 bytes; retain only the fixed-size result.
@@ -7280,6 +7636,12 @@ pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budg
     try left.validateTemporal();
     try right.validateTemporal();
     if (left.sql_null or right.sql_null) return if (left.sql_null == right.sql_null) .eq else if (left.sql_null) .gt else .lt;
+    if (left.bytes()) |bytes| {
+        const other = right.bytes() orelse return error.SqlTypeMismatch;
+        try work.consume(bytes.len +| other.len);
+        return std.mem.order(u8, bytes, other);
+    }
+    if (right.bytes() != null) return error.SqlTypeMismatch;
     if (left.enumeration()) |value| {
         const other = right.enumeration() orelse return error.SqlTypeMismatch;
         // Dense ranks are bounded but variable-width. Account for their
@@ -7322,6 +7684,7 @@ pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budg
 pub fn semanticHashDatum(value: Datum) anyerror!u64 {
     try value.validateTemporal();
     if (value.sql_null) return 0;
+    if (value.bytes()) |bytes| return std.hash.Wyhash.hash(0, bytes);
     if (value.enumeration()) |atom| {
         var hash = std.hash.Wyhash.init(0);
         try atom.hash(&hash);
@@ -7587,7 +7950,7 @@ test "SQL initcap uses one bounded output allocation with cancellation and OOM c
             try std.testing.expectEqualStrings("HéLlo😀World", value.value.string);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{});
 }
 
 test "SQL literal replacement shares invocation admission and borrows unchanged rows" {
@@ -7676,7 +8039,7 @@ test "SQL digest scaling retains constant output space and cleans allocation fai
             try std.testing.expectEqualStrings("9c837c88949d76509749939beea9e092", result.value.string);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{});
 }
 
 test "SQL UTF8 text transforms bound work allocation and parameter types" {
@@ -7709,8 +8072,8 @@ test "SQL UTF8 text transforms bound work allocation and parameter types" {
             try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{}, parameters, .{ .pattern_steps = 1 }));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.prepared, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.prepared, .{});
     for ([_][]const u8{ "left($1,2)", "right($1,-1)", "split_part($1,'🍎',-2)" }) |sql| {
         var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
         defer compiled.deinit();
@@ -8197,7 +8560,7 @@ test "SQL scalar binding and computed output clean up on allocation failures" {
             try std.testing.expectEqualStrings("ênull", result.value.string);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "SQL scalar bound arithmetic hot loop does not allocate per row" {
@@ -9686,7 +10049,7 @@ test "SQL temporal bins preserve logical ingress lazy branches and allocation fa
         }
     };
     try Run.run(a);
-    try std.testing.checkAllAllocationFailures(a, Run.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{});
     for ([_][]const u8{
         "CASE WHEN false THEN date_bin(INTERVAL '1 month',TIMESTAMP '2000-01-01',TIMESTAMP '2000-01-01') ELSE TIMESTAMP '2000-01-01' END",
         "COALESCE(TIMESTAMP '2000-01-01',date_bin(INTERVAL '0',TIMESTAMP '2000-01-01',TIMESTAMP '2000-01-01'))",
@@ -9870,4 +10233,133 @@ test "SQL database cast assignment carries numeric typmods through inference and
     defer constrained.deinit();
     const rounded = try constrained.evaluate(arena.allocator(), &.{Datum{}}, &.{}, .{});
     try std.testing.expectEqualStrings("123.46", try @import("numeric_value.zig").format(&context, rounded.numeric.?.*));
+}
+
+test "SQL bytea conversions own typed parameters and compose with JSON predicates" {
+    _ = @import("bytea_value.zig");
+    _ = @import("text_conversion.zig");
+    const a = std.testing.allocator;
+    const compiler = @import("compiler.zig");
+    var compiled = try compiler.compileScalar(a, "convert_from($1,'UTF8')::jsonb", .{});
+    defer compiled.deinit();
+    var program = try bindTyped(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(ast.ColumnType.bytea, program.parameter_descriptors[0].kind.?);
+    var frame = try @import("parameter_frame.zig").Frame.prepare(a, program.parameter_descriptors, &.{.{ .text = "{\"source\":\"decoded\"}" }}, .{});
+    defer frame.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const output = try (try program.bindParameters(&frame)).evaluate(arena.allocator(), &.{}, .{});
+    try std.testing.expectEqualStrings("decoded", output.value.object.get("source").?.string);
+    var predicate_sql = try compiler.compileScalar(a, "jsonb_typeof(convert_from($1,'UTF8')::jsonb) = 'object'", .{});
+    defer predicate_sql.deinit();
+    var predicate = try bindTyped(a, predicate_sql.expression, &.{}, &.{}, .{});
+    defer predicate.deinit();
+    try std.testing.expect((try (try predicate.bindParameters(&frame)).evaluate(arena.allocator(), &.{}, .{})).value.bool);
+    for ([_][]const u8{ "convert_from(convert_to('café','UTF8'),'UTF8')", "convert_from('\\x636166e9'::bytea,'LATIN1')", "convert_from('caf\\351','LATIN1')" }) |sql| {
+        var parsed = try compiler.compileScalar(a, sql, .{});
+        defer parsed.deinit();
+        var bound = try bindTyped(a, parsed.expression, &.{}, &.{}, .{});
+        defer bound.deinit();
+        try std.testing.expectEqualStrings("café", (try bound.evaluate(arena.allocator(), &.{}, &.{}, .{})).value.string);
+    }
+    var wrong = try compiler.compileScalar(a, "convert_from('text'::text,'UTF8')", .{});
+    defer wrong.deinit();
+    try std.testing.expectError(error.SqlUndefinedFunction, bindTyped(a, wrong.expression, &.{}, &.{}, .{}));
+}
+
+test "SQL bytea PostgreSQL reference preserves strict codecs types and diagnostics" {
+    const Fixture = struct { scalars: []const struct { sql: []const u8, value: Json, oid: ?u32, sqlstate: ?[]const u8 } };
+    const a = std.testing.allocator;
+    var reference = try std.json.parseFromSlice(Fixture, a, @import("parity_fixtures.zig").bytea_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(usize, 1058), reference.value.scalars.len);
+    for (reference.value.scalars) |entry| {
+        errdefer std.debug.print("bytea reference expression={s}\n", .{entry.sql});
+        var compiled = try @import("compiler.zig").compileScalar(a, entry.sql, .{});
+        defer compiled.deinit();
+        var program = bindTyped(a, compiled.expression, &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const result = program.evaluate(arena.allocator(), &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        try std.testing.expect(entry.sqlstate == null);
+        try std.testing.expectEqual(entry.value == .null, result.sql_null);
+        try std.testing.expectEqual(entry.oid.?, @as(u32, if (program.output_type.kind == .bytea) 17 else if (program.output_type.kind == .json) 3802 else 25));
+        if (!result.sql_null) {
+            const value = if (result.bytes()) |bytes| Json{ .string = try Bytea.formatAlloc(arena.allocator(), bytes, 4096) } else result.value;
+            try std.testing.expectEqual(std.math.Order.eq, try compare(entry.value, value));
+        }
+    }
+}
+
+test "SQL bytea UTF8 prepared conversion borrows immutable input with zero row allocations" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "convert_from($1,'UTF8')", .{});
+    defer compiled.deinit();
+    var program = try bindTyped(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var frame = try @import("parameter_frame.zig").Frame.prepare(a, program.parameter_descriptors, &.{.{ .text = "immutable café payload" }}, .{});
+    defer frame.deinit();
+    const prepared = try program.bindParameters(&frame);
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..10000) |_| {
+        const output = try prepared.evaluate(none.allocator(), &.{}, .{});
+        try std.testing.expect(output.value.string.ptr == frame.values[0].bytes().?.ptr);
+    }
+    std.debug.print("SQL UTF8 conversion: rows=10000 parameter_decode_count=1 row_scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
+}
+
+test "SQL phonetic prepared programs retain typed nullability and match PostgreSQL row kernels" {
+    const a = std.testing.allocator;
+    var fixture = try std.json.parseFromSlice(struct { values: []const struct { input: []const u8, soundex: []const u8, difference: i32 }, probes: []const struct { sql: []const u8, code: []const u8 } }, a, @import("parity_fixtures.zig").phonetic_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const owned = region.allocator();
+    var parsed = try @import("compiler.zig").compileScalar(owned, "soundex($1)", .{});
+    defer parsed.deinit();
+    var parameters: [1]?ast.ColumnType = .{.string};
+    var first = try bind(owned, parsed.expression, &.{}, &parameters, .{});
+    defer first.deinit();
+    var second_parsed = try @import("compiler.zig").compileScalar(owned, "difference($1,'Robert')", .{});
+    defer second_parsed.deinit();
+    var second = try bind(owned, second_parsed.expression, &.{}, &parameters, .{});
+    defer second.deinit();
+    const kind = try inferOutput(owned, second_parsed.expression, &.{}, &parameters);
+    try std.testing.expectEqual(ast.ColumnType.integer, kind.kind.?);
+    try std.testing.expectEqual(arrays.ElementType.int32, kind.element_type.?);
+    var scratch: std.heap.ArenaAllocator = .init(a);
+    defer scratch.deinit();
+    for (fixture.value.values) |entry| {
+        _ = scratch.reset(.retain_capacity);
+        const values = [_]Json{.{ .string = entry.input }};
+        const text_value = try first.evaluate(scratch.allocator(), &.{}, &values, .{});
+        const difference_value = try second.evaluate(scratch.allocator(), &.{}, &values, .{});
+        try std.testing.expectEqualStrings(entry.soundex, text_value.value.string);
+        try std.testing.expectEqual(@as(i64, entry.difference), difference_value.value.integer);
+    }
+    try std.testing.expect((try first.evaluate(owned, &.{}, &.{.null}, .{})).sql_null);
+    try std.testing.expect((try second.evaluate(owned, &.{}, &.{.null}, .{})).sql_null);
+    for (fixture.value.probes) |probe| {
+        try std.testing.expectEqualStrings("42883", probe.code);
+        var invalid = try @import("compiler.zig").compileScalar(a, probe.sql["SELECT ".len..], .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.SqlUndefinedFunction, bind(a, invalid.expression, &.{}, &.{}, .{}));
+    }
+    var uuid = try @import("compiler.zig").compileScalar(owned, "uuid_generate_v4()", .{});
+    defer uuid.deinit();
+    var program = try bind(owned, uuid.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(Volatility.@"volatile", Function.gen_random_uuid.volatility());
+    const generated = try program.evaluate(owned, &.{}, &.{}, .{ .execution_io = std.testing.io });
+    try std.testing.expectEqual(@as(usize, 36), generated.value.string.len);
+    try std.testing.expectEqual(@as(u8, '4'), generated.value.string[14]);
 }

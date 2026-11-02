@@ -33,6 +33,17 @@ pub fn isCopy(input: []const u8) bool {
     return std.ascii.eqlIgnoreCase(parser.word() catch return false, "copy");
 }
 
+pub fn isPrepareTransaction(input: []const u8) bool {
+    var parser: Parser = .{ .alloc = undefined, .input = input };
+    const verb = parser.word() catch return false;
+    if (!std.ascii.eqlIgnoreCase(verb, "prepare")) return false;
+    if (!std.ascii.eqlIgnoreCase(parser.word() catch return false, "transaction")) return false;
+    // TRANSACTION is also an unreserved prepared-statement name. An argument
+    // list or AS belongs to ordinary PREPARE; a GID goes to native SQL.
+    if (parser.take('(') catch return true) return false;
+    return !std.ascii.eqlIgnoreCase(parser.word() catch return true, "as");
+}
+
 pub fn isCommit(input: []const u8) bool {
     var parser: Parser = .{ .alloc = undefined, .input = input };
     const verb = parser.word() catch return false;
@@ -626,6 +637,7 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8, max_parameters: usize)
     var p: Parser = .{ .alloc = alloc, .input = input };
     const verb = p.word() catch return null;
     if (std.ascii.eqlIgnoreCase(verb, "prepare")) {
+        if (isPrepareTransaction(input)) return null;
         const name = try p.name();
         var types: std.ArrayList(Type) = .empty;
         var descriptors: std.ArrayList(@import("backend.zig").Parameter) = .empty;
@@ -1001,5 +1013,22 @@ test "pgwire cursor declaration options retain binary identity in every PostgreS
         defer arena.deinit();
         const sql = try std.fmt.allocPrint(arena.allocator(), "DECLARE c {s} CURSOR FOR SELECT 1", .{options});
         try std.testing.expectError(error.InvalidSqlSyntax, parse(arena.allocator(), sql, 0));
+    }
+}
+
+test "pgwire transaction preparation delegates to native SQL without shadowing prepared statement names" {
+    const a = std.testing.allocator;
+    try std.testing.expect(isPrepareTransaction("PREPARE /* before GID */ TRANSACTION 'gid'"));
+    try std.testing.expect(!isPrepareTransaction("PREPARE \"TRANSACTION\" AS SELECT 1"));
+    try std.testing.expect((try parse(a, "PREPARE TRANSACTION 'gid'", 16)) == null);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const named = (try parse(arena.allocator(), "PREPARE \"TRANSACTION\" AS SELECT 1", 16)).?;
+    try std.testing.expectEqualStrings("TRANSACTION", named.prepare.name);
+    for ([_][]const u8{ "PREPARE TRANSACTION AS SELECT 1", "PREPARE TRANSACTION /* types */ (integer) AS SELECT $1" }, 0..) |sql, parameters| {
+        try std.testing.expect(!isPrepareTransaction(sql));
+        const unquoted = (try parse(arena.allocator(), sql, 16)).?;
+        try std.testing.expectEqualStrings("transaction", unquoted.prepare.name);
+        try std.testing.expectEqual(parameters, unquoted.prepare.types.len);
     }
 }

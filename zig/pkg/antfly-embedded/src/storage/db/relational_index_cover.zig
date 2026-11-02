@@ -120,6 +120,19 @@ pub const Plan = struct {
             hash.update(&record.identity.origin_id);
             if (!(try included.getOrPut(alloc, id)).found_existing) try type_records.append(alloc, record.*);
         };
+        // A projected domain retains every base definition required to decode
+        // its cells. Copy only immutable record headers; the source epoch owns
+        // their bytes for this covering layout's lifetime.
+        var type_cursor: usize = 0;
+        while (type_cursor < type_records.items.len) : (type_cursor += 1) {
+            const record = type_records.items[type_cursor];
+            if (record.definition != .domain or record.definition.domain.base != .named) continue;
+            const id = record.definition.domain.base.named.id;
+            if ((try included.getOrPut(alloc, id)).found_existing) continue;
+            if (type_records.items.len == 4096) return error.InvalidSchema;
+            const parent = schema.namedType(source_table, id) orelse return error.InvalidSchema;
+            try type_records.append(alloc, parent.*);
+        }
         std.mem.sort(named_types.Record, type_records.items, {}, struct {
             fn less(_: void, left: named_types.Record, right: named_types.Record) bool {
                 return left.identity.id < right.identity.id;
@@ -164,13 +177,7 @@ pub const Plan = struct {
                     !std.mem.eql(u8, source_column.path, column.path)) return error.RelationalIndexColumnTypeMismatch;
                 if (column.named_type_id) |id| {
                     if ((try checked_types.getOrPut(alloc, id)).found_existing) continue;
-                    const previous = schema.namedType(source_table, id) orelse return error.RelationalIndexColumnTypeMismatch;
-                    const current = schema.namedType(self.table(), id) orelse return error.RelationalIndexColumnTypeMismatch;
-                    if (!std.mem.eql(u8, &previous.identity.origin_id, &current.identity.origin_id)) return error.RelationalIndexColumnTypeMismatch;
-                    const common = @min(previous.definition.labels.len, current.definition.labels.len);
-                    for (previous.definition.labels[0..common], current.definition.labels[0..common]) |left, right| {
-                        if (left.id != right.id or !std.mem.eql(u8, left.text, right.text) or !std.mem.eql(u8, left.order_key, right.order_key)) return error.RelationalIndexColumnTypeMismatch;
-                    }
+                    if (!((schema.sameNamedPhysicalType(source_table, self.table(), id, false) catch return error.RelationalIndexColumnTypeMismatch))) return error.RelationalIndexColumnTypeMismatch;
                 }
             } else if (column.required) return error.RelationalIndexColumnNotFound;
         }

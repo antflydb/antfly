@@ -389,7 +389,8 @@ pub const Enforcer = struct {
         for (self.policies.items) |rule| {
             if (!std.mem.eql(u8, rule.ptype, "p")) continue;
             if (!try self.subjectMatches(username, rule.fields[0])) continue;
-            try out.append(alloc, try rule.clone(alloc));
+            try out.ensureUnusedCapacity(alloc, 1);
+            out.appendAssumeCapacity(try rule.clone(alloc));
         }
         return try out.toOwnedSlice(alloc);
     }
@@ -408,7 +409,8 @@ pub const Enforcer = struct {
         }
         for (self.policies.items) |rule| {
             if (!ruleMatchesFilter(rule, ptype, field_index, field_values)) continue;
-            try out.append(alloc, try rule.clone(alloc));
+            try out.ensureUnusedCapacity(alloc, 1);
+            out.appendAssumeCapacity(try rule.clone(alloc));
         }
         return try out.toOwnedSlice(alloc);
     }

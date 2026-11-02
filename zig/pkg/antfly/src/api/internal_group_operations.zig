@@ -48,7 +48,7 @@ fn logUnknownTransitionFailure(group_id: u64, action: metadata_mod.TransitionAct
     std.log.warn("private transition failed group_id={} action={s} err={s}", .{ group_id, @tagName(action), @errorName(err) });
 }
 
-pub const Error = operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
+pub const Error = @import("external_transaction_errors.zig").Error || operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
     RetainedEffectsFull,
     AuthoritativeLookupMissing,
     TopologyChanged,
@@ -292,6 +292,7 @@ pub const Operations = struct {
     }
 
     fn mapCommonReadError(err: anyerror) ?Error {
+        if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
         if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
         if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
         return switch (err) {
@@ -456,6 +457,7 @@ pub const Operations = struct {
             error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.Canceled, error.Cancelled => return error.Canceled,
             else => {
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("group-local Raft batch validation failed group_id={} table={s} err={s}", .{
                     group_id,
@@ -482,6 +484,7 @@ pub const Operations = struct {
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
             else => {
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("group-local Raft batch failed group_id={} table={s} err={s}", .{
@@ -523,6 +526,7 @@ pub const Operations = struct {
             error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.Canceled, error.Cancelled => return error.Canceled,
             else => {
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("routed Raft batch validation failed group_id={} table={s} err={s}", .{
                     group_id,
@@ -673,6 +677,7 @@ pub const Operations = struct {
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
             else => {
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("routed Raft batch failed group_id={} table={s} err={s}", .{
@@ -692,10 +697,15 @@ pub const Operations = struct {
 
     pub fn txnBegin(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnBeginRequest) Error!void {
         try ensurePreDecisionRequestActive(request);
+        if (input.route_fence) |fence| {
+            if (fence.route.group_id != group_id or fence.topology_epoch != input.topology_epoch) return error.TopologyChanged;
+        }
         const writes = self.writes orelse return error.NotFound;
         const supports_pre_decision_context =
             writes.vtable.txn_begin_group_local_with_pre_decision_context != null;
         _ = (writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants, .{
+            .external_decision_owner = input.external_decision_owner,
+            .route_fence = input.route_fence,
             .restore_staging_scope = input.restore_staging_scope,
             .restore_staging_plan_id = input.restore_staging_plan_id,
             .deadline_ns = request.deadline_ns,
@@ -723,6 +733,7 @@ pub const Operations = struct {
             error.MetadataSnapshotUnavailable,
             => return error.GroupLeaderUnavailable,
             else => {
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 return error.Internal;
             },
@@ -751,6 +762,7 @@ pub const Operations = struct {
                 error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.PreDecisionDeadlineExceeded,
                 error.Canceled, error.Cancelled => return error.Canceled,
                 else => {
+                    if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
                     if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                     return error.Internal;
                 },
@@ -788,7 +800,9 @@ pub const Operations = struct {
                 // One registry drives Raft terminal results and participant
                 // transport; adding a lifecycle fence must not silently turn
                 // its recoverable typed rejection into an HTTP 500.
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 return error.Internal;
             },
@@ -810,7 +824,10 @@ pub const Operations = struct {
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
-            else => return error.Internal,
+            else => {
+                if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
+                return error.Internal;
+            },
         }) orelse return error.NotFound;
     }
 

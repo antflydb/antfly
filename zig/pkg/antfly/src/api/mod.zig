@@ -554,3 +554,7 @@ test "api query contract tensor program envelope preserves dictionary identity" 
     try std.testing.expectEqual(@as(?usize, 0), view.program.outputs[0].input);
     try std.testing.expectEqual(@as(?usize, 0), view.program.outputs[1].step);
 }
+
+comptime {
+    if (@import("builtin").is_test) _ = @import("sql_text_campaign_test.zig");
+}

@@ -1322,3 +1322,81 @@ test "relational index system document schema integrity fences speculative epoch
     try std.testing.expectEqual(@as(u32, 2), db.core.schema.?.version);
     try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{ .key = "new", .value = "\"invalid after reopen\"" }} }));
 }
+
+test "relational index system domain handoffs materialize before votes and survive cold rows without fresh constraint coercion" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const r = region.allocator();
+    const named = @import("../../system_catalog/named_types.zig");
+    const record: named.Record = .{ .identity = try named.Identity.init(7, 2, 1, @splat(8)), .owner = .auth_disabled, .definition = .{ .domain = .{ .base = .{ .builtin = .text }, .not_null = true } } };
+    const layout = try @import("../../common/sql_named_type_layout.zig").toWireLeaky(r, record);
+    const layouts = try std.json.Stringify.valueAlloc(r, [_]@TypeOf(layout){layout}, .{});
+    const json = try std.fmt.allocPrint(r, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"named_types\":{s},\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{{\"status\":{{\"type\":[\"text\",\"null\"],\"x-antfly-sql-type-id\":7}}}}}}}}}}}}", .{layouts});
+    var validator = try @import("../../schema/mod.zig").CompiledTableValidator.init(a, json);
+    defer validator.deinit(a);
+    const contract = validator.execution.domains.?.preparedContract();
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("domain-handoff-cold");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+    var db = try db_mod.DB.open(a, directory.path(), options);
+    var live = true;
+    defer if (live) db.close();
+    try db.setSchemaJson(a, json);
+    try std.testing.expectError(error.SqlNotNullViolation, db.batch(.{ .writes = &.{.{ .key = "raw", .value = "{\"status\":null}" }} }));
+    try db.batch(.{ .writes = &.{.{ .key = "typed", .value = "{\"status\":null}", .prepared_domain = &contract }} });
+    var normalized_contract: @import("../../schema/domain_handoff.zig").Contract = undefined;
+    const normalized = prepared: {
+        const session = try db.openRelationalReadSession(r, "a", "z", .{ .limit = 1, .relational_query = .{ .fields = &.{}, .schema_version = 1 } });
+        defer session.deinit();
+        const writes = [_]@import("types.zig").BatchWrite{.{ .key = "normalized", .value = "{\"status\":null}" }};
+        try std.testing.expectError(error.SqlNotNullViolation, session.normalizeDomainRows(r, &writes, &.{.{ .schema_version = 1, .inputs = &.{} }}, &normalized_contract));
+        break :prepared try session.normalizeDomainRows(r, &writes, &.{.{ .schema_version = 1, .inputs = &.{.{ .ordinal = 0, .source = .{ .id = 7, .origin_id = @splat(8), .generation = 1 } }} }}, &normalized_contract);
+    };
+    try std.testing.expect(contract.eql(normalized_contract));
+    try db.batch(.{ .writes = normalized });
+    try db.batch(.{ .writes = &.{.{ .key = "nonnull", .value = "{\"status\":\"ordinary text\"}" }} });
+    const transaction = try db.beginTransaction(100);
+    try db.writeIntents(transaction, &.{.{ .key = "pending", .value = "{\"status\":null}", .prepared_domain = &contract }}, &.{});
+    {
+        var intents = try db.core.collectTransactionIntentBatch(a, transaction);
+        defer intents.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), intents.writes.len);
+        try std.testing.expect(intents.prepared_rows[0] != null);
+    }
+    db.close();
+    live = false;
+    db = try db_mod.DB.open(a, directory.path(), options);
+    live = true;
+    try db.commitTransaction(transaction, 101);
+    for ([_][]const u8{ "typed", "pending", "normalized" }) |key| {
+        const bytes = (try db.get(a, key)).?;
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("status").? == .null);
+    }
+    const nonnull = (try db.get(a, "nonnull")).?;
+    defer a.free(nonnull);
+    try std.testing.expect(std.mem.indexOf(u8, nonnull, "ordinary text") != null);
+    try std.testing.expect((try db.get(a, "raw")) == null);
+    var stale = contract;
+    stale.domain_digest[0] ^= 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, db.batch(.{ .writes = &.{.{ .key = "stale", .value = "{\"status\":null}", .prepared_domain = &stale }} }));
+    var archive: std.ArrayList(u8) = .empty;
+    defer archive.deinit(a);
+    try @import("../portable_backup.zig").exportPortable(a, db.core.store, &archive);
+    var restored_directory = try @import("../../common/test_directory.zig").TestDirectory.init("domain-handoff-restore");
+    defer restored_directory.cleanup();
+    var restored = try db_mod.DB.open(a, restored_directory.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(a, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_][]const u8{ "typed", "pending", "normalized" }) |key| {
+        const bytes = (try restored.get(a, key)).?;
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("status").? == .null);
+    }
+    try std.testing.expectError(error.SqlNotNullViolation, restored.batch(.{ .writes = &.{.{ .key = "new-raw", .value = "{\"status\":null}" }} }));
+}

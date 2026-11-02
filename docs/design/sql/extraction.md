@@ -1074,9 +1074,40 @@ batch path.
 `antfly-api-sql-sequence-effects-test` qualifies real HTTP connections, pgwire
 prepared resources, implicit MERGE transactions, lost/forged acknowledgement
 handling, document TRUNCATE publication and independently reopened owners.
-The PostgreSQL reference also records serial/identity lifecycles, but those
-three original declarations remain unresolved until their native atomic
-publication and shared mutation/default contracts are implemented.
+The serial/identity originals (`sql-0318` through `sql-0320`) are also qualified
+through atomic native table/owned-sequence/default publication, shared mutation
+preparation, counter handoff, checkpoint restoration and independent cold owners.
+Their scope and remaining broader limits are recorded in the parity ledger.
+
+
+## Prepared transactions
+
+`PREPARE TRANSACTION`, `COMMIT PREPARED` and `ROLLBACK PREPARED` use the existing
+native transaction coordinator with a durable, database/principal-bound GID
+registry. Admission freezes the plan and participant manifest before the first
+native BEGIN. The registry records a first-wins decision before phase two;
+prepared native votes have no automatic expiry decision. Owner-specific receipts
+and compact session outcomes distinguish durable completion from lost replies.
+
+Commit activates every native participant barrier before resolving rows. Old
+pinned cuts remain readable; new reads wait while a cohort is partially active.
+O(1) catalog reservation counters protect affected tables and databases. Recovery
+uses bounded pages and bounded `std.Io` fanout, leaving indefinitely prepared GIDs
+out of the background work queue until an explicit decision arrives.
+
+The mounted public campaign compares the three unchanged originals with
+PostgreSQL 18 and complete metadata/session/data-owner restarts. Native storage,
+registry and distributed-delivery gates exercise cancellation, exact authority,
+late enlistment fences and cold receipts. Public listing/observation history,
+permanent API-owner loss administration and logical-backup policy remain open;
+this is not a claim of complete PostgreSQL prepared-transaction operations or
+quorum failover qualification.
+
+Table lifetime semantics are tracked separately. The existing population oracle's
+`--persistence` mode verifies nine unchanged TEMP, UNLOGGED and LIKE originals
+against independent PostgreSQL sessions and real clean/crash restarts. Their
+reference is `sql_persistence_reference.json`; the native paths remain guarded
+and unqualified until they implement the same lifecycle contracts.
 
 ## Open work
 
@@ -1086,9 +1117,8 @@ publication and shared mutation/default contracts are implemented.
 - MERGE cross-owner/failover fault matrix and partial/expression-key probes.
 - Stronger-isolation deployment and fault validation; TTL visibility contract;
   guarded Lite sessions.
-- Serial/identity declarations, atomic table/owned-sequence defaults and
-  transactional counter ownership/reset handoff; TRUNCATE and FK promoted-standby and
-  repeated-soak gates (see TRUNCATE known gaps).
+- Broader counter-aware table-archive import and initial identity/FK publication;
+  TRUNCATE and FK promoted-standby and repeated-soak gates (see TRUNCATE known gaps).
 - Complete route-wide policy/session validation, revocation/restore and
   promoted-primary security workloads.
 - Typed-value gaps listed under [Exact NUMERIC](#exact-numeric) and
@@ -1155,3 +1185,245 @@ that dropping a UNIQUE-constrained table is definitely rejected before proposal,
 preserves its data/schema through restart, and returns the existing `0A000`
 retirement diagnostic. Private forwarding preserves that exact non-admission
 instead of reporting an unknown commit outcome.
+
+
+### Definition-copy admission and sequence authority
+
+Definition-copy creation carries a bounded set of independently authorized source
+owners in the existing native catalog command. Each source pins its physical
+schema identity, logical name and catalog incarnation. Metadata validates the
+read set before selecting constraint/sequence names, again during preparation,
+and in the same write transaction as destination publication. A global catalog
+revision alone is insufficient: physical schema publication can advance without
+changing that revision. Command version 8 and metadata capability 120 distinguish
+this contract from routine, cast, type and authorization commands (versions 4–7).
+The native regression covers stale schemas, cold replay, name reuse, and atomic
+creation of an independent destination identity sequence.
+
+Sequence-default allocation independently verifies the persisted default in the
+same metadata read as the attribute and sequence. An existing attribute and
+`OWNED BY` edge cannot authorize a detached default. Execution retains authority
+by sequence incarnation/ID **and destination table/attribute**, while counter
+leases remain keyed by sequence identity. Implicit identity privileges cannot be
+selected using another destination's proof. Restart tests retain the default
+removal and reject the stale allocation request.
+
+`LIKE` parsing retains source order, insertion offsets, and all PostgreSQL
+INCLUDING/EXCLUDING options with last-option precedence. Ordinary relational
+column declarations now pass through the existing schema builder and native CREATE
+publication. Source grants use the existing resolver; one bounded metadata cut
+captures the complete source-definition guard set. Destination conditionals check
+committed existence before looking up missing sources. Copied index and UNIQUE
+names are new destination declarations, not transferred namespace ownership.
+
+Identity configuration is read in batches of at most 64 descriptors under the
+same catalog revision and incarnation. START, increment, integer width, bounds,
+cache and cycle configuration become fresh creation intents. The native containing
+transaction assigns destination attributes and independent sequence IDs; running
+source counter values and leases never copy. A copied SERIAL default instead
+references the original sequence. It remains guarded until ordinary dependency
+edges, RESTRICT/CASCADE retirement, and destination-attribute handoff are wired
+without resetting or borrowing ownership of that counter. Native column comments
+now copy from the attribute registry in the containing CREATE transaction. Index
+comment transfer remains open; property descriptions alone do not implement
+catalog comments.
+
+The persistence oracle includes repeatable LIKE lifecycle probes for default and
+generated values, fresh identity/shared SERIAL counters, deferred UNIQUE checks,
+CHECK/NOT NULL copying, FK omission, comments, source authorization, ordered mixed
+sources, option exclusion, conditional creation, TRUNCATE and retirement. A
+SELECT-granted role can copy a definition even when RLS hides every source row;
+the destination starts without the source's policies or RLS flags. These
+are supplemental evidence for the unchanged original, not additional inventory
+cases. TEMP/UNLOGGED publication and the remaining lock/trigger cohorts also remain
+open; this admission/authority work adds no implementation credit by itself.
+
+
+### Identity defaults preserve SQL grant and policy authority
+
+Implicit identity allocation uses the table's bound SQL privilege mask, native
+credential caps, current user incarnation, and the independently verified native
+sequence/attribute binding. Its execution owner retains only the compact grant
+projection; statement schemas, row buffers, and planner state are not retained
+for authorization. Explicit sequence calls and SERIAL defaults keep ordinary
+sequence permission checks. DEFAULT lowering marks its internal target preimage
+source, so adding that source cannot manufacture a SELECT requirement for an
+UPDATE-only command. Predicates and RETURNING column expressions retain their
+read requirements.
+
+Integrity proof caches belong to an immutable write or transaction admission
+scope. Creating one before installing the SQL grant provider would lose that
+authority during coordinated sequence-backed writes. The scope initializes its
+cache at its final address, releases it after synchronous preparation, and signs
+one proof per physical participant. Known participants reuse the immutable table
+ID, database, and schema version already held by that admission, avoiding reverse
+name resolution and a second catalog lookup. This witness is routing information,
+not permission: the current provider must still sign it, and declining a known
+binding fails closed. Discovered participants retain catalog discovery and the
+previous integrity-read authority. Transient discovery/signing buffers are freed
+after each miss; only the final token and database enter the retained cache. A proof
+cannot be reused by a different admission frame merely because it names the same
+table. This uses the existing request callbacks and native policy proofs.
+
+The mounted authorization campaign exercises INSERT/UPDATE-only identity writes,
+explicit sequence and SELECT denial, policy-approved/rejected rows, table-grant
+and membership revocation, durable counter gaps, and cold continuation. Its
+supplemental PostgreSQL oracle performs a real clean restart and supplies the
+expected row identities and counter states. Native RLS also filters administrative
+observers; the fixture explicitly grants its independent observer the policy role.
+That does not add SELECT or native table permissions to the mutation credential.
+The unchanged authorization originals remain separate from these additional
+checks; this integration work creates no additional inventory credit.
+
+
+### Durable string lengths and definition-copy recovery
+
+The mounted declaration-copy campaign now covers ordered multi-source properties,
+PK/NOT NULL/CHECK enforcement, defaults and generated expressions, option
+exclusion, conditional missing-source behavior, current SQL-only SELECT grants,
+revocation, and independence from source rows and RLS policies. It observes the
+existing policy publication/owner ACK barrier before probing row visibility.
+Complete cold metadata, session and data-owner reopen retains copied rows,
+constraints and independent identity counters. The SELECT-only source caller can
+create and use its fresh identity without an extra source-sequence grant.
+
+The persistence oracle's exact source uses `CHECK (length(status)>0)`. SQL read
+support did not previously imply durable-expression support. Native `length`,
+`octet_length`, and `bit_length` now return PostgreSQL int32 results, propagate SQL
+NULL, and distinguish UTF-8 code points from bytes/bits. Character counting
+validates UTF-8 in one allocation-free pass with bounded cancellation polling.
+Schema semantic/encoding version 42 records the feature independently of physical
+row format. Existing owner reader requirements gate publication and cold decode;
+a version-41 reader cannot accept it. Public OpenAPI and generated clients expose
+the three expression operations.
+
+Seven focused Debug checks and the complete mounted declaration/identity campaign
+pass without skips, failures or leaks. The nine-original real PostgreSQL
+persistence oracle remains reproducible. The creation gate includes this mounted
+campaign, sharing the existing compiled owner rather than introducing another CI
+build. Native column comments join the authenticated source read set, are read
+again in the containing CREATE transaction, and publish with fresh destination
+attribute identities. No post-CREATE comment request is issued. The native race
+and cold tests cover concurrent source edits; the mounted campaign covers option
+exclusion and independence from later source-comment removal. The combined
+creation/source gates pass 60 tests without skips, failures or leaks. The complete
+Debug SQL gate passes 1,660 local and 243 server tests, with four optional
+benchmark skips and no failures or leaks. This does not qualify sql-0369 yet: its full oracle also checks shared
+SERIAL retirement and native index comments. The remaining TEMP/UNLOGGED lifetimes and
+other previously open cohorts retain their original blocking dispositions.
+
+
+### Shared sequence retirement must use the existing publication barriers
+
+Native metadata now distinguishes the referencing destination attribute from
+a sequence's actual OWNED BY attribute. Table preparation derives the complete
+outgoing set from the schema and stable attribute directory before the first
+write. Forward rows use a compact fixed-width binding tuple; reverse rows index
+sequence to table/attribute and retain the semantic binding fingerprint. Both
+directions publish in the containing table transaction. Unchanged schemas skip
+this work; unchanged bindings produce no directory writes. Ordinary removal and
+staged generation replacement remove the old outgoing set atomically with the
+replacement. The existing owned-counter handoff remains a separate operation.
+
+Each sequence also has a transactional reference count and monotonic revision.
+Unchanged bindings do not advance it; even an add/remove cycle changes the
+revision. A zero-count tombstone remains while the sequence exists and is
+reclaimed on sequence deletion. Prepared changes retain deltas and rebase them
+inside the transaction, so multiple table participants sharing a sequence cannot
+overwrite one another's summary. Complete discovery streams reverse edges,
+retains at most 128 table IDs, checks cancellation and the forward fingerprints,
+and returns that stamp. Future retirement admission can compare it with one
+point read before rejoining exact schema-owner guards. It grants no privilege,
+ownership or publication authority.
+
+Snapshot and native checkpoint verification share the same closure checks.
+Actual table bindings, stable attributes, forward/reverse rows, sequence routing
+and incarnation, and per-sequence counts must agree. Reverse verification binary
+searches encoded forward frames; scratch state is bounded by one schema rather
+than all primary rows or quadratic decoded copies. Protocol 123 fences this
+directory as part of the unreleased column-sequence cohort. Handoff preparation
+negotiates its capability before the linearizable cut.
+
+Twelve targeted Debug checks pass without skips, failures or leaks, including
+real metadata creation, no-op preparation, reference removal, TRUNCATE,
+metadata snapshot restore, and cold owners. Additional assertions cover missing
+forward/reverse/summary rows, invented attributes, multiple referencing tables,
+bounded/canceled discovery, and add/remove revision safety. The external
+reference is constructed through the private native test store; public borrowed
+default creation remains guarded. A copied ordinary default must ultimately bind
+the existing sequence identity, while identity copies continue to create
+independently owned sequences. Neither a borrowed reference nor TRUNCATE of its
+destination may transfer ownership or reset the shared counter.
+
+The column-default snapshot now attests the complete persisted binding
+fingerprint, including its generation mode, under protocol 122. Native metadata
+derives it from the actual stored default; ingress verifies it before choosing
+implicit identity privileges or reserving a counter value. The statement cache
+key includes every semantic fingerprint field: sequence incarnation/ID, sequence
+namespace, destination table/attribute and generation. Cache hits therefore need
+no per-row cryptographic hash. ALWAYS and BY DEFAULT cannot share an entry merely
+because both permit implicit identity privileges. Ordinary shared defaults will
+continue to require ordinary sequence privileges; their activation remains
+guarded until the dependency and retirement machinery below is complete.
+
+The proof RPC negotiates protocol readiness before its linearizable metadata
+read, and revalidates that readiness before the native snapshot. A failed upgrade
+does not read a proof or allocate a value. Ordinary sequence reads keep their
+existing capability path. Eighteen targeted Debug checks pass without skips,
+failures or leaks, covering native generation forgery, namespace/mode cache
+isolation, capability ordering/denial, sequence effects, owned identity handoff,
+copied identities and cold owners.
+
+Direct sequence DROP now checks the reference directory during read-only
+admission. A live dependency is a durable SQL rejection (2BP01), including exact
+cold retries; it cannot remove the descriptor/counter and strand a default.
+Owned table/attribute retirement also checks external references before its first
+write. The resource-deletion boundary independently refuses live references so a
+missing caller guard aborts the transaction rather than publishing corruption.
+A final unused sequence may reclaim its zero-count directory tombstone.
+An indexed owner-attribute lookup also rejects explicit ownership changes of
+identity sequences (0A000), including OWNED BY NONE and reassignment to the same
+column. Those decisions are retained SQL outcomes; ordinary SERIAL ownership
+changes continue through the existing native catalog/counter transaction.
+
+The physical owner now has a distinct `sequence_default_removal` purpose. Its
+identity-bound selector derives one canonical schema successor, removing only
+ordinary defaults for that sequence and advancing the schema epoch. Identity
+column dependencies cannot be removed through this purpose. Exact postimage
+verification preserves every unrelated declaration; compiled index/constraint
+generations remain unchanged. Native progress and authenticated row audits use
+zero-row completion, while install/release retain the existing owner fences,
+receipts, historical layouts and cancellation machinery. This is the physical
+half of retirement, not a catalog-deletion grant or completed public CASCADE.
+
+The remaining coordinator must reserve the complete
+reference cohort and remove defaults through the existing signed schema-owner
+publication/ACK ledger. Default removal changes no stored row values, so it must
+use compatible in-place schema publication rather than copying primary rows via
+a restore job. The accepting writer must independently validate the complete
+reference set and canonical postimages. Reservations must reject new references
+until publication or durable cancellation, and resume after leader loss. Catalog
+retirement, reference cleanup, schema publication and the terminal outcome must
+share that ledger's existing durability and owner barriers. DROP of an owning
+table additionally retires its owned sequence through that same protected cut;
+external referencing tables survive CASCADE with their defaults removed. Restore
+must remap destination attributes separately from sequence ownership and validate
+external references before activation. These are implementation requirements,
+not claims of completed native support or additional inventory credit.
+
+The next coordinator change belongs in the common schema-validation plan and
+ledger, alongside the existing named-type finalizer. Give sequence retirement
+its own typed descriptor/stamp and active-resource reservation; do not represent
+a sequence as a named type or add another background-job protocol. Admission
+must compare the captured stamp, exact live descriptor and every participant's
+actual schema/range cut. The number of matching references in those exact
+preimages must equal the native count, proving complete membership without a
+catalog-wide or primary-row scan. A count or digest alone is insufficient.
+The active reservation must block new table references and competing sequence
+mutations until the common job releases or durably cancels. Pending SQL outcomes
+should point at this common job rather than duplicating schemas/owner arrays.
+Only after all physical owners install may one transaction publish every
+postimage and remove the counter/descriptor, ownership edge and final summary.
+The common release barrier, not an early catalog reply, certifies terminal
+success. Fresh sequence creation needs explicit pending-resource validation so
+this check cannot stage an orphan resource before a rejected table publication.

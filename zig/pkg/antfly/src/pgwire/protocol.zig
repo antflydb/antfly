@@ -526,7 +526,7 @@ pub const Session = struct {
         return self.executeCells(alloc, statement, parameters, types, descriptors, null, null, binding_guard, setting_epoch);
     }
 
-    fn executeCells(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, native_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum, parameter_owner: ?*@import("antfly_local_sources").sql_parameter_frame.Ingress, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
+    fn executeCells(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, native_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum, parameter_owner: ?*@import("antfly_local_sources").sql_parameter_frame.Ingress, binding_guard: ?[]const u8, setting_epoch: ?u64) anyerror!backend.Result {
         if (try commands.settingCommand(alloc, statement)) |setting| {
             if (parameters.len != 0 or types.len != 0) return error.InvalidParameter;
             return switch (setting) {
@@ -567,11 +567,27 @@ pub const Session = struct {
             savepoint_name = try self.alloc.dupe(u8, value.savepoint);
             try self.savepoints.ensureUnusedCapacity(self.alloc, 1);
         };
+        if (self.status == .in_transaction and commands.isPrepareTransaction(statement)) {
+            var cursors = self.sql_cursors.valueIterator();
+            const held = while (cursors.next()) |cursor| {
+                if (cursor.hold and !cursor.committed) break true;
+            } else false;
+            if (held) {
+                // Syntax errors retain their normal failed-transaction shape;
+                // only an executable PREPARE boundary performs this rollback.
+                var scratch = std.heap.ArenaAllocator.init(alloc);
+                defer scratch.deinit();
+                _ = try self.describeTyped(scratch.allocator(), statement, &.{}, &.{});
+                var rolled_back = try self.execute(alloc, "ROLLBACK", &.{}, &.{}, null, null);
+                defer rolled_back.deinit();
+                return error.PreparedTransactionWithHeldCursor;
+            }
+        }
         if (commands.isCommit(statement)) try self.materializeHeldCursors();
         const previous_status = self.status;
         var result = try self.source.vtable.execute(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req);
         errdefer result.deinit();
-        if (result.mutation_outcome != null) {
+        if (result.mutation_outcome != null or std.ascii.eqlIgnoreCase(result.command_tag, "PREPARE TRANSACTION")) {
             self.mutation_ack_pending = true;
             self.diagnostic.transaction_id = result.transaction_id;
         }
@@ -626,14 +642,14 @@ pub const Session = struct {
             },
         };
         if (self.status == .idle) {
-            if (self.catalog_settings) |*state| state.finish(std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT"));
+            if (self.catalog_settings) |*state| state.finish((std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT") or std.ascii.eqlIgnoreCase(result.command_tag, "PREPARE TRANSACTION")));
             self.clearCursorSavepoints();
         }
         if (self.status == .idle) if (self.timeout_transaction) |settings| {
-            self.statement_timeout = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.committed else settings.before;
-            self.namespace_setting = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.namespace_committed else settings.namespace_before;
-            self.application_name = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.application_committed else settings.application_before;
-            self.lake_visibility = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.lake_committed else settings.lake_before;
+            self.statement_timeout = if ((std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT") or std.ascii.eqlIgnoreCase(result.command_tag, "PREPARE TRANSACTION"))) settings.committed else settings.before;
+            self.namespace_setting = if ((std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT") or std.ascii.eqlIgnoreCase(result.command_tag, "PREPARE TRANSACTION"))) settings.namespace_committed else settings.namespace_before;
+            self.application_name = if ((std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT") or std.ascii.eqlIgnoreCase(result.command_tag, "PREPARE TRANSACTION"))) settings.application_committed else settings.application_before;
+            self.lake_visibility = if ((std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT") or std.ascii.eqlIgnoreCase(result.command_tag, "PREPARE TRANSACTION"))) settings.lake_committed else settings.lake_before;
             self.timeout_transaction = null;
             self.transaction_namespace = null;
         };
@@ -839,7 +855,7 @@ pub const Session = struct {
         switch (setting) {
             .set => |value| {
                 try state.set(owner, raw.scope, value.name, value.value, value.local);
-                return .{ .command_tag = "SET", .transaction_status = self.status, .session_id = self.session_id };
+                return .{ .command_tag = "SET", .transaction_status = self.status, .session_id = self.session_id, .notices = if (value.local and self.status != .in_transaction) &.{.{ .code = "25P01", .severity = .warning, .message = "SET LOCAL can only be used in transaction blocks" }} else &.{} };
             },
             .reset => |name| {
                 try state.reset(owner, raw.scope, name);
@@ -847,7 +863,7 @@ pub const Session = struct {
             },
             .reset_local => |name| {
                 try state.resetLocal(owner, raw.scope, name);
-                return .{ .command_tag = "SET", .transaction_status = self.status, .session_id = self.session_id };
+                return .{ .command_tag = "SET", .transaction_status = self.status, .session_id = self.session_id, .notices = if (self.status != .in_transaction) &.{.{ .code = "25P01", .severity = .warning, .message = "SET LOCAL can only be used in transaction blocks" }} else &.{} };
             },
             .show => |name| {
                 var view = try settings_catalog.View.capture(alloc, owner, raw.scope, state.values());
@@ -1055,7 +1071,7 @@ pub const Session = struct {
                 for (input_descriptors, statement.parameter_oids, 0..) |*descriptor, type_oid, index| {
                     descriptor.* = if (current.parameter_descriptors.len == count) current.parameter_descriptors[index] else try values.parameterFromOid(type_oid);
                     if (try values.parameterOid(descriptor.*) != type_oid) return error.InvalidParameter;
-                    if (descriptor.enum_view != null and !self.source.vtable.native_parameters) return error.UnsupportedParameterType;
+                    if ((descriptor.enum_view != null or descriptor.domainView() != null) and !self.source.vtable.native_parameters) return error.UnsupportedParameterType;
                 }
                 const needs_owner = self.source.vtable.native_parameters and for (input_descriptors) |descriptor| {
                     if (descriptor.kind == .array or descriptor.kind == .json) break true;
@@ -2334,7 +2350,7 @@ pub const Session = struct {
     fn sendNotice(self: *Session, notice: backend.Notice) !void {
         var bytes: std.Io.Writer.Allocating = .init(self.alloc);
         defer bytes.deinit();
-        try bytes.writer.writeAll("SNOTICE\x00C");
+        try bytes.writer.writeAll(if (notice.severity == .warning) "SWARNING\x00C" else "SNOTICE\x00C");
         try bytes.writer.writeAll(notice.code);
         try bytes.writer.writeAll("\x00M");
         try bytes.writer.writeAll(notice.message);
@@ -2578,7 +2594,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.ForeignKeyParentMissing, error.ForeignKeyReferenced => "23503",
         error.InvalidParameter => "22P02",
         error.SqlInvalidTextRepresentation, error.InvalidSqlArrayShape => "22P02",
-        error.InvalidSqlBinaryRepresentation, error.SqlBinaryTypeMismatch, error.SqlJsonUnicodeEscape, error.SqlUntranslatableCharacter, error.SqlProtocolViolation, error.SqlJsonbUnsupportedVersion => @import("antfly_local_sources").sql_errors.describe(err).code,
+        error.SqlInvalidCharacterEncoding, error.SqlCharsetUntranslatableCharacter, error.InvalidSqlBinaryRepresentation, error.SqlBinaryTypeMismatch, error.SqlJsonUnicodeEscape, error.SqlUntranslatableCharacter, error.SqlProtocolViolation, error.SqlJsonbUnsupportedVersion => @import("antfly_local_sources").sql_errors.describe(err).code,
         error.SqlNumericOutOfRange => "22003",
         error.SqlInvalidTextEncoding => "22021",
         error.SqlArraySubscriptError => "2202E",
@@ -2614,7 +2630,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.SettingCatalogChanged => "55000",
         error.UnknownColumn => "42703",
         error.UnknownTable => "42P01",
-        error.UnsupportedSqlExecution, error.UnsupportedSqlShape, error.SqlStatementSnapshotRequired => "0A000",
+        error.PreparedTransactionWithHeldCursor, error.UnsupportedSqlExecution, error.UnsupportedSqlShape, error.SqlStatementSnapshotRequired => "0A000",
         error.UnsupportedStartupOption, error.UnsupportedFormattingSetting => "0A000",
         error.UnsupportedEncoding => "22021",
         error.PortalExecutionFailed => "55000",

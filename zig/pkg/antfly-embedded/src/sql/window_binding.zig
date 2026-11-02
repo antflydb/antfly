@@ -24,7 +24,7 @@ const compiler = @import("compiler.zig");
 const Allocator = std.mem.Allocator;
 pub const Kind = enum { row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value, count, sum, avg, min, max, bool_and, bool_or };
 pub const Sort = struct { partition: []const usize, order: []const usize, directions: []const @import("operators.zig").Order };
-pub const Spec = struct { kind: Kind, arguments: []const usize, filter: ?usize, sort: usize, frame: ?ast.Window.Frame, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, enum_view: ?*const @import("../common/sql_enum_value.zig").View = null, integer_numeric_result: bool = false, star: bool };
+pub const Spec = struct { input_coercion: ?*const scalar.Program = null, default_coercion: ?*const scalar.Program = null, domain_view: ?*const @import("../schema/domain_value.zig").View = null, kind: Kind, arguments: []const usize, filter: ?usize, sort: usize, frame: ?ast.Window.Frame, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, enum_view: ?*const @import("../common/sql_enum_value.zig").View = null, integer_numeric_result: bool = false, star: bool };
 pub const Bound = struct {
     input: *const describe.BoundStatement,
     statement: ast.Select,
@@ -105,6 +105,15 @@ fn validatePredicate(predicate: *const ast.Predicate) anyerror!void {
         else => {},
     }
 }
+fn domainCoercion(alloc: Allocator, source: describe.Column, target: *const @import("../schema/domain_value.zig").View, backend: catalog.Backend) !*const scalar.Program {
+    const result = try alloc.create(scalar.Program);
+    const domain = try scalar.domainType(target);
+    const value: ast.Scalar = .{ .column = "$window_value" };
+    const expression: ast.Scalar = .{ .cast = .{ .operand = &value, .type = domain.kind.?, .element_type = domain.element_type, .numeric_modifier = domain.numeric_modifier, .enum_view = domain.enum_view, .domain_view = target } };
+    result.* = try scalar.bindWithSettings(alloc, &expression, &.{.{ .name = "$window_value", .type = source.type, .element_type = source.element_type, .numeric_modifier = source.numeric_modifier, .enum_view = source.enum_view, .domain_view = source.domain_view }}, &.{}, .{ .invocation = backend.parameter_invocation }, backend.settings_view);
+    return result;
+}
+
 const Pending = struct { node: *const ast.Scalar, arguments: []const usize, filter: ?usize, sort: usize };
 const Builder = struct {
     alloc: Allocator,
@@ -244,7 +253,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
     input.* = try describe.bindInternal(alloc, pinned_backend, &input_compiled, inferred);
     const parameters = @constCast(input.parameter_types);
     const columns = try alloc.alloc(scalar.Column, input.columns.len + builder.specs.items.len);
-    for (input.columns, columns[0..input.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view };
+    for (input.columns, columns[0..input.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column) };
     const specs = try alloc.alloc(Spec, builder.specs.items.len);
     for (builder.specs.items, specs, columns[input.columns.len..], 0..) |pending, *spec, *column, index| {
         const call = pending.node.call;
@@ -259,6 +268,10 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
         }
         const first_null = nargs != 0 and call.args[0].* == .literal and call.args[0].literal == .null;
         const default_null = nargs == 3 and call.args[2].* == .literal and call.args[2].literal == .null;
+        const first_unknown = nargs != 0 and call.args[0].* == .literal and (call.args[0].literal == .null or call.args[0].literal == .string);
+        const default_unknown = nargs == 3 and call.args[2].* == .literal and (call.args[2].literal == .null or call.args[2].literal == .string);
+        const first_domain = if (nargs != 0) scalar.domainViewOf(input.columns[pending.arguments[0]]) else null;
+        const default_domain = if (nargs == 3) scalar.domainViewOf(input.columns[pending.arguments[2]]) else null;
         var input_type = if (nargs != 0) input.columns[pending.arguments[0]].type else ast.ColumnType.integer;
         var input_enum = if (nargs != 0) input.columns[pending.arguments[0]].enum_view else null;
         var input_element = if (nargs != 0) input.columns[pending.arguments[0]].element_type else null;
@@ -282,7 +295,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
             },
             .lag, .lead, .nth_value => {
                 if (nargs > 1 and input.columns[pending.arguments[1]].type != .integer) return error.SqlTypeMismatch;
-                if (nargs == 3 and !default_null) {
+                if (nargs == 3 and !default_null and !(first_domain != null and default_unknown)) {
                     const default_type = input.columns[pending.arguments[2]].type;
                     if ((input_type == .integer or input_type == .number) and (default_type == .integer or default_type == .number)) {
                         const left = input_element orelse (if (input_type == .integer) @import("array_value.zig").ElementType.int64 else .float64);
@@ -346,8 +359,24 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
                 } else slot.* = .integer;
             };
         };
-        spec.* = .{ .kind = kind, .arguments = pending.arguments, .filter = pending.filter, .sort = pending.sort, .frame = call.window.?.frame, .type = result_type, .element_type = result_element, .enum_view = if (result_type == .enumeration) input_enum else null, .integer_numeric_result = integer_numeric_result, .star = call.star };
-        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$window_{d}", .{index}), .type = result_type, .element_type = result_element, .enum_view = spec.enum_view };
+        const result_domain = switch (kind) {
+            .first_value, .last_value, .nth_value => scalar.domainViewOf(input.columns[pending.arguments[0]]),
+            .lag, .lead => domain: {
+                const source_domain = scalar.domainViewOf(input.columns[pending.arguments[0]]);
+                if (nargs < 3 or default_unknown) break :domain source_domain;
+                if (first_unknown) break :domain default_domain;
+                if (scalar.sameDomain(source_domain, default_domain)) break :domain source_domain;
+                break :domain null;
+            },
+            else => null,
+        };
+        // LAG/LEAD evaluate only the selected value/default. Fresh unknown
+        // inputs cross a real domain cast at that demand point; checking the
+        // entire input projection would reject an unused NOT NULL default.
+        const input_coercion = if (result_domain != null and !scalar.sameDomain(first_domain, result_domain)) try domainCoercion(alloc, input.columns[pending.arguments[0]], result_domain.?, backend) else null;
+        const default_coercion = if ((kind == .lag or kind == .lead) and nargs == 3 and result_domain != null and !scalar.sameDomain(default_domain, result_domain)) try domainCoercion(alloc, input.columns[pending.arguments[2]], result_domain.?, backend) else null;
+        spec.* = .{ .input_coercion = input_coercion, .default_coercion = default_coercion, .domain_view = result_domain, .kind = kind, .arguments = pending.arguments, .filter = pending.filter, .sort = pending.sort, .frame = call.window.?.frame, .type = result_type, .element_type = result_element, .enum_view = if (result_type == .enumeration) input_enum else null, .integer_numeric_result = integer_numeric_result, .star = call.star };
+        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$window_{d}", .{index}), .type = result_type, .element_type = result_element, .enum_view = spec.enum_view, .domain_view = scalar.domainViewOf(spec) };
     }
     const output_programs = try alloc.alloc(scalar.Program, outputs.len);
     const names = try alloc.alloc([]const u8, outputs.len);

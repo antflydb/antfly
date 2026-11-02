@@ -228,7 +228,7 @@ pub const Prepared = struct {
             .page => self.page = try job.PreparedPage.replay(a, core, try job.PageCommand.decode(self.command.payload), control(&context)),
             .install => {
                 const ready = try job.requireReady(&read, command.binding);
-                if (command.binding.purpose != .not_null and (command.binding.purpose != .foreign_key_source or ready.transaction_coverage == null))
+                if (command.binding.purpose != .not_null and !command.binding.purpose.schemaOnly() and command.binding.purpose != .domain_not_null and (command.binding.purpose != .foreign_key_source or ready.transaction_coverage == null))
                     return error.ForeignKeyValidationRequired;
                 if (!equal(try ready.digest(), self.command.payload[32..64].*)) return error.SchemaValidationJobChanged;
                 var candidate = try job.Candidate.load(a, &read, command.binding, control(&context));

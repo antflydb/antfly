@@ -1379,8 +1379,8 @@ components:
           type: boolean
     SQLColumnType:
       type: string
-      description: Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
-      enum: [string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange, enumeration]
+      description: Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client. Bytea results use PostgreSQL hex text (a backslash followed by x and lowercase hex digits) in JSON and opaque bytes in PostgreSQL binary format.
+      enum: [string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange, enumeration, bytea]
     SQLArrayElementType:
       $ref: "schema.yaml#/components/schemas/SQLArrayElementType"
     SQLTemporalKind:
@@ -1443,7 +1443,7 @@ components:
           $ref: "#/components/schemas/SQLColumnType"
         named_type:
           $ref: "schema.yaml#/components/schemas/SQLNamedTypeIdentity"
-          description: Required for enumeration values, including NULL. Identifies the immutable catalog type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains a null cell.
+          description: Required for enum and domain values, including NULL. Identifies the immutable logical catalog type and its scalar/array wire OIDs. The type and element_type fields describe the physical value; enum cells use exact label strings. Domain parameters undergo fresh constraint validation; a declared identity does not prove an already validated value. SQL NULL remains a null cell.
         temporal_kind:
           $ref: "#/components/schemas/SQLTemporalKind"
         element_type:
@@ -1540,13 +1540,13 @@ components:
       type: object
       additionalProperties: false
       required: [type, nullable]
-      description: Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint.
+      description: Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. Bytea arguments are PostgreSQL bytea input strings; use hex text (a backslash followed by x and hexadecimal octets) for arbitrary binary data. SQL NULL remains a null cell.
       properties:
         type:
           $ref: '#/components/schemas/SQLColumnType'
         named_type:
           $ref: "schema.yaml#/components/schemas/SQLNamedTypeIdentity"
-          description: Required for enumeration values, including NULL. Identifies the immutable catalog type and its scalar/array wire OIDs. Enum cells use exact label strings; SQL NULL remains a null cell.
+          description: Required for enum and domain values, including NULL. Identifies the immutable logical catalog type and its scalar/array wire OIDs. The type and element_type fields describe the physical value; enum cells use exact label strings. Domain parameters undergo fresh constraint validation; a declared identity does not prove an already validated value. SQL NULL remains a null cell.
         temporal_kind:
           $ref: '#/components/schemas/SQLTemporalKind'
         element_type:
@@ -1918,14 +1918,14 @@ components:
           minimum: 0
     SQLCatalogObjectKind:
       type: string
-      enum: [sequence, function, procedure, operator, aggregate, cast, type]
-      description: Native catalog resource kind; never a synthetic physical table.
+      enum: [sequence, function, procedure, operator, aggregate, cast, type, authorization, table, index]
+      description: Catalog object affected by an exact recoverable operation.
     SQLCatalogOperationKind:
       type: string
       enum: [create, alter, rename, drop]
     SQLCatalogOperationState:
       type: string
-      enum: [committed, rejected, unknown]
+      enum: [committed, rejected, unknown, pending]
       description: A retained authoritative result, or an unconfirmed outcome. Unknown is never permission to replay DDL.
     SQLCatalogOperationReceipt:
       type: object
@@ -7024,7 +7024,7 @@ components:
           type: string
         disposition:
           type: string
-          enum: [active, outcome_unknown, committed, committed_pending, committed_repair_required, aborted]
+          enum: [active, prepared, outcome_unknown, committed, committed_pending, committed_repair_required, aborted]
           description: Durable read-only transaction outcome. outcome_unknown is not permission to replay a mutation with another ID.
         staged_table_count:
           type: integer

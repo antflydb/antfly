@@ -3403,6 +3403,17 @@ pub const DB = struct {
         std.debug.assert(fresh != 0);
         return self.query_schema_identity.cmpxchgStrong(0, fresh, .acq_rel, .acquire) orelse fresh;
     }
+    /// Bounded local physical work and advisory statistics. SQL authorization
+    /// and the exact range cohort are enforced by the control-plane producer;
+    /// native runtime admission also applies to internal transport callers.
+    pub fn sqlMaintenanceJson(self: *DB, alloc: Allocator, bytes: []const u8) ![]u8 {
+        if (!self.core.sql_maintenance_mutex.tryLock()) return error.MaintenanceBusy;
+        defer self.core.sql_maintenance_mutex.unlock(self.core.index_manager.checkpointIo());
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforceReplicationWriteGate();
+        return @import("sql_maintenance.zig").execute(self, alloc, bytes);
+    }
+
     pub fn constraintValidationStatus(self: *DB) !ConstraintValidationStatus {
         if (comptime storage_engine.enabled) return storage_engine.call("constraintValidationStatus", .{self});
         try self.lockApplySharedForPortableRuntime();
@@ -3736,6 +3747,7 @@ pub const DB = struct {
         defer if (view) |*schema| schema.release();
         var read = try self.core.store.beginReadTxn();
         errdefer read.abort();
+        try transactions_mod.checkExternalReadAdmission(&read);
         if (self.local_execution.row_policy_gate.currentPhase() != initial_phase or
             self.local_execution.row_policy_gate.generation.load(.acquire) != policy_generation or
             self.local_execution.row_policy_gate.catalog_epoch.load(.acquire) != policy_epoch)
@@ -11809,9 +11821,15 @@ pub const DB = struct {
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
         const raw = blk: {
-            if (!internal_keys.isChunkArtifactRecordKey(store_key)) break :blk try self.core.getStoreValue(alloc, store_key);
-            var read = try self.core.store.beginProbeTxn();
+            if (!internal_keys.isChunkArtifactRecordKey(store_key)) {
+                var value: ?[]const u8 = null;
+                var lease = try transactions_mod.captureServingValue(self.core.store, store_key, &value);
+                defer lease.abort();
+                break :blk if (value) |bytes| try alloc.dupe(u8, bytes) else null;
+            }
+            var read = try self.core.store.beginReadTxn();
             defer read.abort();
+            try transactions_mod.checkExternalReadAdmission(&read);
             const value = (try @import("artifact_chunk_generation.zig").readMember(alloc, &read, store_key)) orelse break :blk null;
             if (internal_keys.mediaWindowIndex(store_key)) |index| break :blk try @import("../../chunking/chunk.zig").mediaWindowPayloadAlloc(alloc, value, index);
             break :blk try alloc.dupe(u8, value);
@@ -19147,13 +19165,32 @@ pub const DB = struct {
         // Detached index entries are adopted by the serving manager. Their
         // mutexes, configs and runtime objects must share its allocator, even
         // when this repair was requested through a short-lived HTTP arena.
+        // A private candidate consumes the same logical source contract as
+        // the serving owner. AROW rows require its immutable schema registry;
+        // treating them as document keys silently publishes an empty index.
+        // Capture storage mode and copy range bounds under the same apply
+        // lease; publication cannot mix two source contracts.
+        const source_projection = source: {
+            try self.lockApplySharedForPortableRuntime();
+            defer self.core.unlockApplyShared();
+            const range = self.core.byteRange();
+            const start = try alloc.dupe(u8, range.start);
+            errdefer alloc.free(start);
+            const end = try alloc.dupe(u8, range.end);
+            break :source .{ .range = types.ByteRange{ .start = start, .end = end }, .relational = self.core.index_manager.relational_base_rows };
+        };
+        defer alloc.free(source_projection.range.start);
+        defer alloc.free(source_projection.range.end);
         var shadow_manager = try index_manager_mod.IndexManager.initWithOptions(
             self.core.index_manager.alloc,
             shadow_base,
             shadow_backends,
         );
-        // Repair candidates share the table's immutable source owner too.
-        // Otherwise their native base build silently recreates payload copies.
+        shadow_manager.updateRange(source_projection.range);
+        shadow_manager.setRelationalBaseRows(source_projection.relational);
+        // The repair's DB lifetime drains before this registry is destroyed.
+        // Individual row decodes pin the immutable epoch named by that row.
+        shadow_manager.setSchemaRegistry(self.core.schema_registry);
         shadow_manager.source_payload_store = self.core.index_manager.source_payload_store;
         shadow_manager.setIo(self.backend_runtime.io());
         shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
@@ -26380,6 +26417,38 @@ pub const DB = struct {
         return self.beginTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, null);
     }
 
+    /// Bind external decision authority at enlistment, before a vote can race
+    /// timeout recovery. Replicated admissions use the leader's durable time.
+    pub fn beginExternalTransaction(self: *DB, request: types.ExternalTransactionBegin) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginExternalTransaction", .{ self, request });
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var policy: ?row_policy_gate_mod.Gate.Lease = null;
+        defer if (policy) |*lease| lease.release();
+        if (request.ordered_receipt == null) policy = try self.local_execution.row_policy_gate.enterRaw();
+        var replication = if (request.ordered_receipt == null) self.acquireReplicationMutationShared() else null;
+        defer if (replication) |*lease| lease.release();
+        if (request.ordered_receipt == null) try self.enforceReplicationWriteGate();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (request.ordered_receipt) |identity| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
+            .already_applied => return request.txn_id,
+            .apply => {},
+        };
+        try request.owner.requireFreshVoteAt(if (request.ordered_receipt != null) request.admission_timestamp_ns else @max(1, currentTimeNs()));
+        if (self.local_execution.restore_staging_required.load(.acquire) or request.restore_staging_scope != null) {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, request.restore_staging_scope);
+        }
+        var receipt_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = if (request.ordered_receipt) |identity| orderedApplyReceiptWrite(identity, &receipt_buf) else null;
+        return self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(request.txn_id, request.begin_timestamp, request.created_at_ns, request.participants, request.coordinator, true, .{
+            .external_decision_owner = request.owner,
+            .writes = if (marker) |write| &.{write} else &.{},
+        });
+    }
+
     pub fn beginTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
@@ -26561,6 +26630,9 @@ pub const DB = struct {
         req: types.TransactionIntentRequest,
         ordered_receipt: ?OrderedApplyReceipt,
     ) !void {
+        if (req.external_activation) return self.activateExternalTransaction(txn_id, req, ordered_receipt);
+        if (req.external_decision_owner) |owner|
+            try owner.requireFreshVoteAt(if (ordered_receipt != null) req.timestamp_ns else @max(1, currentTimeNs()));
         if (ordered_receipt == null) try self.maybeFinalizePendingRowPolicyPublication();
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
@@ -26657,6 +26729,7 @@ pub const DB = struct {
                 .key = write.key,
                 .value = write.value,
                 .json_null_fields = write.json_null_fields,
+                .prepared_domain = write.prepared_domain,
             });
         }
         for (effective_ops.deletes) |key| {
@@ -26956,10 +27029,11 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans },
+                .{ .external_decision_owner = req.external_decision_owner, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .external_decision_owner = req.external_decision_owner,
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
                 .index_span_digests = index_spans,
@@ -27276,7 +27350,11 @@ pub const DB = struct {
             fn prepare(ctx: *@This(), scratch: Allocator, intent: *transactions_mod.WriteIntent) !void {
                 if (isMetadataKey(intent.key)) return;
                 const value = intent.value orelse return;
-                var row = try mapper.PreparedRelationalWrite.initTyped(ctx.alloc, scratch, scratch, false, intent.key, value, ctx.validator, ctx.view.tableSchema().*, ctx.view.physicalLayout(), intent.json_null_fields, false);
+                if (intent.prepared_domain) |contract| {
+                    const validator = ctx.validator orelse return error.InvalidBatchRequest;
+                    try validator.requirePreparedDomain(contract.*);
+                }
+                var row = try mapper.PreparedRelationalWrite.initTyped(ctx.alloc, scratch, scratch, false, intent.key, value, ctx.validator, ctx.view.tableSchema().*, ctx.view.physicalLayout(), intent.json_null_fields, intent.prepared_domain != null);
                 defer row.deinit(ctx.alloc);
                 try row.finalizeMetadata(0);
                 var specials = std.json.ObjectMap.empty;
@@ -27286,6 +27364,7 @@ pub const DB = struct {
                     if (root.object.get(field)) |special| try specials.put(scratch, field, special);
                 const sidecar = try std.json.Stringify.valueAlloc(ctx.alloc, std.json.Value{ .object = specials }, .{});
                 intent.prepared_row = row.takePackedRow();
+                intent.prepared_domain = null;
                 intent.value = sidecar;
                 intent.json_null_fields = &.{};
             }
@@ -27369,6 +27448,7 @@ pub const DB = struct {
             visibility_cancellation,
             null,
             null,
+            null,
         );
     }
 
@@ -27391,7 +27471,36 @@ pub const DB = struct {
             visibility_cancellation,
             identity,
             resolved_participant,
+            null,
         );
+    }
+
+    pub fn resolveExternalTransaction(self: *DB, request: types.ExternalTransactionResolution) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveExternalTransaction", .{ self, request });
+        try request.owner.validate();
+        try self.resolveTransactionIntentsInternal(request.txn_id, request.status, request.commit_version, request.sync_level, request.visibility_cancellation, request.ordered_receipt, request.resolved_participant, request.owner);
+    }
+
+    fn activateExternalTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, ordered: ?OrderedApplyReceipt) !void {
+        const owner = req.external_decision_owner orelse return error.InvalidBatchRequest;
+        if (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or
+            req.integrity.len != 0 or req.integrity_commands.len != 0 or req.range_guards.len != 0 or
+            req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or
+            req.restore_staging_scope != null or req.relational_repair or req.row_policy_principal_proof.len != 0 or
+            req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0) return error.InvalidBatchRequest;
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var marker: [ordered_apply_receipt_value_len]u8 = undefined;
+        const writes: []const docstore_mod.KVPair = if (ordered) |receipt| block: {
+            switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), receipt)) {
+                .already_applied => return,
+                .apply => {},
+            }
+            break :block &.{orderedApplyReceiptWrite(receipt, &marker)};
+        } else &.{};
+        var manager = try self.core.initTxnManager();
+        defer manager.deinit();
+        try manager.activateExternalDecision(txn_id, owner, .{ .writes = writes });
     }
 
     pub const resolveTransactionIntentsInternal = local_mutation.resolveTransactionIntentsInternal;
@@ -42701,7 +42810,7 @@ pub const DB = struct {
         // would incorrectly reject ordinary SQL on such tables.
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
-        if (!allow_unresolved and try manager.hasUnresolvedWriteIntents()) {
+        if (!allow_unresolved and try manager.hasStatementReadDebt()) {
             replay.release();
             primary.release();
             return null;

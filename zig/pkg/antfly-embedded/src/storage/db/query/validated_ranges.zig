@@ -179,7 +179,6 @@ test "public graph metric borrowed wire validated ranges preserve scanner state 
     var cache = ValidatedRanges.init(a);
     defer cache.deinit();
     try cache.remember(raw[6..17]);
-    try cache.remember(raw[24..33]);
     var scanner = std.json.Scanner.initCompleteInput(a, raw);
     defer scanner.deinit();
     try std.testing.expectEqual(.object_begin, try scanner.next());
@@ -191,6 +190,9 @@ test "public graph metric borrowed wire validated ranges preserve scanner state 
     try std.testing.expect(try checked.skip(&scanner, true));
     try std.testing.expectEqualStrings("y", (try scanner.next()).string);
     try std.testing.expectEqual(.string, try scanner.peekNextTokenType());
+    // Address-hashed spans may evict one another; this test exercises the
+    // scanner shortcut, while the collision test below verifies fallback.
+    try cache.remember(raw[24..33]);
     try std.testing.expect(try checked.skip(&scanner, false));
     try std.testing.expectEqualStrings("z", (try scanner.next()).string);
     try std.testing.expectEqualStrings("2", (try scanner.next()).number);

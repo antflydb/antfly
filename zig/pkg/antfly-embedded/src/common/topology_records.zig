@@ -23,6 +23,8 @@ pub const TableRecord = struct {
     /// Physical backing rows belong to this logical materialized-view identity.
     /// Public mutations must address the view lifecycle, never this storage name.
     sql_materialized_view_id: ?u64 = null,
+    /// Explicit SQL namespace names over otherwise table-local native indexes.
+    sql_native_indexes_json: []const u8 = "",
     /// Server-derived requirements of the published definition and retained
     /// layouts. This internal fact is not a client capability or owner ACK.
     schema_reader_requirements: ?@import("schema_readers.zig").ReaderRequirements = null,
@@ -63,7 +65,7 @@ pub const TableRecord = struct {
             const reader_field = comptime std.mem.eql(u8, field_name, "schema_reader_requirements");
             const text_field = comptime std.mem.eql(u8, field_name, "full_text_read_index");
             const object_field = comptime std.mem.eql(u8, field_name, "object_storage_generation") or std.mem.eql(u8, field_name, "object_storage_identity");
-            if ((!std.mem.eql(u8, field_name, "sql_materialized_view_id") or self.sql_materialized_view_id != null) and (!reader_field or self.schema_reader_requirements != null) and (!text_field or self.full_text_read_index != null) and (!object_field or self.storage.engine == .object) and (!std.mem.eql(u8, field_name, "lake_index_catalog_json") or self.lake_index_catalog_json.len != 0)) {
+            if ((!std.mem.eql(u8, field_name, "sql_native_indexes_json") or self.sql_native_indexes_json.len != 0) and (!std.mem.eql(u8, field_name, "sql_materialized_view_id") or self.sql_materialized_view_id != null) and (!reader_field or self.schema_reader_requirements != null) and (!text_field or self.full_text_read_index != null) and (!object_field or self.storage.engine == .object) and (!std.mem.eql(u8, field_name, "lake_index_catalog_json") or self.lake_index_catalog_json.len != 0)) {
                 try jw.objectField(field_name);
                 try jw.write(@field(self, field_name));
             }

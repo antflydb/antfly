@@ -22,15 +22,18 @@ const domain = @import("antfly_local_sources").system_catalog_domain;
 pub fn authorizeTarget(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, a: std.mem.Allocator, target: domain.Target) !void {
     if (server.cfg.auth_enabled and identity == null) return error.Forbidden;
     const resource = try target.resourceNameAlloc(a);
+    defer a.free(resource);
     if (!try http.tablePermissionCurrentlyAllowed(identity, resource, .admin)) return error.Forbidden;
 }
 
 pub fn namespaceUsage(identity: ?http.AuthenticatedIdentity, a: std.mem.Allocator, target: domain.Target) !bool {
     const actor = identity orelse return true;
     const table = try target.resourceNameAlloc(a);
+    defer a.free(table);
     if (try http.tablePermissionCurrentlyAllowed(actor, table, .read) or
         try http.tablePermissionCurrentlyAllowed(actor, table, .write)) return true;
     const namespace = try @import("../system_catalog/routes.zig").resourceNameAlloc(a, .{ .kind = .namespace, .database = target.database, .name = target.namespace });
+    defer a.free(namespace);
     if (!http.permissionsAllow(actor.permissions, .namespace, namespace, .read)) return false;
     const manager = actor.live_user_manager orelse return true;
     if (std.mem.startsWith(u8, actor.credential_principal, "api-key:")) {

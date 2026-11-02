@@ -326,6 +326,7 @@ test "SQL TRUNCATE prepared statement uses mounted durable generation admission"
                 prepared += 1;
             }
             if (tag == 'E') {
+                errdefer std.debug.print("prepared TRUNCATE error payload: {s}\n", .{payload});
                 try std.testing.expect(std.mem.indexOf(u8, payload, "55000") != null);
                 try std.testing.expect(std.mem.indexOf(u8, payload, "restore_job_id") != null);
                 pending += 1;

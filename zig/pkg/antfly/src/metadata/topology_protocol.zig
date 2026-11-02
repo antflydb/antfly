@@ -154,7 +154,52 @@ const std = @import("std");
 /// deletable summaries, scoped native paths, canonical routing proofs, legacy
 /// qualification, and bounded edits during resumable qualification. Earlier
 /// SQL readers must not admit these records using their overlapping numbers.
-pub const current_version: u16 = 112;
+/// Version 113 admits immutable SQL roles, provenance-preserving ACLs, and
+/// creator-bound table ACL initialization in the catalog transaction.
+/// Version 114 decodes identity-fenced named-type annotations on the shared
+/// outcome lane; presentation edits preserve executable type generations.
+/// Version 115 binds multi-table named-type epoch publications and their
+/// compact dependency reservations to the common schema validation ledger.
+/// Version 117 decodes builtin-based immutable domain definitions. Native
+/// dependent-column activation remains independently capability-gated.
+// CREATE copies native column annotations inside its guarded transaction.
+// Earlier creation-source readers must not silently discard these intents.
+pub const current_version: u16 = 135;
+/// The unreleased combined catalog profile also decodes trigger-return contracts.
+/// Keep new declarations above the older scalar-only routine capability floor.
+pub const sql_trigger_function_version: u16 = 135;
+/// SQL namespace ownership of native indexes and exact shared-journal outcomes.
+pub const sql_native_index_namespace_version: u16 = 135;
+/// Reserved; not advertised until private session-commit receiver qualification.
+pub const sql_connection_transactions_version: u16 = 136;
+/// Public catalog-operation recovery binds an immutable logical target label.
+pub const table_retirement_public_version: u16 = 135;
+/// Exact whole-table publication after physical barriers with no survivors.
+pub const table_retirement_direct_version: u16 = 134;
+/// Root-bound all-survivor schema publication under the owning retirement.
+pub const table_retirement_survivors_version: u16 = 133;
+/// Root-bound source and parent plans with sparse, durable owner ACKs.
+pub const table_retirement_physical_version: u16 = 132;
+/// Durable table-retirement reservations, dependency leases and recovery proof.
+pub const table_retirement_version: u16 = 131;
+/// Transactional incoming-FK indexing and bounded complete-coverage adoption.
+pub const foreign_key_directory_version: u16 = 130;
+/// Hidden FK CREATE carries guarded LIKE inputs and immutable annotation effects.
+pub const initial_fk_creation_copy_version: u16 = 129;
+/// Hidden initial-FK plans reserve counter effects and publish them with the child.
+pub const initial_fk_column_sequences_version: u16 = 128;
+pub const sql_object_annotations_version: u16 = 127;
+pub const sql_attribute_handoffs_version: u16 = 126;
+/// Column allocation attests the complete persisted default binding, including mode.
+pub const sql_column_default_proof_version: u16 = 122;
+pub const sql_creation_sources_version: u16 = 121;
+pub const sql_prepared_transactions_version: u16 = 119;
+pub const sql_domain_epoch_version: u16 = 118;
+pub const sql_domain_version: u16 = 117;
+pub const sql_type_retirement_version: u16 = 116;
+pub const sql_type_epoch_version: u16 = 115;
+pub const sql_type_comment_version: u16 = 114;
+pub const sql_authorization_version: u16 = 113;
 pub const sql_type_version: u16 = 111;
 pub const sql_cast_version: u16 = 110;
 pub const sql_routine_version: u16 = 110;
@@ -164,7 +209,9 @@ pub const sql_population_version: u16 = 101;
 pub const job_state_version: u16 = 104;
 pub const sql_drop_generation_version: u16 = 99;
 pub const sql_view_domains_version: u16 = 98;
-pub const sql_column_sequences_version: u16 = 97;
+// Owned defaults include the atomic attribute-reference directory.
+pub const sql_column_sequences_version: u16 = 125;
+pub const sql_sequence_retirement_version: u16 = 125;
 pub const native_service_tables_version: u16 = 96;
 pub const resolver_records_version: u16 = 104;
 /// Stable database/namespace annotations, without physical schema publication.
@@ -183,6 +230,9 @@ pub const sql_sequence_catalog_version: u16 = 90;
 pub const schema_validation_publication_version: u16 = 91;
 /// The same unreleased cohort decodes bounded native reporter retirement jobs.
 pub const native_reporter_restart_version: u16 = 91;
+/// AFNOWN1 is also used by standalone schema validation and reporter recovery.
+/// Its format does not imply the stronger complete index-delivery workflow.
+pub const native_owner_binding_version: u16 = 91;
 pub const sql_column_transform_version: u16 = 89;
 pub const fk_generation_column_addition_version: u16 = 88;
 pub const sql_row_policy_intent_version: u16 = 87;

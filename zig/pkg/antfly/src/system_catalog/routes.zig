@@ -80,12 +80,24 @@ fn tableNameAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
     return value;
 }
 
+/// Shared authorization category for logical catalog kinds. SQL roles use
+/// the existing principal-administration permission category.
+pub fn permissionKind(kind: domain.Kind) @import("../usermgr/mod.zig").ResourceType {
+    return switch (kind) {
+        .query_source, .view, .sequence, .table => .table,
+        .routine, .named_type, .namespace => .namespace,
+        .cast, .database => .database,
+        .tablespace => .tablespace,
+        .role => .user,
+    };
+}
+
 pub fn resourceNameAlloc(alloc: std.mem.Allocator, route: Route) ![]u8 {
     const name = route.name orelse "*";
     return switch (route.kind) {
         .named_type => std.fmt.allocPrint(alloc, "{s}.{s}", .{ route.database, route.namespace }),
         .cast => alloc.dupe(u8, route.database),
-        .database, .tablespace, .query_source => alloc.dupe(u8, name),
+        .database, .tablespace, .query_source, .role => alloc.dupe(u8, name),
         .namespace => std.fmt.allocPrint(alloc, "{s}.{s}", .{ route.database, name }),
         .table, .view, .sequence, .routine => (domain.TableScope{ .database = route.database, .namespace = route.namespace, .table = route.name }).keyAlloc(alloc),
     };

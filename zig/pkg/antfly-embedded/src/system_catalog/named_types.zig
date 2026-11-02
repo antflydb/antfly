@@ -72,15 +72,18 @@ pub fn validateLabel(text: []const u8) !void {
     if (!std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidSqlNamedType;
 }
 pub const Placement = union(enum) { end, before: []const u8, after: []const u8 };
-pub const Definition = struct {
+pub const Definition = union(enum) {
     /// Append-only symbol-ID directory. BEFORE/AFTER never reorders this array.
     labels: []const Label,
+    domain: @import("domain_types.zig").Definition,
 
     pub fn byId(self: Definition, id: u32) !Label {
+        if (self != .labels) return error.InvalidSqlEnumSymbol;
         if (id == 0 or id > self.labels.len or self.labels[id - 1].id != id) return error.InvalidSqlEnumSymbol;
         return self.labels[id - 1];
     }
     pub fn validate(self: Definition, a: A) !void {
+        if (self == .domain) return self.domain.validate(a);
         var view = try View.init(a, self);
         defer view.deinit(a);
     }
@@ -94,6 +97,7 @@ pub const View = struct {
     ordered: []u32,
 
     pub fn init(a: A, definition: Definition) !View {
+        if (definition != .labels) return error.SqlTypeMismatch;
         if (definition.labels.len > max_labels) return error.SqlProgramLimitExceeded;
         var bytes: usize = 0;
         for (definition.labels, 0..) |label, i| {
@@ -240,6 +244,7 @@ pub const Record = struct {
     /// every label and rank. Local IDs and durable origins both define type
     /// identity, independently of column names and catalog ownership.
     pub fn sameValueDomain(self: Record, other: Record) bool {
+        if (self.definition != .labels or other.definition != .labels) return false;
         if (self.identity.id != other.identity.id or !std.mem.eql(u8, &self.identity.origin_id, &other.identity.origin_id)) return false;
         const common = @min(self.definition.labels.len, other.definition.labels.len);
         for (self.definition.labels[0..common], other.definition.labels[0..common]) |left, right| {
@@ -248,9 +253,64 @@ pub const Record = struct {
         return true;
     }
 
+    /// Compare validated immutable records before compatible publication.
+    /// Older row layouts and ordered keys remain meaningful only if every
+    /// existing symbol, label and rank is an exact prefix of the successor.
+    /// This requires no allocator and never interprets catalog spelling.
+    pub fn requireAdditiveSuccessor(self: Record, next: Record) !void {
+        if (self.definition != .labels or next.definition != .labels) return error.InvalidSqlNamedType;
+        try self.validateHeader();
+        try next.validateHeader();
+        var expected = self.identity;
+        expected.generation = std.math.add(u32, expected.generation, 1) catch return error.InvalidSqlNamedType;
+        if (!std.meta.eql(expected, next.identity) or next.definition.labels.len <= self.definition.labels.len or
+            next.definition.labels.len > max_labels or !self.sameValueDomain(next)) return error.InvalidSqlNamedType;
+    }
+
+    /// SET NOT NULL changes one logical rule, never the physical base,
+    /// defaults, checks, durable identity or owner. Historical rows require
+    /// a separate, fenced validation proof before this epoch is published.
+    pub fn requireDomainNotNullSuccessor(self: Record, next: Record) !void {
+        try self.validateHeader();
+        try next.validateHeader();
+        if (self.definition != .domain or next.definition != .domain) return error.InvalidSqlNamedType;
+        var identity = self.identity;
+        identity.generation = std.math.add(u32, identity.generation, 1) catch return error.InvalidSqlNamedType;
+        if (!std.meta.eql(identity, next.identity)) return error.InvalidSqlNamedType;
+        const old = self.definition.domain;
+        const new = next.definition.domain;
+        if (old.not_null or !new.not_null or !std.meta.eql(old.base, new.base) or
+            !std.meta.eql(old.numeric_modifier, new.numeric_modifier) or old.checks.len != new.checks.len)
+            return error.InvalidSqlNamedType;
+        if (old.default_expression) |expression| {
+            if (!std.mem.eql(u8, expression, new.default_expression orelse return error.InvalidSqlNamedType)) return error.InvalidSqlNamedType;
+        } else if (new.default_expression != null) return error.InvalidSqlNamedType;
+        for (old.checks, new.checks) |left, right| {
+            if (left.validated != right.validated or !std.mem.eql(u8, left.name, right.name) or
+                !std.mem.eql(u8, left.expression, right.expression)) return error.InvalidSqlNamedType;
+        }
+    }
+
+    pub fn requireEpochSuccessor(self: Record, next: Record) !void {
+        if (self.definition == .domain) return self.requireDomainNotNullSuccessor(next);
+        return self.requireAdditiveSuccessor(next);
+    }
+
     /// Deep ownership for native schema epochs. No JSON arena or catalog
     /// cursor is retained by an installed schema.
     pub fn cloneOwned(self: Record, a: A) !Record {
+        if (self.definition == .domain) {
+            var definition = try self.definition.domain.cloneOwned(a);
+            errdefer definition.deinitOwned(a);
+            var result = self;
+            result.definition = .{ .domain = definition };
+            result.owner = switch (self.owner) {
+                .auth_disabled => .auth_disabled,
+                .user => |principal| .{ .user = .{ .name = try a.dupe(u8, principal.name), .instance_id = principal.instance_id } },
+                .role => |principal| .{ .role = .{ .name = try a.dupe(u8, principal.name), .instance_id = principal.instance_id } },
+            };
+            return result;
+        }
         const labels = try a.alloc(Label, self.definition.labels.len);
         var initialized: usize = 0;
         errdefer {
@@ -274,11 +334,15 @@ pub const Record = struct {
         return .{ .version = self.version, .identity = self.identity, .definition = .{ .labels = labels }, .owner = owner };
     }
     pub fn deinitOwned(self: *Record, a: A) void {
-        for (self.definition.labels) |label| {
-            a.free(label.text);
-            a.free(label.order_key);
+        if (self.definition == .domain) {
+            self.definition.domain.deinitOwned(a);
+        } else {
+            for (self.definition.labels) |label| {
+                a.free(label.text);
+                a.free(label.order_key);
+            }
+            a.free(self.definition.labels);
         }
-        a.free(self.definition.labels);
         switch (self.owner) {
             .auth_disabled => {},
             .user, .role => |principal| a.free(principal.name),
@@ -364,4 +428,58 @@ test "SQL named enum immutable successors unwind every allocation failure" {
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL named enum additive publication rejects retired symbols rebound origins and changed ranks" {
+    const a = std.testing.allocator;
+    var first = try Owned.create(a, &.{ "z", "a" });
+    defer first.deinit();
+    const before: Record = .{ .identity = try Identity.init(17, 2, 1, @splat(8)), .definition = first.definition, .owner = .auth_disabled };
+    var added = try Owned.add(a, first.definition, "middle", .{ .before = "a" });
+    defer added.deinit();
+    var after = before;
+    after.identity.generation += 1;
+    after.definition = added.definition;
+    try before.requireAdditiveSuccessor(after);
+    var forged = after;
+    forged.identity.origin_id = @splat(9);
+    try std.testing.expectError(error.InvalidSqlNamedType, before.requireAdditiveSuccessor(forged));
+    forged = after;
+    forged.identity.namespace_id += 1;
+    try std.testing.expectError(error.InvalidSqlNamedType, before.requireAdditiveSuccessor(forged));
+    forged = after;
+    forged.identity.generation += 1;
+    try std.testing.expectError(error.InvalidSqlNamedType, before.requireAdditiveSuccessor(forged));
+    forged = after;
+    forged.definition = first.definition;
+    try std.testing.expectError(error.InvalidSqlNamedType, before.requireAdditiveSuccessor(forged));
+    const labels = try a.dupe(Label, added.definition.labels);
+    defer a.free(labels);
+    labels[0].order_key = labels[1].order_key;
+    forged = after;
+    forged.definition.labels = labels;
+    try std.testing.expectError(error.InvalidSqlNamedType, before.requireAdditiveSuccessor(forged));
+}
+
+test "SQL domain named records retain identity and own cold contracts independently of enum symbols" {
+    const a = std.testing.allocator;
+    const record: Record = .{
+        .identity = try Identity.init(23, 2, 1, @splat(9)),
+        .owner = .auth_disabled,
+        .definition = .{ .domain = .{ .base = .{ .builtin = .text }, .not_null = true, .default_expression =
+        \\{"op":"literal","type":"string","value":"queued"}
+        } },
+    };
+    const bytes = try record.encode(a);
+    defer a.free(bytes);
+    var cold = try Record.decode(a, bytes);
+    defer cold.deinit();
+    var owned = try cold.value.cloneOwned(a);
+    defer owned.deinitOwned(a);
+    try std.testing.expectEqualDeep(record, owned);
+    try std.testing.expectEqualDeep(record.identity, cold.value.identity);
+    try std.testing.expectError(error.SqlTypeMismatch, View.init(a, owned.definition));
+    try std.testing.expectError(error.InvalidSqlEnumSymbol, owned.definition.byId(1));
+    try std.testing.expectError(error.InvalidSqlNamedType, owned.requireAdditiveSuccessor(owned));
+    try std.testing.expect(!owned.sameValueDomain(owned));
 }

@@ -100,3 +100,89 @@ pub fn firstDependent(txn: anytype, group: u64, id: u64) !?u64 {
     if (table == 0) return error.InvalidCatalogRecord;
     return table;
 }
+
+/// Immutable activation preparation, not an authority or a paginated partial
+/// membership proof. Read at most one excess edge before rejecting oversized
+/// cohorts; ordinary point mutations keep their O(1) firstDependent path.
+pub const max_dependents = 128;
+pub fn dependentsAlloc(a: A, txn: anytype, group: u64, id: u64, limit: usize) ![]u64 {
+    if (id == 0 or limit == 0 or limit > max_dependents) return error.InvalidCatalogMutation;
+    var buffer: [192]u8 = undefined;
+    const prefix = try prefixKey(&buffer, group, id);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var result: std.ArrayList(u64) = .empty;
+    defer result.deinit(a);
+    var row = try cursor.seekAtOrAfter(prefix);
+    var previous: u64 = 0;
+    while (row) |item| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, prefix)) break;
+        if (item.key.len != prefix.len + 8 or !std.mem.eql(u8, item.value, &.{1})) return error.InvalidCatalogRecord;
+        const table = std.mem.readInt(u64, item.key[prefix.len..][0..8], .big);
+        if (table <= previous) return error.InvalidCatalogRecord;
+        if (result.items.len == limit) return error.SqlProgramLimitExceeded;
+        try result.append(a, table);
+        previous = table;
+    }
+    return result.toOwnedSlice(a);
+}
+
+/// Discovery/exclusion only. The immutable staged rewrite and its exact
+/// current type/dependency cut are the publication authority.
+pub const RetirementLock = struct {
+    id: [16]u8,
+    intent_digest: [32]u8,
+    admission_digest: [32]u8,
+    generation: u32,
+    pub const encoded_len = 88;
+    pub fn encode(self: @This()) ![encoded_len]u8 {
+        if (self.generation == 0 or std.mem.allEqual(u8, &self.id, 0) or std.mem.allEqual(u8, &self.intent_digest, 0) or std.mem.allEqual(u8, &self.admission_digest, 0)) return error.InvalidCatalogRecord;
+        var bytes: [encoded_len]u8 = undefined;
+        bytes[0..4].* = "ATR1".*;
+        bytes[4..20].* = self.id;
+        bytes[20..52].* = self.intent_digest;
+        bytes[52..84].* = self.admission_digest;
+        std.mem.writeInt(u32, bytes[84..88], self.generation, .little);
+        return bytes;
+    }
+    pub fn decode(bytes: []const u8) !@This() {
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "ATR1")) return error.InvalidCatalogRecord;
+        const value: @This() = .{ .id = bytes[4..20].*, .intent_digest = bytes[20..52].*, .admission_digest = bytes[52..84].*, .generation = std.mem.readInt(u32, bytes[84..88], .little) };
+        _ = try value.encode();
+        return value;
+    }
+};
+pub fn retirementKey(buffer: []u8, group: u64, type_id: u64) ![]const u8 {
+    if (group == 0 or type_id == 0) return error.InvalidCatalogRecord;
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:system_catalog:{d}:type-retirement:{d}", .{ group, type_id });
+}
+pub fn retirementLock(txn: anytype, group: u64, type_id: u64) !?RetirementLock {
+    var buffer: [192]u8 = undefined;
+    const bytes = txn.get(try retirementKey(&buffer, group, type_id)) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try RetirementLock.decode(bytes);
+}
+pub fn acquireRetirement(txn: anytype, group: u64, type_id: u64, lock: RetirementLock) !void {
+    const bytes = try lock.encode();
+    if (try retirementLock(txn, group, type_id) != null) return error.CatalogPublicationProofPending;
+    var buffer: [192]u8 = undefined;
+    try txn.put(try retirementKey(&buffer, group, type_id), &bytes);
+}
+pub fn releaseRetirement(txn: anytype, group: u64, type_id: u64, expected: RetirementLock) !void {
+    const actual = (try retirementLock(txn, group, type_id)) orelse return error.CatalogGenerationChanged;
+    if (!std.meta.eql(actual, expected)) return error.CatalogGenerationChanged;
+    var buffer: [192]u8 = undefined;
+    try txn.delete(try retirementKey(&buffer, group, type_id));
+}
+
+test "SQL routine catalog type retirement locks reject corrupt and substituted ownership" {
+    const lock: RetirementLock = .{ .id = @splat(1), .intent_digest = @splat(2), .admission_digest = @splat(3), .generation = 7 };
+    const bytes = try lock.encode();
+    try std.testing.expectEqualDeep(lock, try RetirementLock.decode(&bytes));
+    try std.testing.expectError(error.InvalidCatalogRecord, RetirementLock.decode(bytes[0 .. bytes.len - 1]));
+    var bad = bytes;
+    @memset(bad[84..88], 0);
+    try std.testing.expectError(error.InvalidCatalogRecord, RetirementLock.decode(&bad));
+}

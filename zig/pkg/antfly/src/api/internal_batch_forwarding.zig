@@ -149,3 +149,46 @@ fn consumerTests() type {
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
 }
+
+pub fn externalTransactionProtocol(req: @import("antfly_local_sources").storage_db_types.BatchRequest) ?u16 {
+    if (req.transaction) |transaction| switch (transaction) {
+        .begin => |begin| if (begin.external_decision_owner != null) {
+            return @import("../common/data_raft_protocol.zig").batch_external_transaction_protocol_version;
+        },
+        .prepare => |prepare| if (prepare.external_decision_owner != null or prepare.external_activation) {
+            return @import("../common/data_raft_protocol.zig").batch_external_transaction_protocol_version;
+        },
+        .resolve => |resolve| if (resolve.external_decision_owner != null) {
+            return @import("../common/data_raft_protocol.zig").batch_external_transaction_protocol_version;
+        },
+        else => {},
+    };
+    return null;
+}
+
+pub fn validateExternalVoteAdmission(req: @import("antfly_local_sources").storage_db_types.BatchRequest, realtime_ns: u64) !void {
+    if (req.transaction) |transaction| {
+        if (transaction == .begin) {
+            if (transaction.begin.external_decision_owner) |owner| try owner.requireFreshVoteAt(@max(1, realtime_ns));
+            return;
+        }
+        if (transaction != .prepare) return;
+        const prepare = transaction.prepare;
+        if (prepare.external_activation) {
+            const owner = prepare.external_decision_owner orelse return error.InvalidExternalDecisionOwner;
+            try owner.validate();
+        } else if (prepare.external_decision_owner) |owner| try owner.requireFreshVoteAt(@max(1, realtime_ns));
+    }
+}
+
+pub fn materializeExternalVoteTimestamp(req: *@import("antfly_local_sources").storage_db_types.BatchRequest, realtime_ns: u64) void {
+    if (req.transaction) |transaction| switch (transaction) {
+        .begin => |begin| if (begin.external_decision_owner != null) {
+            req.timestamp_ns = @max(1, realtime_ns);
+        },
+        .prepare => |prepare| if (prepare.external_decision_owner != null and !prepare.external_activation) {
+            req.timestamp_ns = @max(1, realtime_ns);
+        },
+        else => {},
+    };
+}

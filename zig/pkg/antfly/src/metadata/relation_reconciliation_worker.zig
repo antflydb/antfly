@@ -232,6 +232,11 @@ pub fn PublicationProofPool(comptime Scan: type, comptime Proof: type, comptime 
 /// by CAS, including terminal failures; unchanged failed epochs stay stopped.
 /// Alternate collection and forward work whenever both are available.
 pub fn nextIntent(work: r.Work, group: u64, prefer_gc: bool) !?control.Command {
+    const building = if (work.current) |state| state.failure == .none and state.phase != .ready else false;
+    if (!building and !(prefer_gc and work.garbage != null)) if (work.foreign_key_backfill) |cut| {
+        try cut.validate();
+        return .{ .foreign_keys = cut };
+    };
     return nextIntentWithCoverage(work, group, prefer_gc, .relations);
 }
 fn nextIntentWithCoverage(work: r.Work, group: u64, prefer_gc: bool, desired: r.Coverage) !?control.Command {
@@ -857,4 +862,17 @@ test "relation reconciliation worker rejects changed publication cuts and preser
     host.preparation.publish.prior = r.Generation.of(&prior);
     try std.testing.expectError(error.CatalogGenerationChanged, worker.step(&host, 41, 4 * round_interval_ns));
     try std.testing.expectEqual(@as(usize, 1), host.appends);
+}
+
+test "incoming FK directory scheduler progresses idle catalogs and preserves occupancy migration" {
+    const work: r.Work = .{ .epoch = null, .current = null, .root = null, .foreign_key_backfill = .{} };
+    const intent = (try nextIntent(work, 41, false)).?;
+    try std.testing.expect(intent == .foreign_keys);
+    var activation: protocol.Activation = .{ .version = protocol.constraint_occupancy_version, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) };
+    try std.testing.expect((try coverageMigration(work, 41, activation)).? == .adopt);
+    var adopted = work;
+    adopted.epoch = .{ .incarnation = @splat(0x11), .revision = 1 };
+    try std.testing.expect((try coverageMigration(adopted, 41, activation)).? == .start);
+    activation.version = protocol.foreign_key_directory_version;
+    try std.testing.expectError(error.InvalidRelationReconciliationCommand, coverageMigration(adopted, 41, activation));
 }

@@ -8,6 +8,44 @@ describe("relational expression structural admission", () => {
   const validate = (expression: unknown) =>
     validateRelationalExpression(expression, "expression", { nodes: 0, literalBytes: 0 });
 
+  it("requires exact schema-owned enum identities on literals and casts", () => {
+    const literal = { op: "literal", type: "enumeration", named_type_id: 17, value: "z" };
+    expect(() => validate(literal)).not.toThrow();
+    expect(() => validate({ ...literal, value: null })).not.toThrow();
+    expect(() =>
+      validate({
+        op: "cast",
+        type: "enumeration",
+        named_type_id: 17,
+        args: [{ op: "literal", type: "string", value: "z" }],
+      })
+    ).not.toThrow();
+    expect(() => validate({ op: "cast", type: "string", args: [literal] })).not.toThrow();
+    for (const named_type_id of [undefined, null, 0, -1, 1.5, "17", Number.MAX_SAFE_INTEGER + 1])
+      expect(() => validate({ ...literal, named_type_id })).toThrow(TypeError);
+    expect(() => validate({ ...literal, value: 1 })).toThrow(TypeError);
+    expect(() => validate({ ...integer, named_type_id: 17 })).toThrow(TypeError);
+  });
+
+  it("admits transaction clocks with native precision bounds", () => {
+    for (const precision of [undefined, 0, 3, 6])
+      expect(() =>
+        validate(
+          precision === undefined
+            ? { op: "transaction_timestamp" }
+            : { op: "transaction_timestamp", precision }
+        )
+      ).not.toThrow();
+    for (const precision of [null, "3", -1, 7, 1.5, Number.NaN])
+      expect(() => validate({ op: "transaction_timestamp", precision })).toThrow(TypeError);
+    expect(() => validate({ op: "transaction_timestamp", args: [] })).toThrow(TypeError);
+  });
+
+  it("admits generated range domains without interpreting their syntax locally", () => {
+    for (const type of ["numrange", "daterange", "tsrange", "tstzrange"])
+      expect(() => validate({ op: "literal", type, value: "empty" })).not.toThrow();
+  });
+
   it("admits UUID default declarations without accepting irrelevant fields or arguments", () => {
     for (const expression of [
       { op: "uuidv4" },

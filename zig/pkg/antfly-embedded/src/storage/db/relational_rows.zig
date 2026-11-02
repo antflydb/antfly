@@ -289,6 +289,7 @@ pub const Reader = struct {
     pub fn openSnapshot(alloc: Allocator, snapshot: docstore.DocStore.Txn, authenticated: bool, active_view: registry.SchemaView, indexes: ?catalog.WriteSnapshot, request: Request, now_ns: u64) !Reader {
         var read = snapshot;
         errdefer read.abort();
+        try @import("../transactions.zig").checkExternalReadAdmission(&read);
         if (active_view.storageMode() != .relational) return error.RelationalTableRequired;
         if (request.expected_schema_version) |version| if (version != active_view.version()) return error.PreparedGenerationChanged;
         if (request.fields.len > 256 or request.conditions.len > 256 or request.expression_equalities.len > 256 or (request.index == null and (request.lower != null or request.upper != null)))

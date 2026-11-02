@@ -28,6 +28,103 @@ const settings = @import("antfly_local_sources").system_catalog_settings;
 
 pub const Request = domain.Request;
 
+/// Negotiate the complete default-proof decoder before observing a binding.
+/// Existing ordinary sequence reads do not need this additional capability.
+fn readSqlSequenceSnapshot(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("sequence_catalog.zig").SnapshotRequest) ![]u8 {
+    if (!context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    if (request.column_default != null or request.prepare_retirement) {
+        if (request.prepare_retirement and !context.schema_validation_authority) return error.Forbidden;
+        const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (request.prepare_retirement) protocol.sql_sequence_retirement_version else protocol.sql_column_default_proof_version);
+        try svc.ensureLinearizableReadWithContext(context);
+        try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    } else {
+        try svc.ensureLinearizableReadWithContext(context);
+    }
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const bytes = try store.sqlSequenceSnapshot(alloc, svc.metadata_group_id, request, context);
+    errdefer alloc.free(bytes);
+    try context.ensureActive();
+    return bytes;
+}
+
+test "system catalog creation sources default proofs negotiate capability before snapshot reads" {
+    const sequences = @import("sequence_catalog.zig");
+    const Spy = struct {
+        metadata_group_id: u64 = 41,
+        default_mode: bool,
+        retirement_mode: bool = false,
+        allow_upgrade: bool = true,
+        version: u16 = protocol.sql_column_default_proof_version - 1,
+        phase: u8 = 0,
+        reads: usize = 0,
+
+        pub fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: operation.RequestContext, minimum: u16) !bool {
+            try std.testing.expect(self.default_mode or self.retirement_mode);
+            try std.testing.expectEqual(@as(u8, 0), self.phase);
+            try std.testing.expectEqual(if (self.retirement_mode) protocol.sql_sequence_retirement_version else protocol.sql_column_default_proof_version, minimum);
+            self.phase = 1;
+            if (!self.allow_upgrade) return error.TableTopologyProtocolUpgradeRequired;
+            self.version = minimum;
+            return true;
+        }
+        pub fn ensureLinearizableReadWithContext(self: *@This(), _: operation.RequestContext) !void {
+            try std.testing.expectEqual(@as(u8, if (self.default_mode or self.retirement_mode) 1 else 0), self.phase);
+            self.phase = 2;
+        }
+        pub fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, ready: bool) !void {
+            try std.testing.expect(ready and (self.default_mode or self.retirement_mode));
+            try std.testing.expectEqual(@as(u8, 2), self.phase);
+            self.phase = 3;
+        }
+        pub fn projectedStore(self: *@This()) ?*@This() {
+            return self;
+        }
+        pub fn sqlSequenceSnapshot(self: *@This(), a: std.mem.Allocator, group: u64, request: sequences.SnapshotRequest, _: operation.RequestContext) ![]u8 {
+            try std.testing.expectEqual(self.metadata_group_id, group);
+            try std.testing.expectEqual(self.default_mode, request.column_default != null);
+            try std.testing.expectEqual(self.retirement_mode, request.prepare_retirement);
+            try std.testing.expectEqual(@as(u8, if (self.default_mode or self.retirement_mode) 3 else 2), self.phase);
+            if (self.default_mode) try std.testing.expectEqual(protocol.sql_column_default_proof_version, self.version);
+            self.reads += 1;
+            self.phase = 4;
+            return a.dupe(u8, "{}");
+        }
+    };
+    const a = std.testing.allocator;
+    const context: operation.RequestContext = .{ .setting_admin = true };
+    const request: sequences.SnapshotRequest = .{ .targets = &.{.{ .table = "counter" }}, .sequence_ids = &.{11}, .incarnation = @splat(1), .column_default = .{ .scope = .{ .table_id = 7, .storage_name = "table:7", .schema_version = 1 }, .column = "id" } };
+    var upgraded: Spy = .{ .default_mode = true };
+    const bytes = try readSqlSequenceSnapshot(&upgraded, a, context, request);
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(u8, 4), upgraded.phase);
+    try std.testing.expectEqual(@as(usize, 1), upgraded.reads);
+    var denied: Spy = .{ .default_mode = true, .allow_upgrade = false };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, readSqlSequenceSnapshot(&denied, a, context, request));
+    try std.testing.expectEqual(@as(usize, 0), denied.reads);
+    var unauthenticated: Spy = .{ .default_mode = true };
+    try std.testing.expectError(error.Forbidden, readSqlSequenceSnapshot(&unauthenticated, a, .{}, request));
+    try std.testing.expectEqual(@as(u8, 0), unauthenticated.phase);
+    var ordinary: Spy = .{ .default_mode = false };
+    const ordinary_bytes = try readSqlSequenceSnapshot(&ordinary, a, context, .{ .targets = request.targets });
+    defer a.free(ordinary_bytes);
+    try std.testing.expectEqual(protocol.sql_column_default_proof_version - 1, ordinary.version);
+    try std.testing.expectEqual(@as(usize, 1), ordinary.reads);
+    const retirement_request: sequences.SnapshotRequest = .{ .targets = request.targets, .prepare_retirement = true };
+    const retirement_context: operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true };
+    var retiring: Spy = .{ .default_mode = false, .retirement_mode = true };
+    const retired_bytes = try readSqlSequenceSnapshot(&retiring, a, retirement_context, retirement_request);
+    defer a.free(retired_bytes);
+    try std.testing.expectEqual(@as(usize, 1), retiring.reads);
+    var denied_retirement: Spy = .{ .default_mode = false, .retirement_mode = true, .allow_upgrade = false };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, readSqlSequenceSnapshot(&denied_retirement, a, retirement_context, retirement_request));
+    try std.testing.expectEqual(@as(usize, 0), denied_retirement.reads);
+    var missing_authority: Spy = .{ .default_mode = false, .retirement_mode = true };
+    try std.testing.expectError(error.Forbidden, readSqlSequenceSnapshot(&missing_authority, a, context, retirement_request));
+    try std.testing.expectEqual(@as(u8, 0), missing_authority.phase);
+}
+
 /// One ordinary metadata proposal. The read-only preview is never returned
 /// as the allocated identity; only its transactionally stored outcome is.
 pub fn mutateSqlSequence(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("sequence_catalog.zig").Mutation) ![]u8 {
@@ -60,13 +157,57 @@ pub fn mutateSqlSequence(svc: anytype, alloc: std.mem.Allocator, context: operat
     return std.json.Stringify.valueAlloc(alloc, outcome, .{}) catch error.MetadataMutationOutcomeUnknown;
 }
 
+pub fn mutateSqlNativeIndex(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("native_indexes.zig").Mutation) ![]u8 {
+    const routines = @import("native_indexes.zig");
+    if (!context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    const required = protocol.sql_native_index_namespace_version;
+    try @import("../metadata/service.zig").ensureSqlNativeIndexNamespaceCapabilityWithContext(svc, context);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required);
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const command = routines.command(request);
+    if (store.prepareSystemCatalogResult(alloc, svc.metadata_group_id, command)) |preview| {
+        alloc.free(preview);
+    } else |err| {
+        // Accepted semantic failures need the same retained nonce outcome as
+        // success. Only invalid envelopes/capability/IO failures stop admission.
+        if (routines.Outcome.fromError(err) == null) return err;
+    }
+    const observation = try routines.observation(alloc, request);
+    const previous = try store.sqlNativeIndexOutcome(alloc, svc.metadata_group_id, observation);
+    defer alloc.free(previous);
+    if (!std.mem.eql(u8, previous, "null")) return alloc.dupe(u8, previous);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    try context.ensureActive();
+    svc.lockCatalogMutation();
+    var locked = true;
+    defer if (locked) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_system_catalog = bytes });
+    svc.unlockCatalogMutation();
+    locked = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const outcome = store.sqlNativeIndexOutcome(alloc, svc.metadata_group_id, observation) catch return error.MetadataMutationOutcomeUnknown;
+    if (std.mem.eql(u8, outcome, "null")) {
+        alloc.free(outcome);
+        return error.MetadataMutationOutcomeUnknown;
+    }
+    return outcome;
+}
+
 pub fn mutateSqlRoutine(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("routines.zig").Mutation) ![]u8 {
     const routines = @import("routines.zig");
     if (!context.setting_admin) return error.Forbidden;
     try context.ensureActive();
     try request.validate();
-    try @import("../metadata/service.zig").ensureSqlRoutineCapabilityWithContext(svc, context);
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_routine_version);
+    const required = routines.decoderVersion(request);
+    if (required == protocol.sql_trigger_function_version) try @import("../metadata/service.zig").ensureSqlTriggerFunctionCapabilityWithContext(svc, context) else try @import("../metadata/service.zig").ensureSqlRoutineCapabilityWithContext(svc, context);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required);
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const command = routines.command(request);
@@ -102,13 +243,99 @@ pub fn mutateSqlRoutine(svc: anytype, alloc: std.mem.Allocator, context: operati
     return outcome;
 }
 
+pub fn mutateSqlPrepared(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("prepared_transactions.zig").Mutation) ![]u8 {
+    const types = @import("prepared_transactions.zig");
+    if (!context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    if (request.standalone) return error.InvalidCatalogMutation;
+    try @import("../metadata/service.zig").ensureSqlPreparedCapabilityWithContext(svc, context);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_prepared_transactions_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const previous = try store.sqlPreparedOutcome(alloc, svc.metadata_group_id, request);
+    defer alloc.free(previous);
+    if (!std.mem.eql(u8, previous, "null")) return alloc.dupe(u8, previous);
+    const preview = try store.prepareSqlPreparedTransaction(alloc, svc.metadata_group_id, request);
+    alloc.free(preview);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > types.max_bytes) return error.CatalogCommandTooLarge;
+    try context.ensureActive();
+    svc.lockCatalogMutation();
+    var locked = true;
+    defer if (locked) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    try context.ensureActive();
+    if (request.operation == .admit) try (try request.operation.admit.identity.owner(alloc)).requireFreshVoteAt(@import("antfly_platform").clock.Clock.real().nowRealtimeNs());
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_sql_prepared_transaction = bytes });
+    svc.unlockCatalogMutation();
+    locked = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const outcome = store.sqlPreparedOutcome(alloc, svc.metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown;
+    if (std.mem.eql(u8, outcome, "null")) {
+        alloc.free(outcome);
+        return error.MetadataMutationOutcomeUnknown;
+    }
+    return outcome;
+}
+
+pub fn mutateSqlAuthorization(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("authorization.zig").Mutation) ![]u8 {
+    const types = @import("authorization.zig");
+    if (!context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try @import("../metadata/service.zig").ensureSqlAuthorizationCapabilityWithContext(svc, context);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_authorization_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const command = types.command(request);
+    if (store.prepareSystemCatalogResult(alloc, svc.metadata_group_id, command)) |preview| {
+        alloc.free(preview);
+    } else |err| {
+        // Accepted semantic failures need the same retained nonce outcome as
+        // success. Only invalid envelopes/capability/IO failures stop admission.
+        if (types.outcomes.Outcome.fromError(err) == null) return err;
+    }
+    const observation = try types.observation(alloc, request);
+    const previous = try store.sqlAuthorizationOutcome(alloc, svc.metadata_group_id, observation);
+    defer alloc.free(previous);
+    if (!std.mem.eql(u8, previous, "null")) return alloc.dupe(u8, previous);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    try context.ensureActive();
+    svc.lockCatalogMutation();
+    var locked = true;
+    defer if (locked) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_system_catalog = bytes });
+    svc.unlockCatalogMutation();
+    locked = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const outcome = store.sqlAuthorizationOutcome(alloc, svc.metadata_group_id, observation) catch return error.MetadataMutationOutcomeUnknown;
+    if (std.mem.eql(u8, outcome, "null")) {
+        alloc.free(outcome);
+        return error.MetadataMutationOutcomeUnknown;
+    }
+    return outcome;
+}
+
 pub fn mutateSqlType(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("named_types.zig").Mutation) ![]u8 {
     const types = @import("named_types.zig");
     if (!context.setting_admin) return error.Forbidden;
     try context.ensureActive();
     try request.validate();
-    try @import("../metadata/service.zig").ensureSqlTypeCapabilityWithContext(svc, context);
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_type_version);
+    if (request.operation == .set_domain_not_null)
+        try @import("../metadata/service.zig").ensureSqlDomainEpochCapabilityWithContext(svc, context)
+    else if (request.operation == .create_domain)
+        try @import("../metadata/service.zig").ensureSqlDomainCapabilityWithContext(svc, context)
+    else if (request.operation == .comment)
+        try @import("../metadata/service.zig").ensureSqlTypeCommentCapabilityWithContext(svc, context)
+    else
+        try @import("../metadata/service.zig").ensureSqlTypeCapabilityWithContext(svc, context);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (request.operation == .set_domain_not_null) protocol.sql_domain_epoch_version else if (request.operation == .create_domain) protocol.sql_domain_version else if (request.operation == .comment) protocol.sql_type_comment_version else protocol.sql_type_version);
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const command = types.command(request);
@@ -578,8 +805,9 @@ test "system catalog table create preparation owns one validated request across 
 }
 
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
-    if (request.mutation.action == .comment and !context.setting_admin) return error.Forbidden;
+    if ((request.mutation.action == .comment or request.mutation.sql_owner != null) and !context.setting_admin) return error.Forbidden;
     try context.ensureActive();
+    try request.validateBinding();
     if (request.mutation.native_service != null and request.mutation.native_service != context.native_service) return error.Forbidden;
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
     if (request.generated_constraint_names.len != 0 and (request.mutation.kind != .table or request.mutation.action != .create)) return error.InvalidCatalogMutation;
@@ -605,7 +833,8 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
             .schema_reader_requirements = named_type_readers,
         });
     }
-    const required_version = @max(if (request.mutation.native_service != null) protocol.native_service_tables_version else @as(u16, 0), @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (request.generated_constraint_names.len != 0) @max(ordinary_version, protocol.constraint_occupancy_version) else ordinary_version));
+    const source_version: u16 = if (request.creation_object_comments.len != 0) protocol.sql_object_annotations_version else if (request.creation_sources.len != 0) protocol.sql_creation_sources_version else 0;
+    const required_version = @max(source_version, @max(if (request.mutation.sql_owner != null) protocol.sql_authorization_version else @as(u16, 0), @max(if (request.mutation.native_service != null) protocol.native_service_tables_version else @as(u16, 0), @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (request.generated_constraint_names.len != 0) @max(ordinary_version, protocol.constraint_occupancy_version) else ordinary_version))));
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, @max(if (named_type_readers != null) protocol.sql_type_version else 0, @max(required_version, if (request.column_sequences.len != 0) protocol.sql_column_sequences_version else 0)));
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
@@ -615,7 +844,8 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     // The name/owner proof and current catalog revision share one native
     // transaction. Topology capture and durable proposal follow this check.
     const admission = try store.systemCatalogAdmissionWithBinding(a, svc.metadata_group_id, request.mutation, request.binding_guard);
-    var command: storage.SystemCatalogCommand = .{ .expected_revision = admission.meta.revision, .mutation = request.mutation, .column_sequences = request.column_sequences };
+    if (request.creation_revision) |revision| if (revision != admission.meta.revision) return error.CatalogGenerationChanged;
+    var command: storage.SystemCatalogCommand = .{ .expected_revision = admission.meta.revision, .mutation = request.mutation, .column_sequences = request.column_sequences, .creation_sources = request.creation_sources, .creation_comment_sources = request.creation_comment_sources, .creation_object_comments = request.creation_object_comments, .version = if (request.creation_sources.len != 0) storage.SystemCatalogCommand.creation_sources_version else 1 };
     if (request.mutation.action == .create and request.mutation.kind == .table) {
         var req = create_req orelse return error.InvalidCatalogMutation;
         if (request.generated_constraint_names.len != 0) {
@@ -623,7 +853,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
             const names = try std.json.parseFromSliceLeaky(domain.ConstraintNamePrepared, a, bytes, .{});
             req.schema_json = try a.dupe(u8, names.schema_json orelse return error.InvalidCatalogRecord);
             command.constraint_name_admission = names.admission;
-            command.version = 2;
+            command.version = if (request.creation_sources.len != 0) storage.SystemCatalogCommand.creation_sources_version else 2;
         }
         const storage_name = request.physical_name orelse try std.fmt.allocPrint(a, "table:{d}", .{admission.meta.next_id});
         if (!std.mem.startsWith(u8, storage_name, "table:") or storage_name.len > 1024) return error.InvalidCatalogMutation;
@@ -650,7 +880,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         command.mutation.storage_name = storage_name;
         command.topology = .{ .create = .{ .expected_transition_generation = generation, .table = table, .ranges = ranges } };
         if (command.column_sequences.len != 0) {
-            command.version = 3;
+            command.version = if (request.creation_sources.len != 0) storage.SystemCatalogCommand.creation_sources_version else 3;
             const bound = try store.bindTableColumnSequences(a, svc.metadata_group_id, command);
             command = try std.json.parseFromSliceLeaky(storage.SystemCatalogCommand, a, bound, .{});
         }
@@ -1146,6 +1376,58 @@ pub fn acknowledgeRelationalIndexOwner(svc: anytype, alloc: std.mem.Allocator, c
 
 /// Submit once, observe exactly, never turn a lost wait/read into nonadmission.
 /// Callers retain the immutable command/receipt identity for status recovery.
+pub fn submitTableRetirement(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: []const u8) ![]u8 {
+    if (!context.schema_validation_authority or !context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.table_retirement_public_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    svc.lockCatalogMutation();
+    var gate_held = true;
+    defer if (gate_held) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const checked = try store.tableRetirementPreflightJson(alloc, svc.metadata_group_id, command);
+    defer alloc.free(checked);
+    var expected = try std.json.parseFromSlice(@import("../metadata/table_retirement_receipt.zig").Request, alloc, checked, .{});
+    defer expected.deinit();
+    const prior = try store.tableRetirementReceiptJson(alloc, svc.metadata_group_id, expected.value);
+    var prior_owned = true;
+    defer if (prior_owned) alloc.free(prior);
+    var observed = try std.json.parseFromSlice(@import("../metadata/table_retirement_receipt.zig").Observation, alloc, prior, .{});
+    defer observed.deinit();
+    try observed.value.requireFor(expected.value);
+    if (observed.value.accepted) {
+        prior_owned = false;
+        return prior;
+    }
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_table_retirement = command });
+    svc.unlockCatalogMutation();
+    gate_held = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const bytes = store.tableRetirementReceiptJson(alloc, svc.metadata_group_id, expected.value) catch return error.MetadataMutationOutcomeUnknown;
+    errdefer alloc.free(bytes);
+    var accepted = std.json.parseFromSlice(@import("../metadata/table_retirement_receipt.zig").Observation, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    defer accepted.deinit();
+    accepted.value.requireFor(expected.value) catch return error.MetadataMutationOutcomeUnknown;
+    if (!accepted.value.accepted) return error.MetadataMutationOutcomeUnknown;
+    return bytes;
+}
+
+fn readTableRetirement(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request_call: @import("server_call.zig").Call) ![]u8 {
+    if (!context.schema_validation_authority or !context.setting_admin) return error.Forbidden;
+    _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.table_retirement_public_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return switch (request_call) {
+        .table_retirement_receipt => |r| store.tableRetirementReceiptJson(alloc, svc.metadata_group_id, r),
+        .table_retirement_queue => |after| store.tableRetirementQueueJson(alloc, svc.metadata_group_id, after),
+        .table_retirement_effects => |lookup| store.tableRetirementEffectsJson(alloc, svc.metadata_group_id, lookup),
+        .table_retirement_owner_work => |lookup| store.tableRetirementWorkJson(alloc, svc.metadata_group_id, lookup),
+        else => error.InvalidCatalogMutation,
+    };
+}
+
 pub fn submitSchemaValidation(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: []const u8) ![]u8 {
     if (!context.schema_validation_authority) return error.Forbidden;
     const ledger = @import("../metadata/schema_validation_ledger.zig");
@@ -1153,7 +1435,7 @@ pub fn submitSchemaValidation(svc: anytype, alloc: std.mem.Allocator, context: o
     if (ledger.requiresAdmissionAuthority(command) and !context.setting_admin) return error.Forbidden;
     try context.ensureActive();
     if (command.len == 0 or command.len > ledger.max_command_bytes) return error.InvalidGenerationPublication;
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.schema_validation_publication_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, ledger.requiredDecoderVersion(command));
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
     var gate_held = true;
@@ -1397,7 +1679,7 @@ pub fn schemaValidationPrepare(svc: anytype, alloc: std.mem.Allocator, context: 
     try context.ensureActive();
     // Activate only the decoder cohort, never a table/job reservation. A new
     // cluster must not need a previous job to make its first preparation legal.
-    _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.schema_validation_publication_version);
+    _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (request.selection == .object_rename) protocol.sql_object_annotations_version else protocol.schema_validation_publication_version);
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     return store.schemaValidationPrepareCut(alloc, svc.metadata_group_id, request);
@@ -1924,7 +2206,9 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     try command.validateShape();
     try context.ensureActive();
     const naming = if (command.plan) |plan| plan.constraint_name_admission != null else false;
-    const minimum = if (command.catalog_coverage == .checks_v1) protocol.initial_fk_checks_catalog_version else if (naming) @max(protocol.fk_initial_create_version, protocol.constraint_occupancy_version) else protocol.fk_initial_create_version;
+    const ordinary_minimum = if (command.catalog_coverage == .checks_v1) protocol.initial_fk_checks_catalog_version else if (naming) @max(protocol.fk_initial_create_version, protocol.constraint_occupancy_version) else protocol.fk_initial_create_version;
+    const owner_minimum: u16 = if (command.plan) |plan| (if (plan.sql_owner != null) protocol.sql_authorization_version else 0) else 0;
+    const minimum = @max(ordinary_minimum, owner_minimum);
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, minimum);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
@@ -2114,6 +2398,15 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .policy_publication_begin => |request| beginPolicyPublication(svc, alloc, context, request),
         .policy_definition_mutate => |command| mutatePolicyDefinition(svc, alloc, context, command),
         .policy_publication_mutate => |command| mutatePolicyPublication(svc, alloc, context, command),
+        .table_retirement_submit => |command| submitTableRetirement(svc, alloc, context, command),
+        .table_retirement_receipt, .table_retirement_queue, .table_retirement_effects, .table_retirement_owner_work => readTableRetirement(svc, alloc, context, input),
+        .table_retirement_prepare => |guard| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.foreign_key_directory_version);
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.prepareTableRetirementManifestJsonWithContext(alloc, svc.metadata_group_id, guard, context);
+        },
         .fk_generation_publication_begin => |plan| mutateFkGenerationPublication(svc, alloc, context, .{ .plan_id = plan.id, .child_table_id = plan.child_before.table_id, .expected_revision = 0, .action = .begin, .plan = plan, .catalog_coverage = plan.catalog_coverage }),
         .fk_generation_publication_mutate => |command| mutateFkGenerationPublication(svc, alloc, context, command),
         .fk_generation_publication_status => |child_table_id| fkGenerationPublicationStatusJson(svc, alloc, context, child_table_id),
@@ -2164,6 +2457,10 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         },
         .fk_initial_create_prepare => |request| blk: {
             if (!context.fk_generation_publication_authority) return error.Forbidden;
+            if (request.creation_copy != null)
+                _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.initial_fk_creation_copy_version);
+            if (request.column_sequences.len != 0)
+                _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.initial_fk_column_sequences_version);
             if (request.generated_constraint_names.len != 0)
                 _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.constraint_occupancy_version);
             try svc.ensureLinearizableReadWithContext(context);
@@ -2271,6 +2568,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             break :blk std.json.Stringify.valueAlloc(alloc, table, .{});
         },
         .resolve_many => |request| blk: {
+            if (request.sql_principal != null and !context.setting_admin) return error.Forbidden;
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             const result = try store.resolveSystemCatalogIdentitiesWithContext(alloc, svc.metadata_group_id, request, context);
@@ -2296,6 +2594,10 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             try request.validate();
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            if (request.object) |key| {
+                const stamp = try svc.commentObjectWithContext(context, .{ .guard = request.guard, .key = key }, request.description);
+                break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = request.guard.owner.schema_version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
+            }
             if (request.column) |column| {
                 const stamp = try svc.commentColumnWithContext(context, request.guard, .{ .name = column, .value = request.description });
                 break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = request.guard.owner.schema_version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
@@ -2322,11 +2624,47 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
         },
         .sql_view_mutate => |request| mutateSqlView(svc, alloc, context, request),
+        .sql_prepared_mutate => |request| mutateSqlPrepared(svc, alloc, context, request),
+        .sql_prepared_read => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlPreparedRead(alloc, svc.metadata_group_id, request, context);
+        },
+        .sql_prepared_outcome => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlPreparedOutcome(alloc, svc.metadata_group_id, request);
+        },
+        .sql_authorization_mutate => |request| mutateSqlAuthorization(svc, alloc, context, request),
+        .sql_authorization_read => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlAuthorizationRead(alloc, svc.metadata_group_id, request, context);
+        },
+        .sql_authorization_outcome => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlAuthorizationOutcome(alloc, svc.metadata_group_id, request);
+        },
         .sql_type_mutate => |request| mutateSqlType(svc, alloc, context, request),
         .sql_type_snapshot => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;
             try context.ensureActive();
             try request.validate();
+            if (request.prepare_activation) _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_type_epoch_version);
+            if (request.prepare_retirement) _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_type_retirement_version);
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.sqlTypeSnapshot(alloc, svc.metadata_group_id, request, context);
@@ -2364,6 +2702,21 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.sqlCastOutcome(alloc, svc.metadata_group_id, request);
         },
+        .sql_native_index_mutate => |request| mutateSqlNativeIndex(svc, alloc, context, request),
+        .sql_native_index_prepare => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlNativeIndexPrepare(alloc, svc.metadata_group_id, request);
+        },
+        .sql_native_index_outcome => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlNativeIndexOutcome(alloc, svc.metadata_group_id, request);
+        },
         .sql_routine_mutate => |request| mutateSqlRoutine(svc, alloc, context, request),
         .sql_routine_snapshot => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;
@@ -2389,27 +2742,30 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             break :blk alloc.dupe(u8, "null");
         },
         .sql_sequence_mutate => |request| mutateSqlSequence(svc, alloc, context, request),
+        .sql_index_annotations => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const bytes = try store.getSqlIndexAnnotations(alloc, svc.metadata_group_id, request);
+            errdefer alloc.free(bytes);
+            try context.ensureActive();
+            break :blk bytes;
+        },
         .sql_column_sequence_handoffs => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;
             try context.ensureActive();
+            const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_column_sequences_version);
             try svc.ensureLinearizableReadWithContext(context);
+            try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             const bytes = try store.prepareColumnSequenceHandoffs(alloc, svc.metadata_group_id, request);
             errdefer alloc.free(bytes);
             try context.ensureActive();
             break :blk bytes;
         },
-        .sql_sequence_snapshot => |request| blk: {
-            if (!context.setting_admin) return error.Forbidden;
-            try context.ensureActive();
-            try request.validate();
-            try svc.ensureLinearizableReadWithContext(context);
-            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-            const bytes = try store.sqlSequenceSnapshot(alloc, svc.metadata_group_id, request, context);
-            errdefer alloc.free(bytes);
-            try context.ensureActive();
-            break :blk bytes;
-        },
+        .sql_sequence_snapshot => |request| readSqlSequenceSnapshot(svc, alloc, context, request),
         .sql_sequence_admission_head => blk: {
             if (!context.setting_admin) return error.Forbidden;
             try svc.ensureLinearizableReadWithContext(context);

@@ -3763,6 +3763,841 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-maintenance-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-maintenance-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-maintenance-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_maintenance_reference.py",
+        "--check"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-authorization-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-authorization-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-authorization-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_authorization_reference.py",
+        "--check"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-type-comment-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-enum-catalog-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-type-comment-catalog-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-sql-routine-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-type-comment-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_domain_catalog_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_domain_catalog_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-enum-public-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-enum-catalog-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-enum-cohort-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-schema-validation-publication-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-enum-storage-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-relational-enum-epoch-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-enum-catalog-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-sql-routine-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-enum-admission-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-schema-validation-submission-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-enum-catalog-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_enum_catalog_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_enum_catalog_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-enum-execution-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_enum_execution_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_enum_execution_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-type-retirement-planner-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Doptimize=Debug",
+        "-j1",
+        "-Dtest-filter=SQL named type retirement"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-type-retirement-admission-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-rewrite-admission-contract-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-domain-catalog-public-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-enum-catalog-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-domain-catalog-decoder-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-sql-presentation-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-domain-annotation-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_domain_annotation_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_domain_annotation_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-domain-rows-public-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-domain-row-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-domain-rows-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_domain_row_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_domain_row_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-domain-native-restore-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-relational-domain-restore-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-domain-native-fk-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-domain-cascade-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-domain-epoch-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-relational-domain-epoch-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-domain-epoch-fault-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-schema-validation-domain-epoch-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-prepared-transaction-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-prepared-transaction-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-prepared-transaction-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_prepared_transaction_reference.py",
+        "--check"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-original-prepared-transaction-owner-debug": {
+      "command": [
+        "zig",
+        "build",
+        "docstore-test",
+        "-Dtest-filter=external prepared",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-prepared-transaction-registry-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-sql-prepared-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-prepared-transaction-delivery-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-transactions-test",
+        "-Dtest-filter=distributed txn external",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-object-comments-errors-debug": {
+      "command": [
+        "zig",
+        "build",
+        "runtime-error-identities-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-object-comments-presentation-debug": {
+      "command": [
+        "zig",
+        "test",
+        "pkg/antfly/src/api/index_annotation_projection.zig",
+        "-O",
+        "Debug"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-object-comments-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-object-comment-lifecycle-test",
+        "antfly-api-sql-definition-copy-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-object-comments-admission-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-sql-object-annotations-test",
+        "antfly-relational-index-publication-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-object-comments-model-debug": {
+      "command": [
+        "zig",
+        "test",
+        "pkg/antfly-embedded/src/object_annotations_test_root.zig",
+        "-O",
+        "Debug"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-object-comments-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_object_comment_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/postgres_object_comments.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-like-lifetime-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-definition-copy-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-like-lifetime-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_population_reference.py",
+        "--persistence",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/sql_persistence_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 300
+    },
+    "sql-qualified-initial-counter-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-initial-counter-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-initial-counter-codec-debug": {
+      "command": [
+        "zig",
+        "build",
+        "system-catalog-sequence-binding-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
+    "sql-qualified-initial-counter-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_initial_counter_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/postgres_initial_counter_visibility.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-initial-copy-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-initial-copy-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-initial-copy-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_initial_copy_reference.py",
+        "--check",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/postgres_initial_copy_visibility.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-copied-counter-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-copied-counter-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-copied-counter-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_copied_counter_reference.py",
+        "zig/pkg/antfly-embedded/src/sql/fixtures/postgres_copied_counter_reference.json",
+        "--check"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-table-cascade-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-standalone-initial-fk-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-table-cascade-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/check_sql_drop_postgres.py"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-table-cascade-distributed-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-drop-retirement-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-sync-controls-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-sync-control-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-sync-controls-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_sync_control_reference.py",
+        "--check"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-original-sync-controls-seal-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-transactions-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-sync-controls-overlay-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=sql.setting_catalog",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 300
+    },
+    "sql-original-bytea-conversion-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "pgwire-test",
+        "public-api-parity-test",
+        "-Dtest-filter=bytea",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-original-bytea-conversion-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_bytea_reference.py",
+        "--check"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-trigger-functions-public-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-trigger-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-trigger-functions-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-sql-routine-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-trigger-functions-vm-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL trigger",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-trigger-functions-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_trigger_reference.py",
+        "--check"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-native-full-text-lifecycle-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-index-lifecycle-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-native-full-text-catalog-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-test",
+        "-Dtest-filter=SQL native index",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-native-full-text-manifest-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-derived-coverage-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-native-full-text-namespace-debug": {
+      "command": [
+        "zig",
+        "test",
+        "pkg/antfly-embedded/src/system_catalog/native_indexes.zig",
+        "-Odebug"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 180
+    },
+    "sql-native-full-text-analyzer-debug": {
+      "command": [
+        "zig",
+        "build",
+        "index-manager-test",
+        "-Dtest-filter=observed analyzer publication",
+        "-Dtest-filter=observed full text analyzers",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-native-full-text-binding-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL native index",
+        "-Dtest-filter=SQL exact original rejection contracts",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-native-full-text-and-phonetic-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-phonetic-public-debug": {
+      "command": [
+        "zig",
+        "build",
+        "public-api-parity-test",
+        "-Dtest-filter=phonetic",
+        "-Dtest-filter=SQL UUID prepared CREATE TABLE",
+        "-Dtest-filter=SQL TRUNCATE prepared statement",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-phonetic-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--project",
+        "scripts",
+        "--locked",
+        "python",
+        "scripts/generate_sql_phonetic_reference.py",
+        "--check"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -4903,33 +5738,105 @@
     },
     {
       "id": "sql-0072",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL runs through authenticated public ingress against native owners and matches PostgreSQL command tags and complete logical postimages. VACUUM schedules existing durable LSM value reclamation; ANALYZE persists bounded typed statistics outside the apply lock; REINDEX uses existing replicated index-repair admission and waits for ready owner epochs. The Debug campaign rejects unauthorized execution, reopens owners, and resumes interrupted relational and document ANALYZE from persisted cursors without double counting. This is not a claim of PostgreSQL heap physical layout or multi-node failover qualification.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_maintenance_lifecycle_integration_test.zig",
+          "test": "mounted SQL original maintenance preserves all owners rows authorization and cold progress",
+          "gate": "sql-maintenance-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_maintenance_lifecycle_integration_test.zig",
+          "test": "mounted SQL original maintenance preserves all owners rows authorization and cold progress",
+          "gate": "sql-maintenance-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0073",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL runs through authenticated public ingress against native owners and matches PostgreSQL command tags and complete logical postimages. VACUUM schedules existing durable LSM value reclamation; ANALYZE persists bounded typed statistics outside the apply lock; REINDEX uses existing replicated index-repair admission and waits for ready owner epochs. The Debug campaign rejects unauthorized execution, reopens owners, and resumes interrupted relational and document ANALYZE from persisted cursors without double counting. This is not a claim of PostgreSQL heap physical layout or multi-node failover qualification.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_maintenance_lifecycle_integration_test.zig",
+          "test": "mounted SQL original maintenance preserves all owners rows authorization and cold progress",
+          "gate": "sql-maintenance-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_maintenance_lifecycle_integration_test.zig",
+          "test": "mounted SQL original maintenance preserves all owners rows authorization and cold progress",
+          "gate": "sql-maintenance-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0074",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL runs through authenticated public ingress against native owners and matches PostgreSQL command tags and complete logical postimages. VACUUM schedules existing durable LSM value reclamation; ANALYZE persists bounded typed statistics outside the apply lock; REINDEX uses existing replicated index-repair admission and waits for ready owner epochs. The Debug campaign rejects unauthorized execution, reopens owners, and resumes interrupted relational and document ANALYZE from persisted cursors without double counting. This is not a claim of PostgreSQL heap physical layout or multi-node failover qualification.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_maintenance_lifecycle_integration_test.zig",
+          "test": "mounted SQL original maintenance preserves all owners rows authorization and cold progress",
+          "gate": "sql-maintenance-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_maintenance_lifecycle_integration_test.zig",
+          "test": "mounted SQL original maintenance preserves all owners rows authorization and cold progress",
+          "gate": "sql-maintenance-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0075",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL runs through authenticated public ingress against native owners and matches PostgreSQL command tags and complete logical postimages. VACUUM schedules existing durable LSM value reclamation; ANALYZE persists bounded typed statistics outside the apply lock; REINDEX uses existing replicated index-repair admission and waits for ready owner epochs. The Debug campaign rejects unauthorized execution, reopens owners, and resumes interrupted relational and document ANALYZE from persisted cursors without double counting. This is not a claim of PostgreSQL heap physical layout or multi-node failover qualification.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_maintenance_lifecycle_integration_test.zig",
+          "test": "mounted SQL original maintenance preserves all owners rows authorization and cold progress",
+          "gate": "sql-maintenance-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_maintenance_lifecycle_integration_test.zig",
+          "test": "mounted SQL original maintenance preserves all owners rows authorization and cold progress",
+          "gate": "sql-maintenance-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0076",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL runs through authenticated public ingress against native owners and matches PostgreSQL command tags and complete logical postimages. VACUUM schedules existing durable LSM value reclamation; ANALYZE persists bounded typed statistics outside the apply lock; REINDEX uses existing replicated index-repair admission and waits for ready owner epochs. The Debug campaign rejects unauthorized execution, reopens owners, and resumes interrupted relational and document ANALYZE from persisted cursors without double counting. This is not a claim of PostgreSQL heap physical layout or multi-node failover qualification.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_maintenance_lifecycle_integration_test.zig",
+          "test": "mounted SQL original maintenance preserves all owners rows authorization and cold progress",
+          "gate": "sql-maintenance-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_maintenance_lifecycle_integration_test.zig",
+          "test": "mounted SQL original maintenance preserves all owners rows authorization and cold progress",
+          "gate": "sql-maintenance-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0077",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL runs through authenticated public ingress against native owners and matches PostgreSQL command tags and complete logical postimages. VACUUM schedules existing durable LSM value reclamation; ANALYZE persists bounded typed statistics outside the apply lock; REINDEX uses existing replicated index-repair admission and waits for ready owner epochs. The Debug campaign rejects unauthorized execution, reopens owners, and resumes interrupted relational and document ANALYZE from persisted cursors without double counting. This is not a claim of PostgreSQL heap physical layout or multi-node failover qualification.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_maintenance_lifecycle_integration_test.zig",
+          "test": "mounted SQL original maintenance preserves all owners rows authorization and cold progress",
+          "gate": "sql-maintenance-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_maintenance_lifecycle_integration_test.zig",
+          "test": "mounted SQL original maintenance preserves all owners rows authorization and cold progress",
+          "gate": "sql-maintenance-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0078",
@@ -5175,28 +6082,188 @@
     },
     {
       "id": "sql-0096",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged enum declaration executes through authenticated public SQL and becomes usable native parent/child columns with stable identity, scalar casts, defaults/generated/CHECK expressions, UNIQUE/FK enforcement and cold typed reads. PostgreSQL witnesses retain the exact original, labels and diagnostics. Native immutable symbol/rank directories drive values and index keys; catalog-only declaration is not the qualification. Enum arrays, enum-valued durable views, protected-table evolution and dependent CASCADE remain separate unfinished work.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum schema binding prepares public typed writes and retains cold projections through all owner additive epochs",
+          "gate": "sql-qualified-enum-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes",
+          "gate": "sql-qualified-enum-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog named enum publication retains cold order identity and exact outcomes",
+          "gate": "sql-qualified-enum-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes",
+          "gate": "sql-qualified-enum-catalog-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0097",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged ADD VALUE executes as a complete bounded all-owner enum epoch over populated UNIQUE/FK tables. The public campaign proves pending admission, denied receipt access, predecessor reads, cold recovery, new-label writes, retained integrity and exact earlier outcomes after a second generation. Native LSM evidence proves zero historical row scans, unchanged row bytes and stable index identity; cohort fault tests retain atomic type/schema publication and all participant locks. The shared admission boundary retries only known nonsends with the same plan and never replays uncertain delivery. Protected-table policy rebinding remains ineligible rather than bypassing policy guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum schema binding prepares public typed writes and retains cold projections through all owner additive epochs",
+          "gate": "sql-qualified-enum-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes",
+          "gate": "sql-qualified-enum-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog named enum publication retains cold order identity and exact outcomes",
+          "gate": "sql-qualified-enum-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes",
+          "gate": "sql-qualified-enum-catalog-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/schema_validation_ledger.zig",
+          "test": "schema validation publication type cohort atomically retains all locks aliases schemas and type through faults cold recovery and release",
+          "gate": "sql-qualified-enum-cohort-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system compatible enum epoch preserves populated LSM rows index identity cold recovery and release",
+          "gate": "sql-qualified-enum-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/schema_validation_admission.zig",
+          "test": "system catalog schema validation admission waits for known nonsends with one prepared identity and never retries uncertainty",
+          "gate": "sql-qualified-enum-admission-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum schema binding prepares public typed writes and retains cold projections through all owner additive epochs",
+          "gate": "sql-qualified-enum-execution-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0098",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged conditional positioned ADD executes against live dependent schemas and emits the exact PostgreSQL duplicate-label notice without another schema installation. Metadata witnesses cover insertion placement, missing-neighbor diagnostics and no-op replay. The public campaign also publishes a later BEFORE-positioned generation, writes its new symbol through native UNIQUE/FK tables and compares enum ordering with PostgreSQL; earlier recovery tokens retain their original generation. This does not claim dependent CASCADE, domains or protected-table evolution.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum schema binding prepares public typed writes and retains cold projections through all owner additive epochs",
+          "gate": "sql-qualified-enum-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes",
+          "gate": "sql-qualified-enum-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog named enum publication retains cold order identity and exact outcomes",
+          "gate": "sql-qualified-enum-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes",
+          "gate": "sql-qualified-enum-catalog-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/schema_validation_ledger.zig",
+          "test": "schema validation publication type cohort atomically retains all locks aliases schemas and type through faults cold recovery and release",
+          "gate": "sql-qualified-enum-cohort-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system compatible enum epoch preserves populated LSM rows index identity cold recovery and release",
+          "gate": "sql-qualified-enum-storage-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/schema_validation_admission.zig",
+          "test": "system catalog schema validation admission waits for known nonsends with one prepared identity and never retries uncertainty",
+          "gate": "sql-qualified-enum-admission-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum schema binding prepares public typed writes and retains cold projections through all owner additive epochs",
+          "gate": "sql-qualified-enum-execution-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0099",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged DROP TYPE succeeds through public catalog publication when unused and rejects live parent/child enum dependencies with PostgreSQL 2BP01 after cold additive activation. Failed retirement preserves both schemas, data, UNIQUE/FK enforcement and subsequent type evolution. Native catalog tests retain identity-fenced retirement, name reuse and exact cold outcomes. Dependent CASCADE has its own qualified populated cold-rewrite campaign.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum schema binding prepares public typed writes and retains cold projections through all owner additive epochs",
+          "gate": "sql-qualified-enum-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes",
+          "gate": "sql-qualified-enum-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog named enum publication retains cold order identity and exact outcomes",
+          "gate": "sql-qualified-enum-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes",
+          "gate": "sql-qualified-enum-catalog-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0100",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged DROP TYPE IF EXISTS CASCADE retires a live enum and its dependent parent/child columns through the shared manifest-first staged schema rewrite. The metadata writer derives the exact dependency postimages and publishes table replacements, type removal, reverse edges, sequence ownership and durable outcome atomically. The public Debug campaign verifies administrator admission, pre-copy interruption, cold adoption, PostgreSQL notices and complete surviving columns/data, continued identity values, name reuse and exact old-receipt recovery. The bounded native planner closes generated-column and incoming-FK dependencies, preserves opaque JSON and unwinds allocation failures. Unsupported protected/view/artifact cohorts remain guarded; this case does not qualify domains, enum arrays or portable catalog restoration.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum schema binding prepares public typed writes and retains cold projections through dependent retirement",
+          "gate": "sql-qualified-enum-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/type_retirement.zig",
+          "test": "SQL named type retirement closes generated and incoming FK dependencies without matching opaque JSON",
+          "gate": "sql-qualified-type-retirement-planner-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/type_retirement.zig",
+          "test": "SQL named type retirement owns bounded candidates and unwinds every allocation failure",
+          "gate": "sql-qualified-type-retirement-planner-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/relational_rewrite_admission.zig",
+          "test": "distributed txn rewrite admission closes current and historical dependencies before any pin",
+          "gate": "sql-qualified-type-retirement-admission-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/system_catalog/sequence_outcomes.zig",
+          "test": "SQL routine catalog type retirement projects exact cold restore progress and rejects substituted jobs",
+          "gate": "sql-qualified-enum-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum schema binding prepares public typed writes and retains cold projections through dependent retirement",
+          "gate": "sql-qualified-enum-execution-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0101",
@@ -5735,13 +6802,117 @@
     },
     {
       "id": "sql-0144",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original COMMENT binds the authorized table incarnation, stable index/constraint identity and structural directory epoch. Native point annotations preserve schema definitions and user-row bytes; explicit NULL suppresses inline descriptions. PostgreSQL 18 and authenticated public SQL agree on command results, quoted/Unicode text, NULL/empty removal, permissions and missing-object errors. Drop/recreate never reuses annotation identity. CHECK, UNIQUE/backing-index and FK renames retain distinct comments and native allocations; a real paused readiness ACK survives independent cold metadata/session/data reopen, reserves the future name until release, and completes through the original durable receipt with zero row records/scans. Existing and newly declared FKs remain enforced. LIKE copies actual accepting-cut CHECK/index notes atomically using bounded source-at-a-time preparation, including NULL, while following PostgreSQL UNIQUE-comment semantics. Native every-write faults, snapshots, stale IDs, proposed/preimage rejection and indexed name-admission races are qualified. This does not qualify standalone per-table portable annotation backup, owning-table sequence CASCADE, or arbitrary multi-node faults.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "relational index publication native owner binding snapshot uses its format floor independently of claim delivery",
+          "gate": "sql-qualified-object-comments-admission-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/runtime_failure_identity.zig",
+          "test": "catalog object annotation namespace diagnostics retain exact identity across compiled boundaries",
+          "gate": "sql-qualified-object-comments-errors-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/index_annotation_projection.zig",
+          "test": "index annotation projection preserves exact numeric tokens throughout configuration and status",
+          "gate": "sql-qualified-object-comments-presentation-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original index and constraint comments preserve schemas rows authorization and cold object identities",
+          "gate": "sql-qualified-object-comments-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL object comment renames preserve CHECK UNIQUE backing index and FK identities through cold publication",
+          "gate": "sql-qualified-object-comments-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "system catalog SQL object annotations fence recreation abort every note write and survive checkpoints and cold snapshots",
+          "gate": "sql-qualified-object-comments-admission-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "catalog object annotation index name admission rejects late namespace collisions without publishing or poisoning replay",
+          "gate": "sql-qualified-object-comments-admission-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/system_catalog/object_annotation_store.zig",
+          "test": "catalog object annotation LIKE copies use final slots latest notes separate index constraints explicit null and bounded fault safe preparation",
+          "gate": "sql-qualified-object-comments-model-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/system_catalog/object_annotation_store.zig",
+          "test": "catalog object annotation LIKE releases each wide source before loading the next",
+          "gate": "sql-qualified-object-comments-model-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original index and constraint comments preserve schemas rows authorization and cold object identities",
+          "gate": "sql-qualified-object-comments-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0145",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original COMMENT binds the authorized table incarnation, stable index/constraint identity and structural directory epoch. Native point annotations preserve schema definitions and user-row bytes; explicit NULL suppresses inline descriptions. PostgreSQL 18 and authenticated public SQL agree on command results, quoted/Unicode text, NULL/empty removal, permissions and missing-object errors. Drop/recreate never reuses annotation identity. CHECK, UNIQUE/backing-index and FK renames retain distinct comments and native allocations; a real paused readiness ACK survives independent cold metadata/session/data reopen, reserves the future name until release, and completes through the original durable receipt with zero row records/scans. Existing and newly declared FKs remain enforced. LIKE copies actual accepting-cut CHECK/index notes atomically using bounded source-at-a-time preparation, including NULL, while following PostgreSQL UNIQUE-comment semantics. Native every-write faults, snapshots, stale IDs, proposed/preimage rejection and indexed name-admission races are qualified. This does not qualify standalone per-table portable annotation backup, owning-table sequence CASCADE, or arbitrary multi-node faults.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "relational index publication native owner binding snapshot uses its format floor independently of claim delivery",
+          "gate": "sql-qualified-object-comments-admission-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/runtime_failure_identity.zig",
+          "test": "catalog object annotation namespace diagnostics retain exact identity across compiled boundaries",
+          "gate": "sql-qualified-object-comments-errors-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/index_annotation_projection.zig",
+          "test": "index annotation projection preserves exact numeric tokens throughout configuration and status",
+          "gate": "sql-qualified-object-comments-presentation-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original index and constraint comments preserve schemas rows authorization and cold object identities",
+          "gate": "sql-qualified-object-comments-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL object comment renames preserve CHECK UNIQUE backing index and FK identities through cold publication",
+          "gate": "sql-qualified-object-comments-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "system catalog SQL object annotations fence recreation abort every note write and survive checkpoints and cold snapshots",
+          "gate": "sql-qualified-object-comments-admission-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "catalog object annotation index name admission rejects late namespace collisions without publishing or poisoning replay",
+          "gate": "sql-qualified-object-comments-admission-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/system_catalog/object_annotation_store.zig",
+          "test": "catalog object annotation LIKE copies use final slots latest notes separate index constraints explicit null and bounded fault safe preparation",
+          "gate": "sql-qualified-object-comments-model-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/system_catalog/object_annotation_store.zig",
+          "test": "catalog object annotation LIKE releases each wide source before loading the next",
+          "gate": "sql-qualified-object-comments-model-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original index and constraint comments preserve schemas rows authorization and cold object identities",
+          "gate": "sql-qualified-object-comments-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0146",
@@ -5804,13 +6975,47 @@
     },
     {
       "id": "sql-0149",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged COMMENT ON TYPE executes through the authenticated public SQL API and the native identity-fenced catalog outcome lane. PostgreSQL witnesses and native tests verify the COMMENT tag, exact persisted annotation, denied access, cold restart, NULL/empty removal, and lost-reply recovery without mutation replay. Presentation-only publication preserves immutable executable identity, layout digests and generations; enum additions preserve descriptions. Redundant comments avoid resource rewrites. This annotation case does not qualify unfinished dependent ALTER/DROP or domains.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes",
+          "gate": "sql-qualified-type-comment-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog named enum publication retains cold order identity and exact outcomes",
+          "gate": "sql-qualified-type-comment-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL named enum catalog publication preserves ordered symbols scoped names and cold outcomes",
+          "gate": "sql-qualified-type-comment-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0150",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged COMMENT ON DOMAIN runs through authenticated public SQL and the shared atomic catalog/outcome lane. The independent PostgreSQL witness and mounted Debug campaign verify the exact tag, persisted annotation, object-kind diagnostics, denied mutation, immutable executable identity, cold reopen, NULL removal, and lost-ACK observation without mutation replay. This presentation-only case does not qualify domain columns, casts, dependent alterations or dependent CASCADE.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL domain catalog annotations and independent retirement preserve PostgreSQL diagnostics cold identity and outcomes",
+          "gate": "sql-qualified-domain-catalog-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/service.zig",
+          "test": "presentation SQL domain declarations activate a durable decoder before type interpretation",
+          "gate": "sql-qualified-domain-catalog-decoder-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL domain catalog annotations and independent retirement preserve PostgreSQL diagnostics cold identity and outcomes",
+          "gate": "sql-qualified-domain-annotation-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0151",
@@ -5907,8 +7112,25 @@
     },
     {
       "id": "sql-0158",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original DROP TABLE usage_records CASCADE; executes through public SQL HTTP, immutable native admission and real FK owner barriers. The native campaign retires a populated mutual-FK root, its owned sequence and two transitive views, withdraws a surviving borrowed default and FK together, preserves the surviving row version and logical digest, retains uniqueness, and recovers the exact public operation receipt and writable surviving owners after cold reopen. An isolated PostgreSQL 18+ oracle verifies the matching dependency, row, index, default and command semantics. Borrowed-default setup uses supported schema ingress; this does not claim SQL borrowed-default creation, document dependency retirement or materialized backing retirement. A separate distributed campaign executes real metadata/data RPCs, loses an actual source-fence reply before its metadata ACK, reopens metadata and data stores cold, and resolves the same public token without SQL replay while preserving survivor identity/values and uniqueness.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/standalone/runtime.zig",
+          "test": "standalone public SQL CASCADE retires mutual FK owners and recovers exact catalog receipts cold",
+          "gate": "sql-table-cascade-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/standalone/runtime.zig",
+          "test": "standalone public SQL CASCADE retires mutual FK owners and recovers exact catalog receipts cold",
+          "gate": "sql-table-cascade-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_schema_lifecycle_integration_test.zig",
+          "test": "mounted SQL CASCADE retirement recovers lost source acknowledgement with a cold survivor",
+          "gate": "sql-table-cascade-distributed-debug"
+        }
+      ]
     },
     {
       "id": "sql-0159",
@@ -6268,8 +7490,25 @@
     },
     {
       "id": "sql-0178",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged UUID projection executes through public native SQL over stored rows with PostgreSQL uuid-ossp output identity and UUIDv4 version/variant checks. uuid_generate_v4 uses the existing volatile native gen_random_uuid implementation and execution Io rather than a second generator. Prepared execution and typed output are qualified; extension installation/lifecycle cases remain separate unresolved work.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_text_campaign_test.zig",
+          "test": "httpx SQL PostgreSQL original phonetic filtering and UUID generation execute on stored rows",
+          "gate": "sql-phonetic-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL phonetic prepared programs retain typed nullability and match PostgreSQL row kernels",
+          "gate": "sql-native-full-text-and-phonetic-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_text_campaign_test.zig",
+          "test": "httpx SQL PostgreSQL original phonetic filtering and UUID generation execute on stored rows",
+          "gate": "sql-phonetic-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0179",
@@ -8378,8 +9617,35 @@
     },
     {
       "id": "sql-0274",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged source SQL and parameter execute through mounted native HTTP against a nonempty table, matching PostgreSQL 18 result values, ordering, column types and SQL NULL flags. An owned bytea frame decodes binary input once; UTF8 conversion borrows validated input without row scratch allocation. Bounded native codecs retain binary payloads across compact buffers, grouped and joined queries, spill, pgwire binary/hex output and streamed HTTP JSON. Strict encoding diagnostics, allocation failures, cancellation and every LATIN1/WIN1252 octet are independently qualified. Physical BYTEA columns and additional charset families retain explicit guards.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_text_campaign_test.zig",
+          "test": "httpx SQL PostgreSQL original bytea conversion preserves typed parameters and JSON filtering",
+          "gate": "sql-original-bytea-conversion-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_text_campaign_test.zig",
+          "test": "httpx SQL PostgreSQL original bytea conversion preserves typed parameters and JSON filtering",
+          "gate": "sql-original-bytea-conversion-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/runtime.zig",
+          "test": "SQL bytea buffered native queries match PostgreSQL across page ownership boundaries",
+          "gate": "sql-original-bytea-conversion-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/typed_store.zig",
+          "test": "SQL bytea retained buffers own binary extensions without growing compact entries",
+          "gate": "sql-original-bytea-conversion-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/pgwire/values.zig",
+          "test": "pgwire bytea parameters and result cells preserve opaque binary and canonical hex",
+          "gate": "sql-original-bytea-conversion-native-debug"
+        }
+      ]
     },
     {
       "id": "sql-0275",
@@ -8990,28 +10256,148 @@
     },
     {
       "id": "sql-0306",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged builtin-domain declaration executes through authenticated native catalog publication and generated public typed table schemas. PostgreSQL 18 and mounted Debug campaigns verify numeric CHECK enforcement, inherited text defaults, fresh NOT NULL rejection, exact-domain outer-join NULL preservation, untouched-field updates and cold query/mutation metadata. Compiler-owned provenance is consumed before durable native intents; private session/fanout contracts retain owned identities and reject public forgery or stale epochs. Real LSM FK cascades and portable restore preserve historical typed NULLs without permitting fresh raw NULL writes. Restrictive ALTER remains independently unresolved.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL domain rows preserve original numeric checks defaults typed NULLs and cold mutations",
+          "gate": "sql-qualified-domain-rows-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL domain rows preserve original numeric checks defaults typed NULLs and cold mutations",
+          "gate": "sql-qualified-domain-rows-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_expression_system_test.zig",
+          "test": "relational index system domain handoffs materialize before votes and survive cold rows without fresh constraint coercion",
+          "gate": "sql-qualified-domain-native-restore-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity_commit.zig",
+          "test": "distributed txn domain cascade preserves historical typed NULL defaults provenance and cold commits",
+          "gate": "sql-qualified-domain-native-fk-debug"
+        }
+      ]
     },
     {
       "id": "sql-0307",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged builtin-domain declaration executes through authenticated native catalog publication and generated public typed table schemas. PostgreSQL 18 and mounted Debug campaigns verify numeric CHECK enforcement, inherited text defaults, fresh NOT NULL rejection, exact-domain outer-join NULL preservation, untouched-field updates and cold query/mutation metadata. Compiler-owned provenance is consumed before durable native intents; private session/fanout contracts retain owned identities and reject public forgery or stale epochs. Real LSM FK cascades and portable restore preserve historical typed NULLs without permitting fresh raw NULL writes. Restrictive ALTER remains independently unresolved.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL domain rows preserve original numeric checks defaults typed NULLs and cold mutations",
+          "gate": "sql-qualified-domain-rows-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL domain rows preserve original numeric checks defaults typed NULLs and cold mutations",
+          "gate": "sql-qualified-domain-rows-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_expression_system_test.zig",
+          "test": "relational index system domain handoffs materialize before votes and survive cold rows without fresh constraint coercion",
+          "gate": "sql-qualified-domain-native-restore-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity_commit.zig",
+          "test": "distributed txn domain cascade preserves historical typed NULL defaults provenance and cold commits",
+          "gate": "sql-qualified-domain-native-fk-debug"
+        }
+      ]
     },
     {
       "id": "sql-0308",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged ALTER DOMAIN positive_amount SET NOT NULL runs through the shared durable all-owner type/schema validation coordinator. Exact immutable rule postimages and decoder capability 118 precede admission. Existing SQL NULLs reject with 23502 through the original durable token, without publication; after removal, projected bounded scans validate all dependent tables before atomic type/schema publication. Mounted PostgreSQL-backed CRUD crosses cold restart; native LSM witnesses verify page replay, historical-row audits, unchanged primary bytes/index identity, frozen writers and release. The multi-owner fault matrix covers admission/publication/ACK cuts, aliases, locks, cold recovery and retained rejection. Physical column nullability and PostgreSQL domain-value provenance remain distinct.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/online_merge_io.zig",
+          "test": "relational index system rewrite admission owns complete immutable historical schema manifest",
+          "gate": "sql-qualified-domain-epoch-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL domain rows preserve original numeric checks defaults typed NULLs and cold mutations",
+          "gate": "sql-qualified-domain-rows-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL domain rows preserve original numeric checks defaults typed NULLs and cold mutations",
+          "gate": "sql-qualified-domain-rows-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_index_system_test.zig",
+          "test": "relational index system domain NOT NULL epoch scans populated LSM rows and preserves cold index identity",
+          "gate": "sql-qualified-domain-epoch-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/schema_validation_ledger.zig",
+          "test": "schema validation publication domain NOT NULL cohort atomically retains all locks aliases schemas and type through faults cold recovery and release",
+          "gate": "sql-qualified-domain-epoch-fault-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/system_catalog/sequence_outcomes.zig",
+          "test": "schema validation publication domain NOT NULL rejection remains observable through the original cold type outcome",
+          "gate": "sql-qualified-domain-epoch-fault-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_nullability_job.zig",
+          "test": "relational index system nullability job domain NOT NULL preparation binds exact rules sparse projections and retained inputs",
+          "gate": "sql-qualified-domain-epoch-native-debug"
+        }
+      ]
     },
     {
       "id": "sql-0309",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged independent DROP DOMAIN retires a real native domain through the identity/generation-fenced catalog transaction and shared durable nonce outcome. PostgreSQL and mounted public Debug witnesses verify exact command/error tags, cold absence, wrong-object rejection, and lost-ACK DROP observation with null committed object/generation and no replay. This no-dependent declaration case does not qualify domain column enforcement or dependent CASCADE.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL domain catalog annotations and independent retirement preserve PostgreSQL diagnostics cold identity and outcomes",
+          "gate": "sql-qualified-domain-catalog-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/service.zig",
+          "test": "presentation SQL domain declarations activate a durable decoder before type interpretation",
+          "gate": "sql-qualified-domain-catalog-decoder-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL domain catalog annotations and independent retirement preserve PostgreSQL diagnostics cold identity and outcomes",
+          "gate": "sql-qualified-domain-annotation-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0310",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged dependent DROP DOMAIN IF EXISTS CASCADE executes on the metadata-owned SQL endpoint through the shared staged schema/type retirement coordinator. The PostgreSQL-backed mounted Debug campaign observes the original durable token to committed state without replay, verifies the cascade notice and removal of only the dependent amount column, preserves existing domain-typed NULLs in retained columns, and successfully inserts later rows using the retained domain default. Creation/mutations and the retirement cross a cold owner/catalog restart; native canonical restore and FK/cold-intent witnesses cover the shared row handoff.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL domain rows preserve original numeric checks defaults typed NULLs and cold mutations",
+          "gate": "sql-qualified-domain-rows-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_enum_catalog_integration_test.zig",
+          "test": "mounted SQL domain rows preserve original numeric checks defaults typed NULLs and cold mutations",
+          "gate": "sql-qualified-domain-rows-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/relational_expression_system_test.zig",
+          "test": "relational index system domain handoffs materialize before votes and survive cold rows without fresh constraint coercion",
+          "gate": "sql-qualified-domain-native-restore-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/api/relational_integrity_commit.zig",
+          "test": "distributed txn domain cascade preserves historical typed NULL defaults provenance and cold commits",
+          "gate": "sql-qualified-domain-native-fk-debug"
+        }
+      ]
     },
     {
       "id": "sql-0311",
@@ -9422,58 +10808,190 @@
     },
     {
       "id": "sql-0332",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original matches independent PostgreSQL membership, default-ACL and table-ACL postimages through atomic native public catalog operations. Mounted execution verifies immutable principal instances, API-key upper bounds, existing mandatory filters and RLS, exact mutation privileges, commit-time revocation, default capture, role dependency retirement and independent cold reopen.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0333",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original matches independent PostgreSQL membership, default-ACL and table-ACL postimages through atomic native public catalog operations. Mounted execution verifies immutable principal instances, API-key upper bounds, existing mandatory filters and RLS, exact mutation privileges, commit-time revocation, default capture, role dependency retirement and independent cold reopen.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0334",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original matches independent PostgreSQL membership, default-ACL and table-ACL postimages through atomic native public catalog operations. Mounted execution verifies immutable principal instances, API-key upper bounds, existing mandatory filters and RLS, exact mutation privileges, commit-time revocation, default capture, role dependency retirement and independent cold reopen.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0335",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original matches independent PostgreSQL membership, default-ACL and table-ACL postimages through atomic native public catalog operations. Mounted execution verifies immutable principal instances, API-key upper bounds, existing mandatory filters and RLS, exact mutation privileges, commit-time revocation, default capture, role dependency retirement and independent cold reopen.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0336",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original matches independent PostgreSQL membership, default-ACL and table-ACL postimages through atomic native public catalog operations. Mounted execution verifies immutable principal instances, API-key upper bounds, existing mandatory filters and RLS, exact mutation privileges, commit-time revocation, default capture, role dependency retirement and independent cold reopen.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0337",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original matches independent PostgreSQL membership, default-ACL and table-ACL postimages through atomic native public catalog operations. Mounted execution verifies immutable principal instances, API-key upper bounds, existing mandatory filters and RLS, exact mutation privileges, commit-time revocation, default capture, role dependency retirement and independent cold reopen.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0338",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original matches independent PostgreSQL membership, default-ACL and table-ACL postimages through atomic native public catalog operations. Mounted execution verifies immutable principal instances, API-key upper bounds, existing mandatory filters and RLS, exact mutation privileges, commit-time revocation, default capture, role dependency retirement and independent cold reopen.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0339",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original matches independent PostgreSQL membership, default-ACL and table-ACL postimages through atomic native public catalog operations. Mounted execution verifies immutable principal instances, API-key upper bounds, existing mandatory filters and RLS, exact mutation privileges, commit-time revocation, default capture, role dependency retirement and independent cold reopen.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0340",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original matches independent PostgreSQL membership, default-ACL and table-ACL postimages through atomic native public catalog operations. Mounted execution verifies immutable principal instances, API-key upper bounds, existing mandatory filters and RLS, exact mutation privileges, commit-time revocation, default capture, role dependency retirement and independent cold reopen.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0341",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original matches independent PostgreSQL membership, default-ACL and table-ACL postimages through atomic native public catalog operations. Mounted execution verifies immutable principal instances, API-key upper bounds, existing mandatory filters and RLS, exact mutation privileges, commit-time revocation, default capture, role dependency retirement and independent cold reopen.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0342",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original matches independent PostgreSQL membership, default-ACL and table-ACL postimages through atomic native public catalog operations. Mounted execution verifies immutable principal instances, API-key upper bounds, existing mandatory filters and RLS, exact mutation privileges, commit-time revocation, default capture, role dependency retirement and independent cold reopen.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0343",
@@ -9596,8 +11114,20 @@
     },
     {
       "id": "sql-0350",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original matches independent PostgreSQL membership, default-ACL and table-ACL postimages through atomic native public catalog operations. Mounted execution verifies immutable principal instances, API-key upper bounds, existing mandatory filters and RLS, exact mutation privileges, commit-time revocation, default capture, role dependency retirement and independent cold reopen.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_authorization_lifecycle_integration_test.zig",
+          "test": "mounted SQL original authorization preserves PostgreSQL matrices credential caps filtered mutations and cold revocation",
+          "gate": "sql-authorization-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0351",
@@ -9870,8 +11400,65 @@
     },
     {
       "id": "sql-0369",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged LIKE INCLUDING ALL original runs through authenticated public SQL into ordinary native table creation. PostgreSQL 18 independently witnesses declaration copying, independent identity configuration, shared SERIAL allocation, generated/default values, constraints, comments, security exclusions and the required RESTRICT then borrower/source retirement lifetime. Mounted metadata/data/durable-session owners qualify empty creation, typed rows, mixed sources/options, source SELECT versus counter privileges, column/object comments, deferred UNIQUE declarations, CHECK/NOT NULL enforcement, excluded FKs/RLS, explicit attribute renames, owned versus borrowed TRUNCATE, and independently cold recovery. The coupled lifetime checks exact unchanged SERIAL counter state after borrower DROP, independent identity retirement, source-counter cleanup, surviving-parent writes, safe name reuse and a canonical final native checkpoint. The source now uses one public CREATE combining identity/SERIAL and FK declarations. Native decoder-128 publication reserves immutable counter postimages, keeps resources absent while hidden, atomically publishes counter/table/dependency state, and survives cold cancellation, exhaustive publication-preparation allocation failures and duplicate publication after allocation. Owning-table CASCADE, portable per-table annotation export and arbitrary distributed fault interleavings are separate contracts, not claimed by this case. Copied counters in FK-bearing LIKE now use decoder-129 source postimages and shared definition/lifetime leases, independently rederived at native admission and atomically converted to live default edges. Native recovery rejects missing/orphaned/wrong-effects leases and moved publication keys. Public prepared and batch failures preserve PostgreSQL default effects without publishing rows or evaluating later rows. The independent copied-counter witness also records future owning-table CASCADE expectations; those are not an activation claim.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_creation_integration_test.zig",
+          "test": "mounted SQL LIKE declaration copies retain grants constraints isolation and cold owners",
+          "gate": "sql-qualified-like-lifetime-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_creation_integration_test.zig",
+          "test": "mounted SQL LIKE full ownership lifetime retires borrowed defaults and fresh identities through cold owners",
+          "gate": "sql-qualified-like-lifetime-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_creation_integration_test.zig",
+          "test": "mounted SQL LIKE declaration copies retain grants constraints isolation and cold owners",
+          "gate": "sql-qualified-like-lifetime-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_creation_integration_test.zig",
+          "test": "mounted SQL LIKE full ownership lifetime retires borrowed defaults and fresh identities through cold owners",
+          "gate": "sql-qualified-like-lifetime-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "initial FK counter effects stay hidden through cold owners and publish one counter cut",
+          "gate": "sql-qualified-initial-counter-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "initial FK counter cancellation releases hidden names without creating counters",
+          "gate": "sql-qualified-initial-counter-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/system_catalog/column_sequences.zig",
+          "test": "column sequence bindings round trip typed durable envelopes with exact IDs and allocation failures",
+          "gate": "sql-qualified-initial-counter-codec-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_creation_integration_test.zig",
+          "test": "mounted SQL LIKE full ownership lifetime retires borrowed defaults and fresh identities through cold owners",
+          "gate": "sql-qualified-initial-counter-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "initial FK copied counters borrow SERIAL through cold publication without allocating a counter",
+          "gate": "sql-qualified-copied-counter-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "initial FK copied counters cancel fresh identity names after source retirement",
+          "gate": "sql-qualified-copied-counter-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_table_creation_integration_test.zig",
+          "test": "mounted SQL LIKE full ownership lifetime retires borrowed defaults and fresh identities through cold owners",
+          "gate": "sql-qualified-copied-counter-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0370",
@@ -10535,33 +12122,195 @@
     },
     {
       "id": "sql-0405",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and mutation dispatch remain separately unresolved.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards",
+          "gate": "sql-trigger-functions-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog trigger contracts preserve capability fencing generation outcomes and cold row-return bodies",
+          "gate": "sql-trigger-functions-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/procedure.zig",
+          "test": "SQL trigger functions preserve original row returns lazy PERFORM and context boundaries",
+          "gate": "sql-trigger-functions-vm-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/trigger_contract_test.zig",
+          "test": "SQL trigger preparation lazy binding notice delivery and decode clean every allocation failure",
+          "gate": "sql-trigger-functions-vm-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards",
+          "gate": "sql-trigger-functions-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0406",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and mutation dispatch remain separately unresolved.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards",
+          "gate": "sql-trigger-functions-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog trigger contracts preserve capability fencing generation outcomes and cold row-return bodies",
+          "gate": "sql-trigger-functions-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/procedure.zig",
+          "test": "SQL trigger functions preserve original row returns lazy PERFORM and context boundaries",
+          "gate": "sql-trigger-functions-vm-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/trigger_contract_test.zig",
+          "test": "SQL trigger preparation lazy binding notice delivery and decode clean every allocation failure",
+          "gate": "sql-trigger-functions-vm-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards",
+          "gate": "sql-trigger-functions-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0407",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and mutation dispatch remain separately unresolved.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards",
+          "gate": "sql-trigger-functions-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog trigger contracts preserve capability fencing generation outcomes and cold row-return bodies",
+          "gate": "sql-trigger-functions-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/procedure.zig",
+          "test": "SQL trigger functions preserve original row returns lazy PERFORM and context boundaries",
+          "gate": "sql-trigger-functions-vm-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/trigger_contract_test.zig",
+          "test": "SQL trigger preparation lazy binding notice delivery and decode clean every allocation failure",
+          "gate": "sql-trigger-functions-vm-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards",
+          "gate": "sql-trigger-functions-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0408",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and mutation dispatch remain separately unresolved.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards",
+          "gate": "sql-trigger-functions-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog trigger contracts preserve capability fencing generation outcomes and cold row-return bodies",
+          "gate": "sql-trigger-functions-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/procedure.zig",
+          "test": "SQL trigger functions preserve original row returns lazy PERFORM and context boundaries",
+          "gate": "sql-trigger-functions-vm-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/trigger_contract_test.zig",
+          "test": "SQL trigger preparation lazy binding notice delivery and decode clean every allocation failure",
+          "gate": "sql-trigger-functions-vm-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards",
+          "gate": "sql-trigger-functions-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0409",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and mutation dispatch remain separately unresolved.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards",
+          "gate": "sql-trigger-functions-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog trigger contracts preserve capability fencing generation outcomes and cold row-return bodies",
+          "gate": "sql-trigger-functions-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/procedure.zig",
+          "test": "SQL trigger functions preserve original row returns lazy PERFORM and context boundaries",
+          "gate": "sql-trigger-functions-vm-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/trigger_contract_test.zig",
+          "test": "SQL trigger preparation lazy binding notice delivery and decode clean every allocation failure",
+          "gate": "sql-trigger-functions-vm-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards",
+          "gate": "sql-trigger-functions-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0410",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged CREATE executes through authenticated mounted SQL and the durable routine catalog, including replacement, cold reopen and lost-reply recovery. The bounded compiled trigger-function VM preserves NEW/OLD/NULL, notices and first-demand PERFORM binding against PostgreSQL. This qualifies the original function definition; table-trigger attachment and mutation dispatch remain separately unresolved.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards",
+          "gate": "sql-trigger-functions-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL routine catalog trigger contracts preserve capability fencing generation outcomes and cold row-return bodies",
+          "gate": "sql-trigger-functions-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/procedure.zig",
+          "test": "SQL trigger functions preserve original row returns lazy PERFORM and context boundaries",
+          "gate": "sql-trigger-functions-vm-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/trigger_contract_test.zig",
+          "test": "SQL trigger preparation lazy binding notice delivery and decode clean every allocation failure",
+          "gate": "sql-trigger-functions-vm-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_routine_lifecycle_integration_test.zig",
+          "test": "mounted SQL original trigger-function definitions preserve authenticated durable lifecycle and context guards",
+          "gate": "sql-trigger-functions-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0411",
@@ -15360,13 +17109,87 @@
     },
     {
       "id": "sql-0696",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged native full-text declaration executes through authenticated mounted SQL, the shared guarded metadata transaction and ordinary /indexes workers. Named queries qualify historical AROW backfill, live updates, source hydration and highlight spans before and after independent metadata/data-owner cold reopen. SQL/native deletion release names; lost-ACK recovery observes the original durable outcome after drop/recreate without replay or fabricated OIDs. Shared declared-column binding also qualifies document aliases and fail-closed type/path guards. Private table codecs and portable manifests preserve selected names and incarnation fences; analyzer publication retains custom resource lifetimes.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original native full-text indexes share API lifecycle across cold restart",
+          "gate": "sql-native-full-text-lifecycle-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "SQL native index original full-text declarations retain typed intent and reject unsupported options",
+          "gate": "sql-native-full-text-and-phonetic-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/system_catalog/native_indexes.zig",
+          "test": "SQL native index field binding shares declared document aliases and typed row guards",
+          "gate": "sql-native-full-text-binding-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL native index namespace source digest tracks selected incarnations only",
+          "gate": "sql-native-full-text-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/backups.zig",
+          "test": "restore manifest preserves trusted coverage incarnation metadata for SQL native names",
+          "gate": "sql-native-full-text-manifest-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/system_catalog/native_indexes.zig",
+          "test": "native index namespace bindings reject corruption and have a zero allocation absent path",
+          "gate": "sql-native-full-text-namespace-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/catalog/index_manager.zig",
+          "test": "observed analyzer publication preserves custom analyzer resources",
+          "gate": "sql-native-full-text-analyzer-debug"
+        }
+      ]
     },
     {
       "id": "sql-0697",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged native full-text declaration executes through authenticated mounted SQL, the shared guarded metadata transaction and ordinary /indexes workers. Named queries qualify historical AROW backfill, live updates, source hydration and highlight spans before and after independent metadata/data-owner cold reopen. SQL/native deletion release names; lost-ACK recovery observes the original durable outcome after drop/recreate without replay or fabricated OIDs. Shared declared-column binding also qualifies document aliases and fail-closed type/path guards. Private table codecs and portable manifests preserve selected names and incarnation fences; analyzer publication retains custom resource lifetimes.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original native full-text indexes share API lifecycle across cold restart",
+          "gate": "sql-native-full-text-lifecycle-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "SQL native index original full-text declarations retain typed intent and reject unsupported options",
+          "gate": "sql-native-full-text-and-phonetic-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/system_catalog/native_indexes.zig",
+          "test": "SQL native index field binding shares declared document aliases and typed row guards",
+          "gate": "sql-native-full-text-binding-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL native index namespace source digest tracks selected incarnations only",
+          "gate": "sql-native-full-text-catalog-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/backups.zig",
+          "test": "restore manifest preserves trusted coverage incarnation metadata for SQL native names",
+          "gate": "sql-native-full-text-manifest-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/system_catalog/native_indexes.zig",
+          "test": "native index namespace bindings reject corruption and have a zero allocation absent path",
+          "gate": "sql-native-full-text-namespace-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/db/catalog/index_manager.zig",
+          "test": "observed analyzer publication preserves custom analyzer resources",
+          "gate": "sql-native-full-text-analyzer-debug"
+        }
+      ]
     },
     {
       "id": "sql-0698",
@@ -15412,7 +17235,7 @@
     {
       "id": "sql-0701",
       "status": "rejected",
-      "reason": "Exact pinned original rejection is preserved by InvalidSqlSyntax at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. No SQL prefix is executed.",
+      "reason": "The unchanged original is rejected as UnsupportedSqlShape before backend acquisition. USING btree is recognized, while the requested native storage/lifecycle option is unavailable. The complete-statement boundary emits a nonempty source-bounded diagnostic and never executes an accepted SQL prefix.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/sql/parity_case_test.zig",
@@ -15424,7 +17247,7 @@
     {
       "id": "sql-0702",
       "status": "rejected",
-      "reason": "Exact pinned original rejection is preserved by InvalidSqlSyntax at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. No SQL prefix is executed.",
+      "reason": "The unchanged original is rejected as UnsupportedSqlShape before backend acquisition. USING btree is recognized, while the requested native storage/lifecycle option is unavailable. The complete-statement boundary emits a nonempty source-bounded diagnostic and never executes an accepted SQL prefix.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/sql/parity_case_test.zig",
@@ -15436,7 +17259,7 @@
     {
       "id": "sql-0703",
       "status": "rejected",
-      "reason": "Exact pinned original rejection is preserved by InvalidSqlSyntax at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. No SQL prefix is executed.",
+      "reason": "The unchanged original is rejected as UnsupportedSqlShape before backend acquisition. USING btree is recognized, while the requested native storage/lifecycle option is unavailable. The complete-statement boundary emits a nonempty source-bounded diagnostic and never executes an accepted SQL prefix.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/sql/parity_case_test.zig",
@@ -16564,28 +18387,153 @@
     },
     {
       "id": "sql-0771",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction command executes through the mounted authenticated SQL API, durable metadata GID registry, existing distributed transaction coordinator and native externally decided intents. PostgreSQL 18 command tags, typed row visibility, owner authorization and definite diagnostics match before and after complete metadata/session/data-owner restart. Multi-owner activation barriers, exact decision authority, cancelled admission, durable delivery receipts and bounded recovery are tested independently. This qualifies the original command; public prepared-transaction listing, phase-two observation history and permanent API-owner loss administration remain separate work.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_prepared_transaction_integration_test.zig",
+          "test": "mounted SQL original prepared transactions retain multi-owner intents across complete cold restart",
+          "gate": "sql-original-prepared-transaction-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_prepared_transaction_integration_test.zig",
+          "test": "mounted SQL original prepared transactions retain multi-owner intents across complete cold restart",
+          "gate": "sql-original-prepared-transaction-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/transactions.zig",
+          "test": "external prepared coordinator retains LSM vote across cold timeout and requires exact resolution authority",
+          "gate": "sql-original-prepared-transaction-owner-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL prepared transaction native registry freezes cohorts decisions receipts and cold handoffs",
+          "gate": "sql-original-prepared-transaction-registry-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/transactions.zig",
+          "test": "distributed txn external session purpose and delivery receipts survive cold recovery without ordinary commit",
+          "gate": "sql-original-prepared-transaction-delivery-debug"
+        }
+      ]
     },
     {
       "id": "sql-0772",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction command executes through the mounted authenticated SQL API, durable metadata GID registry, existing distributed transaction coordinator and native externally decided intents. PostgreSQL 18 command tags, typed row visibility, owner authorization and definite diagnostics match before and after complete metadata/session/data-owner restart. Multi-owner activation barriers, exact decision authority, cancelled admission, durable delivery receipts and bounded recovery are tested independently. This qualifies the original command; public prepared-transaction listing, phase-two observation history and permanent API-owner loss administration remain separate work.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_prepared_transaction_integration_test.zig",
+          "test": "mounted SQL original prepared transactions retain multi-owner intents across complete cold restart",
+          "gate": "sql-original-prepared-transaction-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_prepared_transaction_integration_test.zig",
+          "test": "mounted SQL original prepared transactions retain multi-owner intents across complete cold restart",
+          "gate": "sql-original-prepared-transaction-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/transactions.zig",
+          "test": "external prepared coordinator retains LSM vote across cold timeout and requires exact resolution authority",
+          "gate": "sql-original-prepared-transaction-owner-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL prepared transaction native registry freezes cohorts decisions receipts and cold handoffs",
+          "gate": "sql-original-prepared-transaction-registry-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/transactions.zig",
+          "test": "distributed txn external session purpose and delivery receipts survive cold recovery without ordinary commit",
+          "gate": "sql-original-prepared-transaction-delivery-debug"
+        }
+      ]
     },
     {
       "id": "sql-0773",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original transaction command executes through the mounted authenticated SQL API, durable metadata GID registry, existing distributed transaction coordinator and native externally decided intents. PostgreSQL 18 command tags, typed row visibility, owner authorization and definite diagnostics match before and after complete metadata/session/data-owner restart. Multi-owner activation barriers, exact decision authority, cancelled admission, durable delivery receipts and bounded recovery are tested independently. This qualifies the original command; public prepared-transaction listing, phase-two observation history and permanent API-owner loss administration remain separate work.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_prepared_transaction_integration_test.zig",
+          "test": "mounted SQL original prepared transactions retain multi-owner intents across complete cold restart",
+          "gate": "sql-original-prepared-transaction-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_prepared_transaction_integration_test.zig",
+          "test": "mounted SQL original prepared transactions retain multi-owner intents across complete cold restart",
+          "gate": "sql-original-prepared-transaction-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/storage/transactions.zig",
+          "test": "external prepared coordinator retains LSM vote across cold timeout and requires exact resolution authority",
+          "gate": "sql-original-prepared-transaction-owner-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL prepared transaction native registry freezes cohorts decisions receipts and cold handoffs",
+          "gate": "sql-original-prepared-transaction-registry-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/transactions.zig",
+          "test": "distributed txn external session purpose and delivery receipts survive cold recovery without ordinary commit",
+          "gate": "sql-original-prepared-transaction-delivery-debug"
+        }
+      ]
     },
     {
       "id": "sql-0774",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SET command uses an immutable native control definition and the existing typed connection/transaction overlays. PostgreSQL 18 lifetime rows, command tags and SET LOCAL outside-transaction warnings agree through HTTP and the real pgwire/native SQL backend. All five visibility choices reach durable multi-owner commit records; propose retains the SQL write-durability floor. Savepoint, rollback, reset, failed first-seal persistence, retry with a changed caller hint, full cold connection/session/data recovery and cross-credential isolation are qualified. Commit sealing reads HTTP settings at its serialized durable cut; pgwire remains the sole owner of its live overlay. These controls do not alter shared catalog defaults or implement ALTER ROLE defaults for native controls.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sync_control_integration_test.zig",
+          "test": "mounted SQL native sync controls preserve original SET lifetimes and durable multi-owner visibility choices",
+          "gate": "sql-original-sync-controls-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sync_control_integration_test.zig",
+          "test": "mounted SQL native sync controls preserve original SET lifetimes and durable multi-owner visibility choices",
+          "gate": "sql-original-sync-controls-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/transactions.zig",
+          "test": "distributed txn SQL sync choice seals atomically and survives cold retries with changed caller settings",
+          "gate": "sql-original-sync-controls-seal-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/setting_catalog.zig",
+          "test": "SQL native sync control shares overlays savepoints and immutable definition authority",
+          "gate": "sql-original-sync-controls-overlay-debug"
+        }
+      ]
     },
     {
       "id": "sql-0775",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SET command uses an immutable native control definition and the existing typed connection/transaction overlays. PostgreSQL 18 lifetime rows, command tags and SET LOCAL outside-transaction warnings agree through HTTP and the real pgwire/native SQL backend. All five visibility choices reach durable multi-owner commit records; propose retains the SQL write-durability floor. Savepoint, rollback, reset, failed first-seal persistence, retry with a changed caller hint, full cold connection/session/data recovery and cross-credential isolation are qualified. Commit sealing reads HTTP settings at its serialized durable cut; pgwire remains the sole owner of its live overlay. These controls do not alter shared catalog defaults or implement ALTER ROLE defaults for native controls.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sync_control_integration_test.zig",
+          "test": "mounted SQL native sync controls preserve original SET lifetimes and durable multi-owner visibility choices",
+          "gate": "sql-original-sync-controls-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_sync_control_integration_test.zig",
+          "test": "mounted SQL native sync controls preserve original SET lifetimes and durable multi-owner visibility choices",
+          "gate": "sql-original-sync-controls-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/transactions.zig",
+          "test": "distributed txn SQL sync choice seals atomically and survives cold retries with changed caller settings",
+          "gate": "sql-original-sync-controls-seal-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/setting_catalog.zig",
+          "test": "SQL native sync control shares overlays savepoints and immutable definition authority",
+          "gate": "sql-original-sync-controls-overlay-debug"
+        }
+      ]
     },
     {
       "id": "sql-0776",
@@ -17448,8 +19396,25 @@
     },
     {
       "id": "sql-0838",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged document residual Soundex read and original parameters execute over stored rows through the public native SQL route, with complete output checked against an independent PostgreSQL fuzzystrmatch witness. Native fixed-size Soundex/difference kernels preserve ASCII and separator behavior, typed NULLs, arity/type errors and cancellation/work budgets without kernel scratch allocation. Supplemental oracle witnesses do not add original-case credit.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_text_campaign_test.zig",
+          "test": "httpx SQL PostgreSQL original phonetic filtering and UUID generation execute on stored rows",
+          "gate": "sql-phonetic-public-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
+          "test": "SQL phonetic prepared programs retain typed nullability and match PostgreSQL row kernels",
+          "gate": "sql-native-full-text-and-phonetic-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_text_campaign_test.zig",
+          "test": "httpx SQL PostgreSQL original phonetic filtering and UUID generation execute on stored rows",
+          "gate": "sql-phonetic-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0839",
