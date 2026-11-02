@@ -3062,6 +3062,9 @@ fn applyDecoderEmbeddingsAt(
     const total = batch * seq_len;
     const embed_w = try promptEmbedWeight(cb);
     var hidden = try cb.embeddingLookup(embed_w, input_ids, total, d_model);
+    // Position metadata can fail independently of backend tensor allocation.
+    // Keep the current residual owned until final normalization succeeds.
+    errdefer cb.free(hidden);
 
     const pos_ids = try allocator.alloc(i64, total);
     defer allocator.free(pos_ids);

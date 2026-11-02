@@ -55958,6 +55958,19 @@ int termite_metal_decode_runtime_apply_rms_norm_add_device(
     }
 }
 
+// Metadata-only availability proof before invalidating an assigned target.
+int antfly_metal_decoder_output_available(termite_metal_decode_runtime *runtime, int kind) {
+    if (!runtime) return 0;
+    switch (kind) {
+        case 0: return runtime->add_pipeline != nil;
+        case 1: return runtime->add_scale_pipeline != nil;
+        case 2: return runtime->scaled_add_scale_pipeline != nil;
+        case 3: return runtime->multiply_add_pipeline != nil;
+        case 4: return runtime->multiply_add2_pipeline != nil;
+        default: return 0;
+    }
+}
+
 int termite_metal_decode_runtime_apply_add_scale_device(
     termite_metal_decode_runtime *runtime,
     void *lhs_handle,

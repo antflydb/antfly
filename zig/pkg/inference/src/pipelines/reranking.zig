@@ -922,12 +922,13 @@ pub const RerankingPipeline = struct {
         try self.checkExecution();
         const width = self.batchSequenceWidth(sequence);
         const text_plan = try text_inputs.Plan.init(self.session.inputInfo(), &.{ @intCast(batch), @intCast(width) }, .{ .attention_heads = self.session.model_contract.text_attention_heads });
-        var permit = try self.session.admit(.{
+        const signature = text_plan.signature();
+        var permit = try self.session.admitShapeRequest(.{ .shapes = signature.slice() }, .{
             .batch = batch,
             .sequence = width,
             .input_bytes = text_plan.input_bytes,
             .host_preprocess_bytes = text_plan.temporary_bytes,
-        });
+        }, self.allocator, self.execution_control);
         errdefer permit.deinit();
         try self.checkExecution();
         return permit;

@@ -1642,3 +1642,296 @@ test "prepared physical Metal executor allocation failures cancel owned frames b
     };
     try std.testing.checkAllAllocationFailures(a, Case.run, .{ &executable, &program, &cb, x, input });
 }
+test "prepared physical warm claims lend exact bank quota without a release or capacity gap" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const memory = @import("../runtime/tier/memory.zig");
+    const admission = @import("storage_admission.zig");
+    const Owner = struct {
+        controller: memory.AdmissionController = .{},
+        current: memory.AdmissionLease = undefined,
+        credit: memory.AdmissionAmounts = .{},
+        refs: usize = 1,
+        fn retain(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, kind: @import("../graph/backend_contracts.zig").BackendKind, class: @import("storage_accounting.zig").Class, bytes: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return admission.fromRunLease(allocator, &self.current, .{
+                .controller = &self.controller,
+                .backend_class = .cpu,
+                .limits = .{ .host_limit_bytes = 64, .combined_limit_bytes = 64 },
+                .check_live_memory = false,
+                .credit = &self.credit,
+                .lifetime = .{ .context = self, .retain = retain, .release = release },
+            }, kind, class, bytes);
+        }
+    };
+    const Order = struct {
+        admitted: bool = false,
+        before_reuse: usize = 0,
+        records: usize = 0,
+        fn before(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.admitted) return error.DeviceFenceBeforeAdmission;
+            self.before_reuse += 1;
+        }
+        fn record(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.records += 1;
+        }
+        fn deinit(_: *anyopaque) void {}
+        const vtable = ops.physical_storage.Completion.VTable{ .record = record, .before_reuse = before, .deinit = deinit };
+    };
+    var order = Order{};
+    var owner = Owner{};
+    defer owner.controller.deinit();
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 4, 4 }));
+    try graph.markOutput(try b.neg(x));
+    var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    var executable_owned = true;
+    defer if (executable_owned) executable.deinit();
+    const pool = executable.runtime.physical_pool.?;
+    pool.max_frames = 1;
+    var held: ?ops.CT = null;
+    defer if (held) |value| cb.free(value);
+    const cap = admission.Capability{ .identity = .{ .controller = &owner.controller, .backend_class = .cpu }, .context = &owner, .reserve_fn = Owner.reserve };
+    for (0..3) |iteration| {
+        order.admitted = false;
+        var claim = try pool.claimWarm(cap.identity);
+        defer if (claim) |*value| value.release();
+        if (iteration == 0) {
+            try std.testing.expect(claim == null);
+            try std.testing.expectEqual(@as(usize, 0), pool.frames.items.len);
+        } else {
+            try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 64 }, claim.?.credit);
+            try std.testing.expect((try pool.claimWarm(cap.identity)) == null);
+            try std.testing.expect((try pool.acquire()) == null);
+            if (iteration == 1) {
+                var foreign = memory.AdmissionController{};
+                defer foreign.deinit();
+                var wrong_cap = cap;
+                wrong_cap.identity.controller = &foreign;
+                if (claim) |*value| {
+                    try std.testing.expectError(error.PhysicalStorageAdmissionMismatch, pool.acquirePrepared(wrong_cap, value));
+                    try std.testing.expect(value.frame != null);
+                    const previous_nonce = value.nonce;
+                    value.release();
+                    claim = try pool.claimWarm(cap.identity);
+                    try std.testing.expect(claim != null);
+                    try std.testing.expect(claim.?.nonce != previous_nonce);
+                }
+            }
+        }
+        const incremental: usize = if (claim) |value| 64 - value.credit.host_scratch_bytes else 64;
+        owner.current = try owner.controller.tryAcquire(.cpu, .{ .host_limit_bytes = 64, .combined_limit_bytes = 64 }, .{ .host_scratch_bytes = incremental }, false);
+        defer owner.current.release();
+        order.admitted = true;
+        owner.credit = .{ .host_scratch_bytes = incremental };
+        var host: [16]f32 = undefined;
+        for (&host, 0..) |*value, index| value.* = @floatFromInt(index + iteration);
+        const input = try cb.fromFloat32Shape(&host, &.{ 4, 4 });
+        defer cb.free(input);
+        var inputs = [_]interpreter.RuntimeInput{.{ .node_id = x, .value = input, .source_backend = &cb }};
+        var result = try executable.run(a, .{
+            .runtime_inputs = try program.remapInputs(&inputs),
+            .storage_admission = cap,
+            .physical_frame_claim = if (claim) |*value| value else null,
+            .output_placement = .producer,
+            .collect_partition_stats = true,
+        });
+        defer result.deinit(&executable.runtime);
+        if (iteration == 0) pool.frames.items[0].completions[0] = .{ .ptr = &order, .vtable = &Order.vtable };
+        try std.testing.expectEqual(iteration, order.before_reuse);
+        try std.testing.expectEqual(iteration, order.records);
+        try std.testing.expectEqual(@as(u64, if (iteration == 0) 1 else 0), result.stats.physical_storage_allocations);
+        const actual = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual, host) |found, original| try std.testing.expectEqual(-original, found);
+        if (iteration == 2) held = try cb.primReshape(result.outputs[0], &.{ 1, 16 });
+        if (claim) |value| try std.testing.expect(value.frame == null);
+        owner.current.release();
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 64 }, owner.controller.snapshot());
+        try std.testing.expectEqual(@as(usize, 2), owner.refs);
+    }
+    // Published aliases block the loan while retaining the original quota.
+    try std.testing.expect((try pool.claimWarm(cap.identity)) == null);
+    executable.deinit();
+    executable_owned = false;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 64 }, owner.controller.snapshot());
+    cb.free(held.?);
+    held = null;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, owner.controller.snapshot());
+    try std.testing.expectEqual(@as(usize, 1), owner.refs);
+}
+test "prepared physical warm capacity excludes measured allocator padding" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const memory = @import("../runtime/tier/memory.zig");
+    const admission = @import("storage_admission.zig");
+    const Owner = struct {
+        controller: memory.AdmissionController = .{},
+        current: memory.AdmissionLease = undefined,
+        credit: memory.AdmissionAmounts = .{},
+        refs: usize = 1,
+        limit: usize = 192,
+        fn retain(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, kind: @import("../graph/backend_contracts.zig").BackendKind, class: @import("storage_accounting.zig").Class, bytes: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return admission.fromRunLease(allocator, &self.current, .{
+                .controller = &self.controller,
+                .backend_class = .cpu,
+                .limits = .{ .host_limit_bytes = self.limit, .combined_limit_bytes = self.limit },
+                .check_live_memory = false,
+                .credit = &self.credit,
+                .lifetime = .{ .context = self, .retain = retain, .release = release },
+            }, kind, class, bytes);
+        }
+    };
+    const Order = struct {
+        admitted: bool = false,
+        before_reuse: usize = 0,
+        records: usize = 0,
+        fn before(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.admitted) return error.DeviceFenceBeforeAdmission;
+            self.before_reuse += 1;
+        }
+        fn record(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.records += 1;
+        }
+        fn deinit(_: *anyopaque) void {}
+        const vtable = ops.physical_storage.Completion.VTable{ .record = record, .before_reuse = before, .deinit = deinit };
+    };
+    var order = Order{};
+    var owner = Owner{};
+    defer owner.controller.deinit();
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const original_backend = context.computeBackend();
+    const Padded = struct {
+        fn bound(_: *anyopaque, bytes: usize) !usize {
+            return std.math.add(usize, bytes, 128);
+        }
+    };
+    var kernels = original_backend.vtable.kernels.?.*;
+    kernels.physicalStorageReservationBytes = Padded.bound;
+    var table = original_backend.vtable.*;
+    table.kernels = &kernels;
+    const cb = ops.ComputeBackend{ .ptr = original_backend.ptr, .vtable = &table };
+
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 4, 4 }));
+    try graph.markOutput(try b.neg(x));
+    var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    var executable_owned = true;
+    defer if (executable_owned) executable.deinit();
+    const pool = executable.runtime.physical_pool.?;
+    pool.max_frames = 1;
+    try std.testing.expectEqual(@as(usize, 192), (try pool.storageRequirement()).host_scratch_bytes);
+    var held: ?ops.CT = null;
+    defer if (held) |value| cb.free(value);
+    const cap = admission.Capability{ .identity = .{ .controller = &owner.controller, .backend_class = .cpu }, .context = &owner, .reserve_fn = Owner.reserve };
+    for (0..3) |iteration| {
+        order.admitted = false;
+        var claim = try pool.claimWarm(cap.identity);
+        defer if (claim) |*value| value.release();
+        if (iteration == 0) {
+            try std.testing.expect(claim == null);
+            try std.testing.expectEqual(@as(usize, 0), pool.frames.items.len);
+        } else {
+            try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 64 }, claim.?.credit);
+            try std.testing.expect((try pool.claimWarm(cap.identity)) == null);
+            try std.testing.expect((try pool.acquire()) == null);
+            if (iteration == 1) {
+                var foreign = memory.AdmissionController{};
+                defer foreign.deinit();
+                var wrong_cap = cap;
+                wrong_cap.identity.controller = &foreign;
+                if (claim) |*value| {
+                    try std.testing.expectError(error.PhysicalStorageAdmissionMismatch, pool.acquirePrepared(wrong_cap, value));
+                    try std.testing.expect(value.frame != null);
+                    const previous_nonce = value.nonce;
+                    value.release();
+                    claim = try pool.claimWarm(cap.identity);
+                    try std.testing.expect(claim != null);
+                    try std.testing.expect(claim.?.nonce != previous_nonce);
+                }
+            }
+        }
+        const requirement = if (claim) |value|
+            value.requirement orelse (try pool.storageRequirement())
+        else
+            try pool.storageRequirement();
+        if (iteration != 0) try std.testing.expectEqual(@as(usize, 64), requirement.host_scratch_bytes);
+        const incremental: usize = requirement.host_scratch_bytes - (if (claim) |value| @min(requirement.host_scratch_bytes, value.credit.host_scratch_bytes) else 0);
+        owner.limit = if (iteration == 0) 192 else 64;
+        owner.current = try owner.controller.tryAcquire(.cpu, .{ .host_limit_bytes = owner.limit, .combined_limit_bytes = owner.limit }, .{ .host_scratch_bytes = incremental }, false);
+        defer owner.current.release();
+        order.admitted = true;
+        owner.credit = .{ .host_scratch_bytes = incremental };
+        var host: [16]f32 = undefined;
+        for (&host, 0..) |*value, index| value.* = @floatFromInt(index + iteration);
+        const input = try cb.fromFloat32Shape(&host, &.{ 4, 4 });
+        defer cb.free(input);
+        var inputs = [_]interpreter.RuntimeInput{.{ .node_id = x, .value = input, .source_backend = &cb }};
+        var result = try executable.run(a, .{
+            .runtime_inputs = try program.remapInputs(&inputs),
+            .storage_admission = cap,
+            .physical_frame_claim = if (claim) |*value| value else null,
+            .output_placement = .producer,
+            .collect_partition_stats = true,
+        });
+        defer result.deinit(&executable.runtime);
+        if (iteration == 0) pool.frames.items[0].completions[0] = .{ .ptr = &order, .vtable = &Order.vtable };
+        try std.testing.expectEqual(iteration, order.before_reuse);
+        try std.testing.expectEqual(iteration, order.records);
+        try std.testing.expectEqual(@as(u64, if (iteration == 0) 1 else 0), result.stats.physical_storage_allocations);
+        const actual = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual, host) |found, original| try std.testing.expectEqual(-original, found);
+        if (iteration == 2) held = try cb.primReshape(result.outputs[0], &.{ 1, 16 });
+        if (claim) |value| try std.testing.expect(value.frame == null);
+        owner.current.release();
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 64 }, owner.controller.snapshot());
+        try std.testing.expectEqual(@as(usize, 2), owner.refs);
+    }
+    // Published aliases block the loan while retaining the original quota.
+    try std.testing.expect((try pool.claimWarm(cap.identity)) == null);
+    executable.deinit();
+    executable_owned = false;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 64 }, owner.controller.snapshot());
+    cb.free(held.?);
+    held = null;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, owner.controller.snapshot());
+    try std.testing.expectEqual(@as(usize, 1), owner.refs);
+}

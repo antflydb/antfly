@@ -45,7 +45,20 @@ pub const BackendContext = union(enum) {
         compute: *WasmCompute,
     },
 
+    pub const InitOptions = struct { observe_native_allocations: bool = false };
     pub fn init(allocator: std.mem.Allocator, requested: BackendType, io: ?std.Io) !BackendContext {
+        return initWithOptions(allocator, requested, io, .{});
+    }
+    pub fn initWithOptions(allocator: std.mem.Allocator, requested: BackendType, io: ?std.Io, options: InitOptions) !BackendContext {
+        if (requested == .native and options.observe_native_allocations) {
+            if (@import("../execution/allocation_observer.zig").State.forAllocator(allocator) != null) return initImpl(allocator, requested, io);
+            const observer = try @import("../execution/allocation_observer.zig").State.create(allocator, .from_owner_creation);
+            defer observer.release();
+            return initImpl(observer.allocator(), requested, io);
+        }
+        return initImpl(allocator, requested, io);
+    }
+    fn initImpl(allocator: std.mem.Allocator, requested: BackendType, io: ?std.Io) !BackendContext {
         return switch (requested) {
             .cuda => blk: {
                 if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
@@ -116,8 +129,9 @@ pub const BackendContext = union(enum) {
             .native => |*ctx| {
                 if (comptime build_options.enable_native) {
                     ctx.compute.computeBackend().deinit();
+                    const store_allocator = ctx.weight_store.allocator;
                     ctx.weight_store.deinitOwned();
-                    allocator.destroy(ctx.weight_store);
+                    store_allocator.destroy(ctx.weight_store);
                 } else {
                     unreachable;
                 }
@@ -268,6 +282,18 @@ pub const SharedBackendContext = struct {
     ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
 
     pub fn init(allocator: std.mem.Allocator, requested: BackendType, io: ?std.Io) !*SharedBackendContext {
+        return initWithOptions(allocator, requested, io, .{});
+    }
+    pub fn initWithOptions(allocator: std.mem.Allocator, requested: BackendType, io: ?std.Io, options: BackendContext.InitOptions) !*SharedBackendContext {
+        if (requested == .native and options.observe_native_allocations) {
+            if (@import("../execution/allocation_observer.zig").State.forAllocator(allocator) != null) return initImpl(allocator, requested, io);
+            const observer = try @import("../execution/allocation_observer.zig").State.create(allocator, .from_owner_creation);
+            defer observer.release();
+            return initImpl(observer.allocator(), requested, io);
+        }
+        return initImpl(allocator, requested, io);
+    }
+    fn initImpl(allocator: std.mem.Allocator, requested: BackendType, io: ?std.Io) !*SharedBackendContext {
         const shared = try allocator.create(SharedBackendContext);
         errdefer allocator.destroy(shared);
         var context = try BackendContext.init(allocator, requested, io);
@@ -629,4 +655,54 @@ test "backend context CUDA preserves typed input bytes" {
         try std.testing.expectEqual(tensor.dtype, exported.dtype);
         try std.testing.expectEqualSlices(u8, tensor.data, exported.payload.bytes);
     }
+}
+// Draft tests for compute_context.zig after the opt-in observer integration.
+test "early native observations outlive their compute through a foreign dense view" {
+    const a = std.testing.allocator;
+    const observers = @import("../execution/allocation_observer.zig");
+    var destination = try BackendContext.init(a, .native, null);
+    defer destination.deinit(a);
+    var source = try BackendContext.initWithOptions(a, .native, null, .{ .observe_native_allocations = true });
+    var source_open = true;
+    defer if (source_open) source.deinit(a);
+    const owner = observers.State.forAllocator(source.native.compute.allocator).?.retain();
+    defer owner.release();
+    try std.testing.expectEqual(observers.Coverage.from_owner_creation, owner.coverage);
+    const source_backend = source.computeBackend();
+    const destination_backend = destination.computeBackend();
+    const tensor = try source_backend.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    var tensor_open = true;
+    defer if (tensor_open) source_backend.free(tensor);
+    const alias = try destination_backend.primReshape(tensor, &.{4});
+    var alias_open = true;
+    defer if (alias_open) destination_backend.free(alias);
+    source_backend.free(tensor);
+    tensor_open = false;
+    source.deinit(a);
+    source_open = false;
+    try std.testing.expect(owner.snapshot().requested_live_bytes >= 4 * @sizeOf(f32));
+    const actual = try destination_backend.toFloat32(alias, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, actual);
+    destination_backend.free(alias);
+    alias_open = false;
+    try std.testing.expectEqual(@as(u64, 0), owner.snapshot().requested_live_bytes);
+}
+
+test "early native observed context construction unwinds every allocation failure" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var context = try BackendContext.initWithOptions(a, .native, null, .{ .observe_native_allocations = true });
+            defer context.deinit(a);
+            const backend = context.computeBackend();
+            const input = try backend.fromFloat32Shape(&.{ -1, 2 }, &.{2});
+            defer backend.free(input);
+            const output = try backend.relu(input);
+            defer backend.free(output);
+            const values = try backend.toFloat32(output, a);
+            defer a.free(values);
+            try std.testing.expectEqualSlices(f32, &.{ 0, 2 }, values);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

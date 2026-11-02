@@ -47,3 +47,9 @@ pub const encoder_decoder_runtime = @import("encoder_decoder_runtime.zig");
 pub const seq2seq_runtime = @import("seq2seq_runtime.zig");
 
 pub const decoder_checkpoint = @import("decoder_checkpoint.zig");
+pub const prepared_invocation = @import("prepared_invocation.zig");
+pub const decoder_pending_step = @import("decoder_pending_step.zig");
+pub const decoder_prefill = @import("decoder_prefill.zig");
+
+pub const cached_decoder = @import("cached_decoder.zig");
+pub const decoder_stage = @import("decoder_stage.zig");

@@ -402,6 +402,7 @@ pub fn meanPool(
 }
 pub const t5RelativePositionBucket = attention.t5RelativePositionBucket;
 pub const ropeCore = attention.ropeCore;
+pub const ropeCoreWithPositions = attention.ropeCoreWithPositions;
 pub const flashCausalAttentionHost = attention.flashCausalAttentionHost;
 pub const flashAttentionHost = attention.flashAttentionHost;
 pub const flashAttentionHostWithIo = attention.flashAttentionHostWithIo;

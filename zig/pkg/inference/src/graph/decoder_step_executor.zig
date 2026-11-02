@@ -205,19 +205,22 @@ pub const Executor = struct {
         endDecodeEpoch(self.context.cb, self.lighton_cuda_execution_id, self.lighton_graph_attempts, self.lighton_graph_declines);
     }
 
-    fn graphWeight(self: *Executor, name: []const u8) !ops.CT {
-        return gpt_arch.getTracedWeight(self.context.allocator, self.context.cb, self.context.gpt_config, name);
+    fn canonicalContext(self: *const Executor) execution.Context {
+        var context = self.context;
+        // Preserve this executor's canonical traced-weight override without
+        // an opaque callback into its transient owner.
+        context.weights = null;
+        context.weight_semantics = .traced_decoder;
+        return context;
+    }
+
+    fn graphWeight(self: *const Executor, name: []const u8) !ops.CT {
+        const context = self.canonicalContext();
+        return context.graphWeight(name);
     }
 
     fn forwardAllLogits(self: *Executor, input_ids: []const i64, batch_size: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext) ![]f32 {
-        var context = self.context;
-        const Adapter = struct {
-            fn get(raw: *anyopaque, name: []const u8) !ops.CT {
-                const executor: *Executor = @ptrCast(@alignCast(raw));
-                return executor.graphWeight(name);
-            }
-        };
-        context.weights = .{ .ptr = self, .get_fn = Adapter.get };
+        const context = self.canonicalContext();
         return forwardAll(&context, self.graph_cache, input_ids, batch_size, seq_len, decode_context, &self.replay_last_logits_fallbacks);
     }
 

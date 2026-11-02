@@ -3572,7 +3572,17 @@ fn linearNoBiasSourceTensorChunked(
     const scratch_row_elements = std.math.add(usize, in_dim, if (native.useBlas()) 0 else rows) catch return error.ShapeMismatch;
     const scratch_row_bytes = std.math.mul(usize, scratch_row_elements, @sizeOf(f32)) catch return error.ShapeMismatch;
     const block_rows = @max(@as(usize, 1), @min(out_dim, target_weight_bytes / @max(@as(usize, 1), scratch_row_bytes)));
-    const scratch_bytes = std.math.mul(usize, block_rows, scratch_row_bytes) catch return error.ShapeMismatch;
+    // Stable contiguous F32 source rows need no conversion buffer. Preserve
+    // the existing block geometry and GEMM calls; borrowing changes only the
+    // source address. Overlapping output keeps the historical staging path.
+    const borrowed_weight = if (borrowTensorF32IfAligned(tensor)) |source|
+        (if (!kernel_geometry.byteRangesOverlap(@intFromPtr(source.ptr), tensor.data.len, @intFromPtr(output.ptr), output.len * @sizeOf(f32))) source else null)
+    else
+        null;
+    const staged_weight_elements = if (borrowed_weight != null) 0 else std.math.mul(usize, block_rows, in_dim) catch return error.ShapeMismatch;
+    const output_block_elements = if (native.useBlas()) 0 else std.math.mul(usize, rows, block_rows) catch return error.ShapeMismatch;
+    const scratch_elements = std.math.add(usize, staged_weight_elements, output_block_elements) catch return error.ShapeMismatch;
+    const scratch_bytes = std.math.mul(usize, scratch_elements, @sizeOf(f32)) catch return error.ShapeMismatch;
     const scratch_estimate = run_memory.Estimate{
         .prompt_tokens = 0,
         .retained_tokens = 0,
@@ -3581,18 +3591,25 @@ fn linearNoBiasSourceTensorChunked(
         .scratch_bytes = scratch_bytes,
         .scratch_tier = .host,
     };
-    if (self.run_budget) |budget| try budget.reserveEstimate(scratch_estimate);
-    defer if (self.run_budget) |budget| budget.releaseEstimate(scratch_estimate);
-    const weight_block = try self.allocator.alloc(f32, block_rows * in_dim);
+    if (scratch_bytes != 0) if (self.run_budget) |budget| try budget.reserveEstimate(scratch_estimate);
+    defer if (scratch_bytes != 0) {
+        if (self.run_budget) |budget| budget.releaseEstimate(scratch_estimate);
+    };
+    const weight_block = try self.allocator.alloc(f32, staged_weight_elements);
     defer self.allocator.free(weight_block);
-    const output_block = try self.allocator.alloc(f32, if (native.useBlas()) 0 else rows * block_rows);
+    const output_block = try self.allocator.alloc(f32, output_block_elements);
     defer self.allocator.free(output_block);
 
     var row_start: usize = 0;
     while (row_start < out_dim) : (row_start += block_rows) {
         if (self.io) |io| try io.checkCancel();
         const row_count = @min(block_rows, out_dim - row_start);
-        try convertTensorRowsToF32(tensor, row_start, row_count, in_dim, weight_block[0 .. row_count * in_dim]);
+        const weights = if (borrowed_weight) |source|
+            source[row_start * in_dim ..][0 .. row_count * in_dim]
+        else converted: {
+            try convertTensorRowsToF32(tensor, row_start, row_count, in_dim, weight_block[0 .. row_count * in_dim]);
+            break :converted weight_block[0 .. row_count * in_dim];
+        };
         if (native.useBlas()) {
             try native.sgemmTransBStrided(
                 self.io,
@@ -3601,7 +3618,7 @@ fn linearNoBiasSourceTensorChunked(
                 in_dim,
                 1.0,
                 input,
-                weight_block[0 .. row_count * in_dim],
+                weights,
                 0.0,
                 output[row_start..],
                 out_dim,
@@ -3615,7 +3632,7 @@ fn linearNoBiasSourceTensorChunked(
             in_dim,
             1.0,
             input,
-            weight_block[0 .. row_count * in_dim],
+            weights,
             0.0,
             output_block[0 .. rows * row_count],
         );
@@ -3732,6 +3749,9 @@ pub const QuantizedActivationPolicy = enum { automatic, strict_f32 };
 
 pub const NativeCompute = struct {
     allocator: std.mem.Allocator,
+    allocation_observer_owner: ?*@import("../execution/allocation_observer.zig").State = null,
+    allocation_observer_enable_failed: bool = false,
+
     data: *WeightStore,
     run_budget: ?*run_memory.RunBudget = null,
     quantized_activation_policy: QuantizedActivationPolicy = .automatic,
@@ -3754,6 +3774,21 @@ pub const NativeCompute = struct {
     /// process-wide futex pool inside lib/linalg directly.  Tests typically
     /// pass null; production session creation supplies the application's Io.
     io: ?std.Io = null,
+
+    pub const InitOptions = struct { observe_allocations: bool = false, io: ?std.Io = null };
+    pub fn initWithOptions(allocator: std.mem.Allocator, data: *WeightStore, run_budget: ?*run_memory.RunBudget, options: InitOptions) !NativeCompute {
+        var result = if (options.io) |io| initWithIo(allocator, data, run_budget, io) else init(allocator, data, run_budget);
+        errdefer result.deinit();
+        if (options.observe_allocations) try result.observeAllocations(.from_owner_creation);
+        return result;
+    }
+    fn observeAllocations(self: *NativeCompute, coverage: @import("../execution/allocation_observer.zig").Coverage) !void {
+        const observers = @import("../execution/allocation_observer.zig");
+        if (observers.State.forAllocator(self.allocator) != null) return;
+        const observer = try observers.State.create(self.allocator, coverage);
+        self.allocation_observer_owner = observer;
+        self.allocator = observer.allocator();
+    }
 
     pub fn init(allocator: std.mem.Allocator, data: *WeightStore, run_budget: ?*run_memory.RunBudget) NativeCompute {
         initPrefetchQueue(data, allocator);
@@ -3788,6 +3823,11 @@ pub const NativeCompute = struct {
         }
         self.weight_reservations.deinit(self.allocator);
         self.weight_reservations = .empty;
+        if (self.allocation_observer_owner) |observer| {
+            self.allocator = observer.backing;
+            self.allocation_observer_owner = null;
+            observer.release();
+        }
     }
 
     // Dispatchers select the canonical Io API when this backend was constructed
@@ -4526,6 +4566,7 @@ fn getIo(ctx: *anyopaque) ?std.Io {
 }
 
 const kernel_backend_impl = ops.KernelBackend{
+    .assignedKernelSupported = &assignedKernelSupportedOp,
     .physicalStorageBytes = &physicalStorageBytesOp,
     .physicalTensorView = &physicalTensorViewOp,
     .runAssignedKernel = &runAssignedKernelOp,
@@ -4534,6 +4575,8 @@ const kernel_backend_impl = ops.KernelBackend{
 };
 
 pub const vtable_impl = ComputeBackend.VTable{
+    .enableAllocationObservation = &enableAllocationObservationOp,
+    .debugTimingSnapshot = &debugTimingSnapshotOp,
     .kernels = &kernel_backend_impl,
     .backendKind = &backendKind,
     .deinitBackend = &deinitBackend,
@@ -4707,6 +4750,31 @@ pub const vtable_impl = ComputeBackend.VTable{
     .maskedBceWithLogitsLoss = &maskedBceWithLogitsLossOp,
     .maskedBceWithLogitsBackward = &maskedBceWithLogitsBackwardOp,
 };
+
+fn enableAllocationObservationOp(ctx: *anyopaque) void {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    self.observeAllocations(.since_enable) catch {
+        self.allocation_observer_enable_failed = true;
+        return;
+    };
+    self.allocation_observer_enable_failed = false;
+}
+fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const observers = @import("../execution/allocation_observer.zig");
+    const telemetry = @import("../execution/runtime_telemetry.zig");
+    const compute_owner = observers.State.forAllocator(self.allocator);
+    const model_owner = observers.State.forAllocator(self.data.allocator);
+    const compute = if (compute_owner) |owner| telemetry.ObservedAllocator.init(owner) else null;
+    return .{ .runtime = .{
+        .counters = .{ .graph_submissions = 0, .frame_submissions = 0, .synchronizations = 0 },
+        .native_allocations = .{
+            .compute = compute,
+            .model = if (compute_owner != null and compute_owner == model_owner) compute else if (model_owner) |owner| telemetry.ObservedAllocator.init(owner) else null,
+            .late_enable_failed = self.allocation_observer_enable_failed,
+        },
+    } };
+}
 
 fn backendKind(_: *anyopaque) BackendKind {
     return .native;
@@ -7146,6 +7214,34 @@ fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     return allocatingArithmetic(.add, ctx, a, b);
 }
 
+/// Empty broadcasting still follows concrete dimensions: [0,2] with [2]
+/// is empty, while [0,2] with [3] is incompatible. Keep publication owned.
+fn emptyBinaryBroadcast(self: *NativeCompute, a: CT, b: CT, a_count: usize, b_count: usize) !?CT {
+    if (a_count != 0 and b_count != 0) return null;
+    const a_flat = [_]i64{@intCast(a_count)};
+    const b_flat = [_]i64{@intCast(b_count)};
+    var a_shape = tensorStoredShape(a) orelse &a_flat;
+    var b_shape = tensorStoredShape(b) orelse &b_flat;
+    var a_resolved: [8]i64 = undefined;
+    var b_resolved: [8]i64 = undefined;
+    for (a_shape) |dim| if (dim < 0) {
+        a_resolved = resolveShapeFromDataLen(a_shape, a_count) orelse return error.ShapeMismatch;
+        a_shape = a_resolved[0..a_shape.len];
+        break;
+    };
+    for (b_shape) |dim| if (dim < 0) {
+        b_resolved = resolveShapeFromDataLen(b_shape, b_count) orelse return error.ShapeMismatch;
+        b_shape = b_resolved[0..b_shape.len];
+        break;
+    };
+    const plan = try @import("binary_broadcast.zig").Plan.init(a_shape, b_shape);
+    if (plan.lhs_count != a_count or plan.rhs_count != b_count or plan.count != 0) return error.ShapeMismatch;
+    const data = try self.allocator.alloc(f32, 0);
+    const result = try self.makeOwnedBuf(data);
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, plan.shape[0..plan.rank]);
+}
+
 inline fn allocatingArithmetic(comptime op: enum { add, multiply }, ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     if (integerSource(a) != null and integerSource(b) != null) return integerBinaryOp(self, a, b, if (op == .add) .add else .multiply);
@@ -7156,6 +7252,7 @@ inline fn allocatingArithmetic(comptime op: enum { add, multiply }, ctx: *anyopa
     defer a_view.deinit(self.allocator);
     const b_view = try denseTensorView(self, b);
     defer b_view.deinit(self.allocator);
+    if (try emptyBinaryBroadcast(self, a, b, a_view.data.len, b_view.data.len)) |result| return result;
     const a_data = a_view.data;
     const b_data = b_view.data;
     // Handle implicit broadcasting for primitive add (bias in lowered linear).
@@ -32542,13 +32639,10 @@ fn visionRopeOp(
 /// so each token owns `hidden / head_dim` consecutive chunks. Falling back to
 /// the historical layout inference keeps callers without that shape metadata
 /// working, while preventing a batch-sized position stride for encoders.
-fn ropeInto(self: *NativeCompute, input: CT, output: []f32, request: ops.kernel_descriptor.Rope) !void {
-    const positions = try self.allocator.alloc(usize, request.total_chunks);
-    defer self.allocator.free(positions);
-    for (positions, 0..) |*position, chunk| position.* = request.positionAt(chunk);
+fn ropeInto(_: *NativeCompute, input: CT, output: []f32, request: ops.kernel_descriptor.Rope) !void {
     const data = getData(input);
     if (output.ptr != data.ptr) @memcpy(output, data);
-    ropeCore(output, positions, request.head_dim, request.rope_dim, request.theta, request.freq_scale, request.consecutive_pairs);
+    linalg.ropeCoreWithPositions(output, request, request.head_dim, request.rope_dim, request.theta, request.freq_scale, request.consecutive_pairs);
 }
 
 fn ropeOp(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT {
@@ -33204,6 +33298,7 @@ fn subtractOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     defer a_view.deinit(self.allocator);
     const b_view = try denseTensorView(self, b);
     defer b_view.deinit(self.allocator);
+    if (try emptyBinaryBroadcast(self, a, b, a_view.data.len, b_view.data.len)) |result| return result;
     const output = try primBinaryBroadcast(self.allocator, a_view.data, b_view.data, .sub);
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
@@ -33219,6 +33314,7 @@ fn divideOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     defer a_view.deinit(self.allocator);
     const b_view = try denseTensorView(self, b);
     defer b_view.deinit(self.allocator);
+    if (try emptyBinaryBroadcast(self, a, b, a_view.data.len, b_view.data.len)) |result| return result;
     const output = try primBinaryBroadcast(self.allocator, a_view.data, b_view.data, .div);
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
@@ -33312,6 +33408,7 @@ fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     defer a_view.deinit(self.allocator);
     const b_view = try denseTensorView(self, b);
     defer b_view.deinit(self.allocator);
+    if (try emptyBinaryBroadcast(self, a, b, a_view.data.len, b_view.data.len)) |result| return result;
     const a_data = a_view.data;
     const b_data = b_view.data;
     const output = try primBinaryBroadcast(self.allocator, a_data, b_data, .lt);
@@ -48733,10 +48830,17 @@ fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) any
     return view;
 }
 
+fn assignedKernelSupportedOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+    return switch (descriptor.operation) {
+        .transpose, .broadcast, .concat, .slice, .gather => false,
+        else => true,
+    };
+}
+
 fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const descriptor = request.descriptor;
-    if (descriptor.operation == .transpose or descriptor.operation == .broadcast or descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather) return false;
+    if (!assignedKernelSupportedOp(ctx, descriptor)) return false;
     if (request.inputs.len != descriptor.input_count) return error.InvalidTensorShape;
     for (request.inputs, 0..) |input, i| {
         const buf = toBuf(input);
@@ -51141,4 +51245,117 @@ test "native owned imports and foreign dense aliases unwind every allocation fai
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "native empty scalar and trailing-dimension broadcasts preserve shape and owned publication" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const empty = try cb.fromFloat32Shape(&.{}, &.{ 0, 2 });
+    defer cb.free(empty);
+    const scalar = try cb.fromFloat32Shape(&.{1}, &.{});
+    defer cb.free(scalar);
+    const vector = try cb.fromFloat32Shape(&.{ 1, 2 }, &.{2});
+    defer cb.free(vector);
+    const bad_vector = try cb.fromFloat32Shape(&.{ 1, 2, 3 }, &.{3});
+    defer cb.free(bad_vector);
+    const bad_empty = try cb.fromFloat32Shape(&.{}, &.{ 0, 3 });
+    defer cb.free(bad_empty);
+    const Kind = enum { add, multiply, subtract, divide, less };
+    const Fixture = struct {
+        fn apply(backend: *NativeCompute, comptime kind: Kind, left: CT, right: CT) !CT {
+            return switch (kind) {
+                .add => allocatingArithmetic(.add, backend, left, right),
+                .multiply => allocatingArithmetic(.multiply, backend, left, right),
+                .subtract => subtractOp(backend, left, right),
+                .divide => divideOp(backend, left, right),
+                .less => lessThanOp(backend, left, right),
+            };
+        }
+    };
+    inline for (std.enums.values(Kind)) |kind| {
+        for ([_]CT{ scalar, vector, empty }) |other| {
+            inline for (.{ false, true }) |reverse| {
+                const output = try Fixture.apply(&compute, kind, if (reverse) other else empty, if (reverse) empty else other);
+                defer cb.free(output);
+                try std.testing.expect(output != empty);
+                try std.testing.expect(toBuf(output).owned);
+                try std.testing.expect(toBuf(output).retained_parent == null);
+                try std.testing.expectEqual(@as(usize, 0), toBuf(output).data.len);
+                try std.testing.expectEqualSlices(i64, &.{ 0, 2 }, tensorStoredShape(output).?);
+            }
+        }
+        try std.testing.expectError(error.ShapeMismatch, Fixture.apply(&compute, kind, empty, bad_vector));
+        try std.testing.expectError(error.ShapeMismatch, Fixture.apply(&compute, kind, bad_vector, empty));
+        try std.testing.expectError(error.ShapeMismatch, Fixture.apply(&compute, kind, empty, bad_empty));
+    }
+}
+
+test "Native descriptor RoPE preserves explicit positions without transient allocation" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.resident_weights.deinit(a);
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    var seed: [96]f32 = undefined;
+    for (&seed, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 31)) / 9 - 1;
+    const input = try compute.withLogicalShape(try compute.makeBuf(&seed, false), &.{ 6, 16 });
+    defer freeTensor(&compute, input);
+    for ([_]bool{ false, true }) |pairs| {
+        const request = try ops.kernel_descriptor.Rope.init(toBuf(input).logical_shape, seed.len, 3, 8, 8, 10000, 0.75, 7, pairs);
+        var positions: [12]usize = undefined;
+        for (&positions, 0..) |*value, chunk| value.* = 7 + ((chunk / 2) % 3);
+        var expected = seed;
+        ropeCore(&expected, &positions, 8, 8, 10000, 0.75, pairs);
+        var actual: [96]f32 = undefined;
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        {
+            const saved = compute.allocator;
+            compute.allocator = failing.allocator();
+            defer compute.allocator = saved;
+            try ropeInto(&compute, input, &actual, request);
+        }
+        try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+        try std.testing.expectEqualSlices(f32, &expected, &actual);
+    }
+}
+
+test "Native aligned source F32 linear borrows weights with unchanged blocked output" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.resident_weights.deinit(a);
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const in_dim = 9;
+    const out_dim = 17;
+    var weights: [in_dim * out_dim]f32 = undefined;
+    for (&weights, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 19)) / 13 - 0.5;
+    var unaligned_bytes: [@sizeOf(@TypeOf(weights)) + 1]u8 align(@alignOf(f32)) = undefined;
+    @memcpy(unaligned_bytes[1..], std.mem.asBytes(&weights));
+    const aligned = tensor_mod.Tensor{ .data = std.mem.asBytes(&weights), .dtype = .f32, .shape = &.{ out_dim, in_dim }, .name = "", .allocator = a, .owns_data = false, .owns_shape = false };
+    const unaligned = tensor_mod.Tensor{ .data = unaligned_bytes[1..], .dtype = .f32, .shape = &.{ out_dim, in_dim }, .name = "", .allocator = a, .owns_data = false, .owns_shape = false };
+    try std.testing.expect(aligned.asFloat32IfAligned() != null);
+    try std.testing.expect(unaligned.asFloat32IfAligned() == null);
+    inline for (.{ 1, 5, 33 }) |rows| {
+        var input: [rows * in_dim]f32 = undefined;
+        for (&input, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 23)) / 11 - 1;
+        var expected: [rows * out_dim]f32 = undefined;
+        var actual: [rows * out_dim]f32 = undefined;
+        // Forced unaligned storage remains on the frozen conversion/staging
+        // path, using exactly the same block geometry and GEMM entry points.
+        try linearNoBiasSourceTensorChunked(&compute, &input, &unaligned, &expected, rows, in_dim, out_dim);
+        var counted = std.testing.FailingAllocator.init(a, .{});
+        {
+            const saved = compute.allocator;
+            compute.allocator = counted.allocator();
+            defer compute.allocator = saved;
+            try linearNoBiasSourceTensorChunked(&compute, &input, &aligned, &actual, rows, in_dim, out_dim);
+        }
+        try std.testing.expectEqual(@as(usize, if (native.useBlas()) 0 else rows * out_dim * @sizeOf(f32)), counted.allocated_bytes);
+        try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+        try std.testing.expectEqualSlices(f32, &expected, &actual);
+    }
 }

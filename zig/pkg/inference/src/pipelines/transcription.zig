@@ -26,6 +26,8 @@
 //   - preprocessor_config.json (mel spectrogram params)
 
 const stage_runtime = @import("../execution/encoder_decoder_runtime.zig");
+const decoder_stage = @import("../execution/decoder_stage.zig");
+const pending_step = @import("../execution/decoder_pending_step.zig");
 const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -454,24 +456,9 @@ pub const TranscriptionPipeline = struct {
         var logprob_sum: f64 = 0;
         var no_speech_prob: f32 = 0;
 
-        const host_encoder: ?backends.Tensor = switch (encoder_output.*) {
-            .host => |outputs| if (outputs.len != 0) outputs[0] else return error.NoEncoderOutput,
-            .resident => null,
-        };
-        // Native Whisper sessions decode through the KV cache; ONNX merged
-        // bundles keep their own incremental state; anything else re-runs
-        // the full prefix per step.
-        var native_decoder: ?session_factory.WhisperNativeDecoder = if (host_encoder) |host| try session_factory.whisperNativeDecoder(
-            self.decoder,
-            allocator,
-            self.execution_control,
-            host.asFloat32(),
-            enc_seq_len,
-        ) else null;
-        defer if (native_decoder) |*decoder| decoder.deinit();
-        timing.kv_cached = native_decoder != null;
-        var incremental = if (native_decoder == null and host_encoder != null) @import("seq2seq_decode.zig").State.init(allocator, self.decoder, host_encoder.?, enc_mask, self.config.vocab_size) else null;
-        defer if (incremental) |*state| state.deinit();
+        var decoder_runtime = try decoder_stage.Decoder.init(allocator, self.decoder, encoder_output, enc_seq_len, enc_mask, self.config.vocab_size, self.execution_control);
+        defer decoder_runtime.deinit();
+        timing.kv_cached = decoder_runtime.native != null;
         // Suppression list handed to the device token-choice kernel.
         var suppress_scratch = std.ArrayListUnmanaged(i32).empty;
         defer suppress_scratch.deinit(allocator);
@@ -498,83 +485,38 @@ pub const TranscriptionPipeline = struct {
                 forced[forced_index].token_id == null and
                 generated_position == offset + 1;
 
-            var native_logits: ?[]f32 = null;
-            defer if (native_logits) |row| allocator.free(row);
-            var dec_outputs: []backends.Tensor = &.{};
-            defer {
-                for (dec_outputs) |*t| {
-                    var mt = t.*;
-                    mt.deinit();
+            var stats_request: ?whisper_arch.StatsRequest = null;
+            if (decoder_runtime.native != null and temperature == 0 and !dynamic_language_slot) {
+                const free_text = generated_position >= prompt_end;
+                suppress_scratch.clearRetainingCapacity();
+                if (free_text) {
+                    try suppress_scratch.appendSlice(allocator, self.config.decode.suppress_tokens);
+                    if (generated_position == prompt_end) try suppress_scratch.appendSlice(allocator, self.config.decode.begin_suppress_tokens);
+                    if (rules_active) try suppress_scratch.append(allocator, rules.no_timestamps);
                 }
-                if (dec_outputs.len > 0) allocator.free(dec_outputs);
-            }
-            var last_logits: []const f32 = &.{};
-            // Greedy steps let the device choose the token and report the
-            // log-sum-exp terms, so the vocabulary row never leaves the GPU.
-            var step_stats: ?ops.WhisperLogitsStatsRaw = null;
-            if (native_decoder) |*decoder| {
-                const pending = dec_ids[decoder.positions()..dec_len];
-                if (temperature == 0 and !dynamic_language_slot) {
-                    const free_text = generated_position >= prompt_end;
-                    suppress_scratch.clearRetainingCapacity();
-                    if (free_text) {
-                        try suppress_scratch.appendSlice(allocator, self.config.decode.suppress_tokens);
-                        if (generated_position == prompt_end) try suppress_scratch.appendSlice(allocator, self.config.decode.begin_suppress_tokens);
-                        if (rules_active) try suppress_scratch.append(allocator, rules.no_timestamps);
-                    }
-                    const vocab = self.config.vocab_size;
-                    const window = if (free_text and rules_active)
-                        whisper_timestamps.ruleWindow(rules, generated.items, vocab)
-                    else
-                        whisper_timestamps.RuleWindow{ .text_allowed = true, .ts_min = vocab, .ts_max = vocab };
-                    const request = whisper_arch.StatsRequest{
-                        .params = .{
-                            .out_dim = @intCast(vocab),
-                            .suppress_count = @intCast(suppress_scratch.items.len),
-                            .ts_begin = if (free_text and rules_active) @intCast(rules.timestamp_begin) else @intCast(vocab),
-                            .text_allowed = @intFromBool(window.text_allowed),
-                            .ts_min = @intCast(window.ts_min),
-                            .ts_max = @intCast(window.ts_max),
-                            .eot = if (self.config.eos_token_id >= 0) @intCast(self.config.eos_token_id) else @intCast(vocab),
-                            .probe_id = if (free_text and generated_position == prompt_end and self.config.no_timestamps_id > 0) @intCast(self.config.no_timestamps_id - 1) else @intCast(vocab),
-                        },
-                        .suppress = suppress_scratch.items,
-                    };
-                    switch (try decoder.stepWith(pending, .{ .stats = request })) {
-                        .stats => |stats| step_stats = stats,
-                        .logits => |row| {
-                            native_logits = row;
-                            last_logits = row;
-                        },
-                        .none, .encoded => return error.NoDecoderOutput,
-                    }
-                } else {
-                    native_logits = try decoder.step(pending);
-                    last_logits = native_logits.?;
-                }
-            } else if (host_encoder == null) {
-                native_logits = try stage_runtime.finalVocabularyRow(allocator, self.decoder, encoder_output, dec_ids[0..dec_len], enc_mask, self.config.vocab_size, self.execution_control);
-                last_logits = native_logits.?;
-            } else {
-                const dec_seq: i64 = @intCast(dec_len);
-                const dec_shape = [_]i64{ 1, dec_seq };
-                var dec_tensor = try backends.Tensor.initInt64(allocator, "input_ids", &dec_shape, dec_ids[0..dec_len]);
-                defer dec_tensor.deinit();
-                const enc_hidden = host_encoder.?.borrowedView("encoder_hidden_states");
-                dec_outputs = if (incremental) |*state| try state.stepOutputs(dec_ids[0..dec_len], self.batch_dispatch, self.execution_control) else if (self.batch_dispatch) |dispatch| try dispatch.run(allocator, self.decoder, null, null, &.{ dec_tensor, enc_hidden }, self.execution_control) else try self.decoder.runWithControl(
-                    &.{ dec_tensor, enc_hidden },
-                    allocator,
-                    self.execution_control,
-                );
-                if (dec_outputs.len == 0) return error.NoDecoderOutput;
-                const logits = dec_outputs[0].asFloat32();
-                const vocab_size = if (dec_outputs[0].shape.len >= 3)
-                    @as(usize, @intCast(dec_outputs[0].shape[2]))
+                const vocab = self.config.vocab_size;
+                const window = if (free_text and rules_active)
+                    whisper_timestamps.ruleWindow(rules, generated.items, vocab)
                 else
-                    return error.InvalidLogitsShape;
-                if (vocab_size == 0 or logits.len < vocab_size) return error.InvalidLogitsShape;
-                last_logits = logits[logits.len - vocab_size ..];
+                    whisper_timestamps.RuleWindow{ .text_allowed = true, .ts_min = vocab, .ts_max = vocab };
+                stats_request = whisper_arch.StatsRequest{
+                    .params = .{
+                        .out_dim = @intCast(vocab),
+                        .suppress_count = @intCast(suppress_scratch.items.len),
+                        .ts_begin = if (free_text and rules_active) @intCast(rules.timestamp_begin) else @intCast(vocab),
+                        .text_allowed = @intFromBool(window.text_allowed),
+                        .ts_min = @intCast(window.ts_min),
+                        .ts_max = @intCast(window.ts_max),
+                        .eot = if (self.config.eos_token_id >= 0) @intCast(self.config.eos_token_id) else @intCast(vocab),
+                        .probe_id = if (free_text and generated_position == prompt_end and self.config.no_timestamps_id > 0) @intCast(self.config.no_timestamps_id - 1) else @intCast(vocab),
+                    },
+                    .suppress = suppress_scratch.items,
+                };
             }
+            var decoder_row = try decoder_runtime.step(dec_ids[0..dec_len], stats_request, self.batch_dispatch);
+            defer decoder_row.deinit();
+            const step_stats = decoder_row.stats;
+            const last_logits = decoder_row.logits;
             const vocab_size = last_logits.len;
             const step_ns = platform.time.monotonicNs() -| step_started;
             if (generated_position >= prompt_end) {
@@ -651,7 +593,7 @@ pub const TranscriptionPipeline = struct {
             // shape, so the device can choose tokens and keep the grammar
             // itself while the host runs one step ahead. Anything the
             // backend declines leaves the loop on the synchronous path.
-            if (native_decoder) |*decoder| {
+            if (decoder_runtime.native) |*decoder| {
                 if (temperature == 0 and step_stats != null and generated_position == prompt_end and dec_len < max_len) {
                     if (try self.decodePipelined(decoder, dec_ids, &dec_len, &generated, &suppress_scratch, rules, rules_active, &logprob_sum, timing)) {
                         completed = true;
@@ -699,15 +641,6 @@ pub const TranscriptionPipeline = struct {
         const allocator = self.allocator;
         const max_len = try self.output_token_budget.decodeEnd(dec_len.*, self.config.max_length);
         const trace = platform.env.getenvBool("TERMITE_WHISPER_TRACE_PIPELINE");
-        if (!decoder.setPipelined(true)) {
-            if (trace) std.debug.print("whisper_pipeline: declined (backend cannot pipeline)\n", .{});
-            return false;
-        }
-        defer _ = decoder.setPipelined(false);
-        // Whatever happens, no frame may outlive this call: the cache slabs
-        // it writes are freed with the decoder.
-        defer decoder.drain();
-
         suppress_scratch.clearRetainingCapacity();
         try suppress_scratch.appendSlice(allocator, self.config.decode.suppress_tokens);
         if (rules_active) try suppress_scratch.append(allocator, rules.no_timestamps);
@@ -717,14 +650,15 @@ pub const TranscriptionPipeline = struct {
         };
         const vocab = self.config.vocab_size;
         const state = whisper_timestamps.grammarState(rules, generated.items, vocab, rules_active);
-        if (!decoder.seedGrammar(&state)) {
-            if (trace) std.debug.print("whisper_pipeline: declined (grammar seed)\n", .{});
+        var stage = pending_step.PipelinedStage(session_factory.WhisperNativeDecoder).begin(decoder, &state) orelse {
+            if (trace) std.debug.print("whisper_pipeline: declined (backend pipeline or grammar seed)\n", .{});
             return false;
-        }
+        };
+        defer stage.deinit();
         var mode: u32 = ops.whisper_logits_mode_device_window | ops.whisper_logits_mode_choose;
         if (rules_active) mode |= ops.whisper_logits_mode_timestamps;
         if (eot_allowed) mode |= ops.whisper_logits_mode_eot_allowed;
-        var params = ops.WhisperLogitsParams{
+        const params = ops.WhisperLogitsParams{
             .out_dim = @intCast(vocab),
             .suppress_count = @intCast(suppress_scratch.items.len),
             .ts_begin = if (rules_active) @intCast(rules.timestamp_begin) else @intCast(vocab),
@@ -737,20 +671,9 @@ pub const TranscriptionPipeline = struct {
         };
 
         // The first in-flight step embeds the token the host just chose.
-        var slot: usize = 0;
-        params.token_slot = 0;
-        params.stats_slot = 0;
         var step_started = platform.time.monotonicNs();
-        const pending = dec_ids[decoder.positions()..dec_len.*];
-        const first = decoder.stepWith(pending, .{ .pipelined = .{ .params = params, .suppress = suppress_scratch.items } }) catch |err| switch (err) {
-            error.UnsupportedOperation => {
-                if (trace) std.debug.print("whisper_pipeline: declined (first step unsupported)\n", .{});
-                return false;
-            },
-            else => return err,
-        };
-        if (first != .encoded) return false;
-        try decoder.submit();
+        if (!try stage.encodePrefix(dec_ids[0..dec_len.*], params, suppress_scratch.items)) return false;
+        try stage.submit();
         var steps: usize = 0;
         defer if (trace) std.debug.print("whisper_pipeline: {d} steps in flight mode\n", .{steps});
 
@@ -759,18 +682,11 @@ pub const TranscriptionPipeline = struct {
             if (self.execution_control) |control| try control.update(.executing, @intCast(position), @intCast(self.config.max_length));
             // Encode the next step while this one runs; it reads the token
             // this step's choice kernel writes to `slot`.
-            var lookahead = false;
-            if (position + 1 < max_len) {
-                params.token_slot = @intCast(1 - slot);
-                params.stats_slot = @intCast(1 - slot);
-                const placeholder = [_]i64{0};
-                const next = decoder.stepWith(&placeholder, .{ .pipelined = .{ .params = params, .suppress = suppress_scratch.items, .device_token_slot = slot } }) catch |err| switch (err) {
-                    error.UnsupportedOperation => null,
-                    else => return err,
-                };
-                lookahead = next != null and next.? == .encoded;
-            }
-            const stats = (try decoder.awaitStats(slot)) orelse return error.NoDecoderOutput;
+            const lookahead = if (position + 1 < max_len)
+                try stage.encodeLookahead(params, suppress_scratch.items)
+            else
+                false;
+            const stats = try stage.awaitStats();
             steps += 1;
             if (trace and !lookahead and position + 1 < max_len) std.debug.print("whisper_pipeline: lookahead unsupported at position {d}\n", .{position});
             const now = platform.time.monotonicNs();
@@ -782,7 +698,7 @@ pub const TranscriptionPipeline = struct {
             try self.output_token_budget.consume();
             if (token == self.config.eos_token_id) {
                 // The encoded lookahead, if any, predicted past the end.
-                if (lookahead) decoder.discard();
+                if (lookahead) stage.discardLookahead();
                 return true;
             }
             dec_ids[dec_len.*] = token;
@@ -795,8 +711,7 @@ pub const TranscriptionPipeline = struct {
                 try self.output_token_budget.check();
                 return dec_len.* >= max_len;
             }
-            try decoder.submit();
-            slot = 1 - slot;
+            try stage.submitLookahead();
         }
     }
 
@@ -948,4 +863,134 @@ test "exhausted transcription fails before touching model resources" {
     var pipeline = TranscriptionPipeline.init(std.testing.allocator, undefined, undefined, undefined, .{ .max_output_tokens = 1 });
     try pipeline.output_token_budget.consume();
     try std.testing.expectError(error.InferenceOutputTokensExceeded, pipeline.transcribePcmConditioned(&.{0.1}, 16000, &.{}));
+}
+
+fn checkTranscriptionPendingFault(fail_on_encode: usize) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    if (!platform.env.getenvBool("TERMITE_WHISPER_ENABLE_PIPELINED_DECODE")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    const fixture = @import("../ops/media_residency_test.zig");
+    const Probe = struct {
+        compute: native.NativeCompute,
+        fail_on_encode: usize,
+        encodes: usize = 0,
+        submits: usize = 0,
+        waits: usize = 0,
+        active: bool = false,
+        submitted: bool = false,
+        fn get(raw: *anyopaque) *@This() {
+            const compute: *native.NativeCompute = @ptrCast(@alignCast(raw));
+            return @fieldParentPtr("compute", compute);
+        }
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .metal;
+        }
+        fn pipeline(_: *anyopaque, _: bool) bool {
+            return true;
+        }
+        fn begin(raw: *anyopaque) !bool {
+            get(raw).active = true;
+            return true;
+        }
+        fn activeFrame(raw: *anyopaque) bool {
+            return get(raw).active;
+        }
+        fn submit(raw: *anyopaque) !void {
+            const self = get(raw);
+            self.active = false;
+            self.submitted = true;
+            self.submits += 1;
+        }
+        fn wait(raw: *anyopaque) !void {
+            const self = get(raw);
+            self.submitted = false;
+            self.waits += 1;
+        }
+        fn finish(raw: *anyopaque) !void {
+            get(raw).active = false;
+        }
+        fn cancel(raw: *anyopaque) !void {
+            get(raw).active = false;
+        }
+        fn scope(_: *anyopaque) !bool {
+            return true;
+        }
+        fn regime(_: *anyopaque, _: ops.DecoderRuntimeFrameRegime) !void {}
+        fn grammar(_: *anyopaque, _: *const ops.WhisperGrammarState) bool {
+            return true;
+        }
+        fn deviceEmbedding(raw: *anyopaque, weight: ops.CT, _: usize, width: usize) !?ops.CT {
+            return try get(raw).compute.computeBackend().embeddingLookup(weight, &.{1}, 1, width);
+        }
+        fn encode(raw: *anyopaque, logits: ops.CT, _: *const ops.WhisperLogitsParams, _: []const i32) !bool {
+            const self = get(raw);
+            // Numerical Native projection really completed before this callback;
+            // frame callbacks only bound its asynchronous lifecycle for the test.
+            const values = try self.compute.computeBackend().toFloat32(logits, std.testing.allocator);
+            defer std.testing.allocator.free(values);
+            try std.testing.expectEqual(@as(usize, 4), values.len);
+            self.encodes += 1;
+            if (self.encodes == self.fail_on_encode) return error.UnsupportedOperation;
+            return true;
+        }
+        fn read(_: *anyopaque, _: usize, stats: *ops.WhisperLogitsStatsRaw) bool {
+            @memset(stats, 0);
+            stats[whisper_timestamps.stats_choice_token] = 1;
+            return true;
+        }
+    };
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    try fixture.putWeight(&weights, "model.decoder.embed_tokens.weight", &.{ 4, 4 }, null);
+    try fixture.putWeight(&weights, "model.decoder.embed_positions.weight", &.{ 8, 4 }, null);
+    try fixture.putWeight(&weights, "model.decoder.layer_norm.weight", &.{4}, 1);
+    try fixture.putWeight(&weights, "model.decoder.layer_norm.bias", &.{4}, 0);
+    var probe = Probe{ .compute = native.NativeCompute.init(a, &weights, null), .fail_on_encode = fail_on_encode };
+    defer probe.compute.deinit();
+    const base = probe.compute.computeBackend();
+    const config = whisper_arch.Config{ .d_model = 4, .decoder_layers = 0, .decoder_attention_heads = 1, .vocab_size = 4, .max_target_positions = 8 };
+    const encoder = try base.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+    var cache = whisper_arch.DecodeCache.init(&base, a, config, encoder, 1) catch |err| {
+        base.free(encoder);
+        return err;
+    };
+    const warm = try whisper_arch.decoderStepCachedLogits(&base, a, config, &.{0}, &cache);
+    a.free(warm);
+    var table = base.vtable.*;
+    table.backendKind = Probe.kind;
+    table.regions.commands = .{ .setPipelinedFrames = Probe.pipeline, .beginFrame = Probe.begin, .hasActiveFrame = Probe.activeFrame, .submitFrame = Probe.submit, .waitSubmittedFrame = Probe.wait, .submitAndWaitFrame = Probe.finish, .cancelFrame = Probe.cancel };
+    table.regions.decoder.beginPlannedComputeScope = Probe.scope;
+    table.regions.decoder.setActiveFrameRegime = Probe.regime;
+    table.regions.token_selection.writeGrammar = Probe.grammar;
+    table.regions.token_selection.encodeLogitsStats = Probe.encode;
+    table.regions.token_selection.readLogitsStats = Probe.read;
+    table.embeddingLookupDeviceToken = Probe.deviceEmbedding;
+    var backend = base;
+    backend.vtable = &table;
+    var decoder = session_factory.WhisperNativeDecoder{ .allocator = a, .cb = .{ .backend = backend, .guard = .{}, .owns_backend = false }, .config = config, .encoder_hidden = encoder, .cache = cache, .gate = null };
+    defer decoder.deinit();
+    var task = TranscriptionPipeline.init(a, undefined, undefined, undefined, .{ .vocab_size = 4, .max_length = 4, .eos_token_id = 3 });
+    var tokens = [_]i64{ 0, 1, 0, 0 };
+    var length: usize = 2;
+    var generated = std.ArrayListUnmanaged(i32).empty;
+    defer generated.deinit(a);
+    var suppressed = std.ArrayListUnmanaged(i32).empty;
+    defer suppressed.deinit(a);
+    var logprob: f64 = 0;
+    var timing = Timing{};
+    try std.testing.expectError(error.UnsupportedOperation, task.decodePipelined(&decoder, &tokens, &length, &generated, &suppressed, .{ .timestamp_begin = 4, .eot = 3, .no_timestamps = 4 }, false, &logprob, &timing));
+    try std.testing.expectEqual(fail_on_encode, probe.encodes);
+    try std.testing.expect(!probe.active and !probe.submitted);
+    try std.testing.expectEqual(@as(usize, 0), generated.items.len);
+    try std.testing.expectEqual(@as(usize, 2), length);
+    try std.testing.expectEqual(fail_on_encode - 1, probe.submits);
+    try std.testing.expectEqual(@as(usize, 1), probe.waits);
+}
+
+test "transcription initial pipeline error cannot decline after actual decoder projection" {
+    try checkTranscriptionPendingFault(1);
+}
+test "transcription lookahead error cannot publish after actual decoder projection" {
+    try checkTranscriptionPendingFault(2);
 }

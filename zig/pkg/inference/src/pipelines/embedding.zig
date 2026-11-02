@@ -711,7 +711,7 @@ pub const EmbeddingPipeline = struct {
         const mask_i32 = try allocator.alloc(i32, prepared.sequence);
         defer allocator.free(mask_i32);
         for (prepared.attention_mask, 0..) |value, index| mask_i32[index] = @intCast(value);
-        var permit = try self.session.admit(.{ .batch = 1, .sequence = prepared.sequence, .input_bytes = values.data.len + ids.data.len + mask.data.len });
+        var permit = try self.session.admitInputs(&.{ ids, mask, values }, allocator, self.execution_control);
         defer permit.deinit();
         const embeddings = try self.embedPreparedTextInputs(&.{ ids, mask, values }, mask_i32, prepared.input_ids, 1, prepared.sequence, &permit);
         defer allocator.free(embeddings);
@@ -1039,12 +1039,13 @@ pub const EmbeddingPipeline = struct {
             self.execution_gate_held = false;
             self.unlockExecution();
         };
-        var run_permit = try text_session.admit(.{
+        const signature = text_plan.signature();
+        var run_permit = try text_session.admitShapeRequest(.{ .shapes = signature.slice() }, .{
             .batch = batch,
             .sequence = effective_len,
             .input_bytes = text_plan.input_bytes,
             .host_preprocess_bytes = text_plan.temporary_bytes,
-        });
+        }, alloc, self.execution_control);
         defer run_permit.deinit();
         if (self.execution_control) |control| try control.check();
 
@@ -1146,7 +1147,8 @@ pub const EmbeddingPipeline = struct {
             self.execution_gate_held = false;
             self.unlockExecution();
         };
-        var run_permit = try text_session.admit(.{
+        const signature = text_plan.signature();
+        var run_permit = try text_session.admitShapeRequest(.{ .shapes = signature.slice() }, .{
             .batch = if (compact_policy) 1 else batch,
             .sequence = if (compact_policy) active_rows else seq_len,
             .output_bytes = if (compact_policy) batch * self.config.embedding_gemma2_dimensions * @sizeOf(f32) else null,
@@ -1156,7 +1158,7 @@ pub const EmbeddingPipeline = struct {
                 try std.math.add(usize, 256 * 1024 * 1024, try std.math.mul(usize, if (compact_policy) active_rows else total, 192 * 1024))
             else
                 0,
-        });
+        }, alloc, self.execution_control);
         defer run_permit.deinit();
         if (self.execution_control) |control| try control.check();
         var input_set = try text_plan.materialize(alloc, input_ids_tensor, attention_mask_tensor, .{});

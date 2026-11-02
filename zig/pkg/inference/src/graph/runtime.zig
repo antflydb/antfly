@@ -256,7 +256,7 @@ pub const Runtime = struct {
             .partitioned, .compiled_preferred, .compiled_required => {
                 const plan = self.plan orelse return error.MissingGraphRuntimePlan;
                 const mesh = self.mesh orelse return error.MissingGraphRuntimeMesh;
-                const frame = if (self.physical_pool) |pool| try pool.acquireWithAdmission(options.storage_admission) else null;
+                const frame = if (self.physical_pool) |pool| try pool.acquirePrepared(options.storage_admission, options.physical_frame_claim) else null;
                 var frame_finished = false;
                 defer if (frame) |active| {
                     if (!frame_finished) {

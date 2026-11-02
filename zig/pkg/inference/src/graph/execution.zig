@@ -51,6 +51,7 @@ pub const Context = struct {
     cb: *const ops.ComputeBackend,
     gpt_config: *const @import("../models/gpt.zig").Config,
     weights: ?Weights = null,
+    weight_semantics: enum { raw, traced_decoder } = .raw,
     execution_control: ?InferenceExecutionControl = null,
     model_dir: ?[]const u8 = null,
     artifact_dir: ?[]const u8 = null,
@@ -65,7 +66,10 @@ pub const Context = struct {
 
     pub fn graphWeight(self: *const Context, name: []const u8) !ops.CT {
         if (self.weights) |source| return source.get_fn(source.ptr, name);
-        return self.cb.getWeight(name);
+        return switch (self.weight_semantics) {
+            .raw => self.cb.getWeight(name),
+            .traced_decoder => gpt_arch.getTracedWeight(self.allocator, self.cb, self.gpt_config, name),
+        };
     }
 };
 

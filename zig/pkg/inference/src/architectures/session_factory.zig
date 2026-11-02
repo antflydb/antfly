@@ -141,3 +141,6 @@ pub const reclaimOneHostCacheEntryForSession = implementation.reclaimOneHostCach
 pub const memoryBudgetExceededDetail = implementation.memoryBudgetExceededDetail;
 pub const attachSharedPrefetchState = implementation.attachSharedPrefetchState;
 pub const layaResidentStats = implementation.layaResidentStats;
+
+pub const NativeSessionOptions = implementation.NativeSessionOptions;
+pub const createNativeSessionWithOptions = implementation.createNativeSessionWithOptions;

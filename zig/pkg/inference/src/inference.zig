@@ -137,6 +137,11 @@ test {
     _ = execution.reader_pool;
     _ = execution.architecture_session;
     _ = execution.decoder_checkpoint;
+    _ = execution.prepared_invocation;
+    _ = execution.decoder_pending_step;
+    _ = execution.decoder_prefill;
+    _ = execution.cached_decoder;
+    _ = execution.decoder_stage;
     _ = execution.encoder_decoder_runtime;
     _ = execution.seq2seq_runtime;
     _ = execution.sequence_pool;

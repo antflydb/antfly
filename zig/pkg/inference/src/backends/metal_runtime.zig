@@ -9314,11 +9314,52 @@ pub fn decoderRuntimeApplyAddRhsRepeat(self: anytype, lhs: MetalTensor, rhs: Met
     return output_device;
 }
 
+/// Metadata-only proof for explicit decoder targets. No upload, readback or
+/// command encoding is allowed while checking these borrowed device views.
+pub fn decoderRuntimeOutputCompatible(runtime: *RawMetalDecodeRuntime, output: MetalTensor, inputs: []const MetalTensor, dim: usize) bool {
+    if (dim == 0 or dim > std.math.maxInt(u32) or inputs.len == 0 or !output.isDevice() or output.dtype != .f32 or output.elemCount() != dim) return false;
+    const owner: *anyopaque = @ptrCast(runtime);
+    const target = output.device orelse return false;
+    if (target.ref.runtime != owner or !std.mem.eql(i32, output.shape(), inputs[0].shape())) return false;
+    const bytes = std.math.mul(usize, dim, @sizeOf(f32)) catch return false;
+    const target_end = std.math.add(usize, target.byte_offset, bytes) catch return false;
+    if (target.byte_len < bytes or target_end > target.ref.byte_len) return false;
+    for (inputs) |input| {
+        if (!input.isDevice() or input.dtype != .f32 or input.elemCount() != dim) return false;
+        const source = input.device orelse return false;
+        const source_end = std.math.add(usize, source.byte_offset, bytes) catch return false;
+        if (source.ref.runtime != owner or source.byte_len < bytes or source_end > source.ref.byte_len) return false;
+        if (source.ref.handle == target.ref.handle) {
+            if (source.byte_offset < target_end and target.byte_offset < source_end) return false;
+        }
+    }
+    return true;
+}
+
+fn decoderRequestOutput(request: anytype) ?*MetalTensor {
+    return if (@hasField(@TypeOf(request), "output")) request.output else null;
+}
+
+const DecoderOutputKind = enum(c_int) { add, add_scale, scaled_add_scale, multiply_add, multiply_add2 };
+extern fn antfly_metal_decoder_output_available(runtime: *RawMetalDecodeRuntime, kind: c_int) c_int;
+
+fn decoderOutputBuffer(runtime: *RawMetalDecodeRuntime, request: anytype, inputs: []const MetalTensor, dim: usize, kind: DecoderOutputKind) !?MetalTensor {
+    if (decoderRequestOutput(request)) |output| {
+        if (!decoderRuntimeOutputCompatible(runtime, output.*, inputs, dim)) return null;
+        if (antfly_metal_decoder_output_available(runtime, @backingInt(kind)) == 0) return null;
+        // All known writes share one protocol. Mutate the actual owner metadata
+        // so private mirrors on this target and retained aliases cannot stale.
+        output.invalidateHostMirror();
+        return try output.retainedCopy();
+    }
+    return try MetalTensor.deviceAllocate(runtime, try std.math.mul(usize, dim, @sizeOf(f32)), .private, inputs[0].shape());
+}
+
 pub fn decoderRuntimeApplyAddScale(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (request.dim == 0) return null;
-    if (std.math.approxEqAbs(f32, request.scale, 1.0, 1e-6)) {
+    if (decoderRequestOutput(request) == null and std.math.approxEqAbs(f32, request.scale, 1.0, 1e-6)) {
         return decoderRuntimeApplyAdd(self, .{
             .lhs = request.lhs,
             .rhs = request.rhs,
@@ -9327,23 +9368,37 @@ pub fn decoderRuntimeApplyAddScale(self: anytype, request: anytype, stats: anyty
     }
     if (request.lhs.elemCount() == request.rhs.elemCount() and request.lhs.elemCount() > 0 and request.lhs.isDevice() and request.rhs.isDevice()) {
         const elem_count = request.lhs.elemCount();
-        var output_device = try MetalTensor.deviceAllocate(runtime, elem_count * @sizeOf(f32), .private, request.lhs.shape());
+        var output_device = (try decoderOutputBuffer(runtime, request, &.{ request.lhs, request.rhs }, elem_count, if (std.math.approxEqAbs(f32, request.scale, 1.0, 1e-6)) .add else .add_scale)) orelse return null;
         errdefer output_device.deinit();
         stats.decoder_runtime_apply_add_calls += 1;
-        const device_rc = termite_metal_decode_runtime_apply_add_scale_device(
-            runtime,
-            request.lhs.deviceHandle(),
-            request.lhs.deviceByteOffset(),
-            request.rhs.deviceHandle(),
-            request.rhs.deviceByteOffset(),
-            elem_count,
-            request.scale,
-            output_device.deviceHandle(),
-            output_device.deviceByteOffset(),
-        );
+        const device_rc = if (std.math.approxEqAbs(f32, request.scale, 1.0, 1e-6))
+            termite_metal_decode_runtime_apply_add_device(
+                runtime,
+                request.lhs.deviceHandle(),
+                request.lhs.deviceByteOffset(),
+                request.rhs.deviceHandle(),
+                request.rhs.deviceByteOffset(),
+                elem_count,
+                output_device.deviceHandle(),
+                output_device.deviceByteOffset(),
+            )
+        else
+            termite_metal_decode_runtime_apply_add_scale_device(
+                runtime,
+                request.lhs.deviceHandle(),
+                request.lhs.deviceByteOffset(),
+                request.rhs.deviceHandle(),
+                request.rhs.deviceByteOffset(),
+                elem_count,
+                request.scale,
+                output_device.deviceHandle(),
+                output_device.deviceByteOffset(),
+            );
         if (device_rc == 0) return output_device;
         output_device.deinit();
+        if (decoderRequestOutput(request) != null and device_rc != -2) return error.CommandBufferFailed;
     }
+    if (decoderRequestOutput(request) != null) return null;
     var added = (try decoderRuntimeApplyAdd(self, .{
         .lhs = request.lhs,
         .rhs = request.rhs,
@@ -9359,7 +9414,7 @@ pub fn decoderRuntimeApplyScaledAddScale(self: anytype, request: anytype, stats:
     if (request.dim == 0) return null;
     if (request.lhs.elemCount() == request.rhs.elemCount() and request.lhs.elemCount() > 0 and request.lhs.isDevice() and request.rhs.isDevice()) {
         const elem_count = request.lhs.elemCount();
-        var output_device = try MetalTensor.deviceAllocate(runtime, elem_count * @sizeOf(f32), .private, request.lhs.shape());
+        var output_device = (try decoderOutputBuffer(runtime, request, &.{ request.lhs, request.rhs }, elem_count, .scaled_add_scale)) orelse return null;
         errdefer output_device.deinit();
         stats.decoder_runtime_apply_add_calls += 1;
         const device_rc = termite_metal_decode_runtime_apply_scaled_add_scale_device(
@@ -9376,7 +9431,9 @@ pub fn decoderRuntimeApplyScaledAddScale(self: anytype, request: anytype, stats:
         );
         if (device_rc == 0) return output_device;
         output_device.deinit();
+        if (decoderRequestOutput(request) != null and device_rc != -2) return error.CommandBufferFailed;
     }
+    if (decoderRequestOutput(request) != null) return null;
 
     var scaled_lhs = (try decoderRuntimeApplyScale(self, request.lhs, request.lhs_scale)) orelse return null;
     defer scaled_lhs.deinit();
@@ -9394,7 +9451,7 @@ pub fn decoderRuntimeApplyMultiplyAdd(self: anytype, request: anytype, stats: an
     if (request.dim == 0) return null;
     if (!request.lhs.isDevice() or !request.rhs.isDevice() or !request.addend.isDevice()) return null;
     if (request.lhs.elemCount() != request.dim or request.rhs.elemCount() != request.dim or request.addend.elemCount() != request.dim) return null;
-    var output_device = try MetalTensor.deviceAllocate(runtime, request.dim * @sizeOf(f32), .private, request.addend.shape());
+    var output_device = (try decoderOutputBuffer(runtime, request, &.{ request.addend, request.lhs, request.rhs }, request.dim, .multiply_add)) orelse return null;
     errdefer output_device.deinit();
     stats.decoder_runtime_apply_add_calls += 1;
     const device_rc = termite_metal_decode_runtime_apply_multiply_add_device(
@@ -9411,6 +9468,7 @@ pub fn decoderRuntimeApplyMultiplyAdd(self: anytype, request: anytype, stats: an
     );
     if (device_rc == 0) return output_device;
     output_device.deinit();
+    if (decoderRequestOutput(request) != null and device_rc != -2) return error.CommandBufferFailed;
     return null;
 }
 
@@ -9426,7 +9484,7 @@ pub fn decoderRuntimeApplyMultiplyAdd2(self: anytype, request: anytype, stats: a
     {
         return null;
     }
-    var output_device = try MetalTensor.deviceAllocate(runtime, request.dim * @sizeOf(f32), .private, request.lhs0.shape());
+    var output_device = (try decoderOutputBuffer(runtime, request, &.{ request.lhs0, request.rhs0, request.lhs1, request.rhs1 }, request.dim, .multiply_add2)) orelse return null;
     errdefer output_device.deinit();
     stats.decoder_runtime_apply_add_calls += 1;
     const device_rc = termite_metal_decode_runtime_apply_multiply_add2_device(
@@ -9445,6 +9503,7 @@ pub fn decoderRuntimeApplyMultiplyAdd2(self: anytype, request: anytype, stats: a
     );
     if (device_rc == 0) return output_device;
     output_device.deinit();
+    if (decoderRequestOutput(request) != null and device_rc != -2) return error.CommandBufferFailed;
     return null;
 }
 

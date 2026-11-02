@@ -331,7 +331,7 @@ pub const CTCRecognizer = struct {
         var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, pixel_values);
         defer input_tensor.deinit();
 
-        var permit = try self.session.admit(try self.session.planRun(&.{input_tensor}, null));
+        var permit = try self.session.admitInputs(&.{input_tensor}, self.allocator, control);
         defer permit.deinit();
         if (try permit.runResidentWithControl(&.{input_tensor}, self.allocator, control)) |resident_outputs| {
             var resident = resident_outputs;

@@ -440,9 +440,10 @@ fn runPackedBatch(a: std.mem.Allocator, plan: std.mem.Allocator, scratch: std.me
 }
 
 fn runPackedRow(session: Session, scratch: std.mem.Allocator, row: tree.Row, questions: usize, control: ?Control) ![]Tensor {
+    const TensorInfo = @import("../backends/tensor.zig").TensorInfo;
     const n: i64 = @intCast(row.ids.len);
     const q: i64 = @intCast(questions);
-    var request = try session.planShapes(&.{
+    const signature = [_]TensorInfo{
         .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, n } },
         .{ .name = "position_ids", .dtype = .i64, .shape = &.{ 1, n } },
         .{ .name = "token_segment", .dtype = .i64, .shape = &.{ 1, n } },
@@ -450,9 +451,10 @@ fn runPackedRow(session: Session, scratch: std.mem.Allocator, row: tree.Row, que
         .{ .name = "token_qtype", .dtype = .i64, .shape = &.{ 1, n } },
         .{ .name = "marker_pos", .dtype = .i64, .shape = &.{ q, @intCast(row.width) } },
         .{ .name = "anchor_pos", .dtype = .i64, .shape = &.{ q, 1 } },
-    }, 1);
+    };
+    var request = try session.planShapes(&signature, 1);
     request.host_preprocess_bytes = request.input_bytes;
-    var execution = try session.admit(request);
+    var execution = try session.admitShapeRequest(.{ .shapes = &signature }, request, scratch, control);
     defer execution.deinit();
     var inputs: [7]Tensor = undefined;
     var initialized: usize = 0;

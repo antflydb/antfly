@@ -354,6 +354,17 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
     return openHostSession(allocator, model_path, override, .{});
 }
 
+pub const NativeSessionOptions = struct { observe_allocations: bool = false };
+/// Observe allocator-owned model storage from construction, including lazy
+/// stores/prepared caches. Mapped file extents remain a separate memory scope.
+pub fn createNativeSessionWithOptions(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride, options: NativeSessionOptions) !Session {
+    if (!options.observe_allocations) return createNativeSessionWithTaskOverride(allocator, model_path, override);
+    if (@import("allocation_observer.zig").State.forAllocator(allocator) != null) return openHostSession(allocator, model_path, override, .{});
+    const observer = try @import("allocation_observer.zig").State.create(allocator, .from_owner_creation);
+    defer observer.release();
+    return openHostSession(observer.allocator(), model_path, override, .{});
+}
+
 /// Host preparation selects the final owner before installing prefetch guards.
 /// CUDA upload retains packed encoder storage and materializes weights that
 /// would otherwise be lazy; ordinary execution retains its CPU policy.

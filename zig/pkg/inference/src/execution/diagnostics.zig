@@ -13,8 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Optional snapshots. Disabled execution performs no counter collection,
-//! provider sampling or locking; snapshots never expose mutable backend owners.
+//! Optional snapshots. Disabled execution starts no observation scopes or
+//! provider sampling. An explicitly enabled allocation observer stays installed
+//! until owner retirement so escaped allocations keep a valid release path.
+//! Snapshots never expose mutable backend owners.
 const std = @import("std");
 const ops = @import("../ops/ops.zig");
 pub const ExecutionStats = @import("stats.zig").ExecutionStats;
@@ -58,6 +60,7 @@ pub const Diagnostics = struct {
     }
     pub fn begin(self: *const Diagnostics, backend: *const ops.ComputeBackend) ?Start {
         if (!self.isEnabled()) return null;
+        backend.enableAllocationObservation();
         return .{ .scope = observation.Scope.init(), .runtime = backend.debugTimingSnapshot().runtime };
     }
     /// Every caller defers this immediately after begin, including error exits.
@@ -105,6 +108,9 @@ test "native execution observations include nested work and unwind every failed 
         defer result.deinit(&executable.runtime);
         const measured = executable.diagnostics.snapshot().?;
         try std.testing.expect(measured.runtime.submission != null);
+        const observed = measured.runtime.native_allocations.?.compute.?;
+        try std.testing.expectEqual(@import("allocation_observer.zig").Coverage.since_enable, observed.coverage);
+        try std.testing.expect(observed.counter_scope == .owner_interval);
         try std.testing.expectEqual(result.stats.assigned_kernel_dispatches, measured.runtime.submission.?.native_assigned_dispatches);
         try std.testing.expect(measured.runtime.submission.?.native_assigned_dispatches > 0);
         const values = try backend.toFloat32(result.outputs[0], a);

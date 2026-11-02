@@ -74,6 +74,21 @@ const DeviceBufferRef = struct {
     /// owner has no back-reference, so there is no ownership cycle. Retained
     /// views share this record and release the bank pin with their last view.
     physical_lease: ?*@import("../ops/physical_storage.zig").Lease = null,
+    write_generation: u64 = 0,
+    // A leased view's strong Lease pin keeps this canonical allocation Ref
+    // alive. Ordinary aliases share their Ref; there is no owning back-edge.
+    write_owner: ?*DeviceBufferRef = null,
+
+    fn generation(self: *const DeviceBufferRef) ?u64 {
+        const owner = self.write_owner orelse self;
+        // A retained/borrowed external handle cannot prove all its writers.
+        if (!owner.release_on_drop or !owner.recycle_on_drop) return null;
+        return owner.write_generation;
+    }
+    fn noteMutation(self: *DeviceBufferRef) void {
+        const owner = self.write_owner orelse self;
+        owner.write_generation +%= 1;
+    }
 };
 
 pub const MemoryStats = struct {
@@ -419,6 +434,7 @@ pub const DeviceStorage = struct {
     /// When present, the host fields (`data`/`len`) point to this cached
     /// mirror. `mirror_owned` tracks whether deinit must free it.
     mirror_owned: bool = false,
+    mirror_generation: u64 = 0,
 };
 
 extern fn termite_metal_buffer_alloc(
@@ -622,6 +638,7 @@ pub const MetalTensor = struct {
             .recycle_on_drop = false,
             .allocator = allocator,
             .physical_lease = lease,
+            .write_owner = device.ref.write_owner orelse device.ref,
         };
         lease.retain();
         memory_stats.device_borrowed_tensors_created += 1;
@@ -810,6 +827,7 @@ pub const MetalTensor = struct {
                 view.data = self.data;
                 view.len = self.len;
                 view.device.?.mirror_owned = d.mirror_owned;
+                view.device.?.mirror_generation = d.mirror_generation;
             }
             return view;
         }
@@ -994,6 +1012,7 @@ pub const MetalTensor = struct {
 
     pub fn invalidateHostMirror(self: *MetalTensor) void {
         if (self.device) |*d| {
+            d.ref.noteMutation();
             if (d.mirror_owned and self.owned_by_c_allocator) {
                 noteHostMirrorFree(self.len * @sizeOf(f32));
                 std.heap.c_allocator.free(self.data[0..self.len]);
@@ -1108,7 +1127,8 @@ pub const MetalTensor = struct {
             if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) {
                 return error.MetalFrameSyncFailed;
             }
-            if (frame_was_active and dev.mirror_owned) {
+            const generation = dev.ref.generation();
+            if (dev.mirror_owned and (frame_was_active or generation == null or dev.mirror_generation != generation.?)) {
                 // Owned mirrors are Private-storage snapshots (Shared
                 // mirrors alias device memory and are coherent after the
                 // flush). Refresh the snapshot so writes queued since it was
@@ -1121,6 +1141,7 @@ pub const MetalTensor = struct {
                     dev.byte_len,
                 );
             }
+            dev.mirror_generation = dev.ref.generation() orelse 0;
             return self.data[0..self.len];
         }
 
@@ -1141,6 +1162,7 @@ pub const MetalTensor = struct {
             self.owned_by_c_allocator = false;
             dev.mirror_owned = false;
             memory_stats.shared_host_aliases += 1;
+            dev.mirror_generation = dev.ref.generation() orelse 0;
             return self.data[0..self.len];
         }
 
@@ -1158,6 +1180,7 @@ pub const MetalTensor = struct {
         self.len = buf.len;
         self.owned_by_c_allocator = true;
         dev.mirror_owned = true;
+        dev.mirror_generation = dev.ref.generation() orelse 0;
         noteHostMirrorAlloc(dev.byte_len);
         return buf;
     }

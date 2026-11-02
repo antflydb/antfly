@@ -19,6 +19,8 @@ const Tensor = @import("tensor.zig").Tensor;
 const TensorInfo = @import("tensor.zig").TensorInfo;
 const BackendType = @import("backends.zig").BackendType;
 const memory = @import("../runtime/tier/memory.zig");
+const invocation = @import("../execution/prepared_invocation.zig");
+const storage_admission = @import("../execution/storage_admission.zig");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const Interruption = @import("../execution_control.zig").Interruption;
 
@@ -173,11 +175,39 @@ pub const RunAdmission = struct {
         return self.estimateRequest(try RunRequest.fromTensors(inputs), output_info);
     }
 
+    pub const RequestPlan = struct {
+        /// Host preprocessing/input staging and materialized output/KV peaks.
+        protected: memory.AdmissionAmounts,
+        /// Conservative execution scratch; physical coverage must prove any replacement.
+        compatibility: memory.AdmissionAmounts,
+        required: memory.AdmissionAmounts,
+        retained_host_credit: usize,
+        retained_backend_credit: usize,
+
+        /// Resolve the hard-limit peak without separately retained permits.
+        /// Defer checked addition until required, preserving the compatibility
+        /// estimator's behavior when only the credited peak is representable.
+        pub fn uncredited(self: RequestPlan) !memory.AdmissionAmounts {
+            var amounts = self.required;
+            amounts.host_scratch_bytes = try addBytes(amounts.host_scratch_bytes, self.retained_host_credit);
+            amounts.backend_scratch_bytes = try addBytes(amounts.backend_scratch_bytes, self.retained_backend_credit);
+            return amounts;
+        }
+    };
+
     pub fn estimateRequest(
         self: RunAdmission,
         request: RunRequest,
         output_info: []const TensorInfo,
     ) !memory.AdmissionAmounts {
+        return (try self.planRequest(request, output_info)).required;
+    }
+
+    pub fn planRequest(
+        self: RunAdmission,
+        request: RunRequest,
+        output_info: []const TensorInfo,
+    ) !RequestPlan {
         const input_bytes = request.input_bytes;
         const reference_shape = [_]i64{
             std.math.cast(i64, request.batch) orelse return error.ResourceLimitExceeded,
@@ -208,22 +238,32 @@ pub const RunAdmission = struct {
             host_output_peak,
         );
 
-        return switch (self.backend_class) {
-            .cpu => .{
-                .host_scratch_bytes = try addBytes(host_io_peak, workspace),
-                .host_kv_bytes = host_kv_peak,
-            },
+        const protected = memory.AdmissionAmounts{
+            .host_scratch_bytes = host_io_peak,
+            .host_kv_bytes = host_kv_peak,
+        };
+        const retained_backend_credit = if (self.backend_workspace_reserved)
+            0
+        else
+            @min(workspace, request.retained_backend_workspace_bytes);
+        const compatibility: memory.AdmissionAmounts = switch (self.backend_class) {
+            .cpu => .{ .host_scratch_bytes = workspace },
             .gpu => .{
-                // Request inputs and materialized outputs occupy shared host
-                // RAM. Device staging, activations, and outputs share the
-                // backend workspace.
-                .host_scratch_bytes = host_io_peak,
-                .host_kv_bytes = host_kv_peak,
+                // Request IO remains protected host storage. Device staging,
+                // activations and outputs share this compatibility workspace.
                 .backend_scratch_bytes = if (self.backend_workspace_reserved)
                     0
                 else
-                    workspace - @min(workspace, request.retained_backend_workspace_bytes),
+                    workspace - retained_backend_credit,
             },
+        };
+        const required = try protected.merge(compatibility);
+        return .{
+            .protected = protected,
+            .compatibility = compatibility,
+            .required = required,
+            .retained_host_credit = request.pre_admitted_host_bytes,
+            .retained_backend_credit = if (self.backend_class == .gpu) retained_backend_credit else 0,
         };
     }
 
@@ -761,6 +801,7 @@ pub const Session = struct {
         }
     };
 
+    invocation_services: ?*const invocation.Services = null,
     model_lifetime: ?*ModelLifetime = null,
     model_contract: ModelContract = .{},
     compute_backend_provider: ?ComputeBackendProvider = null,
@@ -855,6 +896,13 @@ pub const Session = struct {
 
     /// Run a forward pass with the given input tensors.
     pub fn run(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
+        if (self.preparesInvocation()) {
+            var permit = try self.admitInputs(inputs, allocator, null);
+            defer permit.deinit();
+            const outputs = try permit.run(inputs, allocator);
+            errdefer deinitTensorSlice(outputs, allocator);
+            return attachOutputAdmission(outputs, allocator, &permit.lease, self.resourcePin());
+        }
         var resource_lease = if (self.run_admission) |admission|
             try admission.acquireRequest(try self.planRun(inputs, null), self.outputInfo())
         else
@@ -871,6 +919,13 @@ pub const Session = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) ![]Tensor {
+        if (self.preparesInvocation()) {
+            var permit = try self.admitInputs(inputs, allocator, control);
+            defer permit.deinit();
+            const outputs = try permit.runWithControl(inputs, allocator, control);
+            errdefer deinitTensorSlice(outputs, allocator);
+            return attachOutputAdmission(outputs, allocator, &permit.lease, self.resourcePin());
+        }
         const active = control orelse return self.run(inputs, allocator);
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.interruption());
@@ -975,6 +1030,59 @@ pub const Session = struct {
             }
         }
         return outputs;
+    }
+
+    /// Select exact code and warm storage before acquiring its request peak.
+    pub fn admitInputs(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !RunPermit {
+        return self.admitShapeRequest(.{ .tensors = inputs }, try self.planRun(inputs, null), allocator, control);
+    }
+
+    pub fn admitShapes(self: Session, inputs: []const TensorInfo, batch: usize, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !RunPermit {
+        return self.admitShapeRequest(.{ .shapes = inputs }, try self.planShapes(inputs, batch), allocator, control);
+    }
+
+    /// Caller-supplied request preserves preprocessing/retained-input policy.
+    /// Shapes are consumed synchronously and never borrowed by the permit.
+    pub fn admitShapeRequest(self: Session, shapes: ShapeInputs, request: RunRequest, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !RunPermit {
+        var boundary = if (control) |active| try active.enterUninterruptible(self.interruption()) else null;
+        defer if (boundary) |*scope| scope.deinit();
+        var selected = try invocation.prepare(self, shapes, allocator, control);
+        errdefer if (selected) |*prepared| prepared.deinit();
+        var physical_credit = memory.AdmissionAmounts{};
+        const lease = if (self.run_admission) |admission| blk: {
+            if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
+            const plan = try admission.planRequest(request, self.outputInfo());
+            var required = plan.required;
+            if (selected) |*prepared| {
+                // Physical capacity is additive until numerical coverage proves
+                // which compatibility scratch it replaces. Never guess credit
+                // from a planned allocation or subtract protected IO/output.
+                prepared.requirement.protected = plan.protected;
+                prepared.requirement.compatibility = plan.compatibility;
+                required = try plan.required.merge(prepared.requirement.physical);
+                const full = try (try plan.uncredited()).merge(prepared.requirement.physical);
+                if (!try full.fitsLimits(admission.limits)) return error.ResourceLimitExceeded;
+                const warm = prepared.requirement.warm_credit;
+                physical_credit.host_scratch_bytes = prepared.requirement.physical.host_scratch_bytes -| warm.host_scratch_bytes;
+                physical_credit.backend_scratch_bytes = prepared.requirement.physical.backend_scratch_bytes -| warm.backend_scratch_bytes;
+                required.host_scratch_bytes -= @min(warm.host_scratch_bytes, prepared.requirement.physical.host_scratch_bytes);
+                required.backend_scratch_bytes -= @min(warm.backend_scratch_bytes, prepared.requirement.physical.backend_scratch_bytes);
+            }
+            break :blk admission.controller.tryAcquire(admission.backend_class, admission.limits, required, admission.check_live_memory) catch |err| retry: {
+                if (err != error.ResourceTemporarilyUnavailable) return err;
+                const prepared = if (selected) |*value| value else return err;
+                const reclaim = prepared.reclaim_idle orelse return err;
+                if (!try reclaim(prepared, control)) return err;
+                if (control) |active| try active.check();
+                break :retry try admission.controller.tryAcquire(admission.backend_class, admission.limits, required, admission.check_live_memory);
+            };
+        } else null;
+        return self.retainPermit(.{ .session = self, .request = request, .lease = lease, .prepared = selected, .physical_credit = physical_credit });
+    }
+
+    fn preparesInvocation(self: Session) bool {
+        const services = self.invocation_services orelse return false;
+        return services.accepts(self);
     }
 
     /// Reserve the full request peak before preprocessing allocates input
@@ -1244,7 +1352,7 @@ pub const Session = struct {
             };
         }
         const batch = if (info.len > 0) positiveDimension(info[0].shape, 0) else 1;
-        var permit = try self.admit(try self.planShapes(info, batch));
+        var permit = try self.admitShapeRequest(.{ .shapes = info }, try self.planShapes(info, batch), allocator, control);
         defer permit.deinit();
         var outputs = (try permit.runStageInputsWithinBoundary(inputs, allocator, control)) orelse return null;
         std.debug.assert(outputs.resource_lease == null);
@@ -1364,6 +1472,14 @@ pub const Session = struct {
     }
 
     pub fn runResident(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator) !?ResidentOutputs {
+        if (self.preparesInvocation()) {
+            var permit = try self.admitInputs(inputs, allocator, null);
+            defer permit.deinit();
+            var outputs = (try permit.runResident(inputs, allocator)) orelse return null;
+            outputs.resource_lease = permit.lease;
+            permit.lease = null;
+            return outputs;
+        }
         if (self.vtable.runResident) |run_resident| {
             var resource_lease = if (self.run_admission) |admission|
                 try admission.acquire(inputs, self.outputInfo())
@@ -1383,6 +1499,20 @@ pub const Session = struct {
     }
 
     pub fn runResidentInputs(self: Session, inputs: []const ResidentInput, allocator: std.mem.Allocator) !?ResidentOutputs {
+        if (self.preparesInvocation()) {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const info = try residentShapeInfo(self, inputs, arena.allocator());
+            var request = try self.planShapes(info, if (info.len > 0) positiveDimension(info[0].shape, 0) else 1);
+            request.input_bytes = 0;
+            for (inputs) |input| request.input_bytes = try addBytes(request.input_bytes, input.estimated_bytes);
+            var permit = try self.admitShapeRequest(.{ .shapes = info }, request, allocator, null);
+            defer permit.deinit();
+            var outputs = (try permit.runResidentInputs(inputs, allocator)) orelse return null;
+            outputs.resource_lease = permit.lease;
+            permit.lease = null;
+            return outputs;
+        }
         if (self.vtable.runResidentInputs) |run_resident_inputs| {
             var resource_lease = if (self.run_admission) |admission|
                 try admission.acquireResidentInputs(inputs, self.outputInfo())
@@ -1412,11 +1542,120 @@ pub const Session = struct {
 pub const RunPermit = struct {
     session: Session,
     resource_pin: ?Session.ModelLifetime.ResourcePin = null,
+    prepared: ?invocation.PreparedInvocation = null,
+    physical_credit: memory.AdmissionAmounts = .{},
+    invocation_started: bool = false,
     lease: ?memory.AdmissionLease,
     request: ?RunRequest = null,
     execution_yielded: bool = false,
 
+    fn retirePrepared(self: *RunPermit) void {
+        if (self.prepared) |*selected| selected.deinit();
+        self.prepared = null;
+        self.physical_credit = .{};
+    }
+
+    fn reservePhysical(raw: *anyopaque, allocator: std.mem.Allocator, kind: @import("../graph/backend_contracts.zig").BackendKind, class: @import("../execution/storage_accounting.zig").Class, bytes: usize) !storage_admission.Reservation {
+        const self: *RunPermit = @ptrCast(@alignCast(raw));
+        const policy = self.session.run_admission orelse return error.UnsupportedPhysicalStorageAdmission;
+        const source = if (self.lease) |*lease| lease else return error.MissingRunAdmission;
+        const lifetime: ?storage_admission.Lifetime = if (self.resource_pin) |pin| if (pin.retain_fn) |retain| .{ .context = pin.ptr, .retain_infallible = retain, .release = pin.release_fn } else null else null;
+        return storage_admission.fromRunLease(allocator, source, .{
+            .controller = policy.controller,
+            .backend_class = policy.backend_class,
+            .limits = policy.limits,
+            .check_live_memory = policy.check_live_memory,
+            .credit = &self.physical_credit,
+            .lifetime = lifetime,
+        }, kind, class, bytes);
+    }
+
+    fn storageCapability(self: *RunPermit) ?storage_admission.Capability {
+        const policy = self.session.run_admission orelse return null;
+        if (self.lease == null) return null;
+        return .{ .identity = .{ .controller = policy.controller, .backend_class = policy.backend_class }, .context = self, .reserve_fn = reservePhysical };
+    }
+
+    fn prepareForInputs(self: *RunPermit, inputs: invocation.Inputs, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !void {
+        if (self.prepared != null or !self.session.preparesInvocation()) return;
+        switch (inputs) {
+            .host => |host| self.prepared = try invocation.prepare(self.session, .{ .tensors = host }, allocator, control),
+            .resident => |resident| {
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                const info = try residentShapeInfo(self.session, resident, arena.allocator());
+                self.prepared = try invocation.prepare(self.session, .{ .shapes = info }, allocator, control);
+            },
+        }
+        // Compatibility permits were already acquired without shape selection.
+        // New physical allocations receive separately admitted deficits; none
+        // of their protected legacy quota is claimed as physical credit.
+    }
+
+    fn executePrepared(self: *RunPermit, inputs: invocation.Inputs, placement: invocation.Placement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?invocation.Result {
+        if (self.prepared == null and !self.session.preparesInvocation()) return null;
+        if (self.prepared) |selected| if (selected.executed) self.retirePrepared();
+        var boundary = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
+        defer if (boundary) |*scope| scope.deinit();
+        try self.prepareForInputs(inputs, allocator, control);
+        const selected = if (self.prepared) |*prepared| prepared else return null;
+        defer self.retirePrepared();
+        var result = try selected.run(inputs, placement, allocator, control, self.storageCapability());
+        if (control) |active| active.check() catch |err| {
+            switch (result) {
+                .host => |outputs| deinitTensorSlice(outputs, allocator),
+                .resident => |outputs| {
+                    var owned = outputs;
+                    owned.deinit();
+                },
+            }
+            return err;
+        };
+        if (result == .resident) self.session.pinResident(&result.resident);
+        self.invocation_started = true;
+        return result;
+    }
+
+    fn executePreparedResident(self: *RunPermit, inputs: invocation.Inputs, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?ResidentOutputs {
+        if (try self.executePrepared(inputs, .resident, allocator, control)) |result| {
+            var outputs = result.resident;
+            self.session.pinResident(&outputs);
+            return outputs;
+        }
+        return null;
+    }
+
+    fn acquireExecutionInputs(self: *RunPermit, inputs: invocation.Inputs, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !RunPermit {
+        var request = self.request orelse return error.MissingRunRequest;
+        request.pre_admitted_host_bytes = @min(if (self.lease) |lease| lease.amounts.host_scratch_bytes else 0, try addBytes(request.input_bytes, request.host_preprocess_bytes));
+        return switch (inputs) {
+            .host => |host| self.session.admitShapeRequest(.{ .tensors = host }, request, allocator, control),
+            .resident => |resident| blk: {
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                const info = try residentShapeInfo(self.session, resident, arena.allocator());
+                break :blk self.session.admitShapeRequest(.{ .shapes = info }, request, allocator, control);
+            },
+        };
+    }
+
     fn resolveGeometry(self: *RunPermit, inputs: []const Tensor) !void {
+        if (self.invocation_started and !self.execution_yielded and self.session.preparesInvocation()) {
+            const actual = try self.session.planRun(inputs, null);
+            const previous = self.request orelse return error.MissingRunRequest;
+            if (actual.batch != previous.batch or actual.sequence != previous.sequence or actual.input_bytes != previous.input_bytes) {
+                _ = try self.yieldExecution();
+                var next = previous;
+                next.batch = actual.batch;
+                next.sequence = actual.sequence;
+                next.input_bytes = actual.input_bytes;
+                next.output_bytes = actual.output_bytes;
+                next.output_kv_bytes = actual.output_kv_bytes;
+                next.workspace_bytes = actual.workspace_bytes;
+                self.request = next;
+            }
+        }
+
         const request = self.request orelse return;
         if (self.session.vtable.runGeometry == null and self.session.output_geometry == null and self.session.cached_decoder_geometry == null) return;
         const plan = try self.session.planRun(inputs, null);
@@ -1441,15 +1680,10 @@ pub const RunPermit = struct {
         if (self.execution_yielded) return true;
         const request = self.request orelse return false;
         const resident = (try addBytes(request.input_bytes, request.host_preprocess_bytes)) - request.pre_admitted_host_bytes;
+        self.retirePrepared();
         try self.retainHostBytes(resident);
         self.execution_yielded = true;
         return true;
-    }
-
-    fn acquireExecution(self: *RunPermit) !RunPermit {
-        var request = self.request.?;
-        request.pre_admitted_host_bytes = try addBytes(request.input_bytes, request.host_preprocess_bytes);
-        return self.session.admit(request);
     }
 
     /// Drop transient forward scratch once only materialized outputs remain.
@@ -1464,6 +1698,7 @@ pub const RunPermit = struct {
     ) ![]Tensor {
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) return self.runWithControl(inputs, allocator, null);
+        if (try self.executePrepared(.{ .host = inputs }, .host, allocator, null)) |result| return result.host;
         return self.session.vtable.run(self.session.ptr, inputs, allocator);
     }
 
@@ -1475,12 +1710,13 @@ pub const RunPermit = struct {
     ) ![]Tensor {
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) {
-            var execution = try self.acquireExecution();
+            var execution = try self.acquireExecutionInputs(.{ .host = inputs }, allocator, control);
             defer execution.deinit();
             const outputs = try execution.runWithControl(inputs, allocator, control);
             errdefer deinitTensorSlice(outputs, allocator);
             return Session.attachOutputAdmission(outputs, allocator, &execution.lease, self.session.resourcePin());
         }
+        if (try self.executePrepared(.{ .host = inputs }, .host, allocator, control)) |result| return result.host;
         const active = control orelse return self.run(inputs, allocator);
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
@@ -1507,7 +1743,7 @@ pub const RunPermit = struct {
         if (self.session.vtable.hasLayaDecisions) |supported| if (!supported(self.session.ptr)) return null;
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) {
-            var execution = try self.acquireExecution();
+            var execution = try self.acquireExecutionInputs(.{ .host = inputs }, allocator, control);
             defer execution.deinit();
             const outputs = (try execution.runLayaDecisionsWithControl(inputs, allocator, control)) orelse return null;
             errdefer deinitTensorSlice(outputs, allocator);
@@ -1530,6 +1766,7 @@ pub const RunPermit = struct {
     ) !?ResidentOutputs {
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) return self.runResidentWithControl(inputs, allocator, null);
+        if (try self.executePreparedResident(.{ .host = inputs }, allocator, null)) |outputs| return outputs;
         const run_resident = self.session.vtable.runResident orelse return null;
         var outputs = (try run_resident(self.session.ptr, inputs, allocator)) orelse return null;
         self.session.pinResident(&outputs);
@@ -1544,7 +1781,7 @@ pub const RunPermit = struct {
     ) !?ResidentOutputs {
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) {
-            var execution = try self.acquireExecution();
+            var execution = try self.acquireExecutionInputs(.{ .host = inputs }, allocator, control);
             defer execution.deinit();
             var outputs = (try execution.runResidentWithControl(inputs, allocator, control)) orelse return null;
             std.debug.assert(outputs.resource_lease == null);
@@ -1553,6 +1790,7 @@ pub const RunPermit = struct {
             self.session.pinResident(&outputs);
             return outputs;
         }
+        if (try self.executePreparedResident(.{ .host = inputs }, allocator, control)) |outputs| return outputs;
         const active = control orelse return self.runResident(inputs, allocator);
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
@@ -1573,7 +1811,12 @@ pub const RunPermit = struct {
         if (!self.session.supportsStageInputs(inputs)) return null;
         if (control != null and self.session.vtable.runResidentInputsWithControl == null) return null;
         if (self.execution_yielded) {
-            var execution = try self.acquireExecution();
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const info = try stageShapeInfo(self.session, inputs, arena.allocator());
+            var request = self.request orelse return error.MissingRunRequest;
+            request.pre_admitted_host_bytes = @min(if (self.lease) |lease| lease.amounts.host_scratch_bytes else 0, try addBytes(request.input_bytes, request.host_preprocess_bytes));
+            var execution = try self.session.admitShapeRequest(.{ .shapes = info }, request, allocator, control);
             defer execution.deinit();
             var outputs = (try execution.runStageInputsWithControl(inputs, allocator, control)) orelse return null;
             std.debug.assert(outputs.resource_lease == null);
@@ -1610,6 +1853,7 @@ pub const RunPermit = struct {
             };
             initialized += 1;
         }
+        if (try self.executePreparedResident(.{ .resident = resident }, allocator, control)) |outputs| return outputs;
         var outputs = (if (control) |active|
             try self.session.vtable.runResidentInputsWithControl.?(self.session.ptr, resident, allocator, active)
         else
@@ -1626,6 +1870,7 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
     ) !?ResidentOutputs {
         if (self.execution_yielded) return self.runResidentInputsWithControl(inputs, allocator, null);
+        if (try self.executePreparedResident(.{ .resident = inputs }, allocator, null)) |outputs| return outputs;
         const run_resident_inputs = self.session.vtable.runResidentInputs orelse
             return null;
         var outputs = (try run_resident_inputs(self.session.ptr, inputs, allocator)) orelse return null;
@@ -1640,7 +1885,7 @@ pub const RunPermit = struct {
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
         if (self.execution_yielded) {
-            var execution = try self.acquireExecution();
+            var execution = try self.acquireExecutionInputs(.{ .resident = inputs }, allocator, control);
             defer execution.deinit();
             var outputs = (try execution.runResidentInputsWithControl(inputs, allocator, control)) orelse return null;
             std.debug.assert(outputs.resource_lease == null);
@@ -1649,6 +1894,7 @@ pub const RunPermit = struct {
             self.session.pinResident(&outputs);
             return outputs;
         }
+        if (try self.executePreparedResident(.{ .resident = inputs }, allocator, control)) |outputs| return outputs;
         const active = control orelse return self.runResidentInputs(inputs, allocator);
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
@@ -1680,6 +1926,7 @@ pub const RunPermit = struct {
     /// Reduce two independently owned leases without merging their external
     /// process-owner tokens. All required capacity must already be admitted.
     pub fn retainForRunWithSupplement(self: *RunPermit, extra: *RunPermit, request: RunRequest) !void {
+        self.retirePrepared();
         if (extra.session.ptr != self.session.ptr or extra.session.vtable != self.session.vtable or self.execution_yielded or extra.execution_yielded) return error.InvalidAdmissionLeaseReduction;
         const admission = self.session.run_admission orelse {
             self.request = request;
@@ -1701,6 +1948,7 @@ pub const RunPermit = struct {
     }
 
     pub fn retainForRun(self: *RunPermit, request: RunRequest) !void {
+        self.retirePrepared();
         if (self.execution_yielded) return error.InvalidAdmissionLeaseReduction;
         if (self.lease) |*lease| {
             const admission = self.session.run_admission orelse return error.InvalidAdmissionLeaseReduction;
@@ -1724,7 +1972,7 @@ pub const RunPermit = struct {
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
         if (self.execution_yielded) {
-            var execution = try self.acquireExecution();
+            var execution = try self.acquireExecutionInputs(.{ .host = inputs }, allocator, control);
             defer execution.deinit();
             var outputs = (try execution.runResidentTextEmbeddingWithControl(inputs, request, allocator, control)) orelse return null;
             std.debug.assert(outputs.resource_lease == null);
@@ -1748,12 +1996,34 @@ pub const RunPermit = struct {
     }
 
     pub fn deinit(self: *RunPermit) void {
+        self.retirePrepared();
         if (self.lease) |*lease| lease.release();
         self.lease = null;
         if (self.resource_pin) |pin| pin.release();
         self.resource_pin = null;
     }
 };
+
+fn residentShapeInfo(session: Session, inputs: []const ResidentInput, allocator: std.mem.Allocator) ![]TensorInfo {
+    if (inputs.len != session.inputInfo().len) return error.InputArityMismatch;
+    const info = try allocator.alloc(TensorInfo, inputs.len);
+    for (inputs, session.inputInfo(), info) |input, declared, *actual| actual.* = .{
+        .name = declared.name,
+        .dtype = declared.dtype,
+        .shape = if (input.shape.len != 0) input.shape else try input.backend.tensorShape(input.value, allocator),
+    };
+    return info;
+}
+
+fn stageShapeInfo(session: Session, inputs: []const StageInput, allocator: std.mem.Allocator) ![]TensorInfo {
+    if (inputs.len != session.inputInfo().len) return error.InputArityMismatch;
+    const info = try allocator.alloc(TensorInfo, inputs.len);
+    for (inputs, session.inputInfo(), info) |input, declared, *actual| actual.* = switch (input) {
+        .host => |host| .{ .name = host.name, .dtype = host.dtype, .shape = host.shape },
+        .resident => |value| .{ .name = declared.name, .dtype = declared.dtype, .shape = if (value.shape.len != 0) value.shape else try value.backend.tensorShape(value.value, allocator) },
+    };
+    return info;
+}
 
 fn deinitTensorSlice(tensors: []Tensor, allocator: std.mem.Allocator) void {
     for (tensors) |*tensor| tensor.deinit();
@@ -2641,4 +2911,54 @@ test "cold model retention adoption is failure atomic" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.check, .{});
+}
+
+test "run request plan preserves exact protected compatibility and uncredited peaks" {
+    const request = RunRequest{
+        .batch = 2,
+        .sequence = 8,
+        .input_bytes = 64,
+        .host_preprocess_bytes = 32,
+        .pre_admitted_host_bytes = 16,
+        .output_bytes = 128,
+        .output_kv_bytes = 48,
+        .retained_backend_workspace_bytes = 512,
+    };
+    for ([_]memory.BackendClass{ .cpu, .gpu }) |kind| {
+        for ([_]bool{ false, true }) |reserved| {
+            var controller = memory.AdmissionController{};
+            const admission = RunAdmission{ .controller = &controller, .backend_class = kind, .limits = .{}, .static_workspace_bytes = 2048, .backend_workspace_reserved = reserved, .check_live_memory = false };
+            const plan = try admission.planRequest(request, &.{});
+            try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 240, .host_kv_bytes = 96 }, plan.protected);
+            const compatibility: memory.AdmissionAmounts = if (kind == .cpu)
+                .{ .host_scratch_bytes = 2048 }
+            else
+                .{ .backend_scratch_bytes = if (reserved) 0 else 1536 };
+            try std.testing.expectEqualDeep(compatibility, plan.compatibility);
+            try std.testing.expectEqualDeep(try plan.protected.merge(compatibility), plan.required);
+            try std.testing.expectEqualDeep(plan.required, try admission.estimateRequest(request, &.{}));
+            var uncredited = request;
+            uncredited.pre_admitted_host_bytes = 0;
+            uncredited.retained_backend_workspace_bytes = 0;
+            try std.testing.expectEqualDeep(try admission.estimateRequest(uncredited, &.{}), try plan.uncredited());
+            try std.testing.expectEqual(@as(usize, if (kind == .cpu) 2288 else 240), plan.required.host_scratch_bytes);
+            try std.testing.expectEqual(@as(usize, if (kind == .cpu) 2304 else 256), (try plan.uncredited()).host_scratch_bytes);
+        }
+    }
+}
+
+test "credited request estimator defers unrepresentable uncredited peak" {
+    var controller = memory.AdmissionController{};
+    const admission = RunAdmission{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    const request = RunRequest{
+        .batch = 1,
+        .sequence = 1,
+        .host_preprocess_bytes = std.math.maxInt(usize),
+        .pre_admitted_host_bytes = std.math.maxInt(usize),
+        .output_bytes = 1,
+    };
+    const plan = try admission.planRequest(request, &.{});
+    try std.testing.expectEqual(@as(usize, 8), plan.required.host_scratch_bytes);
+    try std.testing.expectEqualDeep(plan.required, try admission.estimateRequest(request, &.{}));
+    try std.testing.expectError(error.ResourceLimitExceeded, plan.uncredited());
 }

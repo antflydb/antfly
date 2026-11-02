@@ -2197,6 +2197,13 @@ pub const ComputeBackend = struct {
         /// Execute the rank-1 DeBERTa FFN backward strip while returning only
         /// the first branch and final output nodes that remain graph-visible.
         ffnGeluBackwardOutput: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) anyerror!?DecoderRuntimeFfnGeluBackwardOutputResult = null,
+        /// Explicit opt-in prevents legacy hooks from ignoring assigned targets.
+        assigned_outputs: packed struct {
+            add_scale: bool = false,
+            scaled_add_scale: bool = false,
+            multiply_add: bool = false,
+            multiply_add2: bool = false,
+        } = .{},
         /// Apply elementwise add inside the backend-owned decoder runtime.
         applyAdd: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyAddRequest) anyerror!?CT = null,
         /// Apply scaled elementwise add inside the backend-owned decoder runtime.
@@ -3305,6 +3312,7 @@ pub const ComputeBackend = struct {
         /// Snapshot backend-owned debug timing counters for diagnostic
         /// printing. Backends that do not support this can leave it null.
         debugTimingSnapshot: ?*const fn (ctx: *anyopaque) BackendDebugTimingSnapshot = null,
+        enableAllocationObservation: ?*const fn (ctx: *anyopaque) void = null,
 
         /// Reset backend-owned debug timing counters for diagnostic
         /// printing. Backends that do not support this can leave it null.
@@ -5871,6 +5879,12 @@ pub const ComputeBackend = struct {
         return .{};
     }
 
+    /// Optional diagnostic instrumentation. Constructor options can observe
+    /// the full owner history; this late hook observes allocations since enable.
+    pub fn enableAllocationObservation(self: *const ComputeBackend) void {
+        if (self.vtable.enableAllocationObservation) |op| op(self.ptr);
+    }
+
     pub fn debugTimingSnapshot(self: *const ComputeBackend) BackendDebugTimingSnapshot {
         if (self.vtable.debugTimingSnapshot) |op| {
             return op(self.ptr);
@@ -6154,6 +6168,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn decoderRuntimeApplyAddScale(self: *const ComputeBackend, request: *const DecoderRuntimeApplyAddScaleRequest) !?CT {
+        if (request.output != null and !self.vtable.regions.decoder.assigned_outputs.add_scale) return null;
         if (self.vtable.regions.decoder.applyAddScale) |op| {
             return op(self.ptr, request);
         }
@@ -6161,6 +6176,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn decoderRuntimeApplyScaledAddScale(self: *const ComputeBackend, request: *const DecoderRuntimeApplyScaledAddScaleRequest) !?CT {
+        if (request.output != null and !self.vtable.regions.decoder.assigned_outputs.scaled_add_scale) return null;
         if (self.vtable.regions.decoder.applyScaledAddScale) |op| {
             return op(self.ptr, request);
         }
@@ -6168,6 +6184,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn decoderRuntimeApplyMultiplyAdd(self: *const ComputeBackend, request: *const DecoderRuntimeApplyMultiplyAddRequest) !?CT {
+        if (request.output != null and !self.vtable.regions.decoder.assigned_outputs.multiply_add) return null;
         if (self.vtable.regions.decoder.applyMultiplyAdd) |op| {
             return op(self.ptr, request);
         }
@@ -6175,6 +6192,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn decoderRuntimeApplyMultiplyAdd2(self: *const ComputeBackend, request: *const DecoderRuntimeApplyMultiplyAdd2Request) !?CT {
+        if (request.output != null and !self.vtable.regions.decoder.assigned_outputs.multiply_add2) return null;
         if (self.vtable.regions.decoder.applyMultiplyAdd2) |op| {
             return op(self.ptr, request);
         }
@@ -6933,4 +6951,47 @@ test "native runtime telemetry does not report unmeasured host work as zero" {
     try std.testing.expectEqual(@as(?u64, null), snapshot.counters.physical_frees);
     try std.testing.expectEqual(@as(?u64, null), snapshot.memory.live_bytes);
     try std.testing.expectEqual(@as(?u64, 0), snapshot.counters.graph_submissions);
+}
+
+test "decoder assigned output contracts decline legacy providers before submission" {
+    const Fixture = struct {
+        fn record(raw: *anyopaque) void {
+            const count: *usize = @ptrCast(@alignCast(raw));
+            count.* += 1;
+        }
+        fn addScale(raw: *anyopaque, _: *const DecoderRuntimeApplyAddScaleRequest) anyerror!?CT {
+            record(raw);
+            return null;
+        }
+        fn scaledAddScale(raw: *anyopaque, _: *const DecoderRuntimeApplyScaledAddScaleRequest) anyerror!?CT {
+            record(raw);
+            return null;
+        }
+        fn multiplyAdd(raw: *anyopaque, _: *const DecoderRuntimeApplyMultiplyAddRequest) anyerror!?CT {
+            record(raw);
+            return null;
+        }
+        fn multiplyAdd2(raw: *anyopaque, _: *const DecoderRuntimeApplyMultiplyAdd2Request) anyerror!?CT {
+            record(raw);
+            return null;
+        }
+    };
+    var submissions: usize = 0;
+    var table = @import("native_compute.zig").vtable_impl;
+    table.regions.decoder.applyAddScale = Fixture.addScale;
+    table.regions.decoder.applyScaledAddScale = Fixture.scaledAddScale;
+    table.regions.decoder.applyMultiplyAdd = Fixture.multiplyAdd;
+    table.regions.decoder.applyMultiplyAdd2 = Fixture.multiplyAdd2;
+    const cb = ComputeBackend{ .ptr = &submissions, .vtable = &table };
+    const value: CT = @ptrFromInt(16);
+    try std.testing.expectEqual(@as(?CT, null), try cb.decoderRuntimeApplyAddScale(&.{ .lhs = value, .rhs = value, .dim = 1, .scale = 0.5, .output = value }));
+    try std.testing.expectEqual(@as(?CT, null), try cb.decoderRuntimeApplyScaledAddScale(&.{ .lhs = value, .rhs = value, .dim = 1, .lhs_scale = 0.5, .output_scale = 0.25, .output = value }));
+    try std.testing.expectEqual(@as(?CT, null), try cb.decoderRuntimeApplyMultiplyAdd(&.{ .lhs = value, .rhs = value, .addend = value, .dim = 1, .output = value }));
+    try std.testing.expectEqual(@as(?CT, null), try cb.decoderRuntimeApplyMultiplyAdd2(&.{ .lhs0 = value, .rhs0 = value, .lhs1 = value, .rhs1 = value, .dim = 1, .output = value }));
+    try std.testing.expectEqual(@as(usize, 0), submissions);
+    _ = try cb.decoderRuntimeApplyAddScale(&.{ .lhs = value, .rhs = value, .dim = 1, .scale = 0.5 });
+    _ = try cb.decoderRuntimeApplyScaledAddScale(&.{ .lhs = value, .rhs = value, .dim = 1, .lhs_scale = 0.5, .output_scale = 0.25 });
+    _ = try cb.decoderRuntimeApplyMultiplyAdd(&.{ .lhs = value, .rhs = value, .addend = value, .dim = 1 });
+    _ = try cb.decoderRuntimeApplyMultiplyAdd2(&.{ .lhs0 = value, .rhs0 = value, .lhs1 = value, .rhs1 = value, .dim = 1 });
+    try std.testing.expectEqual(@as(usize, 4), submissions);
 }

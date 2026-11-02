@@ -469,9 +469,9 @@ pub fn runDecoder(kind: Backend) !void {
 
 // Append beside the existing model_formats test fixtures. Its graph/weight
 // serializers remain private here; no new production fixture API is needed.
-const NativeResidentLifetimeCase = enum { output, weight, control };
+const NativeResidentLifetimeCase = enum { output, weight, control, observed_weight, observed_oom };
 fn nativeResidentCloseCase(mode: NativeResidentLifetimeCase) !void {
-    const hold_weight = mode == .weight;
+    const hold_weight = mode == .weight or mode == .observed_weight;
     const Probe = struct {
         alive: bool = true,
         calls: usize = 0,
@@ -507,7 +507,29 @@ fn nativeResidentCloseCase(mode: NativeResidentLifetimeCase) !void {
     try directory.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = bytes });
     const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..] });
     defer a.free(path);
-    var session = try factory.createNativeSessionWithTaskOverride(a, path, .generic);
+    if (mode == .observed_oom) {
+        const Case = struct {
+            fn run(allocator: std.mem.Allocator, model_path: []const u8) !void {
+                const loaded = try factory.createNativeSessionWithOptions(allocator, model_path, .generic, .{ .observe_allocations = true });
+                defer loaded.close();
+                var backend = try factory.getComputeBackend(loaded, allocator);
+                defer backend.deinit();
+                const model = backend.debugTimingSnapshot().runtime.native_allocations.?.model.?;
+                try std.testing.expectEqual(@import("../allocation_observer.zig").Coverage.from_owner_creation, model.coverage);
+                try std.testing.expect(model.usage.requested_live_bytes > 0);
+            }
+        };
+        // In-place arena growth depends on backing heap layout. Deny resizing
+        // here so every constructor allocation point is deterministically
+        // injected; normal ownership and dedicated remap tests keep real resizes.
+        var allocation_only = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(allocation_only.allocator(), Case.run, .{path});
+        return;
+    }
+    var session = if (mode == .observed_weight)
+        try factory.createNativeSessionWithOptions(a, path, .generic, .{ .observe_allocations = true })
+    else
+        try factory.createNativeSessionWithTaskOverride(a, path, .generic);
     var session_open = true;
     defer if (session_open) session.close();
     var token_ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 4 }, &.{ 0, 1, 2, 3 });
@@ -538,6 +560,11 @@ fn nativeResidentCloseCase(mode: NativeResidentLifetimeCase) !void {
     const after = try resident.backend.toFloat32(value, a);
     defer a.free(after);
     try std.testing.expectEqualSlices(f32, before, after);
+    if (mode == .observed_weight) {
+        const model = resident.backend.debugTimingSnapshot().runtime.native_allocations.?.model.?;
+        try std.testing.expectEqual(@import("../allocation_observer.zig").Coverage.from_owner_creation, model.coverage);
+        try std.testing.expect(model.usage.requested_live_bytes > 0);
+    }
     try std.testing.expectEqual(@as(usize, 0), probe.expired_calls);
 }
 
@@ -551,4 +578,12 @@ test "native acquired resident weights retain their model inventory after sessio
 
 test "native resident results do not retain request execution callbacks" {
     try nativeResidentCloseCase(.control);
+}
+
+test "native early allocator observations survive model close with mapped resident weights" {
+    try nativeResidentCloseCase(.observed_weight);
+}
+
+test "native early observed model construction unwinds every allocation failure" {
+    try nativeResidentCloseCase(.observed_oom);
 }

@@ -21,6 +21,8 @@
 
 const decoder_routes = @import("../execution/decoder_routes.zig");
 const decoder_checkpoint = @import("../execution/decoder_checkpoint.zig");
+const pending_step = @import("../execution/decoder_pending_step.zig");
+const decoder_prefill = @import("../execution/decoder_prefill.zig");
 const decoder_storage = @import("../execution/decoder_storage.zig");
 const decoder_forward = @import("../execution/decoder_forward.zig");
 const std = @import("std");
@@ -1437,10 +1439,6 @@ fn enableCudaPrefillGreedyToken() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_GREEDY_TOKEN", true);
 }
 
-fn enableCudaPreparedTailPrefillGreedy() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_PREPARED_TAIL_GREEDY", false);
-}
-
 fn enableCudaGreedyDeviceTokenHandoff() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GREEDY_DEVICE_TOKEN_HANDOFF", true);
 }
@@ -1921,10 +1919,7 @@ pub fn gemma4MtpMetalAutoEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_ENABLE_METAL_AUTO", false);
 }
 
-fn gemma4MtpMetalPrefillHiddenCaptureEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_ENABLE_METAL_PREFILL_HIDDEN_CAPTURE", false) and
-        !platform.env.getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_METAL_PREFILL_HIDDEN_CAPTURE");
-}
+const gemma4MtpMetalPrefillHiddenCaptureEnabled = decoder_routes.metalPreparedPrefillHiddenCaptureEnabled;
 
 fn gemma4MetalDirectGreedyDefault() bool {
     return true;
@@ -2309,20 +2304,7 @@ fn reserveSpeculativeTargetVerification(
     _ = try decode_runtime.appendGeneratedTokens(draft_count);
 }
 
-fn retryDirectPrefillAfterMemoryBudgetExceeded(
-    decode_runtime: *BorrowedDecodeStateRuntime,
-    reserved_tokens: usize,
-    attempted_chunk_size: usize,
-    current_chunk_size: *usize,
-    allow_resize: bool,
-    err: anyerror,
-) !bool {
-    if (err != error.MemoryBudgetExceeded or attempted_chunk_size <= 1) return false;
-    try decode_runtime.rollbackReservedPrefill(reserved_tokens);
-    if (!allow_resize) return false;
-    current_chunk_size.* = @max(attempted_chunk_size / 2, 1);
-    return true;
-}
+const retryDirectPrefillAfterMemoryBudgetExceeded = decoder_prefill.retryAfterMemoryBudgetExceeded;
 
 pub const buildOwnedBatchDecodeContext = graph_mod.decode_batch.buildUniform;
 pub const buildOwnedMixedBatchDecodeContext = graph_mod.decode_batch.buildMixed;
@@ -4558,202 +4540,16 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
-    pub const PrefillOutput = struct {
-        last_logits: ?[]f32 = null,
-        greedy_token: ?usize = null,
-        last_hidden: ?ops.CT = null,
-        last_hidden_rows: usize = 0,
-    };
+    pub const PrefillOutput = decoder_prefill.Output;
+    const capturePreparedTailPostNormHidden = decoder_prefill.Forward.capturePreparedTailPostNormHidden;
+    const metalPreparedTailOwnsWholePrefill = decoder_prefill.Forward.metalPreparedTailOwnsWholePrefill;
 
-    /// Prepared decoder tails expose the input to final RMSNorm. Gemma4 MTP's
-    /// `.final` activation contract is the post-norm row used by verification.
-    fn capturePreparedTailPostNormHidden(
-        cb: *const ComputeBackend,
-        capture: bool,
-        pre_norm_hidden: ops.CT,
-        final_norm_slot: usize,
-        hidden_size: usize,
-        eps: f32,
-    ) !?ops.CT {
-        if (!capture) return null;
-        return cb.decoderRuntimeApplyRmsNorm(&.{
-            .slot = final_norm_slot,
-            .input = pre_norm_hidden,
-            .hidden_size = hidden_size,
-            .eps = eps,
-        });
-    }
-
-    fn tryCudaPreparedTailPrefillGreedy(
-        self: *NativeGenerationPipeline,
-        input_ids: []const i64,
-        seq_len: usize,
-        decode_context: *const gpt_arch.DecodeContext,
-        capture_last_hidden: bool,
-    ) !?PrefillOutput {
-        if (!enableCudaPreparedTailPrefillGreedy()) return null;
-        if (self.cb.kind() != .cuda) return null;
-        if (decode_context.attention_mode != .paged_prefill or decode_context.query_sequence_len != input_ids.len) return null;
-
-        const tail = (try decoder_gated_runtime.forwardPrefillLastPreparedTail(
-            &self.cb,
-            self.allocator,
-            self.gpt_config,
-            self.gpt_config.num_hidden_layers,
-            input_ids,
-            seq_len,
-            decode_context,
-            false,
-        )) orelse return null;
-        var owns_hidden = true;
-        errdefer if (owns_hidden) self.cb.free(tail.final_hidden);
-
-        var greedy = (try decoder_tail_runtime.forwardGreedyTokenTensorFromFinalHidden(
-            &self.cb,
-            self.allocator,
-            self.gpt_config,
-            tail.final_hidden,
-            .rms,
-            tail.final_norm_slot,
-        )) orelse {
-            self.cb.free(tail.final_hidden);
-            return null;
-        };
-        if (greedy.token_tensor) |token_tensor| {
-            self.cb.free(token_tensor);
-            greedy.token_tensor = null;
-        }
-
-        const last_hidden = try capturePreparedTailPostNormHidden(
-            &self.cb,
-            capture_last_hidden,
-            tail.final_hidden,
-            tail.final_norm_slot,
-            self.gpt_config.hidden_size,
-            self.gpt_config.norm_eps,
-        );
-        if (capture_last_hidden and last_hidden == null) {
-            self.cb.free(tail.final_hidden);
-            owns_hidden = false;
-            return null;
-        }
-        self.cb.free(tail.final_hidden);
-        owns_hidden = false;
-        debugGenerationStage(
-            "executePrefill prepared_tail_greedy token={d} capture_hidden={}",
-            .{ greedy.token_id, capture_last_hidden },
-        );
+    fn prefillRuntime(self: *NativeGenerationPipeline, state: *NativeDecodeState, mutex: ?*std.atomic.Mutex) decoder_prefill.Runtime {
         return .{
-            .greedy_token = greedy.token_id,
-            .last_hidden = last_hidden,
-            .last_hidden_rows = if (last_hidden != null) 1 else 0,
-        };
-    }
-
-    fn metalPreparedTailOwnsWholePrefill(
-        input_len: usize,
-        seq_len: usize,
-        decode_context: *const gpt_arch.DecodeContext,
-    ) bool {
-        return decode_context.attention_mode == .paged_prefill and
-            decode_context.total_sequence_len == seq_len and
-            decode_context.query_sequence_len == input_len and
-            decode_context.kv_sequence_len == input_len and
-            decode_context.kv_position_offset == 0 and
-            input_len == seq_len;
-    }
-
-    /// Metal analog of the CUDA prepared-tail prefill: the planned prefill
-    /// frame plus a prepared-slot greedy tail, capturing the last POST-final-
-    /// norm hidden row for Gemma4 MTP seeding. Without this the MTP seed path
-    /// re-runs the whole prompt through the generic per-op forward (a second
-    /// prompt-length forward that scales with prompt size). Returns null on
-    /// any miss so the caller falls back to the plain logits prefill.
-    fn tryMetalPreparedTailPrefillGreedy(
-        self: *NativeGenerationPipeline,
-        input_ids: []const i64,
-        seq_len: usize,
-        decode_context: *const gpt_arch.DecodeContext,
-        capture_last_hidden: bool,
-    ) !?PrefillOutput {
-        if (self.cb.kind() != .metal) return null;
-        if (!gemma4MtpMetalPrefillHiddenCaptureEnabled()) return null;
-        if (!metalPreparedTailOwnsWholePrefill(input_ids.len, seq_len, decode_context)) return null;
-
-        const prepared = self.cb.decoderRuntimePrepareOrReuseFamily(
-            self.allocator,
-            self.gpt_config,
-            seq_len,
-            self.gpt_config.num_hidden_layers,
-        ) catch return null;
-        if (!prepared.prepared) return null;
-
-        const tail = (try decoder_gated_runtime.forwardPrefillLastPreparedTail(
-            &self.cb,
-            self.allocator,
-            self.gpt_config,
-            self.gpt_config.num_hidden_layers,
-            input_ids,
-            seq_len,
-            decode_context,
-            true,
-        )) orelse return null;
-        defer self.cb.free(tail.final_hidden);
-
-        const last_hidden = try capturePreparedTailPostNormHidden(
-            &self.cb,
-            capture_last_hidden,
-            tail.final_hidden,
-            tail.final_norm_slot,
-            self.gpt_config.hidden_size,
-            self.gpt_config.norm_eps,
-        );
-        errdefer if (last_hidden) |hidden| self.cb.free(hidden);
-        if (capture_last_hidden and last_hidden == null) return null;
-
-        if (tail.greedy_token_id) |greedy_token| {
-            debugGenerationStage(
-                "executePrefill metal_prepared_tail_greedy token={d} capture_hidden={}",
-                .{ greedy_token, capture_last_hidden },
-            );
-            return .{
-                .greedy_token = @intCast(greedy_token),
-                .last_hidden = last_hidden,
-                .last_hidden_rows = if (last_hidden != null) 1 else 0,
-            };
-        }
-
-        const logits = if (try decoder_tail_runtime.forwardPreparedLogitsTensorFromFinalHidden(
-            &self.cb,
-            self.gpt_config,
-            tail.final_hidden,
-            .rms,
-            tail.final_norm_slot,
-            tail.final_lm_head_slot,
-        )) |prepared_logits|
-            prepared_logits
-        else
-            (try decoder_tail_runtime.forwardLogitsTensorFromFinalHidden(
-                &self.cb,
-                self.gpt_config,
-                tail.final_hidden,
-                .rms,
-                tail.final_norm_slot,
-            )) orelse {
-                if (last_hidden) |hidden| self.cb.free(hidden);
-                return null;
-            };
-        defer self.cb.free(logits);
-        const last_logits = try self.cb.toFloat32(logits, self.allocator);
-        gpt_arch.applyFinalLogitSoftcapInPlace(self.gpt_config, last_logits);
-        debugGenerationStage(
-            "executePrefill metal_prepared_tail_logits capture_hidden={}",
-            .{capture_last_hidden},
-        );
-        return .{
-            .last_logits = last_logits,
-            .last_hidden = last_hidden,
-            .last_hidden_rows = if (last_hidden != null) 1 else 0,
+            .forward = self.physicalDecoder(),
+            .state = state,
+            .execution = if (mutex) |lock| self.executionAccess(lock) else .{ .io = self.io, .control = self.execution_control },
+            .work_control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork },
         };
     }
 
@@ -4822,24 +4618,17 @@ pub const NativeGenerationPipeline = struct {
         const allow_shared_kv_prefill = can_use_typed_prefill_outputs and
             self.checkpoint_prepare == null and self.checkpoint_resume == null and
             !capture_last_hidden and config.kv_cache_mode == .exact_hybrid;
-        // Admission already covers prompt + output KV. Reserve the prompt and
-        // a bounded decode tail instead of growing/copying every donor layer
-        // during prefill. Longer decodes keep the ordinary growth contract.
-        // Keep fitting, restore, shared prefixes, and speculation on their
-        // existing storage contracts until separately qualified.
-        if (allow_shared_kv_prefill and self.cb.kind() == .cuda and self.kv_dtype == .f16 and
-            self.prompt_cache == null and !config.prompt_cache_enabled and self.draft_cb == null and
-            !config.speculation_requested and prefilled_tokens == 0 and decode_state.total_tokens == 0 and
-            decode_state.sequence_id == null and decode_state.isPaged() and decode_state.kvSlidingWindowTokens() == null and
-            decode_state.cudaPagedKvReplayCapacityTokens() == null and
-            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_RESERVE_PREFILL_KV", true))
-        {
-            if (cudaE4bPrefillKvCapacity(self.gpt_config, seq_len, config.max_tokens)) |capacity| {
-                const limit = std.mem.alignForward(usize, seq_len + @as(usize, @intCast(config.max_tokens)), 16);
-                try decode_state.reserveFreshCudaKvCapacity(capacity, limit);
-                std.log.info("cuda_prefill_kv_reservation prompt_tokens={d} capacity_tokens={d}", .{ seq_len, capacity });
-            }
-        }
+        var prompt_state = self.prefillRuntime(decode_state, null);
+        try prompt_state.preparePromptState(.{
+            .prompt_tokens = seq_len,
+            .generated_tokens = config.max_tokens,
+            .fresh_cuda_capacity = allow_shared_kv_prefill,
+            .prefilled_tokens = prefilled_tokens,
+            .prompt_cache_enabled = config.prompt_cache_enabled,
+            .has_prompt_cache = self.prompt_cache != null,
+            .has_draft = self.draft_cb != null,
+            .speculation_requested = config.speculation_requested,
+        });
         const prefer_cuda_direct_last_logits = can_use_typed_prefill_outputs and self.cb.kind() == .cuda;
         debugGenerationStage(
             "executePrefill enter seq_len={d} prefilled={d} query_len={d} paged={} scheduler={} compiled_whole_model={} prefill_greedy={}",
@@ -4854,10 +4643,6 @@ pub const NativeGenerationPipeline = struct {
             },
         );
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
-        if (self.gpt_config.isQwen35() and decode_state.isPaged()) {
-            try decode_state.ensureQwen35LinearCache(self.gpt_config);
-            decode_state.resetQwen35LinearCache();
-        }
 
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| {
@@ -5116,197 +4901,46 @@ pub const NativeGenerationPipeline = struct {
                         }
                     }
                 }
-                const direct_execution_mutex = directPrefillExecutionMutex(
+                var numerical = self.prefillRuntime(decode_state, directPrefillExecutionMutex(
                     exact_prefill_probe,
-                    use_cuda_prefill_greedy_token or
-                        (total_chunk_end == seq_len and prefer_cuda_direct_last_logits),
+                    use_cuda_prefill_greedy_token or (total_chunk_end == seq_len and prefer_cuda_direct_last_logits),
                     use_metal_prefill_greedy_token,
                     self.execution_lock,
-                );
-                if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
-                defer if (direct_execution_mutex) |mutex| self.unlockExecution(mutex);
-                var exact_scope: if (build_options.enable_cuda) ?cuda_compute.CudaCompute.AttentionMatchRepeatScope else ?void = null;
-                if (comptime build_options.enable_cuda) {
-                    if (exact_prefill_probe and chunk.len > 1) {
-                        if (chunk.len > 512) return error.UnsupportedCompactionQueryRoute;
-                        const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
-                        exact_scope = try compute.beginAttentionMatchRepeat(true, chunk.len);
-                        compute.kernels.attention_match_repeat_check_ctx = self;
-                        compute.kernels.attention_match_repeat_check_fn = checkAttentionMatchQueryWork;
-                    }
-                }
-                defer if (comptime build_options.enable_cuda) {
-                    if (exact_scope) |*scope| {
-                        exact_prefill_calls += scope.compute.kernels.attention_match_repeat_split_launches;
-                        scope.deinit();
-                    }
-                };
-
-                try decode_runtime.appendPrefillChunk(chunk.len);
-                const decode_context = decode_runtime.makeDecodeContext(total_chunk_end, chunk.len);
-                // Shared-KV pruning is only valid for these explicit output
-                // intents. Checkpoint fitting collects queries from every
-                // consumer; hidden-row/MTP consumers also retain the full path.
-                const shared_prefill = if (allow_shared_kv_prefill and
-                    (output_intent == .kv_only or output_intent == .last_logits or output_intent == .greedy_token))
-                    try gpt_arch.tryCudaSharedKvPrefill(&self.cb, allocator, self.gpt_config, chunk, total_chunk_end, &decode_context, output_intent != .kv_only)
-                else
-                    null;
-                const metal_prepared: ?PrefillOutput = if (shared_prefill == null and processed == 0 and total_chunk_end == seq_len and use_metal_prefill_greedy_token)
-                    try self.tryMetalPreparedTailPrefillGreedy(chunk, total_chunk_end, &decode_context, capture_last_hidden)
-                else
-                    null;
-                if (shared_prefill) |prepared| {
-                    prefill_last_logits = prepared.last_logits;
-                    debugGenerationStage("executePrefill shared_kv_pruned rows={d} output={s}", .{ chunk.len, @tagName(output_intent) });
-                } else if (metal_prepared) |prepared| {
-                    prefill_last_logits = prepared.last_logits;
-                    prefill_greedy_token = prepared.greedy_token;
-                    prefill_last_hidden = prepared.last_hidden;
-                    prefill_last_hidden_rows = prepared.last_hidden_rows;
-                } else if (output_intent == .greedy_token or output_intent == .greedy_token_and_hidden) {
-                    if (try self.tryCudaPreparedTailPrefillGreedy(chunk, total_chunk_end, &decode_context, capture_last_hidden)) |prepared| {
-                        prefill_greedy_token = prepared.greedy_token;
-                        prefill_last_hidden = prepared.last_hidden;
-                        prefill_last_hidden_rows = prepared.last_hidden_rows;
-                    } else if (capture_last_hidden) {
-                        var greedy_hidden = gpt_arch.forwardGreedyLastTokenWithFinalHidden(&self.cb, allocator, self.gpt_config, chunk, 1, total_chunk_end, &decode_context) catch |err| {
-                            if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, admitted_plan == null, err)) continue;
-                            return err;
-                        };
-                        prefill_greedy_token = greedy_hidden.token_id;
-                        if (greedy_hidden.token_tensor) |token| {
-                            self.cb.free(token);
-                            greedy_hidden.token_tensor = null;
+                ));
+                const outcome = try numerical.runChunk(.{
+                    .token_ids = chunk,
+                    .total_chunk_end = total_chunk_end,
+                    .prompt_tokens = seq_len,
+                    .already_prefilled = prefilled_tokens,
+                    .processed_rows = processed,
+                    .output_intent = output_intent,
+                    .capture_hidden = capture_last_hidden,
+                    .shared_kv_pruning = allow_shared_kv_prefill,
+                    .prepared_metal_whole_prompt = processed == 0 and total_chunk_end == seq_len and use_metal_prefill_greedy_token,
+                    .metal_target_last_logits = use_metal_target_last_logits,
+                    .cuda_direct_last_logits = prefer_cuda_direct_last_logits,
+                    .typed_outputs = can_use_typed_prefill_outputs,
+                    .attempted_chunk_size = chunk_size,
+                    .allow_resize = admitted_plan == null,
+                    .compact_selected = config.kv_cache_mode == .select_v1,
+                    .selection_gpu_oracle = select_v1_gpu_oracle,
+                    .exact_repeat_probe = exact_prefill_probe,
+                    .exact_repeat_calls = &exact_prefill_calls,
+                });
+                switch (outcome) {
+                    .retry_chunk_size => |smaller| {
+                        current_chunk_size = smaller;
+                        continue;
+                    },
+                    .complete => |output| {
+                        if (output.last_logits) |values| prefill_last_logits = values;
+                        if (output.greedy_token) |token| prefill_greedy_token = token;
+                        if (output.last_hidden) |hidden| {
+                            prefill_last_hidden = hidden;
+                            prefill_last_hidden_rows = output.last_hidden_rows;
                         }
-                        prefill_last_hidden = greedy_hidden.hidden;
-                        prefill_last_hidden_rows = greedy_hidden.rows;
-                    } else {
-                        prefill_greedy_token = gpt_arch.forwardGreedyLastToken(&self.cb, allocator, self.gpt_config, chunk, 1, total_chunk_end, &decode_context) catch |err| {
-                            if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, admitted_plan == null, err)) continue;
-                            return err;
-                        };
-                    }
-                    debugGenerationStage(
-                        "executePrefill captured greedy token={d}",
-                        .{prefill_greedy_token.?},
-                    );
-                } else if (output_intent == .last_logits_and_hidden or
-                    (output_intent == .last_logits and use_metal_target_last_logits))
-                {
-                    var target_hidden = self.forwardFinalHiddenDevice(
-                        chunk,
-                        1,
-                        total_chunk_end,
-                        prefilled_tokens,
-                        &decode_context,
-                    ) catch |err| {
-                        if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, admitted_plan == null, err)) continue;
-                        return err;
-                    };
-                    var keep_target_hidden = false;
-                    defer {
-                        if (!keep_target_hidden) self.cb.free(target_hidden.hidden);
-                        if (target_hidden.pre_norm_hidden) |pre_norm| self.cb.free(pre_norm);
-                        if (target_hidden.prepared_tail_choices) |choices| target_hidden.choices_allocator.?.free(choices);
-                    }
-                    const last_hidden = try self.cb.sliceRows2D(
-                        allocator,
-                        target_hidden.hidden,
-                        target_hidden.rows - 1,
-                        1,
-                        self.gpt_config.hidden_size,
-                    );
-                    defer self.cb.free(last_hidden);
-                    const lm_w = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
-                    defer self.cb.free(lm_w);
-                    const last_logits_device = try self.cb.linearNoBias(
-                        last_hidden,
-                        lm_w,
-                        1,
-                        self.gpt_config.hidden_size,
-                        self.gpt_config.vocab_size,
-                    );
-                    defer self.cb.free(last_logits_device);
-                    const last_logits = try self.cb.toFloat32(last_logits_device, allocator);
-                    gpt_arch.applyFinalLogitSoftcapInPlace(self.gpt_config, last_logits);
-                    prefill_last_logits = last_logits;
-                    if (capture_last_hidden) {
-                        prefill_last_hidden = target_hidden.hidden;
-                        prefill_last_hidden_rows = target_hidden.rows;
-                        keep_target_hidden = true;
-                    }
-                    if (capture_last_hidden) {
-                        debugGenerationStage(
-                            "executePrefill captured final logits and MTP hidden vocab_size={d}",
-                            .{self.gpt_config.vocab_size},
-                        );
-                    } else {
-                        debugGenerationStage(
-                            "executePrefill captured target final-row logits vocab_size={d}",
-                            .{self.gpt_config.vocab_size},
-                        );
-                    }
-                } else if (output_intent == .last_logits and prefer_cuda_direct_last_logits) {
-                    prefill_last_logits = self.forwardLastLogits(chunk, 1, total_chunk_end, &decode_context) catch |err| {
-                        if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, admitted_plan == null, err)) continue;
-                        return err;
-                    };
-                    debugGenerationStage(
-                        "executePrefill captured CUDA final-row logits vocab_size={d}",
-                        .{self.gpt_config.vocab_size},
-                    );
-                } else if (output_intent == .kv_only and can_use_typed_prefill_outputs) {
-                    const hidden_only_result = if (self.cb.kind() == .cuda and cudaReplayLastLogitsEnabled())
-                        gpt_arch.forwardHiddenOnlyWithCudaReplay(
-                            &self.cb,
-                            allocator,
-                            self.gpt_config,
-                            chunk,
-                            1,
-                            total_chunk_end,
-                            &decode_context,
-                            "gpt.prefill_hidden_only",
-                        )
-                    else
-                        gpt_arch.forwardHiddenOnly(
-                            &self.cb,
-                            allocator,
-                            self.gpt_config,
-                            chunk,
-                            1,
-                            total_chunk_end,
-                            &decode_context,
-                        );
-                    hidden_only_result catch |err| {
-                        if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, admitted_plan == null, err)) continue;
-                        return err;
-                    };
-                    debugGenerationStage(
-                        "executePrefill chunk complete processed={d} total_chunk_end={d} output=kv_only",
-                        .{ processed, total_chunk_end },
-                    );
-                } else {
-                    const logits = self.forwardAllLogits(chunk, 1, total_chunk_end, &decode_context) catch |err| {
-                        if (try retryDirectPrefillAfterMemoryBudgetExceeded(&decode_runtime, chunk.len, chunk_size, &current_chunk_size, admitted_plan == null, err)) continue;
-                        return err;
-                    };
-                    defer allocator.free(logits);
-                    debugGenerationStage(
-                        "executePrefill chunk complete processed={d} total_chunk_end={d} logits_len={d}",
-                        .{ processed, total_chunk_end, logits.len },
-                    );
-                    if (total_chunk_end == seq_len) {
-                        prefill_last_logits = try allocator.dupe(f32, logits[(chunk.len - 1) * self.gpt_config.vocab_size ..][0..self.gpt_config.vocab_size]);
-                        debugGenerationStage(
-                            "executePrefill captured last logits vocab_size={d}",
-                            .{self.gpt_config.vocab_size},
-                        );
-                    }
+                    },
                 }
-                // The chunk's KV writes and query captures are committed at
-                // this point. Selection never runs inside an active forward.
-                if (config.kv_cache_mode == .select_v1) try decode_state.compactSelectedGlobalDonors(self.gpt_config, self.execution_control, select_v1_gpu_oracle);
                 processed = chunk_end;
                 if (admitted_plan != null) plan_chunk_index += 1;
                 if (self.scheduler) |scheduler| {
@@ -5370,15 +5004,12 @@ pub const NativeGenerationPipeline = struct {
         decode_state: *NativeDecodeState,
         capture_last_hidden: bool,
     ) !PrefillOutput {
-        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        var numerical = self.prefillRuntime(decode_state, directPrefillExecutionMutex(true, false, false, self.execution_lock));
         var direct_prefill_turn_acquired = false;
         defer if (direct_prefill_turn_acquired) {
             self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
         };
-        if (self.gpt_config.isQwen35() and decode_state.isPaged()) {
-            try decode_state.ensureQwen35LinearCache(self.gpt_config);
-            decode_state.resetQwen35LinearCache();
-        }
+        try numerical.resetRecurrentPrompt();
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| {
                 scheduler.notePrefillProgress(lease, 0, seq_len);
@@ -5388,34 +5019,27 @@ pub const NativeGenerationPipeline = struct {
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| {
                 if (self.io == null) {
-                    _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+                    try numerical.prepareWholePrompt(seq_len);
                 } else {
                     try scheduler.awaitTurnControlled(lease, .prefill, self.io.?, self.execution_control);
                     direct_prefill_turn_acquired = true;
-                    _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+                    try numerical.prepareWholePrompt(seq_len);
                 }
             } else {
-                _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+                try numerical.prepareWholePrompt(seq_len);
             }
         } else {
-            _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+            try numerical.prepareWholePrompt(seq_len);
         }
 
-        const host_embeddings = prepared.input_embeddings orelse return error.InvalidPreparedPrompt;
-        // Match text prefill/decode lock order: scheduler turn, then model.
-        // Both stay held until the backend forward and result copy complete.
-        const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
-        if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
-        defer if (direct_execution_mutex) |mutex| self.unlockExecution(mutex);
-        prepared.input_embeddings = null;
-        const input_embeddings = try self.cb.ensureDeviceResidentOwned(host_embeddings);
-        var owns_input_embeddings = true;
-        errdefer if (owns_input_embeddings) self.cb.free(input_embeddings);
-        const ple_token_ids = prepared.ple_token_ids orelse prepared.token_ids;
-        var decode_context = decode_runtime.makeDecodeContext(seq_len, seq_len);
-        decode_context.attn_or_mask = prepared.attn_or_mask;
-        owns_input_embeddings = false;
-        const logits = try self.forwardPreparedEmbeddingsLastLogits(input_embeddings, ple_token_ids, seq_len, &decode_context, capture_last_hidden);
+        if (prepared.input_embeddings == null) return error.InvalidPreparedPrompt;
+        const logits = try numerical.runEmbeddingsOwned(.{
+            .owner = &prepared.input_embeddings,
+            .token_ids = prepared.ple_token_ids orelse prepared.token_ids,
+            .sequence_length = seq_len,
+            .capture_hidden = capture_last_hidden,
+            .attention_mask = prepared.attn_or_mask,
+        });
         errdefer if (logits.last_logits) |values| self.allocator.free(values);
         errdefer if (logits.last_hidden) |hidden| self.cb.free(hidden);
         if (self.scheduler) |scheduler| {
@@ -5440,101 +5064,18 @@ pub const NativeGenerationPipeline = struct {
         decode_context: *const gpt_arch.DecodeContext,
         capture_last_hidden: bool,
     ) !PrefillOutput {
-        var owns_input = true;
-        defer if (owns_input) self.cb.free(input_embeddings);
-        if (try self.tryMetalPreparedMultimodalPrefill(input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden)) |logits| {
-            return logits;
-        }
-        if (capture_last_hidden) return error.MultimodalMtpPrefillUnavailable;
-        const ple_vectors = try gpt_arch.computePleVectors(&self.cb, self.allocator, self.gpt_config, ple_token_ids, input_embeddings, seq_len);
-        defer if (ple_vectors) |vectors| self.cb.free(vectors);
-        owns_input = false;
-        return .{ .last_logits = try gpt_arch.forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
-            &self.cb,
-            self.allocator,
-            self.gpt_config,
-            input_embeddings,
-            .{},
-            1,
-            seq_len,
-            decode_context,
-            ple_vectors,
-        ) };
-    }
-
-    /// The planned Gemma prefill frame for a media prompt: the same route
-    /// the token-id prefill takes, fed with the prepared embeddings, so the
-    /// whole layer stack runs as one command buffer instead of one
-    /// submission per op. Null leaves the embeddings untouched for the
-    /// generic forward.
-    fn tryMetalPreparedMultimodalPrefill(
-        self: *NativeGenerationPipeline,
-        input_embeddings: ops.CT,
-        ple_token_ids: []const i64,
-        seq_len: usize,
-        decode_context: *const gpt_arch.DecodeContext,
-        capture_last_hidden: bool,
-    ) !?PrefillOutput {
-        if (self.cb.kind() != .metal) return null;
-        if (decode_context.attention_mode != .paged_prefill or decode_context.attn_or_mask != null) return null;
-        if (!metalPreparedTailOwnsWholePrefill(ple_token_ids.len, seq_len, decode_context)) return null;
-        const prepared = self.cb.decoderRuntimePrepareOrReuseFamily(
-            self.allocator,
-            self.gpt_config,
-            seq_len,
-            self.gpt_config.num_hidden_layers,
-        ) catch return null;
-        if (!prepared.prepared) return null;
-        var rows = (try decoder_gated_runtime.forwardFinalHiddenRowsFromEmbeddings(
-            &self.cb,
-            self.allocator,
-            self.gpt_config,
-            self.gpt_config.num_hidden_layers,
-            input_embeddings,
-            ple_token_ids,
-            seq_len,
-            decode_context,
-        )) orelse return null;
-        defer rows.deinit(&self.cb);
-        const last_hidden = try self.cb.sliceRows2D(self.allocator, rows.final_hidden, rows.rows - 1, 1, self.gpt_config.hidden_size);
-        var owns_last_hidden = true;
-        defer if (owns_last_hidden) self.cb.free(last_hidden);
-        const lm_w = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
-        defer self.cb.free(lm_w);
-        const last_logits_device = try self.cb.linearNoBias(last_hidden, lm_w, 1, self.gpt_config.hidden_size, self.gpt_config.vocab_size);
-        defer self.cb.free(last_logits_device);
-        const last_logits = try self.cb.toFloat32(last_logits_device, self.allocator);
-        gpt_arch.applyFinalLogitSoftcapInPlace(self.gpt_config, last_logits);
-        debugGenerationStage("multimodal prefill metal_prepared_frame rows={d}", .{rows.rows});
-        if (capture_last_hidden) owns_last_hidden = false;
-        return .{ .last_logits = last_logits, .last_hidden = if (capture_last_hidden) last_hidden else null, .last_hidden_rows = if (capture_last_hidden) 1 else 0 };
+        var numerical = decoder_prefill.Forward{ .forward = self.physicalDecoder() };
+        return numerical.forwardPreparedEmbeddingsLastLogits(input_embeddings, ple_token_ids, seq_len, decode_context, capture_last_hidden);
     }
 
     // Uniform-length pages only; the caller reserves the complete group peak.
-    pub const default_prepared_qwen_prefill_items: usize = 8;
-    pub const max_prepared_qwen_prefill_items: usize = 16;
-    // The qualified serial prefill pack pool covers at most 4096 rows.
-    // Keep larger page counts within that complete transient lifetime bound.
-    pub const max_prepared_qwen_prefill_rows: usize = 4096;
-
-    pub fn packedQwenPrefillItemLimit(backend: ops.BackendKind, wide: bool) usize {
-        return if (backend == .cuda and wide) max_prepared_qwen_prefill_items else default_prepared_qwen_prefill_items;
-    }
-
-    pub fn preparedQwenPrefillBatchLimit(configured: usize, seq: usize) !usize {
-        return preparedQwenPrefillGeometryLimit(configured, seq, false);
-    }
-
-    pub fn preparedQwenPrefillBatchLimitForBackend(kind: ops.BackendKind, configured: usize, seq: usize) !usize {
-        return preparedQwenPrefillGeometryLimit(configured, seq, kind == .cuda and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES"));
-    }
-
-    fn preparedQwenPrefillGeometryLimit(configured: usize, seq: usize, wide: bool) !usize {
-        const capacity = if (wide) max_prepared_qwen_prefill_items else default_prepared_qwen_prefill_items;
-        const rows = if (wide) 8192 else max_prepared_qwen_prefill_rows;
-        if (configured == 0 or configured > capacity or seq == 0) return error.InvalidBatchDecodeState;
-        return @min(configured, @max(@as(usize, 1), rows / seq));
-    }
+    pub const default_prepared_qwen_prefill_items = decoder_routes.default_positioned_prefill_items;
+    pub const max_prepared_qwen_prefill_items = decoder_routes.max_positioned_prefill_items;
+    pub const max_prepared_qwen_prefill_rows = decoder_routes.max_positioned_prefill_rows;
+    pub const packedQwenPrefillItemLimit = decoder_routes.positionedPrefillItemLimit;
+    pub const preparedQwenPrefillBatchLimit = decoder_routes.positionedPrefillBatchLimit;
+    pub const preparedQwenPrefillBatchLimitForBackend = decoder_routes.positionedPrefillBatchLimitForBackend;
+    const preparedQwenPrefillGeometryLimit = decoder_routes.positionedPrefillGeometryLimit;
 
     pub const PreparedQwenPrefillItem = struct {
         pipeline: *NativeGenerationPipeline,
@@ -5545,100 +5086,28 @@ pub const NativeGenerationPipeline = struct {
 
     /// Group-owned CPU logits, their independent result copies, positions and
     /// bounded context metadata stay admitted until the batch forward returns.
-    pub fn preparedQwenPrefillHostScratch(items: usize, seq: usize, vocab: usize) !usize {
-        if (items > default_prepared_qwen_prefill_items) return error.InvalidBatchDecodeState;
-        return preparedQwenPrefillHostScratchCapacity(items, seq, vocab);
-    }
-
-    pub fn preparedQwenPrefillHostScratchForBackend(kind: ops.BackendKind, items: usize, seq: usize, vocab: usize) !usize {
-        if (kind == .cuda and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES"))
-            return preparedQwenPrefillHostScratchCapacity(items, seq, vocab);
-        return preparedQwenPrefillHostScratch(items, seq, vocab);
-    }
-
-    fn preparedQwenPrefillHostScratchCapacity(items: usize, seq: usize, vocab: usize) !usize {
-        if (items == 0 or items > max_prepared_qwen_prefill_items or seq == 0 or vocab == 0) return error.InvalidBatchDecodeState;
-        const logits = std.math.mul(usize, items, vocab) catch return error.ResourceLimitExceeded;
-        const logits_bytes = std.math.mul(usize, logits, 2 * @sizeOf(f32)) catch return error.ResourceLimitExceeded;
-        const positions = std.math.mul(usize, items, seq) catch return error.ResourceLimitExceeded;
-        const position_bytes = std.math.mul(usize, positions, 3 * @sizeOf(u32)) catch return error.ResourceLimitExceeded;
-        const arrays = std.math.add(usize, logits_bytes, position_bytes) catch return error.ResourceLimitExceeded;
-        return std.math.add(usize, arrays, 32 * 1024) catch error.ResourceLimitExceeded;
-    }
+    pub const preparedQwenPrefillHostScratch = decoder_routes.positionedPrefillHostScratch;
+    pub const preparedQwenPrefillHostScratchForBackend = decoder_routes.positionedPrefillHostScratchForBackend;
+    const preparedQwenPrefillHostScratchCapacity = decoder_routes.positionedPrefillHostScratchCapacity;
 
     /// The caller owns the shared provider step, independent page state, a
     /// complete group device envelope and the group's CPU scratch permit.
     /// No combined device tensor escapes; returned host rows are independent.
     pub fn forwardPreparedQwenPrefillBatch(items: []const PreparedQwenPrefillItem) ![][]f32 {
-        const capacity = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES")) max_prepared_qwen_prefill_items else default_prepared_qwen_prefill_items;
-        if (items.len == 0 or items.len > capacity) return error.InvalidBatchDecodeState;
-        const first = items[0];
-        const self = first.pipeline;
-        const cb = &self.cb;
-        const a = self.allocator;
-        const seq = first.seq_len;
-        const cfg = self.gpt_config;
-        if (seq == 0 or !cfg.hasQwen35VisionArchitectureContract()) return error.UnsupportedBatchedPrefill;
-        const total = try std.math.mul(usize, items.len, seq);
-        if (try preparedQwenPrefillBatchLimitForBackend(cb.kind(), items.len, seq) != items.len) return error.UnsupportedBatchedPrefill;
-        const positions = try a.alloc(u32, try std.math.mul(usize, total, 3));
-        defer a.free(positions);
-        var mixed: [max_prepared_qwen_prefill_items]MixedBatchDecodeItem = undefined;
-        var reserved: [max_prepared_qwen_prefill_items]usize = @splat(0);
-        var prepared_count: usize = 0;
-        errdefer for (0..prepared_count) |index| {
-            var decode = BorrowedDecodeStateRuntime.init(items[index].state);
-            decode.rollbackReservedPrefill(reserved[index]) catch {};
+        if (items.len > max_prepared_qwen_prefill_items) return error.InvalidBatchDecodeState;
+        var requests: [max_prepared_qwen_prefill_items]decoder_prefill.PositionedEmbeddingBatchItem = undefined;
+        for (items, requests[0..items.len]) |item, *request| request.* = .{
+            .allocator = item.pipeline.allocator,
+            .backend = &item.pipeline.cb,
+            .model = &item.pipeline.gpt_config,
+            .state = item.state,
+            .embeddings_owner = &item.prepared.input_embeddings,
+            .geometry_tokens = item.prepared.plan.tokenCount(),
+            .position_ids = item.prepared.plan.mrope_positions,
+            .deepstack_layer_count = item.prepared.deepstack_layer_count,
+            .sequence_length = item.seq_len,
         };
-        for (items, 0..) |item, index| {
-            if (item.pipeline.cb.ptr != self.cb.ptr or item.seq_len != seq or
-                item.prepared.plan.tokenCount() != seq or item.prepared.plan.mrope_positions.len != 3 * seq or
-                item.prepared.deepstack_layer_count != 0 or item.prepared.input_embeddings == null or
-                item.state.total_tokens != 0) return error.InvalidPreparedPrompt;
-            mixed[index] = .{ .state = item.state, .total_sequence_len = seq, .query_sequence_len = seq, .kv_sequence_len = 0, .kv_position_offset = 0, .attention_mode = .paged_prefill };
-            reserved[index] = try reserveAndRefreshScheduledPrefill(&mixed[index], seq);
-            prepared_count += 1;
-            for (0..3) |axis| @memcpy(positions[axis * total + index * seq ..][0..seq], item.prepared.plan.mrope_positions[axis * seq ..][0..seq]);
-        }
-        var owned = try buildOwnedMixedBatchDecodeContextWithMrope(a, mixed[0..items.len], positions);
-        defer owned.deinit();
-        const combined = (try cb.allocUninitF32Shape(&.{ @intCast(total), @intCast(cfg.hidden_size) })) orelse return error.UnsupportedBatchedPrefill;
-        var consumed = false;
-        defer if (!consumed) cb.free(combined);
-        for (items, 0..) |item, index| {
-            if (!try cb.copyRows2D(a, combined, index * seq, item.prepared.input_embeddings.?, 0, seq, cfg.hidden_size)) return error.UnsupportedBatchedPrefill;
-        }
-        for (items) |item| {
-            cb.free(item.prepared.input_embeddings.?);
-            item.prepared.input_embeddings = null;
-        }
-        consumed = true;
-        const hidden = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(cb, a, cfg, combined, .{}, items.len, seq, &owned.context, null);
-        defer cb.free(hidden.hidden);
-        if (hidden.total_rows != total) return error.InvalidTensorShape;
-        const last = (try cb.allocUninitF32Shape(&.{ @intCast(items.len), @intCast(cfg.hidden_size) })) orelse return error.UnsupportedBatchedPrefill;
-        defer cb.free(last);
-        for (0..items.len) |index| if (!try cb.copyRows2D(a, last, index, hidden.hidden, (index + 1) * seq - 1, 1, cfg.hidden_size)) return error.UnsupportedBatchedPrefill;
-        const weight = try gpt_arch.getLmHeadWeight(cb, cfg);
-        defer cb.free(weight);
-        const logits = try cb.linearNoBias(last, weight, items.len, cfg.hidden_size, cfg.vocab_size);
-        defer cb.free(logits);
-        const host = try cb.toFloat32(logits, a);
-        defer a.free(host);
-        gpt_arch.applyFinalLogitSoftcapInPlace(cfg, host);
-        const output = try a.alloc([]f32, items.len);
-        var copied: usize = 0;
-        errdefer {
-            for (output[0..copied]) |row| a.free(row);
-            a.free(output);
-        }
-        for (output, 0..) |*row, index| {
-            row.* = try a.dupe(f32, host[index * cfg.vocab_size ..][0..cfg.vocab_size]);
-            copied += 1;
-        }
-        if (platform.env.getenvBool("TERMITE_METAL_STAGE_TIMING_LOG_FRAMES"))
-            std.debug.print("LIGHTONOCR3 profile_prefill_items={d} profile_prefill_query_tokens={d}\n", .{ items.len, seq });
-        return output;
+        return decoder_prefill.forwardPositionedEmbeddingBatch(requests[0..items.len]);
     }
 
     fn executePreparedQwen3VlPrefill(
@@ -5653,12 +5122,11 @@ pub const NativeGenerationPipeline = struct {
         // fallback. Reject unsupported routing before cache or GPU mutation.
         if (self.prepared_qwen_prefill_chunk_rows != 0 and
             (self.qwen_prefill_batch == null or prepared.deepstack_layer_count != 0)) return error.InvalidPreparedPrompt;
-        try decode_state.ensureQwen35LinearCache(self.gpt_config);
-        decode_state.resetQwen35LinearCache();
+        var numerical = self.prefillRuntime(decode_state, directPrefillExecutionMutex(true, false, false, self.execution_lock));
+        try numerical.resetRecurrentPrompt();
         if (self.qwen_prefill_batch) |hook| if (prepared.deepstack_layer_count == 0) {
             return hook.run_fn(hook.ptr, self, prepared, seq_len, decode_state, wants_greedy);
         };
-        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         var direct_prefill_turn_acquired = false;
         defer if (direct_prefill_turn_acquired) self.scheduler.?.finishTurn(self.scheduler_lease.?, .prefill);
         if (self.scheduler) |scheduler| {
@@ -5667,44 +5135,35 @@ pub const NativeGenerationPipeline = struct {
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| {
                 if (self.io == null) {
-                    _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+                    try numerical.prepareWholePrompt(seq_len);
                 } else {
                     try scheduler.awaitTurnControlled(lease, .prefill, self.io.?, self.execution_control);
                     direct_prefill_turn_acquired = true;
-                    _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+                    try numerical.prepareWholePrompt(seq_len);
                 }
             } else {
-                _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+                try numerical.prepareWholePrompt(seq_len);
             }
         } else {
-            _ = try decode_runtime.preparePrefill(seq_len, seq_len);
+            try numerical.prepareWholePrompt(seq_len);
         }
 
-        const input_embeddings = prepared.input_embeddings orelse return error.InvalidPreparedPrompt;
-        prepared.input_embeddings = null;
-        const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
-        if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
-        defer if (direct_execution_mutex) |mutex| self.unlockExecution(mutex);
-        var decode_context = decode_runtime.makeDecodeContext(seq_len, seq_len);
-        decode_context.mrope_positions = prepared.plan.mrope_positions;
-        decode_context.qwen3vl_visual_mask = prepared.plan.visual_token_mask;
-        decode_context.qwen3vl_deepstack_embeddings = prepared.deepstack_embeddings;
-        decode_context.qwen3vl_deepstack_layer_count = prepared.deepstack_layer_count;
-        const logits = try gpt_arch.forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
-            &self.cb,
-            self.allocator,
-            self.gpt_config,
-            input_embeddings,
-            .{},
-            1,
-            seq_len,
-            &decode_context,
-            null,
-        );
+        if (prepared.input_embeddings == null) return error.InvalidPreparedPrompt;
+        const output = try numerical.runEmbeddingsOwned(.{
+            .owner = &prepared.input_embeddings,
+            .token_ids = prepared.token_ids,
+            .sequence_length = seq_len,
+            .ensure_device_resident = false,
+            .route = .ordinary_last_row,
+            .positions = prepared.plan.mrope_positions,
+            .visual_mask = prepared.plan.visual_token_mask,
+            .deepstack_embeddings = prepared.deepstack_embeddings,
+            .deepstack_layer_count = prepared.deepstack_layer_count,
+        });
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, seq_len, seq_len);
         }
-        return .{ .last_logits = logits };
+        return output;
     }
 
     const DecodeResult = struct {
@@ -6262,6 +5721,18 @@ pub const NativeGenerationPipeline = struct {
         return true;
     }
 
+    fn pendingStepContext(self: *NativeGenerationPipeline, state: *NativeDecodeState) pending_step.Context {
+        return .{
+            .allocator = self.allocator,
+            .backend = &self.cb,
+            .model = &self.gpt_config,
+            .state = state,
+            .control = self.execution_control,
+            .execution = if (self.execution_lock) |mutex| self.executionAccess(mutex) else .{ .io = self.io, .control = self.execution_control },
+            .prefetch_drain_budget = prefetch_drain_budget_per_step,
+        };
+    }
+
     fn runPipelinedGreedyTail(
         self: *NativeGenerationPipeline,
         token_ids: []i64,
@@ -6277,76 +5748,52 @@ pub const NativeGenerationPipeline = struct {
         tokens_generated: *usize,
         finish_reason: *[]const u8,
     ) !bool {
-        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         if (tokens_generated.* >= max_tokens) return false;
         if (seq_len.* == 0) return false;
-        self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
-        {
-            const arm_ctx = decode_runtime.makeDecodeContext(seq_len.*, 1);
-            const armed = decoder_gated_runtime.forwardGreedyTokenPipelinedArm(
-                &self.cb,
-                self.allocator,
-                self.gpt_config,
-                self.gpt_config.num_hidden_layers,
-                token_ids[seq_len.* - 1],
-                seq_len.*,
-                &arm_ctx,
-            ) catch false;
-            if (!armed) return false;
-        }
-        errdefer {
-            _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .cancel_pending) catch {};
-            _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .await_only) catch {};
-        }
+        var pending = try pending_step.GreedyFrame.init(self.pendingStepContext(decode_state));
+        defer pending.deinit();
+        pending.drainPrefetch();
+        // A driver error may follow a committed submission. Cleanup owns the
+        // lane until cancel/drain complete; only explicit false can decline.
+        errdefer pending.abort();
+        if (!try pending.arm(token_ids[seq_len.* - 1], seq_len.*)) return false;
         while (tokens_generated.* < max_tokens) {
             if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated.*), @intCast(max_tokens));
             const remaining = max_tokens - tokens_generated.*;
             var next_token: i64 = -1;
-            var speculative_appended = false;
             var stepped = false;
             if (remaining > 1) {
-                _ = try decode_runtime.appendGeneratedToken();
-                speculative_appended = true;
-                self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
-                const step_ctx = decode_runtime.makeDecodeContext(seq_len.* + 1, 1);
-                if (try decoder_gated_runtime.forwardGreedyTokenPipelinedStep(
-                    &self.cb,
-                    self.allocator,
-                    self.gpt_config,
-                    self.gpt_config.num_hidden_layers,
-                    seq_len.* + 1,
-                    &step_ctx,
-                )) |tok| {
+                _ = try pending.reserveLookahead();
+                if (try pending.step(seq_len.* + 1)) |tok| {
                     next_token = tok;
                     stepped = true;
                 } else {
-                    next_token = (try decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .await_only)) orelse return error.InvalidModelOutput;
+                    next_token = (try pending.awaitToken()) orelse return error.InvalidModelOutput;
                 }
             } else {
-                next_token = (try decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .await_only)) orelse return error.InvalidModelOutput;
+                next_token = (try pending.awaitToken()) orelse return error.InvalidModelOutput;
             }
             if (next_token < 0) return error.InvalidModelOutput;
             const token: usize = @intCast(next_token);
             if (self.shouldStopOnEos(config, token)) {
                 if (stepped) {
-                    _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .cancel_pending) catch {};
+                    pending.cancelPending();
                 }
                 finish_reason.* = "stop";
                 return true;
             }
             if (stepped) {
-                const submit_ok = ((decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .submit_pending) catch null) != null);
+                const submit_ok = try pending.submit();
                 if (!submit_ok) {
-                    _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .cancel_pending) catch {};
+                    pending.cancelPending();
                     stepped = false;
                 }
             }
             token_ids[seq_len.*] = @intCast(token);
             seq_len.* += 1;
             tokens_generated.* += 1;
-            if (!speculative_appended) {
-                _ = try decode_runtime.appendGeneratedToken();
-            }
+            if (!pending.reserved_position) _ = try pending.reserveLookahead();
+            try pending.commitPosition();
             try penalty_state.noteToken(self.allocator, @intCast(token));
             if (on_token_fn != null and on_token_ctx != null and emitted_text != null) {
                 const keep_streaming = try self.emitDecodedDelta(
@@ -6356,23 +5803,14 @@ pub const NativeGenerationPipeline = struct {
                     on_token_ctx.?,
                 );
                 if (!keep_streaming) {
-                    _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .await_only) catch {};
+                    _ = pending.awaitToken() catch {};
                     finish_reason.* = "stop";
                     return true;
                 }
             }
             if (!stepped) {
                 if (tokens_generated.* >= max_tokens) break;
-                const rearm_ctx = decode_runtime.makeDecodeContext(seq_len.*, 1);
-                const rearmed = decoder_gated_runtime.forwardGreedyTokenPipelinedArm(
-                    &self.cb,
-                    self.allocator,
-                    self.gpt_config,
-                    self.gpt_config.num_hidden_layers,
-                    token_ids[seq_len.* - 1],
-                    seq_len.*,
-                    &rearm_ctx,
-                ) catch false;
+                const rearmed = try pending.arm(token_ids[seq_len.* - 1], seq_len.*);
                 if (!rearmed) return true;
             }
         }
@@ -6593,7 +6031,7 @@ pub const NativeGenerationPipeline = struct {
                 continue;
             }
 
-            const pending = (try self.cb.beginI32ScalarDownload(candidate)) orelse {
+            var pending = (try pending_step.Readback.begin(self.pendingStepContext(decode_state), candidate)) orelse {
                 const token = try gpt_arch.resolveGreedyDeviceTokenTensor(&self.cb, allocator, candidate);
                 if (self.shouldStopOnEos(config, token)) {
                     finish_reason = "stop";
@@ -6620,20 +6058,15 @@ pub const NativeGenerationPipeline = struct {
                 candidate_token_tensor = null;
                 continue;
             };
-            var pending_active = true;
-            errdefer if (pending_active) self.cb.cancelI32ScalarDownload(pending);
+            defer pending.deinit();
 
             token_ids[seq_len.*] = 0;
             seq_len.* += 1;
             var appended_placeholder = true;
             errdefer if (appended_placeholder) {
                 seq_len.* -= 1;
-                decode_runtime.truncateGeneratedTokens(1) catch {};
             };
-            _ = try decode_runtime.appendGeneratedToken();
-
-            var next_candidate: ?ops.CT = null;
-            errdefer if (next_candidate) |tensor| self.cb.free(tensor);
+            _ = try pending.reservePosition();
             if (try self.forwardGreedyDeviceDecodeTokenTensor(
                 seq_len.*,
                 tokens_generated + 1,
@@ -6644,30 +6077,24 @@ pub const NativeGenerationPipeline = struct {
                 gbnf_grammar,
                 candidate,
             )) |next| {
-                next_candidate = next;
+                try pending.retainLookahead(next);
             }
 
-            const raw_token = try self.cb.finishI32ScalarDownload(pending);
-            pending_active = false;
-            if (raw_token < 0) return error.InvalidTensorShape;
-            const token: usize = @intCast(raw_token);
+            const token = try pending.resolve();
             if (self.shouldStopOnEos(config, token)) {
-                if (next_candidate) |tensor| {
-                    self.cb.evalTensor(tensor) catch {};
-                    self.cb.free(tensor);
-                    next_candidate = null;
-                }
+                pending.discardLookahead();
                 self.cb.free(candidate);
                 candidate_token_tensor = null;
                 seq_len.* -= 1;
                 appended_placeholder = false;
-                try decode_runtime.truncateGeneratedTokens(1);
+                try pending.rollback();
                 finish_reason = "stop";
                 break;
             }
 
             token_ids[seq_len.* - 1] = @intCast(token);
             appended_placeholder = false;
+            try pending.commit();
             tokens_generated += 1;
             try penalty_state.noteToken(allocator, @intCast(token));
             self.noteDecodeProgressNoMicrobatch(tokens_generated);
@@ -6680,21 +6107,16 @@ pub const NativeGenerationPipeline = struct {
                 on_token_ctx,
                 emitted_text,
             )) {
-                if (next_candidate) |tensor| {
-                    self.cb.evalTensor(tensor) catch {};
-                    self.cb.free(tensor);
-                    next_candidate = null;
-                }
+                pending.discardLookahead();
                 self.cb.free(candidate);
                 candidate_token_tensor = null;
                 finish_reason = "stop";
                 break;
             }
 
-            if (next_candidate) |next| {
+            if (pending.takeLookahead()) |next| {
                 self.cb.free(candidate);
                 candidate_token_tensor = next;
-                next_candidate = null;
             } else {
                 input_device_token_tensor = candidate;
                 candidate_token_tensor = null;
@@ -7480,17 +6902,11 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn graphExecutionContext(self: *NativeGenerationPipeline) graph_mod.execution.Context {
-        const Adapter = struct {
-            fn get(raw: *anyopaque, name: []const u8) !ops.CT {
-                const pipeline: *NativeGenerationPipeline = @ptrCast(@alignCast(raw));
-                return pipeline.graphWeight(name);
-            }
-        };
         return .{
             .allocator = self.allocator,
             .cb = &self.cb,
             .gpt_config = &self.gpt_config,
-            .weights = .{ .ptr = self, .get_fn = Adapter.get },
+            .weight_semantics = .traced_decoder,
             .execution_control = self.execution_control,
             .model_dir = self.model_dir,
             .artifact_dir = self.artifact_dir,
@@ -7506,7 +6922,8 @@ pub const NativeGenerationPipeline = struct {
     }
 
     pub fn graphWeight(self: *NativeGenerationPipeline, name: []const u8) !ops.CT {
-        return gpt_arch.getTracedWeight(self.allocator, &self.cb, &self.gpt_config, name);
+        const context = self.graphExecutionContext();
+        return context.graphWeight(name);
     }
 
     /// Speculative decoding: use `draft_pipeline` to propose `k` candidate
@@ -15946,4 +15363,339 @@ test "physical materialization rolls back paged KV reservations on failed forwar
     try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
     try std.testing.expectEqual(@as(usize, 2), manager.tokenCount(state.sequence_id.?).?);
     try std.testing.expectEqual(@as(usize, 1), state.kvView().?.logical_block_count);
+}
+
+test "pipelined decode arm enters the actual published execution lane" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const Probe = struct {
+        lane: *execution_control_mod.ExecutionLane,
+        mutex: *std.atomic.Mutex,
+        entered: bool = false,
+        lane_owned: bool = false,
+        mutex_owned: bool = false,
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .metal;
+        }
+        fn weight(_: *anyopaque, _: []const u8) !ops.CT {
+            return @ptrFromInt(8);
+        }
+        fn free(_: *anyopaque, _: ops.CT) void {}
+        fn drain(_: *anyopaque, _: usize) void {}
+        fn decode(raw: *anyopaque, request: *const ops.DecoderRuntimeDecodeRequest) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (request.phase != .submit_only) return error.UnexpectedTestDecodePhase;
+            self.entered = true;
+            self.lane_owned = self.lane.owned;
+            self.mutex_owned = !self.mutex.tryLock();
+            if (!self.mutex_owned) self.mutex.unlock();
+            // Exit before any numerical submission. This is the real method's
+            // real backend callback boundary, with bounded CPU fault injection.
+            return error.InjectedPipelinedArmFailure;
+        }
+    };
+    var lane = execution_control_mod.ExecutionLane{};
+    var mutex: std.atomic.Mutex = .unlocked;
+    var probe = Probe{ .lane = &lane, .mutex = &mutex };
+    var table = @import("../ops/native_compute.zig").vtable_impl;
+    table.backendKind = Probe.kind;
+    table.getWeight = Probe.weight;
+    table.getEmbeddingWeight = Probe.weight;
+    table.freeTensor = Probe.free;
+    table.drainPrefetchBudget = Probe.drain;
+    table.regions.decoder.decode = Probe.decode;
+    var pipeline = NativeGenerationPipeline{
+        .allocator = std.testing.allocator,
+        .cb = .{ .ptr = &probe, .vtable = &table },
+        .gpt_config = .{ .family = .gemma, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .intermediate_size = 8, .vocab_size = 16, .ple_hidden_size = 1 },
+        .tokenizer = undefined,
+        .execution_lock = &mutex,
+        .execution_gate = &lane,
+    };
+    var state = NativeDecodeState.initContiguous(std.testing.allocator);
+    defer state.deinit();
+    try state.notePrefill(2);
+    state.kv_view = .{ .sequence_id = 0, .pool_id = 0, .logical_block_count = 1, .tail_tokens = 2, .token_count = 2, .position_offset = 0 };
+    var tokens = [_]i64{ 1, 2, 0, 0 };
+    var length: usize = 2;
+    var generated: usize = 0;
+    var reason: []const u8 = "length";
+    var penalty = SamplingPenaltyState.init(false);
+    defer penalty.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InjectedPipelinedArmFailure, pipeline.runPipelinedGreedyTail(&tokens, &length, &state, .{}, &penalty, 2, 2, null, null, null, &generated, &reason));
+    try std.testing.expect(probe.entered);
+    try std.testing.expect(probe.lane_owned);
+    try std.testing.expect(probe.mutex_owned);
+    try std.testing.expect(!lane.owned);
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+}
+
+test "pipelined arm error cannot decline after a possible committed submission" {
+    try expectPipelinedCommittedFault(.arm);
+}
+test "pipelined step error cancels and drains before releasing its lane" {
+    try expectPipelinedCommittedFault(.step);
+}
+test "pipelined submit error cannot rearm or replay a possibly committed step" {
+    try expectPipelinedCommittedFault(.submit);
+}
+test "pipelined rearm error cannot report successful task completion" {
+    try expectPipelinedCommittedFault(.rearm);
+}
+const PipelinedCommittedFault = enum { arm, step, submit, rearm };
+fn expectPipelinedCommittedFault(mode: PipelinedCommittedFault) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const Probe = struct {
+        mode: PipelinedCommittedFault,
+        lane: *execution_control_mod.ExecutionLane,
+        mutex: *std.atomic.Mutex,
+        arms: usize = 0,
+        steps: usize = 0,
+        submits: usize = 0,
+        cancels: usize = 0,
+        awaits_after_failure: usize = 0,
+        replays_after_failure: usize = 0,
+        injected: bool = false,
+        cleanup_owned_lane: bool = true,
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .metal;
+        }
+        fn weight(_: *anyopaque, _: []const u8) !ops.CT {
+            return @ptrFromInt(8);
+        }
+        fn free(_: *anyopaque, _: ops.CT) void {}
+        fn drain(_: *anyopaque, _: usize) void {}
+        fn checkCleanup(self: *@This()) void {
+            const acquired = self.mutex.tryLock();
+            if (acquired) self.mutex.unlock();
+            self.cleanup_owned_lane = self.cleanup_owned_lane and self.lane.owned and !acquired;
+        }
+        fn decode(raw: *anyopaque, request: *const ops.DecoderRuntimeDecodeRequest) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.injected and request.phase != .cancel_pending and request.phase != .await_only) {
+                self.replays_after_failure += 1;
+                return false; // Bound a legacy fallback; never allow an infinite canary.
+            }
+            request.output_token_ids[0] = 7;
+            switch (request.phase) {
+                .submit_only => {
+                    self.arms += 1;
+                    if (self.mode == .arm or (self.mode == .rearm and self.arms == 2)) {
+                        self.injected = true; // Simulate a driver returning after possible commit.
+                        return error.InjectedCommittedDecode;
+                    }
+                },
+                .step => {
+                    self.steps += 1;
+                    if (self.mode == .step) {
+                        self.injected = true;
+                        return error.InjectedCommittedDecode;
+                    }
+                    if (self.mode == .rearm) return false; // Explicit pre-submission decline.
+                },
+                .submit_pending => {
+                    self.submits += 1;
+                    if (self.mode == .submit) {
+                        self.injected = true;
+                        return error.InjectedCommittedDecode;
+                    }
+                },
+                .cancel_pending => {
+                    self.cancels += 1;
+                    self.checkCleanup();
+                },
+                .await_only => if (self.injected) {
+                    self.awaits_after_failure += 1;
+                    self.checkCleanup();
+                },
+                else => return error.UnexpectedTestDecodePhase,
+            }
+            return true;
+        }
+    };
+    var lane = execution_control_mod.ExecutionLane{};
+    var mutex: std.atomic.Mutex = .unlocked;
+    var probe = Probe{ .mode = mode, .lane = &lane, .mutex = &mutex };
+    var table = @import("../ops/native_compute.zig").vtable_impl;
+    table.backendKind = Probe.kind;
+    table.getWeight = Probe.weight;
+    table.getEmbeddingWeight = Probe.weight;
+    table.freeTensor = Probe.free;
+    table.drainPrefetchBudget = Probe.drain;
+    table.regions.decoder.decode = Probe.decode;
+    var pipeline = NativeGenerationPipeline{
+        .allocator = std.testing.allocator,
+        .cb = .{ .ptr = &probe, .vtable = &table },
+        .gpt_config = .{ .family = .gemma, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .intermediate_size = 8, .vocab_size = 16, .ple_hidden_size = 1 },
+        .tokenizer = undefined,
+        .execution_lock = &mutex,
+        .execution_gate = &lane,
+    };
+    var state = NativeDecodeState.initContiguous(std.testing.allocator);
+    defer state.deinit();
+    try state.notePrefill(2);
+    state.kv_view = .{ .sequence_id = 0, .pool_id = 0, .logical_block_count = 1, .tail_tokens = 2, .token_count = 2, .position_offset = 0 };
+    var tokens = [_]i64{ 1, 2, 0, 0 };
+    var length: usize = 2;
+    var generated: usize = 0;
+    var reason: []const u8 = "length";
+    var penalty = SamplingPenaltyState.init(false);
+    defer penalty.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InjectedCommittedDecode, pipeline.runPipelinedGreedyTail(&tokens, &length, &state, .{}, &penalty, 2, 2, null, null, null, &generated, &reason));
+    try std.testing.expect(probe.injected);
+    try std.testing.expectEqual(@as(usize, 0), probe.replays_after_failure);
+    try std.testing.expectEqual(@as(usize, 1), probe.cancels);
+    try std.testing.expectEqual(@as(usize, 1), probe.awaits_after_failure);
+    try std.testing.expect(probe.cleanup_owned_lane);
+    try std.testing.expect(!lane.owned);
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+}
+
+test "prepared positioned prefill retains its actual tensor owner when lane acquisition is cancelled" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(a);
+    defer model.deinit(a);
+    var pipeline = model.pipeline(a, .{ .family = .qwen3_vl, .hidden_size = 4, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .intermediate_size = 8, .vocab_size = 16 });
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var mutex: std.atomic.Mutex = .unlocked;
+    pipeline.execution_lock = &mutex;
+    pipeline.execution_control = .{ .check_fn = Cancel.check };
+    const tensor = try pipeline.cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+    var prepared = qwen3vl_projector.PreparedPrompt{
+        .allocator = a,
+        .token_ids = try a.dupe(i64, &.{1}),
+        .input_embeddings = tensor,
+        .plan = .{
+            .allocator = a,
+            .mrope_positions = try a.dupe(u32, &.{ 0, 0, 0 }),
+            .causal_positions = try a.dupe(u32, &.{0}),
+            .visual_token_mask = try a.dupe(bool, &.{false}),
+            .visual_spans = try a.alloc(@import("../architectures/qwen3vl_plan.zig").VisualSpan, 0),
+            .mrope_position_delta = 0,
+        },
+        .deepstack_embeddings = try a.alloc(f32, 0),
+        .deepstack_layer_count = 0,
+    };
+    defer {
+        // Retain bounded fixture cleanup even when the old route loses its
+        // original owner. The assertion below independently exposes that loss.
+        if (prepared.input_embeddings == null) pipeline.cb.free(tensor);
+        prepared.deinit(&pipeline.cb);
+    }
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 4, .store_cpu_bytes = false });
+    var state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer state.deinit();
+    try std.testing.expectError(error.Cancelled, pipeline.executePreparedQwen3VlPrefill(&prepared, 1, &state, false));
+    try std.testing.expect(prepared.input_embeddings != null);
+    try std.testing.expectEqual(tensor, prepared.input_embeddings.?);
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+}
+
+test "prefill chunk runtime matches actual native eager logits and state advancement" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(a);
+    defer model.deinit(a);
+    try model.putWeight(a, "model.norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
+    try model.putWeight(a, "model.embed_tokens.weight", &.{ 2, 4 }, &.{ 1, 0, 0, 0, 0, 1, 0, 0 });
+    var pipeline = model.pipeline(a, .{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .intermediate_size = 8, .vocab_size = 2, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope });
+    var legacy_state = NativeDecodeState.initContiguous(a);
+    defer legacy_state.deinit();
+    const ids = [_]i64{ 0, 1 };
+    var legacy_runtime = BorrowedDecodeStateRuntime.init(&legacy_state);
+    try legacy_runtime.appendPrefillChunk(ids.len);
+    const legacy_context = legacy_runtime.makeDecodeContext(ids.len, ids.len);
+    // Exercise the independent canonical eager implementation, rather than
+    // calling the task adapter which now delegates to the runtime under test.
+    const eager_logits = try gpt_arch.forward(&pipeline.cb, a, pipeline.gpt_config, &ids, 1, ids.len, &legacy_context);
+    defer a.free(eager_logits);
+    const eager_last = eager_logits[(ids.len - 1) * pipeline.gpt_config.vocab_size ..][0..pipeline.gpt_config.vocab_size];
+    var physical_state = NativeDecodeState.initContiguous(a);
+    defer physical_state.deinit();
+    var physical = decoder_prefill.Runtime{ .forward = pipeline.physicalDecoder(), .state = &physical_state };
+    const outcome = try physical.runChunk(.{
+        .token_ids = &ids,
+        .total_chunk_end = ids.len,
+        .prompt_tokens = ids.len,
+        .already_prefilled = 0,
+        .processed_rows = 0,
+        .output_intent = .last_logits,
+        .capture_hidden = false,
+        .shared_kv_pruning = false,
+        .prepared_metal_whole_prompt = false,
+        .metal_target_last_logits = false,
+        .cuda_direct_last_logits = false,
+        .typed_outputs = false,
+        .attempted_chunk_size = ids.len,
+        .allow_resize = false,
+    });
+    try std.testing.expect(outcome == .complete);
+    const actual = outcome.complete;
+    defer if (actual.last_logits) |values| a.free(values);
+    defer if (actual.last_hidden) |hidden| pipeline.cb.free(hidden);
+    try std.testing.expectEqualSlices(f32, eager_last, actual.last_logits.?);
+    try std.testing.expectEqual(@as(usize, 2), legacy_state.total_tokens);
+    try std.testing.expectEqual(legacy_state.total_tokens, physical_state.total_tokens);
+    try std.testing.expectEqual(legacy_state.isPaged(), physical_state.isPaged());
+}
+
+test "decoder runtime weight semantics bind actual backend and model without a pipeline callback" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(a);
+    defer model.deinit(a);
+    const values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    try model.putWeight(a, "model.embed_tokens.weight", &.{ 2, 4 }, &values);
+    try model.putWeight(a, "override.weight", &.{2}, &.{ 11, 12 });
+    var pipeline = model.pipeline(a, .{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .vocab_size = 2, .weight_tying = true });
+    var context = pipeline.graphExecutionContext();
+    try std.testing.expect(context.weights == null);
+    try std.testing.expectEqual(.traced_decoder, context.weight_semantics);
+    try std.testing.expect(context.cb == &pipeline.cb);
+    try std.testing.expect(context.gpt_config == &pipeline.gpt_config);
+    // Missing tied head resolves through the same real model helper; no new
+    // tensor adapter or synthetic registry stands in for backend weight lookup.
+    const direct = try gpt_arch.getTracedWeight(a, &pipeline.cb, &pipeline.gpt_config, "lm_head.weight");
+    defer pipeline.cb.free(direct);
+    const resolved = try context.graphWeight("lm_head.weight");
+    defer pipeline.cb.free(resolved);
+    const expected = try pipeline.cb.toFloat32(direct, a);
+    defer a.free(expected);
+    const actual = try pipeline.cb.toFloat32(resolved, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &values, expected);
+    try std.testing.expectEqualSlices(f32, expected, actual);
+    const Probe = struct {
+        backend: *const ComputeBackend,
+        value: ops.CT,
+        calls: usize = 0,
+        fn get(raw: *anyopaque, name: []const u8) !ops.CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.mem.eql(u8, name, "lm_head.weight")) return error.UnexpectedTestWeight;
+            self.calls += 1;
+            return (try self.backend.retainImmutableTensor(self.value, std.testing.allocator)) orelse error.UnsupportedImmutableBorrow;
+        }
+    };
+    const custom_value = try pipeline.cb.getWeight("override.weight");
+    defer pipeline.cb.free(custom_value);
+    var probe = Probe{ .backend = &pipeline.cb, .value = custom_value };
+    context.weights = .{ .ptr = &probe, .get_fn = Probe.get };
+    const custom = try context.graphWeight("lm_head.weight");
+    defer pipeline.cb.free(custom);
+    const custom_data = try pipeline.cb.toFloat32(custom, a);
+    defer a.free(custom_data);
+    try std.testing.expectEqualSlices(f32, &.{ 11, 12 }, custom_data);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
 }

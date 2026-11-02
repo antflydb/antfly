@@ -68,6 +68,46 @@ const ReplayBindingState = struct { weight: ?CT = null, supplied: bool = false }
 
 const TransferPlan = struct { shape: ml.graph.Shape, backend_index: usize, allocation: buffers.AllocationId };
 
+/// Move-only exclusive claim. The specialization/cache owner must outlive this
+/// token. Claiming performs no GPU work or admission; consuming it happens only
+/// after request admission, against the exact identity whose quota was credited.
+pub const FrameClaim = struct {
+    frame: ?*Frame,
+    identity: admission.Identity,
+    credit: @import("../runtime/tier/memory.zig").AdmissionAmounts,
+    /// Refine already-materialized spans to measured bytes; missing banks keep
+    /// their cached cold upper bound. Null means capacity metadata is not ready.
+    requirement: ?@import("../runtime/tier/memory.zig").AdmissionAmounts = null,
+    nonce: u64,
+
+    pub fn release(self: *FrameClaim) void {
+        const frame = self.frame orelse return;
+        self.frame = null;
+        const pool = frame.pool;
+        @import("antfly_platform").sync.lockYielding(&pool.mutex);
+        defer pool.mutex.unlock();
+        if (!frame.claimed or frame.claim_nonce != self.nonce) {
+            std.debug.assert(false); // copied/stale ownership token
+            return;
+        }
+        frame.claimed = false;
+        frame.in_use = false;
+    }
+
+    fn consume(self: *FrameClaim, pool: *Pool, capability: ?admission.Capability) !*Frame {
+        const frame = self.frame orelse return error.PhysicalFrameClaimConsumed;
+        if (frame.pool != pool) return error.InvalidPhysicalFrameClaim;
+        const cap = capability orelse return error.InvalidPhysicalFrameClaim;
+        if (!self.identity.eql(cap.identity)) return error.PhysicalStorageAdmissionMismatch;
+        @import("antfly_platform").sync.lockYielding(&pool.mutex);
+        defer pool.mutex.unlock();
+        if (!frame.claimed or !frame.in_use or frame.claim_nonce != self.nonce) return error.InvalidPhysicalFrameClaim;
+        self.frame = null;
+        frame.claimed = false;
+        return pool.prepareAcquired(frame, cap);
+    }
+};
+
 pub const Pool = struct {
     allocator: std.mem.Allocator,
     accounting: ?*accounting.Ledger = null,
@@ -89,6 +129,8 @@ pub const Pool = struct {
     replay_kernel_count: usize = 0,
     replay_backend: ?usize = null,
     replay_decision: ReplayDecision = .unsupported_backend,
+    storage_requirement: ?@import("../runtime/tier/memory.zig").AdmissionAmounts = null,
+    storage_requirement_bounds: []usize = &.{},
 
     pub fn create(allocator: std.mem.Allocator, graph: *const Graph, plan: *buffers.BufferPlan, backends: []const *const ops.ComputeBackend, operator_plans: []const ?ops.OperatorPlan) !?*Pool {
         const prepared = try allocator.alloc(?KernelPlan, graph.nodeCount());
@@ -107,6 +149,7 @@ pub const Pool = struct {
                 if (backend.kind() != slot.backend) continue;
                 const functions = backend.vtable.kernels orelse continue;
                 if (functions.runAssignedKernel == null or functions.physicalTensorView == null) continue;
+                if (functions.assignedKernelSupported) |supported| if (!supported(backend.ptr, &descriptor)) continue;
                 const workspace = if (backend.vtable.kernels.?.assignedKernelWorkspace) |requirement| try requirement(backend.ptr, &descriptor) else kernels.WorkspaceRequirement{};
                 if (workspace.byte_size % @sizeOf(f32) != 0) return error.InvalidWorkspaceSize;
                 scratch_requirements[backend_index].byte_size = @max(scratch_requirements[backend_index].byte_size, workspace.byte_size);
@@ -194,6 +237,9 @@ pub const Pool = struct {
     /// descriptor coverage keep their existing execution path.
     pub fn prepareReplay(self: *Pool, graph: *const Graph, plan: *buffers.BufferPlan, bindings: []const Binding, costs: @import("placement.zig").RegionCosts) !void {
         std.debug.assert(self.frames.items.len == 0);
+        self.storage_requirement = null;
+        self.allocator.free(self.storage_requirement_bounds);
+        self.storage_requirement_bounds = &.{};
         var backend_index: ?usize = null;
         for (self.backends, 0..) |backend, index| {
             const functions = backend.vtable.kernels orelse continue;
@@ -351,12 +397,104 @@ pub const Pool = struct {
         self.allocator.free(self.transfers);
         self.allocator.free(self.workspace_allocations);
         self.allocator.free(self.backends);
+        self.allocator.free(self.storage_requirement_bounds);
         if (self.accounting) |ledger| ledger.release();
         self.allocator.destroy(self);
     }
 
     /// Busy published outputs pin their frame. Bound retained storage; callers
     /// may use the observable compatibility fallback when all frames are pinned.
+    /// Inspect retained quota only. No allocation, adoption, device wait or
+    /// descriptor preparation may occur before the caller's admission decision.
+    /// Capacity of the actual prepared output/auxiliary/workspace/input and
+    /// transfer bindings. Aliased allocation IDs are counted once. This is an
+    /// upper bound for selected physical storage, not a claim that legacy or
+    /// input-dependent routes no longer need their compatibility workspace.
+    pub fn storageRequirement(self: *Pool) !@import("../runtime/tier/memory.zig").AdmissionAmounts {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.storage_requirement) |cached| return cached;
+        const seen = try self.allocator.alloc(usize, self.plan.allocations.len);
+        errdefer self.allocator.free(seen);
+        @memset(seen, 0);
+        var amounts = @import("../runtime/tier/memory.zig").AdmissionAmounts{};
+        if (self.host_workspace_allocation != buffers.invalid_allocation) {
+            const id = self.host_workspace_allocation;
+            amounts.host_scratch_bytes = @intCast(self.plan.allocations[id].byte_size);
+            seen[id] = amounts.host_scratch_bytes;
+        }
+        for (self.kernels) |maybe| if (maybe) |kernel| {
+            try self.addStorageRequirement(seen, kernel.backend_index, kernel.output_allocation, &amounts);
+            if (kernel.workspace_bytes != 0) try self.addStorageRequirement(seen, kernel.backend_index, self.workspace_allocations[kernel.backend_index], &amounts);
+            for (kernel.auxiliaries) |maybe_auxiliary| if (maybe_auxiliary) |auxiliary| {
+                try self.addStorageRequirement(seen, kernel.backend_index, auxiliary.allocation, &amounts);
+            };
+        };
+        for (self.transfers) |maybe| if (maybe) |transfer| try self.addStorageRequirement(seen, transfer.backend_index, transfer.allocation, &amounts);
+        if (self.replay_backend) |index| for (self.replay_inputs) |input| {
+            if (input.constant != null) continue;
+            if (input.allocation) |id| try self.addStorageRequirement(seen, index, id, &amounts);
+        };
+        self.storage_requirement_bounds = seen;
+        self.storage_requirement = amounts;
+        return amounts;
+    }
+
+    fn addStorageRequirement(self: *Pool, seen: []usize, index: usize, id: buffers.AllocationId, amounts: *@import("../runtime/tier/memory.zig").AdmissionAmounts) !void {
+        if (id == buffers.invalid_allocation or id >= seen.len) return error.InvalidPhysicalAllocation;
+        if (seen[id] != 0) return;
+        const allocation = self.plan.allocations[id];
+        if (allocation.kind == .constant_binding) return;
+        const backend = self.backends[index];
+        const bytes: usize = @intCast(allocation.byte_size);
+        const functions = backend.vtable.kernels orelse return error.InvalidPhysicalAllocation;
+        const bound = if (functions.physicalStorageReservationBytes) |query| try query(backend.ptr, bytes) else bytes;
+        if (bound < bytes) return error.InvalidPhysicalStorageReservation;
+        seen[id] = bound;
+        switch (backend.kind()) {
+            .native => amounts.host_scratch_bytes = try std.math.add(usize, amounts.host_scratch_bytes, bound),
+            .cuda, .metal => amounts.backend_scratch_bytes = try std.math.add(usize, amounts.backend_scratch_bytes, bound),
+            else => return error.InvalidPhysicalAllocation,
+        }
+    }
+
+    pub fn claimWarm(self: *Pool, identity: admission.Identity) !?FrameClaim {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.frames.items) |frame| {
+            var requirement = self.storage_requirement;
+            const credit = (try frame.reusableCredit(identity, if (requirement) |*value| value else null)) orelse continue;
+            frame.claim_nonce = std.math.add(u64, frame.claim_nonce, 1) catch {
+                frame.retired = true;
+                continue;
+            };
+            frame.in_use = true;
+            frame.claimed = true;
+            return .{ .frame = frame, .identity = identity, .credit = credit, .requirement = requirement, .nonce = frame.claim_nonce };
+        }
+        return null;
+    }
+
+    pub fn acquirePrepared(self: *Pool, capability: ?admission.Capability, claim: ?*FrameClaim) !?*Frame {
+        if (claim) |prepared| return try prepared.consume(self, capability);
+        return self.acquireWithAdmission(capability);
+    }
+
+    fn prepareAcquired(self: *Pool, frame: *Frame, capability: ?admission.Capability) !*Frame {
+        frame.in_use = true;
+        errdefer frame.in_use = false;
+        frame.storage_admission = capability;
+        errdefer frame.storage_admission = null;
+        frame.storage_admission_failed = false;
+        for (frame.completions) |completion| if (completion) |value| value.beforeReuse() catch |err| {
+            frame.retired = true;
+            return err;
+        };
+        if (capability) |cap| try frame.adoptAdmission(cap);
+        frame.stats = .{ .replay_decision = self.replay_decision };
+        return frame;
+    }
+
     pub fn acquire(self: *Pool) !?*Frame {
         return self.acquireWithAdmission(null);
     }
@@ -364,29 +502,8 @@ pub const Pool = struct {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         for (self.frames.items) |frame| {
-            if (frame.in_use or frame.retired) continue;
-            var unique = true;
-            for (frame.storages, 0..) |lease, id| if (lease) |value| {
-                if (self.plan.allocations[id].kind == .constant_binding) continue;
-                const capture_pin: usize = if (frame.replay_ready) @intFromBool(frame.capture_pins[id]) else 0;
-                if (value.references.load(.acquire) != 1 + capture_pin) {
-                    unique = false;
-                    break;
-                }
-            };
-            if (!unique) continue;
-            for (frame.completions) |completion| if (completion) |value| value.beforeReuse() catch |err| {
-                frame.retired = true;
-                return err;
-            };
-            frame.in_use = true;
-            errdefer frame.in_use = false;
-            frame.storage_admission = capability;
-            errdefer frame.storage_admission = null;
-            frame.storage_admission_failed = false;
-            if (capability) |cap| try frame.adoptAdmission(cap);
-            frame.stats = .{ .replay_decision = self.replay_decision };
-            return frame;
+            if ((try frame.reusableCredit(null, null)) == null) continue;
+            return try self.prepareAcquired(frame, capability);
         }
         if (self.frames.items.len >= self.max_frames) return null;
         const frame = try Frame.createWithAdmission(self, capability);
@@ -407,6 +524,8 @@ pub const Frame = struct {
     host_workspace_fresh: bool = true,
     collect_storage_stats: bool = false,
     in_use: bool = true,
+    claimed: bool = false,
+    claim_nonce: u64 = 0,
     retired: bool = false,
     stats: Stats = .{},
     scope_backends: usize = 0,
@@ -455,6 +574,43 @@ pub const Frame = struct {
         }
         return self;
     }
+    fn reusableCredit(self: *const Frame, identity: ?admission.Identity, requirement: ?*@import("../runtime/tier/memory.zig").AdmissionAmounts) !?@import("../runtime/tier/memory.zig").AdmissionAmounts {
+        if (self.in_use or self.retired) return null;
+        var credit = @import("../runtime/tier/memory.zig").AdmissionAmounts{};
+        if (identity) |expected| if (self.host_workspace_admission) |reserved| {
+            if (!reserved.identity.eql(expected)) return null;
+            credit.host_scratch_bytes = reserved.amounts().host_scratch_bytes;
+        };
+        for (self.storages, 0..) |maybe, id| if (maybe) |lease| {
+            const shared_literal = self.pool.plan.allocations[id].kind == .constant_binding;
+            if (!shared_literal) {
+                const capture_pin: usize = if (self.replay_ready) @intFromBool(self.capture_pins[id]) else 0;
+                if (lease.references.load(.acquire) != 1 + capture_pin) return null;
+            }
+            if (identity) |expected| {
+                if (requirement) |refined| {
+                    if (id >= self.pool.storage_requirement_bounds.len) return error.InvalidPhysicalAllocation;
+                    const bound = self.pool.storage_requirement_bounds[id];
+                    if (!shared_literal and bound != 0) {
+                        const retained = lease.backing_byte_size orelse lease.byte_size;
+                        const domain = if (lease.backend.kind() == .native) &refined.host_scratch_bytes else &refined.backend_scratch_bytes;
+                        if (domain.* < bound) return error.InvalidPhysicalStorageReservation;
+                        domain.* = try std.math.add(usize, domain.* - bound, retained);
+                    }
+                }
+                if (lease.admission) |reserved| {
+                    if (!reserved.identity.eql(expected)) return null;
+                    // Shared literal ownership cannot be lent by an exclusive frame.
+                    if (shared_literal) continue;
+                    const owned = reserved.amounts();
+                    credit.host_scratch_bytes = try std.math.add(usize, credit.host_scratch_bytes, owned.host_scratch_bytes);
+                    credit.backend_scratch_bytes = try std.math.add(usize, credit.backend_scratch_bytes, owned.backend_scratch_bytes);
+                }
+            }
+        };
+        return credit;
+    }
+
     fn reserveHost(pool: *Pool, capability: admission.Capability, bytes: usize) !?*admission.Reservation {
         if (bytes == 0) return null;
         const owner = try pool.allocator.create(admission.Reservation);

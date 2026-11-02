@@ -248,6 +248,7 @@ pub const ExecuteOptions = struct {
     cached_buffer_plan_validated: bool = false,
     physical_frame: ?*@import("../execution/physical_buffers.zig").Frame = null,
     storage_admission: ?@import("../execution/storage_admission.zig").Capability = null,
+    physical_frame_claim: ?*@import("../execution/physical_buffers.zig").FrameClaim = null,
 
     /// Skip Metal graph-fusion probes for graphs whose hot path is already
     /// covered by backend primitive/runtime commands.

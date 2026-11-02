@@ -869,6 +869,8 @@ pub const DecoderRuntimeApplyAddRequest = struct {
 };
 
 pub const DecoderRuntimeApplyAddScaleRequest = struct {
+    /// Exact assigned target; unsupported providers decline before submission.
+    output: ?CT = null,
     lhs: CT,
     rhs: CT,
     dim: usize,
@@ -876,6 +878,8 @@ pub const DecoderRuntimeApplyAddScaleRequest = struct {
 };
 
 pub const DecoderRuntimeApplyScaledAddScaleRequest = struct {
+    /// Exact assigned target; unsupported providers decline before submission.
+    output: ?CT = null,
     lhs: CT,
     rhs: CT,
     dim: usize,
@@ -884,6 +888,8 @@ pub const DecoderRuntimeApplyScaledAddScaleRequest = struct {
 };
 
 pub const DecoderRuntimeApplyMultiplyAddRequest = struct {
+    /// Exact assigned target; unsupported providers decline before submission.
+    output: ?CT = null,
     lhs: CT,
     rhs: CT,
     addend: CT,
@@ -891,6 +897,8 @@ pub const DecoderRuntimeApplyMultiplyAddRequest = struct {
 };
 
 pub const DecoderRuntimeApplyMultiplyAdd2Request = struct {
+    /// Exact assigned target; unsupported providers decline before submission.
+    output: ?CT = null,
     lhs0: CT,
     rhs0: CT,
     lhs1: CT,

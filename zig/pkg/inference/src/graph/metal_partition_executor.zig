@@ -15584,8 +15584,8 @@ fn executeRuntimeAdd(
     output_hint: ?CT,
 ) !?CT {
     const dim = tensorElementCount(output_shape) orelse return null;
-    if (try executeRuntimeScaledAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim)) |result| return result;
-    if (try executeRuntimeMultiplyAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim)) |result| return result;
+    if (try executeRuntimeScaledAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim, output_hint)) |result| return result;
+    if (try executeRuntimeMultiplyAddFromDeferredMul(graph, cb, values, inputs, output_shape, dim, output_hint)) |result| return result;
     const lhs_operand = runtimeBinaryOperand(graph, values, inputs[0], output_shape) orelse return null;
     const rhs_operand = runtimeBinaryOperand(graph, values, inputs[1], output_shape) orelse return null;
     if (!binaryBroadcastResultMatches(lhs_operand.shape, rhs_operand.shape, output_shape)) return null;
@@ -15642,6 +15642,21 @@ fn runtimeBinaryOperand(
     return null;
 }
 
+/// Try an exact target first, then preserve the original tuned route when
+/// that target's representation/layout is unsupported. Resource/encode errors
+/// propagate; only an explicit no-submission decline permits another attempt.
+fn executeDecoderWithOutputHint(cb: *const ComputeBackend, comptime method: anytype, request: anytype) !?CT {
+    var configured = request;
+    while (true) {
+        const output = method(cb, &configured) catch |err| switch (err) {
+            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
+            else => return err,
+        };
+        if (output != null or configured.output == null) return output;
+        configured.output = null;
+    }
+}
+
 fn executeRuntimeScaledAddFromDeferredMul(
     graph: *const Graph,
     cb: *const ComputeBackend,
@@ -15649,6 +15664,7 @@ fn executeRuntimeScaledAddFromDeferredMul(
     inputs: []const NodeId,
     output_shape: ml.graph.Shape,
     dim: usize,
+    output_hint: ?CT,
 ) !?CT {
     if (inputs.len < 2) return null;
     if (pendingDeferredScaleMul(graph, values, inputs[0], output_shape)) |lhs_scaled| {
@@ -15667,32 +15683,28 @@ fn executeRuntimeScaledAddFromDeferredMul(
     if (pendingDeferredScaleMul(graph, values, inputs[0], output_shape)) |scaled| {
         const scaled_lhs = valueFor(values, scaled.source_id) orelse return null;
         const residual = valueFor(values, inputs[1]) orelse return null;
-        const output = cb.decoderRuntimeApplyScaledAddScale(&.{
+        const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyScaledAddScale, ops_mod.DecoderRuntimeApplyScaledAddScaleRequest{
+            .output = output_hint,
             .lhs = scaled_lhs,
             .rhs = residual,
             .dim = dim,
             .lhs_scale = scaled.scale,
             .output_scale = 1.0,
-        }) catch |err| switch (err) {
-            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
-            else => return err,
-        };
+        });
         if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
         return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
     }
     if (pendingDeferredScaleMul(graph, values, inputs[1], output_shape)) |scaled| {
         const scaled_lhs = valueFor(values, scaled.source_id) orelse return null;
         const residual = valueFor(values, inputs[0]) orelse return null;
-        const output = cb.decoderRuntimeApplyScaledAddScale(&.{
+        const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyScaledAddScale, ops_mod.DecoderRuntimeApplyScaledAddScaleRequest{
+            .output = output_hint,
             .lhs = scaled_lhs,
             .rhs = residual,
             .dim = dim,
             .lhs_scale = scaled.scale,
             .output_scale = 1.0,
-        }) catch |err| switch (err) {
-            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
-            else => return err,
-        };
+        });
         if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
         return try executeDeferredScaleAddFallback(cb, values, scaled, residual);
     }
@@ -15706,18 +15718,19 @@ fn executeRuntimeMultiplyAddFromDeferredMul(
     inputs: []const NodeId,
     output_shape: ml.graph.Shape,
     dim: usize,
+    output_hint: ?CT,
 ) !?CT {
     if (inputs.len < 2) return null;
     if (pendingDeferredElementwiseMul(graph, values, inputs[0], output_shape)) |mul| {
         if (pendingDeferredElementwiseMul(graph, values, inputs[1], output_shape)) |rhs_mul| {
-            return try executeDeferredElementwiseMultiplyAdd2(cb, values, mul, rhs_mul, dim);
+            return try executeDeferredElementwiseMultiplyAdd2(cb, values, mul, rhs_mul, dim, output_hint);
         }
         const addend = valueFor(values, inputs[1]) orelse return null;
-        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim);
+        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim, output_hint);
     }
     if (pendingDeferredElementwiseMul(graph, values, inputs[1], output_shape)) |mul| {
         const addend = valueFor(values, inputs[0]) orelse return null;
-        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim);
+        return try executeDeferredElementwiseMultiplyAdd(cb, values, mul, addend, dim, output_hint);
     }
     return null;
 }
@@ -15728,6 +15741,7 @@ fn executeDeferredElementwiseMultiplyAdd2(
     lhs_mul: DeferredElementwiseMul,
     rhs_mul: DeferredElementwiseMul,
     dim: usize,
+    output_hint: ?CT,
 ) !?CT {
     var lhs0 = valueFor(values, lhs_mul.lhs_id) orelse return null;
     var rhs0 = valueFor(values, lhs_mul.rhs_id) orelse return null;
@@ -15767,16 +15781,14 @@ fn executeDeferredElementwiseMultiplyAdd2(
             }
         }
     }
-    const output = cb.decoderRuntimeApplyMultiplyAdd2(&.{
+    const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyMultiplyAdd2, ops_mod.DecoderRuntimeApplyMultiplyAdd2Request{
+        .output = output_hint,
         .lhs0 = lhs0,
         .rhs0 = rhs0,
         .lhs1 = lhs1,
         .rhs1 = rhs1,
         .dim = dim,
-    }) catch |err| switch (err) {
-        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
-        else => return err,
-    };
+    });
     if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
 
     const lhs_product = cb.multiply(lhs0, rhs0) catch |err| switch (err) {
@@ -15802,6 +15814,7 @@ fn executeDeferredElementwiseMultiplyAdd(
     mul: DeferredElementwiseMul,
     addend: CT,
     dim: usize,
+    output_hint: ?CT,
 ) !?CT {
     var lhs = valueFor(values, mul.lhs_id) orelse return null;
     var rhs = valueFor(values, mul.rhs_id) orelse return null;
@@ -15832,15 +15845,13 @@ fn executeDeferredElementwiseMultiplyAdd(
             }
         }
     }
-    const output = cb.decoderRuntimeApplyMultiplyAdd(&.{
+    const output = try executeDecoderWithOutputHint(cb, ComputeBackend.decoderRuntimeApplyMultiplyAdd, ops_mod.DecoderRuntimeApplyMultiplyAddRequest{
+        .output = output_hint,
         .lhs = lhs,
         .rhs = rhs,
         .addend = residual,
         .dim = dim,
-    }) catch |err| switch (err) {
-        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
-        else => return err,
-    };
+    });
     if (try promoteMetalOutputIfNeeded(cb, output)) |result| return result;
 
     const multiplied = cb.multiply(lhs, rhs) catch |err| switch (err) {

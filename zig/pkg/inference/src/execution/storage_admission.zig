@@ -13,8 +13,22 @@ const Class = @import("storage_accounting.zig").Class;
 /// storage reservation retains it once; its release follows all token releases.
 pub const Lifetime = struct {
     context: *anyopaque,
-    retain: *const fn (*anyopaque) bool,
+    retain: ?*const fn (*anyopaque) bool = null,
+    /// A pin already held by the caller may expose an infallible clone. Store
+    /// its real owner pointer/callbacks, never the address of a stack wrapper.
+    retain_infallible: ?*const fn (*anyopaque) void = null,
     release: *const fn (*anyopaque) void,
+
+    pub fn isValid(self: Lifetime) bool {
+        return (self.retain != null) != (self.retain_infallible != null);
+    }
+
+    pub fn acquire(self: Lifetime) bool {
+        if (!self.isValid()) return false;
+        if (self.retain) |take| return take(self.context);
+        self.retain_infallible.?(self.context);
+        return true;
+    }
 };
 
 pub const Policy = struct {
@@ -83,6 +97,10 @@ pub const Reservation = struct {
         std.debug.assert(remaining == 0);
     }
 
+    pub fn amounts(self: *const Reservation) memory.AdmissionAmounts {
+        return amountsForDomain(self.domain, self.reservedBytes());
+    }
+
     pub fn reservedBytes(self: *const Reservation) usize {
         var bytes: usize = 0;
         for (self.leases) |lease| if (lease) |owned| {
@@ -123,7 +141,10 @@ pub fn fromRunLease(allocator: std.mem.Allocator, source: *memory.AdmissionLease
     if (bytes == 0) return error.InvalidStorageAdmission;
     if (source.controller != policy.controller or source.retain_backend_class != policy.backend_class) return error.InvalidStorageAdmission;
     const domain = try domainFor(backend, class);
-    if (policy.lifetime) |owner| if (!owner.retain(owner.context)) return error.ResourceOwnerShuttingDown;
+    if (policy.lifetime) |owner| {
+        if (!owner.isValid()) return error.InvalidStorageLifetime;
+        if (!owner.acquire()) return error.ResourceOwnerShuttingDown;
+    }
     errdefer if (policy.lifetime) |owner| owner.release(owner.context);
     const allowed = if (policy.credit) |remaining| domainBytes(remaining.*, domain) else 0;
     const credit = @min(bytes, @min(domainBytes(source.amounts, domain), allowed));
@@ -316,4 +337,48 @@ test "physical storage admission external deficit denial and split OOM preserve 
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
     try controller.configureResourceBudget(null);
     try std.testing.expectEqual(@as(usize, 1), budget.contexts);
+}
+
+test "physical storage admission clones infallible owner pins without stack adapters" {
+    const Owner = struct {
+        refs: usize = 1,
+        fn hold(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+        fn take(raw: *anyopaque) bool {
+            hold(raw);
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+    };
+    const a = std.testing.allocator;
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var source = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 64 }, false);
+    defer source.release();
+    var owner = Owner{};
+    var credit = memory.AdmissionAmounts{ .host_scratch_bytes = 64 };
+    var policy = Policy{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .check_live_memory = false, .credit = &credit };
+    const original = source;
+    policy.lifetime = .{ .context = &owner, .release = Owner.release };
+    try std.testing.expectError(error.InvalidStorageLifetime, fromRunLease(a, &source, policy, .native, .activation, 64));
+    policy.lifetime.?.retain = Owner.take;
+    policy.lifetime.?.retain_infallible = Owner.hold;
+    try std.testing.expectError(error.InvalidStorageLifetime, fromRunLease(a, &source, policy, .native, .activation, 64));
+    try std.testing.expectEqual(@as(usize, 1), owner.refs);
+    try std.testing.expectEqualDeep(original, source);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 64 }, credit);
+    policy.lifetime.?.retain = null;
+    var reservation = try fromRunLease(a, &source, policy, .native, .activation, 64);
+    defer reservation.release();
+    try std.testing.expectEqual(@as(usize, 2), owner.refs);
+    source.release();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 64 }, controller.snapshot());
+    reservation.release();
+    try std.testing.expectEqual(@as(usize, 1), owner.refs);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
 }

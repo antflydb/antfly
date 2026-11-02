@@ -36426,56 +36426,90 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(tensor);
     }
 
+    fn assignedDecoderOutputLegal(self: *MetalCompute, output: CT, input_values: []const CT, dim: usize) bool {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (input_values.len > 4) return false;
+        const target_buf = toBuf(output);
+        if (bufHasAnyQuantizedStorage(target_buf) or hasHostView(target_buf) or target_buf.lazy_entry != null or target_buf.lazy_multiply != null) return false;
+        const target = target_buf.metal_tensor orelse return false;
+        var inputs: [4]MetalTensor = undefined;
+        for (input_values, 0..) |value, index| {
+            const input_buf = toBuf(value);
+            if (bufHasAnyQuantizedStorage(input_buf) or hasHostView(input_buf) or input_buf.lazy_entry != null or input_buf.lazy_multiply != null) return false;
+            inputs[index] = input_buf.metal_tensor orelse return false;
+        }
+        return metal_runtime.decoderRuntimeOutputCompatible(runtime, target, inputs[0..input_values.len], dim);
+    }
+
     fn decoderRuntimeApplyAddScaleOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyAddScaleRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (request.output) |output| if (!self.assignedDecoderOutputLegal(output, &.{ request.lhs, request.rhs }, request.dim)) return null;
         var lhs = try self.ownedMetalTensorFromCt(request.lhs);
         defer lhs.deinit();
         var rhs = try self.ownedMetalTensorFromCt(request.rhs);
         defer rhs.deinit();
-        const tensor = (try metal_runtime.decoderRuntimeApplyAddScale(self.provider_impl, .{
+        var tensor = (try metal_runtime.decoderRuntimeApplyAddScale(self.provider_impl, .{
+            .output = if (request.output) |output| &toBuf(output).metal_tensor.? else null,
             .lhs = lhs,
             .rhs = rhs,
             .dim = request.dim,
             .scale = request.scale,
         }, &self.timing_stats)) orelse return null;
+        if (request.output) |output| {
+            tensor.deinit();
+            return output;
+        }
         return self.ctFromOwnedMetalTensor(tensor);
     }
 
     fn decoderRuntimeApplyScaledAddScaleOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyScaledAddScaleRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (request.output) |output| if (!self.assignedDecoderOutputLegal(output, &.{ request.lhs, request.rhs }, request.dim)) return null;
         var lhs = try self.ownedMetalTensorFromCt(request.lhs);
         defer lhs.deinit();
         var rhs = try self.ownedMetalTensorFromCt(request.rhs);
         defer rhs.deinit();
-        const tensor = (try metal_runtime.decoderRuntimeApplyScaledAddScale(self.provider_impl, .{
+        var tensor = (try metal_runtime.decoderRuntimeApplyScaledAddScale(self.provider_impl, .{
+            .output = if (request.output) |output| &toBuf(output).metal_tensor.? else null,
             .lhs = lhs,
             .rhs = rhs,
             .dim = request.dim,
             .lhs_scale = request.lhs_scale,
             .output_scale = request.output_scale,
         }, &self.timing_stats)) orelse return null;
+        if (request.output) |output| {
+            tensor.deinit();
+            return output;
+        }
         return self.ctFromOwnedMetalTensor(tensor);
     }
 
     fn decoderRuntimeApplyMultiplyAddOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyMultiplyAddRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (request.output) |output| if (!self.assignedDecoderOutputLegal(output, &.{ request.addend, request.lhs, request.rhs }, request.dim)) return null;
         var lhs = try self.ownedDeviceMetalTensorFromCt(request.lhs);
         defer lhs.deinit();
         var rhs = try self.ownedDeviceMetalTensorFromCt(request.rhs);
         defer rhs.deinit();
         var addend = try self.ownedDeviceMetalTensorFromCt(request.addend);
         defer addend.deinit();
-        const tensor = (try metal_runtime.decoderRuntimeApplyMultiplyAdd(self.provider_impl, .{
+        var tensor = (try metal_runtime.decoderRuntimeApplyMultiplyAdd(self.provider_impl, .{
+            .output = if (request.output) |output| &toBuf(output).metal_tensor.? else null,
             .lhs = lhs,
             .rhs = rhs,
             .addend = addend,
             .dim = request.dim,
         }, &self.timing_stats)) orelse return null;
+        if (request.output) |output| {
+            tensor.deinit();
+            return output;
+        }
         return self.ctFromOwnedMetalTensor(tensor);
     }
 
     fn decoderRuntimeApplyMultiplyAdd2Op(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyMultiplyAdd2Request) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (request.output) |output| if (!self.assignedDecoderOutputLegal(output, &.{ request.lhs0, request.rhs0, request.lhs1, request.rhs1 }, request.dim)) return null;
         var lhs0 = try self.ownedDeviceMetalTensorFromCt(request.lhs0);
         defer lhs0.deinit();
         var rhs0 = try self.ownedDeviceMetalTensorFromCt(request.rhs0);
@@ -36484,13 +36518,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer lhs1.deinit();
         var rhs1 = try self.ownedDeviceMetalTensorFromCt(request.rhs1);
         defer rhs1.deinit();
-        const tensor = (try metal_runtime.decoderRuntimeApplyMultiplyAdd2(self.provider_impl, .{
+        var tensor = (try metal_runtime.decoderRuntimeApplyMultiplyAdd2(self.provider_impl, .{
+            .output = if (request.output) |output| &toBuf(output).metal_tensor.? else null,
             .lhs0 = lhs0,
             .rhs0 = rhs0,
             .lhs1 = lhs1,
             .rhs1 = rhs1,
             .dim = request.dim,
         }, &self.timing_stats)) orelse return null;
+        if (request.output) |output| {
+            tensor.deinit();
+            return output;
+        }
         return self.ctFromOwnedMetalTensor(tensor);
     }
 
@@ -36872,6 +36911,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.regions.decoder.ffnGeluBackwardChain = decoderRuntimeFfnGeluBackwardChainOp;
         vt.regions.decoder.ffnGeluBackwardOutput = decoderRuntimeFfnGeluBackwardOutputOp;
         vt.regions.decoder.applyAdd = decoderRuntimeApplyAddOp;
+        vt.regions.decoder.assigned_outputs = .{ .add_scale = true, .scaled_add_scale = true, .multiply_add = true, .multiply_add2 = true };
         vt.regions.decoder.applyAddScale = decoderRuntimeApplyAddScaleOp;
         vt.regions.decoder.applyScaledAddScale = decoderRuntimeApplyScaledAddScaleOp;
         vt.regions.decoder.applyMultiplyAdd = decoderRuntimeApplyMultiplyAddOp;
@@ -48989,6 +49029,7 @@ test "Metal target kernel table never inherits native representation callbacks" 
     const metal_functions = MetalCompute.vtable_impl.kernels.?;
     const native_functions = native_compute_mod.vtable_impl.kernels.?;
     inline for (@typeInfo(ops.KernelBackend).@"struct".field_names) |field| {
+        if (@typeInfo(@FieldType(ops.KernelBackend, field)) != .optional) continue;
         if (@field(metal_functions, field)) |implementation| {
             if (@field(native_functions, field)) |native_implementation| try std.testing.expect(implementation != native_implementation);
         }
@@ -50323,4 +50364,187 @@ test "Metal uniform observation counts real dispatch submission waits and rounde
     try std.testing.expect(interval.process.?.counters.physical_allocations > 0);
     try std.testing.expect(interval.process.?.owned_live_bytes >= actual_backing);
     try std.testing.expect(interval.process.?.owned_lifetime_peak_bytes >= interval.process.?.owned_live_bytes);
+}
+test "Metal decoder assigned outputs preserve all four tuned kernels without host access or output allocation" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    const Fixture = struct {
+        const Kind = enum { add_scale, scaled_add_scale, multiply_add, multiply_add2 };
+        fn invoke(backend: *const ops.ComputeBackend, kind: Kind, inputs: [4]CT, target: ?CT) !?CT {
+            return switch (kind) {
+                .add_scale => backend.decoderRuntimeApplyAddScale(&.{ .lhs = inputs[0], .rhs = inputs[1], .dim = 16, .scale = 0.25, .output = target }),
+                .scaled_add_scale => backend.decoderRuntimeApplyScaledAddScale(&.{ .lhs = inputs[0], .rhs = inputs[1], .dim = 16, .lhs_scale = 0.5, .output_scale = 0.25, .output = target }),
+                .multiply_add => backend.decoderRuntimeApplyMultiplyAdd(&.{ .lhs = inputs[0], .rhs = inputs[1], .addend = inputs[2], .dim = 16, .output = target }),
+                .multiply_add2 => backend.decoderRuntimeApplyMultiplyAdd2(&.{ .lhs0 = inputs[0], .rhs0 = inputs[1], .lhs1 = inputs[2], .rhs1 = inputs[3], .dim = 16, .output = target }),
+            };
+        }
+    };
+    var host: [4][16]f32 = undefined;
+    var inputs: [4]CT = undefined;
+    var initialized: usize = 0;
+    defer for (inputs[0..initialized]) |value| cb.free(value);
+    for (&host, 0..) |*row, operand| {
+        for (row, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index + operand * 4)) / 8;
+        inputs[operand] = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(row, &.{ 4, 4 }));
+        initialized += 1;
+    }
+    const backing = (try ops.physical_storage.Lease.create(a, cb, 64)).?;
+    var backing_owned = true;
+    defer if (backing_owned) backing.release();
+    const target = (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = backing, .shape = &.{ 4, 4 } })).?;
+    var target_owned = true;
+    defer if (target_owned) cb.free(target);
+    const malformed_shape = (try cb.cloneTensorShape(target, &.{ 1, 16 })).?;
+    defer cb.free(malformed_shape);
+    const audit_mod = @import("../execution/transfer_audit.zig");
+    inline for (std.enums.values(Fixture.Kind)) |kind| {
+        const before = compute.timing_stats.decoder_runtime_apply_add_calls;
+        var audit = audit_mod.Audit{ .forbid_device_host_access = true };
+        try audit_mod.begin(&audit);
+        const bad_shape = Fixture.invoke(&cb, kind, inputs, malformed_shape);
+        const bad_alias = Fixture.invoke(&cb, kind, inputs, inputs[0]);
+        audit_mod.end();
+        try std.testing.expectEqual(@as(?CT, null), try bad_shape);
+        try std.testing.expectEqual(@as(?CT, null), try bad_alias);
+        try std.testing.expectEqual(before, compute.timing_stats.decoder_runtime_apply_add_calls);
+        try std.testing.expectEqual(@as(u64, 0), audit.download_bytes);
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        errdefer cb.decoderRuntimeCancelFrame() catch {};
+        const allocations_before = metal_tensor_mod.memoryStatsSnapshot().device_owned_buffers_created;
+        try audit_mod.begin(&audit);
+        const invoked = Fixture.invoke(&cb, kind, inputs, target);
+        audit_mod.end();
+        try std.testing.expectEqual(target, (try invoked).?);
+        try std.testing.expectEqual(allocations_before, metal_tensor_mod.memoryStatsSnapshot().device_owned_buffers_created);
+        try std.testing.expectEqual(@as(u64, 0), audit.download_bytes);
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        const actual = try cb.toFloat32(target, a);
+        defer a.free(actual);
+        // Keep the original allocator-owned route as an independent device
+        // control, in addition to the explicit CPU formula below.
+        const legacy = (try Fixture.invoke(&cb, kind, inputs, null)).?;
+        defer cb.free(legacy);
+        const unbound = try cb.toFloat32(legacy, a);
+        defer a.free(unbound);
+        for (actual, 0..) |found, index| {
+            const expected = switch (kind) {
+                .add_scale => (host[0][index] + host[1][index]) * 0.25,
+                .scaled_add_scale => (host[0][index] * 0.5 + host[1][index]) * 0.25,
+                .multiply_add => host[0][index] * host[1][index] + host[2][index],
+                .multiply_add2 => host[0][index] * host[1][index] + host[2][index] * host[3][index],
+            };
+            if (!std.math.approxEqAbs(f32, expected, found, 0.00001) or !std.math.approxEqAbs(f32, expected, unbound[index], 0.00001))
+                std.debug.print("decoder_assigned_output: route={s} index={d} expected={d} bound={d} unbound={d}\n", .{ @tagName(kind), index, expected, found, unbound[index] });
+            try std.testing.expectApproxEqAbs(expected, unbound[index], 0.00001);
+            try std.testing.expectApproxEqAbs(expected, found, 0.00001);
+        }
+    }
+    const held = (try cb.cloneTensorShape(target, &.{ 1, 16 })).?;
+    defer cb.free(held);
+    cb.free(target);
+    target_owned = false;
+    backing.release();
+    backing_owned = false;
+    const retained = try cb.toFloat32(held, a);
+    defer a.free(retained);
+    for (retained, 0..) |found, index| try std.testing.expectApproxEqAbs(host[0][index] * host[1][index] + host[2][index] * host[3][index], found, 0.00001);
+}
+
+const MetalAliasGenerationOwner = enum { ordinary, physical, external };
+
+fn qualifyMetalAliasGeneration(comptime kind: MetalAliasGenerationOwner) !void {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    const runtime = compute.provider_impl.raw_decode_runtime.?;
+    var host: [16]f32 = undefined;
+    for (&host, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index)) / 8;
+    const left = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&host, &.{ 4, 4 }));
+    defer cb.free(left);
+    const right = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&host, &.{ 4, 4 }));
+    defer cb.free(right);
+    const audit_mod = @import("../execution/transfer_audit.zig");
+    var lease: ?*ops.physical_storage.Lease = null;
+    defer if (lease) |value| value.release();
+    const target = if (kind == .physical) physical: {
+        lease = (try ops.physical_storage.Lease.create(a, cb, 64)).?;
+        break :physical (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = lease.?, .shape = &.{ 4, 4 } })).?;
+    } else owned: {
+        var buffer = try MetalTensor.deviceAllocateFreshWithAllocator(a, @ptrCast(runtime), 64, .private, &.{ 4, 4 });
+        errdefer buffer.deinit();
+        break :owned try compute.ctFromOwnedMetalTensor(buffer);
+    };
+    defer cb.free(target);
+    const alias = if (kind == .physical)
+        // A distinct DeviceBufferRef group still shares the physical Lease.
+        (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = lease.?, .shape = &.{ 4, 4 } })).?
+    else if (kind == .ordinary)
+        (try cb.cloneTensorShape(target, &.{ 4, 4 })).?
+    else external: {
+        const original = MetalCompute.toBuf(target).metal_tensor.?;
+        var borrowed = MetalTensor.deviceBorrowed(@ptrCast(runtime), original.deviceHandle().?, 0, 64, &.{ 4, 4 });
+        errdefer borrowed.deinit();
+        break :external try compute.ctFromOwnedMetalTensor(borrowed);
+    };
+    defer cb.free(alias);
+    const view = (try cb.cloneTensorShape(alias, &.{ 1, 16 })).?;
+    defer cb.free(view);
+    for (0..3) |iteration| {
+        const scale: f32 = @as(f32, @floatFromInt(iteration + 1)) * 0.5;
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        errdefer cb.decoderRuntimeCancelFrame() catch {};
+        const buffers_before = metal_tensor_mod.memoryStatsSnapshot().device_owned_buffers_created;
+        const mirrors_before = metal_tensor_mod.memoryStatsSnapshot().host_mirror_allocations;
+        var write_audit = audit_mod.Audit{ .forbid_device_host_access = true };
+        try audit_mod.begin(&write_audit);
+        const written = cb.decoderRuntimeApplyScaledAddScale(&.{ .lhs = left, .rhs = right, .dim = 16, .lhs_scale = scale, .output_scale = 1, .output = target });
+        audit_mod.end();
+        try std.testing.expectEqual(target, (try written).?);
+        try std.testing.expect(metal_runtime_mod.hasActiveFrame(runtime));
+        try std.testing.expectEqual(@as(u64, 0), write_audit.download_bytes);
+        try std.testing.expectEqual(buffers_before, metal_tensor_mod.memoryStatsSnapshot().device_owned_buffers_created);
+        try std.testing.expectEqual(mirrors_before, metal_tensor_mod.memoryStatsSnapshot().host_mirror_allocations);
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        for ([_]CT{ alias, view }) |retained| {
+            const actual = try cb.toFloat32(retained, a);
+            defer a.free(actual);
+            for (actual, host, 0..) |found, input, index| {
+                const expected = input * scale + input;
+                if (!std.math.approxEqAbs(f32, expected, found, 0.00001))
+                    std.debug.print("metal_alias_generation: owner={s} iteration={d} index={d} expected={d} actual={d}\n", .{ @tagName(kind), iteration, index, expected, found });
+                try std.testing.expectApproxEqAbs(expected, found, 0.00001);
+            }
+        }
+        // Known owners reuse valid mirrors without another device transfer;
+        // external wrappers cannot prove writes and must refresh snapshots.
+        var read_audit = audit_mod.Audit{};
+        try audit_mod.begin(&read_audit);
+        const repeated = cb.toFloat32(alias, a);
+        audit_mod.end();
+        const repeated_values = try repeated;
+        defer a.free(repeated_values);
+        if (iteration > 0 or kind != .external) try std.testing.expectEqual(@as(u64, if (kind == .external) 64 else 0), read_audit.download_bytes);
+        if (iteration > 0) try std.testing.expectEqual(mirrors_before, metal_tensor_mod.memoryStatsSnapshot().host_mirror_allocations);
+    }
+}
+
+test "Metal assigned writes refresh retained alias mirrors ordinary" {
+    try qualifyMetalAliasGeneration(.ordinary);
+}
+
+test "Metal assigned writes refresh retained alias mirrors physical" {
+    try qualifyMetalAliasGeneration(.physical);
+}
+
+test "Metal assigned writes refresh retained alias mirrors external" {
+    try qualifyMetalAliasGeneration(.external);
 }

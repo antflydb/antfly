@@ -140,6 +140,18 @@ pub fn t5RelativePositionBucket(relative_position: i64, num_buckets_: usize, max
 /// for token index `tok`. Tokens with position 0 are identity (cos 0 = 1,
 /// sin 0 = 0) so padded slots are left unchanged.
 pub fn ropeCore(output: []f32, positions: []const usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, consecutive_pairs: bool) void {
+    const Positions = struct {
+        values: []const usize,
+        pub inline fn positionAt(self: @This(), chunk: usize) usize {
+            return self.values[chunk];
+        }
+    };
+    ropeCoreWithPositions(output, Positions{ .values = positions }, head_dim, rope_dim, theta, freq_scale, consecutive_pairs);
+}
+
+/// The position source is a static policy. Formula-backed layouts avoid a
+/// temporary position array while sharing the exact rotation and cache order.
+pub fn ropeCoreWithPositions(output: []f32, positions: anytype, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, consecutive_pairs: bool) void {
     const total_tokens = output.len / head_dim;
     const half = rope_dim / 2;
     const head_half = head_dim / 2;
@@ -154,7 +166,7 @@ pub fn ropeCore(output: []f32, positions: []const usize, head_dim: usize, rope_d
     };
     var previous_position: ?usize = null;
     for (0..total_tokens) |tok| {
-        const pos = positions[tok];
+        const pos = positions.positionAt(tok);
         const base = tok * head_dim;
         if (cached and (previous_position == null or previous_position.? != pos)) {
             for (0..half) |j| {
@@ -3386,4 +3398,33 @@ test "embeddinggemma2 grouped shared KV workers drain allocation failure and can
     io.vtable = &table;
     try std.testing.expectError(error.Canceled, Case.run(std.testing.allocator, io));
     try Case.run(std.testing.allocator, std.testing.io);
+}
+
+test "RoPE formula position providers match explicit positions across cached and scalar geometries" {
+    const Formula = struct {
+        offset: usize,
+        calls: *usize,
+        pub fn positionAt(self: @This(), chunk: usize) usize {
+            self.calls.* += 1;
+            return self.offset + ((chunk / 2) % 3);
+        }
+    };
+    inline for (.{ .{ 8, 4 }, .{ 64, 64 }, .{ 520, 520 } }) |geometry| {
+        const head_dim = geometry[0];
+        const rope_dim = geometry[1];
+        inline for (.{ false, true }) |consecutive_pairs| {
+            for ([_]usize{ 0, 7 }) |offset| {
+                var explicit: [12]usize = undefined;
+                for (&explicit, 0..) |*value, chunk| value.* = offset + ((chunk / 2) % 3);
+                var expected: [12 * head_dim]f32 = undefined;
+                for (&expected, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 71)) / 17 - 2;
+                var actual = expected;
+                var calls: usize = 0;
+                ropeCore(&expected, &explicit, head_dim, rope_dim, 10000, 0.75, consecutive_pairs);
+                ropeCoreWithPositions(&actual, Formula{ .offset = offset, .calls = &calls }, head_dim, rope_dim, 10000, 0.75, consecutive_pairs);
+                try std.testing.expectEqual(@as(usize, 12), calls);
+                try std.testing.expectEqualSlices(f32, &expected, &actual);
+            }
+        }
+    }
 }

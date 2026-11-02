@@ -17,6 +17,7 @@
 //! facts; this owner selects physical schedules without task configuration,
 //! tokenizers, streaming callbacks or pipeline ownership.
 const std = @import("std");
+const platform = @import("antfly_platform");
 const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const gpt_mod = @import("../models/gpt.zig");
@@ -233,4 +234,59 @@ pub fn shouldUsePreparedQwenPrefillGreedyToken(backend: ops.BackendKind, model: 
         !request.has_token_observer and request.exact_hybrid and !request.storage.compaction and
         gpt_arch.canUseFastGreedyArgmaxForConfig(model) and
         shouldUseCudaPrefillGreedyToken(backend, request, allow, model.suppressTokenIds().len != 0, enabled);
+}
+
+pub const default_positioned_prefill_items: usize = 8;
+pub const max_positioned_prefill_items: usize = 16;
+// The qualified serial prefill pack pool covers at most 4096 rows.
+// Keep larger page counts within that complete transient lifetime bound.
+pub const max_positioned_prefill_rows: usize = 4096;
+
+pub fn positionedPrefillItemLimit(backend: ops.BackendKind, wide: bool) usize {
+    return if (backend == .cuda and wide) max_positioned_prefill_items else default_positioned_prefill_items;
+}
+
+pub fn positionedPrefillBatchLimit(configured: usize, seq: usize) !usize {
+    return positionedPrefillGeometryLimit(configured, seq, false);
+}
+
+pub fn positionedPrefillBatchLimitForBackend(kind: ops.BackendKind, configured: usize, seq: usize) !usize {
+    return positionedPrefillGeometryLimit(configured, seq, kind == .cuda and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES"));
+}
+
+pub fn positionedPrefillGeometryLimit(configured: usize, seq: usize, wide: bool) !usize {
+    const capacity = if (wide) max_positioned_prefill_items else default_positioned_prefill_items;
+    const rows = if (wide) 8192 else max_positioned_prefill_rows;
+    if (configured == 0 or configured > capacity or seq == 0) return error.InvalidBatchDecodeState;
+    return @min(configured, @max(@as(usize, 1), rows / seq));
+}
+
+pub fn positionedPrefillHostScratch(items: usize, seq: usize, vocab: usize) !usize {
+    if (items > default_positioned_prefill_items) return error.InvalidBatchDecodeState;
+    return positionedPrefillHostScratchCapacity(items, seq, vocab);
+}
+
+pub fn positionedPrefillHostScratchForBackend(kind: ops.BackendKind, items: usize, seq: usize, vocab: usize) !usize {
+    if (kind == .cuda and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES"))
+        return positionedPrefillHostScratchCapacity(items, seq, vocab);
+    return positionedPrefillHostScratch(items, seq, vocab);
+}
+
+pub fn positionedPrefillHostScratchCapacity(items: usize, seq: usize, vocab: usize) !usize {
+    if (items == 0 or items > max_positioned_prefill_items or seq == 0 or vocab == 0) return error.InvalidBatchDecodeState;
+    const logits = std.math.mul(usize, items, vocab) catch return error.ResourceLimitExceeded;
+    const logits_bytes = std.math.mul(usize, logits, 2 * @sizeOf(f32)) catch return error.ResourceLimitExceeded;
+    const positions = std.math.mul(usize, items, seq) catch return error.ResourceLimitExceeded;
+    const position_bytes = std.math.mul(usize, positions, 3 * @sizeOf(u32)) catch return error.ResourceLimitExceeded;
+    const arrays = std.math.add(usize, logits_bytes, position_bytes) catch return error.ResourceLimitExceeded;
+    return std.math.add(usize, arrays, 32 * 1024) catch error.ResourceLimitExceeded;
+}
+
+pub fn cudaPreparedPrefillGreedyEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_PREPARED_TAIL_GREEDY", false);
+}
+
+pub fn metalPreparedPrefillHiddenCaptureEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_ENABLE_METAL_PREFILL_HIDDEN_CAPTURE", false) and
+        !platform.env.getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_METAL_PREFILL_HIDDEN_CAPTURE");
 }

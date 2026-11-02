@@ -89,8 +89,45 @@ pub const Process = struct {
         return result;
     }
 };
+/// Actual requested allocation spans through an explicitly observed owner
+/// allocator. Allocator padding, mapped files and external library heaps are
+/// separate scopes. Matching/ancestor identities must never be added together.
+pub const ObservedAllocator = struct {
+    counter_scope: enum { owner_lifetime, owner_interval } = .owner_lifetime,
+    owner_identity: usize,
+    parent_identity: ?usize,
+    coverage: @import("allocation_observer.zig").Coverage,
+    usage: @import("allocation_observer.zig").Snapshot,
+    pub fn init(owner: *@import("allocation_observer.zig").State) ObservedAllocator {
+        return .{ .owner_identity = @intFromPtr(owner), .parent_identity = if (owner.parent()) |p| @intFromPtr(p) else null, .coverage = owner.coverage, .usage = owner.snapshot() };
+    }
+    fn since(self: ObservedAllocator, before: ObservedAllocator) ObservedAllocator {
+        var result = self;
+        if (self.owner_identity == before.owner_identity and self.counter_scope == .owner_lifetime and before.counter_scope == .owner_lifetime) {
+            result.usage = self.usage.since(before.usage);
+            result.counter_scope = .owner_interval;
+        }
+        return result;
+    }
+};
+pub const NativeAllocations = struct {
+    compute: ?ObservedAllocator = null,
+    model: ?ObservedAllocator = null,
+    late_enable_failed: bool = false,
+    fn since(self: NativeAllocations, before: NativeAllocations) NativeAllocations {
+        var result = self;
+        if (self.compute) |after| if (before.compute) |start| {
+            result.compute = after.since(start);
+        };
+        if (self.model) |after| if (before.model) |start| {
+            result.model = after.since(start);
+        };
+        return result;
+    }
+};
 pub const Snapshot = struct {
     counters: Counters = .{},
+    native_allocations: ?NativeAllocations = null,
     memory: Memory = .{},
     /// Invocation interval on its submitting thread, including CPU fallbacks.
     submission: ?@import("runtime_observation.zig").Counters = null,
@@ -100,6 +137,7 @@ pub const Snapshot = struct {
         return .{
             .counters = self.counters.since(before.counters),
             .memory = self.memory,
+            .native_allocations = if (self.native_allocations) |after| if (before.native_allocations) |start| after.since(start) else after else null,
             .process = if (self.process) |after| if (before.process) |start| after.since(start) else after else null,
         };
     }

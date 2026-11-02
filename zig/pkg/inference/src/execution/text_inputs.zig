@@ -65,6 +65,25 @@ pub const Plan = struct {
     input_bytes: usize = 0,
     temporary_bytes: usize = 0,
 
+    pub const Signature = struct {
+        items: [max_inputs]tensors.TensorInfo = undefined,
+        len: usize = 0,
+
+        pub fn slice(self: *const Signature) []const tensors.TensorInfo {
+            return self.items[0..self.len];
+        }
+    };
+
+    /// Borrow resolved geometry before allocating public input payloads. The
+    /// plan must remain alive while a consumer reads these shape slices.
+    pub fn signature(self: *const Plan) Signature {
+        var result = Signature{ .len = self.len };
+        for (self.specs[0..self.len], result.items[0..self.len]) |*spec, *info| {
+            info.* = .{ .name = spec.name, .dtype = spec.dtype, .shape = spec.shape() };
+        }
+        return result;
+    }
+
     pub fn init(info: []const tensors.TensorInfo, shape: []const i64, options: Options) !Plan {
         if (shape.len != 2 or shape[0] <= 0 or shape[1] <= 0 or info.len == 0 or info.len > max_inputs) return error.InvalidInputShape;
         var plan = Plan{ .batch = @intCast(shape[0]), .sequence = @intCast(shape[1]) };
@@ -184,11 +203,15 @@ fn checkDeclaredTextInputs(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 288), plan.input_bytes);
     var inputs = try plan.materialize(allocator, ids, mask, options);
     defer inputs.deinit();
+    const signature = plan.signature();
     try std.testing.expectEqual(@as(usize, 5), inputs.len);
-    for (inputs.slice(), info) |input, declared| {
+    for (inputs.slice(), info, signature.slice()) |input, declared, planned| {
         try std.testing.expectEqualStrings(declared.name, input.name);
         try std.testing.expectEqual(declared.dtype, input.dtype);
         try std.testing.expectEqualSlices(i64, declared.shape, input.shape);
+        try std.testing.expectEqualStrings(input.name, planned.name);
+        try std.testing.expectEqual(input.dtype, planned.dtype);
+        try std.testing.expectEqualSlices(i64, input.shape, planned.shape);
     }
     try std.testing.expectEqualSlices(i64, &.{ 0, 1, 2 }, inputs.items[0].asInt64());
     for (inputs.items[1].asFloat32(), 0..) |value, index| {
