@@ -11344,7 +11344,7 @@ test "managed constructors retain cooperative fallback without a process boundar
     }
 }
 
-test "preferred load attempt releases admission on cancellation and guard failure" {
+test "preferred load guard and early cancellation fail before admission" {
     const allocator = std.testing.allocator;
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
@@ -11366,13 +11366,12 @@ test "preferred load attempt releases admission on cancellation and guard failur
     try manager.ensureResourceOwnerReady();
 
     const Hooks = struct {
-        fn cancelAfterAdmission(raw: ?*anyopaque) !void {
-            const owner: *ModelManager = @ptrCast(@alignCast(raw.?));
-            if (owner.admissionController().snapshot().host_weight_bytes > 0) return error.Timeout;
+        fn cancelBeforeConstruction(_: ?*anyopaque) !void {
+            return error.Timeout;
         }
         fn failArm(raw: *anyopaque, _: execution_control_mod.MonitorControl) !u64 {
             const owner: *ModelManager = @ptrCast(@alignCast(raw));
-            try std.testing.expect(owner.admissionController().snapshot().host_weight_bytes > 0);
+            try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, owner.admissionController().snapshot());
             return error.OutOfMemory;
         }
         fn disarm(_: *anyopaque, _: u64) void {
@@ -11381,11 +11380,12 @@ test "preferred load attempt releases admission on cancellation and guard failur
     };
     const controls = [_]InferenceExecutionControl{
         .{},
-        .{ .ptr = &manager, .check_fn = Hooks.cancelAfterAdmission },
+        .{ .ptr = &manager, .check_fn = Hooks.cancelBeforeConstruction },
         .{ .hard_cancellation = .{ .ptr = &manager, .arm_fn = Hooks.failArm, .disarm_fn = Hooks.disarm } },
     };
     const errors = [_]anyerror{ error.ProcessIsolationRequired, error.Timeout, error.OutOfMemory };
-    // Use Metal's process-required construction contract for this test.
+    // Primary loads arm process protection before artifact admission.
+    // Component loads exercise their distinct admission-first contract above.
     for (0..3) |_| for (controls, errors) |control, expected| {
         try std.testing.expectError(expected, loadSessionForPreferredBackends(
             &manager,
@@ -11397,6 +11397,39 @@ test "preferred load attempt releases admission on cancellation and guard failur
         ));
         try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
     };
+}
+
+test "preferred load cancellation after construction releases retained admission" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024 });
+    try manager.ensureResourceOwnerReady();
+    var man = try manifest_mod.loadFromDir(allocator, root);
+    defer man.deinit();
+    const State = struct {
+        manager: *ModelManager,
+        observed: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.manager.admissionController().snapshot().host_weight_bytes != 0) {
+                self.observed = true;
+                return error.Timeout;
+            }
+        }
+    };
+    for (0..3) |_| {
+        var state = State{ .manager = &manager };
+        try std.testing.expectError(error.Timeout, loadSessionForPreferredBackends(&manager, &.{.native}, root, man, &manager.session_manager, .{ .ptr = &state, .check_fn = State.check }));
+        try std.testing.expect(state.observed);
+        try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    }
 }
 
 fn loadErrorPriority(err: anyerror) u2 {
