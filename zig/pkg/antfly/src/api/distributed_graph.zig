@@ -3202,12 +3202,18 @@ const CanonicalEdgeBatch = struct {
             if (budget.remaining_physical_edges == 0) return budget.exhaust(.explored_edges, budget.max_edges);
             const a = self.tracked.allocator();
             try self.shards.ensureUnusedCapacity(a, 1);
-            const room = budget.max_retained_state_bytes -| budget.retained_state_bytes;
             var cursor_bytes: usize = 0;
             inline for (.{ cursor.edge_type, cursor.adjacent_key, cursor.edge_id, cursor.owner_document }) |value| cursor_bytes = try std.math.add(usize, cursor_bytes, value.len);
             if (cursor.physical_resume_key) |value| cursor_bytes = try std.math.add(usize, cursor_bytes, value.len);
             const overhead = try std.math.add(usize, key.len * 12 + 64 * 1024, try std.math.mul(usize, cursor_bytes, 6));
-            if (room <= overhead) return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+            // Yield optional adjacency toward the requested response size
+            // before deriving a smaller transport allowance. Otherwise a warm
+            // cache can make an indivisible edge appear too large to return.
+            const response_bytes = @max(@as(usize, 1), max_bytes -| bytes);
+            _ = budget.prepareStateHeadroom(overhead +| (response_bytes *| 16));
+            // Sixteen spare bytes keep the transport safety factor's response
+            // allowance nonzero, even when the preferred size cannot fit.
+            const room = try budget.ensureStateHeadroom(try std.math.add(usize, overhead, 16));
             var workspace = std.heap.ArenaAllocator.init(a);
             defer workspace.deinit();
             const keys = [_][]const u8{key};
@@ -18000,6 +18006,50 @@ test "distributed graph metric post processing applies max results after filter 
         try std.testing.expectEqual(@as(usize, 12), fixture.batch_edge_calls);
         // 130 roots + 129 unique endpoints, once on each of two shards.
         try std.testing.expectEqual(@as(usize, 518), fixture.batch_edge_keys);
+    }
+    // Parallel prefetch can leave a partial cursor. Required continuation
+    // reclaims optional adjacency before rejecting overhead or response bytes.
+    for ([_]bool{ false, true }) |tight_response| {
+        var impl = std.Io.Threaded.init(alloc, .{});
+        defer impl.deinit();
+        var fixture = TestState{ .graph = &graph, .batch_edge_cap = 1, .io_impl = &impl };
+        var work = graph_work_budget.WorkBudget.initWithLimits(.{});
+        var gate = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&fixture), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+        gate.incoming_probe_options.work_budget = &work;
+        defer gate.deinit();
+        var edge_cache = CanonicalEdgeBatch{ .tracked = .{ .backing = alloc, .budget = &work } };
+        defer edge_cache.deinit();
+        var optional = TraversalReadCache{};
+        defer optional.deinit();
+        const reader = DistributedEdgeReader{ .catalog = FakeCatalog.iface(), .worker = FakeWorker.iface(&fixture), .source_table = "docs", .index_name = "graph_idx", .consistency = .read_index, .admission = &gate, .physical_work_budget = &work, .prefetched = &edge_cache, .reuse_cache = &optional };
+        const frontier = [_]FrontierState{ .{ .key = @constCast(roots[0]) }, .{ .key = @constCast(roots[1]) } };
+        try edge_cache.prepare(reader, &frontier, 1, query.query.params);
+        const payload = try alloc.alloc(u8, 32 * 1024);
+        defer alloc.free(payload);
+        @memset(payload, 'x');
+        const warm = FrontierState{ .key = @constCast("warm") };
+        const cached = db_mod.types.GraphSearchResult{ .name = @constCast(""), .nodes = @constCast(&[_]graph_query_mod.GraphResultNode{.{ .key = payload, .depth = 1, .distance = 1 }}), .hits = &.{}, .total_hits = 1 };
+        // The checked fixture allocator is opaque; use an admitted backing
+        // so this test exercises actual residency rather than skipped caching.
+        optional.put(std.testing.allocator, &work, "docs", null, warm, cached, &.{});
+        try std.testing.expect(optional.get("docs", null, warm) != null);
+        const cursor = edge_cache.shards.items[1].result.resume_cursor.?;
+        var cursor_bytes: usize = 0;
+        inline for (.{ cursor.edge_type, cursor.adjacent_key, cursor.edge_id, cursor.owner_document }) |value| cursor_bytes += value.len;
+        if (cursor.physical_resume_key) |value| cursor_bytes += value.len;
+        const overhead = roots[0].len * 12 + 64 * 1024 + cursor_bytes * 6;
+        // First exercise the overhead rejection, then the positive-but-tiny
+        // response allowance that would reject an otherwise fitting edge.
+        const initial_room = if (tight_response) overhead + 16 else 64 * 1024 - 128;
+        var required = try graph_work_budget.RetainedLease.init(&work, work.max_retained_state_bytes - work.retained_state_bytes - initial_room);
+        defer required.deinit();
+        const scans_before = work.remaining_physical_edges;
+        var resumed = (try edge_cache.take(alloc, reader, "docs", 22, roots[0], &.{}, .out, 10, 1024 * 1024)).?;
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), resumed.edges.len);
+        try std.testing.expect(optional.get("docs", null, warm) == null);
+        try std.testing.expectEqual(@as(usize, 1), scans_before - work.remaining_physical_edges);
+        try std.testing.expect(work.exhaustion() == null);
     }
     // Compare selection ownership with a wide cached payload, independently
     // of response creation. No filtered-out payload needs a second copy.
