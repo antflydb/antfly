@@ -47,6 +47,8 @@ test "LightOnOCR3 BF16 vision device contract includes Ampere and Blackwell" {
     try std.testing.expect(!validRowGeometry(1, 0));
     // Direct module users must obey the same contract as the selector.
     var ctx: context.CudaContext = undefined;
+    ctx.observation = null;
+    ctx.observation_enable_failed = false;
     ctx.info.compute_major = 8;
     ctx.info.compute_minor = 0;
     ctx.info.driver_version = 12090;
@@ -138,7 +140,7 @@ pub const Module = struct {
     }
 
     fn launch(self: *Module, ctx: *context.CudaContext, function: Program.Entry, grid: usize, args: []?*anyopaque) !void {
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.program.function(function), @intCast(grid), 1, 1, 256, 1, 1, 0, ctx.stream, args.ptr, null));
+        try ctx.launchKernel(self.program.function(function), @intCast(grid), 1, 1, 256, 1, 1, 0, ctx.stream, args.ptr, null);
         ctx.noteKernelLaunch();
     }
 
@@ -148,7 +150,7 @@ pub const Module = struct {
         var h: u32 = @intCast(hidden);
         var eps = epsilon;
         var args = [_]?*anyopaque{ &p[0], &p[1], &p[2], &p[3], &r, &h, &eps };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.program.function(.norm), @intCast(rows), 1, 1, 128, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.launchKernel(self.program.function(.norm), @intCast(rows), 1, 1, 128, 1, 1, 0, ctx.stream, &args, null);
         ctx.noteKernelLaunch();
     }
 

@@ -214,6 +214,8 @@ pub fn run(comptime K: type, comptime Before: type) !void {
                     var trace = Trace{ .pointer_count = if (c.kind == .qkv) 7 else 5, .scalar_count = if (c.kind == .pair) 3 else 4 };
                     active = &trace;
                     var ctx: context.CudaContext = undefined;
+                    ctx.observation = null;
+                    ctx.observation_enable_failed = false;
                     ctx.ctx = @ptrFromInt(0xc000);
                     ctx.stream = @ptrFromInt(0xb000);
                     ctx.stats = .{};

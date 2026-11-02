@@ -801,6 +801,8 @@ pub const Session = struct {
         }
     };
 
+    /// Borrowed model-owned observation capability, independent of format.
+    invocation_diagnostics: ?@import("../execution/invocation_observation.zig").Binding = null,
     invocation_services: ?*const invocation.Services = null,
     model_lifetime: ?*ModelLifetime = null,
     model_contract: ModelContract = .{},
@@ -848,11 +850,16 @@ pub const Session = struct {
     }
 
     pub fn configureExecutionDiagnostics(self: Session, enabled: bool) bool {
+        if (self.invocation_diagnostics) |binding| {
+            binding.diagnostics.configure(enabled);
+            return true;
+        }
         const configure = self.vtable.configureExecutionDiagnostics orelse return false;
         configure(self.ptr, enabled);
         return true;
     }
     pub fn executionDiagnostics(self: Session) ?@import("../execution/diagnostics.zig").Snapshot {
+        if (self.invocation_diagnostics) |binding| return binding.diagnostics.snapshot();
         const snapshot = self.vtable.executionDiagnostics orelse return null;
         return snapshot(self.ptr);
     }
@@ -908,7 +915,11 @@ pub const Session = struct {
         else
             null;
         errdefer if (resource_lease) |*lease| lease.release();
-        const outputs = try self.vtable.run(self.ptr, inputs, allocator);
+        const outputs = try @import("../execution/invocation_observation.zig").call(self.invocation_diagnostics, self.vtable.run, .{
+            self.ptr,
+            inputs,
+            allocator,
+        });
         errdefer deinitTensorSlice(outputs, allocator);
         return attachOutputAdmission(outputs, allocator, &resource_lease, self.resourcePin());
     }
@@ -940,7 +951,12 @@ pub const Session = struct {
             resource_lease = null;
             return err;
         };
-        const outputs = try self.vtable.runWithControl(self.ptr, inputs, allocator, active);
+        const outputs = try @import("../execution/invocation_observation.zig").call(self.invocation_diagnostics, self.vtable.runWithControl, .{
+            self.ptr,
+            inputs,
+            allocator,
+            active,
+        });
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
         return attachOutputAdmission(outputs, allocator, &resource_lease, self.resourcePin());
@@ -960,7 +976,12 @@ pub const Session = struct {
         else
             null;
         errdefer if (lease) |*l| l.release();
-        const outputs = (try run_decisions(self.ptr, inputs, allocator, control)) orelse {
+        const outputs = (try @import("../execution/invocation_observation.zig").call(self.invocation_diagnostics, run_decisions, .{
+            self.ptr,
+            inputs,
+            allocator,
+            control,
+        })) orelse {
             if (lease) |*l| l.release();
             return null;
         };
@@ -1486,7 +1507,11 @@ pub const Session = struct {
             else
                 null;
             errdefer if (resource_lease) |*lease| lease.release();
-            var outputs = (try run_resident(self.ptr, inputs, allocator)) orelse {
+            var outputs = (try @import("../execution/invocation_observation.zig").call(self.invocation_diagnostics, run_resident, .{
+                self.ptr,
+                inputs,
+                allocator,
+            })) orelse {
                 if (resource_lease) |*lease| lease.release();
                 return null;
             };
@@ -1519,7 +1544,11 @@ pub const Session = struct {
             else
                 null;
             errdefer if (resource_lease) |*lease| lease.release();
-            var outputs = (try run_resident_inputs(self.ptr, inputs, allocator)) orelse {
+            var outputs = (try @import("../execution/invocation_observation.zig").call(self.invocation_diagnostics, run_resident_inputs, .{
+                self.ptr,
+                inputs,
+                allocator,
+            })) orelse {
                 if (resource_lease) |*lease| lease.release();
                 return null;
             };
@@ -1533,7 +1562,12 @@ pub const Session = struct {
 
     pub fn runResidentTextEmbedding(self: Session, inputs: []const Tensor, request: ResidentTextEmbeddingRequest, allocator: std.mem.Allocator) !?ResidentOutputs {
         const run_resident = self.vtable.runResidentTextEmbedding orelse return null;
-        var outputs = (try run_resident(self.ptr, inputs, request, allocator)) orelse return null;
+        var outputs = (try @import("../execution/invocation_observation.zig").call(self.invocation_diagnostics, run_resident, .{
+            self.ptr,
+            inputs,
+            request,
+            allocator,
+        })) orelse return null;
         self.pinResident(&outputs);
         return outputs;
     }
@@ -1699,7 +1733,11 @@ pub const RunPermit = struct {
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) return self.runWithControl(inputs, allocator, null);
         if (try self.executePrepared(.{ .host = inputs }, .host, allocator, null)) |result| return result.host;
-        return self.session.vtable.run(self.session.ptr, inputs, allocator);
+        return @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, self.session.vtable.run, .{
+            self.session.ptr,
+            inputs,
+            allocator,
+        });
     }
 
     pub fn runWithControl(
@@ -1721,12 +1759,12 @@ pub const RunPermit = struct {
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
         defer hard_cancellation.deinit();
-        const outputs = try self.session.vtable.runWithControl(
+        const outputs = try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, self.session.vtable.runWithControl, .{
             self.session.ptr,
             inputs,
             allocator,
             active,
-        );
+        });
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
         return outputs;
@@ -1753,7 +1791,12 @@ pub const RunPermit = struct {
         try active.check();
         var protection = if (control) |c| try c.enterUninterruptible(self.session.interruption()) else null;
         defer if (protection) |*p| p.deinit();
-        const outputs = (try run_decisions(self.session.ptr, inputs, allocator, control)) orelse return null;
+        const outputs = (try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, run_decisions, .{
+            self.session.ptr,
+            inputs,
+            allocator,
+            control,
+        })) orelse return null;
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
         return outputs;
@@ -1768,7 +1811,11 @@ pub const RunPermit = struct {
         if (self.execution_yielded) return self.runResidentWithControl(inputs, allocator, null);
         if (try self.executePreparedResident(.{ .host = inputs }, allocator, null)) |outputs| return outputs;
         const run_resident = self.session.vtable.runResident orelse return null;
-        var outputs = (try run_resident(self.session.ptr, inputs, allocator)) orelse return null;
+        var outputs = (try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, run_resident, .{
+            self.session.ptr,
+            inputs,
+            allocator,
+        })) orelse return null;
         self.session.pinResident(&outputs);
         return outputs;
     }
@@ -1796,7 +1843,12 @@ pub const RunPermit = struct {
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
         defer hard_cancellation.deinit();
         var outputs = if (self.session.vtable.runResidentWithControl) |run_controlled|
-            (try run_controlled(self.session.ptr, inputs, allocator, active)) orelse return null
+            (try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, run_controlled, .{
+                self.session.ptr,
+                inputs,
+                allocator,
+                active,
+            })) orelse return null
         else
             return null;
         errdefer outputs.deinit();
@@ -1828,7 +1880,7 @@ pub const RunPermit = struct {
         if (control) |active| try active.check();
         var protection = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
         defer if (protection) |*scope| scope.deinit();
-        return self.runStageInputsWithinBoundary(inputs, allocator, control);
+        return @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, RunPermit.runStageInputsWithinBoundary, .{ self, inputs, allocator, control });
     }
 
     fn runStageInputsWithinBoundary(self: *RunPermit, inputs: []const StageInput, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?ResidentOutputs {
@@ -1855,9 +1907,9 @@ pub const RunPermit = struct {
         }
         if (try self.executePreparedResident(.{ .resident = resident }, allocator, control)) |outputs| return outputs;
         var outputs = (if (control) |active|
-            try self.session.vtable.runResidentInputsWithControl.?(self.session.ptr, resident, allocator, active)
+            try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, self.session.vtable.runResidentInputsWithControl.?, .{ self.session.ptr, resident, allocator, active })
         else
-            try self.session.vtable.runResidentInputs.?(self.session.ptr, resident, allocator)) orelse return null;
+            try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, self.session.vtable.runResidentInputs.?, .{ self.session.ptr, resident, allocator })) orelse return null;
         errdefer outputs.deinit();
         if (control) |active| try active.check();
         self.session.pinResident(&outputs);
@@ -1873,7 +1925,11 @@ pub const RunPermit = struct {
         if (try self.executePreparedResident(.{ .resident = inputs }, allocator, null)) |outputs| return outputs;
         const run_resident_inputs = self.session.vtable.runResidentInputs orelse
             return null;
-        var outputs = (try run_resident_inputs(self.session.ptr, inputs, allocator)) orelse return null;
+        var outputs = (try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, run_resident_inputs, .{
+            self.session.ptr,
+            inputs,
+            allocator,
+        })) orelse return null;
         self.session.pinResident(&outputs);
         return outputs;
     }
@@ -1900,7 +1956,12 @@ pub const RunPermit = struct {
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
         defer hard_cancellation.deinit();
         const run_controlled = self.session.vtable.runResidentInputsWithControl orelse return null;
-        var outputs = (try run_controlled(self.session.ptr, inputs, allocator, active)) orelse return null;
+        var outputs = (try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, run_controlled, .{
+            self.session.ptr,
+            inputs,
+            allocator,
+            active,
+        })) orelse return null;
         errdefer outputs.deinit();
         try active.check();
         self.session.pinResident(&outputs);
@@ -1915,7 +1976,12 @@ pub const RunPermit = struct {
     ) !?ResidentOutputs {
         if (self.execution_yielded) return self.runResidentTextEmbeddingWithControl(inputs, request, allocator, null);
         const run_resident = self.session.vtable.runResidentTextEmbedding orelse return null;
-        var outputs = (try run_resident(self.session.ptr, inputs, request, allocator)) orelse return null;
+        var outputs = (try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, run_resident, .{
+            self.session.ptr,
+            inputs,
+            request,
+            allocator,
+        })) orelse return null;
         self.session.pinResident(&outputs);
         return outputs;
     }
@@ -1986,7 +2052,13 @@ pub const RunPermit = struct {
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
         defer hard_cancellation.deinit();
         var outputs = if (self.session.vtable.runResidentTextEmbeddingWithControl) |run_controlled|
-            (try run_controlled(self.session.ptr, inputs, request, allocator, active)) orelse return null
+            (try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, run_controlled, .{
+                self.session.ptr,
+                inputs,
+                request,
+                allocator,
+                active,
+            })) orelse return null
         else
             return null;
         errdefer outputs.deinit();

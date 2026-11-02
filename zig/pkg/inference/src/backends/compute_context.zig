@@ -692,7 +692,9 @@ test "early native observations outlive their compute through a foreign dense vi
 test "early native observed context construction unwinds every allocation failure" {
     const Case = struct {
         fn run(a: std.mem.Allocator) !void {
-            var context = try BackendContext.initWithOptions(a, .native, null, .{ .observe_native_allocations = true });
+            const observer = try @import("../execution/allocation_observer.zig").State.createWithMetadata(a, a, .from_owner_creation);
+            defer observer.release();
+            var context = try BackendContext.initWithOptions(observer.allocator(), .native, null, .{ .observe_native_allocations = true });
             defer context.deinit(a);
             const backend = context.computeBackend();
             const input = try backend.fromFloat32Shape(&.{ -1, 2 }, &.{2});

@@ -87,6 +87,30 @@ pub const HiddenSource = enum {
     }
 };
 
+pub const DeviceTokenOutcome = struct { token: usize, token_tensor: ?ops.CT = null };
+pub const DeviceStepEvents = struct { handoff_attempts: usize = 0, handoff_hits: usize = 0, handoff_fallbacks: usize = 0 };
+pub const DeviceStepRequest = struct {
+    token_ids: []const i64,
+    sequence_length: usize,
+    input_token_tensor: ?ops.CT = null,
+    sampling: ?graph_mod.model_runtime.SamplingConfig = null,
+    prefetch_drain_budget: usize = 4,
+};
+pub const DeviceStepResult = union(enum) { token: DeviceTokenOutcome, logits: []f32, declined };
+
+pub fn deviceTokenHandoffEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GREEDY_DEVICE_TOKEN_HANDOFF", true);
+}
+pub fn gatedTokenTensorEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GATED_TOKEN_TENSOR_DECODE", false);
+}
+pub fn metalDirectTailDefault() bool {
+    return true;
+}
+pub fn metalDirectTailEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_DIRECT_GREEDY", metalDirectTailDefault());
+}
+
 pub const Runtime = struct {
     context: graph_mod.execution.Context,
     graph_cache: ?*graph_mod.cache.GraphCache = null,
@@ -102,6 +126,73 @@ pub const Runtime = struct {
         activation: []f32,
         next_target_choice: ?u32 = null,
     };
+
+    pub fn forwardDeviceStep(self: *Runtime, state: *NativeDecodeState, request: DeviceStepRequest, events: *DeviceStepEvents) !DeviceStepResult {
+        const cb = self.context.cb;
+        const allocator = self.context.allocator;
+        const model = self.context.gpt_config.*;
+        const kind = cb.kind();
+        var physical = BorrowedDecodeStateRuntime.init(state);
+        if (request.sampling) |sampling| {
+            if (kind != .metal or model.family != .gemma or !model.hasPle() or !metalDirectTailEnabled()) return .declined;
+            cb.drainPrefetchBudget(request.prefetch_drain_budget);
+            const decode = physical.makeDecodeContext(request.sequence_length, 1);
+            if (try decoder_gated_runtime.forwardSampledToken(cb, allocator, model, model.num_hidden_layers, request.token_ids[request.sequence_length - 1], request.sequence_length, &decode, sampling, request.token_ids[0..request.sequence_length])) |token| {
+                if (token < 0) return error.InvalidModelOutput;
+                return .{ .token = .{ .token = @intCast(token) } };
+            }
+            if (try decoder_gated_runtime.forwardLastLogits(cb, allocator, model, model.num_hidden_layers, request.token_ids[request.sequence_length - 1], request.sequence_length, &decode)) |logits|
+                return .{ .logits = logits };
+            return .declined;
+        }
+        cb.drainPrefetchBudget(request.prefetch_drain_budget);
+        const decode = physical.makeDecodeContext(request.sequence_length, 1);
+        if (kind == .metal and model.family == .gemma and model.hasPle() and metalDirectTailEnabled()) {
+            if (try decoder_gated_runtime.forwardGreedyToken(cb, allocator, model, model.num_hidden_layers, request.token_ids[request.sequence_length - 1], request.sequence_length, &decode)) |token| {
+                if (token < 0) return error.InvalidModelOutput;
+                return .{ .token = .{ .token = @intCast(token) } };
+            }
+        }
+        if (request.input_token_tensor) |tensor| {
+            if (deviceTokenHandoffEnabled()) {
+                events.handoff_attempts += 1;
+                if (gatedTokenTensorEnabled() and (kind != .cuda or !gpt_arch.cudaDecodeGraphReplayRequired())) {
+                    if (try decoder_gated_runtime.forwardGreedyTokenFromTokenTensor(cb, allocator, model, model.num_hidden_layers, request.token_ids[request.sequence_length - 1], tensor, request.sequence_length, &decode)) |result| {
+                        events.handoff_hits += 1;
+                        return .{ .token = .{ .token = result.token_id, .token_tensor = result.token_tensor } };
+                    }
+                }
+                if (try gpt_arch.forwardGreedyLastTokenFromTokenTensor(cb, allocator, model, tensor, 1, request.sequence_length, &decode)) |result| {
+                    events.handoff_hits += 1;
+                    return .{ .token = .{ .token = result.token_id, .token_tensor = result.token_tensor } };
+                }
+                events.handoff_fallbacks += 1;
+            }
+        }
+        const ids = request.token_ids[request.sequence_length - 1 .. request.sequence_length];
+        return .{ .token = .{ .token = try gpt_arch.forwardGreedyLastToken(cb, allocator, model, ids, 1, request.sequence_length, &decode) } };
+    }
+
+    pub fn forwardDeviceTokenTensor(self: *Runtime, state: *NativeDecodeState, sequence_length: usize, input: ops.CT, drain_budget: usize, events: *DeviceStepEvents) !?ops.CT {
+        const cb = self.context.cb;
+        const model = self.context.gpt_config.*;
+        cb.drainPrefetchBudget(drain_budget);
+        var physical = BorrowedDecodeStateRuntime.init(state);
+        const decode = physical.makeDecodeContext(sequence_length, 1);
+        events.handoff_attempts += 1;
+        if (gatedTokenTensorEnabled() and !gpt_arch.cudaDecodeGraphReplayRequired()) {
+            if (try decoder_gated_runtime.forwardGreedyTokenTensorOnlyFromTokenTensor(cb, self.context.allocator, model, model.num_hidden_layers, 0, input, sequence_length, &decode)) |token| {
+                events.handoff_hits += 1;
+                return token;
+            }
+        }
+        if (try gpt_arch.forwardGreedyLastTokenTensorOnlyFromTokenTensor(cb, self.context.allocator, model, input, 1, sequence_length, &decode)) |token| {
+            events.handoff_hits += 1;
+            return token;
+        }
+        events.handoff_fallbacks += 1;
+        return null;
+    }
 
     pub fn materializeAcceptedTokenKv(
         self: *Runtime,
@@ -1227,4 +1318,46 @@ pub fn isSuppressedToken(token_id: u32, token_ids: []const i32) bool {
 
 fn getenvBool(comptime name: [*:0]const u8) bool {
     return platform.env.getenvBool(name);
+}
+
+fn populateDeviceStepWeights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.putWeight(store, "model.embed_tokens.weight", &.{ 4, 4 }, null);
+    try fixture.putWeight(store, "model.norm.weight", &.{4}, 1);
+}
+
+fn checkActualDeviceStep(cb_value: ComputeBackend, reference_value: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cb = &cb_value;
+    const reference = &reference_value;
+    const config = @import("../models/gpt.zig").Config{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .vocab_size = 4, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope };
+    var state = NativeDecodeState.initContiguous(a);
+    defer state.deinit();
+    try state.notePrefill(2);
+    var borrowed = BorrowedDecodeStateRuntime.init(&state);
+    const decode = borrowed.makeDecodeContext(2, 1);
+    const expected = try gpt_arch.forwardGreedyLastToken(reference, a, config, &.{1}, 1, 2, &decode);
+    var numerical = Runtime{ .context = .{ .allocator = a, .cb = cb, .gpt_config = &config, .weight_semantics = .traced_decoder } };
+    var events = DeviceStepEvents{};
+    const result = try numerical.forwardDeviceStep(&state, .{ .token_ids = &.{ 0, 1 }, .sequence_length = 2 }, &events);
+    try std.testing.expect(result == .token);
+    defer if (result.token.token_tensor) |tensor| cb.free(tensor);
+    try std.testing.expectEqual(expected, result.token.token);
+    try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
+    try std.testing.expectEqualDeep(DeviceStepEvents{}, events);
+    // An unsupported physical sampled frame is a pre-numerical decline; the
+    // task retains its canonical sampler and full-logits compatibility route.
+    const declined = try numerical.forwardDeviceStep(&state, .{ .token_ids = &.{ 0, 1 }, .sequence_length = 2, .sampling = .{ .temperature = 0.5 } }, &events);
+    try std.testing.expect(declined == .declined);
+    try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
+    try std.testing.expectEqualDeep(DeviceStepEvents{}, events);
+}
+
+test "decoder device step matches independent Native greedy output without advancing task state" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("../ops/media_residency_test.zig").onNative(populateDeviceStepWeights, checkActualDeviceStep);
+}
+
+test "decoder device step preserves actual Metal greedy output and pre-numerical sampled decline" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateDeviceStepWeights, checkActualDeviceStep);
 }

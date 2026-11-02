@@ -600,6 +600,7 @@ pub fn createSessionWithOptions(
     return .{
         .ptr = self,
         .model_lifetime = &self.model_lifetime,
+        .invocation_diagnostics = .{ .diagnostics = &self.executable.diagnostics, .stable_backend = self.shared_backend_ctx.stableBackend().* },
         .invocation_services = &invocation_services,
         .vtable = &imported_session_vtable,
         .model_contract = .{ .resident_text_embeddings = switch (self.cb.kind()) {
@@ -608,15 +609,6 @@ pub fn createSessionWithOptions(
         } },
         .shared_compute_context = self.shared_backend_ctx,
     };
-}
-
-fn configureExecutionDiagnostics(ptr: *anyopaque, enabled: bool) void {
-    const self: *ImportedOnnxSession = @ptrCast(@alignCast(ptr));
-    self.executable.diagnostics.configure(enabled);
-}
-fn executionDiagnostics(ptr: *anyopaque) ?@import("../execution/diagnostics.zig").Snapshot {
-    const self: *ImportedOnnxSession = @ptrCast(@alignCast(ptr));
-    return self.executable.diagnostics.snapshot();
 }
 
 const invocation_services = prepared_mod.Services{ .accepts = acceptsPreparedInvocation, .prepare = prepareInvocation };
@@ -726,20 +718,12 @@ fn dispatchPreparedInvocation(prepared: *prepared_mod.PreparedInvocation, inputs
         if (control) |active| try active.lock(&root.specialization_mutex) else @import("antfly_platform").sync.lockYielding(&root.specialization_mutex);
     }
     defer if (dynamic) root.specialization_mutex.unlock();
-    const collect = root.executable.diagnostics.isEnabled();
-    target.executable.diagnostics.configure(collect);
-    defer if (dynamic and collect) {
-        if (target.executable.diagnostics.snapshot()) |snapshot| {
-            var measured = snapshot;
-            measured.specializations = .{
-                .hits = @intFromBool(prepared.backend_cookie & 1 != 0),
-                .misses = @intFromBool(prepared.backend_cookie & 2 != 0),
-                .builds = @intFromBool(prepared.backend_cookie & 2 != 0),
-                .evictions = @intFromBool(prepared.backend_cookie & 4 != 0),
-            };
-            root.executable.diagnostics.publish(measured);
-        }
-    };
+    const diagnostic_metadata: ?@import("../execution/diagnostics.zig").ProgramMetadata = if (dynamic) .{ .fixed = .{
+        .hits = @intFromBool(prepared.backend_cookie & 1 != 0),
+        .misses = @intFromBool(prepared.backend_cookie & 2 != 0),
+        .builds = @intFromBool(prepared.backend_cookie & 2 != 0),
+        .evictions = @intFromBool(prepared.backend_cookie & 4 != 0),
+    } } else null;
     const host = switch (inputs) {
         .host => |values| values,
         .resident => null,
@@ -757,8 +741,8 @@ fn dispatchPreparedInvocation(prepared: *prepared_mod.PreparedInvocation, inputs
     }
     const claim = if (prepared.frame_claim) |*value| value else null;
     return switch (placement) {
-        .host => .{ .host = try runConcreteWithOutputs(target, host, resident, allocator, control, false, capability, claim) },
-        .resident => .{ .resident = try runConcreteWithOutputs(target, host, resident, allocator, control, true, capability, claim) },
+        .host => .{ .host = try root.executable.diagnostics.callProgram(&target.executable.diagnostics, diagnostic_metadata, runConcreteWithOutputs, .{ target, host, resident, allocator, control, false, capability, claim }) },
+        .resident => .{ .resident = try root.executable.diagnostics.callProgram(&target.executable.diagnostics, diagnostic_metadata, runConcreteWithOutputs, .{ target, host, resident, allocator, control, true, capability, claim }) },
     };
 }
 
@@ -788,8 +772,6 @@ fn reclaimIdleSpecializations(prepared: *prepared_mod.PreparedInvocation, contro
 }
 
 const imported_session_vtable = Session.VTable{
-    .configureExecutionDiagnostics = configureExecutionDiagnostics,
-    .executionDiagnostics = executionDiagnostics,
     .run = run,
     .runWithControl = runWithControl,
     .inputInfo = inputInfo,
@@ -1067,22 +1049,14 @@ fn runWithOutputs(
         }
         const cache_before = self.specializations.stats;
         const specialized = try specializeForInputs(self, .{ .tensors = host_inputs orelse metadata.? });
-        const collect_diagnostics = self.executable.diagnostics.isEnabled();
-        specialized.executable.diagnostics.configure(collect_diagnostics);
-        defer if (collect_diagnostics) {
-            if (specialized.executable.diagnostics.snapshot()) |snapshot| {
-                var measured = snapshot;
-                measured.specializations = self.specializations.stats.since(cache_before);
-                self.executable.diagnostics.publish(measured);
-            }
-        };
+        const diagnostic_metadata = @import("../execution/diagnostics.zig").ProgramMetadata{ .since = .{ .counters = &self.specializations.stats, .before = cache_before } };
         if (resident) {
-            var outputs = try runWithOutputs(specialized, host_inputs, resident_inputs, allocator, control, true);
+            var outputs = try self.executable.diagnostics.callProgram(&specialized.executable.diagnostics, diagnostic_metadata, runWithOutputs, .{ specialized, host_inputs, resident_inputs, allocator, control, true });
             // Normalized resident values use the shared context and survive
             // eviction. Producer-owned host exports finish inside this lock.
             outputs.backend = self.shared_backend_ctx.stableBackend();
             return outputs;
-        } else return runWithOutputs(specialized, host_inputs, resident_inputs, allocator, control, false);
+        } else return self.executable.diagnostics.callProgram(&specialized.executable.diagnostics, diagnostic_metadata, runWithOutputs, .{ specialized, host_inputs, resident_inputs, allocator, control, false });
     }
     return runConcreteWithOutputs(self, host_inputs, resident_inputs, allocator, control, resident, null, null);
 }
@@ -3220,14 +3194,14 @@ test "ONNX host outputs export directly from a final CPU fallback" {
     try std.testing.expectEqualSlices(f32, &.{ 0, 2, 4, 0 }, outputs[0].asFloat32());
     try std.testing.expectEqual(@as(usize, 0), Probe.copies);
     try std.testing.expectEqual(@as(usize, 1), Probe.native_relu_calls);
-    const first_stats = session.executionDiagnostics().?.execution;
+    const first_stats = session.executionDiagnostics().?.execution.?;
     try std.testing.expectEqual(@as(u64, 1), first_stats.physical_transfer_dispatches);
     try std.testing.expectEqual(@as(u64, 24), first_stats.physical_transfer_bytes);
     var resident = (try session.runResident(&.{ values, index_values }, a)).?;
     defer resident.deinit();
     try std.testing.expect(Probe.copies > 0);
     try std.testing.expectEqual(@as(usize, 2), Probe.native_relu_calls);
-    const warm_stats = session.executionDiagnostics().?.execution;
+    const warm_stats = session.executionDiagnostics().?.execution.?;
     try std.testing.expectEqual(@as(u64, 1), warm_stats.physical_transfer_dispatches);
     try std.testing.expectEqual(@as(u64, 0), warm_stats.physical_storage_allocations);
 }
@@ -3270,7 +3244,7 @@ test "imported onnx session preserves exported contractions and reports warm phy
             const diagnostics = session.executionDiagnostics().?;
             try std.testing.expect(diagnostics.specializations == null);
             try std.testing.expectEqual(@as(?u64, 0), diagnostics.runtime.counters.graph_submissions);
-            const stats = diagnostics.execution;
+            const stats = diagnostics.execution.?;
             try std.testing.expect(stats.assigned_kernel_dispatches > 0);
             if (iteration != 0) {
                 try std.testing.expectEqual(@as(u64, 0), stats.physical_storage_allocations);
@@ -3386,8 +3360,8 @@ test "imported ONNX CUDA assigned graph captures and replays with changing publi
         for (outputs[0].asFloat32(), values) |value, original| try std.testing.expectEqual(@abs(original) * 9, value);
         const snapshot = session.executionDiagnostics().?;
         if (iteration >= 2) {
-            if (snapshot.execution.physical_graph_replays == 0) std.debug.print("ONNX replay decision={s}\n", .{@tagName(snapshot.execution.physical_replay)});
-            try std.testing.expectEqual(@as(u64, 1), snapshot.execution.physical_graph_replays);
+            if (snapshot.execution.?.physical_graph_replays == 0) std.debug.print("ONNX replay decision={s}\n", .{@tagName(snapshot.execution.?.physical_replay)});
+            try std.testing.expectEqual(@as(u64, 1), snapshot.execution.?.physical_graph_replays);
         }
     }
     // Canonicalization replaces the first add(x, x) with a scalar multiply.
@@ -3426,7 +3400,7 @@ test "imported ONNX CUDA assigned graph captures and replays with changing publi
         a.free(restored);
     }
     for (restored[0].asFloat32(), original) |value, source| try std.testing.expectEqual(@abs(source) * 9, value);
-    try std.testing.expectEqual(@as(u64, 1), session.executionDiagnostics().?.execution.physical_graph_replays);
+    try std.testing.expectEqual(@as(u64, 1), session.executionDiagnostics().?.execution.?.physical_graph_replays);
     const public_inputs = [_]RuntimeInput{.{ .node_id = impl.input_node_ids[0], .value = public }};
     var held = try impl.executable.run(a, .{ .runtime_inputs = &public_inputs, .output_placement = .producer });
     defer held.deinit(&impl.executable.runtime);
@@ -3510,7 +3484,7 @@ test "mixed resident stages import host controls without reading resident activa
         };
         defer outputs.deinit();
         const measured = session.executionDiagnostics() orelse return error.MissingResidentDiagnostics;
-        try std.testing.expect(measured.execution.assigned_kernel_dispatches > 0);
+        try std.testing.expect(measured.execution.?.assigned_kernel_dispatches > 0);
         const alias_values = try outputs.backend.toFloat32(outputs.outputs[1], a);
         defer a.free(alias_values);
         try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, alias_values);

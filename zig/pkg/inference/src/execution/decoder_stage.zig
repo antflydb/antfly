@@ -15,6 +15,7 @@ const Control = @import("../execution_control.zig").InferenceExecutionControl;
 pub const Row = struct {
     allocator: std.mem.Allocator,
     logits: []const f32 = &.{},
+    vocab_size: usize = 0,
     stats: ?ops.WhisperLogitsStatsRaw = null,
     owned_logits: ?[]f32 = null,
     host_outputs: []backends.Tensor = &.{},
@@ -28,6 +29,11 @@ pub const Row = struct {
 };
 
 pub const Decoder = struct {
+    pub const Options = struct {
+        allow_native: bool = true,
+        allow_merged: bool = true,
+        output_rows: enum { final_available, full_prefix } = .final_available,
+    };
     allocator: std.mem.Allocator,
     session: backends.Session,
     encoder: *const stages.EncoderOutputs,
@@ -35,14 +41,19 @@ pub const Decoder = struct {
     vocab_size: usize,
     control: ?Control,
     native: ?architecture.WhisperNativeDecoder,
+    options: Options,
     incremental: ?merged.State,
 
     pub fn init(allocator: std.mem.Allocator, session: backends.Session, encoder: *const stages.EncoderOutputs, encoder_length: usize, encoder_mask: []const i64, vocab_size: usize, control: ?Control) !Decoder {
+        return initWithOptions(allocator, session, encoder, encoder_length, encoder_mask, vocab_size, control, .{});
+    }
+
+    pub fn initWithOptions(allocator: std.mem.Allocator, session: backends.Session, encoder: *const stages.EncoderOutputs, encoder_length: usize, encoder_mask: []const i64, vocab_size: usize, control: ?Control, options: Options) !Decoder {
         const host: ?backends.Tensor = switch (encoder.*) {
             .host => |outputs| if (outputs.len != 0) outputs[0] else return error.NoEncoderOutput,
             .resident => null,
         };
-        var native = if (host) |value| try architecture.whisperNativeDecoder(session, allocator, control, value.asFloat32(), encoder_length) else null;
+        var native = if (options.allow_native and host != null) try architecture.whisperNativeDecoder(session, allocator, control, host.?.asFloat32(), encoder_length) else null;
         errdefer if (native) |*value| value.deinit();
         return .{
             .allocator = allocator,
@@ -52,7 +63,8 @@ pub const Decoder = struct {
             .vocab_size = vocab_size,
             .control = control,
             .native = native,
-            .incremental = if (native == null and host != null) merged.State.init(allocator, session, host.?, encoder_mask, vocab_size) else null,
+            .options = options,
+            .incremental = if (options.allow_merged and native == null and host != null) merged.State.init(allocator, session, host.?, encoder_mask, vocab_size) else null,
         };
     }
 
@@ -65,7 +77,7 @@ pub const Decoder = struct {
     /// Dispatch stays a synchronous borrowed capability; no task pointer or
     /// tokenizer is retained. Rows preserve provider ownership without copies.
     pub fn step(self: *Decoder, prefix: []const i64, stats_request: ?native_arch.StatsRequest, dispatch: anytype) !Row {
-        var row = Row{ .allocator = self.allocator };
+        var row = Row{ .allocator = self.allocator, .vocab_size = self.vocab_size };
         errdefer row.deinit();
         if (self.native) |*decoder| {
             const pending = prefix[decoder.positions()..];
@@ -93,25 +105,32 @@ pub const Decoder = struct {
                 if (self.incremental) |*state| {
                     row.host_outputs = try state.stepOutputs(prefix, dispatch, self.control);
                 } else {
-                    const shape = [_]i64{ 1, @intCast(prefix.len) };
-                    var tokens = try backends.Tensor.initInt64(self.allocator, "input_ids", &shape, prefix);
-                    defer tokens.deinit();
-                    const hidden = outputs[0].borrowedView("encoder_hidden_states");
+                    var inputs: stages.DecoderInputs = undefined;
+                    try inputs.init(self.allocator, self.session.inputInfo(), prefix, self.encoder_mask, .{ .host = outputs[0] });
+                    defer inputs.deinit();
+                    const host_inputs = try inputs.hostInputs();
                     row.host_outputs = if (comptime @TypeOf(dispatch) == @TypeOf(null))
-                        try self.session.runWithControl(&.{ tokens, hidden }, self.allocator, self.control)
+                        try self.session.runWithControl(host_inputs, self.allocator, self.control)
                     else if (comptime @typeInfo(@TypeOf(dispatch)) == .optional)
-                        if (dispatch) |provider| try provider.run(self.allocator, self.session, null, null, &.{ tokens, hidden }, self.control) else try self.session.runWithControl(&.{ tokens, hidden }, self.allocator, self.control)
+                        if (dispatch) |provider| try provider.run(self.allocator, self.session, null, null, host_inputs, self.control) else try self.session.runWithControl(host_inputs, self.allocator, self.control)
                     else
-                        try dispatch.run(self.allocator, self.session, null, null, &.{ tokens, hidden }, self.control);
+                        try dispatch.run(self.allocator, self.session, null, null, host_inputs, self.control);
                 }
                 if (row.host_outputs.len == 0) return error.NoDecoderOutput;
+                if (row.host_outputs[0].dtype != .f32) return error.InvalidLogitsShape;
                 const logits = row.host_outputs[0].asFloat32();
                 const vocab = if (row.host_outputs[0].shape.len >= 3)
                     @as(usize, @intCast(row.host_outputs[0].shape[2]))
                 else
                     return error.InvalidLogitsShape;
                 if (vocab == 0 or logits.len < vocab) return error.InvalidLogitsShape;
-                row.logits = logits[logits.len - vocab ..];
+                row.vocab_size = vocab;
+                const end = switch (self.options.output_rows) {
+                    .final_available => logits.len,
+                    .full_prefix => if (self.incremental != null) logits.len else std.math.mul(usize, prefix.len, vocab) catch return error.InvalidLogitsShape,
+                };
+                if (end < vocab or end > logits.len) return error.InvalidLogitsShape;
+                row.logits = logits[end - vocab .. end];
             },
         }
         return row;

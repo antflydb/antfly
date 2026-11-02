@@ -347,7 +347,7 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
         fn ready(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const c: *cuda.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
-            try c.ctx.driver.check(c.ctx.driver.fns.cuEventSynchronize(self.staging_event));
+            try c.ctx.driver.check(c.ctx.synchronizeEventResult(self.staging_event));
         }
         fn flush(self: *@This()) !void {
             if (self.pending_count == 0) return;

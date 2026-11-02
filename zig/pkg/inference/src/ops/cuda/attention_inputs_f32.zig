@@ -117,7 +117,7 @@ pub const Module = struct {
             .epsilon = r.epsilon,
         };
         var args = [_]?*anyopaque{&p};
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.program.function(.prepare), @intCast(r.query_heads + r.key_heads), @intCast(r.rows), 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.launchKernel(self.program.function(.prepare), @intCast(r.query_heads + r.key_heads), @intCast(r.rows), 1, 256, 1, 1, 0, ctx.stream, &args, null);
         ctx.noteKernelLaunch();
         self.calls += 1;
     }

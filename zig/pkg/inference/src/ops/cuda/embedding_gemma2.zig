@@ -376,7 +376,7 @@ pub const Module = struct {
         var fp = floor;
         var args = [_]?*anyopaque{ @ptrCast(&ip), @ptrCast(&pp), @ptrCast(&mp), @ptrCast(&op), @ptrCast(&hp), @ptrCast(&fp) };
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.audio_logmel, @intCast(frames), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.launchKernel(self.audio_logmel, @intCast(frames), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
         self.stats_.launches += 1;
         self.stats_.audio_frontend_fused_launches += 1;
     }
@@ -390,7 +390,7 @@ pub const Module = struct {
         var op = out.ptr;
         var args = [_]?*anyopaque{ @ptrCast(&ip), @ptrCast(&tp), @ptrCast(&op) };
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.audio_fft512, @intCast(frames), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.launchKernel(self.audio_fft512, @intCast(frames), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
         self.stats_.audio_fft_launches += 1;
         self.stats_.launches += 1;
     }
@@ -417,7 +417,7 @@ pub const Module = struct {
         var wo: u32 = @intCast(ow);
         var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&wp), @ptrCast(&bp), @ptrCast(&ci), @ptrCast(&co), @ptrCast(&hh), @ptrCast(&ww), @ptrCast(&ho), @ptrCast(&wo) };
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(if (bf16) self.audio_conv_bf16 else self.audio_conv_tiled, @intCast((oh * ow + 15) / 16), @intCast((oc + 15) / 16), @intCast(batch), if (bf16) 32 else 16, if (bf16) 1 else 16, 1, 0, ctx.stream, &args, null));
+        try ctx.launchKernel(if (bf16) self.audio_conv_bf16 else self.audio_conv_tiled, @intCast((oh * ow + 15) / 16), @intCast((oc + 15) / 16), @intCast(batch), if (bf16) 32 else 16, if (bf16) 1 else 16, 1, 0, ctx.stream, &args, null);
         self.stats_.launches += 1;
         if (bf16) self.stats_.audio_conv_bf16_launches += 1 else self.stats_.audio_conv_tiled_launches += 1;
     }
@@ -1384,12 +1384,12 @@ fn require(b: Buffer, n: usize) !void {
 }
 fn launch(ctx: *Context, f: driver.CUfunction, args: []?*anyopaque, grid: [3]u32, block: [3]u32) !void {
     try ctx.makeCurrent();
-    try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, ctx.stream, args.ptr, null));
+    try ctx.launchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, ctx.stream, args.ptr, null);
     ctx.noteKernelLaunch();
 }
 fn launchShared(ctx: *Context, f: driver.CUfunction, args: []?*anyopaque, grid: [3]u32, block: [3]u32, shared: u32) !void {
     try ctx.makeCurrent();
-    try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], shared, ctx.stream, args.ptr, null));
+    try ctx.launchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], shared, ctx.stream, args.ptr, null);
     ctx.noteKernelLaunch();
 }
 

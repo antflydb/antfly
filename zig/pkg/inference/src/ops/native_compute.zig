@@ -3775,6 +3775,51 @@ pub const NativeCompute = struct {
     /// pass null; production session creation supplies the application's Io.
     io: ?std.Io = null,
 
+    // Draft inside NativeCompute. This is an explicit cold query, not an eager
+    // per-request debug snapshot; caller chooses a metadata allocator. The model
+    // locks give one coherent view of opened shards and prepared payload owners.
+    pub fn modelStorageInventory(self: *NativeCompute, allocator: std.mem.Allocator) !@import("../execution/storage_inventory.zig").Snapshot {
+        const inventory = @import("../execution/storage_inventory.zig");
+        const begin_ns = platform.time.monotonicNs();
+        var collector = inventory.Collector{ .allocator = allocator };
+        defer collector.deinit();
+        const visitor = collector.visitor();
+        const data = self.data;
+        if (data.prefetch_initialized) data.prefetch.lock();
+        defer if (data.prefetch_initialized) data.prefetch.unlock();
+        platform.sync.lockYielding(&data.quantized_prepare_lock);
+        defer data.quantized_prepare_lock.unlock();
+        platform.sync.lockYielding(&data.embeddinggemma2_f32_cache_lock);
+        defer data.embeddinggemma2_f32_cache_lock.unlock();
+        platform.sync.lockYielding(&data.gliner_head_dense_cache_lock);
+        defer data.gliner_head_dense_cache_lock.unlock();
+        const complete = if (data.tensor_store) |store| try store.visitStorageSpans(visitor) else true;
+        var resident = data.resident_weights.valueIterator();
+        while (resident.next()) |weight| try visitLoadedStorage(weight, visitor);
+        var lazy = data.lazy_weights.valueIterator();
+        while (lazy.next()) |entry| if (entry.loaded) |*weight| try visitLoadedStorage(weight, visitor);
+        var canonical = data.embeddinggemma2_canonical_panels.valueIterator();
+        while (canonical.next()) |entry| try visitor.visit(std.mem.sliceAsBytes(entry.panels.data), .owned_heap);
+        var panels = data.embeddinggemma2_panels.valueIterator();
+        while (panels.next()) |entry| try visitor.visit(std.mem.sliceAsBytes(entry.panels.data), .owned_heap);
+        var mirrors = data.embeddinggemma2_f32_cache.valueIterator();
+        while (mirrors.next()) |entry| try visitor.visit(std.mem.sliceAsBytes(entry.data), .owned_heap);
+        var dense = data.gliner_head_dense_cache.valueIterator();
+        while (dense.next()) |entry| try visitor.visit(std.mem.sliceAsBytes(entry.data), .owned_heap);
+        var result = try collector.finish(complete);
+        result.collection = .{ .begin_ns = begin_ns, .end_ns = platform.time.monotonicNs() };
+        return result;
+    }
+    fn visitLoadedStorage(weight: *const LoadedWeight, visitor: @import("../execution/storage_inventory.zig").Visitor) !void {
+        const tensor = &weight.tensor;
+        if (tensor.owns_data) try visitor.visit(tensor.data, .owned_heap) else if (tensor.mmap_source_bytes) |bytes| try visitor.visit(bytes, .borrowed_bytes) else try visitor.visit(tensor.data, .borrowed_bytes);
+        if (weight.quantized_storage) |*storage| {
+            if (storage.raw_mmap_region) |region| try visitor.visit(region.data, .mapped_file) else if (storage.raw_owned) try visitor.visit(storage.raw_bytes, .owned_heap) else if (storage.raw_mmap_backed and storage.raw_mmap_source_bytes != null) try visitor.visit(storage.raw_mmap_source_bytes.?, .mapped_file) else try visitor.visit(storage.raw_bytes, .borrowed_bytes);
+            for (storage.prepared.entries) |buffer| if (buffer) |owned| try visitor.visit(owned.bytes, .owned_heap);
+            if (storage.prepared_group_cache) |group| try visitor.visit(group.packed_bytes, .owned_heap);
+        }
+    }
+
     pub const InitOptions = struct { observe_allocations: bool = false, io: ?std.Io = null };
     pub fn initWithOptions(allocator: std.mem.Allocator, data: *WeightStore, run_budget: ?*run_memory.RunBudget, options: InitOptions) !NativeCompute {
         var result = if (options.io) |io| initWithIo(allocator, data, run_budget, io) else init(allocator, data, run_budget);
@@ -4575,7 +4620,8 @@ const kernel_backend_impl = ops.KernelBackend{
 };
 
 pub const vtable_impl = ComputeBackend.VTable{
-    .enableAllocationObservation = &enableAllocationObservationOp,
+    .modelStorageInventory = &modelStorageInventoryOp,
+    .enableRuntimeObservation = &enableRuntimeObservationOp,
     .debugTimingSnapshot = &debugTimingSnapshotOp,
     .kernels = &kernel_backend_impl,
     .backendKind = &backendKind,
@@ -4751,13 +4797,20 @@ pub const vtable_impl = ComputeBackend.VTable{
     .maskedBceWithLogitsBackward = &maskedBceWithLogitsBackwardOp,
 };
 
-fn enableAllocationObservationOp(ctx: *anyopaque) void {
+fn enableRuntimeObservationOp(ctx: *anyopaque) void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     self.observeAllocations(.since_enable) catch {
         self.allocation_observer_enable_failed = true;
+        @import("../execution/allocation_registry.zig").missing(.compute);
         return;
     };
     self.allocation_observer_enable_failed = false;
+    const registry = @import("../execution/allocation_registry.zig");
+    if (registry.enabled()) {
+        const owners = @import("../execution/allocation_observer.zig");
+        if (owners.State.forAllocator(self.allocator)) |owner| registry.bind(.compute, owner) else registry.missing(.compute);
+        if (owners.State.forAllocator(self.data.allocator)) |owner| registry.bind(.model, owner) else registry.missing(.model);
+    }
 }
 fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
@@ -4774,6 +4827,11 @@ fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
             .late_enable_failed = self.allocation_observer_enable_failed,
         },
     } };
+}
+
+fn modelStorageInventoryOp(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?@import("../execution/storage_inventory.zig").Snapshot {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    return try self.modelStorageInventory(allocator);
 }
 
 fn backendKind(_: *anyopaque) BackendKind {
@@ -48805,8 +48863,29 @@ test "embeddinggemma2 video host borrows avoid copies and writable views reject 
     cb.free(view);
 }
 
+// Draft replacement after central compile releases. Physical buffer byte spans
+// describe retained payload allocations; ownership metadata/allocator padding
+// remain outside this buffer metric and in optional allocator observations.
 fn physicalStorageBytesOp(_: *anyopaque, tensor: CT) ?usize {
-    return toBuf(tensor).data.len * @sizeOf(f32);
+    var buf = toBuf(tensor);
+    while (true) {
+        if (buf.quantized_storage != null or buf.owned_quantized_storage != null) return null;
+        if (buf.owned and buf.retained_parent != null) return null;
+        if (buf.owned) if (buf.source_tensor) |source| {
+            if (source.owns_data) return null;
+        };
+        if (buf.physical_lease) |lease| return lease.backing_byte_size;
+        if (buf.dense_storage) |owner| return owner.data.len * @sizeOf(f32);
+        if (buf.retained_parent) |parent| {
+            buf = toBuf(parent);
+            continue;
+        }
+        if (buf.owned) return buf.data.len * @sizeOf(f32);
+        if (buf.source_tensor) |source| if (source.owns_data) return source.data.len;
+        // Quantized owners may retain several independent prepared panels.
+        // Borrowed spans do not prove the extent of their actual allocation.
+        return null;
+    }
 }
 
 fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) anyerror!?CT {
@@ -51358,4 +51437,50 @@ test "Native aligned source F32 linear borrows weights with unchanged blocked ou
         try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
         try std.testing.expectEqualSlices(f32, &expected, &actual);
     }
+}
+
+test "native physical backing queries retain full dense and physical-frame allocations" {
+    const a = std.testing.allocator;
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer data.deinitOwned();
+    var compute = NativeCompute.init(a, &data, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    const source = try backend.fromFloat32Shape(&.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, &.{ 4, 4 });
+    var source_open = true;
+    defer if (source_open) backend.free(source);
+    const slice = try sliceRows2DOp(&compute, source, 1, 1, 4);
+    defer backend.free(slice);
+    backend.free(source);
+    source_open = false;
+    try std.testing.expectEqual(@as(?usize, 16 * @sizeOf(f32)), physicalStorageBytesOp(&compute, slice));
+    const lease = (try ops.physical_storage.Lease.create(a, backend, 256)).?;
+    var lease_open = true;
+    defer if (lease_open) lease.release();
+    const frame_view = (try physicalTensorViewOp(&compute, .{ .storage = lease, .shape = &.{4} })).?;
+    defer backend.free(frame_view);
+    lease.release();
+    lease_open = false;
+    try std.testing.expectEqual(@as(?usize, 256), physicalStorageBytesOp(&compute, frame_view));
+}
+
+test "native physical backing queries distinguish typed ownership and unknown borrowed or composite spans" {
+    const a = std.testing.allocator;
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer data.deinitOwned();
+    var compute = NativeCompute.init(a, &data, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    var values = [_]f32{ 1, 2, 3, 4 };
+    const borrowed = try compute.makeBuf(&values, false);
+    defer backend.free(borrowed);
+    try std.testing.expectEqual(@as(?usize, null), physicalStorageBytesOp(&compute, borrowed));
+    const tensor = try tensor_mod.Tensor.initInt64(a, "typed", &.{4}, &.{ 1, 2, 3, 4 });
+    const typed = try compute.importOwnedStaticTensor(tensor);
+    defer backend.free(typed);
+    try std.testing.expectEqual(@as(?usize, 4 * @sizeOf(i64)), physicalStorageBytesOp(&compute, typed));
+    try std.testing.expectEqualSlices(f32, &values, try getDataChecked(typed));
+    // Both the exact integer source and its numeric view remain owned. One
+    // cheap backing-span query cannot pretend those form a single allocation.
+    try std.testing.expectEqual(@as(?usize, null), physicalStorageBytesOp(&compute, typed));
 }

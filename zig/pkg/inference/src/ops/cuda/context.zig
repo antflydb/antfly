@@ -43,6 +43,7 @@ pub const DeviceInfo = struct {
 };
 
 pub const RuntimeStats = struct {
+    /// Legacy accepted launch API events, including capture recording and graphs.
     kernel_launches: usize = 0,
     graph_submissions: usize = 0,
     stream_syncs: usize = 0,
@@ -94,11 +95,29 @@ pub const CudaContext = struct {
     video_decoder_release: ?*const fn (*anyopaque) callconv(.c) void = null,
     video_cache_budget: @import("video_cache_budget.zig").CacheBudget = .{},
     stats: RuntimeStats = .{},
+    observation: ?*@import("graph_observation.zig").State = null,
+    observation_enable_failed: bool = false,
     device_allocations: @import("allocation_budget.zig").Budget = .{},
     debug_graph_capture_active: bool = false,
     debug_graph_capture_id: usize = 0,
     debug_graph_capture_param_trace_count: usize = 0,
     debug_graph_capture_tensor_trace_count: usize = 0,
+
+    pub fn enableRuntimeObservation(self: *CudaContext) void {
+        if (self.observation != null) return;
+        self.observation = @import("graph_observation.zig").State.create(std.heap.page_allocator) catch {
+            self.observation_enable_failed = true;
+            return;
+        };
+        self.observation_enable_failed = false;
+    }
+    pub fn runtimeObservation(self: *const CudaContext) ?@import("../../execution/runtime_telemetry.zig").Cuda {
+        if (self.observation) |state| return state.snapshot();
+        return if (self.observation_enable_failed) .{ .state = .allocation_failed } else null;
+    }
+    fn graphObservationApi(self: *const CudaContext) @import("graph_observation.zig").Api {
+        return .{ .get_nodes = self.driver.fns.cuGraphGetNodes, .get_type = self.driver.fns.cuGraphNodeGetType, .get_child = self.driver.fns.cuGraphChildGraphNodeGetGraph };
+    }
 
     pub fn initDefault() driver_mod.Error!CudaContext {
         var driver = try CudaDriver.open();
@@ -185,6 +204,8 @@ pub const CudaContext = struct {
     /// Leave driver entry points loaded for host-only cleanup after a lost
     /// context has relinquished all in-flight device references.
     pub fn releaseResources(self: *CudaContext) void {
+        if (self.observation) |state| state.deinit();
+        self.observation = null;
         if (self.ctx != null) {
             _ = self.driver.fns.cuCtxSetCurrent(self.ctx);
         }
@@ -208,9 +229,30 @@ pub const CudaContext = struct {
         try self.driver.check(self.driver.fns.cuCtxSetCurrent(self.ctx));
     }
 
+    /// Raw driver status preserves existing checked and silent cleanup paths.
+    /// Counters observe explicit successful host wait APIs, not implicit waits
+    /// inside a vendor operation/free or measured CPU blocking time.
+    pub inline fn synchronizeStreamResult(self: *CudaContext, stream: CUstream) driver_mod.CUresult {
+        const result = self.driver.fns.cuStreamSynchronize(stream);
+        if (self.observation) |state| state.hostSynchronization(false, result);
+        return result;
+    }
+    pub inline fn synchronizeEventResult(self: *CudaContext, event: CUevent) driver_mod.CUresult {
+        const result = self.driver.fns.cuEventSynchronize(event);
+        if (self.observation) |state| state.hostSynchronization(true, result);
+        return result;
+    }
+    /// A GPU dependency is distinct from a host wait. Owned-stream recording
+    /// is separate; another stream's capture state is deliberately unknown.
+    pub inline fn waitStreamEventResult(self: *CudaContext, stream: CUstream, event: CUevent, flags: c_uint) driver_mod.CUresult {
+        const result = self.driver.fns.cuStreamWaitEvent(stream, event, flags);
+        if (self.observation) |state| state.streamDependency(stream == self.stream, self.debug_graph_capture_active, result);
+        return result;
+    }
+
     pub fn synchronize(self: *CudaContext) driver_mod.Error!void {
         try self.makeCurrent();
-        try self.driver.check(self.driver.fns.cuStreamSynchronize(self.stream));
+        try self.driver.check(self.synchronizeStreamResult(self.stream));
         self.stats.stream_syncs += 1;
     }
 
@@ -240,7 +282,7 @@ pub const CudaContext = struct {
     pub fn waitEvent(self: *CudaContext, event: CUevent) driver_mod.Error!void {
         if (event == null) return error.InvalidCudaState;
         try self.makeCurrent();
-        try self.driver.check(self.driver.fns.cuStreamWaitEvent(self.stream, event, 0));
+        try self.driver.check(self.waitStreamEventResult(self.stream, event, 0));
     }
 
     pub fn beginStreamCapture(self: *CudaContext, mode: driver_mod.CUstreamCaptureMode) driver_mod.Error!void {
@@ -283,6 +325,7 @@ pub const CudaContext = struct {
             try self.driver.check(self.driver.fns.cuGraphInstantiate(&exec, graph, 0));
         }
         if (exec == null) return error.InvalidCudaState;
+        if (self.observation) |state| state.register(self.graphObservationApi(), graph, exec);
         return exec;
     }
 
@@ -295,14 +338,19 @@ pub const CudaContext = struct {
         outcome.update_result = result_info.result;
         outcome.error_node = result_info.errorNode;
         outcome.error_from_node = result_info.errorFromNode;
+        if (outcome.success()) if (self.observation) |state| {
+            state.register(self.graphObservationApi(), graph, exec);
+        };
         return outcome;
     }
 
     pub fn launchGraph(self: *CudaContext, exec: CUgraphExec) driver_mod.Error!void {
         try self.makeCurrent();
         try self.driver.check(self.driver.fns.cuGraphLaunch(exec, self.stream));
-        self.noteKernelLaunch();
+        // Preserve legacy API-event counters without calling this an eager kernel.
+        self.stats.kernel_launches += 1;
         self.stats.graph_submissions += 1;
+        if (self.observation) |state| state.graphCall(exec, self.debug_graph_capture_active);
     }
 
     /// Return the driver's authoritative stream-capture state when the
@@ -366,13 +414,14 @@ pub const CudaContext = struct {
     pub fn endProfileEventPairUs(self: *CudaContext, pair: ProfileEventPair) driver_mod.Error!u64 {
         defer self.destroyProfileEventPair(pair);
         try self.recordProfileEnd(pair);
-        try self.driver.check(self.driver.fns.cuEventSynchronize(pair.end));
+        try self.driver.check(self.synchronizeEventResult(pair.end));
         return self.readProfileEventPairUs(pair);
     }
 
     pub fn destroyGraphExec(self: *CudaContext, exec: CUgraphExec) void {
         if (exec == null) return;
         self.makeCurrent() catch {};
+        if (self.observation) |state| state.retire(exec);
         _ = self.driver.fns.cuGraphExecDestroy(exec);
     }
 
@@ -397,6 +446,22 @@ pub const CudaContext = struct {
         _ = self.driver.fns.cuEventDestroy(event);
     }
 
+    /// Canonical project-owned driver submission. Preserve exact config and
+    /// stream and observe only after the original driver.check succeeds.
+    pub inline fn launchKernel(self: *CudaContext, function: driver_mod.CUfunction, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint, shared_bytes: c_uint, stream: CUstream, params: ?[*]?*anyopaque, extra: ?[*]?*anyopaque) driver_mod.Error!void {
+        try self.driver.check(self.driver.fns.cuLaunchKernel(function, gx, gy, gz, bx, by, bz, shared_bytes, stream, params, extra));
+        self.noteObservedKernel(stream);
+    }
+    pub inline fn launchCooperativeKernel(self: *CudaContext, launch: anytype, function: driver_mod.CUfunction, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint, shared_bytes: c_uint, stream: CUstream, params: ?[*]?*anyopaque) driver_mod.Error!void {
+        try self.driver.check(launch(function, gx, gy, gz, bx, by, bz, shared_bytes, stream, params));
+        self.noteObservedKernel(stream);
+    }
+    inline fn noteObservedKernel(self: *CudaContext, stream: CUstream) void {
+        if (self.observation) |state| {
+            if (stream == self.stream) state.kernelCall(self.debug_graph_capture_active) else state.foreignKernelCall();
+        }
+    }
+
     pub fn noteKernelLaunch(self: *CudaContext) void {
         self.stats.kernel_launches += 1;
     }
@@ -413,4 +478,64 @@ pub fn probeDefault() driver_mod.Error!DeviceInfo {
     var ctx = try CudaContext.initDefault();
     defer ctx.deinit();
     return ctx.info;
+}
+test "CUDA explicit wait helpers preserve arguments statuses and host dependency recording scopes" {
+    const Fake = struct {
+        threadlocal var result: driver_mod.CUresult = driver_mod.CUDA_SUCCESS;
+        threadlocal var expected_stream: CUstream = null;
+        threadlocal var expected_event: CUevent = null;
+        threadlocal var expected_flags: c_uint = 0;
+        fn stream(value: CUstream) callconv(.c) driver_mod.CUresult {
+            std.debug.assert(value == expected_stream);
+            return result;
+        }
+        fn event(value: CUevent) callconv(.c) driver_mod.CUresult {
+            std.debug.assert(value == expected_event);
+            return result;
+        }
+        fn depend(value: CUstream, completion: CUevent, flags: c_uint) callconv(.c) driver_mod.CUresult {
+            std.debug.assert(value == expected_stream and completion == expected_event and flags == expected_flags);
+            return result;
+        }
+    };
+    const state = try @import("graph_observation.zig").State.create(std.testing.allocator);
+    defer state.deinit();
+    var context: CudaContext = undefined;
+    context.observation = null;
+    context.observation_enable_failed = false;
+    context.driver = undefined;
+    context.driver.fns.cuStreamSynchronize = Fake.stream;
+    context.driver.fns.cuEventSynchronize = Fake.event;
+    context.driver.fns.cuStreamWaitEvent = Fake.depend;
+    context.observation = state;
+    context.stream = @ptrFromInt(1);
+    context.debug_graph_capture_active = false;
+    context.stats = .{};
+    Fake.result = driver_mod.CUDA_SUCCESS;
+    Fake.expected_stream = context.stream;
+    Fake.expected_event = @ptrFromInt(2);
+    Fake.expected_flags = 7;
+    try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, context.synchronizeStreamResult(context.stream));
+    try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, context.synchronizeEventResult(Fake.expected_event));
+    try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, context.waitStreamEventResult(context.stream, Fake.expected_event, 7));
+    context.debug_graph_capture_active = true;
+    try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, context.waitStreamEventResult(context.stream, Fake.expected_event, 7));
+    Fake.expected_stream = @ptrFromInt(3);
+    try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, context.waitStreamEventResult(Fake.expected_stream, Fake.expected_event, 7));
+    Fake.result = 1;
+    try std.testing.expectEqual(@as(driver_mod.CUresult, 1), context.synchronizeEventResult(Fake.expected_event));
+    try std.testing.expectEqual(@as(driver_mod.CUresult, 1), context.waitStreamEventResult(Fake.expected_stream, Fake.expected_event, 7));
+    const counters = state.snapshot().counters.?;
+    try std.testing.expectEqual(@as(u64, 1), counters.host_stream_synchronizations);
+    try std.testing.expectEqual(@as(u64, 1), counters.host_event_synchronizations);
+    try std.testing.expectEqual(@as(u64, 1), counters.failed_host_synchronizations);
+    try std.testing.expectEqual(@as(u64, 1), counters.gpu_stream_dependencies);
+    try std.testing.expectEqual(@as(u64, 1), counters.capture_recording_stream_wait_events);
+    try std.testing.expectEqual(@as(u64, 1), counters.foreign_stream_wait_event_calls);
+    try std.testing.expectEqual(@as(u64, 1), counters.failed_gpu_stream_dependencies);
+    try std.testing.expectEqual(@as(usize, 0), context.stats.stream_syncs);
+    // The optional observer does not alter a silent cleanup caller's driver
+    // status handling, even when no observation owner has been installed.
+    context.observation = null;
+    try std.testing.expectEqual(@as(driver_mod.CUresult, 1), context.synchronizeStreamResult(Fake.expected_stream));
 }

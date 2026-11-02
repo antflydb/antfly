@@ -32,6 +32,10 @@ pub const CUevent = ?*anyopaque;
 pub const CUjit_option = c_uint;
 pub const CUstreamCaptureMode = c_uint;
 pub const CUstreamCaptureStatus = c_uint;
+pub const CUgraphGetNodesFn = *const fn (CUgraph, ?[*]CUgraphNode, *usize) callconv(.c) CUresult;
+pub const CUgraphNodeGetTypeFn = *const fn (CUgraphNode, *c_uint) callconv(.c) CUresult;
+pub const CUgraphChildGraphNodeGetGraphFn = *const fn (CUgraphNode, *CUgraph) callconv(.c) CUresult;
+
 pub const CUgraphExecUpdateResult = c_uint;
 pub const CUgraphInstantiateResult = c_uint;
 pub const CUDA_SUCCESS: CUresult = 0;
@@ -154,6 +158,9 @@ pub const CudaDriver = struct {
         ) callconv(.c) CUresult,
         cuLaunchCooperativeKernel: ?*const fn (f: CUfunction, gridDimX: c_uint, gridDimY: c_uint, gridDimZ: c_uint, blockDimX: c_uint, blockDimY: c_uint, blockDimZ: c_uint, sharedMemBytes: c_uint, hStream: CUstream, kernelParams: ?[*]?*anyopaque) callconv(.c) CUresult = null,
         cuOccupancyMaxActiveBlocksPerMultiprocessor: ?*const fn (numBlocks: *c_int, func: CUfunction, blockSize: c_int, dynamicSMemSize: usize) callconv(.c) CUresult = null,
+        cuGraphGetNodes: ?CUgraphGetNodesFn = null,
+        cuGraphNodeGetType: ?CUgraphNodeGetTypeFn = null,
+        cuGraphChildGraphNodeGetGraph: ?CUgraphChildGraphNodeGetGraphFn = null,
         cuGraphInstantiate: *const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, flags: c_ulonglong) callconv(.c) CUresult,
         cuGraphInstantiateWithParams: ?*const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, instantiateParams: *CUDA_GRAPH_INSTANTIATE_PARAMS) callconv(.c) CUresult,
         cuGraphExecUpdate: ?CUgraphExecUpdateFn,
@@ -208,6 +215,9 @@ pub const CudaDriver = struct {
                 .cuLaunchKernel = lookup(&lib, @TypeOf(@as(Table, undefined).cuLaunchKernel), "cuLaunchKernel") catch return error.CudaSymbolMissing,
                 .cuLaunchCooperativeKernel = lookupOptional(&lib, *const fn (CUfunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, CUstream, ?[*]?*anyopaque) callconv(.c) CUresult, "cuLaunchCooperativeKernel"),
                 .cuOccupancyMaxActiveBlocksPerMultiprocessor = lookupOptional(&lib, *const fn (*c_int, CUfunction, c_int, usize) callconv(.c) CUresult, "cuOccupancyMaxActiveBlocksPerMultiprocessor"),
+                .cuGraphGetNodes = lookupOptional(&lib, CUgraphGetNodesFn, "cuGraphGetNodes"),
+                .cuGraphNodeGetType = lookupOptional(&lib, CUgraphNodeGetTypeFn, "cuGraphNodeGetType"),
+                .cuGraphChildGraphNodeGetGraph = lookupOptional(&lib, CUgraphChildGraphNodeGetGraphFn, "cuGraphChildGraphNodeGetGraph"),
                 .cuGraphInstantiate = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphInstantiate), "cuGraphInstantiateWithFlags") catch return error.CudaSymbolMissing,
                 .cuGraphInstantiateWithParams = lookupOptional(&lib, *const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, instantiateParams: *CUDA_GRAPH_INSTANTIATE_PARAMS) callconv(.c) CUresult, "cuGraphInstantiateWithParams"),
                 .cuGraphExecUpdate = lookupGraphExecUpdate(&lib),

@@ -619,7 +619,7 @@ pub const Preprocessor = struct {
         args[0] = &src;
         args[1] = &dst;
         for (&sizes, 2..) |*value, i| args[i] = value;
-        try self.ctx.driver.check(self.ctx.driver.fns.cuLaunchKernel(self.program.function(.rgb8), (frame.width * frame.height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null));
+        try self.ctx.launchKernel(self.program.function(.rgb8), (frame.width * frame.height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null);
         self.ctx.noteKernelLaunch();
         return output;
     }
@@ -639,7 +639,7 @@ pub const Preprocessor = struct {
         args[1] = &dst;
         for (&sizes, 2..) |*value, i| args[i] = value;
         for (&normalization, 10..) |*value, i| args[i] = value;
-        try self.ctx.driver.check(self.ctx.driver.fns.cuLaunchKernel(self.program.function(.patches), (width * height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null));
+        try self.ctx.launchKernel(self.program.function(.patches), (width * height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null);
         self.ctx.noteKernelLaunch();
         return output;
     }
@@ -1103,6 +1103,8 @@ test "embeddinggemma2 video staging fences coalesce repeats and drain consumer e
     };
     Mock.synchronizations = 0;
     var ctx: context.CudaContext = undefined;
+    ctx.observation = null;
+    ctx.observation_enable_failed = false;
     ctx.ctx = @ptrFromInt(1);
     ctx.stream = @ptrFromInt(2);
     ctx.stats = .{};

@@ -192,7 +192,7 @@ const TensorCorePlanLease = struct {
     }
 };
 
-const TensorCoreInvocation = struct {
+pub const TensorCoreInvocation = struct {
     dst: buffer_mod.DeviceBuffer,
     input: buffer_mod.DeviceBuffer,
     weight: buffer_mod.DeviceBuffer,
@@ -590,6 +590,37 @@ pub const CublasLt = struct {
         defer if (bias != null) self.bias_submission_mutex.unlock();
         try self.validateContext(ctx);
         if (rows == 0 or in_dim == 0 or out_dim == 0) return .heuristic;
+        const invocation = TensorCoreInvocation{
+            .dst = dst,
+            .input = input,
+            .weight = weight,
+            .workspace = workspace,
+            .bias = bias,
+        };
+        try validateWeightOutInvocation(kind, input_type, output_type, rows, in_dim, out_dim, invocation, residual);
+        var plan_lease = try self.tensorCorePlanFor(kind, input_type, output_type, 1, rows, in_dim, out_dim, workspace.len, tuning, ctx, invocation);
+        defer plan_lease.deinit(self);
+        const plan = plan_lease.plan;
+        try checkRawBytes(workspace, plan.workspace_size);
+        if (bias) |value| try self.setBias(plan.op_desc, value, output_type);
+
+        try self.submitDensePlan(ctx, plan, invocation, residual);
+        if (!plan_lease.publish(self) and tuning.normalized().enabled) {
+            // A tuned request promises reusable measured inference. If cache
+            // publication fails, drain the accepted launch before returning
+            // an error so caller-owned buffers are no longer in flight.
+            ctx.synchronize() catch {};
+            return error.CublasLtUnsupported;
+        }
+        return plan.selection;
+    }
+
+    fn validateWeightOutInvocation(kind: TensorCorePlanKind, input_type: c_int, output_type: c_int, rows: usize, in_dim: usize, out_dim: usize, invocation: TensorCoreInvocation, residual: ?buffer_mod.DeviceBuffer) Error!void {
+        const dst = invocation.dst;
+        const input = invocation.input;
+        const weight = invocation.weight;
+        const workspace = invocation.workspace;
+        const bias = invocation.bias;
         if (rows > std.math.maxInt(u32) or in_dim > std.math.maxInt(u32) or out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
         if (kind == .strided_batched) return error.CublasLtUnsupported;
         const input_cols = if (kind == .dense_input_gradient) out_dim else in_dim;
@@ -619,20 +650,19 @@ pub const CublasLt = struct {
             try requireDisjoint(workspace, workspace.len, value, dst_bytes);
         }
 
-        const invocation = TensorCoreInvocation{
-            .dst = dst,
-            .input = input,
-            .weight = weight,
-            .workspace = workspace,
-            .bias = bias,
-        };
         try validateWorkspaceAlignment(workspace);
-        var plan_lease = try self.tensorCorePlanFor(kind, input_type, output_type, 1, rows, in_dim, out_dim, workspace.len, tuning, ctx, invocation);
-        defer plan_lease.deinit(self);
-        const plan = plan_lease.plan;
-        try checkRawBytes(workspace, plan.workspace_size);
-        if (bias) |value| try self.setBias(plan.op_desc, value, output_type);
+    }
 
+    fn validateDenseInvocation(_: *const CublasLt, request: DenseRequest, invocation: TensorCoreInvocation, residual: ?buffer_mod.DeviceBuffer) Error!void {
+        if (request.rows == 0 or request.in_dim == 0 or request.out_dim == 0 or request.with_bias != (invocation.bias != null)) return error.CublasLtUnsupported;
+        try validateWeightOutInvocation(if (request.with_bias) .dense_bias else .dense, request.precision.native(), CUDA_R_32F, request.rows, request.in_dim, request.out_dim, invocation, residual);
+    }
+
+    inline fn submitDensePlan(self: *CublasLt, ctx: *context_mod.CudaContext, plan: TensorCorePlan, invocation: TensorCoreInvocation, residual: ?buffer_mod.DeviceBuffer) Error!void {
+        const dst = invocation.dst;
+        const input = invocation.input;
+        const weight = invocation.weight;
+        const workspace = invocation.workspace;
         var alpha: f32 = 1.0;
         var beta: f32 = if (residual != null) 1.0 else 0.0;
         const workspace_ptr: ?*anyopaque = if (workspace.ptr != 0 and plan.workspace_size > 0)
@@ -662,14 +692,6 @@ pub const CublasLt = struct {
             ctx.synchronize() catch {};
             return err;
         };
-        if (!plan_lease.publish(self) and tuning.normalized().enabled) {
-            // A tuned request promises reusable measured inference. If cache
-            // publication fails, drain the accepted launch before returning
-            // an error so caller-owned buffers are no longer in flight.
-            ctx.synchronize() catch {};
-            return error.CublasLtUnsupported;
-        }
-        return plan.selection;
     }
 
     fn lightOnProjectionRows(rows: usize, in_dim: usize, out_dim: usize) u32 {
@@ -702,24 +724,8 @@ pub const CublasLt = struct {
             (kind == .dense or kind == .dense_bias) and batch_count == 1 and rows >= 1 and rows <= 64 and !tuning.enabled) 32 else 0;
     }
 
-    fn tensorCorePlanFor(
-        self: *CublasLt,
-        kind: TensorCorePlanKind,
-        input_type: c_int,
-        output_type: c_int,
-        batch_count: usize,
-        rows: usize,
-        in_dim: usize,
-        out_dim: usize,
-        workspace_bytes: usize,
-        tuning: MatmulTuning,
-        ctx: *context_mod.CudaContext,
-        invocation: TensorCoreInvocation,
-    ) Error!TensorCorePlanLease {
-        if (batch_count == 0 or batch_count > std.math.maxInt(u32)) return error.CublasLtUnsupported;
-        if (rows == 0 or rows > std.math.maxInt(u32) or in_dim == 0 or in_dim > std.math.maxInt(u32) or out_dim == 0 or out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
-        const effective_tuning = tuning.normalized();
-        const key = TensorCorePlanKey{
+    fn tensorCoreKey(self: *const CublasLt, kind: TensorCorePlanKind, input_type: c_int, output_type: c_int, batch_count: usize, rows: usize, in_dim: usize, out_dim: usize, workspace_bytes: usize, effective_tuning: MatmulTuning, invocation: TensorCoreInvocation) TensorCorePlanKey {
+        return TensorCorePlanKey{
             .kind = kind,
             .input_type = input_type,
             .output_type = output_type,
@@ -739,65 +745,9 @@ pub const CublasLt = struct {
             .tuning_fingerprint = effective_tuning.fingerprint(),
             .canonical_rows = self.canonicalDecodeRows(kind, input_type, output_type, batch_count, rows, in_dim, out_dim, effective_tuning),
         };
-        if (key.canonical_rows != 0) {
-            if (key.input_type == CUDA_R_16BF) {
-                if (originalLightOnGdnProbe(key)) self.canonical_gdn_calls += 1 else self.lighton_projection_probe_calls += 1;
-            } else self.canonical_f16_calls += 1;
-        }
-
-        // Keep the steady-state path to one short plan-map lookup. The much
-        // longer tuning mutex is taken only after a cache miss, then the map
-        // is checked again so a concurrent first user can publish the plan.
-        spinLock(&self.tensor_core_plans_mutex);
-        const cached_plan = self.tensor_core_plans.get(key);
-        if (cached_plan != null) self.plan_cache_hits += 1 else self.plan_cache_misses += 1;
-        self.tensor_core_plans_mutex.unlock();
-        if (cached_plan) |plan| return .{ .plan = plan, .owns_descriptors = false };
-
-        // Descriptor creation, heuristic discovery, algo checks, and event
-        // timing are all first-use host work. A cached plan is graph-safe, but
-        // every cache miss must fail closed while the actual stream is being
-        // captured, including ordinary (non-tuned) misses.
-        if (ctx.streamCaptureActive() catch return error.CublasLtUnsupported) {
-            return error.CublasLtUnsupported;
-        }
-
-        // An enabled tuning request is useful only when its result can be
-        // cached. Otherwise every invocation would repeat synchronous timing.
-        if (effective_tuning.enabled and self.allocator == null) return error.CublasLtUnsupported;
-        var owns_tuning_mutex = false;
-        if (effective_tuning.enabled) {
-            lockYielding(&self.tensor_core_tuning_mutex);
-            owns_tuning_mutex = true;
-        }
-        errdefer if (owns_tuning_mutex) self.tensor_core_tuning_mutex.unlock();
-
-        spinLock(&self.tensor_core_plans_mutex);
-        const cached_after_tuning_wait = self.tensor_core_plans.get(key);
-        const cache_has_capacity = self.tensor_core_plans.count() < self.plan_cache_capacity;
-        self.tensor_core_plans_mutex.unlock();
-        if (cached_after_tuning_wait) |plan| {
-            if (owns_tuning_mutex) self.tensor_core_tuning_mutex.unlock();
-            return .{ .plan = plan, .owns_descriptors = false };
-        }
-        if (effective_tuning.enabled and !cache_has_capacity) return error.CublasLtUnsupported;
-
-        const candidate = try self.createTensorCorePlan(key, effective_tuning, ctx, invocation);
-        return .{
-            .plan = candidate,
-            .owns_descriptors = true,
-            .pending_key = if (self.allocator != null) key else null,
-            .owns_tuning_mutex = owns_tuning_mutex,
-        };
     }
 
-    fn createTensorCorePlan(
-        self: *CublasLt,
-        key: TensorCorePlanKey,
-        tuning: MatmulTuning,
-        ctx: *context_mod.CudaContext,
-        invocation: TensorCoreInvocation,
-    ) Error!TensorCorePlan {
+    fn createTensorCoreDescriptors(self: *CublasLt, key: TensorCorePlanKey, invocation: TensorCoreInvocation) Error!TensorCorePlan {
         var plan = TensorCorePlan{
             .algo = undefined,
             .workspace_size = 0,
@@ -857,6 +807,192 @@ pub const CublasLt = struct {
             try self.configureStridedBatch(plan.c_desc, batch_i32, output_stride);
             try self.configureStridedBatch(plan.d_desc, batch_i32, output_stride);
         }
+
+        return plan;
+    }
+
+    /// A vendor algorithm and its descriptors owned by one prepared frame.
+    /// Cache eviction cannot retire these descriptors; backend lifetime is
+    /// retained by the containing executable/frame, never by a process cache.
+    pub const PreparedDense = struct {
+        owner: *CublasLt,
+        plan: TensorCorePlan,
+        key: TensorCorePlanKey,
+        tuning: MatmulTuning,
+        precision: DensePrecision,
+        with_bias: bool,
+
+        pub fn deinit(self: *PreparedDense) void {
+            self.owner.destroyTensorCorePlan(self.plan);
+            self.* = undefined;
+        }
+
+        /// Binding validation is metadata-only and precedes submission. The
+        /// selected physical precision, geometry, alignment and workspace
+        /// remain exact; a mismatch cannot silently discover another plan.
+        pub fn validate(self: *const PreparedDense, invocation: TensorCoreInvocation) Error!void {
+            const specification = self.request();
+            _ = try self.owner.validateDenseInvocation(specification, invocation, null);
+            const actual = self.owner.tensorCoreKey(
+                if (self.with_bias) .dense_bias else .dense,
+                self.precision.native(),
+                CUDA_R_32F,
+                1,
+                self.key.rows,
+                self.key.in_dim,
+                self.key.out_dim,
+                invocation.workspace.len,
+                self.tuning,
+                invocation,
+            );
+            if (!std.meta.eql(self.key, actual)) return error.CublasLtUnsupported;
+        }
+
+        fn request(self: *const PreparedDense) DenseRequest {
+            return .{ .precision = self.precision, .rows = self.key.rows, .in_dim = self.key.in_dim, .out_dim = self.key.out_dim, .with_bias = self.with_bias, .tuning = self.tuning };
+        }
+
+        pub fn submit(self: *PreparedDense, ctx: *context_mod.CudaContext, invocation: TensorCoreInvocation) Error!MatmulSelection {
+            try self.validate(invocation);
+            try self.owner.validateContext(ctx);
+            if (invocation.bias) |bias| try self.owner.setBias(self.plan.op_desc, bias, CUDA_R_32F);
+            try self.owner.submitDensePlan(ctx, self.plan, invocation, null);
+            return self.plan.selection;
+        }
+    };
+
+    pub const DensePrecision = enum {
+        f32,
+        f16,
+        bf16,
+        fn native(self: DensePrecision) c_int {
+            return switch (self) {
+                .f32 => CUDA_R_32F,
+                .f16 => CUDA_R_16F,
+                .bf16 => CUDA_R_16BF,
+            };
+        }
+    };
+    pub const DenseRequest = struct {
+        precision: DensePrecision,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        with_bias: bool = false,
+        tuning: MatmulTuning = .{},
+    };
+
+    /// Prepare after assigned storage exists and before recording a graph.
+    /// Algorithm probes use only the caller's declared unpublished output
+    /// and workspace. Reuse a cached algorithm by value, with new independently
+    /// owned descriptors; no pointer into an evictable cache escapes.
+    pub fn prepareDense(self: *CublasLt, ctx: *context_mod.CudaContext, request: DenseRequest, invocation: TensorCoreInvocation) Error!PreparedDense {
+        try self.validateContext(ctx);
+        if (ctx.streamCaptureActive() catch return error.CublasLtUnsupported) return error.CublasLtUnsupported;
+        _ = try self.validateDenseInvocation(request, invocation, null);
+        const tuning = request.tuning.normalized();
+        const key = self.tensorCoreKey(if (request.with_bias) .dense_bias else .dense, request.precision.native(), CUDA_R_32F, 1, request.rows, request.in_dim, request.out_dim, invocation.workspace.len, tuning, invocation);
+        if (tuning.enabled) lockYielding(&self.tensor_core_tuning_mutex);
+        defer if (tuning.enabled) self.tensor_core_tuning_mutex.unlock();
+        spinLock(&self.tensor_core_plans_mutex);
+        const cached = self.tensor_core_plans.get(key);
+        self.tensor_core_plans_mutex.unlock();
+        const plan = if (cached) |selected|
+            try self.cloneTensorCorePlan(key, invocation, selected)
+        else
+            try self.createTensorCorePlan(key, tuning, ctx, invocation);
+        errdefer self.destroyTensorCorePlan(plan);
+        try checkRawBytes(invocation.workspace, plan.workspace_size);
+        return .{ .owner = self, .plan = plan, .key = key, .tuning = tuning, .precision = request.precision, .with_bias = request.with_bias };
+    }
+
+    fn cloneTensorCorePlan(self: *CublasLt, key: TensorCorePlanKey, invocation: TensorCoreInvocation, selected: TensorCorePlan) Error!TensorCorePlan {
+        var owned = try self.createTensorCoreDescriptors(key, invocation);
+        owned.algo = selected.algo;
+        owned.workspace_size = selected.workspace_size;
+        owned.selection = selected.selection;
+        return owned;
+    }
+
+    fn tensorCorePlanFor(
+        self: *CublasLt,
+        kind: TensorCorePlanKind,
+        input_type: c_int,
+        output_type: c_int,
+        batch_count: usize,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+        workspace_bytes: usize,
+        tuning: MatmulTuning,
+        ctx: *context_mod.CudaContext,
+        invocation: TensorCoreInvocation,
+    ) Error!TensorCorePlanLease {
+        if (batch_count == 0 or batch_count > std.math.maxInt(u32)) return error.CublasLtUnsupported;
+        if (rows == 0 or rows > std.math.maxInt(u32) or in_dim == 0 or in_dim > std.math.maxInt(u32) or out_dim == 0 or out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
+        const effective_tuning = tuning.normalized();
+        const key = self.tensorCoreKey(kind, input_type, output_type, batch_count, rows, in_dim, out_dim, workspace_bytes, effective_tuning, invocation);
+        if (key.canonical_rows != 0) {
+            if (key.input_type == CUDA_R_16BF) {
+                if (originalLightOnGdnProbe(key)) self.canonical_gdn_calls += 1 else self.lighton_projection_probe_calls += 1;
+            } else self.canonical_f16_calls += 1;
+        }
+
+        // Keep the steady-state path to one short plan-map lookup. The much
+        // longer tuning mutex is taken only after a cache miss, then the map
+        // is checked again so a concurrent first user can publish the plan.
+        spinLock(&self.tensor_core_plans_mutex);
+        const cached_plan = self.tensor_core_plans.get(key);
+        if (cached_plan != null) self.plan_cache_hits += 1 else self.plan_cache_misses += 1;
+        self.tensor_core_plans_mutex.unlock();
+        if (cached_plan) |plan| return .{ .plan = plan, .owns_descriptors = false };
+
+        // Descriptor creation, heuristic discovery, algo checks, and event
+        // timing are all first-use host work. A cached plan is graph-safe, but
+        // every cache miss must fail closed while the actual stream is being
+        // captured, including ordinary (non-tuned) misses.
+        if (ctx.streamCaptureActive() catch return error.CublasLtUnsupported) {
+            return error.CublasLtUnsupported;
+        }
+
+        // An enabled tuning request is useful only when its result can be
+        // cached. Otherwise every invocation would repeat synchronous timing.
+        if (effective_tuning.enabled and self.allocator == null) return error.CublasLtUnsupported;
+        var owns_tuning_mutex = false;
+        if (effective_tuning.enabled) {
+            lockYielding(&self.tensor_core_tuning_mutex);
+            owns_tuning_mutex = true;
+        }
+        errdefer if (owns_tuning_mutex) self.tensor_core_tuning_mutex.unlock();
+
+        spinLock(&self.tensor_core_plans_mutex);
+        const cached_after_tuning_wait = self.tensor_core_plans.get(key);
+        const cache_has_capacity = self.tensor_core_plans.count() < self.plan_cache_capacity;
+        self.tensor_core_plans_mutex.unlock();
+        if (cached_after_tuning_wait) |plan| {
+            if (owns_tuning_mutex) self.tensor_core_tuning_mutex.unlock();
+            return .{ .plan = plan, .owns_descriptors = false };
+        }
+        if (effective_tuning.enabled and !cache_has_capacity) return error.CublasLtUnsupported;
+
+        const candidate = try self.createTensorCorePlan(key, effective_tuning, ctx, invocation);
+        return .{
+            .plan = candidate,
+            .owns_descriptors = true,
+            .pending_key = if (self.allocator != null) key else null,
+            .owns_tuning_mutex = owns_tuning_mutex,
+        };
+    }
+
+    fn createTensorCorePlan(
+        self: *CublasLt,
+        key: TensorCorePlanKey,
+        tuning: MatmulTuning,
+        ctx: *context_mod.CudaContext,
+        invocation: TensorCoreInvocation,
+    ) Error!TensorCorePlan {
+        var plan = try self.createTensorCoreDescriptors(key, invocation);
+        errdefer self.destroyTensorCorePlan(plan);
 
         var pref: MatmulPreference = null;
         try self.check(self.fns.cublasLtMatmulPreferenceCreate(&pref));
@@ -1736,4 +1872,153 @@ test "LightOnOCR3 CUDA projection descriptor policy keeps actual rows and conser
     try std.testing.expectEqual(@as(u32, 0), blas.canonicalDecodeRows(.dense, CUDA_R_16BF, CUDA_R_32F, 1, 85, 2560, 4096, .{ .enabled = true }));
     blas.lighton_projection_profile = .off;
     try std.testing.expectEqual(@as(u32, 0), blas.canonicalDecodeRows(.dense, CUDA_R_16BF, CUDA_R_32F, 1, 85, 2560, 4096, .{}));
+}
+
+test "prepared vendor plans validate exact physical geometry before any CUDA access" {
+    for ([_]CublasLt.DensePrecision{ .f32, .f16, .bf16 }) |precision| {
+        for ([_]bool{ false, true }) |with_bias| {
+            // Deliberately no driver/SDK table: every validation here must be
+            // metadata-only. Only immutable policy inputs are initialized.
+            var blas: CublasLt = undefined;
+            blas.lighton_projection_profile = .off;
+            blas.florence_canonical_f16_decode = false;
+            const bytes: usize = if (precision == .f32) 4 else 2;
+            var invocation = TensorCoreInvocation{
+                .input = .{ .ptr = 0x10000, .len = 3 * 32 * bytes },
+                .weight = .{ .ptr = 0x20000, .len = 16 * 32 * bytes },
+                .dst = .{ .ptr = 0x30000, .len = 3 * 16 * 4 },
+                .workspace = .{ .ptr = 0x40000, .len = 4096 },
+                .bias = if (with_bias) .{ .ptr = 0x50000, .len = 16 * 4 } else null,
+            };
+            const key = blas.tensorCoreKey(if (with_bias) .dense_bias else .dense, precision.native(), CUDA_R_32F, 1, 3, 32, 16, invocation.workspace.len, .{}, invocation);
+            const prepared = CublasLt.PreparedDense{
+                .owner = &blas,
+                .plan = undefined,
+                .key = key,
+                .tuning = .{},
+                .precision = precision,
+                .with_bias = with_bias,
+            };
+            try prepared.validate(invocation);
+            var changed = invocation;
+            changed.workspace.len *= 2;
+            try std.testing.expectError(error.CublasLtUnsupported, prepared.validate(changed));
+            changed = invocation;
+            changed.input.ptr += bytes;
+            try std.testing.expectError(error.CublasLtUnsupported, prepared.validate(changed));
+            changed = invocation;
+            changed.workspace.ptr = invocation.weight.ptr;
+            try std.testing.expectError(error.CublasLtUnsupported, prepared.validate(changed));
+            changed = invocation;
+            changed.input.len -= bytes;
+            try std.testing.expectError(error.CublasLtUnsupported, prepared.validate(changed));
+            // Address changes with the same proven alignment are legal for a
+            // fresh frame binding; captured graph address checks remain owned
+            // by the physical frame, independently of vendor legality.
+            invocation.input.ptr += 256;
+            try prepared.validate(invocation);
+            if (precision == .f16) {
+                blas.florence_canonical_f16_decode = true;
+                try std.testing.expectError(error.CublasLtUnsupported, prepared.validate(invocation));
+            }
+        }
+    }
+}
+
+test "prepared vendor descriptor ownership survives source retirement and every SDK failure" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var fail_at: usize = 0;
+        var next_id: usize = 1;
+        var live: [64]bool = @splat(false);
+        fn status() Status {
+            calls += 1;
+            return if (calls == fail_at) CUBLAS_STATUS_NOT_SUPPORTED else CUBLAS_STATUS_SUCCESS;
+        }
+        fn create(target: *?*anyopaque) Status {
+            const result = status();
+            if (result != CUBLAS_STATUS_SUCCESS) return result;
+            std.debug.assert(next_id < live.len);
+            target.* = @ptrFromInt(next_id);
+            live[next_id] = true;
+            next_id += 1;
+            return result;
+        }
+        fn descCreate(target: *MatmulDesc, _: c_int, _: c_int) callconv(.c) Status {
+            return create(target);
+        }
+        fn layoutCreate(target: *MatrixLayout, _: c_int, _: u64, _: u64, _: i64) callconv(.c) Status {
+            return create(target);
+        }
+        fn destroy(target: ?*anyopaque) callconv(.c) Status {
+            const index = @intFromPtr(target.?);
+            std.debug.assert(live[index]);
+            live[index] = false;
+            return CUBLAS_STATUS_SUCCESS;
+        }
+        fn attribute(_: ?*anyopaque, _: c_int, _: ?*const anyopaque, _: usize) callconv(.c) Status {
+            return status();
+        }
+        fn count() usize {
+            var result: usize = 0;
+            for (live) |value| result += @intFromBool(value);
+            return result;
+        }
+        fn reset(failure: usize) void {
+            calls = 0;
+            fail_at = failure;
+            next_id = 1;
+            live = @splat(false);
+        }
+    };
+    var blas: CublasLt = undefined;
+    blas.fns = undefined;
+    blas.fns.cublasLtMatmulDescCreate = &Fake.descCreate;
+    blas.fns.cublasLtMatrixLayoutCreate = &Fake.layoutCreate;
+    blas.fns.cublasLtMatmulDescDestroy = &Fake.destroy;
+    blas.fns.cublasLtMatrixLayoutDestroy = &Fake.destroy;
+    blas.fns.cublasLtMatmulDescSetAttribute = &Fake.attribute;
+    blas.fns.cublasLtMatrixLayoutSetAttribute = &Fake.attribute;
+    blas.florence_canonical_f16_decode = false;
+    blas.lighton_projection_profile = .off;
+    const invocation = TensorCoreInvocation{
+        .input = .{ .ptr = 0x10000, .len = 3 * 32 * 2 },
+        .weight = .{ .ptr = 0x20000, .len = 16 * 32 * 2 },
+        .dst = .{ .ptr = 0x30000, .len = 3 * 16 * 4 },
+        .workspace = .{ .ptr = 0x40000, .len = 4096 },
+        .bias = .{ .ptr = 0x50000, .len = 16 * 4 },
+    };
+    for ([_]TensorCorePlanKind{ .dense, .dense_bias, .dense_input_gradient, .strided_batched }) |kind| {
+        const key = blas.tensorCoreKey(kind, CUDA_R_16F, CUDA_R_32F, 1, 3, 32, 16, 4096, .{}, invocation);
+        // Exercise the actual descriptor builder on each failing SDK call,
+        // not a mirror of its cleanup logic or an allocator-only simulation.
+        var failure: usize = 1;
+        while (true) : (failure += 1) {
+            Fake.reset(failure);
+            const result = blas.createTensorCoreDescriptors(key, invocation);
+            if (result) |plan| {
+                try std.testing.expect(failure > Fake.calls);
+                try std.testing.expectEqual(@as(usize, 5), Fake.count());
+                blas.destroyTensorCorePlan(plan);
+                try std.testing.expectEqual(@as(usize, 0), Fake.count());
+                break;
+            } else |err| {
+                try std.testing.expectEqual(error.CublasLtError, err);
+                try std.testing.expectEqual(@as(usize, 0), Fake.count());
+            }
+        }
+        Fake.reset(0);
+        var cached = try blas.createTensorCoreDescriptors(key, invocation);
+        cached.algo = .{ .data = @splat(17) };
+        cached.workspace_size = 256;
+        cached.selection = .heuristic;
+        const owned = try blas.cloneTensorCorePlan(key, invocation, cached);
+        try std.testing.expectEqual(@as(usize, 10), Fake.count());
+        blas.destroyTensorCorePlan(cached);
+        try std.testing.expectEqual(@as(usize, 5), Fake.count());
+        try std.testing.expectEqual(cached.algo.data, owned.algo.data);
+        try std.testing.expectEqual(cached.workspace_size, owned.workspace_size);
+        blas.destroyTensorCorePlan(owned);
+        try std.testing.expectEqual(@as(usize, 0), Fake.count());
+    }
 }

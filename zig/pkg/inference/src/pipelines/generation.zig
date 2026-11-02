@@ -23,6 +23,7 @@ const decoder_routes = @import("../execution/decoder_routes.zig");
 const decoder_checkpoint = @import("../execution/decoder_checkpoint.zig");
 const pending_step = @import("../execution/decoder_pending_step.zig");
 const decoder_prefill = @import("../execution/decoder_prefill.zig");
+const speculative_activation = @import("../execution/speculative_activation.zig");
 const decoder_storage = @import("../execution/decoder_storage.zig");
 const decoder_forward = @import("../execution/decoder_forward.zig");
 const std = @import("std");
@@ -1439,13 +1440,7 @@ fn enableCudaPrefillGreedyToken() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PREFILL_GREEDY_TOKEN", true);
 }
 
-fn enableCudaGreedyDeviceTokenHandoff() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GREEDY_DEVICE_TOKEN_HANDOFF", true);
-}
-
-fn enableCudaGatedTokenTensorDecode() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GATED_TOKEN_TENSOR_DECODE", false);
-}
+const enableCudaGreedyDeviceTokenHandoff = decoder_forward.deviceTokenHandoffEnabled;
 
 const metalFinalHiddenFrameOwnsResidentPrefix = decoder_forward.metalFinalHiddenFrameOwnsResidentPrefix;
 
@@ -1921,17 +1916,13 @@ pub fn gemma4MtpMetalAutoEnabled() bool {
 
 const gemma4MtpMetalPrefillHiddenCaptureEnabled = decoder_routes.metalPreparedPrefillHiddenCaptureEnabled;
 
-fn gemma4MetalDirectGreedyDefault() bool {
-    return true;
-}
+const gemma4MetalDirectGreedyDefault = decoder_forward.metalDirectTailDefault;
 
 fn pipelinedMetalDecodeEnabled() bool {
     return metal_runtime.pipelinedDecodeFrameEnabled();
 }
 
-fn gemma4MetalDirectGreedyEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_DIRECT_GREEDY", gemma4MetalDirectGreedyDefault());
-}
+const gemma4MetalDirectGreedyEnabled = decoder_forward.metalDirectTailEnabled;
 
 pub fn gemma4MtpAutoMinGenerationTokens() usize {
     return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_AUTO_MIN_TOKENS") orelse 128;
@@ -5171,10 +5162,7 @@ pub const NativeGenerationPipeline = struct {
         finish_reason: []const u8,
     };
 
-    const DeviceDecodeOutcome = struct {
-        token: usize,
-        token_tensor: ?ops.CT = null,
-    };
+    const DeviceDecodeOutcome = decoder_forward.DeviceTokenOutcome;
 
     fn noteDecodeProgressNoMicrobatch(self: *NativeGenerationPipeline, tokens_generated: usize) void {
         if (self.scheduler) |scheduler| {
@@ -6186,138 +6174,40 @@ pub const NativeGenerationPipeline = struct {
             decoder_runtime_debug_stats.grammar_blocked += 1;
             return null;
         }
-        if (!isPureGreedyConfig(config)) {
-            // Sampled decoding must stay on the fused decoder frame; without
-            // this it fell off onto the per-op eager path, making sampled chat
-            // ~15x slower than greedy on metal.
-            if (backend_kind == .metal and self.gpt_config.family == .gemma and self.gpt_config.hasPle() and gemma4MetalDirectGreedyEnabled()) {
-                self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
-                const sampled_decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
-                // Preferred: the backend-owned sampled frame (device-resident
-                // logit sampling / prepared sampled tail).
-                const sampling = graph_mod.model_runtime.SamplingConfig{
-                    .temperature = config.temperature,
-                    .top_p = config.top_p,
-                    .top_k = config.top_k,
-                    .min_p = config.min_p,
-                    .repetition_penalty = config.repetition_penalty,
-                    .frequency_penalty = config.frequency_penalty,
-                    .presence_penalty = config.presence_penalty,
-                };
-                if (try decoder_gated_runtime.forwardSampledToken(
-                    &self.cb,
-                    self.allocator,
-                    self.gpt_config,
-                    self.gpt_config.num_hidden_layers,
-                    token_ids[seq_len - 1],
-                    seq_len,
-                    &sampled_decode_context,
-                    sampling,
-                    token_ids[0..seq_len],
-                )) |sampled_token_id| {
-                    if (sampled_token_id < 0) return error.InvalidModelOutput;
-                    return .{ .token = @intCast(sampled_token_id) };
-                }
-                // Fallback: same fused forward, host-side sampling from the
-                // read-back logits.
-                if (try decoder_gated_runtime.forwardLastLogits(
-                    &self.cb,
-                    self.allocator,
-                    self.gpt_config,
-                    self.gpt_config.num_hidden_layers,
-                    token_ids[seq_len - 1],
-                    seq_len,
-                    &sampled_decode_context,
-                )) |logits| {
-                    defer self.allocator.free(logits);
-                    // Keep every token constraint on the canonical host sampler
-                    // when the backend-owned sampler cannot honor it. Grammars
-                    // are already excluded above, but model suppression still
-                    // applies to this fused-forward fallback.
-                    var no_json_grammar: ?grammar_mod.JsonGrammar = null;
-                    const outcome = try self.sampleNextToken(
-                        logits,
-                        config,
-                        penalty_state,
-                        null,
-                        &no_json_grammar,
-                        null,
-                    );
-                    return .{ .token = outcome.token };
-                }
-            }
-            decoder_runtime_debug_stats.non_greedy += 1;
-            return null;
-        }
-
-        self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
-        const decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
-        if (backend_kind == .metal and self.gpt_config.family == .gemma and self.gpt_config.hasPle() and gemma4MetalDirectGreedyEnabled()) {
-            if (try decoder_gated_runtime.forwardGreedyToken(
-                &self.cb,
-                self.allocator,
-                self.gpt_config,
-                self.gpt_config.num_hidden_layers,
-                token_ids[seq_len - 1],
-                seq_len,
-                &decode_context,
-            )) |token_id| {
-                if (token_id < 0) return error.InvalidModelOutput;
-                return .{ .token = @intCast(token_id) };
-            }
-        }
-        if (input_token_tensor) |token_tensor| {
-            if (enableCudaGreedyDeviceTokenHandoff()) {
-                decoder_runtime_debug_stats.device_token_handoff_attempts += 1;
-                if (enableCudaGatedTokenTensorDecode() and
-                    (backend_kind != .cuda or !gpt_arch.cudaDecodeGraphReplayRequired()))
-                {
-                    if (try decoder_gated_runtime.forwardGreedyTokenFromTokenTensor(
-                        &self.cb,
-                        self.allocator,
-                        self.gpt_config,
-                        self.gpt_config.num_hidden_layers,
-                        token_ids[seq_len - 1],
-                        token_tensor,
-                        seq_len,
-                        &decode_context,
-                    )) |result| {
-                        decoder_runtime_debug_stats.device_token_handoff_hits += 1;
-                        return .{
-                            .token = result.token_id,
-                            .token_tensor = result.token_tensor,
-                        };
-                    }
-                }
-                if (try gpt_arch.forwardGreedyLastTokenFromTokenTensor(
-                    &self.cb,
-                    self.allocator,
-                    self.gpt_config,
-                    token_tensor,
-                    1,
-                    seq_len,
-                    &decode_context,
-                )) |result| {
-                    decoder_runtime_debug_stats.device_token_handoff_hits += 1;
-                    return .{
-                        .token = result.token_id,
-                        .token_tensor = result.token_tensor,
-                    };
-                }
-                decoder_runtime_debug_stats.device_token_handoff_fallbacks += 1;
-            }
-        }
-
-        const input_ids = token_ids[seq_len - 1 .. seq_len];
-        return .{ .token = try gpt_arch.forwardGreedyLastToken(
-            &self.cb,
-            self.allocator,
-            self.gpt_config,
-            input_ids,
-            1,
-            seq_len,
-            &decode_context,
-        ) };
+        const sampled = !isPureGreedyConfig(config);
+        var events = decoder_forward.DeviceStepEvents{};
+        defer noteDeviceStepEvents(events);
+        var numerical = self.physicalDecoder();
+        const outcome = try numerical.forwardDeviceStep(decode_state, .{
+            .token_ids = token_ids,
+            .sequence_length = seq_len,
+            .input_token_tensor = input_token_tensor,
+            .sampling = if (sampled) .{
+                .temperature = config.temperature,
+                .top_p = config.top_p,
+                .top_k = config.top_k,
+                .min_p = config.min_p,
+                .repetition_penalty = config.repetition_penalty,
+                .frequency_penalty = config.frequency_penalty,
+                .presence_penalty = config.presence_penalty,
+            } else null,
+            .prefetch_drain_budget = prefetch_drain_budget_per_step,
+        }, &events);
+        return switch (outcome) {
+            .token => |token| token,
+            .declined => blk: {
+                if (sampled) decoder_runtime_debug_stats.non_greedy += 1;
+                break :blk null;
+            },
+            .logits => |logits| blk: {
+                defer self.allocator.free(logits);
+                // Task penalties/model suppression stay on the canonical
+                // sampler when the numerical frame cannot select a token.
+                var no_json_grammar: ?grammar_mod.JsonGrammar = null;
+                const selected = try self.sampleNextToken(logits, config, penalty_state, null, &no_json_grammar, null);
+                break :blk .{ .token = selected.token };
+            },
+        };
     }
 
     fn forwardGreedyDeviceDecodeTokenTensor(
@@ -6360,38 +6250,16 @@ pub const NativeGenerationPipeline = struct {
         }
         if (!enableCudaGreedyDeviceTokenHandoff()) return null;
 
-        self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
-        const decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
-        decoder_runtime_debug_stats.device_token_handoff_attempts += 1;
-        if (enableCudaGatedTokenTensorDecode() and !gpt_arch.cudaDecodeGraphReplayRequired()) {
-            if (try decoder_gated_runtime.forwardGreedyTokenTensorOnlyFromTokenTensor(
-                &self.cb,
-                self.allocator,
-                self.gpt_config,
-                self.gpt_config.num_hidden_layers,
-                0,
-                input_token_tensor,
-                seq_len,
-                &decode_context,
-            )) |token_tensor| {
-                decoder_runtime_debug_stats.device_token_handoff_hits += 1;
-                return token_tensor;
-            }
-        }
-        if (try gpt_arch.forwardGreedyLastTokenTensorOnlyFromTokenTensor(
-            &self.cb,
-            self.allocator,
-            self.gpt_config,
-            input_token_tensor,
-            1,
-            seq_len,
-            &decode_context,
-        )) |token_tensor| {
-            decoder_runtime_debug_stats.device_token_handoff_hits += 1;
-            return token_tensor;
-        }
-        decoder_runtime_debug_stats.device_token_handoff_fallbacks += 1;
-        return null;
+        var events = decoder_forward.DeviceStepEvents{};
+        defer noteDeviceStepEvents(events);
+        var numerical = self.physicalDecoder();
+        return numerical.forwardDeviceTokenTensor(decode_state, seq_len, input_token_tensor, prefetch_drain_budget_per_step, &events);
+    }
+
+    fn noteDeviceStepEvents(events: decoder_forward.DeviceStepEvents) void {
+        decoder_runtime_debug_stats.device_token_handoff_attempts += events.handoff_attempts;
+        decoder_runtime_debug_stats.device_token_handoff_hits += events.handoff_hits;
+        decoder_runtime_debug_stats.device_token_handoff_fallbacks += events.handoff_fallbacks;
     }
 
     fn shouldSeedDeviceTokenHandoff(
@@ -6496,222 +6364,53 @@ pub const NativeGenerationPipeline = struct {
 
     const ForwardHiddenDevice = decoder_forward.ForwardHiddenDevice;
 
-    const Gemma4MtpActivationState = struct {
-        const DraftEmbeddingCacheEntry = struct {
-            token_id: i64,
-            tensor: ops.CT,
-        };
-
-        allocator: std.mem.Allocator,
-        draft_cb: *const ComputeBackend,
-        host: ?[]f32 = null,
-        device: ?ops.CT = null,
-        cached_target_choice: ?u32 = null,
-        /// True only when the retained activation produced cached_target_choice.
-        /// Predictor activations and the initial prompt activation do not qualify.
-        cached_choice_matches_activation: bool = false,
-        /// Defer-materialize fold: a committed token (already counted by
-        /// seq_len and present in token_ids) whose target forward/KV write is
-        /// deferred to the next verify round. Invariant at every round
-        /// boundary: decode_state.total_tokens + pendingCount() == seq_len.
-        pending_unmaterialized: bool = false,
-        draft_embedding_cache: std.ArrayListUnmanaged(DraftEmbeddingCacheEntry) = .empty,
-
-        pub fn deinit(self: *Gemma4MtpActivationState) void {
-            if (self.host) |activation| self.allocator.free(activation);
-            if (self.device) |tensor| self.draft_cb.free(tensor);
-            for (self.draft_embedding_cache.items) |entry| self.draft_cb.free(entry.tensor);
-            self.draft_embedding_cache.deinit(self.allocator);
-            self.* = undefined;
-        }
-
-        fn replaceHost(self: *Gemma4MtpActivationState, activation: []f32) void {
-            if (self.host) |old| self.allocator.free(old);
-            if (self.device) |old| self.draft_cb.free(old);
-            self.host = activation;
-            self.device = null;
-            self.cached_target_choice = null;
-            self.cached_choice_matches_activation = false;
-        }
-
-        fn replaceDevice(self: *Gemma4MtpActivationState, tensor: ops.CT) void {
-            if (self.host) |old| self.allocator.free(old);
-            if (self.device) |old| self.draft_cb.free(old);
-            self.host = null;
-            self.device = tensor;
-            self.cached_target_choice = null;
-            self.cached_choice_matches_activation = false;
-        }
-
-        fn residentReady(self: *const Gemma4MtpActivationState) bool {
-            return self.device != null;
-        }
-
-        fn pendingCount(self: *const Gemma4MtpActivationState) usize {
-            return @intFromBool(self.pending_unmaterialized);
-        }
-
-        /// Every committed token except the pending one must have KV written.
-        /// This is a production invariant: a mismatch shifts the verify suffix
-        /// write onto the wrong KV rows, so fail closed in ReleaseFast too.
-        fn validateKvTokensInSync(self: *const Gemma4MtpActivationState, decode_state: *const NativeDecodeState, seq_len: usize) !void {
-            const accounted_tokens = std.math.add(usize, decode_state.total_tokens, self.pendingCount()) catch
-                return error.InvalidSpeculativeState;
-            if (accounted_tokens != seq_len) return error.InvalidSpeculativeState;
-        }
-
-        fn notePendingUnmaterialized(self: *Gemma4MtpActivationState) !void {
-            if (self.pending_unmaterialized) return error.InvalidSpeculativeState;
-            self.pending_unmaterialized = true;
-        }
-
-        fn notePendingKvWritten(self: *Gemma4MtpActivationState) void {
-            self.pending_unmaterialized = false;
-        }
-
-        fn cachedDraftEmbedding(self: *const Gemma4MtpActivationState, token_id: i64) ?ops.CT {
-            for (self.draft_embedding_cache.items) |entry| {
-                if (entry.token_id == token_id) return entry.tensor;
-            }
-            return null;
-        }
-
-        fn rememberDraftEmbedding(self: *Gemma4MtpActivationState, token_id: i64, tensor: ops.CT, limit: usize) !usize {
-            if (limit == 0) {
-                self.draft_cb.free(tensor);
-                return 0;
-            }
-            if (self.cachedDraftEmbedding(token_id) != null) {
-                self.draft_cb.free(tensor);
-                return 0;
-            }
-            var evictions: usize = 0;
-            while (self.draft_embedding_cache.items.len >= limit) {
-                const old = self.draft_embedding_cache.orderedRemove(0);
-                self.draft_cb.free(old.tensor);
-                evictions += 1;
-            }
-            try self.draft_embedding_cache.append(self.allocator, .{
-                .token_id = token_id,
-                .tensor = tensor,
-            });
-            return evictions;
-        }
-    };
+    const Gemma4MtpActivationState = speculative_activation.State;
 
     fn replaceGemma4MtpActivationFromPrompt(
         self: *NativeGenerationPipeline,
-        mtp_activation: *Gemma4MtpActivationState,
+        activation: *Gemma4MtpActivationState,
         prompt_ids: []const i64,
         seq_len: usize,
-        hidden_source: Gemma4MtpTargetHiddenSource,
-        use_resident_draft: bool,
-        draft_cb: *const ComputeBackend,
+        source: Gemma4MtpTargetHiddenSource,
+        resident: bool,
+        draft: *const ComputeBackend,
     ) !void {
-        if (seq_len == 0 or prompt_ids.len < seq_len) return error.InvalidTensorShape;
-        var seed_state = NativeDecodeState.initContiguous(self.allocator);
-        defer seed_state.deinit();
-        seed_state.configureForGptConfig(self.gpt_config);
-        var seed_runtime = BorrowedDecodeStateRuntime.init(&seed_state);
-        const seed_ctx = seed_runtime.makeDecodeContext(seq_len, seq_len);
-        var target_hidden = try self.forwardMtpTargetHiddenDevice(
-            prompt_ids[0..seq_len],
-            1,
-            seq_len,
-            &seed_ctx,
-            hidden_source,
-            "gpt.mtp_seed_prompt_hidden",
-        );
-        defer target_hidden.deinit();
-
-        const row = seq_len - 1;
-        if (use_resident_draft) {
-            if (try self.copyMtpTargetHiddenRowFromHiddenToBackend(&target_hidden, row, hidden_source, draft_cb)) |activation| {
-                mtp_activation.replaceDevice(activation);
-                return;
-            }
-        }
-        mtp_activation.replaceHost(try self.dupeMtpTargetHiddenRowFromHiddenDevice(&target_hidden, row, hidden_source));
+        return activation.replaceFromPrompt(self.physicalDecoder(), prompt_ids, seq_len, source, resident, draft, "gpt.mtp_seed_prompt_hidden");
     }
 
     fn replaceGemma4MtpActivationFromPrefillHidden(
         self: *NativeGenerationPipeline,
-        mtp_activation: *Gemma4MtpActivationState,
+        activation: *Gemma4MtpActivationState,
         hidden: ops.CT,
         rows: usize,
-        hidden_source: Gemma4MtpTargetHiddenSource,
-        use_resident_draft: bool,
-        draft_cb: *const ComputeBackend,
+        source: Gemma4MtpTargetHiddenSource,
+        resident: bool,
+        draft: *const ComputeBackend,
     ) !bool {
-        if (rows == 0) return error.InvalidTensorShape;
-        if (hidden_source != .final) return false;
-        const target_hidden = ForwardHiddenDevice{
-            .cb = &self.cb,
-            .hidden = hidden,
-            .pre_norm_hidden = null,
-            .rows = rows,
-        };
-        const row = rows - 1;
-        if (use_resident_draft) {
-            if (try self.copyMtpTargetHiddenRowFromHiddenToBackend(&target_hidden, row, hidden_source, draft_cb)) |activation| {
-                mtp_activation.replaceDevice(activation);
-                return true;
-            }
-        }
-        mtp_activation.replaceHost(try self.dupeMtpTargetHiddenRowFromHiddenDevice(&target_hidden, row, hidden_source));
-        return true;
+        return activation.replaceFromPrefillHidden(self.physicalDecoder(), hidden, rows, source, resident, draft);
     }
 
     fn cachedMtpDraftTargetEmbedding(
         self: *NativeGenerationPipeline,
         draft_pipeline: *NativeGenerationPipeline,
-        mtp_activation: *Gemma4MtpActivationState,
+        activation: *Gemma4MtpActivationState,
         token_id: i64,
         mtp_profile: ?*MtpProfileStats,
     ) !?ops.CT {
-        const limit = gemma4MtpDraftEmbeddingCacheSize();
-        if (limit == 0) {
-            if (mtp_profile) |profile| {
-                if (profile.enabled) profile.draft_embedding_cache_disabled += 1;
-            }
-            return null;
-        }
-        if (mtp_activation.cachedDraftEmbedding(token_id)) |cached| {
-            if (mtp_profile) |profile| {
-                if (profile.enabled) profile.draft_embedding_cache_hits += 1;
-            }
-            return cached;
-        }
-        if (mtp_profile) |profile| {
-            if (profile.enabled) profile.draft_embedding_cache_misses += 1;
-        }
-
-        const backbone_hidden: usize = @intCast(draft_pipeline.gpt_config.mtp_backbone_hidden_size);
-        const target_hidden_size: usize = @intCast(self.gpt_config.hidden_size);
-        if (backbone_hidden == 0 or target_hidden_size != backbone_hidden) return null;
-        const target_embed_w = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
-        defer self.cb.free(target_embed_w);
-        const token_arr = [_]i64{token_id};
-        const target_embedded = try self.cb.embeddingLookup(target_embed_w, &token_arr, 1, backbone_hidden);
-        const target_embedding = try gpt_arch.maybeScaleTokenEmbeddings(
-            &self.cb,
-            self.allocator,
-            self.gpt_config,
-            target_embedded,
-            1,
-            backbone_hidden,
-        );
-        defer self.cb.free(target_embedding);
-        const copied = (try draft_pipeline.cb.copyTensorFromBackend(&self.cb, target_embedding)) orelse return null;
-        errdefer draft_pipeline.cb.free(copied);
-        const evictions = try mtp_activation.rememberDraftEmbedding(token_id, copied, limit);
-        if (mtp_profile) |profile| {
-            if (profile.enabled) {
-                profile.draft_embedding_cache_inserts += 1;
-                profile.draft_embedding_cache_evictions += evictions;
-            }
-        }
-        return copied;
+        defer if (mtp_profile) |profile| {
+            if (profile.enabled) switch (activation.cache_event.status) {
+                .none => {},
+                .disabled => profile.draft_embedding_cache_disabled += 1,
+                .hit => profile.draft_embedding_cache_hits += 1,
+                .miss => profile.draft_embedding_cache_misses += 1,
+                .inserted => {
+                    profile.draft_embedding_cache_misses += 1;
+                    profile.draft_embedding_cache_inserts += 1;
+                    profile.draft_embedding_cache_evictions += activation.cache_event.evictions;
+                },
+            };
+        };
+        return activation.cachedTargetEmbedding(self.physicalDecoder(), &draft_pipeline.gpt_config, token_id, gemma4MtpDraftEmbeddingCacheSize());
     }
 
     fn forwardAllLogitsAndHiddenHost(

@@ -103,7 +103,7 @@ pub const Fitter = struct {
     }
     fn synchronize(self: *Fitter) !void {
         try self.context.makeCurrent();
-        try self.context.driver.check(self.context.driver.fns.cuStreamSynchronize(self.stream));
+        try self.context.driver.check(self.context.synchronizeStreamResult(self.stream));
     }
     pub fn releaseWorkspace(self: *Fitter) void {
         std.debug.assert(!self.frame_active);
@@ -167,10 +167,10 @@ pub const Fitter = struct {
         if (cooperative) {
             if (blocks == 0 or blocks > self.cooperative_blocks) return error.UnsupportedCooperativeFit;
             const launch_fn = self.context.driver.fns.cuLaunchCooperativeKernel orelse return error.UnsupportedCooperativeFit;
-            try self.context.driver.check(launch_fn(self.program.function(kernel), @intCast(blocks), 1, 1, @intCast(threads), 1, 1, 0, self.stream, &params));
+            try self.context.launchCooperativeKernel(launch_fn, self.program.function(kernel), @intCast(blocks), 1, 1, @intCast(threads), 1, 1, 0, self.stream, &params);
             self.cooperative_launches += 1;
         } else {
-            try self.context.driver.check(self.context.driver.fns.cuLaunchKernel(self.program.function(kernel), @intCast(blocks), 1, 1, @intCast(threads), 1, 1, 0, self.stream, &params, null));
+            try self.context.launchKernel(self.program.function(kernel), @intCast(blocks), 1, 1, @intCast(threads), 1, 1, 0, self.stream, &params, null);
         }
     }
     fn upload(self: *Fitter, device: usize, bytes: []const u8) !void {

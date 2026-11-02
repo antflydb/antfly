@@ -142,6 +142,7 @@ test {
     _ = execution.decoder_prefill;
     _ = execution.cached_decoder;
     _ = execution.decoder_stage;
+    _ = execution.speculative_activation;
     _ = execution.encoder_decoder_runtime;
     _ = execution.seq2seq_runtime;
     _ = execution.sequence_pool;

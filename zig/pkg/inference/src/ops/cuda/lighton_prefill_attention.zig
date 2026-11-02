@@ -143,7 +143,7 @@ pub const Module = struct {
         const index = self.next_slot;
         if (self.copy_pending[index]) {
             try ctx.makeCurrent();
-            try ctx.driver.check(ctx.driver.fns.cuEventSynchronize(self.copy_events[index]));
+            try ctx.driver.check(ctx.synchronizeEventResult(self.copy_events[index]));
             self.copy_pending[index] = false;
             self.slot_reuses += 1;
         }

@@ -227,6 +227,8 @@ test "CUDA physical OOM releases its reservation and permits a later allocation"
         }
     };
     var ctx: context_mod.CudaContext = undefined;
+    ctx.observation = null;
+    ctx.observation_enable_failed = false;
     ctx.ctx = @ptrFromInt(1);
     ctx.device_allocations = .{ .limit = 32 };
     ctx.driver.fns.cuCtxSetCurrent = Mock.setCurrent;

@@ -32,8 +32,26 @@ pub const NativePolicy = struct {
 };
 
 pub fn createNative(allocator: std.mem.Allocator, weights: *native.WeightStore, budget: ?*memory.RunBudget, io: ?std.Io, policy: NativePolicy) !ops.ComputeBackend {
-    const compute = try allocator.create(native.NativeCompute);
-    compute.* = if (io) |handle| native.NativeCompute.initWithIo(allocator, weights, budget, handle) else native.NativeCompute.init(allocator, weights, budget);
+    // The default path keeps its exact allocator. Optional instrumentation
+    // starts before constructing the temporary compute and retains only State
+    // metadata through the enclosing synchronous dispatch observation.
+    const registry = @import("../execution/allocation_registry.zig");
+    const observers = @import("../execution/allocation_observer.zig");
+    var effective_allocator = allocator;
+    var owned_observer: ?*observers.State = null;
+    defer if (owned_observer) |owner| owner.release();
+    if (registry.enabled()) {
+        if (observers.State.forAllocator(weights.allocator)) |owner| registry.bind(.model, owner) else registry.missing(.model);
+        if (observers.State.forAllocator(allocator)) |owner| {
+            registry.bind(.compute, owner);
+        } else if (observers.State.create(allocator, .from_owner_creation) catch null) |owner| {
+            owned_observer = owner;
+            effective_allocator = owner.allocator();
+            registry.bind(.compute, owner);
+        } else registry.missing(.compute);
+    }
+    const compute = try effective_allocator.create(native.NativeCompute);
+    compute.* = if (io) |handle| native.NativeCompute.initWithIo(effective_allocator, weights, budget, handle) else native.NativeCompute.init(effective_allocator, weights, budget);
     compute.quantized_activation_policy = policy.quantized_activations;
     compute.borrow_bf16_linear_weights = policy.borrow_bf16_linear_weights;
     compute.cache_embeddinggemma2_bf16_weights = policy.cache_bf16_weight_mirrors;
@@ -220,4 +238,33 @@ pub fn initializeNativeWeightPrefetch(weights: *native.WeightStore, allocator: s
     var it = weights.lazy_weights.iterator();
     while (it.next()) |entry| entry.value_ptr.guard = weights.prefetch.lockHandle();
     if (weights.lazy_weights.count() > 0) try native.startPrefetchWorker(weights);
+}
+
+test "observed native factory retires its caller arena before immutable interval sampling" {
+    const a = std.testing.allocator;
+    const registry_mod = @import("../execution/allocation_registry.zig");
+    var registry: registry_mod.Registry = undefined;
+    registry.begin(a);
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.deinitOwned();
+    // The model-owned prefetch queue keeps its independently valid allocator.
+    native.initPrefetchQueue(&weights, a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    var backend = try createNative(arena.allocator(), &weights, null, null, .{ .quantized_activations = .strict_f32 });
+    const x = try backend.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+    const y = try backend.add(x, x);
+    const actual = try backend.toFloat32(y, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, actual);
+    backend.free(y);
+    backend.free(x);
+    backend.deinit();
+    arena.deinit();
+    const measured = registry.finish();
+    try std.testing.expect(measured.allocations.? > 0);
+    try std.testing.expectEqual(measured.allocations.?, measured.frees.?);
+    try std.testing.expectEqual(@as(u64, 0), measured.requested_live_bytes.?);
+    try std.testing.expect(measured.maximum_individual_lifetime_peak_bytes.? > 0);
+    try std.testing.expectEqual(@as(usize, 1), measured.missing_model_registrations);
+    try std.testing.expectEqual(@as(usize, 0), measured.missing_compute_registrations);
 }

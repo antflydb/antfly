@@ -105,7 +105,7 @@ pub const Module = struct {
         var params = [_]?*anyopaque{ @ptrCast(&out), @ptrCast(&in), @ptrCast(&staging), @ptrCast(&config) };
         try ctx.makeCurrent();
         const part = self.program.function(.reduce_part) orelse return error.CudaKernelUnavailable;
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(part, plan.grid, config.ctas, 1, plan.block[0], plan.block[1], 1, 0, ctx.stream, &params, null));
+        try ctx.launchKernel(part, plan.grid, config.ctas, 1, plan.block[0], plan.block[1], 1, 0, ctx.stream, &params, null);
         ctx.noteKernelLaunch();
         if (config.ctas > 1) {
             var finish = [_]?*anyopaque{ @ptrCast(&out), @ptrCast(&staging), @ptrCast(&config) };
@@ -379,7 +379,7 @@ pub const Module = struct {
 
     fn launch(ctx: *Context, kernel: driver.CUfunction, grid: u32, block: [2]u32, params: []?*anyopaque) !void {
         const f = kernel orelse return error.CudaKernelUnavailable;
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(f, grid, 1, 1, block[0], block[1], 1, 0, ctx.stream, params.ptr, null));
+        try ctx.launchKernel(f, grid, 1, 1, block[0], block[1], 1, 0, ctx.stream, params.ptr, null);
         ctx.noteKernelLaunch();
     }
 
@@ -435,7 +435,7 @@ pub const Module = struct {
         var backward_u32: u32 = @intFromBool(backward);
         var parameters = [_]?*anyopaque{ @ptrCast(&out_ptr), @ptrCast(&in_ptr), @ptrCast(&dy_ptr), @ptrCast(&count_u32), @ptrCast(&backward_u32) };
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(f, @intCast((@as(u64, n) + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &parameters, null));
+        try ctx.launchKernel(f, @intCast((@as(u64, n) + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &parameters, null);
         ctx.noteKernelLaunch();
     }
 };

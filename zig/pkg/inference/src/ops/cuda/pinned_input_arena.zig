@@ -37,7 +37,7 @@ pub const Arena = struct {
             try ctx.synchronize();
         } else if (self.pending) {
             try ctx.makeCurrent();
-            try ctx.driver.check(ctx.driver.fns.cuEventSynchronize(self.event));
+            try ctx.driver.check(ctx.synchronizeEventResult(self.event));
         }
         try self.host.freeChecked(ctx);
         ctx.destroyEvent(self.event);
@@ -77,7 +77,7 @@ pub const Arena = struct {
             // subsequent encoder/decoder work. Only those copies own bytes.
             if (self.pending) {
                 try ctx.makeCurrent();
-                try ctx.driver.check(ctx.driver.fns.cuEventSynchronize(self.event));
+                try ctx.driver.check(ctx.synchronizeEventResult(self.event));
                 self.pending = false;
             }
             self.wraps += 1;
@@ -147,6 +147,8 @@ test "LightOnOCR3 CUDA pinned input wrap preserves queued bytes without draining
     var controller = memory.AdmissionController{};
     var arena = Arena{ .lease = try controller.tryAcquire(.gpu, .{ .host_limit_bytes = capacity }, .{ .host_scratch_bytes = capacity }, false), .host = .{ .ptr = storage.ptr, .len = storage.len }, .event = @ptrFromInt(1), .offset = capacity - 256 };
     var ctx: context.CudaContext = undefined;
+    ctx.observation = null;
+    ctx.observation_enable_failed = false;
     ctx.ctx = @ptrFromInt(1);
     ctx.stream = null;
     ctx.stats = .{};

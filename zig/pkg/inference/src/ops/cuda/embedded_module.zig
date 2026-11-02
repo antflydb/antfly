@@ -52,7 +52,7 @@ fn Module(comptime image: ?[:0]const u8, comptime entries: anytype) type {
         /// The qualified families use a 2D grid, a 1D block and no dynamic
         /// shared memory. Keep their driver call and launch accounting together.
         pub inline fn launch(self: *const Self, ctx: *context.CudaContext, entry: Entry, grid_x: u32, grid_y: u32, threads: u32, args: []?*anyopaque) driver.Error!void {
-            try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.function(entry), grid_x, grid_y, 1, threads, 1, 1, 0, ctx.stream, args.ptr, null));
+            try ctx.launchKernel(self.function(entry), grid_x, grid_y, 1, threads, 1, 1, 0, ctx.stream, args.ptr, null);
             ctx.noteKernelLaunch();
         }
 

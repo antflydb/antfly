@@ -29,6 +29,8 @@
 const compute_provider = @import("../backends/compute_provider.zig");
 const std = @import("std");
 const cached_decoder = @import("../execution/cached_decoder.zig");
+const stage_runtime = @import("../execution/encoder_decoder_runtime.zig");
+const decoder_stage = @import("../execution/decoder_stage.zig");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const reader_config = @import("antfly_reader_config");
@@ -1145,7 +1147,7 @@ pub const ReadingPipeline = struct {
         if (debug_cuda_session) std.log.info("reading: pixel tensor init done", .{});
         defer pv_tensor.deinit();
 
-        const encoder_outputs = if (session_factory.getFlorenceConfig(self.vision_encoder)) |florence_cfg| blk: {
+        var encoder_outputs: stage_runtime.EncoderOutputs = if (session_factory.getFlorenceConfig(self.vision_encoder)) |florence_cfg| blk: {
             const prompt_text = self.config.prompt orelse "<OCR>";
             const prompt_i32 = try buildFlorencePromptIds(
                 allocator,
@@ -1155,32 +1157,27 @@ pub const ReadingPipeline = struct {
             );
             defer allocator.free(prompt_i32);
 
-            break :blk try runFlorenceVisionEncoder(
+            break :blk .{ .host = try runFlorenceVisionEncoder(
                 self.vision_encoder,
                 allocator,
                 pv_tensor,
                 prompt_i32,
                 self.execution_control,
-            );
+            ) };
         } else blk: {
             if (self.execution_control) |control| try control.update(.executing, 0, 1);
-            const outputs = try self.vision_encoder.runWithControl(&.{pv_tensor}, allocator, self.execution_control);
+            const outputs = try stage_runtime.encodeForFinalRow(allocator, self.vision_encoder, self.decoder, &.{pv_tensor}, null, self.execution_control);
             break :blk outputs;
         };
-        if (debug_cuda_session) std.log.info("reading: vision encoder run done outputs={d}", .{encoder_outputs.len});
-        defer {
-            for (encoder_outputs) |*t| {
-                var mt = t.*;
-                mt.deinit();
-            }
-            allocator.free(encoder_outputs);
+        defer encoder_outputs.deinit(allocator);
+        if (encoder_outputs == .host) {
+            if (encoder_outputs.host.len == 0) return error.NoEncoderOutput;
+            if (debug_cuda_session) std.log.info("reading: vision encoder run done outputs={d}", .{encoder_outputs.host.len});
+            logTensorStatsF32("encoder_hidden(session)", encoder_outputs.host[0].asFloat32());
         }
-
-        if (encoder_outputs.len == 0) return error.NoEncoderOutput;
-        logTensorStatsF32("encoder_hidden(session)", encoder_outputs[0].asFloat32());
         if (debug_cuda_session) std.log.info("reading: decode from encoder outputs start", .{});
         const decode_start = nowNs();
-        const result = try self.decodeFromEncoderOutputs(encoder_outputs, null);
+        const result = try self.decodeFromEncoderOutputs(&encoder_outputs, null);
         logReadProfile("decode_from_encoder", decode_start);
         return result;
     }
@@ -1623,28 +1620,21 @@ pub const ReadingPipeline = struct {
         else
             &[_]backends.Tensor{patch_tensor};
 
-        const encoder_outputs = try self.vision_encoder.runWithControl(inputs, allocator, self.execution_control);
-        defer {
-            for (encoder_outputs) |*t| {
-                var mt = t.*;
-                mt.deinit();
-            }
-            allocator.free(encoder_outputs);
-        }
-        if (encoder_outputs.len == 0) return error.NoEncoderOutput;
-
-        return self.decodeFromEncoderOutputs(encoder_outputs, patches.attention_mask);
+        var encoder_outputs = try stage_runtime.encodeForFinalRow(allocator, self.vision_encoder, self.decoder, inputs, null, self.execution_control);
+        defer encoder_outputs.deinit(allocator);
+        return self.decodeFromEncoderOutputs(&encoder_outputs, patches.attention_mask);
     }
 
     fn decodeFromEncoderOutputs(
         self: *ReadingPipeline,
-        encoder_outputs: []const backends.Tensor,
+        encoder_outputs: *const stage_runtime.EncoderOutputs,
         encoder_attention_mask_opt: ?[]const i64,
     ) !ReadResult {
         const allocator = self.allocator;
-        const encoder_hidden = &encoder_outputs[0];
-
-        const enc_seq_len: usize = if (encoder_hidden.shape.len >= 2) @intCast(encoder_hidden.shape[1]) else 1;
+        const enc_seq_len: usize = switch (encoder_outputs.*) {
+            .host => |outputs| if (outputs.len != 0) (if (outputs[0].shape.len >= 2) @intCast(outputs[0].shape[1]) else 1) else return error.NoEncoderOutput,
+            .resident => |value| @intCast(value.shape[1]),
+        };
         const encoder_attention_mask = if (encoder_attention_mask_opt) |mask|
             mask
         else blk: {
@@ -1668,75 +1658,21 @@ pub const ReadingPipeline = struct {
             }
         }
 
+        var numerical = try decoder_stage.Decoder.initWithOptions(allocator, self.decoder, encoder_outputs, enc_seq_len, encoder_attention_mask, stage_runtime.outputVocabulary(self.decoder) orelse 0, self.execution_control, .{ .allow_native = false, .allow_merged = false, .output_rows = .full_prefix });
+        defer numerical.deinit();
         const decode_loop_start = nowNs();
         var decoder_run_total_ns: u64 = 0;
         var decoder_steps: usize = 0;
         while (dec_len < max_len) {
-            // Build decoder input tensors
-            const dec_seq: i64 = @intCast(dec_len);
-            const dec_shape = [_]i64{ 1, dec_seq };
-
-            var decoder_inputs = std.ArrayListUnmanaged(backends.Tensor).empty;
-            defer {
-                for (decoder_inputs.items) |*tensor| tensor.deinit();
-                decoder_inputs.deinit(allocator);
-            }
-
-            try decoder_inputs.append(
-                allocator,
-                try backends.Tensor.initInt64(allocator, "input_ids", &dec_shape, dec_ids[0..dec_len]),
-            );
-
-            if (hasInput(self.decoder, "encoder_attention_mask")) {
-                const enc_mask_shape = [_]i64{ 1, @intCast(enc_seq_len) };
-                try decoder_inputs.append(
-                    allocator,
-                    try backends.Tensor.initInt64(allocator, "encoder_attention_mask", &enc_mask_shape, encoder_attention_mask),
-                );
-            }
-            if (hasInput(self.decoder, "decoder_attention_mask")) {
-                const dec_mask = try allocator.alloc(i64, dec_len);
-                defer allocator.free(dec_mask);
-                @memset(dec_mask, 1);
-                try decoder_inputs.append(
-                    allocator,
-                    try backends.Tensor.initInt64(allocator, "decoder_attention_mask", &dec_shape, dec_mask),
-                );
-            }
-
-            const enc_hidden = encoder_outputs[0].borrowedView("encoder_hidden_states");
-            try decoder_inputs.append(allocator, enc_hidden);
-
             const decoder_run_start = nowNs();
             if (self.execution_control) |control| try control.update(.executing, @intCast(dec_len), @intCast(max_len));
-            const dec_outputs = try self.decoder.runWithControl(
-                decoder_inputs.items,
-                allocator,
-                self.execution_control,
-            );
+            var row = try numerical.step(dec_ids[0..dec_len], null, null);
+            defer row.deinit();
             const decoder_run_ns = nowNs() - decoder_run_start;
             decoder_run_total_ns += decoder_run_ns;
             decoder_steps += 1;
             logReadProfileStep("decoder_run", decoder_steps, dec_len, decoder_run_ns);
-            defer {
-                for (dec_outputs) |*t| {
-                    var mt = t.*;
-                    mt.deinit();
-                }
-                allocator.free(dec_outputs);
-            }
-
-            if (dec_outputs.len == 0) return error.NoDecoderOutput;
-
-            // Get logits for last position
-            const logits = dec_outputs[0].asFloat32();
-            const vocab_size = if (dec_outputs[0].shape.len >= 3)
-                @as(usize, @intCast(dec_outputs[0].shape[2]))
-            else
-                return error.InvalidLogitsShape;
-
-            // Last position logits
-            const last_logits = logits[(dec_len - 1) * vocab_size ..][0..vocab_size];
+            const last_logits = row.logits;
             if (decoder_steps <= 4) logTopLogits("logits(session)", decoder_steps, last_logits);
 
             // Greedy: argmax
@@ -3235,4 +3171,79 @@ test "LightOnOCR3 CUDA Florence incremental admission preserves complete KV capa
     live = false;
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
     try std.testing.expect(!probe.run_called);
+}
+
+test "reading default imported stages keep encoder resident and preserve host reference output" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const imported = @import("../backends/imported_onnx_session.zig");
+    const fixture = @import("../execution/testing/encoder_decoder.zig");
+    const audit_mod = @import("../execution/transfer_audit.zig");
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try fixture.writeConfigured(a, temp.dir, "encoder.onnx", true, .{ .reading_pair = true });
+    try fixture.writeConfigured(a, temp.dir, "decoder.onnx", false, .{ .reading_pair = true, .decoder_masks = true });
+    const encoder_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..], "encoder.onnx" });
+    defer a.free(encoder_path);
+    const decoder_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..], "decoder.onnx" });
+    defer a.free(decoder_path);
+    const tokenizer_data =
+        \\{"version":"1.0","model":{"type":"BPE","vocab":{"[UNK]":0,"one":1,"two":2},"merges":[],"unk_token":"[UNK]"}}
+    ;
+    const hf = try tokenizer_mod.hf.HfTokenizer.loadFromBytes(a, tokenizer_data);
+    const tokenizer = hf.tokenizer();
+    defer hf.deinitSelf();
+    var pixels = [_]u8{ 255, 0, 0, 255 };
+    for ([_]backends.BackendType{ .native, .metal, .cuda }) |kind| {
+        if (kind == .metal) {
+            if (comptime !build_options.enable_metal) continue;
+            if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) continue;
+        }
+        if (kind == .cuda and comptime !build_options.enable_cuda) continue;
+        const encoder = imported.createSessionWithOptions(a, encoder_path, kind, .{ .graph_runtime_strategy = .compiled_preferred }) catch |err| switch (err) {
+            error.CudaUnavailable, error.NoCudaDevices => continue,
+            else => return err,
+        };
+        defer encoder.close();
+        const shared_decoder = try imported.createSessionWithOptions(a, decoder_path, kind, .{ .graph_runtime_strategy = .compiled_preferred, .shared_backend_ctx = encoder.shared_compute_context });
+        defer shared_decoder.close();
+        const reference_decoder = try imported.createSessionWithOptions(a, decoder_path, kind, .{ .graph_runtime_strategy = .compiled_preferred });
+        defer reference_decoder.close();
+        try std.testing.expect(stage_runtime.supportsResidentPair(encoder, shared_decoder, true));
+        try std.testing.expect(!stage_runtime.supportsResidentPair(encoder, reference_decoder, true));
+        const config = ReadConfig{ .image_size = 1, .image_mean = .{ 0, 0, 0 }, .image_std = .{ 1, 1, 1 }, .max_length = 2, .decoder_start_token_id = 0, .eos_token_id = 1 };
+        var candidate = ReadingPipeline.init(a, encoder, shared_decoder, tokenizer, config, null);
+        var reference = ReadingPipeline.init(a, encoder, reference_decoder, tokenizer, config, null);
+        var candidate_audit = audit_mod.Audit{};
+        const actual = blk: {
+            try audit_mod.begin(&candidate_audit);
+            defer audit_mod.end();
+            break :blk try candidate.readDecoded(.{ .data = &pixels, .width = 1, .height = 1, .channels = 4 });
+        };
+        var owned_actual = actual;
+        defer owned_actual.deinit();
+        var reference_audit = audit_mod.Audit{};
+        const expected = blk: {
+            try audit_mod.begin(&reference_audit);
+            defer audit_mod.end();
+            break :blk try reference.readDecoded(.{ .data = &pixels, .width = 1, .height = 1, .channels = 4 });
+        };
+        var owned_expected = expected;
+        defer owned_expected.deinit();
+        try std.testing.expectEqualStrings(expected.text, actual.text);
+        try std.testing.expectEqual(expected.completion, actual.completion);
+        try std.testing.expectEqual(expected.completion_tokens, actual.completion_tokens);
+        try std.testing.expectEqualStrings("", actual.text);
+        if (kind != .native) {
+            try std.testing.expectEqual(@as(u64, 3 * @sizeOf(f32)), candidate_audit.download_bytes);
+            try std.testing.expect(reference_audit.download_bytes > candidate_audit.download_bytes);
+        }
+        const Cancel = struct {
+            fn check(_: ?*anyopaque) !void {
+                return error.Cancelled;
+            }
+        };
+        candidate.execution_control = .{ .check_fn = Cancel.check };
+        try std.testing.expectError(error.Cancelled, candidate.readDecoded(.{ .data = &pixels, .width = 1, .height = 1, .channels = 4 }));
+    }
 }

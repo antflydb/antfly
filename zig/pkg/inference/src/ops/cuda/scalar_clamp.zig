@@ -39,7 +39,7 @@ pub const Kernel = struct {
         var n: u32 = @intCast(count);
         var bf: u32 = @intFromBool(bf16);
         var args = [_]?*anyopaque{ &src, &dst, &n, &bf };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.program.function(.widen), @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.launchKernel(self.program.function(.widen), @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
         ctx.noteKernelLaunch();
     }
 
@@ -54,7 +54,7 @@ pub const Kernel = struct {
         var hi = upper orelse std.math.inf(f32);
         var flags: u32 = @as(u32, @intFromBool(lower != null)) | (@as(u32, @intFromBool(upper != null)) << 1);
         var args = [_]?*anyopaque{ &src, &dst, &n, &lo, &hi, &flags };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.program.function(.clamp), @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.launchKernel(self.program.function(.clamp), @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
         ctx.noteKernelLaunch();
     }
 };

@@ -3777,15 +3777,15 @@ pub const KernelModule = struct {
             var score_args = [_]?*anyopaque{ &alpha, &query, &keys, &pages, &nq, &qo, &begin, &count, &cap };
             var coefficient_args = [_]?*anyopaque{ &alpha, &beta, &state, &nq, &qo, &begin, &count };
             var value_args = [_]?*anyopaque{ &output, &alpha, &beta, &state, &values, &pages, &nq, &qo, &begin, &count, &cap, &final };
-            try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(scores_fn, ((count + 255) / 256) * ((nq + 7) / 8) * 8, 1, 1, 256, 1, 1, 0, ctx.stream, &score_args, null));
+            try ctx.launchKernel(scores_fn, ((count + 255) / 256) * ((nq + 7) / 8) * 8, 1, 1, 256, 1, 1, 0, ctx.stream, &score_args, null);
             ctx.noteKernelLaunch();
             self.attention_match_repeat_launches += 1;
             self.attention_match_repeat_split_launches += 1;
-            try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(coefficients_fn, (nq * 8 + 31) / 32, 1, 1, 32, 1, 1, 0, ctx.stream, &coefficient_args, null));
+            try ctx.launchKernel(coefficients_fn, (nq * 8 + 31) / 32, 1, 1, 32, 1, 1, 0, ctx.stream, &coefficient_args, null);
             ctx.noteKernelLaunch();
             self.attention_match_repeat_launches += 1;
             self.attention_match_repeat_split_launches += 1;
-            try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(values_fn, ((nq + 7) / 8) * 8, 1, 1, 256, 1, 1, 0, ctx.stream, &value_args, null));
+            try ctx.launchKernel(values_fn, ((nq + 7) / 8) * 8, 1, 1, 256, 1, 1, 0, ctx.stream, &value_args, null);
             ctx.noteKernelLaunch();
             self.attention_match_repeat_launches += 1;
             self.attention_match_repeat_split_launches += 1;
@@ -3953,7 +3953,7 @@ pub const KernelModule = struct {
             else => descriptor.count,
         };
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(function, blocks, 1, 1, descriptor.threads, 1, 1, 0, ctx.stream, &params, null));
+        try ctx.launchKernel(function, blocks, 1, 1, descriptor.threads, 1, 1, 0, ctx.stream, &params, null);
         ctx.noteKernelLaunch();
     }
 
@@ -3972,7 +3972,7 @@ pub const KernelModule = struct {
         var count = try toU32(tensors);
         var params = [_]?*anyopaque{ @ptrCast(&pointer), @ptrCast(@constCast(batch)), @ptrCast(&count) };
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(function, try toU32(blocks), 1, 1, 256, 1, 1, 0, ctx.stream, &params, null));
+        try ctx.launchKernel(function, try toU32(blocks), 1, 1, 256, 1, 1, 0, ctx.stream, &params, null);
         ctx.noteKernelLaunch();
     }
 
@@ -3982,7 +3982,7 @@ pub const KernelModule = struct {
         var count = try toU32(chunks);
         var params = [_]?*anyopaque{ @ptrCast(&pointers[0]), @ptrCast(&pointers[1]), @ptrCast(&count) };
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(function, 1, 1, 1, 256, 1, 1, 0, ctx.stream, &params, null));
+        try ctx.launchKernel(function, 1, 1, 1, 256, 1, 1, 0, ctx.stream, &params, null);
         ctx.noteKernelLaunch();
     }
 
@@ -4012,7 +4012,7 @@ pub const KernelModule = struct {
         const batches: u32 = if (padded <= 128) 2 else 1;
         const blocks = try std.math.divCeil(u32, rows, batches * warps);
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(function, blocks, 1, 1, lanes, warps, 1, 0, ctx.stream, &params, null));
+        try ctx.launchKernel(function, blocks, 1, 1, lanes, warps, 1, 0, ctx.stream, &params, null);
     }
 
     pub const TrainingLayerNormPhase = enum(u32) { forward, input_gradient, parameter_gradients };
@@ -4041,7 +4041,7 @@ pub const KernelModule = struct {
         const threads_y: u32 = if (phase == .parameter_gradients) partitions else 1;
         const shared_bytes: u32 = if (phase == .parameter_gradients) partitions * 33 * 8 else 32;
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(function, blocks, 1, 1, threads_x, threads_y, 1, shared_bytes, ctx.stream, &params, null));
+        try ctx.launchKernel(function, blocks, 1, 1, threads_x, threads_y, 1, shared_bytes, ctx.stream, &params, null);
     }
 
     /// Descriptors and byte extents are checked by the shared boundary planner.
@@ -4068,7 +4068,7 @@ pub const KernelModule = struct {
                 try checkedTensorElements(try checkedTensorElements(descriptor.dims[0], descriptor.dims[2]), (@as(usize, descriptor.dims[1]) + query_tile - 1) / query_tile)
             else
                 work / 32;
-            try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(function, try toU32(blocks), 1, 1, if (tensor_attention) 256 else 128, 1, 1, 0, ctx.stream, &params, null));
+            try ctx.launchKernel(function, try toU32(blocks), 1, 1, if (tensor_attention) 256 else 128, 1, 1, 0, ctx.stream, &params, null);
             ctx.noteKernelLaunch();
         } else try launch1d(function, ctx, work, &params);
     }
@@ -4371,7 +4371,7 @@ pub const KernelModule = struct {
         const block: c_uint = 256;
         const grid: c_uint = try toU32((count + block - 1) / block);
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+        try ctx.launchKernel(
             self.fill_f32,
             grid,
             1,
@@ -4383,7 +4383,7 @@ pub const KernelModule = struct {
             ctx.stream,
             &params,
             null,
-        ));
+        );
         ctx.noteKernelLaunch();
     }
 
@@ -8093,7 +8093,7 @@ pub const KernelModule = struct {
                     @ptrCast(&split_kv_min_tokens_u32),
                     @ptrCast(&arguments.decode_scalars),
                 };
-                try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+                try ctx.launchKernel(
                     function,
                     serial_grid,
                     1,
@@ -8105,7 +8105,7 @@ pub const KernelModule = struct {
                     ctx.stream,
                     &serial_params,
                     null,
-                ));
+                );
                 ctx.noteKernelLaunch();
             },
             .split2, .split4, .split8 => {
@@ -8158,7 +8158,7 @@ pub const KernelModule = struct {
                     try checkedTensorElements(r.batch, r.num_heads),
                     plan.lowering.kv_splits,
                 ));
-                try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+                try ctx.launchKernel(
                     stage1,
                     stage1_grid,
                     1,
@@ -8170,9 +8170,9 @@ pub const KernelModule = struct {
                     ctx.stream,
                     &stage1_params,
                     null,
-                ));
+                );
                 ctx.noteKernelLaunch();
-                try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+                try ctx.launchKernel(
                     stage2,
                     serial_grid,
                     1,
@@ -8184,7 +8184,7 @@ pub const KernelModule = struct {
                     ctx.stream,
                     &stage2_params,
                     null,
-                ));
+                );
                 ctx.noteKernelLaunch();
             },
             .none => unreachable,
@@ -8409,7 +8409,7 @@ pub const KernelModule = struct {
                 const block: c_uint = if (r.head_dim <= 256) 256 else 512;
                 const grid = try toU32(try checkedTensorElements(try checkedTensorElements(r.batch, r.q_seq_len), r.num_heads));
                 try ctx.makeCurrent();
-                try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+                try ctx.launchKernel(
                     prefill_function,
                     grid,
                     1,
@@ -8421,7 +8421,7 @@ pub const KernelModule = struct {
                     ctx.stream,
                     &params,
                     null,
-                ));
+                );
                 ctx.noteKernelLaunch();
                 self.noteGqaPrefillRouteActive(.prefill_fast, r.batch, r.q_seq_len, r.num_heads, r.num_kv_heads, r.head_dim);
                 return .prefill_fast;
@@ -8448,7 +8448,7 @@ pub const KernelModule = struct {
                 const block: c_uint = if (r.head_dim <= 256) 256 else 512;
                 const grid = try toU32(try checkedTensorElements(try checkedTensorElements(r.batch, r.q_seq_len), r.num_heads));
                 try ctx.makeCurrent();
-                try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+                try ctx.launchKernel(
                     decode_function,
                     grid,
                     1,
@@ -8460,7 +8460,7 @@ pub const KernelModule = struct {
                     ctx.stream,
                     &params,
                     null,
-                ));
+                );
                 ctx.noteKernelLaunch();
                 return .decode;
             }
@@ -8535,7 +8535,7 @@ pub const KernelModule = struct {
         const block: c_uint = if (r.head_dim <= 256) 256 else 512;
         const grid = try toU32(try checkedTensorElements(try checkedTensorElements(r.batch, r.q_seq_len), r.num_heads));
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+        try ctx.launchKernel(
             function,
             grid,
             1,
@@ -8547,7 +8547,7 @@ pub const KernelModule = struct {
             ctx.stream,
             &params,
             null,
-        ));
+        );
         ctx.noteKernelLaunch();
         return launch_kind;
     }
@@ -8785,7 +8785,7 @@ pub const KernelModule = struct {
             r.num_heads,
             cuda_kernel_renderer.generated_splitk_online_decode_splits,
         ));
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+        try ctx.launchKernel(
             function.?,
             grid_x,
             1,
@@ -8797,7 +8797,7 @@ pub const KernelModule = struct {
             ctx.stream,
             &params,
             null,
-        ));
+        );
         ctx.noteKernelLaunch();
         self.noteGqaSplitkOnlineDecodeTelemetry(.active, "qualified-contract", request);
         return .decode_splitk_online_sm89;
@@ -9157,7 +9157,7 @@ pub const KernelModule = struct {
         if (split_active) {
             try self.launchAttentionMatchSplit(ctx, r.dst, r.q, r.k, r.v, r.block_table, r.q_seq_len, r.query_position_offset, r.kv_seq_len, r.physical_token_capacity);
         } else {
-            try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+            try ctx.launchKernel(
                 function,
                 grid_x,
                 grid_y,
@@ -9169,7 +9169,7 @@ pub const KernelModule = struct {
                 ctx.stream,
                 &params,
                 null,
-            ));
+            );
             ctx.noteKernelLaunch();
         }
         if (repeat_active and platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_VERIFY_ATTENTION")) {
@@ -9183,7 +9183,7 @@ pub const KernelModule = struct {
             defer host.free(ctx);
             const saved_dst = arguments.dst;
             arguments.dst = reference.ptr;
-            try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.gqa_attention_prefill_turboquant_fast_f32 orelse return error.CudaKernelUnavailable, try toU32(r.q_seq_len * r.num_heads), 1, 1, try toU32(r.head_dim), 1, 1, 0, ctx.stream, &params, null));
+            try ctx.launchKernel(self.gqa_attention_prefill_turboquant_fast_f32 orelse return error.CudaKernelUnavailable, try toU32(r.q_seq_len * r.num_heads), 1, 1, try toU32(r.head_dim), 1, 1, 0, ctx.stream, &params, null);
             ctx.noteKernelLaunch();
             arguments.dst = saved_dst;
             try r.dst.copyToHost(ctx, host.bytes()[0..bytes]);
@@ -9419,7 +9419,7 @@ pub const KernelModule = struct {
             });
         }
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+        try ctx.launchKernel(
             score,
             score_grid_x,
             1,
@@ -9431,9 +9431,9 @@ pub const KernelModule = struct {
             ctx.stream,
             &score_params,
             null,
-        ));
+        );
         ctx.noteKernelLaunch();
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+        try ctx.launchKernel(
             consume,
             consume_grid_x,
             consume_grid_y,
@@ -9445,7 +9445,7 @@ pub const KernelModule = struct {
             ctx.stream,
             &consume_params,
             null,
-        ));
+        );
         ctx.noteKernelLaunch();
         switch (consumer) {
             .tiled64 => noteGeneratedGqaScorePreworkConsumerEvent(
@@ -14059,7 +14059,7 @@ fn launchBlocksShared(function: driver_mod.CUfunction, ctx: *context_mod.CudaCon
     const block: c_uint = try toU32(threads);
     const shared: c_uint = try toU32(shared_bytes);
     try ctx.makeCurrent();
-    try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+    try ctx.launchKernel(
         function,
         grid,
         1,
@@ -14071,7 +14071,7 @@ fn launchBlocksShared(function: driver_mod.CUfunction, ctx: *context_mod.CudaCon
         ctx.stream,
         params,
         null,
-    ));
+    );
     ctx.noteKernelLaunch();
 }
 
@@ -14080,7 +14080,7 @@ fn launch2d(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, grid
     const gy: c_uint = try toU32(grid_y);
     const block: c_uint = try toU32(threads);
     try ctx.makeCurrent();
-    try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+    try ctx.launchKernel(
         function,
         gx,
         gy,
@@ -14092,7 +14092,7 @@ fn launch2d(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, grid
         ctx.stream,
         params,
         null,
-    ));
+    );
     ctx.noteKernelLaunch();
 }
 
@@ -14102,7 +14102,7 @@ fn launch3d(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, grid
     const gz: c_uint = try toU32(grid_z);
     const block: c_uint = try toU32(threads);
     try ctx.makeCurrent();
-    try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+    try ctx.launchKernel(
         function,
         gx,
         gy,
@@ -14114,13 +14114,13 @@ fn launch3d(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, grid
         ctx.stream,
         params,
         null,
-    ));
+    );
     ctx.noteKernelLaunch();
 }
 
 fn launchRaw(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, grid: c_uint, block: c_uint, params: [*]?*anyopaque) driver_mod.Error!void {
     try ctx.makeCurrent();
-    try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+    try ctx.launchKernel(
         function,
         grid,
         1,
@@ -14132,7 +14132,7 @@ fn launchRaw(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, gri
         ctx.stream,
         params,
         null,
-    ));
+    );
     ctx.noteKernelLaunch();
 }
 
@@ -14140,7 +14140,7 @@ fn launchRows(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, ro
     const grid: c_uint = try toU32(rows);
     const block: c_uint = try toU32(f32_tiled_threads);
     try ctx.makeCurrent();
-    try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+    try ctx.launchKernel(
         function,
         grid,
         1,
@@ -14152,7 +14152,7 @@ fn launchRows(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, ro
         ctx.stream,
         params,
         null,
-    ));
+    );
     ctx.noteKernelLaunch();
 }
 
@@ -20327,6 +20327,8 @@ test "generated CUDA Q4_0 Q8_1 E2B argmax launch contract is exact" {
 
     var module: KernelModule = .{};
     var ctx: context_mod.CudaContext = undefined;
+    ctx.observation = null;
+    ctx.observation_enable_failed = false;
     const empty_buffer: buffer_mod.DeviceBuffer = .{};
     try std.testing.expect(!module.hasLinearQ4_0Q8_1ArgmaxE2BPrimitives());
     try std.testing.expectError(
@@ -20373,6 +20375,8 @@ test "generated CUDA llama Q8_1 E2B launch contract is typed and narrow" {
 
     var module: KernelModule = .{};
     var ctx: context_mod.CudaContext = undefined;
+    ctx.observation = null;
+    ctx.observation_enable_failed = false;
     const empty: buffer_mod.DeviceBuffer = .{};
     const typed_empty = GgmlQ8_1Buffer.init(empty);
     try std.testing.expectError(
@@ -20445,6 +20449,8 @@ test "generated CUDA Q6_K Q8_1 argmax launch contracts are exact" {
 
     var module: KernelModule = .{};
     var ctx: context_mod.CudaContext = undefined;
+    ctx.observation = null;
+    ctx.observation_enable_failed = false;
     const empty_buffer: buffer_mod.DeviceBuffer = .{};
     try std.testing.expectError(
         error.InvalidCudaState,
@@ -20510,6 +20516,8 @@ test "generated CUDA Q4_0 Q8_1 E2B launch contracts are exact" {
 
     var module: KernelModule = .{};
     var ctx: context_mod.CudaContext = undefined;
+    ctx.observation = null;
+    ctx.observation_enable_failed = false;
     const empty_buffer: buffer_mod.DeviceBuffer = .{};
     try std.testing.expectError(
         error.CudaKernelUnavailable,
@@ -20566,6 +20574,8 @@ test "generated CUDA exact F32 E2B FFN launch contracts preserve the activation 
 
     var module: KernelModule = .{};
     var ctx: context_mod.CudaContext = undefined;
+    ctx.observation = null;
+    ctx.observation_enable_failed = false;
     const empty_buffer: buffer_mod.DeviceBuffer = .{};
     try std.testing.expectError(
         error.CudaKernelUnavailable,
@@ -20625,6 +20635,8 @@ test "generated CUDA Q4_0 Q8_1 E4B plans reject other model shapes" {
 
     var module: KernelModule = .{};
     var ctx: context_mod.CudaContext = undefined;
+    ctx.observation = null;
+    ctx.observation_enable_failed = false;
     const empty_buffer: buffer_mod.DeviceBuffer = .{};
     try std.testing.expectError(
         error.InvalidCudaState,
@@ -21597,6 +21609,8 @@ test "CUDA primitive index traversal rejects overflowing legacy coordinates befo
         .primitive_scatter_add_axis0_f32_i64 = function,
     };
     var ctx: context_mod.CudaContext = undefined;
+    ctx.observation = null;
+    ctx.observation_enable_failed = false;
     const large = buffer_mod.DeviceBuffer{ .ptr = 8, .len = @as(usize, 1) << 35 };
     inline for (.{ TensorDType.f32, TensorDType.i32, TensorDType.i64 }) |dtype| {
         try std.testing.expectError(error.InvalidCudaState, module.launchPrimitiveScatterAddAxis0(dtype, &ctx, large, large, large, 65536, 65536, 65536));

@@ -3,8 +3,9 @@
 
 //! Opt-in compute-allocation accounting. Requested owned spans created after
 //! enable are measured; allocator padding, previous allocations and model-owned
-//! mapped/resident weights are separate scopes. Metadata uses the backing
-//! allocator directly. Each escaped allocation retains the observer owner.
+//! mapped/resident weights are separate scopes. Observer metadata has an
+//! independent lifetime, so sampling a retired compute never touches its caller
+//! arena. Each escaped allocation retains the observer owner.
 const std = @import("std");
 const platform = @import("antfly_platform");
 
@@ -32,6 +33,8 @@ pub const Snapshot = struct {
 
 pub const State = struct {
     backing: std.mem.Allocator,
+    metadata: std.mem.Allocator,
+    parent_owner: ?*State = null,
     coverage: Coverage,
     references: std.atomic.Value(usize) = .init(1),
     mutex: std.atomic.Mutex = .unlocked,
@@ -39,8 +42,15 @@ pub const State = struct {
     usage: Snapshot = .{},
 
     pub fn create(backing: std.mem.Allocator, coverage: Coverage) !*State {
-        const self = try backing.create(State);
-        self.* = .{ .backing = backing, .coverage = coverage };
+        return createWithMetadata(backing, platform.allocator.processAllocator(platform.allocator.concurrentFallback()), coverage);
+    }
+
+    /// Metadata must outlive every State reference, including observations that
+    /// survive a temporary compute. The data allocator keeps its original
+    /// lifetime contract. The explicit allocator permits bookkeeping OOM tests.
+    pub fn createWithMetadata(backing: std.mem.Allocator, metadata: std.mem.Allocator, coverage: Coverage) !*State {
+        const self = try metadata.create(State);
+        self.* = .{ .backing = backing, .metadata = metadata, .coverage = coverage, .parent_owner = if (forAllocator(backing)) |owner| owner.retain() else null };
         return self;
     }
 
@@ -52,7 +62,7 @@ pub const State = struct {
     /// Distinct observers can wrap another observed owner. Publish the direct
     /// parent identity so callers do not sum overlapping ownership histories.
     pub fn parent(self: *State) ?*State {
-        return forAllocator(self.backing);
+        return self.parent_owner;
     }
 
     pub fn retain(self: *State) *State {
@@ -64,9 +74,11 @@ pub const State = struct {
     pub fn release(self: *State) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         std.debug.assert(self.records.count() == 0);
-        const backing = self.backing;
-        self.records.deinit(backing);
-        backing.destroy(self);
+        const metadata = self.metadata;
+        const parent_owner = self.parent_owner;
+        self.records.deinit(metadata);
+        metadata.destroy(self);
+        if (parent_owner) |owner| owner.release();
     }
 
     pub fn allocator(self: *State) std.mem.Allocator {
@@ -89,7 +101,7 @@ pub const State = struct {
         const self: *State = @ptrCast(@alignCast(raw));
         const memory = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
         platform.sync.lockYielding(&self.mutex);
-        self.records.put(self.backing, @intFromPtr(memory), len) catch {
+        self.records.put(self.metadata, @intFromPtr(memory), len) catch {
             self.mutex.unlock();
             self.backing.rawFree(memory[0..len], alignment, ret_addr);
             return null;
@@ -171,7 +183,7 @@ test "observed compute allocations retain their owner and forward earlier spans"
 test "observed compute allocation bookkeeping is failure atomic" {
     const Case = struct {
         fn run(a: std.mem.Allocator) !void {
-            const state = try State.create(a, .since_enable);
+            const state = try State.createWithMetadata(a, a, .since_enable);
             defer state.release();
             const observed = state.allocator();
             var bytes = try observed.alloc(u8, 31);
@@ -210,7 +222,7 @@ test "observed in-place remap needs no new bookkeeping allocation at full map ca
     var bytes: [65536]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&bytes);
     var failing = std.testing.FailingAllocator.init(fixed.allocator(), .{});
-    const state = try State.create(failing.allocator(), .since_enable);
+    const state = try State.createWithMetadata(failing.allocator(), failing.allocator(), .since_enable);
     defer state.release();
     const observed = state.allocator();
     var payloads: [64][]u8 = undefined;
@@ -230,4 +242,35 @@ test "observed in-place remap needs no new bookkeeping allocation at full map ca
     try std.testing.expectEqual(@as(usize, 0), state.records.available);
     try std.testing.expectEqual(@as(u64, 1), state.snapshot().remaps);
     try std.testing.expectEqual(@as(u64, count * 8 - 1), state.snapshot().requested_live_bytes);
+}
+
+test "observed metadata survives the retired backing arena for final sampling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const state = try State.createWithMetadata(arena.allocator(), std.testing.allocator, .from_owner_creation);
+    defer state.release();
+    const observed = state.allocator();
+    const bytes = try observed.alloc(u8, 47);
+    observed.free(bytes);
+    arena.deinit();
+    // A registry can safely sample/release State after the temporary compute
+    // and its now-empty caller arena have both retired. No data operation is
+    // permitted after arena.deinit.
+    const measured = state.snapshot();
+    try std.testing.expectEqual(@as(u64, 0), measured.requested_live_bytes);
+    try std.testing.expectEqual(@as(u64, 47), measured.requested_lifetime_peak_bytes);
+    try std.testing.expectEqual(@as(u64, 1), measured.frees);
+}
+
+test "nested observed owners retain parent identity without counting metadata as payload" {
+    const a = std.testing.allocator;
+    const parent_owner = try State.createWithMetadata(a, a, .since_enable);
+    const child = try State.createWithMetadata(parent_owner.allocator(), a, .since_enable);
+    defer child.release();
+    try std.testing.expect(child.parent().? == parent_owner);
+    const bytes = try child.allocator().alloc(u8, 29);
+    try std.testing.expectEqual(@as(u64, 29), parent_owner.snapshot().requested_live_bytes);
+    parent_owner.release();
+    child.allocator().free(bytes);
+    try std.testing.expectEqual(@as(u64, 0), child.parent().?.snapshot().requested_live_bytes);
+    try std.testing.expectEqual(@as(u64, 29), child.snapshot().requested_lifetime_peak_bytes);
 }

@@ -53,3 +53,5 @@ pub const decoder_prefill = @import("decoder_prefill.zig");
 
 pub const cached_decoder = @import("cached_decoder.zig");
 pub const decoder_stage = @import("decoder_stage.zig");
+
+pub const speculative_activation = @import("speculative_activation.zig");

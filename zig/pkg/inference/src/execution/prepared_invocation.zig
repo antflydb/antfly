@@ -62,7 +62,7 @@ pub const PreparedInvocation = struct {
         if (self.closed or self.executed) return error.PreparedInvocationAlreadyConsumed;
         if (control) |active| try active.check();
         self.executed = true;
-        return self.dispatch(self, inputs, placement, allocator, control, capability);
+        return @import("invocation_observation.zig").call(self.published.invocation_diagnostics, self.dispatch, .{ self, inputs, placement, allocator, control, capability });
     }
 
     pub fn deinit(self: *PreparedInvocation) void {

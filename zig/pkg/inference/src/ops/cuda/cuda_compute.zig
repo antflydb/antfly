@@ -5538,7 +5538,7 @@ pub const CudaCompute = struct {
         self.pinned_scalar_download_buffer.host.free(&self.ctx);
         self.pinned_bulk_download_buffer.free(&self.ctx);
         if (self.async_i32_scalar_download.in_use and self.async_i32_scalar_download.event != null) {
-            self.ctx.driver.check(self.ctx.driver.fns.cuEventSynchronize(self.async_i32_scalar_download.event)) catch {};
+            self.ctx.driver.check(self.ctx.synchronizeEventResult(self.async_i32_scalar_download.event)) catch {};
             self.async_i32_scalar_download.in_use = false;
         }
         self.async_i32_scalar_download.staging.free(&self.ctx);
@@ -6233,7 +6233,7 @@ pub const CudaCompute = struct {
         // not a completion fence and cannot provide this lifetime guarantee.
         defer {
             self.ctx.makeCurrent() catch {};
-            _ = self.ctx.driver.fns.cuStreamSynchronize(upload_stream);
+            _ = self.ctx.synchronizeStreamResult(upload_stream);
             _ = self.ctx.driver.fns.cuStreamDestroy(upload_stream);
         }
 
@@ -6286,7 +6286,7 @@ pub const CudaCompute = struct {
 
             if (observation.in_flight_index) |slot_index| {
                 const slot = &state.slots[slot_index];
-                try self.ctx.driver.check(self.ctx.driver.fns.cuEventSynchronize(slot.event));
+                try self.ctx.driver.check(self.ctx.synchronizeEventResult(slot.event));
                 state.lock();
                 slot.state = .empty;
                 state.changed.broadcast(state.io);
@@ -6299,7 +6299,7 @@ pub const CudaCompute = struct {
                 return error.A4bCudaIncompleteLoadPipeline;
             state.waitForProgress(worker_count);
         }
-        try self.ctx.driver.check(self.ctx.driver.fns.cuStreamSynchronize(upload_stream));
+        try self.ctx.driver.check(self.ctx.synchronizeStreamResult(upload_stream));
         self.stats.a4b_load_host_stage_ns +|= state.worker_copy_ns;
         self.stats.a4b_load_h2d_ns +|= platform.time.monotonicNs() -| transfer_started_ns;
         self.stats.a4b_load_workers = worker_count;
@@ -8192,7 +8192,7 @@ fn warmupCublasLtBf16(cublaslt: *cublaslt_mod.CublasLt, ctx: *context_mod.CudaCo
     // Inputs stay uninitialized: the result is discarded, only the library
     // load and heuristic init matter.
     cublaslt.matmulBf16WeightF32Out(ctx, dst, input, weight, .{}, rows, dim, dim) catch return;
-    ctx.driver.check(ctx.driver.fns.cuStreamSynchronize(ctx.stream)) catch {};
+    ctx.driver.check(ctx.synchronizeStreamResult(ctx.stream)) catch {};
 }
 
 fn cudaShouldDequantizeWeightOnUpload(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
@@ -8724,6 +8724,11 @@ fn tensorFromCt(tensor: CT) *CudaTensor {
 
 fn unsupportedCt() anyerror!CT {
     return error.CudaOpUnsupported;
+}
+
+fn enableRuntimeObservationOp(ctx: *anyopaque) void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    self.ctx.enableRuntimeObservation();
 }
 
 fn backendKind(_: *anyopaque) ops.BackendKind {
@@ -10759,7 +10764,7 @@ fn beginI32ScalarDownloadOp(ctx: *anyopaque, tensor: CT) anyerror!?ops.PendingI3
         try self.async_i32_scalar_download.staging.copyFromDevice(&self.ctx, logical_buffer, byte_len);
         self.stats.d2d_bytes += byte_len;
         try self.ctx.recordEvent(self.async_i32_scalar_download.ready_event);
-        try self.ctx.driver.check(self.ctx.driver.fns.cuStreamWaitEvent(self.async_i32_scalar_download.copy_stream, self.async_i32_scalar_download.ready_event, 0));
+        try self.ctx.driver.check(self.ctx.waitStreamEventResult(self.async_i32_scalar_download.copy_stream, self.async_i32_scalar_download.ready_event, 0));
         try self.ctx.driver.check(self.ctx.driver.fns.cuMemcpyDtoHAsync(slot.ptr, self.async_i32_scalar_download.staging.ptr, byte_len, self.async_i32_scalar_download.copy_stream));
         @import("../../execution/transfer_audit.zig").download(byte_len);
         try self.ctx.driver.check(self.ctx.driver.fns.cuEventRecord(self.async_i32_scalar_download.event, self.async_i32_scalar_download.copy_stream));
@@ -10790,7 +10795,7 @@ fn finishI32ScalarDownloadOp(ctx: *anyopaque, pending: ops.PendingI32ScalarDownl
     {
         return error.InvalidCudaState;
     }
-    try self.ctx.driver.check(self.ctx.driver.fns.cuEventSynchronize(self.async_i32_scalar_download.event));
+    try self.ctx.driver.check(self.ctx.synchronizeEventResult(self.async_i32_scalar_download.event));
     self.async_i32_scalar_download.in_use = false;
     self.stats.async_i32_scalar_download_finishes += 1;
     const bytes = self.async_i32_scalar_download.host.bytes()[0..@sizeOf(i32)];
@@ -10805,7 +10810,7 @@ fn cancelI32ScalarDownloadOp(ctx: *anyopaque, pending: ops.PendingI32ScalarDownl
     {
         return;
     }
-    self.ctx.driver.check(self.ctx.driver.fns.cuEventSynchronize(self.async_i32_scalar_download.event)) catch return;
+    self.ctx.driver.check(self.ctx.synchronizeEventResult(self.async_i32_scalar_download.event)) catch return;
     self.async_i32_scalar_download.in_use = false;
     self.stats.async_i32_scalar_download_cancels += 1;
 }
@@ -12539,6 +12544,8 @@ test "CUDA op-profile pool free-stack, drain no-op, and category mapping" {
     // slots, the empty-ring drain fast path (never touches the GPU context), and
     // the category -> stat-field mapping for the newly added prefill buckets.
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
 
     compute.temp_scan_profile = .{};
     compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -13064,6 +13071,8 @@ fn allocGreedyTokenDeviceBuffer(self: *CudaCompute, byte_len: usize) !DeviceBuff
 
 test "CUDA greedy graph output borrows only the prepared replay slot" {
     var self: CudaCompute = undefined;
+    self.ctx.observation = null;
+    self.ctx.observation_enable_failed = false;
 
     self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -13103,6 +13112,8 @@ test "CUDA greedy graph output borrows only the prepared replay slot" {
 
 test "CUDA greedy graph output lease remains armed for retry and consumes on tensor creation" {
     var self: CudaCompute = undefined;
+    self.ctx.observation = null;
+    self.ctx.observation_enable_failed = false;
 
     self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -13829,6 +13840,8 @@ fn testAcquiredWeightHandle(allocator: std.mem.Allocator) !void {
     // No driver is needed: acquired handles may free their metadata, but must
     // never attempt to free the resident model's device allocations.
     var self: CudaCompute = undefined;
+    self.ctx.observation = null;
+    self.ctx.observation_enable_failed = false;
 
     self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -14316,6 +14329,8 @@ fn disarmSplitkOnlineDecodeReplay(self: *CudaCompute) void {
 
 test "split-K replay rejection cannot leave a prepared graph or stale scalars" {
     var self: CudaCompute = undefined;
+    self.ctx.observation = null;
+    self.ctx.observation_enable_failed = false;
 
     self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -14379,6 +14394,8 @@ fn preparePersistentCudaBufferReallocation(self: *CudaCompute) !void {
 
 test "CUDA persistent buffer reallocation invalidates graph pointers and rejects capture" {
     var self: CudaCompute = undefined;
+    self.ctx.observation = null;
+    self.ctx.observation_enable_failed = false;
 
     self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -14424,6 +14441,8 @@ fn clearDebugCudaGraphCaptureState(self: *CudaCompute) void {
 
 test "clearing CUDA graph capture state removes stale disabled latch" {
     var self: CudaCompute = undefined;
+    self.ctx.observation = null;
+    self.ctx.observation_enable_failed = false;
 
     self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -14455,6 +14474,8 @@ test "clearing CUDA graph capture state removes stale disabled latch" {
 
 test "CUDA graph request reset clears stale capture and scalar state" {
     var self: CudaCompute = undefined;
+    self.ctx.observation = null;
+    self.ctx.observation_enable_failed = false;
 
     self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -14504,6 +14525,8 @@ test "CUDA graph request reset clears stale capture and scalar state" {
 
 test "CUDA request reset clears pinned temp slot ABI mappings" {
     var self: CudaCompute = undefined;
+    self.ctx.observation = null;
+    self.ctx.observation_enable_failed = false;
 
     self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -16093,6 +16116,8 @@ fn gemma4AudioDepthwiseSegmentedOp(ctx: *anyopaque, input: CT, weight: CT, start
 
 test "Gemma 4 audio CUDA hooks decline pre-Ampere before touching tensors" {
     var self: CudaCompute = undefined;
+    self.ctx.observation = null;
+    self.ctx.observation_enable_failed = false;
 
     self.temp_scan_profile = .{};
     self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -18789,6 +18814,8 @@ fn boundaryMixedWeight(self: *CudaCompute, weight: *const CudaTensor) ?CudaTenso
 
 test "GLiNER Decide CUDA Q8 execution mirror is a borrowed dense view" {
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
 
     compute.temp_scan_profile = .{};
     compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -23561,6 +23588,8 @@ fn glinerQ8F16AttentionEligible(self: *const CudaCompute, batch: usize, seq: usi
 
 test "GLiNER Decide CUDA Q8 long-context attention requires complete supported mirror profile" {
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
 
     compute.temp_scan_profile = .{};
     compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -29594,7 +29623,7 @@ fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
     }
     const memory = self.ctx.device_allocations.snapshot();
     return .{
-        .runtime = .{ .counters = .{ .kernel_dispatches = self.ctx.stats.kernel_launches -| self.ctx.stats.graph_submissions, .graph_submissions = self.ctx.stats.graph_submissions, .synchronizations = self.ctx.stats.stream_syncs, .physical_allocations = memory.allocations, .physical_frees = memory.frees }, .memory = .{ .scope = .backend_device_buffers, .live_bytes = memory.physical_live, .lifetime_peak_bytes = memory.physical_peak } },
+        .runtime = .{ .cuda = self.ctx.runtimeObservation(), .counters = .{ .kernel_dispatches = null, .graph_submissions = if (self.ctx.observation) |state| state.counterValue("known_graph_submissions") +| state.counterValue("opaque_graph_submissions") else null, .synchronizations = if (self.ctx.observation) |state| state.counterValue("host_stream_synchronizations") +| state.counterValue("host_event_synchronizations") else null, .physical_allocations = memory.allocations, .physical_frees = memory.frees }, .memory = .{ .scope = .backend_device_buffers, .live_bytes = memory.physical_live, .lifetime_peak_bytes = memory.physical_peak } },
         .native_quant_null = false,
         .provider = provider,
         .quant = .{},
@@ -29621,6 +29650,7 @@ const kernel_backend_impl = ops.KernelBackend{
 };
 
 const vtable = ops.ComputeBackend.VTable{
+    .enableRuntimeObservation = &enableRuntimeObservationOp,
     .kernels = &kernel_backend_impl,
     .backendKind = &backendKind,
     .modelConstant = &modelConstantOp,
@@ -30409,6 +30439,8 @@ const trainingAdamWManyF32Impl = trainingAdamWManyF32Op;
 
 test "attention match repeat scope restores profile on error" {
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.ctx.info.compute_major = 8;
     compute.ctx.info.compute_minor = 9;
     compute.ctx.debug_graph_capture_active = false;
@@ -31847,6 +31879,8 @@ test "embeddinggemma2 CUDA model constants keep independent admission through bo
             copies = 0;
             var controller = @import("../../runtime/tier/memory.zig").AdmissionController{};
             var compute: CudaCompute = undefined;
+            compute.ctx.observation = null;
+            compute.ctx.observation_enable_failed = false;
 
             compute.temp_scan_profile = .{};
             compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -31937,6 +31971,8 @@ test "embeddinggemma2 CUDA constant snapshots preserve bits after mutation evict
 
 test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclamation before GPU access" {
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
 
     compute.temp_scan_profile = .{};
     compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
@@ -32372,7 +32408,7 @@ const PhysicalCompletionContext = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (!self.recorded) return;
         try self.compute.ctx.makeCurrent();
-        try self.compute.ctx.driver.check(self.compute.ctx.driver.fns.cuEventSynchronize(self.event));
+        try self.compute.ctx.driver.check(self.compute.ctx.synchronizeEventResult(self.event));
     }
     fn deinit(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -32436,6 +32472,8 @@ test "CUDA retained reshape and row views preserve owning metadata without GPU a
     const Case = struct {
         fn run(a: std.mem.Allocator) !void {
             var compute: CudaCompute = undefined;
+            compute.ctx.observation = null;
+            compute.ctx.observation_enable_failed = false;
             compute.allocator = a;
             const source = try a.create(CudaTensor);
             source.* = .{ .buffer = .{ .ptr = 4096, .len = 64 }, .dtype = .f32, .shape = @constCast(&[_]i64{ 4, 4 }), .elem_count = 16, .owns_buffer = false, .owns_shape = false };
@@ -32516,6 +32554,8 @@ test "CUDA physical completion orders default stream changes and waits only at r
     driver.fns.cuStreamWaitEvent = Fake.depend;
     driver.fns.cuEventSynchronize = Fake.wait;
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.ctx.driver = driver;
     compute.ctx.ctx = @ptrFromInt(1);
     compute.ctx.stream = null;
@@ -32537,6 +32577,8 @@ test "CUDA physical completion orders default stream changes and waits only at r
 test "CUDA immutable retention shares typed payload and metadata without GPU submission" {
     const a = std.testing.allocator;
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.allocator = a;
     const source = try a.create(CudaTensor);
     source.* = .{ .buffer = .{ .ptr = 4096, .len = 16 }, .dtype = .i32, .shape = @constCast(&[_]i64{4}), .elem_count = 4, .owns_buffer = false, .owns_shape = false };
@@ -32551,6 +32593,8 @@ test "CUDA immutable retention shares typed payload and metadata without GPU sub
 
 test "CUDA planned transfers reject host copies during capture before device submission" {
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.execution_scope = null;
     compute.debug_cuda_graph_capture_active = true;
     compute.debug_cuda_graph_capture_disabled = false;
@@ -32575,6 +32619,8 @@ test "CUDA physical capture scopes reject nesting and retain operand addresses" 
     const lease = (try ops.physical_storage.Lease.create(a, context.computeBackend(), 16)).?;
     defer lease.release();
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.allocator = a;
     compute.physical_execution_storage = null;
     compute.capturing_physical_storage = .{};
@@ -32608,6 +32654,8 @@ test "CUDA row snapshots use stable allocation and fail closed before capture de
         }
     };
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.debug_cuda_graph_capture_active = true;
     compute.debug_cuda_graph_capture_disabled = false;
     var callbacks = vtable;
@@ -32625,6 +32673,8 @@ test "CUDA planned auxiliary representations retain storage through publication 
     const lease = (try ops.physical_storage.Lease.create(a, context.computeBackend(), 16)).?;
     defer lease.release();
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.allocator = a;
     compute.debug_cuda_graph_capture_active = true;
     compute.capturing_physical_storage = .{};
@@ -32684,6 +32734,8 @@ test "CUDA owned output construction preserves caller resources on allocation fa
             // Construction touches host ownership metadata only. Device buffers
             // remain caller-owned on failure and are never submitted here.
             var compute: CudaCompute = undefined;
+            compute.ctx.observation = null;
+            compute.ctx.observation_enable_failed = false;
             compute.allocator = a;
             const shape = try a.dupe(i64, &.{ 2, 3 });
             defer a.free(shape);
@@ -32896,6 +32948,8 @@ test "CUDA ordinary projection owners release partial results without changing a
 test "CUDA resident weight cache teardown respects borrowed storage without a driver" {
     const a = std.testing.allocator;
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.allocator = a;
     compute.stats = .{};
     compute.resident_weights = .empty;
@@ -32925,6 +32979,8 @@ test "CUDA resident weight cache teardown respects borrowed storage without a dr
 test "CUDA immutable resident eligibility follows metadata identity rather than allocation ownership" {
     const a = std.testing.allocator;
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.resident_weights = .empty;
     defer compute.resident_weights.deinit(a);
     compute.lighton_shared_recurrent_weights_enabled = true;
@@ -33016,6 +33072,8 @@ test "CUDA resident weight cache releases owners and preserves borrowed aliases"
 test "CUDA resident weight uploads consume keys on rejected types without a driver" {
     const a = std.testing.allocator;
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.allocator = a;
     compute.resident_weights = .empty;
     compute.strict_f32_weights = false;
@@ -37763,6 +37821,8 @@ test "LightOn CUDA graph capability has no benchmark GPU allowlist and explains 
     // Only policy fields are initialized: no driver or device allocation is
     // touched by eligibility. Actual graph execution is covered on CUDA.
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.lighton_decode_graph_enabled = true;
     compute.capability_profile = .lightonocr3;
     compute.ctx.info.compute_major = 8;
@@ -37812,6 +37872,8 @@ test "LightOn CUDA graph capability has no benchmark GPU allowlist and explains 
 
 test "CUDA Laya portable warp eligibility depends on loaded symbol and shape" {
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.laya_optimizations = true;
     compute.kernels.laya_attention_warp_f32 = @ptrFromInt(1);
     try std.testing.expect(layaWarpEligible(&compute, 2, 512, 64));
@@ -37828,6 +37890,8 @@ test "CUDA Laya portable warp eligibility depends on loaded symbol and shape" {
 
 test "CUDA vision automatic policy consumes resolved settings without a second environment gate" {
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.capability_profile = .lightonocr3;
     compute.lighton_fused_vision_qkv_enabled = true;
     compute.lighton_fused_vision_mlp_enabled = true;
@@ -37854,6 +37918,8 @@ test "CUDA vision automatic policy consumes resolved settings without a second e
 
 test "LightOn BF16 vision capability includes the portable artifact driver contract" {
     var compute: CudaCompute = undefined;
+    compute.ctx.observation = null;
+    compute.ctx.observation_enable_failed = false;
     compute.capability_profile = .lightonocr3;
     compute.lighton_precision = .bf16_vision;
     compute.resident_training_cache = false;
@@ -37903,4 +37969,95 @@ test "CUDA assigned gather index precondition preserves integers above F32 preci
     context.cuda.debug_cuda_graph_capture_disabled = false;
     try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, validateAssignedGatherIndices(context.cuda, tensorFromCt(value), 16_777_218, &scratch));
     try std.testing.expect(context.cuda.debug_cuda_graph_capture_disabled);
+}
+
+test "CUDA prepared vendor owner survives cache eviction with exact reduced capture outputs" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = CudaCompute.init(a) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compute.deinit();
+    if (compute.cublaslt == null or compute.ctx.info.compute_major < 8) return error.SkipZigTest;
+    const vendor = &compute.cublaslt.?;
+    const blas_module = @import("cublaslt.zig");
+    const capture = @import("graph.zig");
+    inline for ([_]blas_module.CublasLt.DensePrecision{ .f32, .f16, .bf16 }) |precision| {
+        inline for (.{ false, true }) |with_bias| {
+            inline for (.{ 3, 128 }) |rows| {
+                const width = 64;
+                var input: [rows * width]f32 = undefined;
+                var weight: [width * width]f32 = undefined;
+                var bias: [width]f32 = undefined;
+                for (&input, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) / 16;
+                for (&weight, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) / 16;
+                for (&bias, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 5)) / 32;
+                var narrow_input: [input.len]u16 = undefined;
+                var narrow_weight: [weight.len]u16 = undefined;
+                if (precision != .f32) {
+                    for (input, &narrow_input) |value, *result| result.* = if (precision == .f16) @bitCast(@as(f16, @floatCast(value))) else @truncate(@as(u32, @bitCast(value)) >> 16);
+                    for (weight, &narrow_weight) |value, *result| result.* = if (precision == .f16) @bitCast(@as(f16, @floatCast(value))) else @truncate(@as(u32, @bitCast(value)) >> 16);
+                }
+                const input_bytes = if (precision == .f32) std.mem.sliceAsBytes(&input) else std.mem.sliceAsBytes(&narrow_input);
+                const weight_bytes = if (precision == .f32) std.mem.sliceAsBytes(&weight) else std.mem.sliceAsBytes(&narrow_weight);
+                const workspace_bytes: usize = if (precision == .f32 and !with_bias) 0 else 1024 * 1024;
+                var buffers: [6]buffer_mod.DeviceBuffer = @splat(.{});
+                defer {
+                    compute.ctx.synchronize() catch {};
+                    for (&buffers) |*buffer| buffer.free(&compute.ctx);
+                }
+                for (&buffers, [_]usize{ input_bytes.len, weight_bytes.len, @sizeOf(@TypeOf(input)), workspace_bytes, @sizeOf(@TypeOf(input)), @sizeOf(@TypeOf(bias)) }) |*buffer, bytes| buffer.* = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, bytes);
+                try buffers[0].copyFromHost(&compute.ctx, input_bytes);
+                try buffers[1].copyFromHost(&compute.ctx, weight_bytes);
+                try buffers[5].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&bias));
+                // Warm the unchanged original route, so the owned plan must
+                // preserve its accepted algorithm rather than rediscover it.
+                if (with_bias) switch (precision) {
+                    .f32 => try vendor.matmulF32BiasF32Out(&compute.ctx, buffers[4], buffers[0], buffers[1], buffers[5], buffers[3], rows, width, width),
+                    .f16 => try vendor.matmulF16WeightBiasF32Out(&compute.ctx, buffers[4], buffers[0], buffers[1], buffers[5], buffers[3], rows, width, width),
+                    .bf16 => try vendor.matmulBf16WeightBiasF32Out(&compute.ctx, buffers[4], buffers[0], buffers[1], buffers[5], buffers[3], rows, width, width),
+                } else switch (precision) {
+                    .f32 => try vendor.matmulF32WeightF32Out(&compute.ctx, buffers[4], buffers[0], buffers[1], rows, width, width),
+                    .f16 => try vendor.matmulF16WeightF32Out(&compute.ctx, buffers[4], buffers[0], buffers[1], buffers[3], rows, width, width),
+                    .bf16 => try vendor.matmulBf16WeightF32Out(&compute.ctx, buffers[4], buffers[0], buffers[1], buffers[3], rows, width, width),
+                }
+                try compute.ctx.synchronize();
+                const invocation = blas_module.TensorCoreInvocation{ .input = buffers[0], .weight = buffers[1], .dst = buffers[2], .workspace = buffers[3], .bias = if (with_bias) buffers[5] else null };
+                var owned = try vendor.prepareDense(&compute.ctx, .{ .precision = precision, .rows = rows, .in_dim = width, .out_dim = width, .with_bias = with_bias }, invocation);
+                defer owned.deinit();
+                try std.testing.expect(try vendor.reserveTensorCorePlanSlots(&compute.ctx, vendor.plan_cache_capacity));
+                try std.testing.expectEqual(@as(usize, 0), vendor.tensor_core_plans.count());
+                _ = try owned.submit(&compute.ctx, invocation);
+                try compute.ctx.synchronize();
+                var actual: [rows * width]f32 = undefined;
+                var original: [rows * width]f32 = undefined;
+                try buffers[2].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+                try buffers[4].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&original));
+                try std.testing.expectEqualSlices(f32, &original, &actual);
+                for (0..rows) |row| for (0..width) |column| {
+                    var expected: f32 = if (with_bias) bias[column] else 0;
+                    for (0..width) |k| expected += input[row * width + k] * weight[column * width + k];
+                    try std.testing.expectApproxEqAbs(expected, actual[row * width + column], 1e-5);
+                };
+                try capture.beginCapture(&compute.ctx);
+                var recording = true;
+                errdefer if (recording) {
+                    if (capture.endCapture(&compute.ctx)) |aborted| {
+                        var abandoned = aborted;
+                        abandoned.deinit(&compute.ctx);
+                    } else |_| {}
+                };
+                _ = try owned.submit(&compute.ctx, invocation);
+                var graph = try capture.endCapture(&compute.ctx);
+                recording = false;
+                defer graph.deinit(&compute.ctx);
+                try graph.launch(&compute.ctx);
+                try compute.ctx.synchronize();
+                try buffers[2].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+                try std.testing.expectEqualSlices(f32, &original, &actual);
+                try std.testing.expectEqual(@as(usize, 0), vendor.tensor_core_plans.count());
+            }
+        }
+    }
 }

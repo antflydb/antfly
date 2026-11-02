@@ -34,6 +34,7 @@ pub fn supportsResidentPair(encoder: backends.Session, decoder: backends.Session
     if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 3) return false;
     const logits = decoder.outputInfo();
     if (logits.len != 1 or logits[0].dtype != .f32 or logits[0].shape.len != 3) return false;
+    if (decoder.inputInfo().len > 4) return false;
     var tokens = false;
     var hidden = false;
     for (decoder.inputInfo()) |input| {
@@ -43,7 +44,7 @@ pub fn supportsResidentPair(encoder: backends.Session, decoder: backends.Session
         } else if (std.mem.eql(u8, input.name, "encoder_hidden_states")) {
             if (hidden or input.dtype != .f32 or input.shape.len != 3) return false;
             hidden = true;
-        } else if (std.mem.eql(u8, input.name, "encoder_attention_mask")) {
+        } else if ((std.mem.eql(u8, input.name, "encoder_attention_mask") or std.mem.eql(u8, input.name, "decoder_attention_mask"))) {
             if (input.dtype != .i64 or input.shape.len != 2) return false;
         } else return false;
     }
@@ -80,12 +81,95 @@ pub fn encodeWithPermit(allocator: std.mem.Allocator, encoder: backends.Session,
         if (shape.len != 3 or shape[0] != 1 or shape[1] <= 0 or shape[2] <= 0) return error.InvalidEncoderOutput;
         return .{ .resident = .{ .values = values, .shape = .{ shape[0], shape[1], shape[2] } } };
     }
+    return encodeHost(allocator, encoder, inputs, dispatch, control, supplied);
+}
+
+fn encodeHost(allocator: std.mem.Allocator, encoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit) !EncoderOutputs {
     if (comptime @TypeOf(dispatch) != @TypeOf(null)) {
         if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) {
             if (dispatch) |selected| return .{ .host = try selected.run(allocator, encoder, supplied, null, inputs, control) };
         } else return .{ .host = try dispatch.run(allocator, encoder, supplied, null, inputs, control) };
     }
     return .{ .host = if (supplied) |permit| try permit.runWithControl(inputs, allocator, control) else try encoder.runWithControl(inputs, allocator, control) };
+}
+
+/// Address-stable borrowed inputs for the common full-prefix decoder ABI.
+/// Initialize in place and keep this owner alive until synchronous execution
+/// returns; only the optional all-ones query mask needs an allocation.
+pub const DecoderInputs = struct {
+    allocator: std.mem.Allocator,
+    storage: [4]session_mod.StageInput = undefined,
+    host_storage: [4]backends.Tensor = undefined,
+    count: usize = 0,
+    token_shape: [2]i64,
+    encoder_mask_shape: [2]i64,
+    query_mask: ?[]i64 = null,
+
+    pub fn init(self: *DecoderInputs, allocator: std.mem.Allocator, signature: []const backends.TensorInfo, tokens: []const i64, mask: []const i64, hidden: session_mod.StageInput) !void {
+        self.* = .{ .allocator = allocator, .token_shape = .{ 1, std.math.cast(i64, tokens.len) orelse return error.ResourceLimitExceeded }, .encoder_mask_shape = .{ 1, std.math.cast(i64, mask.len) orelse return error.ResourceLimitExceeded } };
+        errdefer self.deinit();
+        if (signature.len > self.storage.len) return error.InvalidDecoderInput;
+        for (signature) |info| {
+            const input: session_mod.StageInput = if (std.mem.eql(u8, info.name, "input_ids")) .{ .host = .{
+                .name = info.name,
+                .data = @constCast(std.mem.sliceAsBytes(tokens)),
+                .shape = &self.token_shape,
+                .dtype = .i64,
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            } } else if (std.mem.eql(u8, info.name, "encoder_attention_mask")) .{ .host = .{
+                .name = info.name,
+                .data = @constCast(std.mem.sliceAsBytes(mask)),
+                .shape = &self.encoder_mask_shape,
+                .dtype = .i64,
+                .allocator = allocator,
+                .owns_data = false,
+                .owns_shape = false,
+            } } else if (std.mem.eql(u8, info.name, "decoder_attention_mask")) blk: {
+                if (self.query_mask == null) {
+                    self.query_mask = try allocator.alloc(i64, tokens.len);
+                    @memset(self.query_mask.?, 1);
+                }
+                break :blk .{ .host = .{ .name = info.name, .data = std.mem.sliceAsBytes(self.query_mask.?), .shape = &self.token_shape, .dtype = .i64, .allocator = allocator, .owns_data = false, .owns_shape = false } };
+            } else if (std.mem.eql(u8, info.name, "encoder_hidden_states")) switch (hidden) {
+                .host => |value| .{ .host = value.borrowedView(info.name) },
+                .resident => |value| .{ .resident = value },
+            } else return error.InvalidDecoderInput;
+            self.storage[self.count] = input;
+            self.count += 1;
+        }
+    }
+
+    pub fn deinit(self: *DecoderInputs) void {
+        if (self.query_mask) |mask| self.allocator.free(mask);
+        self.* = undefined;
+    }
+
+    pub fn stageInputs(self: *const DecoderInputs) []const session_mod.StageInput {
+        return self.storage[0..self.count];
+    }
+
+    pub fn hostInputs(self: *DecoderInputs) ![]const backends.Tensor {
+        for (self.storage[0..self.count], self.host_storage[0..self.count]) |value, *host| host.* = switch (value) {
+            .host => |tensor| tensor,
+            .resident => return error.ExpectedHostEncoder,
+        };
+        return self.host_storage[0..self.count];
+    }
+};
+
+/// A reading task without an artifact vocabulary hint keeps its existing host
+/// output contract. Qualification happens before the encoder is dispatched.
+pub fn outputVocabulary(decoder: backends.Session) ?usize {
+    const outputs = decoder.outputInfo();
+    if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 3 or outputs[0].shape[2] <= 0) return null;
+    return std.math.cast(usize, outputs[0].shape[2]);
+}
+
+pub fn encodeForFinalRow(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control) !EncoderOutputs {
+    if (outputVocabulary(decoder) == null) return encodeHost(allocator, encoder, inputs, dispatch, control, null);
+    return encode(allocator, encoder, decoder, inputs, dispatch, control);
 }
 
 /// Only the final vocabulary row crosses the output boundary. The encoder and
@@ -107,35 +191,10 @@ pub fn finalVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Sessio
         .host => return error.ExpectedResidentEncoder,
     };
     if (tokens.len == 0 or vocab == 0 or resident.shape[1] != mask.len) return error.InvalidInputShape;
-    const token_shape = [_]i64{ 1, @intCast(tokens.len) };
-    const mask_shape = [_]i64{ 1, @intCast(mask.len) };
-    var input_storage: [3]session_mod.StageInput = undefined;
-    const signature = decoder.inputInfo();
-    if (signature.len > input_storage.len) return error.InvalidDecoderInput;
-    for (signature, input_storage[0..signature.len]) |info, *input| {
-        input.* = if (std.mem.eql(u8, info.name, "input_ids")) .{ .host = .{
-            .name = info.name,
-            .data = @constCast(std.mem.sliceAsBytes(tokens)),
-            .shape = &token_shape,
-            .dtype = .i64,
-            .allocator = allocator,
-            .owns_data = false,
-            .owns_shape = false,
-        } } else if (std.mem.eql(u8, info.name, "encoder_attention_mask")) .{ .host = .{
-            .name = info.name,
-            .data = @constCast(std.mem.sliceAsBytes(mask)),
-            .shape = &mask_shape,
-            .dtype = .i64,
-            .allocator = allocator,
-            .owns_data = false,
-            .owns_shape = false,
-        } } else if (std.mem.eql(u8, info.name, "encoder_hidden_states")) .{ .resident = .{
-            .value = resident.values.outputs[0],
-            .backend = resident.values.backend,
-            .shape = &resident.shape,
-        } } else return error.InvalidDecoderInput;
-    }
-    var outputs = (try decoder.runStageInputsWithControl(input_storage[0..signature.len], allocator, control)) orelse return error.UnexpectedResidentStageDecline;
+    var inputs: DecoderInputs = undefined;
+    try inputs.init(allocator, decoder.inputInfo(), tokens, mask, .{ .resident = .{ .value = resident.values.outputs[0], .backend = resident.values.backend, .shape = &resident.shape } });
+    defer inputs.deinit();
+    var outputs = (try decoder.runStageInputsWithControl(inputs.stageInputs(), allocator, control)) orelse return error.UnexpectedResidentStageDecline;
     defer outputs.deinit();
     if (outputs.outputs.len != 1) return error.InvalidDecoderOutput;
     const expected = [_]i64{ 1, @intCast(tokens.len), std.math.cast(i64, vocab) orelse return error.ResourceLimitExceeded };
@@ -233,4 +292,37 @@ test "encoder decoder resident stages retain hidden state and materialize only t
             try std.testing.checkAllAllocationFailures(a, Case.run, .{ decoder, @as(*const EncoderOutputs, &encoded) });
         }
     }
+}
+
+test "decoder input owner borrows real token hidden and encoder mask storage and owns only query mask" {
+    const a = std.testing.allocator;
+    const shape = [_]i64{ 1, 2 };
+    const signature = [_]backends.TensorInfo{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &shape },
+        .{ .name = "encoder_attention_mask", .dtype = .i64, .shape = &shape },
+        .{ .name = "decoder_attention_mask", .dtype = .i64, .shape = &shape },
+        .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{ 1, 2, 4 } },
+    };
+    const tokens = [_]i64{ 7, 9 };
+    const mask = [_]i64{ 1, 0 };
+    var hidden = try backends.Tensor.initFloat32(a, "original_hidden", &.{ 1, 2, 4 }, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    defer hidden.deinit();
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, infos: []const backends.TensorInfo, ids: []const i64, encoder_mask: []const i64, encoded: backends.Tensor) !void {
+            var inputs: DecoderInputs = undefined;
+            try inputs.init(allocator, infos, ids, encoder_mask, .{ .host = encoded });
+            defer inputs.deinit();
+            const host = try inputs.hostInputs();
+            try std.testing.expect(host[0].data.ptr == std.mem.sliceAsBytes(ids).ptr);
+            try std.testing.expect(host[1].data.ptr == std.mem.sliceAsBytes(encoder_mask).ptr);
+            try std.testing.expect(host[3].data.ptr == encoded.data.ptr);
+            try std.testing.expectEqualSlices(i64, &.{ 1, 1 }, host[2].asInt64());
+            try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, host[0].shape);
+            try std.testing.expectEqualStrings("encoder_hidden_states", host[3].name);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Case.run, .{ @as([]const backends.TensorInfo, &signature), @as([]const i64, &tokens), @as([]const i64, &mask), hidden });
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, hidden.asFloat32());
+    try std.testing.expectEqualSlices(i64, &.{ 7, 9 }, &tokens);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 0 }, &mask);
 }

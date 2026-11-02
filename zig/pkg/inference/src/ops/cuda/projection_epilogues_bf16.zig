@@ -87,7 +87,7 @@ pub const Module = struct {
         // are asserted zero by the generator; neither is allocated or read.
         var scratch: u64 = 0;
         var args = [_]?*anyopaque{ &p[0], &p[1], &p[2], &p[3], &rows, &scratch, &scratch };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(@fromBackingInt(@intCast(index))), @intCast((r.wide + 127) / 128), @intCast((r.rows + 63) / 64), 1, catalog.gelu[0].threads, 1, 1, catalog.gelu[0].shared, ctx.stream, &args, null));
+        try ctx.launchKernel(self.programs.function(@fromBackingInt(@intCast(index))), @intCast((r.wide + 127) / 128), @intCast((r.rows + 63) / 64), 1, catalog.gelu[0].threads, 1, 1, catalog.gelu[0].shared, ctx.stream, &args, null);
         ctx.noteKernelLaunch();
         self.calls += 1;
     }
@@ -170,7 +170,7 @@ pub const DownModule = struct {
         var rows: u32 = @intCast(r.rows);
         var scratch: u64 = 0;
         var args = [_]?*anyopaque{ &p[0], &p[1], &p[2], &p[3], &p[4], &rows, &scratch, &scratch };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(@fromBackingInt(@intCast(index))), @intCast((r.hidden + 127) / 128), @intCast((r.rows + 63) / 64), 1, catalog.residual[0].threads, 1, 1, catalog.residual[0].shared, ctx.stream, &args, null));
+        try ctx.launchKernel(self.programs.function(@fromBackingInt(@intCast(index))), @intCast((r.hidden + 127) / 128), @intCast((r.rows + 63) / 64), 1, catalog.residual[0].threads, 1, 1, catalog.residual[0].shared, ctx.stream, &args, null);
         ctx.noteKernelLaunch();
         self.calls += 1;
     }

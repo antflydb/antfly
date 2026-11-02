@@ -75,7 +75,7 @@ fn require(buffer: Buffer, n: usize) !void {
 }
 fn launch(ctx: *Context, function: driver.CUfunction, args: []?*anyopaque, rows: u32, shared: u32) !void {
     try ctx.makeCurrent();
-    try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(function, rows, 1, 1, 256, 1, 1, shared, ctx.stream, args.ptr, null));
+    try ctx.launchKernel(function, rows, 1, 1, 256, 1, 1, shared, ctx.stream, args.ptr, null);
     ctx.noteKernelLaunch();
 }
 

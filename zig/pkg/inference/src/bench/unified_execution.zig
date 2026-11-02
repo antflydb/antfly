@@ -181,7 +181,6 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("kernels qkv={d} qkv_fallback={d} ffn={d} ffn_fallback={d} compute_encoders={d} blit_encoders={d} commands={d}\n", .{ after.metal_runtime_dense_qkv_packed_calls - before.metal_runtime_dense_qkv_packed_calls, after.metal_runtime_dense_qkv_packed_fallbacks - before.metal_runtime_dense_qkv_packed_fallbacks, after.metal_runtime_deberta_ffn_fused_calls - before.metal_runtime_deberta_ffn_fused_calls, after.metal_runtime_deberta_ffn_fused_fallbacks - before.metal_runtime_deberta_ffn_fused_fallbacks, after.metal_runtime_last_frame_compute_encoder_count, after.metal_runtime_last_frame_blit_encoder_count, after.metal_runtime_last_frame_planned_command_op_count });
     if (@hasDecl(inference.backends.Session, "executionDiagnostics")) {
         if (session.executionDiagnostics()) |snapshot| {
-            const stats = snapshot.execution;
             if (comptime @hasField(@TypeOf(snapshot), "runtime")) {
                 const measured = snapshot.runtime;
                 std.debug.print("execution_context kernel_dispatches={?d} graph_submissions={?d} frame_submissions={?d} synchronizations={?d} physical_allocations={?d} physical_frees={?d} memory_scope={s} live_bytes={?d} lifetime_peak_bytes={?d}\n", .{ measured.counters.kernel_dispatches, measured.counters.graph_submissions, measured.counters.frame_submissions, measured.counters.synchronizations, measured.counters.physical_allocations, measured.counters.physical_frees, @tagName(measured.memory.scope), measured.memory.live_bytes, measured.memory.lifetime_peak_bytes });
@@ -189,16 +188,18 @@ pub fn main(init: std.process.Init) !void {
             if (comptime @hasField(@TypeOf(snapshot), "specializations")) if (snapshot.specializations) |cache| {
                 std.debug.print("execution_specializations hits={d} misses={d} builds={d} evictions={d}\n", .{ cache.hits, cache.misses, cache.builds, cache.evictions });
             };
-            if (comptime @hasField(@TypeOf(stats), "physical_graph_replays")) std.debug.print("execution_replay decision={s} captures={d} replays={d} failures={d} error={s} input_copies={d} input_copy_bytes={d}\n", .{ @tagName(stats.physical_replay), stats.physical_graph_captures, stats.physical_graph_replays, stats.physical_capture_failures, stats.physical_replay_error orelse "none", stats.physical_input_copies, stats.physical_input_copy_bytes });
-            std.debug.print("execution_actual upload_calls={d} upload_bytes={d} download_calls={d} download_bytes={d} device_host_accesses={d} device_host_access_bytes={d}\n", .{ stats.actual_upload_calls, stats.actual_upload_bytes, stats.actual_download_calls, stats.actual_download_bytes, stats.device_host_accesses, stats.device_host_access_bytes });
-            std.debug.print("execution assigned={d} storage_allocations={d} storage_bytes={d} storage_reuses={d} busy_fallbacks={d} transfers={d} planned_transfers={d} planned_transfer_bytes={d} interpreter_fallbacks={d} regions={d} commands={d}\n", .{ stats.assigned_kernel_dispatches, stats.physical_storage_allocations, stats.physical_storage_bytes, stats.physical_storage_reuses, stats.physical_frame_busy_fallbacks, stats.cross_device_transfers, stats.physical_transfer_dispatches, stats.physical_transfer_bytes, stats.interpreter_fallbacks, stats.runtime_region_plan_dispatches, stats.backend_command_dispatches });
+            if (snapshot.execution) |stats| {
+                if (comptime @hasField(@TypeOf(stats), "physical_graph_replays")) std.debug.print("execution_replay decision={s} captures={d} replays={d} failures={d} error={s} input_copies={d} input_copy_bytes={d}\n", .{ @tagName(stats.physical_replay), stats.physical_graph_captures, stats.physical_graph_replays, stats.physical_capture_failures, if (snapshot.program_error) |message| message.view() else "none", stats.physical_input_copies, stats.physical_input_copy_bytes });
+                std.debug.print("execution_actual upload_calls={d} upload_bytes={d} download_calls={d} download_bytes={d} device_host_accesses={d} device_host_access_bytes={d}\n", .{ stats.actual_upload_calls, stats.actual_upload_bytes, stats.actual_download_calls, stats.actual_download_bytes, stats.device_host_accesses, stats.device_host_access_bytes });
+                std.debug.print("execution assigned={d} storage_allocations={d} storage_bytes={d} storage_reuses={d} busy_fallbacks={d} transfers={d} planned_transfers={d} planned_transfer_bytes={d} interpreter_fallbacks={d} regions={d} commands={d}\n", .{ stats.assigned_kernel_dispatches, stats.physical_storage_allocations, stats.physical_storage_bytes, stats.physical_storage_reuses, stats.physical_frame_busy_fallbacks, stats.cross_device_transfers, stats.physical_transfer_dispatches, stats.physical_transfer_bytes, stats.interpreter_fallbacks, stats.runtime_region_plan_dispatches, stats.backend_command_dispatches });
+            }
         }
     }
 }
 
 fn providerSnapshot(session: inference.backends.Session, allocator: std.mem.Allocator) inference.ops.NativeQuantTimingStats {
     if (@hasDecl(inference.backends.Session, "executionDiagnostics")) {
-        if (session.executionDiagnostics()) |snapshot| return snapshot.provider;
+        if (session.executionDiagnostics()) |snapshot| if (snapshot.provider) |provider| return provider;
     }
     if (inference.backends.imported_onnx_session.sharedBackendContext(session)) |shared| {
         if (@hasDecl(@TypeOf(shared.*), "stableBackend")) return shared.stableBackend().debugTimingSnapshot().provider;

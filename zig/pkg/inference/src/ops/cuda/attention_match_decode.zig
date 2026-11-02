@@ -251,7 +251,7 @@ pub const Runner = struct {
             values[i] = args[i];
             params[i] = @ptrCast(&values[i]);
         }
-        try self.context.driver.check(self.context.driver.fns.cuLaunchKernel(function, @intCast(x), @intCast(y), 1, 256, 1, 1, 0, self.context.stream, &params, null));
+        try self.context.launchKernel(function, @intCast(x), @intCast(y), 1, 256, 1, 1, 0, self.context.stream, &params, null);
     }
 };
 

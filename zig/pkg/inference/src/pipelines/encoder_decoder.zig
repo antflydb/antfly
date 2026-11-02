@@ -27,6 +27,7 @@
 // Matches Go inference's lib/pipelines/encoder_decoder.go pattern.
 
 const stage_runtime = @import("../execution/encoder_decoder_runtime.zig");
+const decoder_stage = @import("../execution/decoder_stage.zig");
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const c_file = @import("../util/c_file.zig");
@@ -149,61 +150,6 @@ pub const EncoderDecoderPipeline = struct {
         return try self.encoder.runWithControl(&.{ input_ids_tensor, mask_tensor }, allocator, self.execution_control);
     }
 
-    /// Run one decoder step, selecting directly from borrowed backend logits.
-    fn decoderStep(
-        self: *EncoderDecoderPipeline,
-        allocator: std.mem.Allocator,
-        dec_ids: []const i64,
-        dec_seq_len: usize,
-        encoder_hidden: *const backends.Tensor,
-        encoder_attention_mask: []const i64,
-        encoder_seq_len: usize,
-    ) !i32 {
-        const dec_seq: i64 = @intCast(dec_seq_len);
-        const dec_shape = &[_]i64{ 1, dec_seq };
-
-        const dec_input_ids = backends.Tensor{ .data = @constCast(std.mem.sliceAsBytes(dec_ids)), .dtype = .i64, .shape = dec_shape, .name = "input_ids", .allocator = allocator, .owns_data = false, .owns_shape = false };
-
-        const enc_seq: i64 = @intCast(encoder_seq_len);
-        const enc_mask_shape = &[_]i64{ 1, enc_seq };
-        const enc_mask_tensor = backends.Tensor{ .data = @constCast(std.mem.sliceAsBytes(encoder_attention_mask)), .dtype = .i64, .shape = enc_mask_shape, .name = "encoder_attention_mask", .allocator = allocator, .owns_data = false, .owns_shape = false };
-
-        // Rename encoder hidden state for decoder input compatibility
-        // (encoder outputs "last_hidden_state", decoder expects "encoder_hidden_states")
-        const enc_hidden_renamed = encoder_hidden.borrowedView("encoder_hidden_states");
-
-        const inputs = &[_]backends.Tensor{
-            dec_input_ids,
-            enc_mask_tensor,
-            enc_hidden_renamed,
-        };
-        var decoder_outputs = if (self.batch_dispatch) |dispatch|
-            try dispatch.run(allocator, self.decoder, null, null, inputs, self.execution_control)
-        else
-            try self.decoder.runWithControl(inputs, allocator, self.execution_control);
-        defer {
-            for (decoder_outputs) |*o| o.deinit();
-            allocator.free(decoder_outputs);
-        }
-
-        if (decoder_outputs.len == 0) return error.NoDecoderOutput;
-        const logits_tensor = &decoder_outputs[0];
-        if (logits_tensor.dtype != .f32) return error.LogitsSizeMismatch;
-        const logits = logits_tensor.asFloat32();
-
-        // Extract logits for the last token position
-        const vocab_size = self.config.vocab_size;
-        if (vocab_size == 0 or dec_seq_len == 0) return error.LogitsSizeMismatch;
-        const end = std.math.mul(usize, dec_seq_len, vocab_size) catch return error.LogitsSizeMismatch;
-        if (logits.len < end) return error.LogitsSizeMismatch;
-        const last = logits[end - vocab_size .. end];
-        var best: usize = 0;
-        for (last[1..], 1..) |value, index| if (value > last[best]) {
-            best = index;
-        };
-        return std.math.cast(i32, best) orelse error.LogitsSizeMismatch;
-    }
-
     /// Default task entry point. Stage placement is decided before encoding;
     /// explicit host-output APIs remain available to callers that request them.
     pub fn generateMasked(self: *EncoderDecoderPipeline, allocator: std.mem.Allocator, input_ids: []const i64, mask: []const i64) !EncoderDecoderResult {
@@ -248,39 +194,25 @@ pub const EncoderDecoderPipeline = struct {
         defer allocator.free(dec_ids_i64);
         dec_ids_i64[0] = self.config.decoder_start_token_id;
 
-        const encoder_hidden: ?*const backends.Tensor = switch (encoder_outputs.*) {
-            .host => |outputs| if (outputs.len != 0) &outputs[0] else return error.NoEncoderOutput,
-            .resident => null,
-        };
-        var incremental = if (encoder_hidden) |hidden| @import("seq2seq_decode.zig").State.init(allocator, self.decoder, hidden.*, encoder_attention_mask, self.config.vocab_size) else null;
-        defer if (incremental) |*state| state.deinit();
+        var numerical = try decoder_stage.Decoder.initWithOptions(allocator, self.decoder, encoder_outputs, encoder_seq_len, encoder_attention_mask, self.config.vocab_size, self.execution_control, .{ .allow_native = false, .output_rows = .full_prefix });
+        defer numerical.deinit();
 
         for (0..max_len) |step| {
             if (self.execution_control) |control|
                 try control.update(.executing, @intCast(step), @intCast(max_len));
             const dec_seq_len: usize = output_ids.items.len;
 
-            // Run one decoder step
-            const next_token = if (encoder_hidden == null)
-                try stage_runtime.finalGreedyToken(allocator, self.decoder, encoder_outputs, dec_ids_i64[0..dec_seq_len], encoder_attention_mask, self.config.vocab_size, self.execution_control)
-            else if (incremental) |*state| blk: {
-                var logits = try state.step(dec_ids_i64[0..dec_seq_len], self.batch_dispatch, self.execution_control);
-                defer logits.deinit();
-                const values = logits.asFloat32();
-                const last = values[values.len - self.config.vocab_size ..];
-                var best: usize = 0;
-                for (last[1..], 1..) |value, index| if (value > last[best]) {
-                    best = index;
-                };
-                break :blk std.math.cast(i32, best) orelse return error.LogitsSizeMismatch;
-            } else try self.decoderStep(
-                allocator,
-                dec_ids_i64[0..dec_seq_len],
-                dec_seq_len,
-                encoder_hidden.?,
-                encoder_attention_mask,
-                encoder_seq_len,
-            );
+            var row = numerical.step(dec_ids_i64[0..dec_seq_len], null, self.batch_dispatch) catch |err| switch (err) {
+                error.InvalidLogitsShape => return error.LogitsSizeMismatch,
+                else => return err,
+            };
+            defer row.deinit();
+            if (self.config.vocab_size == 0 or row.logits.len != self.config.vocab_size) return error.LogitsSizeMismatch;
+            var best: usize = 0;
+            for (row.logits[1..], 1..) |value, index| if (value > row.logits[best]) {
+                best = index;
+            };
+            const next_token = std.math.cast(i32, best) orelse return error.LogitsSizeMismatch;
             if (next_token == self.config.eos_token_id) break;
             dec_ids_i64[dec_seq_len] = next_token;
             try output_ids.append(allocator, next_token);
@@ -551,4 +483,65 @@ test "findEncoderDecoderPaths falls back to native Florence decoder" {
 
     try std.testing.expect(std.mem.endsWith(u8, paths.encoder, "onnx/vision_encoder.onnx"));
     try std.testing.expectEqualStrings(model_dir, paths.decoder);
+}
+
+test "encoder decoder task shares actual resident and host route owner without changing accepted ids" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const imported = @import("../backends/imported_onnx_session.zig");
+    const fixture = @import("../execution/testing/encoder_decoder.zig");
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try fixture.writeConfigured(a, temp.dir, "encoder.onnx", true, .{ .reading_pair = true });
+    try fixture.writeConfigured(a, temp.dir, "decoder.onnx", false, .{ .reading_pair = true, .encoder_mask = true });
+    const encoder_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..], "encoder.onnx" });
+    defer a.free(encoder_path);
+    const decoder_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", temp.sub_path[0..], "decoder.onnx" });
+    defer a.free(decoder_path);
+    var pixels = try backends.Tensor.initFloat32(a, "pixel_values", &.{ 1, 3, 1, 1 }, &.{ 1, 0, 0 });
+    defer pixels.deinit();
+    for ([_]backends.BackendType{ .native, .metal, .cuda }) |kind| {
+        if (kind == .metal) {
+            if (comptime !@import("build_options").enable_metal) continue;
+            if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) continue;
+        }
+        if (kind == .cuda and comptime !@import("build_options").enable_cuda) continue;
+        const encoder = imported.createSessionWithOptions(a, encoder_path, kind, .{ .graph_runtime_strategy = .compiled_preferred }) catch |err| switch (err) {
+            error.CudaUnavailable, error.NoCudaDevices => continue,
+            else => return err,
+        };
+        defer encoder.close();
+        const decoder = try imported.createSessionWithOptions(a, decoder_path, kind, .{ .graph_runtime_strategy = .compiled_preferred, .shared_backend_ctx = encoder.shared_compute_context });
+        defer decoder.close();
+        var encoded = try stage_runtime.encode(a, encoder, decoder, &.{pixels}, null, null);
+        defer encoded.deinit(a);
+        try std.testing.expect(encoded == .resident);
+        var host_encoded = stage_runtime.EncoderOutputs{ .host = try encoder.runWithControl(&.{pixels}, a, null) };
+        defer host_encoded.deinit(a);
+        var task = EncoderDecoderPipeline{ .allocator = a, .encoder = encoder, .decoder = decoder, .owns_sessions = false, .config = .{ .vocab_size = 3, .max_length = 1, .decoder_start_token_id = 0, .eos_token_id = 2 } };
+        var actual = try task.greedyDecodeOutputs(a, &encoded, &.{1}, 1);
+        defer actual.deinit();
+        var expected = try task.greedyDecodeOutputs(a, &host_encoded, &.{1}, 1);
+        defer expected.deinit();
+        try std.testing.expectEqualSlices(i32, &.{ 0, 1 }, actual.text_ids);
+        try std.testing.expectEqualSlices(i32, expected.text_ids, actual.text_ids);
+        const Cancel = struct {
+            fn check(_: ?*anyopaque) !void {
+                return error.Cancelled;
+            }
+        };
+        task.execution_control = .{ .check_fn = Cancel.check };
+        try std.testing.expectError(error.Cancelled, task.greedyDecodeOutputs(a, &encoded, &.{1}, 1));
+        if (kind == .native) {
+            task.execution_control = null;
+            const Case = struct {
+                fn run(allocator: std.mem.Allocator, pipeline: *EncoderDecoderPipeline, values: *const stage_runtime.EncoderOutputs) !void {
+                    var result = try pipeline.greedyDecodeOutputs(allocator, values, &.{1}, 1);
+                    defer result.deinit();
+                    try std.testing.expectEqualSlices(i32, &.{ 0, 1 }, result.text_ids);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(a, Case.run, .{ &task, @as(*const stage_runtime.EncoderOutputs, &encoded) });
+        }
+    }
 }

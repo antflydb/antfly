@@ -88,7 +88,7 @@ pub const Module = struct {
     }
 
     fn launch(ctx: *Context, f: driver.CUfunction, params: []?*anyopaque, grid: [3]u32, block: [3]u32, shared: u32) !void {
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], shared, ctx.stream, params.ptr, null));
+        try ctx.launchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], shared, ctx.stream, params.ptr, null);
         ctx.noteKernelLaunch();
     }
 

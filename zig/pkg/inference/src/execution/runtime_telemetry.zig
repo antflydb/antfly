@@ -20,6 +20,8 @@ pub const Counters = struct {
     kernel_dispatches: ?u64 = null,
     graph_submissions: ?u64 = null,
     frame_submissions: ?u64 = null,
+    /// Explicit successful project-owned host synchronization API calls.
+    /// GPU dependencies are separate; implicit vendor/free waits stay opaque.
     synchronizations: ?u64 = null,
     physical_allocations: ?u64 = null,
     physical_frees: ?u64 = null,
@@ -125,9 +127,59 @@ pub const NativeAllocations = struct {
         return result;
     }
 };
+/// Explicit CUDA API/topology scopes. No field claims total completed kernels
+/// or kernels hidden in an eager vendor operation/device-dynamic launch.
+pub const CudaCounters = struct {
+    direct_kernel_submissions: u64 = 0,
+    foreign_stream_kernel_calls: u64 = 0,
+    capture_recording_kernel_calls: u64 = 0,
+    capture_recording_graph_calls: u64 = 0,
+    known_graph_submissions: u64 = 0,
+    declared_graph_kernel_nodes_submitted: u64 = 0,
+    declared_graph_nodes_submitted: u64 = 0,
+    opaque_graph_submissions: u64 = 0,
+    /// Explicit project-owned successful host wait APIs. These are not CPU
+    /// blocking durations or implicit vendor/free synchronizations.
+    host_stream_synchronizations: u64 = 0,
+    host_event_synchronizations: u64 = 0,
+    failed_host_synchronizations: u64 = 0,
+    /// Accepted GPU dependency API calls, distinct from host synchronization.
+    gpu_stream_dependencies: u64 = 0,
+    capture_recording_stream_wait_events: u64 = 0,
+    foreign_stream_wait_event_calls: u64 = 0,
+    failed_gpu_stream_dependencies: u64 = 0,
+    metadata_failures: u64 = 0,
+    pub fn since(self: CudaCounters, before: CudaCounters) CudaCounters {
+        var result: CudaCounters = .{};
+        inline for (@typeInfo(CudaCounters).@"struct".field_names) |field|
+            @field(result, field) = @field(self, field) -| @field(before, field);
+        return result;
+    }
+};
+pub const Cuda = struct {
+    state: enum { enabled, allocation_failed } = .enabled,
+    owner_identity: ?usize = null,
+    counter_scope: enum { observer_lifetime, context_interval } = .observer_lifetime,
+    coverage: enum { since_enable } = .since_enable,
+    counters: ?CudaCounters = null,
+    registered_graphs: ?usize = null,
+    fn since(self: Cuda, before: Cuda) Cuda {
+        var result = self;
+        if (self.owner_identity != null and self.owner_identity == before.owner_identity) {
+            if (self.counters) |after| if (before.counters) |start| {
+                result.counters = after.since(start);
+                result.counter_scope = .context_interval;
+            };
+        }
+        return result;
+    }
+};
 pub const Snapshot = struct {
     counters: Counters = .{},
     native_allocations: ?NativeAllocations = null,
+    /// Immutable deduplicated owner intervals for observed numerical dispatch.
+    allocation_owners: ?@import("allocation_registry.zig").Summary = null,
+    cuda: ?Cuda = null,
     memory: Memory = .{},
     /// Invocation interval on its submitting thread, including CPU fallbacks.
     submission: ?@import("runtime_observation.zig").Counters = null,
@@ -137,6 +189,7 @@ pub const Snapshot = struct {
         return .{
             .counters = self.counters.since(before.counters),
             .memory = self.memory,
+            .cuda = if (self.cuda) |after| if (before.cuda) |start| after.since(start) else after else null,
             .native_allocations = if (self.native_allocations) |after| if (before.native_allocations) |start| after.since(start) else after else null,
             .process = if (self.process) |after| if (before.process) |start| after.since(start) else after else null,
         };

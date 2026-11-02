@@ -3312,7 +3312,8 @@ pub const ComputeBackend = struct {
         /// Snapshot backend-owned debug timing counters for diagnostic
         /// printing. Backends that do not support this can leave it null.
         debugTimingSnapshot: ?*const fn (ctx: *anyopaque) BackendDebugTimingSnapshot = null,
-        enableAllocationObservation: ?*const fn (ctx: *anyopaque) void = null,
+        enableRuntimeObservation: ?*const fn (ctx: *anyopaque) void = null,
+        modelStorageInventory: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?@import("../execution/storage_inventory.zig").Snapshot = null,
 
         /// Reset backend-owned debug timing counters for diagnostic
         /// printing. Backends that do not support this can leave it null.
@@ -5881,8 +5882,14 @@ pub const ComputeBackend = struct {
 
     /// Optional diagnostic instrumentation. Constructor options can observe
     /// the full owner history; this late hook observes allocations since enable.
-    pub fn enableAllocationObservation(self: *const ComputeBackend) void {
-        if (self.vtable.enableAllocationObservation) |op| op(self.ptr);
+    /// Explicit cold query; never scans model payloads on the request hot path.
+    pub fn modelStorageInventory(self: *const ComputeBackend, allocator: std.mem.Allocator) !?@import("../execution/storage_inventory.zig").Snapshot {
+        const query = self.vtable.modelStorageInventory orelse return null;
+        return query(self.ptr, allocator);
+    }
+
+    pub fn enableRuntimeObservation(self: *const ComputeBackend) void {
+        if (self.vtable.enableRuntimeObservation) |op| op(self.ptr);
     }
 
     pub fn debugTimingSnapshot(self: *const ComputeBackend) BackendDebugTimingSnapshot {

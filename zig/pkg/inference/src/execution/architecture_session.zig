@@ -2664,6 +2664,7 @@ const BackendData = union {
 };
 
 const ArchSession = struct {
+    diagnostics: @import("diagnostics.zig").Diagnostics = .{},
     model_lifetime: Session.ModelLifetime = .{ .owner = undefined, .destroy_fn = archClose, .quiesce_fn = archQuiesce },
     // Independent of the model execution lane: preparation can overlap model
     // work. Session close follows worker shutdown, like the borrowed device.
@@ -4685,6 +4686,16 @@ fn archSessionHandle(impl: *ArchSession) Session {
     };
     return .{
         .model_lifetime = &impl.model_lifetime,
+        .invocation_diagnostics = .{
+            .diagnostics = &impl.diagnostics,
+            .capture_programs = true,
+            .model_allocator = switch (impl.backend_type) {
+                .native => impl.backend_data.native.allocator,
+                .pjrt => impl.backend_data.pjrt.native.allocator,
+                else => null,
+            },
+            .stable_backend = if (comptime build_options.enable_cuda) if (impl.backend_type == .cuda) impl.backend_data.cuda.compute.computeBackend() else null else null,
+        },
         .ptr = impl,
         .vtable = &arch_vtable,
         .compute_backend_provider = .{ .ptr = impl, .acquire = acquireArchComputeBackend },

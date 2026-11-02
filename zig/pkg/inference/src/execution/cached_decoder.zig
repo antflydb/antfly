@@ -428,3 +428,116 @@ test "cached decoder owner matches actual native scalar batch and compacted stat
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     try @import("../ops/media_residency_test.zig").onNative(populateTestWeights, checkActualCachedDecoder);
 }
+
+const CachedHeadFault = enum { replay, download, capture_commit, recording_decline };
+
+fn checkActualCachedHeadFault(mode: CachedHeadFault) !void {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    const Probe = struct {
+        compute: native.NativeCompute,
+        mode: CachedHeadFault,
+        replays: usize = 0,
+        projections: usize = 0,
+        downloads: usize = 0,
+        commits: usize = 0,
+        aborts: usize = 0,
+        fn get(raw: *anyopaque) *@This() {
+            const compute: *native.NativeCompute = @ptrCast(@alignCast(raw));
+            return @fieldParentPtr("compute", compute);
+        }
+        fn prepare(raw: *anyopaque, _: []const u8, input: CT, _: usize) !?CT {
+            const cb = get(raw).compute.computeBackend();
+            const values = try cb.toFloat32(input, std.testing.allocator);
+            defer std.testing.allocator.free(values);
+            return try cb.fromFloat32Shape(values, &.{ 1, 4 });
+        }
+        fn replay(raw: *anyopaque, input: CT) !?CT {
+            const self = get(raw);
+            self.replays += 1;
+            const cb = self.compute.computeBackend();
+            if (self.mode == .replay) {
+                const committed = try cb.add(input, input);
+                cb.free(committed);
+                return error.InjectedCommittedReplay;
+            }
+            if (self.mode == .download) return try cb.fromFloat32Shape(&.{1}, &.{1});
+            return null;
+        }
+        fn begin(raw: *anyopaque, _: []const u8) !bool {
+            return get(raw).mode != .recording_decline;
+        }
+        fn end(raw: *anyopaque, execute: bool) !void {
+            const self = get(raw);
+            if (execute) {
+                self.commits += 1;
+                return error.InjectedCaptureCommit;
+            }
+            self.aborts += 1;
+        }
+        fn fused(raw: *anyopaque, input: CT, weight: CT, rows: usize, width: usize, vocab: usize, _: []const i32) !?CT {
+            const self = get(raw);
+            self.projections += 1;
+            const cb = self.compute.computeBackend();
+            const logits = try cb.linearNoBias(input, weight, rows, width, vocab);
+            defer cb.free(logits);
+            const token = (try cb.argmaxLastRow(logits, rows, vocab)) orelse return error.UnsupportedOperation;
+            return try cb.fromFloat32Shape(&.{@floatFromInt(token)}, &.{1});
+        }
+        fn download(raw: *anyopaque, tensor: CT, allocator: std.mem.Allocator) ![]f32 {
+            const self = get(raw);
+            self.downloads += 1;
+            if (self.mode == .download) return error.InjectedReadbackFailure;
+            return self.compute.computeBackend().toFloat32(tensor, allocator);
+        }
+    };
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    try populateTestWeights(&weights);
+    var probe = Probe{ .compute = native.NativeCompute.init(a, &weights, null), .mode = mode };
+    defer probe.compute.deinit();
+    const base = probe.compute.computeBackend();
+    var table = base.vtable.*;
+    table.regions.replay.prepareGreedyTokenReplayInput = Probe.prepare;
+    table.regions.replay.replayFinalHidden = Probe.replay;
+    table.regions.replay.captureBegin = Probe.begin;
+    table.regions.replay.captureEnd = Probe.end;
+    table.linearNoBiasArgmaxLastRowSuppressTensor = Probe.fused;
+    table.toFloat32 = Probe.download;
+    var cb = base;
+    cb.vtable = &table;
+    const config = TestArchitecture.Config{ .d_model = 4, .decoder_layers = 1, .decoder_attention_heads = 1, .decoder_ffn_dim = 8, .vocab_size = 4 };
+    const encoder = try base.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 1, 4 });
+    defer base.free(encoder);
+    var decoder = try TestDecoder.init(.{ .allocator = a, .backend = &cb, .model = &config }, .scalar, encoder, 1, 1, 4);
+    defer decoder.deinit();
+    decoder.hidden = try base.fromFloat32Shape(&.{ -1, 2, 3, 0 }, &.{ 1, 4 });
+    switch (mode) {
+        .replay => try std.testing.expectError(error.InjectedCommittedReplay, decoder.selectScalar(&.{}, true, true)),
+        .download => try std.testing.expectError(error.InjectedReadbackFailure, decoder.selectScalar(&.{}, true, true)),
+        .capture_commit => try std.testing.expectError(error.InjectedCaptureCommit, decoder.selectScalar(&.{}, true, true)),
+        .recording_decline => {
+            _ = try decoder.selectScalar(&.{}, true, true);
+        },
+    }
+    try std.testing.expect(decoder.hidden == null);
+    try std.testing.expectEqual(@as(usize, 1), probe.replays);
+    try std.testing.expectEqual(@as(usize, if (mode == .capture_commit or mode == .recording_decline) 1 else 0), probe.projections);
+    try std.testing.expectEqual(@as(usize, if (mode == .download or mode == .recording_decline) 1 else 0), probe.downloads);
+    try std.testing.expectEqual(@as(usize, if (mode == .capture_commit) 1 else 0), probe.commits);
+    try std.testing.expectEqual(@as(usize, if (mode == .capture_commit) 1 else 0), probe.aborts);
+}
+
+test "cached decoder replay error propagates without eager projection or readback" {
+    try checkActualCachedHeadFault(.replay);
+}
+test "cached decoder replay readback error cannot replay numerical work" {
+    try checkActualCachedHeadFault(.download);
+}
+test "cached decoder capture commit error aborts metadata without eager replay" {
+    try checkActualCachedHeadFault(.capture_commit);
+}
+test "cached decoder recording decline performs one ordinary projection" {
+    try checkActualCachedHeadFault(.recording_decline);
+}

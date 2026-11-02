@@ -79,10 +79,10 @@ pub const Module = struct {
         // The pinned generator asserts both hidden ABI scratch sizes are zero.
         var scratch: u64 = 0;
         var first = [_]?*anyopaque{ &p[0], &p[1], &p[2], &p[3], &p[4], &rows, &count, &scratch, &scratch };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(.partial), tiles, 1, 1, catalog.top1[0].threads, 1, 1, catalog.top1[0].shared, ctx.stream, &first, null));
+        try ctx.launchKernel(self.programs.function(.partial), tiles, 1, 1, catalog.top1[0].threads, 1, 1, catalog.top1[0].shared, ctx.stream, &first, null);
         ctx.noteKernelLaunch();
         var last = [_]?*anyopaque{ &p[2], &p[3], &p[5], &scratch, &scratch };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.programs.function(.finish), @intCast(r.rows), 1, 1, catalog.top1[1].threads, 1, 1, catalog.top1[1].shared, ctx.stream, &last, null));
+        try ctx.launchKernel(self.programs.function(.finish), @intCast(r.rows), 1, 1, catalog.top1[1].threads, 1, 1, catalog.top1[1].shared, ctx.stream, &last, null);
         ctx.noteKernelLaunch();
         self.calls += 1;
     }

@@ -151,7 +151,7 @@ test "prepared executable reuses CPU Metal and CUDA plans with resident outputs"
             }
             if (kind == .native) {
                 const diagnostics = executable.diagnostics.snapshot().?;
-                try std.testing.expectEqual(result.stats.assigned_kernel_dispatches, diagnostics.execution.assigned_kernel_dispatches);
+                try std.testing.expectEqual(result.stats.assigned_kernel_dispatches, diagnostics.execution.?.assigned_kernel_dispatches);
                 try std.testing.expect(result.stats.assigned_kernel_dispatches > 0);
                 if (iteration > 0) {
                     try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);

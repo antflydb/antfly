@@ -61,7 +61,7 @@ pub const Arena = struct {
         if (!self.pending) return;
         if (self.fence_valid) {
             try ctx.makeCurrent();
-            try ctx.driver.check(ctx.driver.fns.cuEventSynchronize(self.completion));
+            try ctx.driver.check(ctx.synchronizeEventResult(self.completion));
         } else try ctx.synchronize();
         self.pending = false;
     }
@@ -296,6 +296,8 @@ test "embeddinggemma2 execution cache retains shared admission and releases grap
     Mock.graphs = 0;
     var controller = memory.AdmissionController{};
     var ctx: Context = undefined;
+    ctx.observation = null;
+    ctx.observation_enable_failed = false;
     ctx.ctx = @ptrFromInt(1);
     ctx.stream = @ptrFromInt(2);
     ctx.stats = .{};
@@ -430,6 +432,8 @@ test "embeddinggemma2 graph retention keeps mixed stages and fences only replace
     Mock.barriers = 0;
     Mock.waits = 0;
     var ctx: Context = undefined;
+    ctx.observation = null;
+    ctx.observation_enable_failed = false;
     ctx.ctx = @ptrFromInt(1);
     ctx.stream = @ptrFromInt(2);
     ctx.stats = .{};
