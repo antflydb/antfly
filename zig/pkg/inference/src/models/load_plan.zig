@@ -16,6 +16,7 @@
 //! Artifact-derived load/admission geometry. This layer describes tokenizer,
 //! representation, persistent-weight and temporary preparation requirements;
 //! serving owns eviction, admission leases, publication and cancellation lanes.
+const tokenizer_loader = @import("tokenizer_loader.zig");
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const manifest_mod = @import("manifest.zig");
@@ -71,7 +72,9 @@ pub fn tokenizerAdmissionPlan(encoded_bytes: usize, kind: TokenizerArtifactKind)
     const factors: struct { resident: usize, peak: usize } = switch (kind) {
         .huggingface => .{ .resident = 10, .peak = 13 },
         .wordpiece => .{ .resident = 7, .peak = 9 },
-        .sentencepiece => .{ .resident = 5, .peak = 7 },
+        // Keep the published matcher while constructing the replacement and
+        // its batched token journal; both belong to the construction peak.
+        .sentencepiece => .{ .resident = 5, .peak = 10 },
     };
     return .{
         .peak = .{
@@ -110,6 +113,7 @@ pub fn tokenizerLoadAdmissionPlan(
 ) !ModelLoadAdmissionPlan {
     // Admission and loading must inspect the same catalog-selected artifacts,
     // including export-local vocabularies and root metadata fallbacks.
+    var sentencepiece_sidecar_bytes: usize = 0;
     if (tokenizer_type == .huggingface) {
         if (man.tokenizer_json_path) |path| return tokenizerFileAdmissionPlan(allocator, path, .huggingface);
         if (man.vocab_txt_path) |path| {
@@ -123,29 +127,21 @@ pub fn tokenizerLoadAdmissionPlan(
             return tokenizerAdmissionPlan(encoded, .wordpiece);
         }
     } else {
-        var encoded: usize = 0;
         var found_sentencepiece = false;
-        const sidecars = [_][]const u8{
-            "tokenizer.model",
-            "tokenizer.json",
-            "added_tokens.json",
-        };
-        for (sidecars) |name| {
+        for (0..1 + tokenizer_loader.sentencepiece_sidecars.len) |index| {
+            const name = if (index == 0) tokenizer_loader.sentencepiece_model_filename else tokenizer_loader.sentencepiece_sidecars[index - 1].filename;
             const path = try std.fs.path.join(allocator, &.{ model_dir, name });
             defer allocator.free(path);
-            if (!c_file.fileExists(allocator, path)) continue;
-            const size = std.math.cast(
-                usize,
-                try c_file.fileSize(allocator, path),
-            ) orelse return error.ResourceLimitExceeded;
-            encoded = std.math.add(usize, encoded, size) catch
-                return error.ResourceLimitExceeded;
-            if (std.mem.eql(u8, name, "tokenizer.model")) {
-                found_sentencepiece = true;
-            }
+            const size_u64 = c_file.fileSize(allocator, path) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            const size = std.math.cast(usize, size_u64) orelse return error.ResourceLimitExceeded;
+            sentencepiece_sidecar_bytes = std.math.add(usize, sentencepiece_sidecar_bytes, size) catch return error.ResourceLimitExceeded;
+            if (index == 0) found_sentencepiece = true;
         }
         if (found_sentencepiece) {
-            return tokenizerAdmissionPlan(encoded, .sentencepiece);
+            return tokenizerAdmissionPlan(sentencepiece_sidecar_bytes, .sentencepiece);
         }
     }
     if (man.gguf_path) |path| {
@@ -157,7 +153,7 @@ pub fn tokenizerLoadAdmissionPlan(
         );
         if (encoded == 0) return error.NoTokenizerFound;
         var plan = try tokenizerAdmissionPlan(
-            encoded,
+            std.math.add(usize, encoded, sentencepiece_sidecar_bytes) catch return error.ResourceLimitExceeded,
             if (tokenizer_type == .huggingface)
                 .huggingface
             else
@@ -488,4 +484,28 @@ pub fn attachSessionRunAdmission(
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
         .model_profile = sessionRunAdmissionModelProfile(backend_runtime, man, qwen_cfg),
     };
+}
+
+test "SentencePiece sidecar admission includes overlays when the base vocabulary is in GGUF" {
+    const a = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    var layout = try @import("../gguf/writer.zig").buildLayout(a, &.{.{ .key = "tokenizer.ggml.model", .value = .{ .string = "llama" } }}, &.{});
+    defer layout.deinit(a);
+    const data = try a.alloc(u8, std.mem.alignForward(usize, layout.header_bytes.len, 32));
+    defer a.free(data);
+    @memset(data, 0);
+    @memcpy(data[0..layout.header_bytes.len], layout.header_bytes);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.gguf", .data = data });
+    const root = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "tokenizer.gguf" });
+    defer a.free(path);
+    const man = manifest_mod.ModelManifest{ .allocator = a, .gguf_path = path };
+    const without = try tokenizerLoadAdmissionPlan(a, root, &man, .sentencepiece);
+    const overlay = "{\"added_tokens\":[{\"content\":\"<control>\",\"id\":11}]}";
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data = overlay });
+    const with = try tokenizerLoadAdmissionPlan(a, root, &man, .sentencepiece);
+    try std.testing.expect(with.peak.host_weight_bytes >= without.peak.host_weight_bytes + overlay.len);
+    try std.testing.expect(with.resident.host_weight_bytes >= without.resident.host_weight_bytes + overlay.len);
 }
