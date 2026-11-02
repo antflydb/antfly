@@ -575,6 +575,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi native unbounded writer admits reusable pool before a large request",
         "capi native allocator proof",
         "capi native artifact maintenance",
+        "manual replay background budget",
+        "docstore replay retirement defers",
         "capi native recovery agenda",
         "capi native logical generations",
         "capi native close bounds proof work",

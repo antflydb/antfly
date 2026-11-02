@@ -1717,6 +1717,20 @@ pub const Owner = struct {
             // admissions while one artifact job advances outside the gate.
             store.index_reads_require_admission = true;
             defer store.index_reads_require_admission = false;
+            // Revalidate the current catalog and consumer fences while holding
+            // path admission through a bounded journal-retirement transaction.
+            const retirement_more = blk: {
+                enterMaintenanceWriter(root, .index) catch |err| {
+                    maintenance_error = err;
+                    break :blk true;
+                };
+                defer leaveMaintenanceWriter(root);
+                break :blk database.runBackgroundTurnWithCancellation(cancellation, .retirement) catch |err| {
+                    maintenance_error = err;
+                    break :blk true;
+                };
+            };
+            pending = pending or retirement_more;
             const more = database.runBackgroundTurnWithCancellation(cancellation, .artifacts) catch |err| blk: {
                 maintenance_error = err;
                 break :blk true;

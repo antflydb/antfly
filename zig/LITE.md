@@ -1299,6 +1299,24 @@ foreign logical index change invalidates the detached artifact work, including a
 physical-root ABA. Hosted owners, legacy files without logical identities, and
 explicit idle drains preserve their existing complete maintenance lifecycle.
 
+The native manual executor uses the same per-kind adaptive replay controller as
+other detached replay paths: one bounded window per worker, with a cooperative
+25 ms quantum and bounded record/payload budgets. Partial applied watermarks are
+persisted before yielding; a background turn never waits again for the original
+full visibility target. Explicit foreground visibility waits still complete their
+requested target. An individual indivisible record can exceed the quantum.
+
+Replay-journal retirement records its requested watermark during source work,
+then runs after releasing the primary snapshot. Short owner/path admission
+revalidates the catalog and clamps deletion against current enrichment,
+resolver, graph-replacement and repair checkpoints. Each turn scans at most one
+round of journal lanes and commits at most 256 key deletions. Empty lanes do not
+consume separate turns; the namespace continuation advances only after successful
+publication, and blocked consumer watermarks do not force an idle spin. While
+retirement is outstanding, replay's record cap allows cleanup to service even the
+maximum fan-out of journal lanes. Errors and partial progress retain safe retry
+state across runtime refresh.
+
 Sustained-write qualification must measure progress and storage while writers
 remain active. `scripts/bench/lite_contention.py native --require-sustained`
 requires at least ten minutes of churn, acknowledged-write and integrity checks,

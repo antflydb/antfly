@@ -31933,6 +31933,15 @@ pub const DB = struct {
             try ensureSnapshotActive(options.cancellation);
             return;
         }
+        if (options.source_work_only) {
+            const state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
+            self.executor.notifySequence(sequence);
+            return self.executor.waitForAllWithVisibilityWait(sequence, .{
+                .cancellation = options.cancellation,
+                .replay_budget = &state.replay_budget,
+                .replay_record_cap = if (state.replay_retirement.watermark != 0) docstore_mod.ReplayRetirement.record_cap else 2048,
+            });
+        }
         if (options.cancellation.ptr != null) {
             return try self.runDerivedUntilWithVisibilityWait(sequence, .{
                 .cancellation = options.cancellation,
@@ -32175,7 +32184,7 @@ pub const DB = struct {
 
             const next_target = self.core.nextDerivedSequence();
             if (options.bounded_replay or next_target <= stable_target) {
-                try waitForManagedIndexesApplied(self, sequence, sync_targets.all_indexes);
+                if (!options.source_work_only) try waitForManagedIndexesApplied(self, sequence, sync_targets.all_indexes);
                 _ = try self.runArtifactRepairMetadataMaintenancePass();
                 return;
             }
@@ -34167,6 +34176,20 @@ pub const DB = struct {
     pub fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, phase: types.BackgroundMaintenancePhase) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runBackgroundTurnWithCancellation", .{ self, cancellation, phase });
         try ensureSnapshotActive(cancellation);
+        const state = self.borrowed_group_source_state orelse &self.group_source_owner.state;
+        const split_retirement = phase == .replay or phase == .retirement;
+        const old_retirement = self.core.store.deferred_replay_retirement;
+        const old_bounded = self.core.store.bounded_replay_retirement;
+        defer if (split_retirement) {
+            self.core.store.deferred_replay_retirement = old_retirement;
+            self.core.store.bounded_replay_retirement = old_bounded;
+        };
+        if (split_retirement) self.core.store.deferred_replay_retirement = &state.replay_retirement;
+        if (phase == .retirement) {
+            self.core.store.bounded_replay_retirement = true;
+            if (state.replay_retirement.watermark != 0) try truncateReplaySequenceAsync(self.async_context, state.replay_retirement.watermark);
+            return state.replay_retirement.runnable;
+        }
         if (phase == .artifacts) {
             // No primary snapshot may enclose this work. Captured SST/segment
             // inputs own immutable leases, and Native index-catalog reads join
