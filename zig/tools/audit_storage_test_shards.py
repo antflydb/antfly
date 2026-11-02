@@ -67,6 +67,40 @@ def manifest_sources(
     return [source for source in sources if source.is_relative_to(root)]
 
 
+def catalog_const_entries(catalog: Path) -> dict[str, str]:
+    return dict(
+        re.findall(r'pub const (\w+) = @import\("([^"\n]+)"\);', catalog.read_text())
+    )
+
+
+def suggested_catalog_name(relative: Path) -> str:
+    """Mirror the catalog's own naming convention: the import path with its
+    directory separators and extension collapsed into one identifier."""
+    return "_".join(("storage", *relative.with_suffix("").parts))
+
+
+def missing_from_manifest_hint(
+    source: Path,
+    relative: Path,
+    manifest: Path,
+    catalog: Path | None,
+    reverse_catalog: dict,
+) -> str:
+    """Spell out the exact lines the author must add, rather than making them
+    reverse-engineer the catalog/manifest naming convention themselves."""
+    if catalog is None:
+        return f'add `_ = @import("{relative.as_posix()}");` to {manifest.name}'
+    existing_name = reverse_catalog.get(source)
+    if existing_name is not None:
+        return f'add `_ = @import("antfly_local_sources").{existing_name};` to {manifest.name}'
+    name = suggested_catalog_name(relative)
+    catalog_path = (Path("storage") / relative).as_posix()
+    return (
+        f'add `pub const {name} = @import("{catalog_path}");` to {catalog.name}, '
+        f'then `_ = @import("antfly_local_sources").{name};` to {manifest.name}'
+    )
+
+
 def audit_manifest(
     root: Path,
     manifest: Path,
@@ -80,6 +114,10 @@ def audit_manifest(
     imported = manifest_sources(root, manifest, catalog)
     counts = Counter(imported)
     failures: list[str] = []
+    reverse_catalog: dict[Path, str] = {}
+    if catalog is not None:
+        for name, import_path in catalog_const_entries(catalog).items():
+            reverse_catalog[(catalog.parent / import_path).resolve()] = name
 
     dedicated_counts = Counter(
         (source if source.is_absolute() else root / source).resolve()
@@ -127,7 +165,10 @@ def audit_manifest(
             continue
         count = counts.get(source, 0)
         if count == 0:
-            failures.append(f"test source missing from manifest: {relative}")
+            hint = missing_from_manifest_hint(
+                source, relative, manifest, catalog, reverse_catalog
+            )
+            failures.append(f"test source missing from manifest: {relative} ({hint})")
             continue
         owners = [
             test_filter

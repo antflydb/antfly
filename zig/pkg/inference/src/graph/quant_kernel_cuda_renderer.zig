@@ -5585,3 +5585,32 @@ test "E4B Flash bounds and plan identity keep E2B qualification separate" {
         try std.testing.expect(std.mem.containsAtLeast(u8, id, 1, "e4b"));
     }
 }
+
+// Execution requirements belong to the lowering; benchmark targets remain
+// immutable evidence metadata. Exhaustive switches make new kernels declare
+// their instruction and register-layout contract explicitly.
+pub const CudaExecutionContract = @import("cuda_execution_contract.zig").CudaExecutionContract;
+
+pub fn kernelExecutionContract(kind: KernelKind) CudaExecutionContract {
+    return switch (kind) {
+        .q4_k_small_batch_bias_gelu, .q4_k_mmv, .q4_0_mmv, .q4_0_mm, .q4_0_pair_mmv, .q4_0_pair_activation_q8_1, .q4_0_pair_activation_q8_1_e2b_6144, .q4_0_pair_activation_q8_1_e2b_12288, .q4_0_pair_activation_ggml_q8_1_e2b_6144, .q4_0_pair_activation_ggml_q8_1_e2b_12288, .q4_0_down_q8_1, .q4_0_down_q8_1_e2b_6144, .q4_0_down_q8_1_e2b_12288, .q4_0_down_ggml_q8_1_e2b_6144, .q4_0_down_ggml_q8_1_e2b_12288, .q4_0_pair_activation_f32_e2b_6144_exact, .q4_0_pair_activation_f32_e2b_12288_exact, .q4_0_down_f32_e2b_6144_exact, .q4_0_down_f32_e2b_12288_exact, .q4_0_q8_1_argmax_e2b_tile8, .q6_k_q8_1_argmax_k2560_tile8, .q6_k_q8_1_argmax_k3840_tile8 => .portable_simt_sm75,
+    };
+}
+
+pub fn attentionExecutionContract(kind: AttentionKernelKind) CudaExecutionContract {
+    return switch (kind) {
+        .gqa_decode_split_kv_hd256_f32, .gqa_decode_split_kv_hd512_f32, .gqa_decode_split2_kv_hd256_f32, .gqa_decode_split2_kv_hd512_f32, .gqa_decode_split4_kv_hd256_f32, .gqa_decode_split4_kv_hd512_f32, .gqa_decode_score_prework_hd256_f32, .gqa_decode_score_prework_hd512_f32 => .portable_simt_sm75,
+    };
+}
+
+pub fn splitkOnlineDecodeExecutionContract(kind: SplitkOnlineDecodeKernelKind) CudaExecutionContract {
+    return switch (kind) {
+        .gqa_decode_splitk_online_sm89_hd256_swa512_f16_f32, .gqa_decode_splitk_online_sm89_hd512_global_f16_f32 => .portable_simt_sm75,
+    };
+}
+
+pub fn flashPrefillExecutionContract(kind: FlashPrefillKernelKind) CudaExecutionContract {
+    return switch (kind) {
+        .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32, .gqa_prefill_flash_sm89_e4b_hd512_global_f32, .gqa_prefill_flash_sm89_hd256_swa512_f32, .gqa_prefill_flash_sm89_hd512_global_f32 => .wmma_fragment_sm89,
+    };
+}

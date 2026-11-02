@@ -15,7 +15,7 @@
 
 //! Native single-file Antfly Lite format primitives.
 //!
-//! This module owns revision-3 compatibility and the revision-6 indexed `.aflite`
+//! This module owns revision-3 compatibility and the revision-7 indexed `.aflite`
 //! format, checkpoint publication, ownership retirement, and physical page reuse.
 
 const std = @import("std");
@@ -935,11 +935,13 @@ pub const WriteOptions = struct {
     payload_cache: enum { normal, cold_sequential } = .normal,
 };
 
+const recovery_agenda = @import("recovery_agenda.zig");
+
 pub const magic = "AFLITE\x03P";
 const unpacked_v3_magic = "AFLITE\x03N";
-const indexed_magic = "AFLITE\x06P";
+const indexed_magic = "AFLITE\x07P";
 pub const format_version: u32 = 3;
-pub const indexed_format_version: u32 = 6;
+pub const indexed_format_version: u32 = 7;
 pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
@@ -1656,6 +1658,8 @@ const active_checkpoint_offset: usize = 20;
 const reader_epoch_namespace_offset: usize = 24;
 const checkpoint_slots_offset: usize = 64;
 const checkpoint_slots_end: usize = checkpoint_slots_offset + checkpoint_slot_count * checkpoint_slot_size;
+const logical_generations_size: usize = 48;
+const logical_generations_end = checkpoint_slots_end + checkpoint_slot_count * logical_generations_size;
 const checkpoint_slot_payload_size: usize = 64;
 const checkpoint_slot_checksum_offset: usize = checkpoint_slot_payload_size;
 const header_checksum_offset: usize = header_size - 4;
@@ -3558,7 +3562,16 @@ pub const OwnedDocument = struct {
     value: []u8,
 };
 
+/// Opaque identities never repeat after recovery-slot rollback. Allocator and
+/// reader-lease publications retain them; authored roots receive fresh IDs.
+pub const LogicalGenerations = struct {
+    primary: [16]u8 = @splat(0),
+    metadata: [16]u8 = @splat(0),
+    indexes: [16]u8 = @splat(0),
+};
+
 pub const CheckpointSlot = struct {
+    logical: LogicalGenerations = .{},
     commit_sequence: u64 = 0,
     catalog_root_page: u64 = 0,
     document_root_page: u64 = 0,
@@ -3593,8 +3606,12 @@ pub const PathWriterLock = struct {
     io_impl: std.Io.Threaded,
     borrowed_io: ?std.Io = null,
     file: std.Io.File,
+    /// Admission owns this scope. Closing/yielding the kernel lease drops all
+    /// idle anchors; escaped readers retain independent marker references.
+    reader_registration_batch: ?ReaderCoordinator.RegistrationBatch = null,
 
     pub fn close(self: *PathWriterLock) void {
+        if (self.reader_registration_batch) |batch| batch.end();
         const io = self.borrowed_io orelse self.io_impl.io();
         self.file.close(io);
         if (self.borrowed_io == null) self.io_impl.deinit();
@@ -3633,7 +3650,28 @@ pub const InspectReport = struct {
     issue: ?[]const u8 = null,
 };
 
+fn isControlDocumentPhysicalKey(key: []const u8) bool {
+    var logical = key;
+    // Namespace wrappers are not replay records. Classify only the contained
+    // logical key, never a reserved-looking substring in an authored document ID.
+    if (std.mem.startsWith(u8, logical, "\x02db/")) {
+        const end = std.mem.indexOfScalar(u8, logical, 0) orelse return true;
+        logical = logical[end + 1 ..];
+    }
+    return @import("../internal_keys.zig").isControlRecordKey(logical);
+}
+
+pub const LiveByteAccounting = struct {
+    pub const Category = struct { records: u64 = 0, key_bytes: u64 = 0, value_bytes: u64 = 0 };
+    metadata_catalog: Category = .{},
+    index_catalog: Category = .{},
+    control_documents: Category = .{},
+    documents: Category = .{},
+};
+
 pub const CheckReport = struct {
+    /// Logical payload accounting, excluding physical headers and lease aliases.
+    live_accounting: ?LiveByteAccounting = null,
     valid: bool,
     file_size: u64,
     valid_prefix_size: u64,
@@ -4425,6 +4463,17 @@ test "lite header fingerprints cache unchanged state and fence every header fiel
         if (comptime std.mem.eql(u8, field, "checkpoints")) {
             inline for (0..checkpoint_slot_count) |slot| {
                 inline for (@typeInfo(CheckpointSlot).@"struct".field_names) |checkpoint_field| {
+                    if (comptime std.mem.eql(u8, checkpoint_field, "logical")) {
+                        inline for (@typeInfo(LogicalGenerations).@"struct".field_names) |identity| {
+                            file.header = original;
+                            file.header.indexed_reclamation = true;
+                            const indexed_before = NativeFile.fingerprintHeader(file.header);
+                            @field(file.header.checkpoints[slot].logical, identity)[0] = 1;
+                            try std.testing.expectEqual(NativeFile.fingerprintHeader(file.header), file.headerFingerprint());
+                            try std.testing.expect(!std.mem.eql(u8, &indexed_before, &file.headerFingerprint()));
+                        }
+                        continue;
+                    }
                     file.header = original;
                     @field(file.header.checkpoints[slot], checkpoint_field) += 1;
                     try std.testing.expectEqual(NativeFile.fingerprintHeader(file.header), file.headerFingerprint());
@@ -5357,21 +5406,41 @@ pub const NativeFile = struct {
     }
     fn loadLedgerForDigest(self: *NativeFile, checkpoint: CheckpointSlot, cancel: ?*const maintenance.CancelToken, prepare_digest: bool) !*allocator_v4.State {
         if (cancel) |token| try token.check();
-        if (self.ledger) |state| if (state.root_page == checkpoint.free_map_root_page) {
+        // Adoption may return to the same physical root number after reuse.
+        // A pending rebase is never a cache hit merely because IDs match.
+        if (self.ledger) |state| if (self.allocator_rebase_header == null and state.root_page == checkpoint.free_map_root_page) {
             if (prepare_digest) try state.prepareDigestWithCancel(if (cancel) |token| &token.requested else null);
             return state;
         };
         if (self.allocator_rebase_header != null) if (self.ledger) |state| {
             errdefer self.invalidateLedger();
             const started = std.Io.Clock.awake.now(self.runtime());
-            if (try state.rebase(.{
+            const rebased = state.rebase(.{
                 .context = self,
                 .allocate = ledgerReadOnlyAllocate,
                 .read = ledgerRead,
                 .write = ledgerReadOnlyWrite,
                 .payload_bytes = self.maxPagePayloadBytes(),
                 .cancel_requested = if (cancel) |token| &token.requested else null,
-            }, checkpoint.free_map_root_page, 128)) {
+            }, checkpoint.free_map_root_page, 128) catch |err| switch (err) {
+                // Unprotected physical anchors may have been reused. An
+                // independent load distinguishes cache ancestry failure from
+                // corruption in the current generation.
+                error.InvalidNativeAllocator, error.UnexpectedNativePageKind, error.InvalidNativePageKind, error.InvalidPageId => false,
+                else => return err,
+            };
+            const base = self.allocator_rebase_header.?;
+            const retained = for (self.header.checkpoints) |slot| {
+                if (std.meta.eql(slot, base.checkpoints[base.active_checkpoint])) break true;
+            } else false;
+            var authenticated = retained;
+            if (rebased and !retained) {
+                const root = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
+                defer self.allocator.free(root);
+                authenticated = root.len == 192 and std.mem.eql(u8, root[128..160], &self.headerFingerprint()) and
+                    std.mem.eql(u8, root[160..192], &try state.incrementalFingerprint());
+            }
+            if (rebased and authenticated) {
                 if (state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
                 self.allocator_ledger_rebased = true;
                 self.allocator_work.journal_rebases +|= 1;
@@ -5877,7 +5946,25 @@ pub const NativeFile = struct {
         try self.syncIfRequired();
     }
 
+    fn stampLogicalGenerations(self: *NativeFile, checkpoint: *CheckpointSlot) !void {
+        if (!self.header.indexed_reclamation) return;
+        const before = self.activeCheckpoint();
+        if ((before.document_root_page != checkpoint.document_root_page or
+            before.document_index_root_page != checkpoint.document_index_root_page or
+            before.namespace_directory_root_page != checkpoint.namespace_directory_root_page) and
+            std.mem.eql(u8, &before.logical.primary, &checkpoint.logical.primary))
+            try self.runtimeIo().randomSecure(&checkpoint.logical.primary);
+        if (before.index_catalog_root_page != checkpoint.index_catalog_root_page and
+            std.mem.eql(u8, &before.logical.indexes, &checkpoint.logical.indexes))
+            try self.runtimeIo().randomSecure(&checkpoint.logical.indexes);
+        if (before.catalog_root_page != checkpoint.catalog_root_page and !self.artifact_lease_transaction and
+            std.mem.eql(u8, &before.logical.metadata, &checkpoint.logical.metadata))
+            try self.runtimeIo().randomSecure(&checkpoint.logical.metadata);
+    }
+
     fn persistAllocator(self: *NativeFile, pages: *PageAllocator, checkpoint: *CheckpointSlot) !void {
+        // Certificate fingerprints include identities before any seal is built.
+        try self.stampLogicalGenerations(checkpoint);
         if (!self.header.indexed_reclamation) {
             checkpoint.page_count = pages.next_page_id;
             return self.writeFreeMapPage(checkpoint.free_map_root_page, checkpoint.page_count, pages.remainingFreePages());
@@ -6148,11 +6235,22 @@ pub const NativeFile = struct {
         if (file_size < expected_size) return invalidCheck(report, "truncated_file");
 
         if (self.header.indexed_reclamation) {
-            const state = self.loadLedgerWithCancel(checkpoint, cancel) catch |err| {
+            // A writer/rebased cache contains transient traversal inventories,
+            // which need not describe the current on-disk metadata graph.
+            // Explicit integrity validates a fresh ledger as well as fresh pages.
+            var state = (if (checkpoint.free_map_root_page == 0) allocator_v4.State.init(self.allocator) else allocator_v4.State.load(self.allocator, .{
+                .context = self,
+                .allocate = ledgerReadOnlyAllocate,
+                .read = ledgerReadAny,
+                .write = ledgerReadOnlyWrite,
+                .payload_bytes = self.maxPagePayloadBytes(),
+                .cancel_requested = if (cancel) |token| &token.requested else null,
+            }, checkpoint.free_map_root_page)) catch |err| {
                 if (err == error.MaintenanceCanceled) return err;
                 return invalidCheck(report, issueForPageCheckError(err));
             };
-            const records = self.validateIndexedAllocator(checkpoint, state, cancel) catch |err| {
+            defer state.deinit();
+            const records = self.validateIndexedAllocator(checkpoint, &state, cancel) catch |err| {
                 if (err == error.MaintenanceCanceled) return err;
                 return invalidCheck(report, issueForPageCheckError(err));
             };
@@ -6161,6 +6259,7 @@ pub const NativeFile = struct {
             valid.record_count = records;
             valid.live_file_count = live.record_count;
             valid.live_bytes = live.bytes;
+            valid.live_accounting = live.accounting;
             valid.compact_size = live.compact_size;
             valid.reclaimable_bytes = file_size -| live.compact_size;
             if (valid.tail_bytes != 0) return invalidCheck(valid, "tail_bytes");
@@ -6211,6 +6310,7 @@ pub const NativeFile = struct {
         valid.record_count = catalog_records + index_catalog_records + document_records;
         valid.live_file_count = live.record_count;
         valid.live_bytes = live.bytes;
+        valid.live_accounting = live.accounting;
         valid.compact_size = live.compact_size;
         valid.reclaimable_bytes = if (file_size > live.compact_size) file_size - live.compact_size else 0;
         if (valid.tail_bytes != 0) return invalidCheck(valid, "tail_bytes");
@@ -7254,6 +7354,14 @@ pub const NativeFile = struct {
     pub fn runtimeMetadataUnchanged(self: *NativeFile, latest: *NativeFile) !bool {
         const before = self.activeCheckpoint();
         const after = latest.activeCheckpoint();
+        if (self.header.indexed_reclamation and latest.header.indexed_reclamation) {
+            if (self.header.page_size != latest.header.page_size or
+                !std.mem.eql(u8, &before.logical.primary, &after.logical.primary)) return false;
+            if (std.mem.eql(u8, &before.logical.metadata, &after.logical.metadata)) return true;
+            // Raw catalog callers can publish lease keys without the dedicated
+            // lease transaction. Retain the fenced exact comparison for that
+            // conservative identity change; never traverse an unretained cut.
+        }
         // An idle runtime has no inode reader fence. Its old page IDs are
         // comparable only while the allocator still retains that checkpoint;
         // a retired slot could already have been reused for unrelated bytes.
@@ -7888,6 +7996,27 @@ pub const NativeFile = struct {
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
         for (mutations) |mutation| try self.validateDocumentMutation(mutation);
+        // All backends and SQL/DDL producers meet at this physical writer.
+        // A standalone schema write also uses a transaction, so no crash can
+        // expose recovery work without its agenda marker (or vice versa).
+        if (self.header.indexed_reclamation and !self.flushing_transaction) {
+            const tracked = for (mutations) |mutation| {
+                if (recovery_agenda.namespace(mutation.key) != null) break true;
+            } else false;
+            if (tracked and self.transaction_header == null) {
+                try self.beginTransaction();
+                errdefer self.abortTransaction();
+                try self.putDocumentBatch(mutations);
+                try self.commitTransaction();
+                return;
+            }
+            if (tracked) for (mutations) |mutation| {
+                const scope = recovery_agenda.namespace(mutation.key) orelse continue;
+                const marker = try std.mem.concat(self.allocator, u8, &.{ recovery_agenda.prefix, scope });
+                defer self.allocator.free(marker);
+                try self.putCatalogRecord(marker, "");
+            };
+        }
         if (self.change_capture) |capture| for (mutations) |mutation| capture.record(self.allocator, .documents, mutation.key);
 
         if (self.stagingTransaction() and mutations.len >= TransactionWrites.max_keys) {
@@ -9724,6 +9853,13 @@ pub const NativeFile = struct {
             .namespace_directory_root_page = namespace_directory_root_page,
             .document_index_root_page = document_index_root_page,
         };
+        if (indexed) {
+            // A replacement inode has a new logical lineage. Its freshly copied
+            // roots are also the private writer's baseline, so ordinary root
+            // comparison cannot stamp these identities during allocator bootstrap.
+            inline for (@typeInfo(LogicalGenerations).@"struct".field_names) |identity|
+                try io.randomSecure(&@field(checkpoint.logical, identity));
+        }
         var compact_header = Header{
             .reader_epoch_namespace = if (indexed) try @import("reader_epochs.zig").namespaceForPublicationWithDurability(self.allocator, io, self.path, self.no_sync) else @splat(0),
             .indexed_reclamation = indexed,
@@ -9755,6 +9891,33 @@ pub const NativeFile = struct {
             compact_header.checkpoints = .{ checkpoint, checkpoint };
         }
 
+        if (indexed and !self.header.indexed_reclamation) {
+            // Legacy formats have no agenda. Bootstrap it once from the source
+            // keys before this private image becomes a revision-7 generation.
+            var projection = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = tmp_path, .file = compact_file, .header = compact_header, .no_sync = true, .page_cache_enabled = .init(false) };
+            defer projection.invalidateLedger();
+            defer projection.page_cache.deinit(self.allocator);
+            try projection.beginTransaction();
+            errdefer projection.abortTransaction();
+            var records = try LiveRecordCursor.init(self, .documents);
+            defer records.deinit();
+            while (try records.next(cancel)) |record| {
+                const scope = recovery_agenda.namespace(record.key) orelse continue;
+                const marker = try std.mem.concat(self.allocator, u8, &.{ recovery_agenda.prefix, scope });
+                defer self.allocator.free(marker);
+                const existing = try projection.getCatalogRecordAlloc(self.allocator, marker);
+                if (existing) |bytes| {
+                    self.allocator.free(bytes);
+                } else {
+                    try projection.putCatalogRecord(marker, "");
+                    live_record_count += 1;
+                    live_bytes += marker.len;
+                }
+            }
+            try projection.commitTransaction();
+            compact_header = projection.header;
+            next_page_id = projection.activeCheckpoint().page_count;
+        }
         var encoded_header: [header_size]u8 = undefined;
         encodeHeader(&encoded_header, compact_header);
         try compact_file.writePositionalAll(io, &encoded_header, 0);
@@ -10943,6 +11106,7 @@ pub const NativeFile = struct {
     }
 
     pub const LiveStats = struct {
+        accounting: LiveByteAccounting = .{},
         record_count: u64,
         bytes: u64,
         compact_size: u64,
@@ -10952,6 +11116,7 @@ pub const NativeFile = struct {
     /// Integrity checking separately visits and validates all reachable payloads.
     pub fn liveStats(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !LiveStats {
         var live_bytes: u64 = 0;
+        var accounting: LiveByteAccounting = .{};
         const indexed = self.header.indexed_reclamation or self.vacuum_target_indexed;
         var compact_pages: u64 = if (indexed) 1 else 2; // header; allocator added below
         var record_count: u64 = 0;
@@ -10971,6 +11136,13 @@ pub const NativeFile = struct {
                 const is_catalog = cursor.kind == .catalog;
                 const header_len: usize = if (is_catalog) 16 else documentHeaderSize(record.key);
                 live_bytes +|= record.key.len + len;
+                const category = switch (source) {
+                    .catalog => |root| if (root == .metadata) &accounting.metadata_catalog else &accounting.index_catalog,
+                    .documents => if (isControlDocumentPhysicalKey(record.key)) &accounting.control_documents else &accounting.documents,
+                };
+                category.records +|= 1;
+                category.key_bytes +|= record.key.len;
+                category.value_bytes +|= len;
                 const external = header_len + record.key.len + len > self.maxPagePayloadBytes();
                 const record_size = header_len + record.key.len + (if (external) @as(usize, 8) else len);
                 if (external) compact_pages += if (is_catalog or len >= 64 * 1024) self.valueTreePageCount(len) else self.valuePageCount(len);
@@ -11045,7 +11217,7 @@ pub const NativeFile = struct {
                 compact_pages = total;
             }
         }
-        return .{ .record_count = record_count, .bytes = live_bytes, .compact_size = compact_pages * @as(u64, self.header.page_size) };
+        return .{ .accounting = accounting, .record_count = record_count, .bytes = live_bytes, .compact_size = compact_pages * @as(u64, self.header.page_size) };
     }
 
     fn valueTreePageCount(self: *const NativeFile, value_len: usize) u64 {
@@ -11371,7 +11543,9 @@ pub const NativeFile = struct {
         try self.writePage(next.free_map_root_page, .free_map, &root);
     }
 
-    fn publishCheckpoint(self: *NativeFile, checkpoint: CheckpointSlot) !void {
+    fn publishCheckpoint(self: *NativeFile, proposed: CheckpointSlot) !void {
+        var checkpoint = proposed;
+        try self.stampLogicalGenerations(&checkpoint);
         if (self.transaction_header != null) {
             self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
             return;
@@ -11390,10 +11564,16 @@ pub const NativeFile = struct {
         const next_slot: u8 = if (self.header.active_checkpoint == 0) 1 else 0;
 
         var encoded_slot: [checkpoint_slot_size]u8 = undefined;
-        encodeCheckpointSlot(&encoded_slot, checkpoint);
+        var identities: [logical_generations_size]u8 = undefined;
+        encodeLogicalGenerations(&identities, checkpoint.logical);
+        encodeCheckpointSlot(&encoded_slot, checkpoint, if (self.header.indexed_reclamation) &identities else null);
 
         const io = self.runtimeIo();
         self.checkpoint_publication_uncertain = true;
+        // Identity bytes and roots form one checksummed recovery slot. A crash
+        // during either write invalidates this slot and retains the other one.
+        if (self.header.indexed_reclamation)
+            try self.file.writePositionalAll(io, &identities, logicalGenerationsOffset(next_slot));
         try self.file.writePositionalAll(io, &encoded_slot, checkpointOffset(next_slot));
         try self.syncIfRequired();
         const active_checkpoint: [1]u8 = .{next_slot};
@@ -12169,7 +12349,9 @@ pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     if (header.indexed_reclamation) @memcpy(out[reader_epoch_namespace_offset..][0..32], &header.reader_epoch_namespace);
 
     for (header.checkpoints, 0..) |slot, index| {
-        encodeCheckpointSlot(out[checkpointOffset(index)..][0..checkpoint_slot_size], slot);
+        const identities = out[logicalGenerationsOffset(index)..][0..logical_generations_size];
+        if (header.indexed_reclamation) encodeLogicalGenerations(identities, slot.logical);
+        encodeCheckpointSlot(out[checkpointOffset(index)..][0..checkpoint_slot_size], slot, if (header.indexed_reclamation) identities else null);
     }
 
     std.mem.writeInt(u32, out[header_checksum_offset..][0..4], headerChecksum(out), .little);
@@ -12200,13 +12382,14 @@ pub fn decodeHeader(raw: []const u8) !Header {
     var valid_slots: [checkpoint_slot_count]bool = @splat(false);
     for (&checkpoints, 0..) |*slot, index| {
         const raw_slot = header_raw[checkpointOffset(index)..][0..checkpoint_slot_size];
+        const identities: ?[]const u8 = if (indexed_reclamation) header_raw[logicalGenerationsOffset(index)..][0..logical_generations_size] else null;
         // Zero checksums are a legacy v3 compatibility encoding. Revision 4
         // requires each recoverable slot to authenticate its ownership root.
-        if (indexed_reclamation and std.mem.readInt(u32, raw_slot[checkpoint_slot_checksum_offset..][0..4], .little) != checkpointSlotChecksum(raw_slot)) {
+        if (indexed_reclamation and std.mem.readInt(u32, raw_slot[checkpoint_slot_checksum_offset..][0..4], .little) != checkpointSlotChecksum(raw_slot, identities)) {
             slot.* = .{ .page_count = 0 };
             continue;
         }
-        slot.* = decodeCheckpointSlot(raw_slot) catch {
+        slot.* = decodeCheckpointSlot(raw_slot, identities) catch {
             slot.* = .{ .page_count = 0 };
             continue;
         };
@@ -12228,7 +12411,17 @@ fn checkpointOffset(index: usize) usize {
     return checkpoint_slots_offset + index * checkpoint_slot_size;
 }
 
-fn encodeCheckpointSlot(out: []u8, slot: CheckpointSlot) void {
+fn logicalGenerationsOffset(index: usize) usize {
+    return checkpoint_slots_end + index * logical_generations_size;
+}
+
+fn encodeLogicalGenerations(out: []u8, logical: LogicalGenerations) void {
+    @memcpy(out[0..16], &logical.primary);
+    @memcpy(out[16..32], &logical.metadata);
+    @memcpy(out[32..48], &logical.indexes);
+}
+
+fn encodeCheckpointSlot(out: []u8, slot: CheckpointSlot, identities: ?[]const u8) void {
     std.debug.assert(out.len == checkpoint_slot_size);
     @memset(out, 0);
     std.mem.writeInt(u64, out[0..8], slot.commit_sequence, .little);
@@ -12239,14 +12432,15 @@ fn encodeCheckpointSlot(out: []u8, slot: CheckpointSlot) void {
     std.mem.writeInt(u64, out[40..48], slot.page_count, .little);
     std.mem.writeInt(u64, out[48..56], slot.namespace_directory_root_page, .little);
     std.mem.writeInt(u64, out[56..64], slot.document_index_root_page, .little);
-    std.mem.writeInt(u32, out[checkpoint_slot_checksum_offset..][0..4], checkpointSlotChecksum(out), .little);
+    std.mem.writeInt(u32, out[checkpoint_slot_checksum_offset..][0..4], checkpointSlotChecksum(out, identities), .little);
 }
 
-fn decodeCheckpointSlot(raw: []const u8) !CheckpointSlot {
+fn decodeCheckpointSlot(raw: []const u8, identities: ?[]const u8) !CheckpointSlot {
     std.debug.assert(raw.len == checkpoint_slot_size);
     const expected_checksum = std.mem.readInt(u32, raw[checkpoint_slot_checksum_offset..][0..4], .little);
-    if (expected_checksum != 0 and expected_checksum != checkpointSlotChecksum(raw)) return error.NativeCheckpointChecksumMismatch;
+    if (expected_checksum != 0 and expected_checksum != checkpointSlotChecksum(raw, identities)) return error.NativeCheckpointChecksumMismatch;
     return .{
+        .logical = if (identities) |bytes| .{ .primary = bytes[0..16].*, .metadata = bytes[16..32].*, .indexes = bytes[32..48].* } else .{},
         .commit_sequence = std.mem.readInt(u64, raw[0..8], .little),
         .catalog_root_page = std.mem.readInt(u64, raw[8..16], .little),
         .document_root_page = std.mem.readInt(u64, raw[16..24], .little),
@@ -12805,13 +12999,15 @@ fn headerChecksum(raw: []const u8) u32 {
     var crc = Crc32.init();
     crc.update(raw[0..active_checkpoint_offset]);
     crc.update(raw[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
-    crc.update(raw[checkpoint_slots_end..header_checksum_offset]);
+    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic)) logical_generations_end else checkpoint_slots_end;
+    crc.update(raw[end..header_checksum_offset]);
     return crc.final();
 }
 
-fn checkpointSlotChecksum(raw: []const u8) u32 {
+fn checkpointSlotChecksum(raw: []const u8, identities: ?[]const u8) u32 {
     var crc = Crc32.init();
     crc.update(raw[0..checkpoint_slot_payload_size]);
+    if (identities) |bytes| crc.update(bytes);
     return crc.final();
 }
 
@@ -20948,4 +21144,281 @@ test "lite reader epoch aliases long filenames retain epoch reuse" {
     const captured = (try reader.getDocumentAlloc(a, "doc")).?;
     defer a.free(captured);
     try std.testing.expectEqualSlices(u8, &value, captured);
+}
+
+test "lite reader registration path lease close retains only escaped snapshot protection" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "lease-registration.aflite");
+    defer a.free(path);
+    {
+        var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer writer.close();
+        try writer.putDocument("doc", "value");
+    }
+    var coordinator = ReaderCoordinator.init(a, io);
+    defer coordinator.deinit();
+    var lease = try lockWriterPathWithIo(a, io, path);
+    var held = true;
+    defer if (held) lease.close();
+    lease.reader_registration_batch = coordinator.beginRegistrationBatch();
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .reader_coordinator = &coordinator });
+    var reader_open = true;
+    defer if (reader_open) reader.close();
+    try std.testing.expect(reader.reader_fence.?.shared_epoch != null);
+    lease.close();
+    held = false;
+    try std.testing.expectEqual(@as(usize, 0), coordinator.registration_batches);
+    const inode = (try reader.file.stat(io)).inode;
+    const frontier = try @import("reader_epochs.zig").scan(a, io, path, reader.header.reader_epoch_namespace, inode);
+    try std.testing.expect(frontier.metadata != null);
+    const binding = reader.header.reader_epoch_namespace;
+    reader.close();
+    reader_open = false;
+    try std.testing.expectEqual(@import("reader_epochs.zig").Frontier{}, try @import("reader_epochs.zig").scan(a, io, path, binding, inode));
+}
+
+test "lite logical generations preserve runtime identity beyond recovery slots" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "logical-generations.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    try writer.putDocument("doc", "value");
+    var captured = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
+    defer captured.close();
+    const identity = captured.activeCheckpoint().logical;
+    for (0..4) |i| {
+        try writer.beginArtifactLeaseTransaction();
+        errdefer writer.abortTransaction();
+        var key_buffer: [64]u8 = undefined;
+        const key_bytes = try std.fmt.bufPrint(&key_buffer, "{s}probe-{d}", .{ NativeFile.artifact_lease_key_prefix, i });
+        try writer.putCatalogRecord(key_bytes, "lease");
+        try writer.commitTransaction();
+    }
+    try std.testing.expectEqualDeep(identity, writer.activeCheckpoint().logical);
+    try std.testing.expect(try captured.runtimeMetadataUnchanged(&writer));
+    try writer.putDocument("doc", "changed");
+    try std.testing.expect(!try captured.runtimeMetadataUnchanged(&writer));
+}
+
+test "lite logical generations checksum rejects torn identity extension" {
+    var header = Header{ .indexed_reclamation = true };
+    header.checkpoints[0].commit_sequence = 10;
+    header.checkpoints[1].commit_sequence = 11;
+    header.active_checkpoint = 1;
+    header.checkpoints[1].logical.primary = @splat(42);
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, header);
+    try std.testing.expectEqualDeep(header, try decodeHeader(&encoded));
+    encoded[logicalGenerationsOffset(1)] ^= 1;
+    const decoded = try decodeHeader(&encoded);
+    try std.testing.expectEqual(@as(u64, 10), decoded.checkpoints[decoded.active_checkpoint].commit_sequence);
+}
+
+test "lite recovery agenda commits atomically with raw namespace schema changes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "recovery-agenda.aflite");
+    defer a.free(path);
+    const schema = "\x02db/embedded/tables/2\x00\x00\x00__metadata__:schema_json";
+    const marker = recovery_agenda.prefix ++ "\x02db/embedded/tables/2\x00";
+    {
+        var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer writer.close();
+        try writer.beginTransaction();
+        try writer.putDocument(schema, "pending");
+        writer.abortTransaction();
+        try std.testing.expectEqual(@as(?[]u8, null), try writer.getCatalogRecordAlloc(a, marker));
+        try writer.putDocument(schema, "committed");
+    }
+    var reader = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer reader.close();
+    const pending = (try reader.getCatalogRecordAlloc(a, marker)) orelse return error.MissingRecoveryAgenda;
+    defer a.free(pending);
+    const value = (try reader.getDocumentAlloc(a, schema)) orelse return error.MissingDocument;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("committed", value);
+    try std.testing.expect((try reader.check()).valid);
+}
+
+test "lite recovery agenda is bootstrapped by legacy format conversion" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "legacy-agenda.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
+    defer writer.close();
+    try writer.putDocument("\x00antfly/embedded/sql-ddl", "pending");
+    writer.vacuum_target_indexed = true;
+    var image = try writer.prepareVacuum(null);
+    defer image.deinit();
+    const pending = (try image.prepared.getCatalogRecordAlloc(a, recovery_agenda.prefix)) orelse return error.MissingRecoveryAgenda;
+    defer a.free(pending);
+    try std.testing.expect((try image.prepared.check()).valid);
+}
+
+test "lite logical generations authenticate allocator adoption after root page reuse" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "allocator-root-aba.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.allocator_certificate_on_commit = true;
+    try writer.beginTransaction();
+    try writer.putDocument("churn", "initial");
+    try writer.commitTransaction();
+    for (0..64) |_| {
+        try writer.beginTransaction();
+        try writer.putDocument("churn", "warmup");
+        try writer.commitTransaction();
+        _ = try writer.reclaimPagesForMaintenanceWithCancel(128, null);
+    }
+    var cached = try NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true });
+    defer cached.close();
+    try cached.completeAllocatorVerification();
+    _ = try cached.loadLedgerForDigest(cached.activeCheckpoint(), null, true);
+    const old_root = cached.activeCheckpoint().free_map_root_page;
+    var reused = false;
+    for (0..2048) |_| {
+        try writer.beginTransaction();
+        try writer.putDocument("churn", "replacement");
+        try writer.commitTransaction();
+        if (writer.activeCheckpoint().free_map_root_page == old_root) {
+            reused = true;
+            break;
+        }
+        _ = try writer.reclaimPagesForMaintenanceWithCancel(128, null);
+        if (writer.activeCheckpoint().free_map_root_page == old_root) {
+            reused = true;
+            break;
+        }
+    }
+    try std.testing.expect(reused);
+    const expected_before_adoption = try writer.loadLedgerForDigest(writer.activeCheckpoint(), null, true);
+    try std.testing.expect(!std.mem.eql(u8, &try cached.ledger.?.incrementalFingerprint(), &try expected_before_adoption.incrementalFingerprint()));
+    try cached.adoptIndexPublicationHeader(writer.header);
+    try cached.inheritAllocatorVerification(&writer);
+    const actual = try cached.loadLedgerForDigest(cached.activeCheckpoint(), null, true);
+    const expected = try writer.loadLedgerForDigest(writer.activeCheckpoint(), null, true);
+    try std.testing.expectEqualDeep(expected.root, actual.root);
+    try std.testing.expectEqualSlices(u32, expected.counts.items, actual.counts.items);
+    try std.testing.expectEqual(expected.pending.count(), actual.pending.count());
+    try std.testing.expectEqual(expected.free_pages, actual.free_pages);
+    for (&expected.bitmap, &actual.bitmap) |*left, *right| try std.testing.expectEqualSlices(u64, left.items, right.items);
+    var entries = expected.pending.iterator();
+    while (entries.next()) |entry| try std.testing.expectEqualDeep(entry.value_ptr.*, actual.pending.get(entry.key_ptr.*).?);
+    try std.testing.expectEqualSlices(u8, &try expected.incrementalFingerprint(), &try actual.incrementalFingerprint());
+    try std.testing.expect((try cached.check()).valid);
+    try cached.putDocument("after-adoption", "retained");
+    const after_report = try cached.check();
+    try std.testing.expect(after_report.valid);
+    // Continue through journal publication and retirement after adoption;
+    // transient traversal inventories must never become ownership evidence.
+    for (0..32) |_| {
+        try cached.putDocument("after-adoption", "updated");
+        _ = try cached.reclaimPagesForMaintenanceWithCancel(128, null);
+    }
+    try std.testing.expect((try cached.check()).valid);
+    var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
+    defer reopened.close();
+    try std.testing.expect((try reopened.check()).valid);
+}
+
+test "lite logical byte accounting distinguishes control families and namespace wrappers" {
+    const a = std.testing.allocator;
+    const keys = @import("../internal_keys.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "accounting-families.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    const primary = try keys.documentKeyAlloc(a, "doc\x00\x00__metadata__:authored-id");
+    defer a.free(primary);
+    const relational = try keys.relationalRowKeyAlloc(a, "row");
+    defer a.free(relational);
+    const derived = try a.dupe(u8, primary);
+    defer a.free(derived);
+    derived[derived.len - 1] = keys.artifact_kind;
+    const namespace = "\x02db/embedded/tables/2\x00";
+    try writer.putDocument(primary, "d");
+    try writer.putDocument(relational, "r");
+    try writer.putDocument("plain\x00\x00__txn_records__:authored-id", "p");
+    const named_primary = try std.mem.concat(a, u8, &.{ namespace, primary });
+    defer a.free(named_primary);
+    try writer.putDocument(named_primary, "n");
+    for ([_][]const u8{
+        "\x00\x00__txn_records__:receipt",
+        keys.relational_columnar_manifest_key,
+        &keys.range_document_count_key,
+        &keys.identity_namespace_key,
+        derived,
+    }) |control| {
+        try writer.putDocument(control, "c");
+        const named = try std.mem.concat(a, u8, &.{ namespace, control });
+        defer a.free(named);
+        try writer.putDocument(named, "c");
+    }
+    const report = try writer.check();
+    try std.testing.expect(report.valid);
+    const accounting = report.live_accounting.?;
+    try std.testing.expectEqual(@as(u64, 4), accounting.documents.records);
+    try std.testing.expectEqual(@as(u64, 10), accounting.control_documents.records);
+    try std.testing.expectEqual(@as(u64, 4), accounting.documents.value_bytes);
+    try std.testing.expectEqual(@as(u64, 10), accounting.control_documents.value_bytes);
+    var bytes: u64 = 0;
+    var records: u64 = 0;
+    inline for (@typeInfo(LiveByteAccounting).@"struct".field_names) |field| {
+        const category = @field(accounting, field);
+        bytes += category.key_bytes + category.value_bytes;
+        records += category.records;
+    }
+    try std.testing.expectEqual(report.live_bytes, bytes);
+    try std.testing.expectEqual(report.live_file_count, records);
+}
+
+test "lite logical generations vacuum images establish independent identities" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "vacuum-logical-identities.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    try writer.putDocument("doc", "value");
+    var first = try writer.prepareVacuum(null);
+    defer first.deinit();
+    const first_ids = first.prepared.activeCheckpoint().logical;
+    try writer.putDocument("\x00antfly/embedded/sql-ddl", "pending");
+    var second = try writer.prepareVacuum(null);
+    defer second.deinit();
+    const second_ids = second.prepared.activeCheckpoint().logical;
+    const zero: [16]u8 = @splat(0);
+    inline for (@typeInfo(LogicalGenerations).@"struct".field_names) |identity| {
+        try std.testing.expect(!std.mem.eql(u8, &zero, &@field(first_ids, identity)));
+        try std.testing.expect(!std.mem.eql(u8, &@field(first_ids, identity), &@field(second_ids, identity)));
+        try std.testing.expect(!std.mem.eql(u8, &@field(writer.activeCheckpoint().logical, identity), &@field(second_ids, identity)));
+    }
+    // Allocator-only publication normalization must retain the new lineage,
+    // and both the identity extension and allocator certificate must reopen.
+    try second.prepared.preparePublicationSequence(second.prepared.activeCheckpoint().commit_sequence + 10);
+    try std.testing.expectEqualDeep(second_ids, second.prepared.activeCheckpoint().logical);
+    var reopened = try NativeFile.openWithIo(a, io, second.prepared.path, .{ .read_only = true, .internal_reader = true });
+    defer reopened.close();
+    try std.testing.expectEqualDeep(second_ids, reopened.activeCheckpoint().logical);
+    try std.testing.expect((try reopened.check()).valid);
 }

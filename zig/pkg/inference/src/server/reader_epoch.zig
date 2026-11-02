@@ -100,6 +100,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             limits: runtime.tier.memory.Limits,
             physical_rows_limit: usize,
             epoch_page_limit: usize = 64,
+            cuda_batch_enabled: bool = false,
             decoder_peak: usize = 0,
             features: ExecutionFeatures = .{},
             control: InferenceExecutionControl,
@@ -121,8 +122,8 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 ctx.coordinator.policy.max_step_query_tokens = generation.NativeGenerationPipeline.max_prepared_qwen_prefill_rows;
             }
             ctx.execution_gate_wait_ns = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_GATE_PARK")) 0 else @as(u64, @min(ctx.coordinator.policy.contention_wait_us, 1000)) * std.time.ns_per_us;
-            ctx.phase_wait_ns = if ((Hooks.cudaLightOnBatchProfileEnabled() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHASE_PARK")) or metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_PHASE_PARK")) ctx.execution_gate_wait_ns else 0;
-            ctx.phase_fair = (Hooks.cudaLightOnBatchProfileEnabled() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHASE_FAIR")) or metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_PHASE_FAIR");
+            ctx.phase_wait_ns = if ((factory.cuda_batch_enabled and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHASE_PARK")) or metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_PHASE_PARK")) ctx.execution_gate_wait_ns else 0;
+            ctx.phase_fair = (factory.cuda_batch_enabled and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHASE_FAIR")) or metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_PHASE_FAIR");
             ctx.gate_events = ctx.coordinator.usesStepEvents() and platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_GATE_EVENTS", true);
             // Keep the latency-oriented default; bulk-throughput profiles can
             // prioritize runnable prefills to fill the physical decode batch.

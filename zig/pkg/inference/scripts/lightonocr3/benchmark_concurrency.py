@@ -48,6 +48,14 @@ def prefill_stream_observation(text):
     }
 
 
+def apply_token_burst_overrides(env, enabled, width):
+    """Omitted benchmark flags must preserve runtime automatic selection."""
+    if enabled is not None:
+        env["ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST"] = "1" if enabled else "0"
+    if width is not None:
+        env["ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"] = str(width)
+
+
 def recurrent_placement_observation(text, enabled):
     """Require the loaded session's decision, not a CUDA backend banner."""
     rows = [
@@ -236,8 +244,7 @@ def run(args, model, label, mode, concurrency, output):
     if args.pipeline_vision:
         env["ANTFLY_LIGHTONOCR3_CPU_PREPROCESS"] = "1"
         env["TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"] = "1"
-    env["ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST"] = "1" if args.gpu_token_burst else "0"
-    env["ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"] = str(args.gpu_token_burst_width)
+    apply_token_burst_overrides(env, args.gpu_token_burst, args.gpu_token_burst_width)
     if args.gpu_token_burst:
         env["ANTFLY_LIGHTONOCR3_SINGLE_FRAME"] = "1" if args.backend == "metal" else "0"
         env["ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS"] = "0"
@@ -1036,9 +1043,8 @@ def run(args, model, label, mode, concurrency, output):
                             rows > 64 for rows, _ in cuda_bursts
                         ):
                             result["status"] = "missing_timed_wide_cuda_token_burst"
-                        elif (
-                            max(steps for _, steps in cuda_bursts)
-                            < args.gpu_token_burst_width
+                        elif max(steps for _, steps in cuda_bursts) < (
+                            args.gpu_token_burst_width or 2
                         ):
                             result["status"] = (
                                 "missing_timed_requested_cuda_burst_width"
@@ -2171,16 +2177,17 @@ def main():
     )
     parser.add_argument(
         "--gpu-token-burst",
-        action="store_true",
-        help="Overlap greedy OCR decode steps using GPU token handoff",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override automatic greedy GPU token handoff selection",
     )
     parser.add_argument("--require-cuda-token-burst", action="store_true")
     parser.add_argument(
         "--gpu-token-burst-width",
         type=int,
         choices=tuple(range(2, 9)),
-        default=2,
-        help="Maximum GPU token burst width; two logits buffers are reused",
+        default=None,
+        help="Override the runtime GPU token burst width (2–8)",
     )
     parser.add_argument(
         "--pipeline-vision",
@@ -2309,11 +2316,13 @@ def main():
             "--pipeline-vision requires continuous resident vision with single-image groups"
         )
     if args.require_cuda_token_burst and (
-        not args.gpu_token_burst or args.backend != "cuda"
+        args.gpu_token_burst is False or args.backend != "cuda"
     ):
-        parser.error("--require-cuda-token-burst requires CUDA and --gpu-token-burst")
-    if args.gpu_token_burst_width != 2 and not args.gpu_token_burst:
-        parser.error("--gpu-token-burst-width requires --gpu-token-burst")
+        parser.error(
+            "--require-cuda-token-burst requires CUDA without --no-gpu-token-burst"
+        )
+    if args.gpu_token_burst_width is not None and args.gpu_token_burst is False:
+        parser.error("--gpu-token-burst-width conflicts with --no-gpu-token-burst")
     if args.gpu_token_burst and (
         not args.continuous
         or not args.device_recurrent_state

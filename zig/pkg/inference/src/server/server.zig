@@ -1485,6 +1485,7 @@ pub const WarmModel = struct {
     prepared_pack: ?ops.A4bPreparedPackMode = null,
     drop_host_cache_after_load: bool = false,
     startup_strategy: WarmModelStartupStrategy = .eager,
+    pin: bool = true,
 
     pub fn a4bRequest(self: WarmModel) ?ops.A4bInferenceRequest {
         const residency_mode = self.residency_mode orelse .auto;
@@ -1616,6 +1617,25 @@ pub const max_ordered_embedding_media_parts_per_item: usize = 32;
 const max_chunk_results = lib_chunker.max_chunk_results;
 const max_chunk_target_tokens = lib_chunker.max_chunk_target_tokens;
 const max_chunk_audio_window_ms = lib_chunker.max_chunk_audio_window_ms;
+/// An explicit scratch budget caps the GLiNER boundary encoder's device
+/// ceiling so the run (host working memory, encoder and head) fits within it.
+/// Without an explicit budget, or when the budget cannot hold even the head
+/// and working memory, the configured ceiling is kept and admission decides.
+fn glinerBoundaryEncoderCeiling(configured: usize, explicit_scratch_limit: usize, working_bytes: usize, head_bytes: usize) usize {
+    if (explicit_scratch_limit == 0) return configured;
+    const reserved = std.math.add(usize, working_bytes, head_bytes) catch return configured;
+    if (explicit_scratch_limit <= reserved) return configured;
+    return @min(configured, explicit_scratch_limit - reserved);
+}
+
+test "GLiNER boundary encoder ceiling respects an explicit scratch budget" {
+    const mib: usize = 1024 * 1024;
+    try std.testing.expectEqual(2048 * mib, glinerBoundaryEncoderCeiling(2048 * mib, 0, 64 * mib, 256 * mib));
+    try std.testing.expectEqual(1728 * mib, glinerBoundaryEncoderCeiling(2048 * mib, 2048 * mib, 64 * mib, 256 * mib));
+    try std.testing.expectEqual(2048 * mib, glinerBoundaryEncoderCeiling(2048 * mib, 8192 * mib, 64 * mib, 256 * mib));
+    try std.testing.expectEqual(2048 * mib, glinerBoundaryEncoderCeiling(2048 * mib, 128 * mib, 64 * mib, 256 * mib));
+}
+
 // Admission accounting quantum, independent of model-specific completion defaults.
 const read_admission_tokens_per_unit: usize = 256;
 const max_read_tokens: usize = readers_api.max_output_tokens;
@@ -6264,15 +6284,28 @@ pub const Node = struct {
     }
 
     pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        if (model.name.len == 0) return error.InvalidGenerationRequest;
         try validateWarmModelCudaPrecision(model);
+        const a4b_request = try validatedWarmModelA4bRequest(model);
+        // Persist selection before any startup acquisition, including prefetch.
+        // Pinning controls residency only; eviction must not change execution.
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const model_path = try self.resolveModelPath(io, model.name, warmModelTaskDir(model.kind));
+        defer self.allocator.free(model_path);
+        try self.model_manager.setStartupLoadPolicy(model_path, .{
+            .backend = if (model.cuda_precision != null) .cuda else model.backend,
+            .gliner_cuda_precision = model.cuda_precision,
+            .a4b_request = a4b_request,
+        });
         if (model.startup_strategy == .prefetch)
             return self.prefetchWarmModel(allocator, model);
-        const a4b_request = try validatedWarmModelA4bRequest(model);
         const materialize_optional_sessions = kernelJitMaterializesOptionalSessions(self.config.kernel_jit.mode);
         switch (model.kind) {
-            .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend, a4b_request),
-            .embedder => try self.warmEmbedder(allocator, model.name, model.backend, materialize_optional_sessions),
-            .reranker => try self.warmReranker(allocator, model.name, model.backend),
+            .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend, a4b_request, model.pin),
+            .embedder => try self.warmEmbedder(allocator, model.name, model.backend, materialize_optional_sessions, model.pin),
+            .reranker => try self.warmReranker(allocator, model.name, model.backend, model.pin),
             .transcriber => try self.warmTranscriber(allocator, model),
             .chunker, .classifier, .rewriter, .reader, .extractor => try self.warmLoadOnlyModel(allocator, model),
         }
@@ -6346,7 +6379,7 @@ pub const Node = struct {
     }
 
     pub fn warmGenerator(self: *Node, allocator: std.mem.Allocator, model_name: []const u8) !void {
-        try self.warmGeneratorWithBackend(allocator, model_name, null, null);
+        try self.warmGeneratorWithBackend(allocator, model_name, null, null, true);
     }
 
     fn warmGeneratorWithBackend(
@@ -6355,6 +6388,7 @@ pub const Node = struct {
         model_name: []const u8,
         backend: ?backends_mod.BackendType,
         a4b_request: ?ops.A4bInferenceRequest,
+        pin: bool,
     ) !void {
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
@@ -6373,7 +6407,7 @@ pub const Node = struct {
             preferred_backends,
             true,
             &timing,
-            true,
+            pin,
             a4b_request,
         );
         defer allocator.free(text);
@@ -6397,6 +6431,7 @@ pub const Node = struct {
         model_name: []const u8,
         backend: ?backends_mod.BackendType,
         materialize_optional_sessions: bool,
+        pin: bool,
     ) !void {
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
@@ -6462,13 +6497,13 @@ pub const Node = struct {
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
             .preferred_backends = if (backend) |value| singleBackendPreference(value) else null,
             .cache_default_alias = false,
-            .pin_on_success = true,
+            .pin_on_success = pin,
             .execution_control = control,
         }, &attempt, Attempt.run);
         std.log.info("warmed inference embedder model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
-    fn warmReranker(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType) !void {
+    fn warmReranker(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType, pin: bool) !void {
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference reranker model={s}", .{model_name});
@@ -6486,7 +6521,7 @@ pub const Node = struct {
         var pipeline = model.rerankingPipeline(allocator);
         const scores = try pipeline.rerank("ping", &documents);
         defer allocator.free(scores);
-        model_handle.pin();
+        if (pin) model_handle.pin();
         std.log.info("warmed inference reranker model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
@@ -6507,7 +6542,7 @@ pub const Node = struct {
         else
             try self.model_manager.acquireFromDir(model_path);
         defer model_handle.release();
-        model_handle.pin();
+        if (model.pin) model_handle.pin();
         std.log.info("loaded inference {s} model={s} elapsed_ms={d}", .{ @tagName(model.kind), model.name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
@@ -6539,7 +6574,7 @@ pub const Node = struct {
                 null,
             );
             defer handle.release();
-            try handle.markStartupManaged();
+            try handle.applyStartupPolicy(model.pin);
             return;
         } else |_| {}
         try self.warmLoadOnlyModel(allocator, model);
@@ -7690,6 +7725,7 @@ pub const Node = struct {
         prompt_tokens: usize,
         completion_tokens: usize,
         native_execution_id: u64 = 0,
+        max_native_step_items: usize = 0,
 
         pub fn deinit(self: *Qwen3VlReadResult, allocator: std.mem.Allocator) void {
             allocator.free(self.text);
@@ -7702,6 +7738,7 @@ pub const Node = struct {
         var native_ids = std.AutoHashMapUnmanaged(u64, void).empty;
         defer native_ids.deinit(allocator);
         for (results) |result| {
+            execution.max_native_step_items = @max(execution.max_native_step_items, result.max_native_step_items);
             if (result.native_execution_id != 0) {
                 execution.native_items += 1;
                 try native_ids.put(allocator, result.native_execution_id, {});
@@ -7709,6 +7746,19 @@ pub const Node = struct {
         }
         execution.native_batches = native_ids.count();
         return execution;
+    }
+
+    fn qwenReadExecutionReport(allocator: std.mem.Allocator, results: []const Qwen3VlReadResult) !api.BatchExecutionReport {
+        const observed = try qwenReadExecution(allocator, results);
+        return .{
+            .requested_items = @intCast(observed.requested_items),
+            .native_batches = @intCast(observed.native_batches),
+            .native_items = @intCast(observed.native_items),
+            .max_native_step_items = @intCast(observed.max_native_step_items),
+            .serial_items = @intCast(observed.serial_items),
+            .rejected_items = 0,
+            .fallback_items = 0,
+        };
     }
 
     fn qwen3VlEncodedReadBatchResult(
@@ -8080,16 +8130,54 @@ pub const Node = struct {
         control: InferenceExecutionControl,
     };
 
+    // Resolve all presence-aware overrides through the same policy used by
+    // admission, discovery, workers, and epoch execution.
+    fn lightOnReaderPolicy(self: *const Node) @import("reader_batch_policy.zig").Policy {
+        const Policy = @import("reader_batch_policy.zig").Policy;
+        const canonical = self.config.generation_batching.mode == .on;
+        return Policy.resolve(.{
+            .cuda_available = build_options.enable_cuda and qwen35_execution.cudaCoreEnabled(),
+            .cuda_enabled = self.config.generation_batching.enabledForBackend(.cuda),
+            .rows = if (canonical) self.config.generation_batching.max_step_items else effectiveLightOnReadRows(),
+            .row_ceiling = if (canonical) @max(lightOnPhysicalRowCeiling(), 16) else lightOnPhysicalRowCeiling(),
+            .window = effectiveLightOnReadWindow(),
+            .window_ceiling = if (canonical) reader_execution_pool.Pool.max_capacity else effectiveLightOnReadWindowCeiling(),
+            .window_tracks_rows = canonical,
+        }, .{
+            .cuda_enabled = if (platform.env.getenv("ANTFLY_LIGHTONOCR3_CUDA_BATCH") != null) platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_BATCH") else null,
+            .rows = platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_ROWS"),
+            .window = platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_WINDOW"),
+        });
+    }
+
+    fn lightOnCudaBatchEnabled(self: *const Node) bool {
+        return self.lightOnReaderPolicy().cuda_enabled;
+    }
+
+    fn lightOnContinuousEnabled(self: *const Node, backend: backends_mod.BackendType) bool {
+        const configured = backend == .cuda and self.lightOnCudaBatchEnabled();
+        if (backend != .metal and !configured) return false;
+        return platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_CONTINUOUS", configured or metal_runtime.appleSimdgroupDeviceDefault());
+    }
+
+    fn lightOnReaderRows(self: *const Node) usize {
+        return self.lightOnReaderPolicy().rows;
+    }
+
+    fn lightOnReaderWindow(self: *const Node) usize {
+        return self.lightOnReaderPolicy().window;
+    }
+
     pub fn lightOnOcrPolicy(self: *const Node, physical_rows_limit: usize) runtime.scheduler.native_generate.Policy {
         var policy = self.config.generation_batching.schedulerPolicy();
-        policy.max_step_items = @min(effectiveLightOnReadRows(), physical_rows_limit);
-        policy.max_active_requests_for_batching = effectiveLightOnReadWindow();
+        policy.max_step_items = @min(self.lightOnReaderRows(), physical_rows_limit);
+        policy.max_active_requests_for_batching = self.lightOnReaderWindow();
         policy.allow_mixed_sequence_lengths = true;
         policy.max_decode_wait_us = @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_DECODE_WAIT_US") orelse self.config.generation_batching.max_decode_wait_us, 10000));
         policy.decode_coalesce_rows = policy.max_step_items;
-        policy.decode_coalesce_ready_only = (cudaLightOnBatchProfileEnabled() or metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_READY_COHORTS")) and !platform.env.getenvBool("ANTFLY_LIGHTONOCR3_WAIT_FOR_PREFILL_PEERS");
-        policy.decode_coalesce_after_turn = cudaLightOnBatchProfileEnabled() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_TURN_COALESCING");
-        policy.event_waits = cudaLightOnBatchProfileEnabled() or metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_STEP_EVENTS");
+        policy.decode_coalesce_ready_only = (self.lightOnCudaBatchEnabled() or metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_READY_COHORTS")) and !platform.env.getenvBool("ANTFLY_LIGHTONOCR3_WAIT_FOR_PREFILL_PEERS");
+        policy.decode_coalesce_after_turn = self.lightOnCudaBatchEnabled() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_TURN_COALESCING");
+        policy.event_waits = self.lightOnCudaBatchEnabled() or metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_STEP_EVENTS");
         policy.contention_wait_us = @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_CONTENTION_WAIT_US") orelse (if (metal_runtime.lightOnThroughputProfileEnabled()) @as(usize, 1000) else 100), 1000));
         return policy;
     }
@@ -8244,7 +8332,12 @@ pub const Node = struct {
             defer prepared.deinit();
             const elapsed = platform.time.monotonicNs() -| started;
             try request.control.check();
-            if (ctx.features.vision_batch_items > 1) {
+            const batch_geometry: ?qwen3vl_projector.ResidentBatchGeometry = if (ctx.features.vision_batch_items > 1)
+                qwen3vl_projector.residentBatchGeometryForShape(ctx.cb.?.kind(), prepared.geometry) catch null
+            else
+                null;
+            const batch_items = if (batch_geometry) |geometry| @min(ctx.features.vision_batch_items, geometry.max_items) else 1;
+            if (batch_items > 1) {
                 const payload = LightOnPreparedVisionPayload{ .prepared = &prepared, .limits = limits, .cpu_ns = elapsed };
                 const Cancel = struct {
                     fn check(ptr: *const anyopaque) bool {
@@ -8253,10 +8346,9 @@ pub const Node = struct {
                         return false;
                     }
                 };
-                const key = try qwen3vl_projector.residentBatchGeometryKey(ctx.cfg, images[0], limits);
                 const queued_phase = ctx.beginQueuedPhase(true);
                 defer if (queued_phase) ctx.finishPhaseWait();
-                const result = try ctx.vision_broker.submitControlled(LightOnPreparedVisionPayload, qwen3vl_projector.ProjectedImages, request.io, allocator, .{ .model = ctx.model.model_dir, .generation = ctx.execution_id, .task = .read, .transform = "lighton-prepared-vision", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = ctx.features.vision_batch_items, .max_items = ctx.features.vision_batch_items, .max_bytes = std.math.mul(usize, ctx.features.vision_batch_items, limits.max_encoded_image_bytes) catch std.math.maxInt(usize), .max_wait_us = @min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_VISION_WAIT_US") orelse 2000, 100000) }, .{ .geometry_key = key, .bytes = images[0].len }, .{}, try directExecutorDeadline(request.io, request.control.deadline_ns), .{ .ptr = &request.control, .is_cancelled_fn = Cancel.check }, &payload, ctx, executeLightOnPreparedVisionBatch);
+                const result = try ctx.vision_broker.submitControlled(LightOnPreparedVisionPayload, qwen3vl_projector.ProjectedImages, request.io, allocator, .{ .model = ctx.model.model_dir, .generation = ctx.execution_id, .task = .read, .transform = "lighton-prepared-vision", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = batch_items, .max_items = batch_items, .max_bytes = std.math.mul(usize, batch_items, limits.max_encoded_image_bytes) catch std.math.maxInt(usize), .max_wait_us = @min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_VISION_WAIT_US") orelse 2000, 100000) }, .{ .geometry_key = batch_geometry.?.key, .bytes = images[0].len }, .{}, try directExecutorDeadline(request.io, request.control.deadline_ns), .{ .ptr = &request.control, .is_cancelled_fn = Cancel.check }, &payload, ctx, executeLightOnPreparedVisionBatch);
                 var projected = switch (result.result) {
                     .value => |value| value,
                     .item_error => |failure| return failure.cause,
@@ -8282,14 +8374,15 @@ pub const Node = struct {
             const request: *@This() = @ptrCast(@alignCast(raw));
             try request.control.check();
             const ctx = request.ctx;
-            const geometry = if (images.len == 1)
-                qwen3vl_projector.residentBatchGeometryKey(ctx.cfg, images[0], limits) catch |err| switch (err) {
-                    error.UnsupportedBatchedVision => 0,
+            const geometry: ?qwen3vl_projector.ResidentBatchGeometry = if (images.len == 1)
+                qwen3vl_projector.residentBatchGeometry(ctx.cb.?.kind(), ctx.cfg, images[0], limits) catch |err| switch (err) {
+                    error.UnsupportedBatchedVision => null,
                     else => return err,
                 }
             else
-                0;
-            if (geometry == 0) {
+                null;
+            const batch_items = if (geometry) |shape| @min(ctx.features.vision_batch_items, shape.max_items) else 1;
+            if (batch_items <= 1) {
                 try ctx.lockStep(request.control);
                 defer ctx.unlockStep();
                 var cb = request.pageBackend();
@@ -8305,7 +8398,7 @@ pub const Node = struct {
             const payload = LightOnVisionPayload{ .image = images[0], .limits = limits };
             const queued_phase = ctx.beginQueuedPhase(true);
             defer if (queued_phase) ctx.finishPhaseWait();
-            const result = try ctx.vision_broker.submitControlled(LightOnVisionPayload, qwen3vl_projector.ProjectedImages, request.io, allocator, .{ .model = ctx.model.model_dir, .generation = ctx.execution_id, .task = .read, .transform = "lighton-vision", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = ctx.features.vision_batch_items, .max_items = ctx.features.vision_batch_items, .max_bytes = std.math.mul(usize, ctx.features.vision_batch_items, limits.max_encoded_image_bytes) catch std.math.maxInt(usize), .max_wait_us = @min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_VISION_WAIT_US") orelse 2000, 100000) }, .{ .geometry_key = geometry, .bytes = images[0].len }, .{}, try directExecutorDeadline(request.io, request.control.deadline_ns), .{ .ptr = &request.control, .is_cancelled_fn = Cancel.check }, &payload, ctx, executeLightOnVisionBatch);
+            const result = try ctx.vision_broker.submitControlled(LightOnVisionPayload, qwen3vl_projector.ProjectedImages, request.io, allocator, .{ .model = ctx.model.model_dir, .generation = ctx.execution_id, .task = .read, .transform = "lighton-vision", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = batch_items, .max_items = batch_items, .max_bytes = std.math.mul(usize, batch_items, limits.max_encoded_image_bytes) catch std.math.maxInt(usize), .max_wait_us = @min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_VISION_WAIT_US") orelse 2000, 100000) }, .{ .geometry_key = geometry.?.key, .bytes = images[0].len }, .{}, try directExecutorDeadline(request.io, request.control.deadline_ns), .{ .ptr = &request.control, .is_cancelled_fn = Cancel.check }, &payload, ctx, executeLightOnVisionBatch);
             var projected = switch (result.result) {
                 .value => |value| value,
                 .item_error => |failure| return failure.cause,
@@ -8539,11 +8632,11 @@ pub const Node = struct {
         const ceiling = try runtime.tier.memory.reserveGptGenerationAtLargestChunk(&local_budget, &components, estimate.token_count, @intCast(max_tokens), estimate.token_count);
         if (ceiling != estimate.token_count) return error.MemoryBudgetExceeded;
         const resource = try runtime.tier.memory.estimateGptGeneration(backend, kv_dtype, cfg, estimate.token_count, @intCast(max_tokens), ceiling);
-        const features = LightOnStreamContext.ExecutionFeatures.resolve(cfg, backend);
+        const features = LightOnStreamContext.ExecutionFeatures.resolveWithPolicy(cfg, backend, self.lightOnCudaBatchEnabled(), self.lightOnReaderRows());
         const prepared_decode = features.prepared;
         // Page-local KV, projected inputs and recurrent histories stay fully
         // additive. Shared execution storage optionally has its own epoch lease.
-        var memory = LightOnCohortMemory{ .backend = backend, .amounts = if (features.epoch_auxiliary) .{} else features.auxiliaryAmounts(), .share_decoder_scratch = features.shared_decoder_scratch, .decoder_rows = effectiveLightOnReadRows(), .max_prefill_batch_items = if (features.packed_mixed) features.packed_prefill_items else features.prefill_batch_items, .packed_mixed = features.packed_mixed, .prefill_query_chunk_rows = features.prepared_prefill_chunk_rows };
+        var memory = LightOnCohortMemory{ .backend = backend, .amounts = if (features.epoch_auxiliary) .{} else features.auxiliaryAmounts(), .share_decoder_scratch = features.shared_decoder_scratch, .decoder_rows = self.lightOnReaderRows(), .max_prefill_batch_items = if (features.packed_mixed) features.packed_prefill_items else features.prefill_batch_items, .packed_mixed = features.packed_mixed, .prefill_query_chunk_rows = features.prepared_prefill_chunk_rows };
         var vision_amounts = try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, backend, estimate.media_admission);
         // The prompt probe used single-block projector limits. Charge the
         // larger device envelope before enabling grouped frames. Each page
@@ -8584,13 +8677,13 @@ pub const Node = struct {
         // Refill completed slots in the same resident epoch. The simultaneous
         // window and every GPU forward retain their existing independent caps.
         const epoch_page_limit: usize = if (extended_epoch) 256 else 64;
-        var factory = LightOnStreamContext.Factory{ .node = self, .model = model, .cfg = cfg, .limits = limits, .physical_rows_limit = try lightOnCohortRowLimit(effectiveLightOnReadRows(), contract.batch.max_items, model.manifest.capabilities), .epoch_page_limit = epoch_page_limit, .decoder_peak = memory.decoder_backend_peak, .features = features, .control = control };
+        var factory = LightOnStreamContext.Factory{ .node = self, .model = model, .cfg = cfg, .limits = limits, .physical_rows_limit = try lightOnCohortRowLimit(self.lightOnReaderRows(), contract.batch.max_items, model.manifest.capabilities), .epoch_page_limit = epoch_page_limit, .cuda_batch_enabled = self.lightOnCudaBatchEnabled(), .decoder_peak = memory.decoder_backend_peak, .features = features, .control = control };
         // Queue before admission and GPU allocation. Only active slots reserve
         // live resources; independently completed pages immediately free slots.
         // Logical occupancy can exceed the physical per-step contract. Every
         // page still acquires its own admission lease; the coordinator caps
         // each GPU forward at the contract's physical row limit.
-        var pool_lease = try model.native_reader_stream.joinBounded(control, effectiveLightOnReadWindow(), epoch_page_limit, &factory, LightOnStreamContext.create, LightOnStreamContext.destroy);
+        var pool_lease = try model.native_reader_stream.joinBounded(control, self.lightOnReaderWindow(), epoch_page_limit, &factory, LightOnStreamContext.create, LightOnStreamContext.destroy);
         var pool_owned = true;
         defer if (pool_owned) pool_lease.release();
         const ctx: *LightOnStreamContext = @ptrCast(@alignCast(pool_lease.context));
@@ -8732,7 +8825,7 @@ pub const Node = struct {
             .gpu_token_burst_lighton_decode = ctx.features.gpu_token_burst,
             .gpu_token_burst_width = ctx.features.gpu_token_burst_width,
             .gpu_greedy_stream_lighton_decode = ctx.features.gpu_greedy_stream,
-            .executor_sequence_control = if (ctx.features.gpu_token_burst or platform.env.getenvBool("ANTFLY_LIGHTONOCR3_EXECUTOR_TAIL")) control else null,
+            .executor_sequence_control = if (platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_EXECUTOR_TAIL", ctx.features.executor_tail)) control else null,
             .execution_phase_waiters = if (ctx.phase_fair) &ctx.phase_waiters else null,
             .execution_phase_wake = if (ctx.gate_events and ctx.worker != null) &ctx.worker_wake else null,
             .execution_phase_wake_io = if (ctx.gate_events) if (ctx.worker_io) |*owner| owner.io() else null else null,
@@ -8744,7 +8837,7 @@ pub const Node = struct {
         defer result.deinit();
         try control.check();
         if (std.mem.eql(u8, result.finish_reason, "length")) return error.ReadOutputTruncated;
-        return .{ .text = try a.dupe(u8, result.text), .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used, .native_execution_id = if (state.batched_decode_steps > 0) ctx.execution_id else 0 };
+        return .{ .text = try a.dupe(u8, result.text), .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used, .native_execution_id = if (state.batched_decode_steps > 0) ctx.execution_id else 0, .max_native_step_items = state.max_native_step_items };
     }
 
     fn readLightOnContinuousImages(self: *Node, allocator: std.mem.Allocator, model: *model_manager_mod.LoadedModel, model_path: []const u8, images: []const []const u8, prompt: []const u8, max_tokens: i32, control: InferenceExecutionControl) ![]Qwen3VlReadResult {
@@ -8786,7 +8879,7 @@ pub const Node = struct {
         var tasks: [reader_execution_pool.Pool.max_capacity]Task = undefined;
         var threads: [reader_execution_pool.Pool.max_capacity]std.Thread = undefined;
         var spawned: usize = 0;
-        const count = lightOnContinuousWorkerCount(images.len);
+        const count = lightOnContinuousWorkerCount(images.len, self.lightOnReaderWindow());
         defer for (threads[0..spawned]) |thread| thread.join();
         for (0..count) |i| {
             tasks[i] = .{ .node = self, .model = model, .model_path = model_path, .images = images, .prompt = prompt, .max_tokens = max_tokens, .control = control, .values = values, .failures = failures, .offset = i, .stride = count, .next_image = &next_image, .static_assignment = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_STATIC_PAGE_ASSIGNMENT") };
@@ -8824,8 +8917,7 @@ pub const Node = struct {
         max_tokens: i32,
         control: InferenceExecutionControl,
     ) ![]Qwen3VlReadResult {
-        if ((model.session.backend() == .metal or (model.session.backend() == .cuda and cudaLightOnBatchProfileEnabled())) and
-            platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_CONTINUOUS", metal_runtime.appleSimdgroupDeviceDefault()))
+        if (self.lightOnContinuousEnabled(model.session.backend()))
             return self.readLightOnContinuousImages(allocator, model, model_path, images, prompt, max_tokens, control);
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
@@ -8850,7 +8942,7 @@ pub const Node = struct {
         };
         const owner = std.heap.smp_allocator;
         const contract = try resolvedInferenceExecutorContract(self, "read", &model.manifest);
-        const window = @min(effectiveLightOnReadWindow(), contract.batch.max_items);
+        const window = @min(self.lightOnReaderWindow(), contract.batch.max_items);
         const results = try self.executorMicrobatchBroker().submitBatchControlled(
             LightOnReadPayload,
             Qwen3VlReadResult,
@@ -8948,7 +9040,7 @@ pub const Node = struct {
             if (std.mem.eql(u8, result.finish_reason, "length")) return error.ReadOutputTruncated;
             try self.item.control.check();
             try self.payload.control.check();
-            self.item.slot.setValue(Qwen3VlReadResult, .{ .text = try self.item.allocator.dupe(u8, result.text), .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used }, if (self.pipeline.decode_state.?.batched_decode_steps > 0) .native_batch else .serial);
+            self.item.slot.setValue(Qwen3VlReadResult, .{ .text = try self.item.allocator.dupe(u8, result.text), .prompt_tokens = result.prompt_tokens, .completion_tokens = result.tokens_used, .max_native_step_items = self.pipeline.decode_state.?.max_native_step_items }, if (self.pipeline.decode_state.?.batched_decode_steps > 0) .native_batch else .serial);
         }
     };
 
@@ -8980,7 +9072,7 @@ pub const Node = struct {
     }
 
     fn runLightOnReadCohortPooled(self: *Node, items: []const executor_microbatch.ExecuteItem) !void {
-        if (items.len == 0 or items.len > (if (cudaLightOnBatchProfileEnabled()) @as(usize, 64) else 16)) return error.InvalidBatchDecodeState;
+        if (items.len == 0 or items.len > (if (self.lightOnCudaBatchEnabled()) @as(usize, 64) else 16)) return error.InvalidBatchDecodeState;
         // This allocator is used by the backend across worker threads. Caller
         // allocators are only touched after the submitting caller rejoins.
         const allocator = std.heap.smp_allocator;
@@ -9002,7 +9094,7 @@ pub const Node = struct {
 
         const limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(model.session, self.defaultGenerationLimits(.gpu)));
         var budget = runtime.tier.memory.RunBudget.init(limits);
-        var memory = LightOnCohortMemory{ .backend = backend, .share_decoder_scratch = backend == .cuda, .decoder_rows = @min(items.len, effectiveLightOnReadRows()) };
+        var memory = LightOnCohortMemory{ .backend = backend, .share_decoder_scratch = backend == .cuda, .decoder_rows = @min(items.len, self.lightOnReaderRows()) };
         var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(allocator);
         defer coordinator.deinit();
         coordinator.setPolicy(self.lightOnOcrPolicy(items.len));
@@ -9124,7 +9216,7 @@ pub const Node = struct {
 
         const prompt = try resolveGenerativeReadPrompt(&resident_model_handle.get().manifest, requested_prompt);
         if (resident_model_handle.get().manifest.isLightOnOcr3() and (resident_model_handle.get().session.backend() == .metal or
-            (resident_model_handle.get().session.backend() == .cuda and cudaLightOnBatchProfileEnabled())) and
+            (resident_model_handle.get().session.backend() == .cuda and self.lightOnCudaBatchEnabled())) and
             platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_BATCH", true) and
             (try resolvedInferenceExecutorContract(self, "read", &resident_model_handle.get().manifest)).batch.mode == .native)
             return self.readLightOnImagesViaBroker(allocator, resident_model_handle.get(), model_path, image_datas, prompt, max_tokens, control);
@@ -11452,8 +11544,18 @@ pub const Node = struct {
             var device_lease: ?runtime.tier.memory.AdmissionLease = null;
             defer if (device_lease) |*owned| owned.release();
             if (backend == .metal or backend == .cuda) {
+                // An explicit scratch budget caps the encoder ceiling instead
+                // of refusing every request; the profile keeps the declared one.
+                const encoder_ceiling = glinerBoundaryEncoderCeiling(
+                    execution_options.device.max_encoder_device_bytes,
+                    self.config.generation_budget_overrides.scratch_limit_bytes,
+                    working_bytes,
+                    execution_options.device.head.max_device_bytes,
+                );
+                var ceiling_options = execution_options;
+                ceiling_options.device.max_encoder_device_bytes = encoder_ceiling;
                 if (workspace_plan) |plan| {
-                    request_options.device.max_encoder_device_bytes = try plan.requestEncoderLimit(execution_options.device.max_encoder_device_bytes);
+                    request_options.device.max_encoder_device_bytes = try plan.requestEncoderLimit(encoder_ceiling);
                     request_options.profile_encoder_device_limit = execution_options.device.max_encoder_device_bytes;
                 } else if (reference_encoder_bytes) |needed| {
                     // Size the encoder owner to this request instead of the
@@ -11466,7 +11568,7 @@ pub const Node = struct {
                 // borrowed workspace, which the controller owns through a
                 // separate persistent lease. The reference path has none, so
                 // its run reserves only what this request plans to use.
-                const run_device_bytes = if (workspace_plan == null) request_device_bytes else try boundary_executor.deviceScratchUpperBound(execution_options);
+                const run_device_bytes = if (workspace_plan == null) request_device_bytes else try boundary_executor.deviceScratchUpperBound(ceiling_options);
                 const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                     self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu)),
                     self.config.generation_budget_overrides.scratch_limit_bytes,
@@ -21060,11 +21162,11 @@ pub const Node = struct {
             for (qwen_results, 0..) |result, i| {
                 prompt_tokens = std.math.add(usize, prompt_tokens, result.prompt_tokens) catch std.math.maxInt(usize);
                 completion_tokens = std.math.add(usize, completion_tokens, result.completion_tokens) catch std.math.maxInt(usize);
-                results_out[i] = .{
-                    .text = try alloc.dupe(u8, result.text),
-                    .object = "read",
-                    .index = @intCast(i),
-                };
+                results_out[i] = try toApiReadObject(alloc, .{
+                    .allocator = alloc,
+                    .text = result.text,
+                    .completion = if (result.truncated) .length else .complete,
+                }, i);
                 filled = i + 1;
             }
             return ctx.json(api.ReadResponse{
@@ -21072,10 +21174,7 @@ pub const Node = struct {
                 .data = results_out,
                 .model = body.model,
                 .usage = tokenUsage(prompt_tokens, completion_tokens),
-                .execution = blk: {
-                    const observed = try qwenReadExecution(ctx.allocator, qwen_results);
-                    break :blk .{ .requested_items = @intCast(observed.requested_items), .native_batches = @intCast(observed.native_batches), .native_items = @intCast(observed.native_items), .serial_items = @intCast(observed.serial_items), .rejected_items = 0, .fallback_items = 0 };
-                },
+                .execution = try qwenReadExecutionReport(ctx.allocator, qwen_results),
             });
         }
 
@@ -21231,6 +21330,11 @@ pub const Node = struct {
 
         return .{
             .text = text_copy,
+            .status = switch (result.completion) {
+                .complete => "complete",
+                .length => "truncated",
+                .unresolved => "unresolved",
+            },
             .fields = if (fields_map) |fields| .{ .value = fields } else .absent,
             .regions = regions,
             .object = "read",
@@ -24599,7 +24703,7 @@ pub const Node = struct {
                     manifestSupportsZeroShotClassification(&listing.manifest),
                     has_visual,
                     has_audio,
-                    resolvedExecutorKind(normalizedInferenceTask(task).?, &listing.manifest),
+                    resolvedExecutorKindForNode(self, normalizedInferenceTask(task).?, &listing.manifest),
                     resolvedImageTransform(normalizedInferenceTask(task).?, &listing.manifest),
                     task,
                     requestMediaMaxBytes(self),
@@ -24673,7 +24777,7 @@ pub const Node = struct {
                     manifestSupportsZeroShotClassification(&model.manifest),
                     model.manifest.visual_model_path != null or model.manifest.visual_projection_path != null,
                     model.manifest.audio_model_path != null or model.manifest.audio_projection_path != null,
-                    resolvedExecutorKind(normalizedInferenceTask(task).?, &model.manifest),
+                    resolvedExecutorKindForNode(self, normalizedInferenceTask(task).?, &model.manifest),
                     resolvedImageTransform(normalizedInferenceTask(task).?, &model.manifest),
                     task,
                     requestMediaMaxBytes(self),
@@ -28306,6 +28410,14 @@ test "embeddinggemma2 grouped media executor limits remain family scoped" {
     try std.testing.expectEqual(@as(usize, 1), legacy.max_media_parts_per_item);
 }
 
+fn resolvedExecutorKindForNode(node: *const Node, task: []const u8, manifest: *const manifest_mod.ModelManifest) ResolvedExecutorKind {
+    if (std.mem.eql(u8, task, "read") and manifest.hasTask("read") and manifest.isLightOnOcr3() and
+        node.lightOnCudaBatchEnabled() and node.lightOnReaderRows() > 1 and
+        platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_BATCH", true))
+        return .native_lighton_reader;
+    return resolvedExecutorKind(task, manifest);
+}
+
 pub fn resolvedExecutorKind(
     resolved_task: []const u8,
     manifest: *const manifest_mod.ModelManifest,
@@ -28512,12 +28624,16 @@ fn effectiveLightOnReadWindow() usize {
     // A wider logical window can keep the physical sixteen-row forward full
     // while peers finish vision/prefill or retire. Every page still acquires
     // its own resource lease; this does not increase a forward's row limit.
-    const ceiling: usize = if (cudaLightOnBatchProfileEnabled()) lightOnPhysicalRowCeiling() else if (!metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_WIDE_DECODE")) 16 else if (lightOnPhysicalRowCeiling() == 64 or (lightOnPhysicalRowCeiling() == 32 and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_LOGICAL64"))) @as(usize, 64) else 32;
+    const ceiling = effectiveLightOnReadWindowCeiling();
     return @min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_WINDOW") orelse (if (ceiling > 32) ceiling else if (effectiveLightOnReadRows() > 16) @as(usize, 32) else if (metal_runtime.lightOnThroughputProfileEnabled()) @as(usize, 16) else 8), 1), ceiling);
 }
 
-fn lightOnContinuousWorkerCount(images: usize) usize {
-    return @min(images, effectiveLightOnReadWindow(), reader_execution_pool.Pool.max_capacity);
+fn effectiveLightOnReadWindowCeiling() usize {
+    return if (cudaLightOnBatchProfileEnabled()) lightOnPhysicalRowCeiling() else if (!metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_WIDE_DECODE")) 16 else if (lightOnPhysicalRowCeiling() == 64 or (lightOnPhysicalRowCeiling() == 32 and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_LOGICAL64"))) @as(usize, 64) else 32;
+}
+
+fn lightOnContinuousWorkerCount(images: usize, window: usize) usize {
+    return @min(images, window, reader_execution_pool.Pool.max_capacity);
 }
 
 /// Give concurrent OCR pages time to reach the same cohort before acquiring
@@ -28702,7 +28818,7 @@ fn resolvedInferenceExecutorContract(
     const manifest_audio = model_caps.modelAcceptsInput(manifest, "audio");
     const manifest_document = model_caps.modelAcceptsInput(manifest, "document") or
         model_caps.modelAcceptsInput(manifest, "pdf");
-    const executor_kind = resolvedExecutorKind(resolved_task, manifest);
+    const executor_kind = resolvedExecutorKindForNode(node, resolved_task, manifest);
     const modalities = resolvedExecutorModalities(
         resolved_task,
         manifest_text,
@@ -32984,21 +33100,23 @@ test "startup split Whisper backend is reused through canonical request paths" {
     });
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
     defer allocator.free(root);
-    var node = try Node.init(allocator, .{ .models_dir = root, .allow_unknown_models = true });
-    defer node.deinit();
-    try node.attachIo(std.testing.io);
-    node.model_manager.session_manager.preferred_backends = &.{ .native, .metal };
-    try node.warmTranscriber(allocator, .{ .kind = .transcriber, .name = "owner/tiny", .backend = .native });
-    const path = try node.resolveRequestModelPath(allocator, std.testing.io, "owner/tiny", "transcribers");
-    defer allocator.free(path);
-    const paths = try @import("../pipelines/encoder_decoder.zig").findEncoderDecoderPaths(allocator, path);
-    defer allocator.free(paths.encoder);
-    defer allocator.free(paths.decoder);
-    var handle = try node.model_manager.acquireCompositeRuntime(path, &.{ paths.encoder, paths.decoder }, .whisper, null);
-    defer handle.release();
-    try std.testing.expect(handle.get().startup_managed);
-    try std.testing.expectEqual(@as(usize, 1), node.model_manager.composite_assets.count());
-    try std.testing.expectEqualSlices(backends_mod.BackendType, &.{.native}, handle.get().preferred_backends);
+    for ([_]bool{ true, false }) |pin| {
+        var node = try Node.init(allocator, .{ .models_dir = root, .allow_unknown_models = true });
+        defer node.deinit();
+        try node.attachIo(std.testing.io);
+        node.model_manager.session_manager.preferred_backends = &.{ .native, .metal };
+        try node.warmModel(allocator, .{ .kind = .transcriber, .name = "owner/tiny", .backend = .native, .pin = pin });
+        const path = try node.resolveRequestModelPath(allocator, std.testing.io, "owner/tiny", "transcribers");
+        defer allocator.free(path);
+        const paths = try @import("../pipelines/encoder_decoder.zig").findEncoderDecoderPaths(allocator, path);
+        defer allocator.free(paths.encoder);
+        defer allocator.free(paths.decoder);
+        var handle = try node.model_manager.acquireCompositeRuntime(path, &.{ paths.encoder, paths.decoder }, .whisper, null);
+        defer handle.release();
+        try std.testing.expectEqual(pin, handle.get().startup_managed);
+        try std.testing.expectEqual(@as(usize, 1), node.model_manager.composite_assets.count());
+        try std.testing.expectEqualSlices(backends_mod.BackendType, &.{.native}, handle.get().preferred_backends);
+    }
 }
 
 test "runtime unload bypasses inference admission while load remains admitted" {
@@ -42666,8 +42784,8 @@ test "LightOnOCR3 logical64 isolates physical rows and bounds multi-image worker
     const eligible = metal_runtime.appleSimdgroupDeviceDefault();
     const window: usize = if (eligible) 64 else 32;
     try std.testing.expectEqual(window, effectiveLightOnReadWindow());
-    try std.testing.expectEqual(window, lightOnContinuousWorkerCount(128));
-    try std.testing.expectEqual(@as(usize, 17), lightOnContinuousWorkerCount(17));
+    try std.testing.expectEqual(window, lightOnContinuousWorkerCount(128, window));
+    try std.testing.expectEqual(@as(usize, 17), lightOnContinuousWorkerCount(17, window));
     var node: Node = undefined;
     node.config = .{};
     const policy = node.lightOnOcrPolicy(32);
@@ -47467,6 +47585,23 @@ test "LightOnOCR3 serial and cohort CUDA admission charge persistent recurrent s
     try std.testing.expectEqual(peak, cohort.decoder_backend_peak);
 }
 
+test "LightOnOCR3 configured reader batching separates public request bounds from scheduler rows" {
+    var node = try Node.init(std.testing.allocator, .{
+        .generation_batching = .{ .mode = .on, .max_step_items = 4 },
+        .request_limits = .{ .max_items_per_request = 1 },
+    });
+    defer node.deinit();
+    try std.testing.expectEqual(@as(usize, 4), node.lightOnReaderRows());
+    try std.testing.expectEqual(@as(usize, 8), node.lightOnReaderWindow());
+    const policy = node.lightOnOcrPolicy(2);
+    try std.testing.expectEqual(@as(usize, 2), policy.max_step_items);
+    try std.testing.expectEqual(@as(?usize, 8), policy.max_active_requests_for_batching);
+    node.config.generation_batching.max_step_items = 0;
+    try std.testing.expectEqual(@as(usize, 1), node.lightOnReaderRows());
+    node.config.generation_batching.max_step_items = 10000;
+    try std.testing.expectEqual(@max(lightOnPhysicalRowCeiling(), 16), node.lightOnReaderRows());
+}
+
 test "OCR generative profiles resolve page budgets without changing admission units" {
     const a = std.testing.allocator;
     var lighton_capabilities = [_][]const u8{"lightonocr3"};
@@ -47482,4 +47617,63 @@ test "OCR generative profiles resolve page budgets without changing admission un
         try std.testing.expectEqual(@as(usize, 20), Node.estimateGenerateAdmissionUnitsFromShape(0, 1, @intCast(tokens)));
     }
     try std.testing.expectEqual(@as(usize, 1), estimateReadAdmissionUnits(1, 256));
+}
+
+test "reader batching reports observed cross-request step width rather than request count" {
+    const results = [_]Node.Qwen3VlReadResult{.{ .text = @constCast(""), .prompt_tokens = 1, .completion_tokens = 1, .native_execution_id = 42, .max_native_step_items = 4 }};
+    const observed = try Node.qwenReadExecution(std.testing.allocator, &results);
+    try std.testing.expectEqual(@as(usize, 1), observed.requested_items);
+    try std.testing.expectEqual(@as(usize, 1), observed.native_items);
+    try std.testing.expectEqual(@as(usize, 4), observed.max_native_step_items);
+    const wire = try Node.qwenReadExecutionReport(std.testing.allocator, &results);
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, wire, .{});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"max_native_step_items\":4") != null);
+    var singleton = results;
+    singleton[0].native_execution_id = 0;
+    singleton[0].max_native_step_items = 1;
+    const serial = try Node.qwenReadExecution(std.testing.allocator, &singleton);
+    try std.testing.expectEqual(@as(usize, 0), serial.native_items);
+    try std.testing.expectEqual(@as(usize, 1), serial.max_native_step_items);
+}
+
+test "reader batching node honors explicit environment rollback in canonical mode" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const names = [_][:0]const u8{ "ANTFLY_LIGHTONOCR3_CUDA_BATCH", "ANTFLY_LIGHTONOCR3_BATCH_ROWS", "ANTFLY_LIGHTONOCR3_BATCH_WINDOW" };
+    const values = [_][:0]const u8{ "0", "1", "1" };
+    var saved: [names.len]?[:0]u8 = @splat(null);
+    var saved_count: usize = 0;
+    defer for (names[0..saved_count], saved[0..saved_count]) |name, value| {
+        if (value) |old| {
+            _ = Env.setenv(name, old, 1);
+            std.testing.allocator.free(old);
+        } else _ = Env.unsetenv(name);
+    };
+    for (names, 0..) |name, i| {
+        if (platform.env.getenv(name)) |old| saved[i] = try std.testing.allocator.dupeSentinel(u8, old, 0);
+        saved_count += 1;
+    }
+    for (names, values) |name, value| if (Env.setenv(name, value, 1) != 0) return error.EnvironmentMutationFailed;
+    // This policy query must not initialize model managers, routes or drivers.
+    var node: Node = undefined;
+    node.config = .{ .generation_batching = .{ .mode = .on, .max_step_items = 4 } };
+    try std.testing.expect(!node.lightOnCudaBatchEnabled());
+    const policy = node.lightOnOcrPolicy(16);
+    try std.testing.expectEqual(@as(usize, 1), policy.max_step_items);
+    try std.testing.expectEqual(@as(?usize, 1), policy.max_active_requests_for_batching);
+    try std.testing.expectEqual(@as(usize, 1), lightOnContinuousWorkerCount(4, node.lightOnReaderWindow()));
+}
+
+test "reader batching API reports measured completion without inferring it from text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const completions = [_]readers_api.Completion{ .complete, .length, .unresolved };
+    for (completions, [_][]const u8{ "complete", "truncated", "unresolved" }) |completion, expected| {
+        const result = try Node.toApiReadObject(arena.allocator(), .{ .allocator = arena.allocator(), .text = "same text", .completion = completion }, 0);
+        try std.testing.expectEqualStrings(expected, result.status.?);
+    }
 }

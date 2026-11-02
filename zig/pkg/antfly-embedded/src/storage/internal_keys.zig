@@ -262,6 +262,16 @@ pub fn isInternalMetadataKey(key: []const u8) bool {
     return key[0] == replay_namespace or key[0] == identity_namespace;
 }
 
+/// Physical DB records other than authored primary/relational rows. This also
+/// recognizes the reserved textual families used by transaction receipts,
+/// columnar state and older metadata protocols.
+pub fn isControlRecordKey(key: []const u8) bool {
+    return isInternalMetadataKey(key) or
+        (isInternalUserKey(key) and !isStoredDocumentRowKey(key)) or
+        std.mem.startsWith(u8, key, "\x00\x00__") or
+        std.mem.startsWith(u8, key, "\x00antfly/");
+}
+
 pub fn isInternalUserKey(key: []const u8) bool {
     return key.len > 0 and key[0] == user_namespace;
 }

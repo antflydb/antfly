@@ -46,8 +46,10 @@ pub const Executor = struct {
     provider_runtime: ?*managed.ProviderRuntime = null,
     source_table: []const u8 = "",
 
-    fn providerHttp(self: Executor, cloudflare: bool) !*httpx.Client {
-        if (cloudflare) if (self.provider_runtime) |runtime| return runtime.assetHttpClient();
+    fn providerHttp(self: Executor) !*httpx.Client {
+        // Media tasks can exceed embedding's 30-second I/O envelope regardless
+        // of provider. Invocation deadlines and cancellation remain authoritative.
+        if (self.provider_runtime) |runtime| return runtime.assetHttpClient();
         return self.http;
     }
 
@@ -368,7 +370,7 @@ pub const Executor = struct {
         const key = cfg.bearer_token orelse cfg.api_key orelse (if (uses_default) self.inference_api_key else null);
         if (key) |value| cfg.bearer_token = try secrets.resolveReferenceOwned(a, self.secret_store, value);
         cfg.api_key = null;
-        return transcribing.transcribeWithConfig(a, try self.providerHttp(cfg.provider == .cloudflare), cfg, request, .{
+        return transcribing.transcribeWithConfig(a, try self.providerHttp(), cfg, request, .{
             .timeout_ms = try self.context.remainingTimeoutMs(),
             .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null,
         });
@@ -379,14 +381,14 @@ pub const Executor = struct {
         var cfg = try (self.view.synthesizers orelse return error.ModelNotFound).getConfig(name);
         if (cfg.provider == .vertex) {
             if (cfg.api_key) |value| cfg.api_key = try secrets.resolveReferenceOwned(a, self.secret_store, value);
-            return synthesizing.synthesizeWithConfig(a, try self.providerHttp(cfg.provider == .cloudflare), cfg, request, .{ .timeout_ms = try self.context.remainingTimeoutMs(), .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null });
+            return synthesizing.synthesizeWithConfig(a, try self.providerHttp(), cfg, request, .{ .timeout_ms = try self.context.remainingTimeoutMs(), .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null });
         }
         var key = try secrets.SecretValue.initConfigOrEnv(a, cfg.api_key, if (cfg.provider == .cloudflare) "CLOUDFLARE_API_TOKEN" else if (cfg.provider == .elevenlabs) "ELEVENLABS_API_KEY" else "OPENAI_API_KEY");
         defer key.deinit(a);
         const resolved = try key.resolveOwned(a, self.secret_store);
         defer if (resolved) |value| a.free(value);
         cfg.api_key = resolved;
-        return synthesizing.synthesizeWithConfig(a, try self.providerHttp(cfg.provider == .cloudflare), cfg, request, .{
+        return synthesizing.synthesizeWithConfig(a, try self.providerHttp(), cfg, request, .{
             .timeout_ms = try self.context.remainingTimeoutMs(),
             .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null,
         });
@@ -399,7 +401,7 @@ pub const Executor = struct {
         if (cfg.provider == .antfly and cfg.resolvedUrl() == null and self.antfly_provider == null) if (self.inference_api_url) |endpoint| {
             cfg.api_url = try gateway.apiBaseAlloc(a, endpoint);
         };
-        if (cfg.provider == .apple) return readers.readWithConfigReported(a, try self.providerHttp(cfg.provider == .cloudflare), cfg, request, .{
+        if (cfg.provider == .apple) return readers.readWithConfigReported(a, try self.providerHttp(), cfg, request, .{
             .timeout_ms = try self.context.remainingTimeoutMs(),
             .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null,
         });
@@ -426,7 +428,7 @@ pub const Executor = struct {
                 return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
             }
         };
-        return readers.readWithConfigReported(a, try self.providerHttp(cfg.provider == .cloudflare), cfg, request, .{
+        return readers.readWithConfigReported(a, try self.providerHttp(), cfg, request, .{
             .timeout_ms = try self.context.remainingTimeoutMs(),
             .cancellation = if (self.context.cancellation) |v| httpx.CancellationToken.fromCallback(v.ptr, v.is_cancelled_fn) else null,
         });
@@ -807,4 +809,20 @@ test "provider registry gateway read aliases preserve documents retention and ca
     const image = try std.json.parseFromSliceLeaky(Json, a, legacy, .{});
     try std.testing.expectEqualStrings("url", image.object.get("images").?.array.items[0].object.get("url").?.string);
     try std.testing.expectEqualStrings("caller", image.object.get("prompt").?.string);
+}
+
+test "provider registry media transport retains long task envelope without weakening embedding" {
+    var runtime = managed.ProviderRuntime.init(std.testing.allocator, std.testing.io);
+    defer runtime.deinit();
+    var ordinary = httpx.Client.initWithConfig(std.testing.allocator, std.testing.io, .{});
+    defer ordinary.deinit();
+    const executor = Executor{ .view = undefined, .http = &ordinary, .context = .{ .io = std.testing.io, .deadline_ns = null }, .provider_runtime = &runtime };
+    const media = try executor.providerHttp();
+    try std.testing.expect(media != &ordinary);
+    try std.testing.expectEqual(@as(u64, 300_000), media.config.timeouts.read_ms);
+    try std.testing.expectEqual(@as(u64, 300_000), media.config.timeouts.request_ms);
+    const embedding = try runtime.httpClient();
+    try std.testing.expectEqual(@as(u64, 30_000), embedding.config.timeouts.read_ms);
+    const borrowed = Executor{ .view = undefined, .http = &ordinary, .context = .{ .io = std.testing.io, .deadline_ns = null } };
+    try std.testing.expect((try borrowed.providerHttp()) == &ordinary);
 }

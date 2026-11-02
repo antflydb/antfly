@@ -94,6 +94,8 @@ export type { GraphDiagnostic } from "./graph-types.js";
 export type {
   Capabilities,
   CheckReport,
+  LiveByteAccounting,
+  LiveByteCategory,
   CompactReport,
   InferenceOptions,
   InferenceStatus,

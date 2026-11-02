@@ -21,7 +21,7 @@ struct LightOnAttentionPage {
   uint32_t tokens;
   uint32_t query_position;
   uint32_t block_count;
-  uint32_t blocks[64];
+  uint32_t block_offset;
 };
 struct LightOnAttentionParams {
   const float *q;
@@ -40,12 +40,24 @@ struct LightOnAttentionParams {
   uint32_t row_values;
   uint32_t capacity;
   LightOnAttentionPage pages[64];
+  uint32_t blocks[4096];
   const uint32_t *graph_progress;
   uint32_t graph_step;
   uint32_t reserved;
 };
-static_assert(sizeof(LightOnAttentionPage) == 268, "page ABI");
-static_assert(sizeof(LightOnAttentionParams) == 17264, "packet ABI");
+static_assert(sizeof(LightOnAttentionPage) == 16, "page ABI");
+static_assert(sizeof(LightOnAttentionParams) == 17520, "packet ABI");
+
+__device__ __forceinline__ bool valid_page(const LightOnAttentionParams &p,
+                                           const LightOnAttentionPage &page,
+                                           uint32_t delta) {
+  if (p.page_size == 0 || page.tokens == 0 || page.block_count == 0 ||
+      page.block_offset > 4096 || page.block_count > 4096 - page.block_offset)
+    return false;
+  const uint64_t tokens = uint64_t(page.tokens) + delta;
+  return tokens <= uint64_t(page.block_count) * p.page_size &&
+         tokens <= UINT32_MAX && uint64_t(page.query_position) + delta < tokens;
+}
 
 // Each page owns an exclusive writable tail. Host validation proves bounds,
 // physical capacity and non-aliasing before a single suffix is changed.
@@ -60,13 +72,13 @@ extern "C" __global__ void lighton_attention_write_suffix(
   if (p.graph_progress && progress < p.graph_step)
     return;
   const uint32_t delta = p.graph_progress ? progress - p.graph_step : 0;
-  if (page.tokens == 0 || page.tokens > 1024 || delta > 1024 - page.tokens)
+  if (!valid_page(p, page, delta))
     return;
   const uint32_t token = page.tokens + delta - 1;
   if (token / p.page_size >= page.block_count)
     return;
   const uint32_t physical =
-      page.blocks[token / p.page_size] * p.page_size + token % p.page_size;
+      p.blocks[page.block_offset + token / p.page_size] * p.page_size + token % p.page_size;
   const uint32_t destination = physical * p.row_values + d;
   const uint32_t source = item * p.row_values + d;
   const_cast<__half *>(p.k)[destination] = __float2half_rn(p.new_k[source]);
@@ -101,7 +113,7 @@ attention_chunks(const LightOnAttentionParams &p) {
   if (p.graph_progress && progress < p.graph_step)
     return;
   const uint32_t delta = p.graph_progress ? progress - p.graph_step : 0;
-  if (page.tokens == 0 || page.tokens > 1024 || delta > 1024 - page.tokens)
+  if (!valid_page(p, page, delta))
     return;
   const uint32_t tokens = page.tokens + delta;
   const uint32_t query_position = page.query_position + delta;
@@ -131,7 +143,7 @@ attention_chunks(const LightOnAttentionParams &p) {
     uint32_t physical = p.capacity;
     if (key < tokens && key <= query_position &&
         logical_page < page.block_count)
-      physical = page.blocks[logical_page] * p.page_size + key % p.page_size;
+      physical = p.blocks[page.block_offset + logical_page] * p.page_size + key % p.page_size;
     float score = 0;
     if (physical < p.capacity) {
       const uint32_t base = physical * p.row_values + kv_head * 256;
@@ -181,7 +193,7 @@ attention_chunks(const LightOnAttentionParams &p) {
     const uint32_t key = chunk * Chunk + local_key;
     if (key < tokens && key <= query_position && scores[local_key] != 0) {
       const uint32_t physical =
-          page.blocks[key / p.page_size] * p.page_size + key % p.page_size;
+          p.blocks[page.block_offset + key / p.page_size] * p.page_size + key % p.page_size;
       if (physical < p.capacity) {
         const uint32_t base = physical * p.row_values + kv_head * 256;
         first += scores[local_key] * __half2float(p.v[base + tid]);
@@ -212,7 +224,7 @@ attention_grouped_chunks(const LightOnAttentionParams &p) {
   if (p.graph_progress && progress < p.graph_step)
     return;
   const uint32_t delta = p.graph_progress ? progress - p.graph_step : 0;
-  if (page.tokens == 0 || page.tokens > 1024 || delta > 1024 - page.tokens)
+  if (!valid_page(p, page, delta))
     return;
   const uint32_t tokens = page.tokens + delta;
   const uint32_t query_position = page.query_position + delta;
@@ -238,7 +250,7 @@ attention_grouped_chunks(const LightOnAttentionParams &p) {
     if (key < tokens && key <= query_position &&
         key / p.page_size < page.block_count)
       physical =
-          page.blocks[key / p.page_size] * p.page_size + key % p.page_size;
+          p.blocks[page.block_offset + key / p.page_size] * p.page_size + key % p.page_size;
     float score = 0.f;
     if (physical < p.capacity) {
       unsigned base = physical * p.row_values + kh * 256;
@@ -273,7 +285,7 @@ attention_grouped_chunks(const LightOnAttentionParams &p) {
     unsigned key = chunk * Chunk + local;
     if (key < tokens && key <= query_position && scores[warp][local] != 0.f) {
       unsigned physical =
-          page.blocks[key / p.page_size] * p.page_size + key % p.page_size;
+          p.blocks[page.block_offset + key / p.page_size] * p.page_size + key % p.page_size;
       if (physical < p.capacity) {
         unsigned base = physical * p.row_values + kh * 256;
 #pragma unroll
@@ -312,8 +324,9 @@ lighton_attention_combine(const __grid_constant__ LightOnAttentionParams p) {
   __shared__ float denominator;
   __shared__ float scales[32];
   if (tid < 32) {
-    float m =
-        tid < p.chunks ? p.statistics[(row * p.chunks + tid) * 2] : -INFINITY;
+    float m = -INFINITY;
+    for (uint32_t chunk = tid; chunk < p.chunks; chunk += 32)
+      m = fmaxf(m, p.statistics[(row * p.chunks + chunk) * 2]);
     m = warp_max(m);
     if (tid == 0)
       maximum = m;
@@ -321,11 +334,10 @@ lighton_attention_combine(const __grid_constant__ LightOnAttentionParams p) {
   __syncthreads();
   if (tid < 32) {
     float sum = 0;
-    if (tid < p.chunks) {
-      const uint32_t index = (row * p.chunks + tid) * 2;
+    for (uint32_t chunk = tid; chunk < p.chunks; chunk += 32) {
+      const uint32_t index = (row * p.chunks + chunk) * 2;
       const float scale = expf(p.statistics[index] - maximum);
-      scales[tid] = scale;
-      sum = scale * p.statistics[index + 1];
+      sum += scale * p.statistics[index + 1];
     }
     sum = warp_sum(sum);
     if (tid == 0)
@@ -333,10 +345,20 @@ lighton_attention_combine(const __grid_constant__ LightOnAttentionParams p) {
   }
   __syncthreads();
   float first = 0, second = 0;
-  for (uint32_t chunk = 0; chunk < p.chunks; ++chunk) {
-    const uint32_t base = (row * p.chunks + chunk) * 256;
-    first += scales[chunk] * p.partials[base + tid];
-    second += scales[chunk] * p.partials[base + tid + 128];
+  // Tile the scale staging rather than indexing a 32-entry shared array
+  // with the full document context. Shared memory stays constant as the
+  // admitted partial workspace grows with the number of chunks.
+  for (uint32_t tile = 0; tile < p.chunks; tile += 32) {
+    const uint32_t count = min(32u, p.chunks - tile);
+    if (tid < count)
+      scales[tid] = expf(p.statistics[(row * p.chunks + tile + tid) * 2] - maximum);
+    __syncthreads();
+    for (uint32_t local = 0; local < count; ++local) {
+      const uint32_t base = (row * p.chunks + tile + local) * 256;
+      first += scales[local] * p.partials[base + tid];
+      second += scales[local] * p.partials[base + tid + 128];
+    }
+    __syncthreads();
   }
   p.out[row * 256 + tid] = first / denominator;
   p.out[row * 256 + tid + 128] = second / denominator;

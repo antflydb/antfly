@@ -5,7 +5,7 @@ ARG WASMTIME_VERSION=v45.0.2
 ARG TARGETARCH
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates curl xz-utils && \
+    apt-get install -y --no-install-recommends ca-certificates curl xz-utils libstdc++6 && \
     rm -rf /var/lib/apt/lists/*
 
 RUN case "${TARGETARCH}" in \
@@ -39,6 +39,33 @@ RUN case "${TARGETARCH}" in \
     test -f /opt/cublas/lib/libcublasLt.so.12 && \
     rm /tmp/cublas.tar.xz
 
+# LightOn BF16 vision uses cuDNN graph attention. Bundle its CUDA 12 runtime
+# and NVRTC dependencies alongside the existing CUDA 12.9 cuBLASLt ABI.
+# Pins: NVIDIA redistrib_9.19.0.json and CUDA redistrib_12.9.1.json.
+RUN case "${TARGETARCH}" in \
+        amd64) vendor_arch="x86_64"; cudnn_sha256="9762704894a2c4c6e6f9cda831b1fd55b79e3038955fe551a880a6ce1fe140e2"; cudart_sha256="1f6ad42d4f530b24bfa35894ccf6b7209d2354f59101fd62ec4a6192a184ce99"; nvrtc_sha256="82913658363892dbc0f2638b070476234476e06e084fed60db861cb7e161a6af" ;; \
+        arm64) vendor_arch="sbsa"; cudnn_sha256="d2d3d64c87bd4bc067e2c518e30814fbab00f3e8a8c84c33efe2e826290d00a4"; cudart_sha256="8b422a3b2cb8452cb678181b0bf9d7aa7342df168b5319c5488ae3b8514101fc"; nvrtc_sha256="fb2d50c791465f333fc2236d2419170cf7a7886f48dd9b967a10f8233c686029" ;; \
+        *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    package="cudnn-linux-${vendor_arch}-9.19.0.56_cuda12-archive" && \
+    curl -fsSL "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-${vendor_arch}/${package}.tar.xz" -o /tmp/cudnn.tar.xz && \
+    echo "${cudnn_sha256}  /tmp/cudnn.tar.xz" | sha256sum --check --strict && \
+    mkdir -p /opt/cudnn && \
+    tar -xJf /tmp/cudnn.tar.xz -C /opt/cudnn --strip-components=1 \
+        --wildcards "${package}/lib/*.so*" "${package}/LICENSE*" && \
+    test -f /opt/cudnn/lib/libcudnn.so.9 && \
+    rm /tmp/cudnn.tar.xz && \
+    for component in "cuda_cudart:12.9.79:${cudart_sha256}" "cuda_nvrtc:12.9.86:${nvrtc_sha256}"; do \
+        name="${component%%:*}"; rest="${component#*:}"; version="${rest%%:*}"; checksum="${rest#*:}"; \
+        package="${name}-linux-${vendor_arch}-${version}-archive"; \
+        curl -fsSL "https://developer.download.nvidia.com/compute/cuda/redist/${name}/linux-${vendor_arch}/${package}.tar.xz" -o /tmp/vendor.tar.xz && \
+        echo "${checksum}  /tmp/vendor.tar.xz" | sha256sum --check --strict && \
+        mkdir -p "/opt/${name}" && \
+        tar -xJf /tmp/vendor.tar.xz -C "/opt/${name}" --strip-components=1 \
+            --wildcards "${package}/lib/*.so*" "${package}/LICENSE*" && \
+        rm /tmp/vendor.tar.xz || exit 1; \
+    done
+
 FROM --platform=$TARGETPLATFORM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
@@ -61,6 +88,12 @@ COPY share/antfly /usr/share/antfly
 COPY --from=runtime-libraries /opt/wasmtime/lib/libwasmtime.so /usr/local/lib/libwasmtime.so
 COPY --from=runtime-libraries /opt/cublas/lib/ /usr/local/lib/
 COPY --from=runtime-libraries /opt/cublas/LICENSE* /usr/share/doc/antfly/cublas/
+COPY --from=runtime-libraries /opt/cudnn/lib/ /usr/local/lib/
+COPY --from=runtime-libraries /opt/cudnn/LICENSE* /usr/share/doc/antfly/cudnn/
+COPY --from=runtime-libraries /opt/cuda_cudart/lib/ /usr/local/lib/
+COPY --from=runtime-libraries /opt/cuda_cudart/LICENSE* /usr/share/doc/antfly/cudart/
+COPY --from=runtime-libraries /opt/cuda_nvrtc/lib/ /usr/local/lib/
+COPY --from=runtime-libraries /opt/cuda_nvrtc/LICENSE* /usr/share/doc/antfly/nvrtc/
 
 ENV ANTFLY_WASMTIME_LIB=/usr/local/lib/libwasmtime.so
 # GKE mounts the host CUDA driver here; keep Wasmtime's bundled library path.
@@ -77,6 +110,12 @@ RUN ldd /antfly && \
     cat /tmp/cublaslt-ldd.txt && \
     ! grep -E 'not found|undefined symbol' /tmp/cublaslt-ldd.txt && \
     rm /tmp/cublaslt-ldd.txt && \
+    for library in libcudnn.so.9 libcudnn_graph.so.9 libnvrtc.so.12 libcudart.so.12; do \
+        ldd -r "/usr/local/lib/${library}" > /tmp/vendor-ldd.txt 2>&1 && \
+        cat /tmp/vendor-ldd.txt && \
+        ! grep -E 'not found|undefined symbol' /tmp/vendor-ldd.txt || exit 1; \
+    done && \
+    rm /tmp/vendor-ldd.txt && \
     /antfly --version
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
