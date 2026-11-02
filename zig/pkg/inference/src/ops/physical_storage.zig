@@ -17,15 +17,22 @@
 //! plan owns one reference; outstanding values pin storage across plan eviction.
 const std = @import("std");
 const ops = @import("ops.zig");
+const accounting = @import("../execution/storage_accounting.zig");
 
 pub const Lease = struct {
     allocator: std.mem.Allocator,
     backend: ops.ComputeBackend,
     tensor: ops.CT,
     byte_size: usize,
+    ledger: ?*accounting.Ledger = null,
+    accounting_class: accounting.Class = .activation,
+    backing_byte_size: ?usize = null,
     references: std.atomic.Value(usize) = .init(1),
 
     pub fn create(allocator: std.mem.Allocator, backend: ops.ComputeBackend, byte_size: usize) !?*Lease {
+        return createTracked(allocator, backend, byte_size, null, .activation);
+    }
+    pub fn createTracked(allocator: std.mem.Allocator, backend: ops.ComputeBackend, byte_size: usize, ledger: ?*accounting.Ledger, class: accounting.Class) !?*Lease {
         if (byte_size == 0 or byte_size % @sizeOf(f32) != 0 or byte_size / @sizeOf(f32) > std.math.maxInt(i32)) return null;
         const self = try allocator.create(Lease);
         errdefer allocator.destroy(self);
@@ -34,7 +41,10 @@ pub const Lease = struct {
             allocator.destroy(self);
             return null;
         };
-        self.* = .{ .allocator = allocator, .backend = backend, .tensor = tensor, .byte_size = byte_size };
+        const measure = if (backend.vtable.kernels) |functions| functions.physicalStorageBytes else null;
+        const backing_bytes = if (measure) |bytes| bytes(backend.ptr, tensor) else null;
+        self.* = .{ .allocator = allocator, .backend = backend, .tensor = tensor, .byte_size = byte_size, .ledger = ledger, .accounting_class = class, .backing_byte_size = backing_bytes };
+        if (ledger) |owner| owner.allocated(class, byte_size, backing_bytes);
         return self;
     }
     pub fn retain(self: *Lease) void {
@@ -49,7 +59,12 @@ pub const Lease = struct {
         std.debug.assert(before > 0);
         if (before != 1) return;
         self.backend.free(self.tensor);
+        const ledger = self.ledger;
+        const class = self.accounting_class;
+        const requested = self.byte_size;
+        const backing = self.backing_byte_size;
         self.allocator.destroy(self);
+        if (ledger) |owner| owner.freed(class, requested, backing);
     }
 };
 
@@ -406,4 +421,77 @@ test "row snapshots keep their own values after source storage changes" {
     const values = try cb.toFloat32(published, a);
     defer a.free(values);
     try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, values);
+}
+
+test "physical storage accounting survives program eviction and capture pins at every allocation failure" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+            defer context.deinit(a);
+            const cb = context.computeBackend();
+            const ledger = try accounting.Ledger.create(a);
+            defer ledger.release(); // Diagnostic observer, independent of the program.
+            ledger.retain();
+            var program_owned = true;
+            defer if (program_owned) ledger.release();
+            const constant = (try Lease.createTracked(a, cb, 64, ledger, .constant)).?;
+            defer constant.release();
+            const activation = (try Lease.createTracked(a, cb, 128, ledger, .activation)).?;
+            var activation_owned = true;
+            defer if (activation_owned) activation.release();
+            const view = (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = activation, .shape = &.{ 2, 16 } })).?;
+            var view_owned = true;
+            defer if (view_owned) cb.free(view);
+            var capture = CapturedLeases{};
+            defer capture.deinit(a);
+            try capture.retain(a, activation);
+            try capture.retain(a, activation); // A second address use is not a new allocation.
+            const warm = ledger.snapshot();
+            try std.testing.expectEqual(@as(u64, 2), warm.total.leases_created);
+            try std.testing.expectEqual(@as(?u64, 192), warm.total.backing_live_bytes);
+            try std.testing.expectEqual(@as(u64, 64), warm.constant.requested_live_bytes);
+            try std.testing.expectEqual(@as(u64, 128), warm.activation.requested_live_bytes);
+            program_owned = false;
+            ledger.release();
+            activation_owned = false;
+            activation.release();
+            capture.deinit(a);
+            try std.testing.expectEqual(@as(?u64, 192), ledger.snapshot().total.backing_live_bytes);
+            // Only the published tensor retains the retired activation now.
+            view_owned = false;
+            cb.free(view);
+            const retired = ledger.snapshot();
+            try std.testing.expectEqual(@as(?u64, 64), retired.total.backing_live_bytes);
+            try std.testing.expectEqual(@as(?u64, 192), retired.total.backing_peak_bytes);
+            try std.testing.expectEqual(@as(u64, 1), retired.total.leases_released);
+            try std.testing.expectEqual(@as(u64, 0), retired.activation.requested_live_bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "physical CUDA storage accounting measures its actual backing span" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = @import("../backends/compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer context.deinit(a);
+    const ledger = try accounting.Ledger.create(a);
+    defer ledger.release();
+    const lease = (try Lease.createTracked(a, context.computeBackend(), 68, ledger, .workspace)).?;
+    var lease_owned = true;
+    defer if (lease_owned) lease.release();
+    const live = ledger.snapshot();
+    try std.testing.expectEqual(@as(u64, 68), live.workspace.requested_live_bytes);
+    try std.testing.expect(live.workspace.backing_live_bytes.? >= 68);
+    try std.testing.expectEqual(lease.backing_byte_size.?, live.workspace.backing_live_bytes.?);
+    lease_owned = false;
+    lease.release();
+    const done = ledger.snapshot();
+    try std.testing.expectEqual(@as(?u64, 0), done.total.backing_live_bytes);
+    try std.testing.expectEqual(@as(u64, 1), done.total.leases_created);
+    try std.testing.expectEqual(@as(u64, 1), done.total.leases_released);
 }

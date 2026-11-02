@@ -26,6 +26,8 @@ pub const VTable = struct {
     /// during warmup; capture retains their leases before recording addresses.
     physicalExecutionScope: ?*const fn (ctx: *anyopaque, storages: ?[]const ?*physical_storage.Lease) anyerror!void = null,
     allocatePhysicalStorage: ?*const fn (ctx: *anyopaque, byte_size: usize) anyerror!?CT = null,
+    /// Backing buffer span, including allocator reuse/rounding. Null is unknown.
+    physicalStorageBytes: ?*const fn (ctx: *anyopaque, tensor: CT) ?usize = null,
     physicalTensorView: ?*const fn (ctx: *anyopaque, request: physical_storage.View) anyerror!?CT = null,
     copyPhysicalInput: ?*const fn (ctx: *anyopaque, destination: CT, source: CT) anyerror!void = null,
     createPhysicalReplay: ?*const fn (ctx: *anyopaque) anyerror!?physical_storage.Replay = null,

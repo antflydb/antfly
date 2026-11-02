@@ -63,3 +63,6 @@ test {
     _ = gliner_boundary_artifact;
     _ = gliner_boundary_bundle;
 }
+
+/// Published loaded generation, with explicit serving lifecycle services.
+pub const loaded_runtime = @import("loaded_runtime.zig");

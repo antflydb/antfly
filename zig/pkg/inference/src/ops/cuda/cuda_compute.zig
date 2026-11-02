@@ -29597,6 +29597,7 @@ const kernel_backend_impl = ops.KernelBackend{
     .physicalReplayReshapeViews = true,
     .physicalExecutionScope = &physicalExecutionScopeOp,
     .allocatePhysicalStorage = &allocatePhysicalStorageOp,
+    .physicalStorageBytes = &physicalStorageBytesOp,
     .physicalTensorView = &physicalTensorViewOp,
     .copyPhysicalInput = &copyPhysicalInputOp,
     .createPhysicalReplay = &createPhysicalReplayOp,
@@ -32427,6 +32428,11 @@ test "CUDA retained reshape and row views preserve owning metadata without GPU a
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+fn physicalStorageBytesOp(_: *anyopaque, tensor: CT) ?usize {
+    const buffer = tensorFromCt(tensor).buffer;
+    return if (buffer.borrowed) null else buffer.allocation_bytes;
 }
 
 fn allocatePhysicalStorageOp(ctx: *anyopaque, byte_size: usize) anyerror!?CT {

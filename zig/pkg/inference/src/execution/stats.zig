@@ -36,6 +36,9 @@ pub const PhysicalReplayDecision = enum {
 };
 
 pub const ExecutionStats = struct {
+    /// Actual owned spans for this prepared program, including published values.
+    /// Lifetime peaks are not per-request peaks or total model/device residency.
+    planned_storage: ?@import("storage_accounting.zig").Snapshot = null,
     physical_replay: PhysicalReplayDecision = .not_requested,
     physical_graph_captures: u64 = 0,
     physical_capture_failures: u64 = 0,

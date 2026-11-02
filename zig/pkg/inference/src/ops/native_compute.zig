@@ -4514,6 +4514,7 @@ fn getIo(ctx: *anyopaque) ?std.Io {
 }
 
 const kernel_backend_impl = ops.KernelBackend{
+    .physicalStorageBytes = &physicalStorageBytesOp,
     .physicalTensorView = &physicalTensorViewOp,
     .runAssignedKernel = &runAssignedKernelOp,
     .readFloat32Into = &readFloat32IntoOp,
@@ -34985,39 +34986,12 @@ fn typedShapeNumel(shape: []const i64) ?usize {
 /// A non-owning exact reader. bytesAsSlice retains align(1), allowing safe
 /// reads from mapped or deliberately unaligned integer tensor payloads.
 const IndexReader = struct {
-    source: ?*const tensor_mod.Tensor,
-    legacy: []const f32,
-    len: usize,
-
-    fn init(indices: CT) !IndexReader {
-        if (integerSource(indices)) |source|
-            return .{ .source = source, .legacy = &.{}, .len = try integerTensorCount(source) };
-        const data = getData(indices);
-        return .{ .source = null, .legacy = data, .len = data.len };
-    }
-
-    fn at(self: IndexReader, index: usize) !i64 {
-        if (index >= self.len) return error.IndexOutOfBounds;
-        if (self.source) |source| return switch (source.dtype) {
-            .i8 => std.mem.bytesAsSlice(i8, source.data)[index],
-            .i16 => std.mem.bytesAsSlice(i16, source.data)[index],
-            .u8, .bool_ => source.data[index],
-            .i32 => std.mem.bytesAsSlice(i32, source.data)[index],
-            .i64 => std.mem.bytesAsSlice(i64, source.data)[index],
-            else => unreachable,
-        };
-        const value: f64 = self.legacy[index];
-        if (!std.math.isFinite(value) or value < -9223372036854775808.0 or value >= 9223372036854775808.0)
-            return error.InvalidIndex;
-        return @intFromFloat(value);
-    }
-
-    fn normalized(self: IndexReader, index: usize, extent: usize) !usize {
-        const signed_extent = std.math.cast(i64, extent) orelse return error.InvalidTensorShape;
-        var value = try self.at(index);
-        if (value < 0) value += signed_extent;
-        if (value < 0 or value >= signed_extent) return error.IndexOutOfBounds;
-        return @intCast(value);
+    fn init(indices: CT) !@import("index_metadata.zig").Reader {
+        if (integerSource(indices)) |source| {
+            _ = try integerTensorCount(source);
+            return @import("index_metadata.zig").Reader.init(source.dtype, source.data);
+        }
+        return @import("index_metadata.zig").Reader.init(.f32, std.mem.sliceAsBytes(getData(indices)));
     }
 };
 
@@ -48721,6 +48695,10 @@ test "embeddinggemma2 video host borrows avoid copies and writable views reject 
     cb.free(output); // The retained row still owns the parent allocation.
     try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, (try cb.hostFloat32Read(view)).?);
     cb.free(view);
+}
+
+fn physicalStorageBytesOp(_: *anyopaque, tensor: CT) ?usize {
+    return toBuf(tensor).data.len * @sizeOf(f32);
 }
 
 fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) anyerror!?CT {

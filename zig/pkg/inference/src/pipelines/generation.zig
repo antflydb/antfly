@@ -455,51 +455,7 @@ pub fn selectV1RuntimeQualified() bool {
 /// Conservative upper bound for select_v1 residency and compaction
 /// transients, callable by serving admission before request KV allocation.
 pub fn selectedV1PeakBytes(config: gpt_mod.Config, dtype: runtime.kv.pool.KvDType) !usize {
-    const policy = runtime.kv.selection.defaults;
-    const transient = try policy.transientRows();
-    var resident_device: usize = 0;
-    var largest_row_bytes: usize = 0;
-    var largest_key_width: usize = 0;
-    var largest_query_width: usize = 0;
-    var query_capture: usize = 0;
-    for (0..@as(usize, @intCast(config.num_hidden_layers))) |layer| {
-        const geometry = try config.kvDonorGeometry(layer);
-        if (!config.layerUsesSlidingAttention(layer)) {
-            const query_width = try std.math.mul(usize, @intCast(config.num_attention_heads), @intCast(geometry.head_dim));
-            largest_query_width = @max(largest_query_width, query_width);
-            query_capture = try std.math.add(usize, query_capture, try std.math.mul(usize, policy.query_horizon, try std.math.mul(usize, query_width, @sizeOf(f32))));
-        }
-        if (!config.isKvDonorLayer(layer) or geometry.sliding) continue;
-        const row_bytes = try dtype.bytesForTokenPairChecked(geometry.num_kv_heads, geometry.head_dim);
-        resident_device = try std.math.add(usize, resident_device, try std.math.mul(usize, transient, row_bytes));
-        largest_row_bytes = @max(largest_row_bytes, row_bytes);
-        largest_key_width = @max(largest_key_width, try std.math.mul(usize, @intCast(geometry.num_kv_heads), @intCast(geometry.head_dim)));
-    }
-    const staged_device = try std.math.mul(usize, transient, largest_row_bytes);
-    // Positions, accumulator, GPU result, ranking records, keep bitmap, and
-    // retained source/position arrays, rounded upward for alignment overhead.
-    const host_selection = try std.math.mul(usize, transient, 80);
-    // Metal owns copies of Q and positions, per-query/head normalization, and
-    // scores. Consumer dispatches are serial, so only the largest is live.
-    const gpu_q = try std.math.mul(usize, policy.query_horizon, try std.math.mul(usize, largest_query_width, @sizeOf(f32)));
-    const gpu_query_positions = try std.math.mul(usize, policy.query_horizon, @sizeOf(u32));
-    const gpu_key_positions = try std.math.mul(usize, transient, @sizeOf(u32));
-    const gpu_norm = try std.math.mul(usize, policy.query_horizon, try std.math.mul(usize, @intCast(config.num_attention_heads), 2 * @sizeOf(f32)));
-    const gpu_scores = try std.math.mul(usize, transient, @sizeOf(f32));
-    var scorer = try std.math.add(usize, gpu_q, gpu_query_positions);
-    scorer = try std.math.add(usize, scorer, gpu_key_positions);
-    scorer = try std.math.add(usize, scorer, gpu_norm);
-    scorer = try std.math.add(usize, scorer, gpu_scores);
-    var oracle: usize = 0;
-    if (select_v1_gpu_oracle) {
-        oracle = try std.math.mul(usize, transient, try std.math.mul(usize, largest_key_width, @sizeOf(f32)));
-        oracle = try std.math.add(usize, oracle, try std.math.mul(usize, transient, @sizeOf(f64)));
-    }
-    var total = try std.math.add(usize, resident_device, staged_device);
-    total = try std.math.add(usize, total, query_capture);
-    total = try std.math.add(usize, total, host_selection);
-    total = try std.math.add(usize, total, scorer);
-    return std.math.add(usize, total, oracle);
+    return decoder_storage.selectedPeakBytes(config, dtype, select_v1_gpu_oracle);
 }
 
 test "select_v1 public peak estimate includes dtype-sensitive donor residency" {
@@ -563,22 +519,13 @@ fn validateKvCachePolicy(config: GenerationConfig) !void {
     }
 }
 
-pub fn kvSlidingTrimForced() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_KV_SLIDING_TRIM", false);
-}
+pub const kvSlidingTrimForced = decoder_storage.slidingTrimForced;
 
 pub fn metalSplitSwaRingRequestEligible(
     model_config: gpt_mod.Config,
     generation_config: GenerationConfig,
 ) bool {
-    if (comptime !build_options.enable_metal) return false;
-    const sampled_or_grammar = !isPureGreedyConfig(generation_config) or generation_config.grammar != null;
-    return model_config.supportsSplitSwaGlobalKvRing() and
-        (!sampled_or_grammar or model_config.num_local_experts == 0) and
-        !gemma4_runtime.wholeFramePrefillExplicitlyDisabled() and
-        metalRingDecodeRequestEligible(generation_config) and
-        !kvSlidingTrimForced() and
-        backends.metal_kv_storage.MetalKvStorage.splitSwaKvRingEnabled();
+    return decoder_storage.splitRingRequestEligible(model_config, decoderStorageRequest(generation_config), exact_hybrid_sampled_ring_qualification_override);
 }
 
 pub fn metalSplitSwaRingEligible(
@@ -586,9 +533,7 @@ pub fn metalSplitSwaRingEligible(
     generation_config: GenerationConfig,
     kv_dtype: runtime.kv.pool.KvDType,
 ) bool {
-    if (comptime !build_options.enable_metal) return false;
-    return metalSplitSwaRingRequestEligible(model_config, generation_config) and
-        backends.metal_kv_storage.KeyFormat.fromKvDType(kv_dtype) != null;
+    return decoder_storage.splitRingEligible(model_config, decoderStorageRequest(generation_config), kv_dtype, exact_hybrid_sampled_ring_qualification_override);
 }
 
 pub const GenerationKvRoute = decoder_storage.Route;
@@ -604,11 +549,7 @@ pub fn generationKvCapacityPolicyForRoute(
     generation_config: GenerationConfig,
     kv_dtype: runtime.kv.pool.KvDType,
 ) runtime.tier.memory.GenerationKvCapacityPolicy {
-    if (route == .standard) return .full_history;
-    return generationKvCapacityPolicy(
-        route,
-        metalSplitSwaRingEligible(model_config, generation_config, kv_dtype),
-    );
+    return decoder_storage.routeCapacityPolicy(route, model_config, decoderStorageRequest(generation_config), kv_dtype, exact_hybrid_sampled_ring_qualification_override);
 }
 
 pub fn kvPoolConfig(
@@ -2279,16 +2220,18 @@ fn metalRingDecodeRequestEligible(config: GenerationConfig) bool {
 }
 
 fn metalRingDecodeRequestEligibleWithQualification(config: GenerationConfig, sampled_qualified: bool) bool {
-    // Sampled/grammar decode may materialize KV through the logits path,
-    // even when prefill used a whole-model frame. Ring storage cannot
-    // satisfy that contract after eviction. Select full-history storage
-    // before prefill; never switch layouts or disable the read guard midway.
-    // Both admission and execution use this policy to reserve the same layout.
-    const direct_decode_supported = (isPureGreedyConfig(config) and config.grammar == null) or
-        sampled_qualified;
-    return direct_decode_supported and !config.prompt_cache_enabled and
-        config.cache_compaction_ratio == null and !config.speculation_requested and
-        config.draft_model == null;
+    return decoder_storage.ringRequestEligible(decoderStorageRequest(config), sampled_qualified);
+}
+
+fn decoderStorageRequest(config: GenerationConfig) decoder_storage.Request {
+    return .{
+        .pure_greedy = isPureGreedyConfig(config),
+        .grammar = config.grammar != null,
+        .prompt_cache = config.prompt_cache_enabled,
+        .compaction = config.cache_compaction_ratio != null,
+        .speculation = config.speculation_requested,
+        .draft = config.draft_model != null,
+    };
 }
 
 fn requiresCudaDecodeGraphBeforeEagerFallback(

@@ -21,6 +21,7 @@ const ml = @import("ml");
 const ops = @import("../ops/ops.zig");
 const buffers = @import("../graph/buffer_plan.zig");
 const storage = ops.physical_storage;
+const accounting = @import("storage_accounting.zig");
 const kernels = ops.kernel_descriptor;
 const Graph = ml.graph.Graph;
 const NodeId = ml.graph.NodeId;
@@ -30,6 +31,7 @@ const Binding = @import("program.zig").Binding;
 const ReplayDecision = @import("stats.zig").PhysicalReplayDecision;
 
 pub const Stats = struct {
+    storage_usage: ?accounting.Snapshot = null,
     replay_decision: ReplayDecision = .not_requested,
     dispatches: u64 = 0,
     transfers: u64 = 0,
@@ -66,6 +68,7 @@ const TransferPlan = struct { shape: ml.graph.Shape, backend_index: usize, alloc
 
 pub const Pool = struct {
     allocator: std.mem.Allocator,
+    accounting: ?*accounting.Ledger = null,
     /// Borrow the plan's heap-backed slices, never its movable struct address.
     plan: buffers.BufferPlan,
     kernels: []?KernelPlan,
@@ -173,8 +176,10 @@ pub const Pool = struct {
         for (owned_backends, scratch_requirements, 0..) |backend, requirement, index| {
             if (requirement.byte_size != 0) workspace_ids[index] = try plan.addWorkspace(backend.kind(), requirement.byte_size, requirement.alignment);
         }
+        const ledger = try accounting.Ledger.create(allocator);
+        errdefer ledger.release();
         const self = try allocator.create(Pool);
-        self.* = .{ .allocator = allocator, .plan = plan.*, .kernels = prepared, .transfers = transfers, .backends = owned_backends, .workspace_allocations = workspace_ids };
+        self.* = .{ .allocator = allocator, .accounting = ledger, .plan = plan.*, .kernels = prepared, .transfers = transfers, .backends = owned_backends, .workspace_allocations = workspace_ids };
         return self;
     }
 
@@ -340,6 +345,7 @@ pub const Pool = struct {
         self.allocator.free(self.transfers);
         self.allocator.free(self.workspace_allocations);
         self.allocator.free(self.backends);
+        if (self.accounting) |ledger| ledger.release();
         self.allocator.destroy(self);
     }
 
@@ -380,6 +386,7 @@ pub const Frame = struct {
     pool: *Pool,
     storages: []?*storage.Lease,
     completions: []?storage.Completion,
+    collect_storage_stats: bool = false,
     in_use: bool = true,
     retired: bool = false,
     stats: Stats = .{},
@@ -457,6 +464,9 @@ pub const Frame = struct {
             // An uncertain completion must never authorize address reuse.
             self.retired = true;
             return err;
+        };
+        if (self.collect_storage_stats) if (self.pool.accounting) |ledger| {
+            self.stats.storage_usage = ledger.snapshot();
         };
         return self.stats;
     }
@@ -617,7 +627,7 @@ pub const Frame = struct {
         const owner = &self.pool.shared_constants[binding.constant_index.?];
         if (owner.lease == null) {
             const bytes: usize = @intCast(self.pool.plan.allocations[id].byte_size);
-            const lease = (try storage.Lease.create(self.pool.allocator, cb.*, bytes)) orelse return error.InvalidShape;
+            const lease = (try storage.Lease.createTracked(self.pool.allocator, cb.*, bytes, self.pool.accounting, .constant)) orelse return error.InvalidShape;
             errdefer lease.release();
             const view = try self.viewForShape(cb, lease, binding.shape);
             errdefer cb.free(view);
@@ -642,7 +652,7 @@ pub const Frame = struct {
                 if (cb.vtable.kernels.?.createPhysicalCompletion) |make_completion| self.completions[backend_index] = try make_completion(cb.ptr);
             }
             const bytes: usize = @intCast(self.pool.plan.allocations[allocation_id].byte_size);
-            self.storages[allocation_id] = (try storage.Lease.create(self.pool.allocator, cb.*, bytes)) orelse return null;
+            self.storages[allocation_id] = (try storage.Lease.createTracked(self.pool.allocator, cb.*, bytes, self.pool.accounting, if (self.pool.plan.allocations[allocation_id].kind == .workspace) .workspace else .activation)) orelse return null;
             self.stats.allocations += 1;
             self.stats.allocated_bytes += bytes;
         } else self.stats.reused_allocations += 1;

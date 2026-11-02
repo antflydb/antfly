@@ -33145,7 +33145,7 @@ test "runtime model instances preserve shared task identity and survive missing 
         .sp_tok = null,
         .session = .{ .ptr = &probe, .vtable = &Probe.vtable },
         .session_manager = &node.model_manager.session_manager,
-        .model_manager = &node.model_manager,
+        .host = node.model_manager.loadedRuntimeHost(),
         .model_dir = missing_model_dir,
         .allocator = allocator,
         .prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator),

@@ -191,6 +191,7 @@ pub const Runtime = struct {
     }
 
     fn addPhysicalStats(stats: *partition_mod.PartitionExecutor.ExecutionStats, physical: @import("../execution/physical_buffers.zig").Stats) void {
+        stats.planned_storage = physical.storage_usage;
         stats.physical_replay = physical.replay_decision;
         stats.assigned_kernel_dispatches += physical.dispatches;
         stats.physical_transfer_dispatches += physical.transfers;
@@ -261,7 +262,10 @@ pub const Runtime = struct {
                         if (active.finish()) |_| {} else |err| std.log.warn("physical frame completion failed during cleanup: {s}", .{@errorName(err)});
                     }
                 };
-                if (frame) |active| try active.begin();
+                if (frame) |active| {
+                    active.collect_storage_stats = options.collect_partition_stats;
+                    try active.begin();
+                }
                 var planned_options = options;
                 planned_options.physical_frame = frame;
                 const replay_inputs = if (frame) |active| try active.bindReplayInputs(options) else null;
