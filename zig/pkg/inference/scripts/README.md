@@ -161,7 +161,9 @@ python3 zig/pkg/inference/scripts/kernel_source_accounting.py \
 The ledger includes replacement owners and metadata, staged/unstaged changes
 and untracked files outside ignored fixture directories. Metal shader bytes
 measure the maintained Objective-C string representation; generated copies and
-compiled images remain separate from authored production savings.
+compiled images remain separate from authored production savings. Add
+`--candidate <commit>` to reproduce a committed ledger while later work remains
+in the checkout; this excludes subsequent working-tree changes.
 
 ## LightOnOCR-3 Metal throughput
 

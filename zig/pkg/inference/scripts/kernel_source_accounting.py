@@ -176,11 +176,17 @@ def shader(text):
     return (''.join(device), ''.join(host))
 
 
-def account(root, baseline):
+def account(root, baseline, candidate=None):
     root = Path(root).resolve()
     baseline = subprocess.check_output(['git', 'rev-parse', '--verify', baseline + '^{commit}'], cwd=root, text=True).strip()
-    paths = set(subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', baseline], cwd=root, text=True).splitlines())
-    paths.update(subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], cwd=root, text=True).splitlines())
+    if candidate is not None:
+        candidate = subprocess.check_output(['git', 'rev-parse', '--verify', candidate + '^{commit}'], cwd=root, text=True).strip()
+    diff_args = ['git', 'diff', '--no-renames', '--name-only', baseline]
+    if candidate is not None:
+        diff_args.append(candidate)
+    paths = set(subprocess.check_output(diff_args, cwd=root, text=True).splitlines())
+    if candidate is None:
+        paths.update(subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], cwd=root, text=True).splitlines())
 
     def old(path):
         return subprocess.run(['git', 'show', baseline + ':' + path], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
@@ -196,7 +202,8 @@ def account(root, baseline):
     for name in sorted(paths):
         path = root / name
         before = old(name)
-        after = path.read_bytes() if path.exists() else b''
+        after = (subprocess.run(['git', 'show', candidate + ':' + name], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+                 if candidate is not None else path.read_bytes() if path.exists() else b'')
         row = {'path': name, 'baseline_sha256': hashlib.sha256(before).hexdigest(), 'candidate_sha256': hashlib.sha256(after).hexdigest(), 'groups': []}
         if path.suffix in {'.fatbin', '.cubin', '.ptx'}:
             row['image_bytes_removed'] = len(before) - len(after)
@@ -255,7 +262,8 @@ def account(root, baseline):
     production = {key: sum((x[key] for x in shipping.values())) for key in ['lines_removed', 'bytes_removed']}
     receipt = {
         'baseline': baseline,
-        'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
+        'head': candidate or subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
+        'candidate_source': 'commit' if candidate is not None else 'working_tree',
         'note': 'Net source accounting includes all replacement owners and metadata; '
                 'Zig test blocks are separated lexically. '
                 'All scripts/bench changes are tooling. Image bytes are reported separately.',
@@ -271,9 +279,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path.cwd())
     parser.add_argument('--revision', required=True)
+    parser.add_argument('--candidate', help='Compare this committed tree, excluding subsequent working-tree changes')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    receipt = account(args.root, args.revision)
+    receipt = account(args.root, args.revision, args.candidate)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(receipt, indent=2) + '\n')
     print(json.dumps({'groups': receipt['groups'], 'authored_production': receipt['authored_production']}, indent=2))
