@@ -110,8 +110,13 @@ preparation API do not by themselves complete these remaining requirements:
   graphs retain ordinary execution, with explicit replay decisions in diagnostics.
   Model-specific decode capture retains its learned arena as a compatibility
   path. Universal physical planning and retirement of that fallback remain open.
-- `model_definition.zig`, `compute_context.zig`, prepared executables and model
-  candidates separate important responsibilities. The session factory, model
+- `model_definition.zig` owns artifact loading. Native and PJRT sessions share
+  one failure-atomic host preparation path for normalization, resident/lazy
+  weights and prefetch ownership. CUDA reuses its admitted manifest snapshot
+  when opening that source, retaining early device/artifact preflight. Prefetch
+  guards are installed only after the final session owner is in place.
+  `compute_context.zig`, prepared executables and model candidates separate
+  further responsibilities. The session factory, model
   manager and generation pipeline still contain model-specific loading and
   physical execution decisions. Optional specialized hooks now use typed
   operation regions (decoder, replay, relative/window attention, encoder,

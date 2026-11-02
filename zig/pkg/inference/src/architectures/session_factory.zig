@@ -752,16 +752,33 @@ pub fn createNativeSession(allocator: std.mem.Allocator, model_path: []const u8)
 }
 
 pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
-    return createNativeSessionForCudaUpload(allocator, model_path, override, false);
+    return openHostSession(allocator, model_path, override, .{});
 }
 
-// CUDA borrows packed encoder storage from this temporary session. Ordinary
-// CPU loading keeps its existing execution policy.
-fn createNativeSessionForCudaUpload(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride, retain_gliner_q8: bool) !Session {
-    var direct_quant_enabled = directQuantEnabled();
-    const cpu_plan_context = defaultPlanContextForBackend(.cpu);
+/// Host preparation selects the final owner before installing prefetch guards.
+/// CUDA upload retains packed encoder storage and materializes weights that
+/// would otherwise be lazy; ordinary execution retains its CPU policy.
+const HostPreparation = struct {
+    backend: enum { native, pjrt } = .native,
+    intent: enum { execute, device_upload } = .execute,
+};
+
+fn openHostSession(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride, preparation: HostPreparation) !Session {
     var loaded_model = try model_definition.LoadedModel.open(allocator, model_path);
     defer loaded_model.deinit();
+    return prepareLoadedHostSession(allocator, model_path, &loaded_model, override, preparation);
+}
+
+/// Consumes the loaded source's weights, retaining its metadata until return.
+/// Both host backends use the same normalization, residency and cleanup path.
+fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8, loaded_model: *model_definition.LoadedModel, override: ?TaskOverride, preparation: HostPreparation) !Session {
+    var direct_quant_enabled = directQuantEnabled();
+    const cpu_plan_context = defaultPlanContextForBackend(.cpu);
+    if (preparation.backend == .pjrt) switch (loaded_model.architecture) {
+        .embedding_gemma2 => return error.UnsupportedBackend,
+        .gliner_boundary => return error.UnsupportedGlinerBoundaryBackend,
+        else => {},
+    };
     var mf = loaded_model.manifest;
 
     // Detect architecture from config.json
@@ -797,7 +814,7 @@ fn createNativeSessionForCudaUpload(allocator: std.mem.Allocator, model_path: []
     }
     const boundary_identity = if (arch_config == .gliner_boundary) try captureBoundaryIdentity(&mf, store) else null;
     const gliner_decision_identity = try captureGlinerDecisionIdentity(&mf, store);
-    const keep_gliner_q8 = retain_gliner_q8 and requiresModernBertSpanClassifier(mf) and ggufEncoderHasQuantizedTensors(store);
+    const keep_gliner_q8 = preparation.intent == .device_upload and requiresModernBertSpanClassifier(mf) and ggufEncoderHasQuantizedTensors(store);
     if (keep_gliner_q8) {
         const identity = gliner_decision_identity orelse return error.UnsupportedGlinerDecisionArtifact;
         if (try gliner_decide_qualification.require(identity) != .decide_1b) return error.UnsupportedGlinerDecisionArtifact;
@@ -915,7 +932,7 @@ fn createNativeSessionForCudaUpload(allocator: std.mem.Allocator, model_path: []
         // CUDA transfers the resident inventory and closes this host session.
         // EmbeddingGemma 2's CPU lazy weights must be materialized here so its
         // encoder and media towers remain available after that handoff.
-        const cuda_embedding_gemma2_upload = retain_gliner_q8 and arch_config == .embedding_gemma2;
+        const cuda_embedding_gemma2_upload = preparation.intent == .device_upload and arch_config == .embedding_gemma2;
         if (!cuda_embedding_gemma2_upload and shouldLazyLoadWeight(store.kind(), arch_config, key)) {
             if (lazy_weights.contains(key)) {
                 continue;
@@ -1033,6 +1050,16 @@ fn createNativeSessionForCudaUpload(allocator: std.mem.Allocator, model_path: []
     };
 
     const task = sessionTaskForModelType(mf.model_type, override);
+    const native_data: NativeData = .{
+        .allocator = allocator,
+        .resident_weights = resident_weights,
+        .lazy_weights = lazy_weights,
+        .tensor_store = resident_store,
+        .moe_num_experts = @intCast(moe_num_experts),
+        .residency = residency,
+        .tier_cache = tier_cache,
+        .allow_direct_quant = direct_quant_enabled,
+    };
     const impl = try allocator.create(ArchSession);
     impl.* = .{
         .allocator = allocator,
@@ -1044,33 +1071,43 @@ fn createNativeSessionForCudaUpload(allocator: std.mem.Allocator, model_path: []
             std.meta.activeTag(arch_config),
             task,
         ),
-        .backend_type = .native,
+        .backend_type = switch (preparation.backend) {
+            .native => .native,
+            .pjrt => .pjrt,
+        },
         .boundary_identity = boundary_identity,
         .gliner_decision_identity = gliner_decision_identity,
-        .backend_data = .{ .native = .{
-            .allocator = allocator,
-            .resident_weights = resident_weights,
-            .lazy_weights = lazy_weights,
-            .tensor_store = resident_store,
-            .moe_num_experts = @intCast(moe_num_experts),
-            .residency = residency,
-            .tier_cache = tier_cache,
-            .allow_direct_quant = direct_quant_enabled,
-        } },
+        .backend_data = switch (preparation.backend) {
+            .native => .{ .native = native_data },
+            .pjrt => .{ .pjrt = .{ .native = native_data } },
+        },
     };
     maps_owned = false;
     store_owned = false;
     residency_owned = false;
     errdefer archClose(impl);
-    native_mod.initPrefetchQueue(&impl.backend_data.native, allocator);
+    // The final union member is in place before queues borrow its address.
+    // Client ownership transfers directly to the session; all subsequent
+    // failures close it together with the native weight inventory.
+    if (build_options.enable_pjrt and preparation.backend == .pjrt) {
+        impl.backend_data.pjrt.client = pjrt_lib.pjrt.Client.initFromEnv(allocator) catch |err| blk: {
+            std.log.warn("PJRT plugin not found ({s}); PJRT session will use native CPU fallback", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+    const host_data = switch (preparation.backend) {
+        .native => &impl.backend_data.native,
+        .pjrt => &impl.backend_data.pjrt.native,
+    };
+    native_mod.initPrefetchQueue(host_data, allocator);
     {
-        var lazy_it = impl.backend_data.native.lazy_weights.iterator();
+        var lazy_it = host_data.lazy_weights.iterator();
         while (lazy_it.next()) |entry| {
-            entry.value_ptr.guard = impl.backend_data.native.prefetch.lockHandle();
+            entry.value_ptr.guard = host_data.prefetch.lockHandle();
         }
     }
-    if (impl.backend_data.native.lazy_weights.count() > 0) {
-        try native_mod.startPrefetchWorker(&impl.backend_data.native);
+    if (host_data.lazy_weights.count() > 0) {
+        try native_mod.startPrefetchWorker(host_data);
     }
     return archSessionHandle(impl);
 }
@@ -1096,269 +1133,57 @@ pub fn createPjrtSession(allocator: std.mem.Allocator, model_path: []const u8) !
 }
 
 pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
-    // PJRT weights are served through native CPU — re-use the full native CPU load path.
-    const direct_quant_enabled = directQuantEnabled();
-    const cpu_plan_context = defaultPlanContextForBackend(.cpu);
-    var loaded_model = try model_definition.LoadedModel.open(allocator, model_path);
-    defer loaded_model.deinit();
-    const mf = loaded_model.manifest;
+    return openHostSession(allocator, model_path, override, .{ .backend = .pjrt });
+}
 
-    var arch_config = loaded_model.architecture;
-    if (arch_config == .embedding_gemma2) return error.UnsupportedBackend;
-    if (arch_config == .gliner_boundary) return error.UnsupportedGlinerBoundaryBackend;
-    var store = loaded_model.takeWeights();
-    if (mf.usesGgufWeights()) {
-        if (try buildGgufInspectionReport(allocator, arch_config, store, requiresModernBertSpanClassifier(mf))) |report| {
-            defer {
-                var r = report;
-                r.deinit();
-            }
-            try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
-        }
-    }
-    const source = (try store.weightSource()) orelse return error.NoDenseWeightSource;
-    const is_gliner_span_modern = mf.gliner_architecture == .span and mf.gliner_span_encoder_family == .modern_bert;
-
-    const prefix = switch (arch_config) {
-        .bert => |cfg| cfg.effectivePrefix(),
-        .modern_bert => if (is_gliner_span_modern) "encoder" else "",
-        .gliner_modern_bert => "",
-        .nomic_bert, .embedding_gemma2 => "",
-        .deberta => "deberta",
-        .t5 => "",
-        .gpt => "",
-        .whisper => "",
-        .florence => "",
-        .clip => "",
-        .clap => "",
-        .gliner, .gliner_boundary => "encoder",
-        .layoutlmv3 => |cfg| cfg.effectivePrefix(),
-    };
-
-    const is_gliner = arch_config == .gliner or arch_config == .gliner_boundary or is_gliner_span_modern;
-    const actual_prefix = blk: {
-        if (is_gliner) break :blk prefix;
-        switch (arch_config) {
-            .gpt => |cfg| if (cfg.weight_prefix.len != 0) break :blk "",
-            else => {},
-        }
-        const names = try source.listNames(allocator);
-        defer allocator.free(names);
-        var detected_prefix = prefix;
-        for (names) |name| {
-            if (std.mem.startsWith(u8, name, "bert.")) {
-                detected_prefix = "bert";
-                break;
-            } else if (std.mem.startsWith(u8, name, "deberta.")) {
-                detected_prefix = "deberta";
-                break;
-            } else if (std.mem.startsWith(u8, name, "roberta.")) {
-                detected_prefix = "roberta";
-                break;
-            } else if (std.mem.startsWith(u8, name, "distilbert.")) {
-                detected_prefix = "distilbert";
-                break;
-            } else if (std.mem.startsWith(u8, name, "layoutlmv3.")) {
-                detected_prefix = "layoutlmv3";
-                break;
-            } else if (arch_config == .gpt and std.mem.startsWith(u8, name, "model.language_model.")) {
-                detected_prefix = "model.language_model";
-                break;
-            } else if (arch_config == .gpt and std.mem.startsWith(u8, name, "language_model.")) {
-                detected_prefix = "language_model";
-                break;
-            }
-        }
-        break :blk detected_prefix;
-    };
-
-    // Load all weights (same logic as createNativeSessionWithTaskOverride).
-    const all_names = try source.listNames(allocator);
-    defer allocator.free(all_names);
-    try maybeInferGptAttentionLayoutFromStore(allocator, store, all_names, &arch_config);
-
-    var resident_weights = std.StringHashMapUnmanaged(LoadedWeight){};
-    var lazy_weights = std.StringHashMapUnmanaged(LazyWeightEntry){};
-    errdefer {
-        var wit = resident_weights.iterator();
-        while (wit.next()) |entry| {
-            var w = entry.value_ptr.*;
-            w.deinit();
-            allocator.free(entry.key_ptr.*);
-        }
-        resident_weights.deinit(allocator);
-        var lit = lazy_weights.iterator();
-        while (lit.next()) |entry| {
-            if (entry.value_ptr.loaded) |*loaded| loaded.deinit();
-            entry.value_ptr.tensor_ref.deinit(allocator);
-            allocator.free(entry.key_ptr.*);
-        }
-        lazy_weights.deinit(allocator);
-        store.deinit();
-    }
-
-    for (all_names) |full_name| {
-        if (try appendPackedMoeLazyWeights(allocator, &lazy_weights, store, arch_config, full_name, cpu_plan_context)) {
-            continue;
-        }
-
-        const base_key = if (is_gliner)
-            glinerBaseWeightKey(full_name)
-        else if (actual_prefix.len > 0 and std.mem.startsWith(u8, full_name, actual_prefix) and full_name.len > actual_prefix.len and full_name[actual_prefix.len] == '.')
-            full_name[actual_prefix.len + 1 ..]
-        else
-            full_name;
-        var key_buf: [256]u8 = undefined;
-        const key = try normalizeWeightKey(store.kind(), arch_config, base_key, &key_buf);
-        const owned_key = try allocator.dupe(u8, key);
-        if (shouldLazyLoadWeight(store.kind(), arch_config, key)) {
-            if (lazy_weights.contains(key)) {
-                allocator.free(owned_key);
-                continue;
-            }
-            const expert_coord = parseMoeExpertCoord(key);
-            const tensor_ref = try store.describeTensor(allocator, full_name);
-            try lazy_weights.put(allocator, owned_key, .{
-                .tensor_ref = tensor_ref,
-                .expert_coord = expert_coord,
-                .projection_mask = if (expert_coord != null) projectionMaskForWeightKey(key) else 0,
-                .placement = runtime.tier.planner.planForContext(cpu_plan_context, key, tensor_ref.byte_len),
-            });
-            continue;
-        }
-
-        if (direct_quant_enabled and try shouldKeepResidentWeightQuantizedOnly(allocator, store, arch_config, key, full_name)) {
-            const tensor_ref = try store.describeTensor(allocator, full_name);
-            defer {
-                var ref = tensor_ref;
-                ref.deinit(allocator);
-            }
-            const storage = (try store.loadQuantizedStorageRef(&tensor_ref)) orelse {
-                allocator.free(owned_key);
-                return error.UnsupportedTensorType;
+test "host preparation shares native and PJRT ownership and unwinds allocation failures" {
+    if (!build_options.enable_native or build_options.enable_pjrt) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"bert\",\"hidden_size\":4,\"num_hidden_layers\":1,\"num_attention_heads\":1,\"intermediate_size\":8,\"vocab_size\":2}" });
+    const header = "{\"bert.embeddings.word_embeddings.weight\":{\"dtype\":\"F32\",\"shape\":[2,4],\"data_offsets\":[0,32]}}";
+    const padded_len = comptime std.mem.alignForward(usize, header.len, 8);
+    var bytes: [8 + padded_len + 32]u8 = undefined;
+    @memset(&bytes, ' ');
+    std.mem.writeInt(u64, bytes[0..8], padded_len, .little);
+    @memcpy(bytes[8..][0..header.len], header);
+    const values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    @memcpy(bytes[8 + padded_len ..], std.mem.asBytes(&values));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = &bytes });
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(path);
+    const Check = struct {
+        fn run(a: std.mem.Allocator, model_path: []const u8, preparation: HostPreparation, gpt2: bool) !void {
+            var loaded = try model_definition.LoadedModel.open(a, model_path);
+            defer loaded.deinit();
+            var session = try prepareLoadedHostSession(a, model_path, &loaded, .classifier, preparation);
+            defer session.close();
+            try std.testing.expect(loaded.weights == null);
+            const impl: *ArchSession = @ptrCast(@alignCast(session.ptr));
+            try std.testing.expectEqual(SessionTask.classifier, impl.task);
+            const data = switch (preparation.backend) {
+                .native => &impl.backend_data.native,
+                .pjrt => &impl.backend_data.pjrt.native,
             };
-            const weight: LoadedWeight = .{
-                .tensor = .{
-                    .data = &.{},
-                    .dtype = .f32,
-                    .shape = &.{},
-                    .name = owned_key,
-                    .allocator = allocator,
-                    .owns_data = false,
-                    .owns_shape = false,
-                },
-                .quantized = true,
-                .quantized_storage = storage,
-            };
-            try resident_weights.put(allocator, owned_key, weight);
-            continue;
+            try std.testing.expect(data.prefetch_initialized);
+            try std.testing.expectEqual(@as(u32, 1), data.resident_weights.count());
+            const weight = data.resident_weights.get(if (gpt2) "h.0.attn.c_attn.weight" else "embeddings.word_embeddings.weight").?;
+            try std.testing.expectEqualSlices(i64, if (gpt2) &.{ 4, 2 } else &.{ 2, 4 }, weight.tensor.shape);
+            try std.testing.expectEqualSlices(u8, if (gpt2) std.mem.asBytes(&[_]f32{ 1, 5, 2, 6, 3, 7, 4, 8 }) else std.mem.asBytes(&[_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 }), weight.tensor.data);
         }
-
-        var tensor_ref = store.describeTensor(allocator, full_name) catch {
-            allocator.free(owned_key);
-            continue;
-        };
-        defer {
-            var ref = tensor_ref;
-            ref.deinit(allocator);
-        }
-        var weight = store.loadTensorRef(&tensor_ref) catch {
-            allocator.free(owned_key);
-            continue;
-        };
-        errdefer weight.deinit();
-        if (!direct_quant_enabled) {
-            if (weight.quantized_storage) |*storage| {
-                storage.deinit();
-                weight.quantized_storage = null;
-                weight.quantized = false;
-            }
-        }
-        try resident_weights.put(allocator, owned_key, weight);
-    }
-
-    if (store.kind() != .gguf) {
-        refineArchConfigFromWeights(&arch_config, &resident_weights);
-    }
-
-    if (store.kind() == .safetensors) {
-        try applyJinaV5RetrievalAdapterIfPresent(allocator, model_path, mf, &resident_weights);
-    }
-
-    const keep_store = shouldRetainTensorStore(store.kind(), lazy_weights.count());
-    const resident_store = if (keep_store) store else null;
-    if (!keep_store) store.deinit();
-    const moe_num_experts = switch (arch_config) {
-        .gpt => |cfg| cfg.num_local_experts,
-        else => 0,
     };
-    const residency = if (lazy_weights.count() > 0 and moe_num_experts > 0)
-        runtime.moe.residency.SharedResidency.init(allocator, defaultResidentExpertsPerLayer(arch_config))
-    else
-        null;
-    const tier_cache = if (lazy_weights.count() > 0)
-        runtime.tier.cache.SharedCache.init(runtime.tier.cache.defaultBudgetForBackend(.cpu))
-    else
-        null;
-    errdefer {
-        if (residency) |value| {
-            var v = value;
-            v.deinit();
-        }
-    }
-
-    // Attempt to initialize the PJRT client. On failure (plugin not found,
-    // etc.) we log a warning and proceed with pure native CPU execution. The
-    // compiled-partition path in generation.zig simply won't be activated.
-    const pjrt_client: if (build_options.enable_pjrt) ?pjrt_lib.pjrt.Client else void = blk: {
-        if (!build_options.enable_pjrt) break :blk {};
-        const client = pjrt_lib.pjrt.Client.initFromEnv(allocator) catch |err| {
-            std.log.warn("PJRT plugin not found ({s}); PJRT session will use native CPU fallback", .{@errorName(err)});
-            break :blk null;
-        };
-        std.log.info("PJRT client initialized via session factory", .{});
-        break :blk client;
-    };
-
-    const task = sessionTaskForModelType(mf.model_type, override);
-    const impl = try allocator.create(ArchSession);
-    impl.* = .{
-        .allocator = allocator,
-        .arch_config = arch_config,
-        .task = task,
-        .gliner_span_encoder_family = mf.gliner_span_encoder_family,
-        .deberta_reranker_weight_mirrors = sessionEnablesDebertaRerankerWeightMirrors(
-            mf.model_type,
-            std.meta.activeTag(arch_config),
-            task,
-        ),
-        .backend_type = .pjrt,
-        .backend_data = .{ .pjrt = .{
-            .native = .{
-                .allocator = allocator,
-                .resident_weights = resident_weights,
-                .lazy_weights = lazy_weights,
-                .tensor_store = resident_store,
-                .moe_num_experts = @intCast(moe_num_experts),
-                .residency = residency,
-                .tier_cache = tier_cache,
-                .allow_direct_quant = direct_quant_enabled,
-            },
-            .client = pjrt_client,
-        } },
-    };
-    errdefer archClose(impl);
-    native_mod.initPrefetchQueue(&impl.backend_data.pjrt.native, allocator);
-    {
-        var lazy_it = impl.backend_data.pjrt.native.lazy_weights.iterator();
-        while (lazy_it.next()) |entry| {
-            entry.value_ptr.guard = impl.backend_data.pjrt.native.prefetch.lockHandle();
-        }
-    }
-    if (impl.backend_data.pjrt.native.lazy_weights.count() > 0) {
-        try native_mod.startPrefetchWorker(&impl.backend_data.pjrt.native);
-    }
-    return archSessionHandle(impl);
+    for ([_]HostPreparation{ .{}, .{ .backend = .pjrt }, .{ .intent = .device_upload } }) |preparation|
+        try platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{ path, preparation, false });
+    // GPT-2 safetensors Conv1D storage needs the same transpose for PJRT's
+    // native fallback as for direct CPU execution.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"gpt2\",\"n_embd\":2,\"n_layer\":1,\"n_head\":1,\"n_inner\":4,\"vocab_size\":2}" });
+    const gpt_header = "{\"h.0.attn.c_attn.weight\":{\"dtype\":\"F32\",\"shape\":[2,4],\"data_offsets\":[0,32]}}";
+    @memset(bytes[8 .. 8 + padded_len], ' ');
+    @memcpy(bytes[8..][0..gpt_header.len], gpt_header);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = &bytes });
+    for ([_]HostPreparation{ .{}, .{ .backend = .pjrt } }) |preparation|
+        try platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{ path, preparation, true });
 }
 
 /// Return the PJRT client as a type-erased `*anyopaque` pointer, or null if
@@ -1720,7 +1545,8 @@ fn createCudaSessionWithRequiredProfile(
     }
 
     var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
-    defer model_manifest.deinit();
+    var manifest_owned = true;
+    defer if (manifest_owned) model_manifest.deinit();
     try model_manifest.requireRecognizedGlinerArchitecture();
     if (model_manifest.embedding_style == .embedding_gemma2)
         try cuda_compute_mod.preflightProfileDevice(.embedding_gemma2);
@@ -1788,7 +1614,10 @@ fn createCudaSessionWithRequiredProfile(
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     if (debug_cuda_session) std.log.info("cuda-session: create native session start path={s}", .{model_path});
     const host_prepare_started_ns = platform.time.monotonicNs();
-    var native_session = try createNativeSessionForCudaUpload(allocator, model_path, override, true);
+    manifest_owned = false; // fromOwnedManifest consumes it even on failure.
+    var loaded_model = try model_definition.LoadedModel.fromOwnedManifest(allocator, model_path, model_manifest);
+    defer loaded_model.deinit();
+    var native_session = try prepareLoadedHostSession(allocator, model_path, &loaded_model, override, .{ .intent = .device_upload });
     defer native_session.close();
     std.log.info("inference_model_load backend=cuda phase=host_prepare elapsed_ms={d}", .{(platform.time.monotonicNs() -| host_prepare_started_ns) / std.time.ns_per_ms});
     if (debug_cuda_session) std.log.info("cuda-session: create native session done path={s}", .{model_path});
@@ -5440,13 +5269,15 @@ fn transposeGpt2Conv1dLoadedWeightInPlace(
         }
     }
 
-    if (w.owns_data) allocator.free(w.data);
-    w.data = std.mem.sliceAsBytes(dst);
-    w.owns_data = true;
-
+    // Prepare every fallible allocation before replacing either owned buffer.
     const new_shape = try allocator.alloc(i64, 2);
     new_shape[0] = @intCast(cols);
     new_shape[1] = @intCast(rows);
+    if (w.owns_data and w.data.len > 0) allocator.rawFree(w.data, w.data_alignment, @returnAddress());
+    w.data = std.mem.sliceAsBytes(dst);
+    w.owns_data = true;
+    w.data_alignment = .of(f32);
+
     if (w.owns_shape) allocator.free(w.shape);
     w.shape = new_shape;
     w.owns_shape = true;

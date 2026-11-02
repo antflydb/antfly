@@ -81,7 +81,13 @@ pub const LoadedModel = struct {
     weights: ?tensor_store_mod.TensorStore,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !LoadedModel {
-        var manifest = try manifest_mod.loadFromDir(allocator, path);
+        return fromOwnedManifest(allocator, path, try manifest_mod.loadFromDir(allocator, path));
+    }
+
+    /// Consumes metadata on success and failure. Admission can inspect one
+    /// snapshot before opening weights without reparsing the artifact manifest.
+    pub fn fromOwnedManifest(allocator: std.mem.Allocator, path: []const u8, owned_manifest: manifest_mod.ModelManifest) !LoadedModel {
+        var manifest = owned_manifest;
         errdefer manifest.deinit();
         const weights = try tensor_store_mod.openFromManifest(allocator, manifest);
         errdefer weights.deinit();
