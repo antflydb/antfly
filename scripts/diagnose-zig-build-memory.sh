@@ -187,6 +187,31 @@ memory_report="${out_dir}/${label}.memory.json"
 response_dir="${out_dir}/${label}.response-files"
 rm -f "${memory_report}"
 
+# Cgroup peaks can include earlier/shared workloads. Retain both snapshots and
+# scope metadata; never present their difference as an isolated compiler peak.
+record_linux_memory() {
+    [ -r /proc/self/cgroup ] || return 0
+    {
+        echo 'scope=observed-cgroup-not-necessarily-exclusive'
+        echo 'peak_may_include_prior_workloads=true'
+        cat /proc/self/cgroup
+        cat /proc/meminfo
+        local relative_path
+        relative_path="$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)"
+        local group_dir="/sys/fs/cgroup${relative_path}"
+        # A namespaced cgroup mount may already expose the process group as /.
+        if [ ! -r "${group_dir}/memory.current" ]; then group_dir=/sys/fs/cgroup; fi
+        echo "observed_group_dir=${group_dir}"
+        local metric
+        for metric in memory.current memory.peak memory.max memory.swap.current memory.swap.peak memory.swap.max memory.events cpu.max cpuset.cpus.effective; do
+            if [ -r "${group_dir}/${metric}" ]; then
+                echo "${metric}:"
+                cat "${group_dir}/${metric}"
+            fi
+        done
+    } > "${out_dir}/${label}.linux-memory-$1.txt"
+}
+
 rss_kb_for_pid() {
     ps -o rss= -p "$1" 2>/dev/null | awk '{print $1}'
 }
@@ -221,6 +246,8 @@ rss_mb_from_kb() {
 
 printf 'timestamp\telapsed_s\tpid\trss_kb\trss_mb\tcommand\tsample_id\n' > "${timeline}"
 printf 'elapsed_s\tpid\tcpu_time\tcpu_percent\tsample_id\n' > "${cpu_timeline}"
+
+record_linux_memory before
 
 start_epoch="$(date +%s)"
 sample_taken="0"
@@ -291,6 +318,8 @@ set +e
 wait "${build_pid}"
 build_status="$?"
 set -e
+
+record_linux_memory after
 
 end_epoch="$(date +%s)"
 elapsed_total="$((end_epoch - start_epoch))"
