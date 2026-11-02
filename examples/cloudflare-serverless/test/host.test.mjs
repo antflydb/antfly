@@ -1310,3 +1310,37 @@ test('hosts without the storage-binding ABI reject physical rebinding and remain
  await assert.rejects(host.request(request('latest'),{transport:a.transport,storageScope:'untrusted JSON scope'}),/invalid storage scope/);
  assert.equal(host.usable(),true);assert.equal((await host.request(request('latest'),{transport:a.transport})).visibility.slice(-16),'0000000000000000');
 });
+
+
+async function traceHostedRoots(host,roots){
+ const tasks=[...roots],marked=new Set();
+ for(let i=0;i<tasks.length;i++){
+  assert.ok(i<10000,'bounded trace must terminate');
+  const result=await host.request(request('gc_trace',{gc_task:tasks[i]}));
+  if(result.key)marked.add(result.key);for(const key of result.keys??[])marked.add(key);tasks.push(...result.children);
+ }
+ return{tasks,marked};
+}
+
+test('hosted GC traverses compressed text keys without expanding the page and preserves continuations',async()=>{
+ const{host}=await setup(),ids=Array.from({length:400},(_,i)=>'x'.repeat(4096)+String(i).padStart(8,'0'));
+ for(let offset=0;offset<ids.length;offset+=50)await host.request(request('mutate',{operation_id:'compressed-'+offset,mutations:ids.slice(offset,offset+50).map(doc_id=>({kind:'upsert',doc_id,body:JSON.stringify({text:'needle'})}))}));
+ let published=false;
+ for(let step=0;step<50;step++){if(!(await host.request(request('publish',{paged_text:true,publication_records:16}))).has_more){published=true;break;}}
+ assert.ok(published);assert.equal((await host.request(request('search',{paged_text:true,text:'needle',limit:1}))).hits[0].doc_id,ids[0]);
+ const plan=await host.request(request('gc_prepare')),{tasks}=await traceHostedRoots(host,plan.roots);
+ const compact=tasks.filter(task=>task.kind==='text_page'&&task.page.records===400);
+ assert.ok(compact.some(task=>task.page.bytes<32768),'the valid compressed page is small');
+ assert.deepEqual([...new Set(compact.map(task=>task.offset??0))].sort((a,b)=>a-b),[0,128,256,384]);
+});
+
+test('hosted WAL GC preserves compressed long receipt IDs and their replay decisions',async()=>{
+ const{host}=await setup(),id=i=>'r'.repeat(4090)+String(i).padStart(6,'0');
+ for(let i=0;i<400;i++)await host.request(request('append',{operation_id:id(i),payload:'v'}));
+ const plan=await host.request(request('gc_wal',{gc_id:'e'.repeat(32),gc_keep_from:'1'}));
+ const{tasks}=await traceHostedRoots(host,plan.roots);
+ assert.ok(tasks.some(task=>task.kind==='wal_page'&&task.page.records===400&&task.page.bytes<32768));
+ const latest=(await host.request(request('latest'))).visibility;
+ assert.equal((await host.request(request('append',{operation_id:id(0),payload:'v'}))).visibility.slice(-16),'0000000000000001');
+ assert.equal((await host.request(request('latest'))).visibility,latest);
+});

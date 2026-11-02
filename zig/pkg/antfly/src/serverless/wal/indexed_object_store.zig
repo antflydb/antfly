@@ -1010,13 +1010,13 @@ pub const IndexedObjectStore = struct {
         return error.WalCommitContended;
     }
 
-    pub fn tracePage(self: *@This(), alloc: A, namespace: []const u8, ref: tree.Ref) !tree.Page {
+    pub fn tracePage(self: *@This(), alloc: A, namespace: []const u8, ref: tree.Ref) !tree.NavigationPage {
         if (self.managed_reads) return error.CollectionProofRequired;
         var ctx = try Context.init(self, namespace, null);
         defer ctx.deinit();
-        return tree.readPage(alloc, ctx.store(), ref);
+        return tree.readNavigationPage(alloc, ctx.store(), ref);
     }
-    pub fn traceCollectionPage(self: *@This(), alloc: A, namespace: []const u8, id: [16]u8, retired_before: u64, ref: tree.Ref, cancellation: ?objectstore.CancellationToken) !tree.Page {
+    pub fn traceCollectionPage(self: *@This(), alloc: A, namespace: []const u8, id: [16]u8, retired_before: u64, ref: tree.Ref, cancellation: ?objectstore.CancellationToken) !tree.NavigationPage {
         if (std.mem.allEqual(u8, &id, 0)) return error.InvalidCollectionId;
         var ctx = try Context.init(self, namespace, cancellation);
         defer ctx.deinit();
@@ -1024,7 +1024,7 @@ pub const IndexedObjectStore = struct {
         defer head.deinit(self.alloc);
         if (head.value.root_lifetime_ms == null) return error.ManagedCollectionRequired;
         if (!std.mem.eql(u8, &head.value.gc_attempt, &id) or head.value.gc_retired_before != retired_before) return error.CollectionSuperseded;
-        return tree.readPage(alloc, ctx.store(), ref);
+        return tree.readNavigationPage(alloc, ctx.store(), ref);
     }
     pub const WriteRead = struct { key: []const u8, max_response_bytes: u32 };
     /// Independent immutable roots only. The eventual mutation still decodes

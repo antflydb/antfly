@@ -1023,3 +1023,20 @@ test('canceling a blocked speculative head immediately admits the next reservati
  await new Promise(resolve=>setImmediate(resolve));assert.equal(started,false);cancel.abort();await rejected;await next;assert.equal(started,true);
  for(const release of held)release();await Promise.all(work);assert.equal(kernel.waitingReadPlans,0);assert.equal(kernel.capacityListeners.size,0);
 });
+
+
+test('aged interactive maintenance and commit jobs outrank fresh commits in the shared writer pool',async()=>{
+ const{RequestPool}=await import('../request-pool.mjs'),MiB=1024*1024;
+ for(const priority of['interactive','maintenance','commit']){
+  let now=0;const release=[],entered=[],order=[],pool=new RequestPool(async()=>({usable:()=>true,memoryBytes:()=>0}),3,{clock:()=>now,maxReservedBytes:48*MiB,reservationBytes:16*MiB});
+  const held=Array.from({length:3},()=>pool.withHost(async()=>{entered.push(true);await new Promise(resolve=>release.push(resolve));},{priority:'commit',fairKey:'hot'}));
+  while(entered.length<3)await new Promise(resolve=>setImmediate(resolve));
+  const aged=pool.withHost(async()=>order.push('aged'),{priority,fairKey:'cold',deadlineMs:30000});
+  now=6000;
+  const fresh=pool.withHost(async()=>order.push('fresh'),{priority:'commit',fairKey:'hot',deadlineMs:now+30000});
+  release[0]();
+  try{await Promise.all([aged,fresh]);}finally{for(const finish of release)finish();await Promise.allSettled(held);}
+  assert.deepEqual(order,['aged','fresh'],priority+' must not be demoted below a newer commit');
+  assert.equal(pool.reservedBytes,0);assert.equal(pool.pending.length,0);
+ }
+});

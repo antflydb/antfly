@@ -222,13 +222,13 @@ pub const Context = struct {
             },
             .facts_page, .wal_page, .text_page, .projection_page, .vector_docs_page, .vector_centroid_page => {
                 const ref = task.page orelse return error.InvalidCollectionTask;
-                var page = if (task.kind == .wal_page) try self.wal.tracePage(a, self.namespace, ref) else try tree.readPage(a, pages.store(), ref);
+                var page = if (task.kind == .wal_page) try self.wal.tracePage(a, self.namespace, ref) else try tree.readNavigationPage(a, pages.store(), ref);
                 defer page.deinit(a);
                 key = if (task.kind == .wal_page) try self.wal.pageKeyAlloc(a, self.namespace, ref) else try self.artifactKey(a, &try PageStore.identity(pages.domain, ref));
                 const end = @min(page.entries.len, task.offset +| @as(usize, if (task.kind == .facts_page) 95 else 128));
                 if (task.offset > page.entries.len) return error.InvalidCollectionTask;
-                for (page.entries[task.offset..end]) |entry| {
-                    if (if (task.kind == .wal_page) try @import("wal/payload.zig").traceChild(a, entry) else if (entry.child) |ref_child| ref_child.* else null) |child| {
+                for (page.entries[task.offset..end], task.offset..) |entry, index| {
+                    if (if (task.kind == .wal_page) try @import("wal/payload.zig").traceChild(a, page.key(index), entry) else if (entry.child) |ref_child| ref_child.* else null) |child| {
                         try children.append(a, .{ .kind = task.kind, .page = child, .vector_dims = task.vector_dims });
                     } else if (task.kind == .vector_docs_page and entry.value.len != 0 and @import("vector_segment/blocks.zig").isCompact(entry.value)) {
                         const c = try @import("vector_segment/blocks.zig").control(entry.value, task.vector_dims);

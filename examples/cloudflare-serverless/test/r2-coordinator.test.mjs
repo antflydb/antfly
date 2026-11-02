@@ -434,3 +434,15 @@ test('cold snapshot admission discards its result when a writer takes over',asyn
  try{await retry(fresh,tx=>tx.put('value',2));}finally{release();}
  assert.equal(await pending,2);assert.equal(runs,2);assert.equal(await fresh.ownerRead(tx=>tx.get('value')),2);
 });
+
+
+test('coordinator collection traces compressed long metadata keys without page-wide expansion',async()=>{
+ const{metadataTreeRoot}=await import('../metadata-root.mjs');
+ let now=Date.now();const bucket=new Bucket(),store=storeFor(bucket,{clock:()=>now}),key=i=>'x'.repeat(4096)+String(i).padStart(8,'0');
+ for(let start=0;start<400;start+=50)await store.transaction(async tx=>{for(let i=start;i<start+50;i++)tx.put(key(i),0);});
+ await store.transaction(async tx=>{const root=metadataTreeRoot(tx.snapshot());assert.equal(root.records,400);assert.ok(root.bytes<32768);assert.deepEqual((await tx.trace(root)).children,[]);});
+ let job,done=false;
+ for(let step=0;step<256;step++){const result=await collectCoordinator(store,bucket,()=>now,job);job=result.job_id;if(result.delay_seconds)now+=result.delay_seconds*1000+1;if(result.done){done=true;break;}}
+ assert.ok(done,'collection must finish over compressed metadata');
+ assert.equal(await store.transaction(tx=>tx.get(key(399))),0);
+});

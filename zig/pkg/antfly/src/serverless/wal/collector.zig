@@ -465,8 +465,8 @@ pub const Collector = struct {
                 var page = try self.collector.wal.traceCollectionPage(self.collector.alloc, self.namespace, self.active.id, self.active.roots.retired_before, ref, self.token);
                 defer page.deinit(self.collector.alloc);
                 var children = std.ArrayList(tree.Ref).empty;
-                for (page.entries) |entry| {
-                    if (try @import("payload.zig").traceChild(self.arena, entry)) |child| try children.append(self.arena, child);
+                for (page.entries, 0..) |entry, index| {
+                    if (try @import("payload.zig").traceChild(self.arena, page.key(index), entry)) |child| try children.append(self.arena, child);
                 }
                 if (meta.child_offset > children.items.len) return error.InvalidCollectionState;
                 const end = @min(children.items.len, @as(usize, meta.child_offset) + child_chunk);
@@ -1394,4 +1394,33 @@ test "serverless multiprovider unified WAL collector traces large payloads acros
     try std.testing.expectEqualSlices(u8, body, rows[0].payload);
     @memset(body, 'a');
     try std.testing.expectEqual(@as(?u64, 1), try wal.findIdempotent("docs", 0, body, "retired"));
+}
+
+test "serverless multiprovider native collection resumes over compressed long receipt keys" {
+    const a = std.testing.allocator;
+    var fixture: TestFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var id: [4096]u8 = @splat('r');
+    for (0..400) |i| {
+        _ = try std.fmt.bufPrint(id[4090..], "{d:0>6}", .{i});
+        _ = try fixture.wal.appendIdempotent("docs", 0, "v", &id);
+    }
+    _ = try fixture.wal.truncatePrefix("docs", 400);
+    try fixture.waitForSweep();
+    const active = (try fixture.wal.collectionStatus("docs", null)).?;
+    var page = try fixture.wal.traceCollectionPage(a, "docs", active.id, active.roots.retired_before, active.roots.operations.?, null);
+    defer page.deinit(a);
+    try std.testing.expectEqual(@as(usize, 400), page.entries.len);
+    try std.testing.expect(page.bytes.len < 32768);
+    var expanded: usize = 0;
+    for (0..page.entries.len) |index| expanded += page.key(index).len();
+    try std.testing.expect(expanded > tree.max_page_bytes);
+    try fixture.reopen();
+    try fixture.finish();
+    _ = try std.fmt.bufPrint(id[4090..], "{d:0>6}", .{0});
+    try std.testing.expectEqual(@as(?u64, 1), try fixture.wal.findIdempotent("docs", 0, "v", &id));
+    const rows = try fixture.wal.readRangeAlloc(a, "docs", .{ .start_lsn = 400, .end_lsn = 400 });
+    defer @import("types.zig").freeRecords(a, rows);
+    try std.testing.expectEqualStrings("v", rows[0].payload);
 }

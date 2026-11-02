@@ -81,6 +81,9 @@ Native read-state and document-point projections retain immutable derived state.
 Caches include provider/bucket/prefix, namespace, lineage and authenticated root
 identity. A cache hit is not writer authority or proof of absence. Bounded affinity
 prefers compatible idle kernels without waiting for busy ones or bypassing fairness.
+After five seconds, queued work outranks every fresh ordinary priority, including
+commits. Only authority required by suspended read plans may bypass aged work;
+large reservations still drain capacity before smaller fresh work.
 Detached metadata and point continuations acquire dependencies before scarce query
 execution. Native graph discovery emits exact descriptors; the host deduplicates
 and overlaps only currently discoverable dependencies, then resumes the captured
@@ -138,8 +141,11 @@ capacity. Full state transitions are in [durability](antfly-object-storage-backe
 WAL collection uses the same native edge decoder in hosted and native collectors:
 it follows structural page children and external record payload descriptors.
 Payload trees stay in the WAL's epoch and authenticated page namespace. Hosted
-traversal retains its entry offsets and bounded continuation tasks; neither
-collector may sweep payload chunks while a protected WAL root references them.
+traversal retains its entry offsets and bounded continuation tasks. Hosted,
+WAL and coordinator collectors use compressed navigation pages rather than
+expanding all keys. WAL payload decoding reconstructs only a single eight-byte
+LSN key from its view; large receipt IDs do not require expansion. No collector
+may sweep payload chunks while a protected WAL root references them.
 
 ## Rollout and source ownership
 

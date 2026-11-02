@@ -86,9 +86,14 @@ pub fn load(a: A, pages: tree.Store, encoded: []const u8, limit: usize) ![]u8 {
 
 /// All collectors must traverse both structural edges and external record
 /// payload roots. Chunk leaves themselves carry no further references.
-pub fn traceChild(a: A, entry: tree.DecodedEntry) !?tree.Ref {
+pub fn traceChild(a: A, key: tree.KeyView, entry: tree.DecodedEntry) !?tree.Ref {
     if (entry.child) |ref| return ref.*;
-    return child(a, entry.key, entry.value);
+    // Only record LSNs can contain payload descriptors. Reconstruct this one
+    // fixed-size logical key, never an entire page of compressed receipt IDs.
+    if (key.len() != 8) return null;
+    var lsn: [8]u8 = undefined;
+    key.copy(&lsn);
+    return child(a, &lsn, entry.value);
 }
 
 /// Payload roots occur only in actual WAL record leaves. Chunk values carry

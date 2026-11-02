@@ -448,7 +448,7 @@ pub const Context = struct {
         var root = try Root.load(m, state.root);
         if (req.action == .trace) {
             const ref = req.page orelse return error.InvalidCollectionTask;
-            var page = try tree.readPage(self.alloc, cache.store(), ref);
+            var page = try tree.readNavigationPage(self.alloc, cache.store(), ref);
             defer page.deinit(self.alloc);
             var children = std.ArrayList(tree.Ref).empty;
             defer children.deinit(self.alloc);

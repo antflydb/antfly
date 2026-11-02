@@ -53,7 +53,9 @@ export class RequestPool {
  drain(){try{while(this.pending.length){
   const idle=this.slots.filter(slot=>!slot.busy);if(!idle.length)return;
   const protects=job=>this.waitingReadPlans>0&&job.options.reservationClass==="authority";
-  const now=this.clock(),rank=job=>protects(job)?-2:now-(job.admittedAt??now)>=5000?0:job.options.priority==="commit"?-1:job.options.priority==="maintenance"?2:job.options.priority==="publication"?1:0;
+  // Once aged, ordinary work must outrank every fresh priority, including
+  // commits. Only authority needed by suspended read plans may bypass it.
+  const now=this.clock(),rank=job=>protects(job)?-3:now-(job.admittedAt??now)>=5000?-2:job.options.priority==="commit"?-1:job.options.priority==="maintenance"?2:job.options.priority==="publication"?1:0;
   const available=this.maxReservedBytes-this.reservedBytes;
   // Large aged work drains smaller running reservations instead of starving.
   if(this.pending.some(job=>now-job.admittedAt>=5000&&job.reservationBytes>available)&&!this.pending.some(job=>protects(job)&&job.reservationBytes<=available))return;
