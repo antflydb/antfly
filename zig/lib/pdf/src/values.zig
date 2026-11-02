@@ -838,3 +838,101 @@ pub const reader = struct {
 pub const render = struct {
     pub const textRunBounds = renderTextRunBounds;
 };
+
+pub fn normalizedPageRotation(rotation: ?i32) !PageRotation {
+    const normalized = @mod(rotation orelse 0, 360);
+    return switch (normalized) {
+        0 => .none,
+        90 => .clockwise_90,
+        180 => .clockwise_180,
+        270 => .clockwise_270,
+        else => error.InvalidPageRotation,
+    };
+}
+
+pub fn nativeRasterBboxToPagePoints(
+    page_box: PageBox,
+    effective_dpi: u16,
+    raster_width: u32,
+    raster_height: u32,
+    page_rotation: ?i32,
+    raster_bbox: [4]f64,
+) ?[4]f64 {
+    if (effective_dpi == 0 or raster_width == 0 or raster_height == 0) return null;
+    if (!std.math.isFinite(page_box.min_x) or !std.math.isFinite(page_box.min_y) or
+        !std.math.isFinite(page_box.max_x) or !std.math.isFinite(page_box.max_y) or
+        !(page_box.min_x < page_box.max_x) or !(page_box.min_y < page_box.max_y))
+        return null;
+    for (raster_bbox) |coordinate| if (!std.math.isFinite(coordinate)) return null;
+    const left = raster_bbox[0];
+    const top = raster_bbox[1];
+    const right = raster_bbox[2];
+    const bottom = raster_bbox[3];
+    const final_width: f64 = @floatFromInt(raster_width);
+    const final_height: f64 = @floatFromInt(raster_height);
+    if (!(left < right) or !(top < bottom) or left < 0 or top < 0 or
+        right > final_width or bottom > final_height)
+        return null;
+
+    const rotation = normalizedPageRotation(page_rotation) catch return null;
+    const scale = @as(f64, @floatFromInt(effective_dpi)) / 72.0;
+    const expected_unrotated_width = @ceil((page_box.max_x - page_box.min_x) * scale);
+    const expected_unrotated_height = @ceil((page_box.max_y - page_box.min_y) * scale);
+    if (!std.math.isFinite(expected_unrotated_width) or !std.math.isFinite(expected_unrotated_height) or
+        expected_unrotated_width < 1 or expected_unrotated_height < 1)
+        return null;
+    const expected_final_width = if (rotation == .clockwise_90 or rotation == .clockwise_270)
+        expected_unrotated_height
+    else
+        expected_unrotated_width;
+    const expected_final_height = if (rotation == .clockwise_90 or rotation == .clockwise_270)
+        expected_unrotated_width
+    else
+        expected_unrotated_height;
+    if (final_width != expected_final_width or final_height != expected_final_height) return null;
+    var unrotated: [4]f64 = undefined;
+    var unrotated_width = final_width;
+    var unrotated_height = final_height;
+    switch (rotation) {
+        .none => unrotated = raster_bbox,
+        .clockwise_90 => {
+            unrotated_width = final_height;
+            unrotated_height = final_width;
+            unrotated = .{ top, unrotated_height - right, bottom, unrotated_height - left };
+        },
+        .clockwise_180 => {
+            unrotated = .{
+                unrotated_width - right,
+                unrotated_height - bottom,
+                unrotated_width - left,
+                unrotated_height - top,
+            };
+        },
+        .clockwise_270 => {
+            unrotated_width = final_height;
+            unrotated_height = final_width;
+            unrotated = .{ unrotated_width - bottom, left, unrotated_width - top, right };
+        },
+    }
+    if (unrotated[0] < 0 or unrotated[1] < 0 or
+        unrotated[2] > unrotated_width or unrotated[3] > unrotated_height)
+        return null;
+
+    // `scale` and the exact pixel-grid dimensions were validated above.
+    const mapped = [4]f64{
+        page_box.min_x + unrotated[0] / scale,
+        page_box.min_y + (unrotated_height - unrotated[3]) / scale,
+        page_box.min_x + unrotated[2] / scale,
+        page_box.min_y + (unrotated_height - unrotated[1]) / scale,
+    };
+    // The renderer rounds the trailing CropBox edges up to whole pixels. A
+    // region touching those pixels may extend past the original page bounds.
+    const clipped = [4]f64{
+        std.math.clamp(mapped[0], page_box.min_x, page_box.max_x),
+        std.math.clamp(mapped[1], page_box.min_y, page_box.max_y),
+        std.math.clamp(mapped[2], page_box.min_x, page_box.max_x),
+        std.math.clamp(mapped[3], page_box.min_y, page_box.max_y),
+    };
+    if (!(clipped[0] < clipped[2]) or !(clipped[1] < clipped[3])) return null;
+    return clipped;
+}

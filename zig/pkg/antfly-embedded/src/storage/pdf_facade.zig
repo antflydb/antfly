@@ -17,24 +17,24 @@
 //! render caches live in the compiled media owner. Values retain caller budgets.
 const std = @import("std");
 const c = @import("pdf_native_contract");
-const values = c.pdf;
+const pdf_values = c.pdf;
 const A = std.mem.Allocator;
-pub const RenderedPagePng = values.RenderedPagePng;
-pub const RenderedPageRaster = values.RenderedPageRaster;
-pub const PixelFormat = values.PixelFormat;
-pub const RenderQuality = values.RenderQuality;
-pub const RenderProfile = values.RenderProfile;
-pub const RenderResolutionPolicy = values.RenderResolutionPolicy;
-pub const PageRenderRequest = values.PageRenderRequest;
-pub const PageRenderExecutor = values.PageRenderExecutor;
-pub const RenderScratchGrowth = values.RenderScratchGrowth;
-pub const RenderedPageBatch = values.RenderedPageBatch;
-pub const RenderedPageRasterBatch = values.RenderedPageRasterBatch;
-pub const PageRenderResult = values.PageRenderResult;
-pub const PageRasterResult = values.PageRasterResult;
-pub const PageRenderGeometry = values.PageRenderGeometry;
-pub const PreparedPageRenderPlan = values.PreparedPageRenderPlan;
-pub const RenderBatchOutputKind = values.RenderBatchOutputKind;
+pub const RenderedPagePng = pdf_values.RenderedPagePng;
+pub const RenderedPageRaster = pdf_values.RenderedPageRaster;
+pub const PixelFormat = pdf_values.PixelFormat;
+pub const RenderQuality = pdf_values.RenderQuality;
+pub const RenderProfile = pdf_values.RenderProfile;
+pub const RenderResolutionPolicy = pdf_values.RenderResolutionPolicy;
+pub const PageRenderRequest = pdf_values.PageRenderRequest;
+pub const PageRenderExecutor = pdf_values.PageRenderExecutor;
+pub const RenderScratchGrowth = pdf_values.RenderScratchGrowth;
+pub const RenderedPageBatch = pdf_values.RenderedPageBatch;
+pub const RenderedPageRasterBatch = pdf_values.RenderedPageRasterBatch;
+pub const PageRenderResult = pdf_values.PageRenderResult;
+pub const PageRasterResult = pdf_values.PageRasterResult;
+pub const PageRenderGeometry = pdf_values.PageRenderGeometry;
+pub const PreparedPageRenderPlan = pdf_values.PreparedPageRenderPlan;
+pub const RenderBatchOutputKind = pdf_values.RenderBatchOutputKind;
 pub const Backend = struct {
     ptr: *const anyopaque,
     extract_text_fn: *const fn (*const anyopaque, A, []const u8) anyerror![]u8,
@@ -61,8 +61,8 @@ pub const Backend = struct {
         return renderPagePngAlloc(a, bytes, 1, 72, 40_000_000);
     }
 };
-pub const default_render_bytes_per_pixel_reserve = values.default_render_bytes_per_pixel_reserve;
-pub const render = values.render;
+pub const default_render_bytes_per_pixel_reserve = pdf_values.default_render_bytes_per_pixel_reserve;
+pub const render = pdf_values.render;
 pub const native_fonts = struct {
     pub const sfnt = @import("antfly_font").sfnt;
     pub const regular = @import("pdf_standard_fonts").regular;
@@ -70,16 +70,28 @@ pub const native_fonts = struct {
 };
 pub const syntax = @import("pdf_syntax");
 pub const text_encoding = @import("pdf_text_encoding");
-pub const PageRenderDiagnostics = values.reader.PageRenderDiagnostics;
+pub const PageRenderDiagnostics = pdf_values.reader.PageRenderDiagnostics;
+pub const nativeRasterBboxToPagePoints = pdf_values.nativeRasterBboxToPagePoints;
 pub const reader = struct {
-    pub const PageRenderRuns = values.reader.PageRenderRuns;
-    pub const ShapeRun = values.reader.ShapeRun;
-    pub const ImageRun = values.reader.ImageRun;
+    pub const PageRenderRuns = pdf_values.reader.PageRenderRuns;
+    pub const ShapeRun = pdf_values.reader.ShapeRun;
+    pub const ImageRun = pdf_values.reader.ImageRun;
     pub const DecodeLimits = c.Limits;
     pub const CancellationProbe = c.Probe;
-    pub const PageTextAnalysis = values.reader.PageTextAnalysis;
-    pub const TextRun = values.reader.TextRun;
+    pub const PageTextAnalysis = pdf_values.reader.PageTextAnalysis;
+    pub const TextRun = pdf_values.reader.TextRun;
     pub const PageBox = c.Box;
+    pub const default_max_decoded_stream_bytes = pdf_values.reader.default_max_decoded_stream_bytes;
+    pub const default_max_decode_working_set_bytes = pdf_values.reader.default_max_decode_working_set_bytes;
+    pub const TextOutputSpan = pdf_values.reader.TextOutputSpan;
+    pub const TextFallbackReason = pdf_values.reader.TextFallbackReason;
+    pub const PageRenderDiagnostics = pdf_values.reader.PageRenderDiagnostics;
+    pub const ShadingRun = pdf_values.reader.ShadingRun;
+    pub const PatternRun = pdf_values.reader.PatternRun;
+    pub const BlendMode = pdf_values.reader.BlendMode;
+    pub const ShapeKind = pdf_values.reader.ShapeKind;
+    pub const ShapeLineCap = pdf_values.reader.ShapeLineCap;
+    pub const ShapeLineJoin = pdf_values.reader.ShapeLineJoin;
     pub const Reader = struct {
         handle: *c.Document,
         alloc: A,
