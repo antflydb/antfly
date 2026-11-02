@@ -300,6 +300,19 @@ pub fn SharedPeak(comptime Lease: type) type {
         max_increments: usize = 64,
         leases: [256]Lease = undefined,
 
+        pub const Mark = struct { bytes: usize, count: usize };
+        pub fn mark(self: *const @This()) Mark {
+            return .{ .bytes = self.bytes, .count = self.count };
+        }
+        /// Only before any consumer can enqueue work using the new capacity.
+        /// The epoch gate makes admission growth transactional with the page.
+        pub fn rollback(self: *@This(), before: Mark) void {
+            std.debug.assert(before.count <= self.count and before.bytes <= self.bytes);
+            for (self.leases[before.count..self.count]) |*lease| lease.release();
+            self.count = before.count;
+            self.bytes = before.bytes;
+        }
+
         pub fn grow(self: *@This(), target: usize, context: anytype, comptime acquire: anytype) !void {
             if (target <= self.bytes) return;
             if (self.count >= @min(self.max_increments, self.leases.len)) return error.ResourceLimitExceeded;
@@ -533,4 +546,30 @@ test "LightOnOCR3 128 page reader pool refills within the existing 256 join epoc
     try std.testing.expectEqual(@as(usize, 0), pool.users);
     try std.testing.expectEqual(@as(usize, 1), fake.created);
     try std.testing.expectEqual(@as(usize, 1), fake.destroyed);
+}
+
+test "shared peak admission rollback releases only unconsumed growth" {
+    const Fake = struct {
+        released: usize = 0,
+        const Lease = struct {
+            owner: *usize,
+            fn release(self: *@This()) void {
+                self.owner.* += 1;
+            }
+        };
+        fn acquire(self: *@This(), _: usize) !Lease {
+            return .{ .owner = &self.released };
+        }
+    };
+    var owner = Fake{};
+    var peak = SharedPeak(Fake.Lease){};
+    try peak.grow(10, &owner, Fake.acquire);
+    const before = peak.mark();
+    try peak.grow(20, &owner, Fake.acquire);
+    peak.rollback(before);
+    try std.testing.expectEqual(@as(usize, 10), peak.bytes);
+    try std.testing.expectEqual(@as(usize, 1), peak.count);
+    try std.testing.expectEqual(@as(usize, 1), owner.released);
+    peak.deinit();
+    try std.testing.expectEqual(@as(usize, 2), owner.released);
 }
