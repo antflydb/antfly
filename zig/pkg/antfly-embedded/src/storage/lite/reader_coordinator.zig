@@ -37,7 +37,45 @@ pub const Coordinator = struct {
     artifact_release_head: ?*ArtifactRelease = null,
     artifact_release_tail: ?*ArtifactRelease = null,
 
+    wal_checkpoint_mutex: std.atomic.Mutex = .unlocked,
+    wal_checkpoints: std.StringHashMapUnmanaged(struct { inode: u64, completed_at_ns: u64 }) = .empty,
     known: ?struct { inode: u64, tip: [32]u8 } = null,
+
+    /// A cache re-open is not a process restart. A known successful checkpoint
+    /// provides a conservative lower bound for the age of every later append.
+    /// Peers may checkpoint later; an older local bound only schedules earlier.
+    pub fn recoveredWalDeadline(self: *Coordinator, root: []const u8, inode: u64, max_age_ns: u64) ?u64 {
+        @import("antfly_platform").sync.lockYielding(&self.wal_checkpoint_mutex);
+        defer self.wal_checkpoint_mutex.unlock();
+        const known = self.wal_checkpoints.get(root) orelse return null;
+        if (known.inode != inode) return null;
+        return known.completed_at_ns +| max_age_ns;
+    }
+    pub fn noteWalCheckpoint(self: *Coordinator, root: []const u8, inode: u64, now_ns: u64) void {
+        @import("antfly_platform").sync.lockYielding(&self.wal_checkpoint_mutex);
+        defer self.wal_checkpoint_mutex.unlock();
+        if (self.wal_checkpoints.getPtr(root)) |known| {
+            known.* = .{ .inode = inode, .completed_at_ns = now_ns };
+            return;
+        }
+        const key = self.allocator.dupe(u8, root) catch return;
+        self.wal_checkpoints.put(self.allocator, key, .{ .inode = inode, .completed_at_ns = now_ns }) catch self.allocator.free(key);
+    }
+    pub fn forgetWalCheckpoints(self: *Coordinator, prefix: []const u8) void {
+        @import("antfly_platform").sync.lockYielding(&self.wal_checkpoint_mutex);
+        defer self.wal_checkpoint_mutex.unlock();
+        var removed = false;
+        var it = self.wal_checkpoints.iterator();
+        while (it.next()) |entry| {
+            const root = entry.key_ptr.*;
+            if (!std.mem.eql(u8, root, prefix) and
+                !(std.mem.startsWith(u8, root, prefix) and root.len > prefix.len and root[prefix.len] == '/')) continue;
+            std.debug.assert(self.wal_checkpoints.remove(root));
+            self.allocator.free(root);
+            removed = true;
+        }
+        if (removed) self.wal_checkpoints.rehash(std.hash_map.StringContext{});
+    }
 
     pub const ArtifactRelease = struct {
         inode: u64,
@@ -228,6 +266,9 @@ pub const Coordinator = struct {
         std.debug.assert(self.registration_batches == 0 and self.batch_data_epoch == null and self.batch_metadata_epoch == null);
         self.readers.deinit(self.allocator);
         self.destroyArtifactReleases(self.artifact_release_head);
+        var roots = self.wal_checkpoints.keyIterator();
+        while (roots.next()) |root| self.allocator.free(root.*);
+        self.wal_checkpoints.deinit(self.allocator);
     }
     /// The descriptor already holds its kernel shared lock. Registration may
     /// wait for a writer, which then treats this unregistered lock as external.
@@ -559,4 +600,17 @@ test "lite reader registration batch allocation failures release every fence and
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
+}
+
+test "lite WAL checkpoint ages survive cache refresh and fence inode replacement" {
+    var owner = Coordinator{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer owner.deinit();
+    try std.testing.expect(owner.recoveredWalDeadline("root/index", 1, 100) == null);
+    owner.noteWalCheckpoint("root/index", 1, 200);
+    for (0..20) |_| try std.testing.expectEqual(@as(?u64, 300), owner.recoveredWalDeadline("root/index", 1, 100));
+    try std.testing.expect(owner.recoveredWalDeadline("root/index", 2, 100) == null);
+    owner.noteWalCheckpoint("root/index-other", 1, 400);
+    owner.forgetWalCheckpoints("root/index");
+    try std.testing.expect(owner.recoveredWalDeadline("root/index", 1, 100) == null);
+    try std.testing.expectEqual(@as(?u64, 500), owner.recoveredWalDeadline("root/index-other", 1, 100));
 }

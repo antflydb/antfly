@@ -56,6 +56,8 @@ pub const Store = struct {
         .loaded_content_revision = loadedContentRevision,
         .loaded_wal_metadata_revision = loadedWalMetadataRevision,
         .acquire_read_snapshot = acquireReadSnapshot,
+        .recovered_wal_idle_deadline = recoveredWalIdleDeadline,
+        .wal_checkpoint_completed = walCheckpointCompleted,
         .private_scratch_directory = privateScratchDirectory,
         .create_dir_path = createDirPath,
         .virtual_directories = true,
@@ -93,6 +95,20 @@ pub const Store = struct {
             .docs = docs,
             .namespace_prefix = namespace_prefix,
         };
+    }
+
+    fn recoveredWalIdleDeadline(ptr: *anyopaque, root: []const u8, max_age_ns: u64) ?u64 {
+        const self: *Store = @ptrCast(@alignCast(ptr));
+        const coordinator = self.docs.file.reader_coordinator orelse return null;
+        const inode = (self.docs.file.file.stat(self.docs.file.runtime()) catch return null).inode;
+        return coordinator.recoveredWalDeadline(root, inode, max_age_ns);
+    }
+
+    fn walCheckpointCompleted(ptr: *anyopaque, root: []const u8, now_ns: u64) void {
+        const self: *Store = @ptrCast(@alignCast(ptr));
+        const coordinator = self.docs.file.reader_coordinator orelse return;
+        const inode = (self.docs.file.file.stat(self.docs.file.runtime()) catch return).inode;
+        coordinator.noteWalCheckpoint(root, inode, now_ns);
     }
 
     fn privateScratchDirectory(raw: *anyopaque) ?[]const u8 {
@@ -147,6 +163,8 @@ fn acquireReadSnapshot(ptr: *anyopaque) !StorageIo.Lease {
         const read_vtable: StorageIo.VTable = blk: {
             var value = Store.vtable;
             value.acquire_read_snapshot = null;
+            value.recovered_wal_idle_deadline = null;
+            value.wal_checkpoint_completed = null;
             value.loaded_wal_metadata_revision = null;
             value.open_immutable_source = null;
             value.open_leased_immutable_source = null;
@@ -382,6 +400,10 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
     try validateWritePath(self, new_path);
     var mutation = CatalogWrite{ .kind = .rename, .path = old_path, .value = new_path };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
+    if (self.docs.file.reader_coordinator) |coordinator| {
+        coordinator.forgetWalCheckpoints(old_path);
+        coordinator.forgetWalCheckpoints(new_path);
+    }
 }
 
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -405,6 +427,7 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     };
     var request = Context{ .store = self, .path = directory };
     try self.docs.submitIndexMutation(&request, Context.apply, true);
+    if (self.docs.file.reader_coordinator) |coordinator| coordinator.forgetWalCheckpoints(directory);
 }
 
 // Subtree deletion stays one atomic native transaction. Each private flush
@@ -3174,4 +3197,95 @@ test "lite artifact closed leases retire with the next publication across regist
     var source = try replacement.openArtifactSource("/runs/churn");
     source.close();
     try std.testing.expect((try replacement.file.check()).valid);
+}
+
+test "lite WAL checkpoint ages bound repeated cache recovery without tiny flushes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "wal-cache-age.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    const coordinator = try native.ReaderCoordinator.create(a, std.testing.io);
+    defer coordinator.release();
+    docs.file.reader_coordinator = coordinator;
+    defer docs.file.reader_coordinator = null;
+    var indexes = Store.init(a, &docs);
+    const Clock = struct {
+        var tick: u64 = 100;
+        fn now(_: *anyopaque) u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 100;
+    var callbacks = Store.vtable;
+    callbacks.now_ns = Clock.now;
+    const storage = StorageIo{ .ptr = &indexes, .vtable = &callbacks };
+    const lsm = @import("../lsm_backend.zig");
+    const root = "/cache-age";
+    const options = lsm.Options{ .storage = storage, .flush_threshold_bytes = 1024 * 1024, .mutable_idle_flush_after_ns = 10, .mutable_idle_flush_min_bytes = 1024 * 1024, .mutable_idle_flush_max_age_ns = 100, .compact_threshold_runs = 100, .l0_soft_limit_runs = 100, .l0_hard_limit_runs = 100 };
+    {
+        var backend = try lsm.Backend.open(a, root, options);
+        defer backend.closePreservingWal();
+        var runtime = try backend.runtimeStore(a, .{ .name = "meta", .transient_storage_snapshot = true });
+        defer runtime.deinit();
+        var write = try runtime.beginWrite();
+        errdefer write.abort();
+        try write.put("a", "checkpointed");
+        try write.commit();
+        try backend.checkpointWalAfterDurableBoundary();
+        const inode = (try docs.file.file.stat(std.testing.io)).inode;
+        try std.testing.expectEqual(@as(?u64, 200), coordinator.recoveredWalDeadline(root, inode, 100));
+        Clock.tick = 110;
+        var dirty = try runtime.beginWrite();
+        errdefer dirty.abort();
+        try dirty.put("b", "durable in WAL");
+        try dirty.commit();
+    }
+    // Reopening reconstructible caches must neither force a fresh SST for
+    // these few records nor renew their maximum-age deadline indefinitely.
+    for (111..131) |tick| {
+        Clock.tick = tick;
+        var backend = try lsm.Backend.open(a, root, options);
+        defer backend.closePreservingWal();
+        try std.testing.expect(backend.mutable.entryCount() > 0);
+        _ = try backend.runMaintenanceStep();
+        try std.testing.expectEqual(@as(u64, 0), backend.snapshotWriteStats().flushes);
+        try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+    }
+    Clock.tick = 200;
+    {
+        var backend = try lsm.Backend.open(a, root, options);
+        defer backend.closePreservingWal();
+        _ = try backend.runMaintenanceStep();
+        try std.testing.expectEqual(@as(u64, 1), backend.snapshotWriteStats().flushes);
+        var runtime = try backend.runtimeStore(a, .{ .name = "meta" });
+        defer runtime.deinit();
+        var read = try runtime.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("durable in WAL", try read.get("b"));
+    }
+    // A fresh owner (or forgotten/deleted generation) still has no evidence
+    // of the original age and must retain conservative restart checkpointing.
+    coordinator.forgetWalCheckpoints(root);
+    Clock.tick = 210;
+    {
+        var backend = try lsm.Backend.open(a, root, options);
+        defer backend.closePreservingWal();
+        var runtime = try backend.runtimeStore(a, .{ .name = "meta" });
+        defer runtime.deinit();
+        var write = try runtime.beginWrite();
+        errdefer write.abort();
+        try write.put("c", "unknown age");
+        try write.commit();
+    }
+    Clock.tick = 211;
+    {
+        var backend = try lsm.Backend.open(a, root, options);
+        defer backend.closePreservingWal();
+        _ = try backend.runMaintenanceStep();
+        try std.testing.expectEqual(@as(u64, 1), backend.snapshotWriteStats().flushes);
+    }
 }

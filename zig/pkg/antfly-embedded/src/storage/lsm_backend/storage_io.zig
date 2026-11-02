@@ -594,6 +594,10 @@ pub const Storage = struct {
         /// Short, consistent metadata read batch. The provider must outlive the
         /// returned scope; callers release it before computation/publication.
         acquire_read_snapshot: ?*const fn (*anyopaque) anyerror!Lease = null,
+        /// Cache-owner knowledge of a completed durable WAL checkpoint. Null
+        /// retains conservative restart recovery; this never authorizes reuse.
+        recovered_wal_idle_deadline: ?*const fn (*anyopaque, []const u8, u64) ?u64 = null,
+        wal_checkpoint_completed: ?*const fn (*anyopaque, []const u8, u64) void = null,
         /// Physical directory for private build files; null disables filesystem staging.
         private_scratch_directory: ?*const fn (*anyopaque) ?[]const u8 = null,
         /// Exact immutable native checkpoint, owned by the returned buffer.
@@ -945,6 +949,16 @@ pub const Storage = struct {
     pub fn acquireReadSnapshot(self: Storage) !?Lease {
         const acquire = self.vtable.acquire_read_snapshot orelse return null;
         return try BoundaryAbi.call("acquire_read_snapshot", self.boundary_dispatch, acquire, .{self.ptr});
+    }
+
+    pub fn recoveredWalIdleDeadline(self: Storage, root: []const u8, max_age_ns: u64) ?u64 {
+        const callback = self.vtable.recovered_wal_idle_deadline orelse return null;
+        return BoundaryAbi.call("recovered_wal_idle_deadline", self.boundary_dispatch, callback, .{ self.ptr, root, max_age_ns }) catch null;
+    }
+
+    pub fn walCheckpointCompleted(self: Storage, root: []const u8, now_ns: u64) void {
+        const callback = self.vtable.wal_checkpoint_completed orelse return;
+        BoundaryAbi.call("wal_checkpoint_completed", self.boundary_dispatch, callback, .{ self.ptr, root, now_ns }) catch {};
     }
 
     pub fn loadedWalMetadataRevision(self: Storage, root_dir: []const u8) ?ContentRevision {

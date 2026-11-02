@@ -1386,8 +1386,14 @@ lease key. The bounded orphan sweep remains the crash-recovery fallback.
 Native persistent index handles are caches of committed index state. Opening or
 closing a cache preserves durable, replayed mutable WAL state without publishing
 an empty transaction or flushing that state into a new physical generation.
-Required WAL recovery and catalog repair still run on open. Optional retired
-segment reconciliation runs under explicit index maintenance admission instead.
+Required WAL recovery and catalog repair still run on open. Native owners retain
+the last successful durable WAL checkpoint time for each LSM root and inode.
+Recovered cache state keeps that original maximum-age boundary instead of
+forcing another tiny SST on every runtime open or renewing its grace period.
+Unknown ages and changed inodes retain conservative immediate checkpointing.
+Only a completed WAL reset advances the remembered time; no-op barriers and
+failed checkpoints do not. Directory retirement removes the corresponding age
+hints. Optional retired segment reconciliation runs under explicit index maintenance admission instead.
 This prevents foreground cache refresh from repeatedly invalidating detached
 background work. Replay processing budgets exclude fixed publication admission
 and catalog validation overhead; they continue to charge actual replay work.

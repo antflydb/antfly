@@ -2894,17 +2894,22 @@ pub const Backend = struct {
     }
 
     /// WAL replay proves this mutable state was already dirty before this
-    /// process started. Its original monotonic timestamp cannot be recovered,
-    /// so granting it a fresh maximum-age interval on every restart could
-    /// postpone checkpointing forever. Make recovered state immediately
-    /// eligible; the maintenance worker still performs the normal atomic
-    /// run/manifest/WAL checkpoint sequence.
+    /// process started. A provider may retain a successful checkpoint's age
+    /// across cache re-opens. Without that knowledge, granting a fresh maximum-
+    /// age interval on every restart could postpone checkpointing forever.
+    /// Unknown ages remain immediately eligible; known cache owners keep the
+    /// original bound. Maintenance still performs the atomic run/manifest/WAL
+    /// checkpoint sequence.
     pub fn noteRecoveredWriteMutationLocked(self: *Backend) void {
         if (self.options.mutable_idle_flush_after_ns > 0 and
             self.mutable.entryCount() > 0 and
             !self.options.backend.read_only)
         {
-            const due_ns = @max(self.nowNs(), 1);
+            const remembered = if (self.options.mutable_idle_flush_max_age_ns > 0 and self.storage != null and self.root_dir != null)
+                self.storage.?.recoveredWalIdleDeadline(self.root_dir.?, self.options.mutable_idle_flush_max_age_ns)
+            else
+                null;
+            const due_ns = remembered orelse @max(self.nowNs(), 1);
             self.mutable_idle_flush_deadline_ns = due_ns;
             self.mutable_idle_flush_max_deadline_ns = due_ns;
         } else {
@@ -6121,6 +6126,10 @@ pub const Backend = struct {
         // durably manifested. Keep cleanup-only retry paths and future callers
         // from retaining stale publication debt after a successful reset.
         self.clearPublishedWalLogicalDebtLocked();
+        // Only completed durable reset advances the cache-owner age. A no-op
+        // barrier or failed checkpoint must not postpone the next real cut.
+        if (self.options.mutable_idle_flush_after_ns > 0 and self.options.mutable_idle_flush_max_age_ns > 0)
+            self.storage.?.walCheckpointCompleted(self.root_dir.?, self.nowNs());
     }
 
     pub fn checkpointWalAfterDurableBoundary(self: *Backend) !void {
