@@ -74,6 +74,43 @@ pub const CapturedLeases = struct {
 
 pub const View = struct { storage: *Lease, shape: []const i32, dtype: ops.GraphDType = .f32 };
 
+/// A frame-scoped captured submission. Replay can reuse its own address pins;
+/// published views and foreign captures block mutable storage reuse. Immutable
+/// program storage is shared according to its allocation's ownership.
+/// Begin/commit only record and instantiate; they never submit GPU work.
+/// Failed recording/instantiation can therefore abort and run ordinary kernels.
+/// The backend context must outlive this owner.
+pub const Replay = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    pub const VTable = struct {
+        begin: *const fn (*anyopaque, []const ?*Lease) anyerror!bool,
+        commit: *const fn (*anyopaque) anyerror!void,
+        abort: *const fn (*anyopaque) void,
+        launch: *const fn (*anyopaque) anyerror!void,
+        retains: *const fn (*anyopaque, *const Lease) bool,
+        deinit: *const fn (*anyopaque) void,
+    };
+    pub fn begin(self: Replay, leases: []const ?*Lease) !bool {
+        return self.vtable.begin(self.ptr, leases);
+    }
+    pub fn commit(self: Replay) !void {
+        return self.vtable.commit(self.ptr);
+    }
+    pub fn abort(self: Replay) void {
+        self.vtable.abort(self.ptr);
+    }
+    pub fn launch(self: Replay) !void {
+        return self.vtable.launch(self.ptr);
+    }
+    pub fn retains(self: Replay, lease: *const Lease) bool {
+        return self.vtable.retains(self.ptr, lease);
+    }
+    pub fn deinit(self: Replay) void {
+        self.vtable.deinit(self.ptr);
+    }
+};
+
 /// A recorded submission fence. Waiting may enqueue a device dependency; it
 /// need not block the host. The owner records before publishing a frame as idle.
 pub const Completion = struct {

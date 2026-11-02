@@ -94,9 +94,22 @@ preparation API do not by themselves complete these remaining requirements:
   context; switching contexts retires device bindings while preserving semantic
   graphs and analysis. ONNX initializers retain their shared immutable context.
 - Assigned outputs/workspace cover admitted native/CUDA descriptors, while Metal
-  consumes its existing physical allocation plan. Compatibility allocation paths
-  remain, and CUDA decode capture still uses its learned allocation arena.
-  A universal authoritative allocation/capture plan is unfinished.
+  consumes its existing physical allocation plan. Prepared CUDA graphs with full
+  assigned-kernel coverage can capture the plan's stable output, workspace,
+  mutable-input and F32-literal banks. Binding roles, exact context identity,
+  immutable-handle ownership and copy/launch costs gate admission. Backend
+  predicates exclude packed/reduced and vendor-workspace routes whose complete
+  temporary ownership is not yet in that plan, preserving their tuned dispatch.
+  F32 literals share one immutable allocation across frames; explicit literal
+  overrides use ordinary execution without mutating captured storage. Dense
+  metadata reshapes preserve backing storage and output shapes. Recording and
+  instantiation failures fall back before compute submission; submission errors
+  propagate.
+  Captures own their address leases; published outputs and foreign captures
+  prevent reuse of mutable frame storage. Cancellation/side-channel requests and unsupported
+  graphs retain ordinary execution, with explicit replay decisions in diagnostics.
+  Model-specific decode capture retains its learned arena as a compatibility
+  path. Universal physical planning and retirement of that fallback remain open.
 - `model_definition.zig`, `compute_context.zig`, prepared executables and model
   candidates separate important responsibilities. The session factory, model
   manager and generation pipeline still contain model-specific loading and

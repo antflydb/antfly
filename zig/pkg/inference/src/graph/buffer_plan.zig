@@ -85,6 +85,8 @@ pub const PartitionSlotView = struct {
 };
 
 pub const AllocationKind = enum {
+    input_binding,
+    constant_binding,
     tensor,
     transfer,
     workspace,
@@ -169,6 +171,22 @@ pub const BufferPlan = struct {
         const id: AllocationId = @intCast(self.allocations.len);
         self.allocations = try self.allocator.realloc(self.allocations, self.allocations.len + 1);
         self.allocations[id] = .{ .id = id, .kind = .workspace, .backend = backend, .storage = storage, .byte_size = bytes, .first_use = 0, .last_use = @intCast(self.node_slots.len), .reusable = true };
+        return id;
+    }
+
+    /// A stable mutable input bank for captured submission. External inputs
+    /// remain external logical slots; this allocation records the explicit
+    /// device copy which binds their current values to the captured addresses.
+    pub fn addInputBinding(self: *BufferPlan, backend: BackendKind, bytes: usize) !AllocationId {
+        const id = try self.addWorkspace(backend, bytes, @alignOf(f32));
+        self.allocations[id].kind = .input_binding;
+        self.allocations[id].reusable = false;
+        return id;
+    }
+
+    pub fn addConstantBinding(self: *BufferPlan, backend: BackendKind, bytes: usize) !AllocationId {
+        const id = try self.addInputBinding(backend, bytes);
+        self.allocations[id].kind = .constant_binding;
         return id;
     }
 

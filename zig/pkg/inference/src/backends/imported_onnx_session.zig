@@ -3123,3 +3123,98 @@ test "resident staged execution retains its common context after publishing sess
         if (kind == .metal) try std.testing.expect(@import("../graph/metal_partition_executor.zig").isMetalDeviceResident(projected.backend, projected.outputs[0]));
     }
 }
+
+test "imported ONNX CUDA assigned graph captures and replays with changing public inputs" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 8 }));
+    const positive = try b.absOp(x);
+    var out = positive;
+    for (0..8) |_| out = try b.relu(try b.add(out, positive));
+    try graph.markOutput(out);
+    const bytes = try onnx_graph.exportGraph(a, &graph, .{});
+    defer a.free(bytes);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = bytes });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", dir.sub_path[0..], "model.onnx" });
+    defer a.free(path);
+    var session = try createSessionWithOptions(a, path, .cuda, .{ .graph_runtime_strategy = .compiled_preferred });
+    defer session.close();
+    try std.testing.expect(session.configureExecutionDiagnostics(true));
+    const impl: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    const pool = impl.executable.runtime.physical_pool.?;
+    if (pool.replay_backend == null) {
+        std.debug.print("ONNX replay admission={s} parameters={d} static_inputs={d}\n", .{ @tagName(pool.replay_decision), impl.program.graph.parameters.items.len, impl.static_runtime_inputs.len });
+        for (impl.program.graph.nodes.items, 0..) |node, id| std.debug.print("ONNX replay node={d} op={s}\n", .{ id, @tagName(node.op) });
+    }
+    try std.testing.expect(pool.replay_backend != null);
+    for (0..4) |iteration| {
+        var values: [8]f32 = undefined;
+        for (&values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i)) - 4)) * @as(f32, @floatFromInt(iteration + 1));
+        var input = try Tensor.initFloat32(a, "x", &.{ 1, 8 }, &values);
+        defer input.deinit();
+        const outputs = try session.run(&.{input}, a);
+        defer {
+            for (outputs) |*output| output.deinit();
+            a.free(outputs);
+        }
+        for (outputs[0].asFloat32(), values) |value, original| try std.testing.expectEqual(@abs(original) * 9, value);
+        const snapshot = session.executionDiagnostics().?;
+        if (iteration >= 2) {
+            if (snapshot.execution.physical_graph_replays == 0) std.debug.print("ONNX replay decision={s}\n", .{@tagName(snapshot.execution.physical_replay)});
+            try std.testing.expectEqual(@as(u64, 1), snapshot.execution.physical_graph_replays);
+        }
+    }
+    // Canonicalization replaces the first add(x, x) with a scalar multiply.
+    // An explicit override must use ordinary execution without changing shared
+    // immutable storage; the next captured request sees the original literal.
+    var literal_id: ?NodeId = null;
+    for (impl.program.graph.nodes.items, 0..) |node, id| if (node.op == .constant) {
+        try std.testing.expectEqual(@as(u32, 1), node.op.constant.data_len);
+        try std.testing.expectEqual(@as(f32, 2), impl.program.graph.constantData(node.op.constant.data_offset, 1)[0]);
+        literal_id = @intCast(id);
+        break;
+    };
+    const original = [_]f32{ -4, -3, -2, -1, 0, 1, 2, 3 };
+    const public = try impl.cb.fromFloat32Shape(&original, &.{ 1, 8 });
+    defer impl.cb.free(public);
+    const replacement = try impl.cb.fromFloat32Shape(&.{3}, &.{});
+    defer impl.cb.free(replacement);
+    {
+        var overridden = try impl.executable.run(a, .{
+            .runtime_inputs = &.{ .{ .node_id = impl.input_node_ids[0], .value = public }, .{ .node_id = literal_id.?, .value = replacement } },
+            .activation_readbacks = .forbidden,
+            .output_placement = .producer,
+        });
+        defer overridden.deinit(&impl.executable.runtime);
+        try std.testing.expectEqual(@as(u64, 0), overridden.stats.physical_graph_replays);
+        try std.testing.expectEqual(@import("../execution/stats.zig").PhysicalReplayDecision.literal_override, overridden.stats.physical_replay);
+        const actual = try impl.cb.toFloat32(overridden.outputs[0], a);
+        defer a.free(actual);
+        for (actual, original) |value, source| try std.testing.expectEqual(@abs(source) * 10, value);
+    }
+    var input = try Tensor.initFloat32(a, "x", &.{ 1, 8 }, &original);
+    defer input.deinit();
+    const restored = try session.run(&.{input}, a);
+    defer {
+        for (restored) |*output| output.deinit();
+        a.free(restored);
+    }
+    for (restored[0].asFloat32(), original) |value, source| try std.testing.expectEqual(@abs(source) * 9, value);
+    try std.testing.expectEqual(@as(u64, 1), session.executionDiagnostics().?.execution.physical_graph_replays);
+    const public_inputs = [_]RuntimeInput{.{ .node_id = impl.input_node_ids[0], .value = public }};
+    var held = try impl.executable.run(a, .{ .runtime_inputs = &public_inputs, .output_placement = .producer });
+    defer held.deinit(&impl.executable.runtime);
+    var competing = try impl.executable.run(a, .{ .runtime_inputs = &public_inputs, .output_placement = .producer });
+    defer competing.deinit(&impl.executable.runtime);
+    try std.testing.expectEqual(@as(usize, 2), pool.frames.items.len);
+    for (pool.replay_inputs) |binding| if (binding.constant != null) {
+        const allocation = binding.allocation.?;
+        try std.testing.expect(pool.frames.items[0].storages[allocation].? == pool.frames.items[1].storages[allocation].?);
+        try std.testing.expect(pool.shared_constants[binding.constant_index.?].lease.? == pool.frames.items[0].storages[allocation].?);
+    };
+}

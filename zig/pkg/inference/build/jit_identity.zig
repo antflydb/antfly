@@ -82,6 +82,8 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
     const tile_inputs = @import("../src/tile/source_inputs.zig").paths;
     const contracts = [_][]const u8{
         "src/ops/ops.zig",
+        "src/ops/kernel_backend.zig",
+        "src/ops/physical_storage.zig",
         "src/execution/runtime_telemetry.zig",
         "src/ops/kernel_descriptor.zig",
         "src/graph/kernel_source_owner.zig",

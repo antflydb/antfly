@@ -190,6 +190,54 @@ pub const Runtime = struct {
         return result;
     }
 
+    fn addPhysicalStats(stats: *partition_mod.PartitionExecutor.ExecutionStats, physical: @import("../execution/physical_buffers.zig").Stats) void {
+        stats.physical_replay = physical.replay_decision;
+        stats.assigned_kernel_dispatches += physical.dispatches;
+        stats.physical_transfer_dispatches += physical.transfers;
+        stats.physical_transfer_bytes += physical.transfer_bytes;
+        stats.physical_storage_allocations += physical.allocations;
+        stats.physical_storage_bytes += physical.allocated_bytes;
+        stats.physical_storage_reuses += physical.reused_allocations;
+        stats.physical_graph_captures += physical.graph_captures;
+        stats.physical_capture_failures += physical.capture_failures;
+        stats.physical_replay_error = physical.capture_failure;
+        stats.physical_graph_replays += physical.graph_replays;
+        stats.physical_input_copies += physical.input_copies;
+        stats.physical_input_copy_bytes += physical.input_copy_bytes;
+    }
+
+    fn submitPreparedFrame(
+        allocator: std.mem.Allocator,
+        graph: *const Graph,
+        plan: *const multi_executor.DevicePartitionPlan,
+        mesh: *const device_mesh_mod.DeviceMesh,
+        options: interpreter.ExecuteOptions,
+        frame: ?*@import("../execution/physical_buffers.zig").Frame,
+        capturing: *bool,
+    ) !multi_executor.MultiExecutionResult {
+        var result = multi_executor.executeMultiDevice(allocator, graph, plan, mesh, options) catch |err| recover: {
+            if (!capturing.*) return err;
+            frame.?.abortReplayCapture(err);
+            capturing.* = false;
+            break :recover try multi_executor.executeMultiDevice(allocator, graph, plan, mesh, options);
+        };
+        if (!capturing.*) return result;
+        const active = frame.?;
+        active.commitReplayCapture() catch |err| {
+            // Recording/instantiation has not submitted compute. Preserve the
+            // ordinary execution path when optional capture cannot be prepared.
+            active.abortReplayCapture(err);
+            capturing.* = false;
+            result.deinit(mesh);
+            return multi_executor.executeMultiDevice(allocator, graph, plan, mesh, options);
+        };
+        capturing.* = false;
+        errdefer result.deinit(mesh);
+        // A submission error is an execution error and must propagate.
+        try active.replay.?.launch();
+        return result;
+    }
+
     fn executeImpl(self: *Runtime, allocator: std.mem.Allocator, graph: *const Graph, options: interpreter.ExecuteOptions) !Result {
         switch (self.strategy) {
             .interpreter => {
@@ -216,6 +264,26 @@ pub const Runtime = struct {
                 if (frame) |active| try active.begin();
                 var planned_options = options;
                 planned_options.physical_frame = frame;
+                const replay_inputs = if (frame) |active| try active.bindReplayInputs(options) else null;
+                defer if (replay_inputs != null) frame.?.releaseReplayInputs();
+                if (replay_inputs) |inputs| planned_options.runtime_inputs = inputs;
+                if (frame) |active| if (replay_inputs != null and active.replay_ready) {
+                    var replayed = Result{
+                        .outputs = try active.replayOutputs(allocator),
+                        .owner_backend = durableBackend(self.default_backend.*),
+                        .allocator = allocator,
+                    };
+                    errdefer replayed.deinit(self);
+                    frame_finished = true;
+                    addPhysicalStats(&replayed.stats, try active.finish());
+                    return replayed;
+                };
+                var capturing = if (frame) |active| if (replay_inputs != null) active.beginReplayCapture() catch |err| recover: {
+                    active.abortReplayCapture(err);
+                    break :recover false;
+                } else false else false;
+                defer if (capturing) frame.?.replay.?.abort();
+
                 if (planned_options.cached_partition_last_use == null) planned_options.cached_partition_last_use = self.partition_last_use;
                 if (planned_options.cached_buffer_plan == null) {
                     if (self.buffer_plan) |*buffers| {
@@ -223,19 +291,20 @@ pub const Runtime = struct {
                         planned_options.cached_buffer_plan_validated = true;
                     }
                 }
-                var result = try multi_executor.executeMultiDevice(allocator, graph, &plan, &mesh, planned_options);
+                var result = try submitPreparedFrame(allocator, graph, &plan, &mesh, planned_options, frame, &capturing);
                 errdefer result.deinit(&mesh);
+                if (frame) |active| if (replay_inputs != null) {
+                    active.warmed = active.stats.dispatches == active.pool.replay_kernel_count;
+                };
                 if (options.output_placement == .default_backend) try self.normalizeOutputsToDefaultDevice(allocator, &result);
                 if (frame) |active| {
                     frame_finished = true;
                     const physical_stats = try active.finish();
-                    result.stats.assigned_kernel_dispatches += physical_stats.dispatches;
-                    result.stats.physical_transfer_dispatches += physical_stats.transfers;
-                    result.stats.physical_transfer_bytes += physical_stats.transfer_bytes;
-                    result.stats.physical_storage_allocations += physical_stats.allocations;
-                    result.stats.physical_storage_bytes += physical_stats.allocated_bytes;
-                    result.stats.physical_storage_reuses += physical_stats.reused_allocations;
-                } else if (self.physical_pool != null) result.stats.physical_frame_busy_fallbacks += 1;
+                    addPhysicalStats(&result.stats, physical_stats);
+                } else if (self.physical_pool != null) {
+                    result.stats.physical_frame_busy_fallbacks += 1;
+                    result.stats.physical_replay = .busy_frame;
+                }
                 // Copy representation owners before detaching outputs. Result
                 // cleanup must not depend on an evicted executable's mesh.
                 const devices = if (options.output_placement == .producer) result.output_devices else null;

@@ -29561,9 +29561,14 @@ fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
 }
 
 const kernel_backend_impl = ops.KernelBackend{
+    .physicalReplayReshapeViews = true,
     .physicalExecutionScope = &physicalExecutionScopeOp,
     .allocatePhysicalStorage = &allocatePhysicalStorageOp,
     .physicalTensorView = &physicalTensorViewOp,
+    .copyPhysicalInput = &copyPhysicalInputOp,
+    .createPhysicalReplay = &createPhysicalReplayOp,
+    .physicalReplayTensorSupported = &physicalReplayTensorSupportedOp,
+    .physicalReplayKernelSupported = &physicalReplayKernelSupportedOp,
     .assignedKernelAuxiliaries = &assignedKernelAuxiliariesOp,
     .assignedKernelWorkspace = &assignedKernelWorkspaceOp,
     .runAssignedKernel = &runAssignedKernelOp,
@@ -31916,6 +31921,129 @@ test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclam
     try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyToHostTracked(&compute, device, &bytes));
     try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyToHostTrackedAndSync(&compute, device, &bytes));
     try std.testing.expectError(error.InvalidCudaState, copyToHostTrackedAndSync(&compute, .{}, &bytes));
+}
+
+const PhysicalReplay = struct {
+    compute: *CudaCompute,
+    graph: ?@import("graph.zig").CapturedGraph = null,
+    leases: ops.physical_storage.CapturedLeases = .{},
+    active: bool = false,
+    disabled_before: bool = false,
+    const vtable = ops.physical_storage.Replay.VTable{ .begin = begin, .commit = commit, .abort = abort, .launch = launch, .retains = retains, .deinit = deinit };
+    fn begin(raw: *anyopaque, leases: []const ?*ops.physical_storage.Lease) !bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const compute = self.compute;
+        if (self.graph != null or self.active or compute.execution_scope != null or compute.debug_cuda_graph_capture_active or compute.capturing_physical_storage.values.items.len != 0 or try compute.ctx.streamCaptureActive()) return false;
+        errdefer compute.capturing_physical_storage.deinit(compute.allocator);
+        for (leases) |maybe| if (maybe) |lease| {
+            if (lease.backend.ptr == @as(*anyopaque, @ptrCast(compute))) try compute.capturing_physical_storage.retain(compute.allocator, lease);
+        };
+        try @import("graph.zig").beginCapture(&compute.ctx);
+        self.disabled_before = compute.debug_cuda_graph_capture_disabled;
+        compute.debug_cuda_graph_capture_disabled = false;
+        compute.debug_cuda_graph_capture_active = true;
+        self.active = true;
+        return true;
+    }
+    fn commit(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.active) return error.InvalidCudaState;
+        const compute = self.compute;
+        const unsafe_allocation = compute.debug_cuda_graph_capture_disabled;
+        defer {
+            compute.debug_cuda_graph_capture_active = false;
+            compute.debug_cuda_graph_capture_disabled = self.disabled_before;
+            self.active = false;
+        }
+        errdefer compute.capturing_physical_storage.deinit(compute.allocator);
+        var graph = try @import("graph.zig").endCapture(&compute.ctx);
+        errdefer graph.deinit(&compute.ctx);
+        if (unsafe_allocation) return error.CudaGraphCaptureUnsafeTempAlloc;
+        // Submission is separate: failed instantiation can safely fall back
+        // before any recorded operation has executed.
+        self.graph = graph;
+        self.leases = compute.capturing_physical_storage;
+        compute.capturing_physical_storage = .{};
+    }
+    fn abort(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.active) return;
+        const compute = self.compute;
+        if (compute.ctx.endStreamCapture()) |graph| compute.ctx.destroyGraph(graph) else |_| {}
+        compute.capturing_physical_storage.deinit(compute.allocator);
+        compute.debug_cuda_graph_capture_active = false;
+        compute.debug_cuda_graph_capture_disabled = self.disabled_before;
+        self.active = false;
+    }
+    fn launch(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const graph = self.graph orelse return error.InvalidCudaState;
+        try graph.launch(&self.compute.ctx);
+    }
+    fn retains(raw: *anyopaque, lease: *const ops.physical_storage.Lease) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        for (self.leases.values.items) |value| if (value == lease) return true;
+        return false;
+    }
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        abort(raw);
+        if (self.graph) |*graph| {
+            self.compute.ctx.synchronize() catch {};
+            graph.deinit(&self.compute.ctx);
+        }
+        self.leases.deinit(self.compute.allocator);
+        self.compute.allocator.destroy(self);
+    }
+};
+
+// Capture admits only routes whose complete temporary storage is declared.
+// Packed/reduced projections and vendor workspaces keep their tuned direct
+// path until those representation/workspace owners join the physical plan.
+fn physicalReplayTensorSupportedOp(ctx: *anyopaque, value: CT) bool {
+    const compute: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const tensor = tensorFromCt(value);
+    return tensor.dtype == .f32 and tensor.quant_type == null and tensor.tc_quant == null and tensor.bf16_mirror.ptr == 0 and boundaryMixedWeight(compute, tensor) == null;
+}
+
+fn physicalReplayKernelSupportedOp(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+    const compute: *CudaCompute = @ptrCast(@alignCast(ctx));
+    var rows: usize = 0;
+    var in_dim: usize = 0;
+    var out_dim: usize = 0;
+    switch (descriptor.operation) {
+        .linear => |projection| {
+            rows = projection.rows;
+            in_dim = projection.in_dim;
+            out_dim = projection.out_dim;
+        },
+        .dot => |dot| {
+            if (descriptor.input_shapes[0].rank() != 2) return true;
+            if (compute.training_blas != null) return false;
+            rows = dot.m;
+            in_dim = dot.k;
+            out_dim = dot.n;
+        },
+        .transpose, .broadcast, .unary, .binary, .norm, .softmax, .rope, .reduction, .concat, .slice, .gather => return true,
+    }
+    const vendor = cudaCublasLtEnabled() and compute.ctx.info.compute_major >= 8 and compute.cublaslt != null and
+        (compute.strict_f32_weights or rows >= 128) and in_dim >= 64 and out_dim >= 64;
+    return !vendor;
+}
+
+fn createPhysicalReplayOp(ctx: *anyopaque) anyerror!?ops.physical_storage.Replay {
+    const compute: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const owner = try compute.allocator.create(PhysicalReplay);
+    owner.* = .{ .compute = compute };
+    return .{ .ptr = owner, .vtable = &PhysicalReplay.vtable };
+}
+
+fn copyPhysicalInputOp(ctx: *anyopaque, destination: CT, source: CT) anyerror!void {
+    const compute: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const dst = tensorFromCt(destination);
+    const src = tensorFromCt(source);
+    if (dst.dtype != .f32 or src.dtype != .f32 or dst.quant_type != null or src.quant_type != null or !std.mem.eql(i64, dst.shape, src.shape)) return error.InvalidShape;
+    if (dst.buffer.ptr != src.buffer.ptr) try copyFromDeviceTracked(compute, dst.buffer, src.buffer, dst.elem_count * @sizeOf(f32));
 }
 
 fn physicalExecutionScopeOp(ctx: *anyopaque, leases: ?[]const ?*ops.physical_storage.Lease) anyerror!void {

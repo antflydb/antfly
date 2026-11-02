@@ -20,11 +20,17 @@ const CT = @import("../graph/backend_contracts.zig").CT;
 const kernel_descriptor = @import("kernel_descriptor.zig");
 const physical_storage = @import("physical_storage.zig");
 pub const VTable = struct {
+    /// Dense F32 reshapes create only retained metadata views on this target.
+    physicalReplayReshapeViews: bool = false,
     /// Borrow the current frame's stable storage table. Entries may be filled
     /// during warmup; capture retains their leases before recording addresses.
     physicalExecutionScope: ?*const fn (ctx: *anyopaque, storages: ?[]const ?*physical_storage.Lease) anyerror!void = null,
     allocatePhysicalStorage: ?*const fn (ctx: *anyopaque, byte_size: usize) anyerror!?CT = null,
     physicalTensorView: ?*const fn (ctx: *anyopaque, request: physical_storage.View) anyerror!?CT = null,
+    copyPhysicalInput: ?*const fn (ctx: *anyopaque, destination: CT, source: CT) anyerror!void = null,
+    createPhysicalReplay: ?*const fn (ctx: *anyopaque) anyerror!?physical_storage.Replay = null,
+    physicalReplayTensorSupported: ?*const fn (ctx: *anyopaque, tensor: CT) bool = null,
+    physicalReplayKernelSupported: ?*const fn (ctx: *anyopaque, descriptor: *const kernel_descriptor.Descriptor) bool = null,
     assignedKernelAuxiliaries: ?*const fn (ctx: *anyopaque, descriptor: *const kernel_descriptor.Descriptor) anyerror!kernel_descriptor.AuxiliaryRequirements = null,
     assignedKernelWorkspace: ?*const fn (ctx: *anyopaque, descriptor: *const kernel_descriptor.Descriptor) anyerror!kernel_descriptor.WorkspaceRequirement = null,
     runAssignedKernel: ?*const fn (ctx: *anyopaque, request: kernel_descriptor.Invocation) anyerror!bool = null,

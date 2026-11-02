@@ -14,7 +14,35 @@
 // limitations under the License.
 
 //! Execution diagnostics independent of partition implementation.
+pub const PhysicalReplayDecision = enum {
+    not_requested,
+    unsupported_backend,
+    unsupported_graph,
+    incomplete_bindings,
+    unprofitable,
+    controlled_request,
+    side_channels,
+    literal_override,
+    foreign_inputs,
+    changed_weights,
+    unsupported_owner,
+    unsupported_representation,
+    warming,
+    capture_busy,
+    capture_failed,
+    captured,
+    replayed,
+    busy_frame,
+};
+
 pub const ExecutionStats = struct {
+    physical_replay: PhysicalReplayDecision = .not_requested,
+    physical_graph_captures: u64 = 0,
+    physical_capture_failures: u64 = 0,
+    physical_replay_error: ?[]const u8 = null,
+    physical_graph_replays: u64 = 0,
+    physical_input_copies: u64 = 0,
+    physical_input_copy_bytes: u64 = 0,
     physical_transfer_dispatches: u64 = 0,
     physical_transfer_bytes: u64 = 0,
     assigned_kernel_dispatches: u64 = 0,

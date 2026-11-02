@@ -49,6 +49,7 @@ pub const Executable = struct {
 };
 
 pub const PrepareOptions = struct {
+    physical_replay: bool = true,
     input_bindings: ?[]const interpreter.RuntimeInput = null,
     tensor_descs: ?[]const ?@import("../graph/backend_contracts.zig").TensorDesc = null,
     region_costs: ?@import("placement.zig").RegionCosts = .{},
@@ -60,6 +61,10 @@ pub fn prepare(allocator: std.mem.Allocator, program: *const ModelProgram, backe
 
 pub fn prepareWithOptions(allocator: std.mem.Allocator, program: *const ModelProgram, backend: *const ops.ComputeBackend, strategy: runtime_module.Strategy, options: PrepareOptions) !Executable {
     var prepared = try prepareAnalyzedGraph(allocator, &program.graph, program.analysis, backend, strategy, options);
+    errdefer prepared.deinit();
+    if (comptime !@import("build_options").enable_wasm) {
+        if (options.physical_replay) if (prepared.runtime.physical_pool) |pool| try pool.prepareReplay(&program.graph, &prepared.runtime.buffer_plan.?, program.bindings, options.region_costs orelse .{});
+    }
     prepared.mutable_parameters = program.mutable_parameters;
     return prepared;
 }
@@ -834,4 +839,195 @@ test "prepared state matrix bindings stay live without immutable weight packing 
         defer a.free(values);
         for (values, input_values) |value, expected| try std.testing.expectApproxEqAbs(expected * @as(f32, @floatFromInt(iteration + 1)), value, 1e-5);
     }
+}
+
+test "prepared physical CUDA replay owns address banks and preserves held outputs across eviction" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .cuda, null);
+    defer context.deinit(a);
+    const cb = context.computeBackend();
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{ 4, 4 });
+    const x = try b.parameter("x", shape);
+    const state = try b.parameter("state", shape);
+    const weight_node = try b.parameter("weight", shape);
+    const projected = try b.matmul(x, weight_node);
+    var out = try b.relu(try b.add(try b.mul(projected, state), x));
+    for (0..8) |_| out = try b.relu(try b.add(out, x));
+    const published = try b.reshape(out, ml.graph.Shape.init(.f32, &.{ 2, 8 }));
+    try graph.markOutput(published);
+    var program = try ModelProgram.init(a, &graph, &.{
+        .{ .name = "x", .node_id = x, .kind = .input },
+        .{ .name = "state", .node_id = state, .kind = .state_input },
+        .{ .name = "weight", .node_id = weight_node, .kind = .weight },
+        .{ .name = "out", .node_id = published, .kind = .output },
+    });
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .partitioned);
+    var executable_owned = true;
+    defer if (executable_owned) executable.deinit();
+    const pool = executable.runtime.physical_pool.?;
+    try std.testing.expect(pool.replay_backend != null);
+    pool.max_frames = 2;
+    const values = [_]f32{ -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7 };
+    const input = try cb.fromFloat32Shape(&values, &.{ 4, 4 });
+    defer cb.free(input);
+    const weight = try cb.fromFloat32Shape(&.{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 }, &.{ 4, 4 });
+    var weight_owned = true;
+    defer if (weight_owned) cb.free(weight);
+    var held: [2]runtime_module.Result = undefined;
+    var held_count: usize = 0;
+    defer for (held[0..held_count]) |*result| result.deinit(&executable.runtime);
+    const Run = struct {
+        fn run(allocator: std.mem.Allocator, exec: *Executable, p: *const ModelProgram, backend: *const ops.ComputeBackend, input_value: ops.CT, weight_value: ops.CT, x_id: ml.graph.NodeId, state_id: ml.graph.NodeId, weight_id: ml.graph.NodeId, iteration: usize) !runtime_module.Result {
+            const scale: [16]f32 = @splat(@floatFromInt(iteration + 1));
+            const state_value = try backend.fromFloat32Shape(&scale, &.{ 4, 4 });
+            defer backend.free(state_value);
+            var inputs = [_]interpreter.RuntimeInput{ .{ .node_id = x_id, .value = input_value }, .{ .node_id = state_id, .value = state_value }, .{ .node_id = weight_id, .value = weight_value } };
+            return exec.run(allocator, .{ .runtime_inputs = try p.remapInputs(&inputs), .output_placement = .producer, .activation_readbacks = .forbidden });
+        }
+        fn check(allocator: std.mem.Allocator, exec: *Executable, result: *const runtime_module.Result, original: []const f32, iteration: usize) !void {
+            const actual = try result.backendFor(&exec.runtime, 0).toFloat32(result.outputs[0], allocator);
+            defer allocator.free(actual);
+            for (actual, original) |value, source| try std.testing.expectEqual(@max(@as(f32, 0), source * @as(f32, @floatFromInt(iteration + 10))), value);
+        }
+    };
+    for (0..7) |iteration| {
+        var result = try Run.run(a, &executable, &program, &cb, input, weight, x, state, weight_node, iteration);
+        var owned = true;
+        defer if (owned) result.deinit(&executable.runtime);
+        try Run.check(a, &executable, &result, &values, iteration);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.device_host_accesses);
+        if (iteration == 1 or iteration == 4) try std.testing.expectEqual(@as(u64, 1), result.stats.physical_graph_captures);
+        if (iteration == 2 or iteration == 5) {
+            try std.testing.expectEqual(@as(u64, 1), result.stats.physical_graph_replays);
+            try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
+            try std.testing.expectEqual(@as(u64, 2), result.stats.physical_input_copies);
+            held[held_count] = result;
+            held_count += 1;
+            owned = false;
+        }
+        if (iteration == 6) try std.testing.expectEqual(@as(u64, 1), result.stats.physical_frame_busy_fallbacks);
+    }
+    try Run.check(a, &executable, &held[0], &values, 2);
+    try Run.check(a, &executable, &held[1], &values, 5);
+    held[0].deinit(&executable.runtime);
+    held[0] = held[1];
+    held_count = 1;
+    var foreign = ops.physical_storage.CapturedLeases{};
+    defer foreign.deinit(a);
+    for (pool.frames.items[0].storages, 0..) |lease, id| if (lease) |value| {
+        if (pool.plan.allocations[id].kind == .constant_binding) continue;
+        try foreign.retain(a, value);
+        break;
+    };
+    var blocked = try Run.run(a, &executable, &program, &cb, input, weight, x, state, weight_node, 7);
+    defer blocked.deinit(&executable.runtime);
+    try std.testing.expectEqual(@as(u64, 1), blocked.stats.physical_frame_busy_fallbacks);
+    foreign.deinit(a);
+    // Captured frames retain immutable weight handles independently of the
+    // caller's original reference; replay must still read valid storage.
+    cb.free(weight);
+    weight_owned = false;
+    var resumed = try Run.run(a, &executable, &program, &cb, input, weight, x, state, weight_node, 8);
+    defer resumed.deinit(&executable.runtime);
+    try std.testing.expectEqual(@as(u64, 1), resumed.stats.physical_graph_replays);
+    try Run.check(a, &executable, &resumed, &values, 8);
+    const published_shape = try cb.tensorShape(resumed.outputs[0], a);
+    defer a.free(published_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 8 }, published_shape);
+    executable.deinit();
+    executable_owned = false;
+    // Published views and their captured storage outlive the prepared owner.
+    try Run.check(a, &executable, &held[0], &values, 5);
+}
+
+test "prepared physical CUDA capture failure falls back before submission and restores the context" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const Replay = ops.physical_storage.Replay;
+    const Failure = struct {
+        inner: Replay,
+        var original_factory: @FieldType(ops.KernelBackend, "createPhysicalReplay") = null;
+        const vtable = Replay.VTable{ .begin = begin, .commit = commit, .abort = abort, .launch = launch, .retains = retains, .deinit = deinit };
+        fn create(ctx: *anyopaque) !?Replay {
+            const inner = (try original_factory.?(ctx)) orelse return null;
+            errdefer inner.deinit();
+            const owner = try std.testing.allocator.create(@This());
+            owner.* = .{ .inner = inner };
+            return .{ .ptr = owner, .vtable = &vtable };
+        }
+        fn begin(raw: *anyopaque, leases: []const ?*ops.physical_storage.Lease) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.inner.begin(leases);
+        }
+        fn commit(_: *anyopaque) !void {
+            // Simulate optional graph-executable memory pressure after real
+            // CUDA recording, before any graph submission.
+            return error.OutOfMemory;
+        }
+        fn abort(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inner.abort();
+        }
+        fn launch(_: *anyopaque) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn retains(raw: *anyopaque, lease: *const ops.physical_storage.Lease) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.inner.retains(lease);
+        }
+        fn deinit(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inner.deinit();
+            std.testing.allocator.destroy(self);
+        }
+    };
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .cuda, null);
+    defer context.deinit(a);
+    const original = context.computeBackend();
+    var functions = original.vtable.kernels.?.*;
+    Failure.original_factory = functions.createPhysicalReplay;
+    functions.createPhysicalReplay = Failure.create;
+    var failure_vtable = original.vtable.*;
+    failure_vtable.kernels = &functions;
+    var failing_backend = original;
+    failing_backend.vtable = &failure_vtable;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 1, 8 }));
+    const positive = try b.absOp(x);
+    var out = positive;
+    for (0..8) |_| out = try b.relu(try b.add(out, positive));
+    try graph.markOutput(out);
+    var program = try ModelProgram.init(a, &graph, &.{.{ .name = "x", .node_id = x, .kind = .input }});
+    defer program.deinit();
+    var failed = try prepare(a, &program, &failing_backend, .partitioned);
+    defer failed.deinit();
+    var recovered = try prepare(a, &program, &original, .partitioned);
+    defer recovered.deinit();
+    for ([_]*Executable{ &failed, &recovered }, 0..) |executable, mode| for (0..3) |iteration| {
+        const values: [8]f32 = @splat(@floatFromInt(iteration + 1));
+        const input = try original.fromFloat32Shape(&values, &.{ 1, 8 });
+        defer original.free(input);
+        var inputs = [_]interpreter.RuntimeInput{.{ .node_id = x, .value = input }};
+        var result = try executable.run(a, .{ .runtime_inputs = try program.remapInputs(&inputs), .activation_readbacks = .forbidden, .output_placement = .producer });
+        defer result.deinit(&executable.runtime);
+        const actual = try original.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual) |value| try std.testing.expectEqual(@as(f32, @floatFromInt(iteration + 1)) * 9, value);
+        if (mode == 0 and iteration >= 1) {
+            try std.testing.expectEqual(@import("stats.zig").PhysicalReplayDecision.capture_failed, result.stats.physical_replay);
+            try std.testing.expectEqualStrings("OutOfMemory", result.stats.physical_replay_error.?);
+            try std.testing.expectEqual(@as(u64, if (iteration == 1) 1 else 0), result.stats.physical_capture_failures);
+            try std.testing.expectEqual(@as(u64, 0), result.stats.physical_graph_replays);
+        }
+        if (mode == 1 and iteration == 2) try std.testing.expectEqual(@as(u64, 1), result.stats.physical_graph_replays);
+    };
 }
