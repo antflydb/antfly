@@ -63,6 +63,13 @@ pub const Handle = struct {
     // these flags before admission, including uncertain publication outcomes.
     sql_commit_recovery_needed: bool = true,
     sql_ddl_recovery_needed: bool = true,
+    sql_ddl_recovery_generation: [16]u8 = @splat(0),
+    sql_ddl_agenda_after: [128]u8 = @splat(0),
+    sql_ddl_agenda_after_len: u8 = 0,
+    sql_ddl_recovering: bool = false,
+    sql_ddl_agenda_scan_generation: [16]u8 = @splat(0),
+    sql_ddl_agenda_scan_started: bool = false,
+    sql_ddl_agenda_scan_complete: bool = true,
     sql_ddl_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     sql_commit_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     maintenance_references: usize = 0,

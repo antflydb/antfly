@@ -130,7 +130,7 @@ Automatic backend selection may fall back to another compatible backend (for exa
 
 Text generation works with the decoder artifacts listed above. Multimodal generation is available when the bundle contains a compatible Antfly Gemma 3 projector or a supported Gemma 4 CLIP projector: Gemma 3 accepts images, while Gemma 4 projector metadata can enable images, audio, or both. The projector is opened only when a request contains media, so the same bundle keeps serving text-only requests without projector execution.
 
-Gemma 4 26B-A4B accepts only the exact Q4_0 layout it was built for, on Metal or on a CUDA SM89 GPU with 16 GiB free. Other geometries are rejected at load time. [Gemma 4 26B-A4B serving](https://github.com/antflydb/antfly/blob/main/docs/design/inference/gemma4-a4b.md) covers memory headroom, the CUDA load pipeline, and prepared expert packs.
+Gemma 4 26B-A4B accepts only the exact Q4_0 layout it was built for, on Metal or on a CUDA GPU with the required resident kernels and a 16 GiB inference envelope. Other geometries are rejected at load time. [Gemma 4 26B-A4B serving](https://github.com/antflydb/antfly/blob/main/docs/design/inference/gemma4-a4b.md) covers memory headroom, the CUDA load pipeline, and prepared expert packs.
 
 ## Known Incompatible Artifacts and Families
 

@@ -16,9 +16,10 @@
 const std = @import("std");
 const runtime = @import("../background_runtime.zig");
 const work = @import("group_source_worker.zig");
-/// Cursor/lease identity belongs to the scheduling owner, not a reopened DB.
-/// Native Lite keeps this state per table across foreground runtime refreshes.
+/// Namespace maintenance continuation belongs to the scheduling owner, not a reopened DB.
+/// Native Lite preserves group cursor/lease identity and replay feedback per table.
 pub const State = struct {
+    replay_budget: @import("derived/replay_budget.zig").Controller = .{},
     slice_mutex: std.atomic.Mutex = .unlocked,
     allocator: ?std.mem.Allocator = null,
     worker: ?work.Worker = null,
