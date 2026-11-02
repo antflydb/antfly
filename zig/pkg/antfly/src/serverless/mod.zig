@@ -16,9 +16,11 @@
 pub const manifest = @import("manifest/mod.zig");
 pub const artifacts = @import("artifacts/mod.zig");
 pub const query = @import("query/mod.zig");
+pub const hosted_collection = @import("hosted_collection.zig");
 pub const runtime = @import("runtime/mod.zig");
 pub const server = @import("server.zig");
 pub const wal = @import("wal/mod.zig");
+pub const visibility = @import("visibility.zig");
 pub const build = @import("build/mod.zig");
 pub const api = @import("api/mod.zig");
 pub const catalog = @import("catalog/mod.zig");
@@ -486,6 +488,7 @@ pub const ListenerConfig = server.ListenerConfig;
 pub const ServerlessServer = server.ServerlessServer;
 
 test "serverless module compiles" {
+    _ = hosted_collection;
     _ = manifest;
     _ = artifacts;
     _ = query;

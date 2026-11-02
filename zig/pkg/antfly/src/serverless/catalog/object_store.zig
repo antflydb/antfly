@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const objectstore = @import("objectstore");
 const platform_sync = @import("antfly_platform").sync;
 const object_storage = @import("antfly_local_sources").storage_object_storage;
 const catalog_types = @import("types.zig");
@@ -119,7 +120,7 @@ pub const ObjectStore = struct {
         var current = try self.tryReadState(self.alloc);
         defer if (current) |*value| {
             freeNamespaceRecords(self.alloc, value.records);
-            if (value.etag) |etag| self.alloc.free(etag);
+            if (value.revision) |revision| freeRevision(self.alloc, revision);
         };
 
         for (if (current) |value| value.records else &.{}) |record| {
@@ -147,7 +148,7 @@ pub const ObjectStore = struct {
         };
         initialized += 1;
 
-        try self.writeState(updated, if (current) |value| value.etag else null);
+        try self.writeState(updated, if (current) |value| value.revision else null);
         freeNamespaceRecords(self.alloc, updated);
         return true;
     }
@@ -168,7 +169,7 @@ pub const ObjectStore = struct {
         var current_bindings = try self.tryReadTableBindings(self.alloc);
         defer if (current_bindings) |*value| {
             freeTableBindings(self.alloc, value.records);
-            if (value.etag) |etag| self.alloc.free(etag);
+            if (value.revision) |revision| freeRevision(self.alloc, revision);
         };
 
         for (if (current_bindings) |value| value.records else &.{}) |binding| {
@@ -179,7 +180,7 @@ pub const ObjectStore = struct {
         var current_namespaces = try self.tryReadState(self.alloc);
         defer if (current_namespaces) |*value| {
             freeNamespaceRecords(self.alloc, value.records);
-            if (value.etag) |etag| self.alloc.free(etag);
+            if (value.revision) |revision| freeRevision(self.alloc, revision);
         };
 
         const namespaces = if (current_namespaces) |value| value.records else &.{};
@@ -212,7 +213,7 @@ pub const ObjectStore = struct {
             };
             initialized_namespaces += 1;
 
-            try self.writeState(updated_namespaces, if (current_namespaces) |value| value.etag else null);
+            try self.writeState(updated_namespaces, if (current_namespaces) |value| value.revision else null);
             freeNamespaceRecords(self.alloc, updated_namespaces);
         }
 
@@ -241,7 +242,7 @@ pub const ObjectStore = struct {
         };
         initialized_bindings += 1;
 
-        try self.writeTableBindings(updated_bindings, if (current_bindings) |value| value.etag else null);
+        try self.writeTableBindings(updated_bindings, if (current_bindings) |value| value.revision else null);
         freeTableBindings(self.alloc, updated_bindings);
         return true;
     }
@@ -253,7 +254,7 @@ pub const ObjectStore = struct {
         const current = try self.tryReadState(alloc);
         defer if (current) |*value| {
             freeNamespaceRecords(alloc, value.records);
-            if (value.etag) |etag| alloc.free(etag);
+            if (value.revision) |revision| freeRevision(alloc, revision);
         };
 
         const records = if (current) |value| try cloneNamespaceRecordsAlloc(alloc, value.records) else try alloc.alloc(catalog_types.NamespaceRecord, 0);
@@ -268,12 +269,12 @@ pub const ObjectStore = struct {
         const current_namespaces = try self.tryReadState(alloc);
         defer if (current_namespaces) |*value| {
             freeNamespaceRecords(alloc, value.records);
-            if (value.etag) |etag| alloc.free(etag);
+            if (value.revision) |revision| freeRevision(alloc, revision);
         };
         const current_bindings = try self.tryReadTableBindings(alloc);
         defer if (current_bindings) |*value| {
             freeTableBindings(alloc, value.records);
-            if (value.etag) |etag| alloc.free(etag);
+            if (value.revision) |revision| freeRevision(alloc, revision);
         };
 
         const namespaces = if (current_namespaces) |value| value.records else &.{};
@@ -310,12 +311,12 @@ pub const ObjectStore = struct {
         const current_namespaces = try self.tryReadState(alloc);
         defer if (current_namespaces) |*value| {
             freeNamespaceRecords(alloc, value.records);
-            if (value.etag) |etag| alloc.free(etag);
+            if (value.revision) |revision| freeRevision(alloc, revision);
         };
         const current_bindings = try self.tryReadTableBindings(alloc);
         defer if (current_bindings) |*value| {
             freeTableBindings(alloc, value.records);
-            if (value.etag) |etag| alloc.free(etag);
+            if (value.revision) |revision| freeRevision(alloc, revision);
         };
 
         const namespaces = if (current_namespaces) |value| value.records else &.{};
@@ -349,7 +350,7 @@ pub const ObjectStore = struct {
         var current_bindings = try self.tryReadTableBindings(self.alloc);
         defer if (current_bindings) |*value| {
             freeTableBindings(self.alloc, value.records);
-            if (value.etag) |etag| self.alloc.free(etag);
+            if (value.revision) |revision| freeRevision(self.alloc, revision);
         };
 
         const bindings = if (current_bindings) |value| value.records else &.{};
@@ -373,7 +374,7 @@ pub const ObjectStore = struct {
         }
         if (!found) return false;
 
-        try self.writeTableBindings(updated_bindings, if (current_bindings) |value| value.etag else null);
+        try self.writeTableBindings(updated_bindings, if (current_bindings) |value| value.revision else null);
         freeTableBindings(self.alloc, updated_bindings);
         return true;
     }
@@ -385,7 +386,7 @@ pub const ObjectStore = struct {
         const current = try self.tryReadTableBindings(alloc);
         defer if (current) |*value| {
             freeTableBindings(alloc, value.records);
-            if (value.etag) |etag| alloc.free(etag);
+            if (value.revision) |revision| freeRevision(alloc, revision);
         };
 
         for (if (current) |value| value.records else &.{}) |binding| {
@@ -403,7 +404,7 @@ pub const ObjectStore = struct {
         const current = try self.tryReadState(self.alloc);
         defer if (current) |*value| {
             freeNamespaceRecords(self.alloc, value.records);
-            if (value.etag) |etag| self.alloc.free(etag);
+            if (value.revision) |revision| freeRevision(self.alloc, revision);
         };
 
         const records = if (current) |value| value.records else &.{};
@@ -420,7 +421,7 @@ pub const ObjectStore = struct {
         var current = try self.tryReadState(self.alloc);
         defer if (current) |*value| {
             freeNamespaceRecords(self.alloc, value.records);
-            if (value.etag) |etag| self.alloc.free(etag);
+            if (value.revision) |revision| freeRevision(self.alloc, revision);
         };
 
         const records = if (current) |value| value.records else return error.NamespaceNotFound;
@@ -433,34 +434,35 @@ pub const ObjectStore = struct {
         }
         if (!found) return error.NamespaceNotFound;
 
-        try self.writeState(records, current.?.etag);
+        try self.writeState(records, current.?.revision);
         return policy;
     }
 
     const CurrentState = struct {
         records: []catalog_types.NamespaceRecord,
-        etag: ?[]u8,
+        revision: ?objectstore.ObjectRevision,
     };
 
     const CurrentTableBindings = struct {
         records: []TableBinding,
-        etag: ?[]u8,
+        revision: ?objectstore.ObjectRevision,
     };
 
     fn tryReadState(self: *ObjectStore, alloc: std.mem.Allocator) !?CurrentState {
         const key = try stateKeyAlloc(alloc, self.opened.prefix);
         defer alloc.free(key);
 
-        var result = self.opened.client.getObject(self.opened.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.opened.client.getObject(self.opened.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         defer result.deinit(alloc);
 
         const records = try decodeStateAlloc(alloc, result.body);
+        errdefer freeNamespaceRecords(alloc, records);
         return .{
             .records = records,
-            .etag = if (result.metadata.etag) |value| try alloc.dupe(u8, value) else null,
+            .revision = if (result.metadata.writeRevision()) |value| try value.clone(alloc) else null,
         };
     }
 
@@ -468,43 +470,40 @@ pub const ObjectStore = struct {
         const key = try tableBindingsKeyAlloc(alloc, self.opened.prefix);
         defer alloc.free(key);
 
-        var result = self.opened.client.getObject(self.opened.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.opened.client.getObject(self.opened.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         defer result.deinit(alloc);
 
         const records = try decodeTableBindingsAlloc(alloc, result.body);
+        errdefer freeTableBindings(alloc, records);
         return .{
             .records = records,
-            .etag = if (result.metadata.etag) |value| try alloc.dupe(u8, value) else null,
+            .revision = if (result.metadata.writeRevision()) |value| try value.clone(alloc) else null,
         };
     }
 
-    fn writeState(self: *ObjectStore, records: []const catalog_types.NamespaceRecord, expected_etag: ?[]const u8) !void {
+    fn writeState(self: *ObjectStore, records: []const catalog_types.NamespaceRecord, expected_revision: ?objectstore.ObjectRevision) !void {
         const key = try stateKeyAlloc(self.alloc, self.opened.prefix);
         defer self.alloc.free(key);
         const encoded = try encodeStateAlloc(self.alloc, records);
         defer self.alloc.free(encoded);
 
-        var result = try self.opened.client.putObject(self.opened.bucket, key, encoded, .{
+        var result = try self.opened.client.compareAndPut(self.opened.bucket, key, encoded, expected_revision, .{
             .content_type = "application/json",
-            .if_none_match = expected_etag == null,
-            .if_match_etag = expected_etag,
         });
         defer result.deinit(self.alloc);
     }
 
-    fn writeTableBindings(self: *ObjectStore, bindings: []const TableBinding, expected_etag: ?[]const u8) !void {
+    fn writeTableBindings(self: *ObjectStore, bindings: []const TableBinding, expected_revision: ?objectstore.ObjectRevision) !void {
         const key = try tableBindingsKeyAlloc(self.alloc, self.opened.prefix);
         defer self.alloc.free(key);
         const encoded = try encodeTableBindingsAlloc(self.alloc, bindings);
         defer self.alloc.free(encoded);
 
-        var result = try self.opened.client.putObject(self.opened.bucket, key, encoded, .{
+        var result = try self.opened.client.compareAndPut(self.opened.bucket, key, encoded, expected_revision, .{
             .content_type = "application/json",
-            .if_none_match = expected_etag == null,
-            .if_match_etag = expected_etag,
         });
         defer result.deinit(self.alloc);
     }
@@ -715,6 +714,11 @@ fn findNamespaceRecord(records: []const catalog_types.NamespaceRecord, namespace
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
+}
+
+fn freeRevision(alloc: std.mem.Allocator, revision: objectstore.ObjectRevision) void {
+    var owned = revision;
+    owned.deinit(alloc);
 }
 
 test "objectstore-backed catalog store persists namespace records over file uri" {

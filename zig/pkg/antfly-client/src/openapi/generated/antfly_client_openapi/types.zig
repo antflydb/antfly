@@ -24703,8 +24703,11 @@ pub const GraphQueryParams = struct {
     max_depth: ?i64 = null,
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
+    /// Global result-entry limit shared by all starts; root-specific path entries each consume one slot.
     max_results: ?i64 = null,
+    /// Deduplicate nodes per root when include_paths is true, otherwise across all starts.
     deduplicate_nodes: ?bool = null,
+    /// Preserve independent paths per start; the first path node identifies the root. max_depth is measured from each root.
     include_paths: ?bool = null,
     weight_mode: ?PathWeightMode = null,
     k: ?i64 = null,
@@ -25803,7 +25806,7 @@ pub const GraphShortestPathQuery = struct {
 /// A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item.
 pub const GraphTemplateValue = std.json.Value;
 
-/// Breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge.
+/// Breadth-first traversal by exact table-qualified node identity. With include_paths, visited state and deduplication are independent per start node, preserving paths between roots and overlapping root provenance. The first node in each path identifies its root. Without include_paths, result nodes are deduplicated across starts. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge.
 pub const GraphTraversal = struct {
     edge_filter: ?GraphRelationshipFilter = null,
     start: GraphNodeSelector,
@@ -25811,11 +25814,11 @@ pub const GraphTraversal = struct {
     direction: ?EdgeDirection = null,
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const GraphEdgeType = null,
-    /// Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
+    /// Maximum hop depth measured independently from each start. Defaults to one hop to keep fan-out explicit.
     max_depth: ?i64 = null,
     edge_weight: ?GraphEdgeWeightRange = null,
     limit: ?i64 = null,
-    /// Return each node once across all starts. Set false with include_paths to return each reaching path, including its start node. Depth, result, and work limits still bound path enumeration.
+    /// With include_paths, return each node once per start, preserving a separate path for every reaching root. Without include_paths, return each node once across all starts. Set false with include_paths to enumerate reaching paths within a root. Depth, result, and shared request work limits still bound enumeration.
     deduplicate_nodes: ?bool = null,
     include_paths: ?bool = null,
     /// Include each result node's stored document when it exists at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
@@ -41610,7 +41613,7 @@ pub const NamespaceCatalogRecord = struct {
     }
 };
 
-/// Filter nodes during graph traversal using existing query primitives
+/// Admission predicate applied to every start, target and intermediate node before returning or expanding it, for all graph operations. Denied nodes cannot occur in result paths or expose descendants through traversal.
 pub const NodeFilter = struct {
     /// Antfly query to filter nodes (same syntax as search filter_query)
     filter_query: ?LegacyGraphDocumentQuery = null,

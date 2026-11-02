@@ -4580,6 +4580,32 @@ const TeardownTicket = struct {
         domain.release();
     }
 };
+/// Emit the first denial and at most one diagnostic batch per second thereafter.
+/// The manager updates its diagnostic counters on every attempt, including
+/// suppressed retries. Access is serialized by admission_diagnostic_mutex.
+const AdmissionDenialLogGate = struct {
+    last_logged_ns: ?u64 = null,
+
+    fn shouldLog(self: *@This(), now_ns: u64) bool {
+        if (self.last_logged_ns) |last| {
+            if (now_ns -| last < std.time.ns_per_s) return false;
+        }
+        self.last_logged_ns = now_ns;
+        return true;
+    }
+};
+
+test "memory admission denial logging bounds a retry flood and resumes after the interval" {
+    var gate = AdmissionDenialLogGate{};
+    try std.testing.expect(gate.shouldLog(0));
+    for (1..271_168) |attempt|
+        try std.testing.expect(!gate.shouldLog(@intCast(attempt)));
+    try std.testing.expect(gate.shouldLog(std.time.ns_per_s));
+    try std.testing.expect(!gate.shouldLog(std.time.ns_per_s));
+    try std.testing.expect(!gate.shouldLog(0));
+    try std.testing.expect(gate.shouldLog(2 * std.time.ns_per_s));
+}
+
 pub const ModelManager = struct {
     pub const HostCacheReclaimer = struct {
         context: *anyopaque,
@@ -4812,6 +4838,7 @@ pub const ModelManager = struct {
     serving_policy: ?model_compatibility.Policy = null,
     admission_diagnostic_mutex: std.atomic.Mutex = .unlocked,
     admission_diagnostic: MemoryAdmissionDiagnostic = .{},
+    admission_denial_log_gate: AdmissionDenialLogGate = .{},
     admission_enabled: bool = false,
     admission_limit_overrides: runtime.tier.memory.Limits = .{},
     process_memory_limit_bytes: usize = 0,
@@ -6037,12 +6064,14 @@ pub const ModelManager = struct {
         spinLock(&self.admission_diagnostic_mutex);
         diagnostic.denied_count = self.admission_diagnostic.denied_count +| 1;
         self.admission_diagnostic = diagnostic;
+        const should_log = self.admission_denial_log_gate.shouldLog(diagnostic.last_denied_ns);
         self.admission_diagnostic_mutex.unlock();
-        if (builtin.is_test) return;
+        if (!should_log or builtin.is_test) return;
         std.log.warn(
-            "inference run admission denied pressure={s} request_count={d} admitted_host_bytes={d} admitted_backend_bytes={d} admitted_kv_bytes={d} admitted_scratch_bytes={d}",
+            "inference run admission denied pressure={s} denied_count={d} request_count={d} admitted_host_bytes={d} admitted_backend_bytes={d} admitted_kv_bytes={d} admitted_scratch_bytes={d}",
             .{
                 if (pressure) |value| @tagName(std.meta.activeTag(value)) else "unknown",
+                diagnostic.denied_count,
                 requests.len,
                 admitted.hostTotalBytes(),
                 admitted.backendTotalBytes(),
@@ -15078,13 +15107,17 @@ test "memory admission diagnostics retain pressure and recover after release" {
     try std.testing.expectEqual(@as(u64, 30), denied.requested_host_bytes);
     try std.testing.expectEqual(@as(u64, 80), denied.admitted_host_bytes);
     try std.testing.expectEqual(@as(u64, 100), denied.host_limit_bytes);
+    for (0..64) |_| {
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireAmountsWithEviction(.cpu, limits, .{ .host_scratch_bytes = 30 }));
+    }
+    try std.testing.expectEqual(@as(u64, 65), manager.memoryAdmissionDiagnostic().denied_count);
     held.release();
     var recovered = try manager.acquireAmountsWithEviction(.cpu, limits, .{ .host_scratch_bytes = 30 });
     recovered.release();
     try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
     // The last denial remains observable after recovery; its timestamp/count
     // distinguish it from the current request and survive DB snapshot refresh.
-    try std.testing.expectEqual(denied.denied_count, manager.memoryAdmissionDiagnostic().denied_count);
+    try std.testing.expectEqual(@as(u64, 65), manager.memoryAdmissionDiagnostic().denied_count);
 }
 
 /// Planning does not construct a device. Execution validates its actual identity

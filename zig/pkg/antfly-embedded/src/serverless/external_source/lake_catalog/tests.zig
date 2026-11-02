@@ -313,3 +313,71 @@ test "lake catalog retirement rejects live files and fences staged writers that 
     const statistics_body = try std.json.Stringify.valueAlloc(scratch, .{ .requirements = .{}, .updates = .{.{ .action = "set-statistics", .statistics = .{ .@"snapshot-id" = snapshot_id, .@"statistics-path" = "gs://archive/hn/data/dead.parquet", .@"file-size-in-bytes" = @as(u64, 1), .@"file-footer-size-in-bytes" = @as(u64, 1), .@"blob-metadata" = .{} } }} }, .{});
     try std.testing.expectError(error.LakeObjectRetired, catalog.commit(a, .{ .id = "statistics-resurrection", .expected_metadata_location = live.metadata_location, .body = statistics_body, .timestamp_ms = 4 }));
 }
+
+test "lake catalog managed uses captured generation revisions with unrelated HTTP etags" {
+    const GenerationOnly = struct {
+        fn inner(raw: *anyopaque, alloc: std.mem.Allocator) storage.Client {
+            const memory: *storage.MemoryClient = @ptrCast(@alignCast(raw));
+            var client = memory.client();
+            client.allocator = alloc;
+            return client;
+        }
+        fn putResult(alloc: std.mem.Allocator, result: storage.PutResult) !storage.PutResult {
+            var out = result;
+            errdefer out.deinit(alloc);
+            out.version_id = out.etag;
+            out.etag = null;
+            out.etag = try alloc.dupe(u8, "unrelated-http-etag");
+            out.revision_kind = .generation;
+            return out;
+        }
+        fn get(raw: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8, opts: storage.GetOptions) !storage.GetResult {
+            // Native catalog operations must use one response for bytes and CAS
+            // identity, without a second metadata request that can race it.
+            try std.testing.expect(opts.skip_metadata_probe);
+            var client = inner(raw, alloc);
+            var out = try client.getObject(bucket, key, opts);
+            errdefer out.deinit(alloc);
+            out.metadata.version_id = out.metadata.etag;
+            out.metadata.etag = null;
+            out.metadata.etag = try alloc.dupe(u8, "unrelated-http-etag");
+            out.metadata.revision_kind = .generation;
+            return out;
+        }
+        fn put(raw: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8, body: []const u8, opts: storage.PutOptions) !storage.PutResult {
+            // Models GCS rejecting the legacy HTTP ETag write contract.
+            if (opts.if_match_etag != null) return error.LegacyEtagWriteRejected;
+            var client = inner(raw, alloc);
+            return putResult(alloc, try client.putObject(bucket, key, body, opts));
+        }
+        fn atRevision(raw: *anyopaque, alloc: std.mem.Allocator, bucket: []const u8, key: []const u8, body: []const u8, revision: storage.ObjectRevision, opts: storage.PutOptions) !storage.PutResult {
+            if (revision != .generation) return error.GenerationRequired;
+            try std.testing.expect(!std.mem.eql(u8, revision.generation, "unrelated-http-etag"));
+            var client = inner(raw, alloc);
+            return putResult(alloc, try client.compareAndPut(bucket, key, body, .{ .etag = revision.generation }, opts));
+        }
+    };
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    var vtable = client.vtable.*;
+    vtable.get_object = GenerationOnly.get;
+    vtable.put_object = GenerationOnly.put;
+    vtable.put_at_revision = GenerationOnly.atRevision;
+    client.vtable = &vtable;
+    const catalog: managed.Managed = .{ .client = client, .bucket = "archive", .prefix = "hn", .source_uri = "gs://archive/hn" };
+    var created = try catalog.create(a, "create", create_request, 1);
+    defer created.deinit(a);
+    var initial = try catalog.load(a);
+    defer initial.deinit(a);
+    try std.testing.expect(!std.mem.eql(u8, initial.version.?, "unrelated-http-etag"));
+    const c: types.Commit = .{ .id = "one", .expected_metadata_location = initial.metadata_location, .body = updates, .timestamp_ms = 2 };
+    var first = try catalog.commit(a, c);
+    defer first.deinit(a);
+    var replay = try catalog.commit(a, c);
+    defer replay.deinit(a);
+    try std.testing.expectEqualStrings(first.metadata_location, replay.metadata_location);
+    var stale = c;
+    stale.id = "stale";
+    try std.testing.expectError(error.LakeCommitConflict, catalog.commit(a, stale));
+}

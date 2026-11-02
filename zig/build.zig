@@ -869,6 +869,10 @@ pub fn create(b: *std.Build) ?Artifacts {
         .link_libc = link_libc,
     }) }));
     error_identity_step.dependOn(&error_status_run.step);
+    const provider_failure_tests = b.addTest(.{
+        .root_module = antfly_test_mod.import_table.get("antfly_inference_provider_failure").?,
+    });
+    error_identity_step.dependOn(&b.addRunArtifact(provider_failure_tests).step);
     model_chunk_step.dependOn(&error_status_run.step);
 
     const run_antfly_embedded_pkg_tests = owner_tests.run_antfly_embedded_pkg_tests;

@@ -552,6 +552,39 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     inference_wasm_inference_mod.addImport("onnx_graph", wasm_onnx.graph);
     inference_wasm_inference_mod.addImport("onnx_data", wasm_onnx.data);
 
+    const serverless_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/serverless_runtime_wasm.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .single_threaded = true,
+        .strip = !(b.option(bool, "serverless-debug", "Retain serverless WASM debug information") orelse false),
+    });
+    var host_imports = embedded_support_wasm_mod.import_table.iterator();
+    while (host_imports.next()) |entry| serverless_mod.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    const serverless_sources = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/source_catalog.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .single_threaded = true,
+    });
+    var source_imports = serverless_mod.import_table.iterator();
+    while (source_imports.next()) |entry| serverless_sources.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    serverless_sources.addImport("antfly_credentials", wasm_credentials_mod);
+    serverless_sources.addImport("antfly_google", wasm_google_mod);
+    serverless_sources.addImport("antfly_source_root", serverless_sources);
+    serverless_sources.addImport("antfly_test_source_root", serverless_mod);
+    serverless_sources.addImport("antfly_server_test_sources", serverless_mod);
+    serverless_mod.addImport("antfly_local_sources", serverless_sources);
+    serverless_mod.addImport("antfly_source_root", serverless_sources);
+    const serverless_wasm = b.addExecutable(.{ .name = "antfly-serverless", .root_module = serverless_mod });
+    serverless_wasm.entry = .disabled;
+    serverless_wasm.rdynamic = true;
+    serverless_wasm.export_memory = true;
+    serverless_wasm.stack_size = 1024 * 1024;
+    serverless_wasm.max_memory = 32 * 1024 * 1024;
+    const host_install = b.addInstallArtifact(serverless_wasm, .{ .dest_dir = .{ .override = .prefix }, .dest_sub_path = "antfly-serverless/host.raw.wasm" });
+    b.step("serverless-wasm", "Build the R2-backed serverless WASM host").dependOn(&host_install.step);
+
     const antfly_wasm_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/wasm_root.zig"),
         .strip = strip,

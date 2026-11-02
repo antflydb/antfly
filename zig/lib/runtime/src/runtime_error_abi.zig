@@ -24,6 +24,13 @@ const std = @import("std");
 
 pub const abi_version: u32 = 1;
 
+test "OCR truncation preserves terminal identity across runtime callbacks" {
+    const transported = statusFromError(error.ReadOutputTruncated);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
+    try std.testing.expectEqual(error.ReadOutputTruncated, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.ReadOutputTruncated));
+}
+
 test "FK publication progress and corrupt retirement proofs retain distinct boundary semantics" {
     const pending = statusFromError(error.GenerationAdmissionAcknowledgementPending);
     const changed = statusFromError(error.GenerationRetirementChanged);
@@ -952,60 +959,61 @@ pub const Detail = enum(c_int) {
     ha_catalog_replication_sources_unsupported,
     // Append-only: numeric Detail values are part of the stable C ABI.
     embed_admission_refused,
+    read_output_truncated,
     // Append-only SQL additions follow every published main Detail identity.
-    sql_index_already_exists = 839,
-    sql_constraint_already_exists = 840,
-    program_limit_exceeded = 841,
-    catalog_occupancy_not_ready = 842,
-    unsupported_native_index_owner = 843,
-    invalid_private_index_claim_inventory = 844,
-    invalid_private_index_claim_receipt = 845,
-    private_index_owner_job_changed = 846,
-    private_index_publication_canceled = 847,
-    private_index_job_required = 848,
-    private_index_publication_required = 849,
-    invalid_private_index_owner_job = 850,
-    invalid_private_index_inputs = 851,
-    relational_index_catalog_schema_mismatch = 852,
-    invalid_index_publication_candidate = 853,
-    immutable_relational_index_definition_conflict = 854,
-    private_index_cancellation_pending = 855,
-    private_index_cancellation_required = 856,
-    invalid_private_index_cancellation = 857,
-    invalid_private_index_native_receipt = 858,
-    invalid_relational_index_progress = 859,
-    missing_relational_index_definitions = 860,
-    index_owner_receipt_changed = 861,
-    invalid_index_owner_receipt = 862,
-    sql_invalid_power_argument = 863,
-    invalid_schema_reader_requirements = 864,
-    private_index_root_recovery_required = 865,
-    invalid_relational_index_budget = 866,
-    private_index_claim_backlog_full = 867,
-    partial_index_predicate_not_implied = 868,
-    relational_check_violation = 869,
-    row_policy_denied = 870,
-    row_policy_authentication_required = 871,
-    check_constraint_validation_required = 872,
-    foreign_key_match_full_violation = 873,
-    invalid_schema_validation_job = 874,
-    invalid_schema_validation_page_command = 875,
-    invalid_schema_validation_token = 876,
-    schema_validation_canceled = 877,
-    schema_validation_cancellation_required = 878,
-    schema_validation_command_rejected = 879,
-    schema_validation_inputs_required = 880,
-    schema_validation_job_changed = 881,
-    schema_validation_job_required = 882,
-    schema_validation_not_ready = 883,
-    schema_validation_preparation_changed = 884,
-    schema_validation_publication_required = 885,
-    schema_validation_runtime_recovery_required = 886,
-    store_registration_required = 887,
-    catalog_publication_fence_unavailable = 888,
-    undefined_column = 889,
-    foreign_key_validation_required = 890,
-    materialized_view_read_only = 891,
+    sql_index_already_exists = 840,
+    sql_constraint_already_exists = 841,
+    program_limit_exceeded = 842,
+    catalog_occupancy_not_ready = 843,
+    unsupported_native_index_owner = 844,
+    invalid_private_index_claim_inventory = 845,
+    invalid_private_index_claim_receipt = 846,
+    private_index_owner_job_changed = 847,
+    private_index_publication_canceled = 848,
+    private_index_job_required = 849,
+    private_index_publication_required = 850,
+    invalid_private_index_owner_job = 851,
+    invalid_private_index_inputs = 852,
+    relational_index_catalog_schema_mismatch = 853,
+    invalid_index_publication_candidate = 854,
+    immutable_relational_index_definition_conflict = 855,
+    private_index_cancellation_pending = 856,
+    private_index_cancellation_required = 857,
+    invalid_private_index_cancellation = 858,
+    invalid_private_index_native_receipt = 859,
+    invalid_relational_index_progress = 860,
+    missing_relational_index_definitions = 861,
+    index_owner_receipt_changed = 862,
+    invalid_index_owner_receipt = 863,
+    sql_invalid_power_argument = 864,
+    invalid_schema_reader_requirements = 865,
+    private_index_root_recovery_required = 866,
+    invalid_relational_index_budget = 867,
+    private_index_claim_backlog_full = 868,
+    partial_index_predicate_not_implied = 869,
+    relational_check_violation = 870,
+    row_policy_denied = 871,
+    row_policy_authentication_required = 872,
+    check_constraint_validation_required = 873,
+    foreign_key_match_full_violation = 874,
+    invalid_schema_validation_job = 875,
+    invalid_schema_validation_page_command = 876,
+    invalid_schema_validation_token = 877,
+    schema_validation_canceled = 878,
+    schema_validation_cancellation_required = 879,
+    schema_validation_command_rejected = 880,
+    schema_validation_inputs_required = 881,
+    schema_validation_job_changed = 882,
+    schema_validation_job_required = 883,
+    schema_validation_not_ready = 884,
+    schema_validation_preparation_changed = 885,
+    schema_validation_publication_required = 886,
+    schema_validation_runtime_recovery_required = 887,
+    store_registration_required = 888,
+    catalog_publication_fence_unavailable = 889,
+    undefined_column = 890,
+    foreign_key_validation_required = 891,
+    materialized_view_read_only = 892,
 };
 
 test "partial index proof rejection preserves exact callback error identity" {
@@ -1981,6 +1989,7 @@ pub fn statusFromError(err: anyerror) Status {
         // identity (the enrichment retry-budget exemption) can tell them
         // apart by name.
         error.EmbedAdmissionRefused => status(.retryable, .embed_admission_refused),
+        error.ReadOutputTruncated => status(.invalid_argument, .read_output_truncated),
         else => status(.internal, .none),
     };
 }
@@ -2925,6 +2934,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .runtime_stopping => "RuntimeStopping",
         .runtime_already_ready => "RuntimeAlreadyReady",
         .embed_admission_refused => "EmbedAdmissionRefused",
+        .read_output_truncated => "ReadOutputTruncated",
     };
 }
 
@@ -3455,9 +3465,10 @@ test "released document reader and inference Detail identifiers retain main wire
         .{ Detail.standalone_replication_sources_unsupported, @as(c_int, 836) },
         .{ Detail.ha_catalog_replication_sources_unsupported, @as(c_int, 837) },
         .{ Detail.embed_admission_refused, @as(c_int, 838) },
+        .{ Detail.read_output_truncated, @as(c_int, 839) },
     };
     inline for (published) |entry| try std.testing.expectEqual(entry[1], @backingInt(entry[0]));
-    try std.testing.expect(@backingInt(Detail.sql_index_already_exists) > 838);
+    try std.testing.expect(@backingInt(Detail.sql_index_already_exists) > 839);
 }
 
 test "merged runtime error details preserve main wire identifiers" {

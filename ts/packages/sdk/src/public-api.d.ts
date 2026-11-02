@@ -22544,7 +22544,7 @@ export interface components {
             /** Format: double */
             value: number;
         };
-        /** @description Breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge. */
+        /** @description Breadth-first traversal by exact table-qualified node identity. With include_paths, visited state and deduplication are independent per start node, preserving paths between roots and overlapping root provenance. The first node in each path identifies its root. Without include_paths, result nodes are deduplicated across starts. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge. */
         GraphTraversal: {
             edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             start: components["schemas"]["GraphNodeSelector"];
@@ -22553,7 +22553,7 @@ export interface components {
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: components["schemas"]["GraphEdgeType"][];
             /**
-             * @description Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
+             * @description Maximum hop depth measured independently from each start. Defaults to one hop to keep fan-out explicit.
              * @default 1
              */
             max_depth?: number;
@@ -22561,7 +22561,7 @@ export interface components {
             /** @default 100 */
             limit?: number;
             /**
-             * @description Return each node once across all starts. Set false with include_paths to return each reaching path, including its start node. Depth, result, and work limits still bound path enumeration.
+             * @description With include_paths, return each node once per start, preserving a separate path for every reaching root. Without include_paths, return each node once across all starts. Set false with include_paths to enumerate reaching paths within a root. Depth, result, and shared request work limits still bound enumeration.
              * @default true
              */
             deduplicate_nodes?: boolean;
@@ -22717,7 +22717,7 @@ export interface components {
         LegacyGraphDocumentQuery: {
             [key: string]: unknown;
         };
-        /** @description Filter nodes during graph traversal using existing query primitives */
+        /** @description Admission predicate applied to every start, target and intermediate node before returning or expanding it, for all graph operations. Denied nodes cannot occur in result paths or expose descendants through traversal. */
         NodeFilter: {
             /** @description Antfly query to filter nodes (same syntax as search filter_query) */
             filter_query?: components["schemas"]["LegacyGraphDocumentQuery"];
@@ -22768,8 +22768,11 @@ export interface components {
             min_weight?: number;
             /** Format: double */
             max_weight?: number;
+            /** @description Global result-entry limit shared by all starts; root-specific path entries each consume one slot. */
             max_results?: number;
+            /** @description Deduplicate nodes per root when include_paths is true, otherwise across all starts. */
             deduplicate_nodes?: boolean;
+            /** @description Preserve independent paths per start; the first path node identifies the root. max_depth is measured from each root. */
             include_paths?: boolean;
             weight_mode?: components["schemas"]["PathWeightMode"];
             k?: number;
