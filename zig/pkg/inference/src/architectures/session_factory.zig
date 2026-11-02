@@ -566,15 +566,7 @@ fn prepareLayaResidentImpl(session: Session, published: Session, control: ?Infer
     // Packed rows use the generic masked encoder, not the fused resident kernels.
     if (self.backend_type != .metal or self.arch_config != .modern_bert or self.arch_config.modern_bert.laya == null or isPackedLaya(self)) return;
     if (!@import("../ops/laya_metal.zig").enabledFor(self.arch_config.modern_bert.laya.?)) return;
-    const active = control orelse InferenceExecutionControl{};
-    try active.check();
-    var protection = if (control) |c| try c.enterUninterruptible(published.interruption()) else null;
-    defer if (protection) |*p| p.deinit();
-    var cb = try makeComputeBackend(self, self.allocator, null);
-    defer cb.deinit();
-    cb.execution_control = control;
-    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-    _ = try @import("../ops/laya_metal.zig").Owner.prepare(compute, self.arch_config.modern_bert, control);
+    try @import("../models/resident_preparation.zig").prepareLaya(.{ .ptr = self, .session = session, .create = createPreparationBackend }, published, self.allocator, self.arch_config.modern_bert, control);
 }
 
 pub const UnsupportedTensorTypeCount = struct {
@@ -5096,47 +5088,24 @@ fn makeGpuHostedComputeBackend(
     };
 }
 
-fn makeMetalHostedComputeBackend(
-    self: *ArchSession,
-    allocator: std.mem.Allocator,
-    run_budget: ?*runtime.tier.memory.RunBudget,
-) !ops.ComputeBackend {
-    if (!build_options.enable_metal) return error.MetalNotEnabled;
-    const compute = try allocator.create(MetalCompute);
-    errdefer allocator.destroy(compute);
-    try compute.initInPlaceWithKernelJitOptions(
-        allocator,
-        gpuBackendData(self),
-        run_budget,
-        self.io,
-        .{
-            .config = self.kernel_jit_config,
-            .scope = self.metal_jit_scope,
-            .load_context = self.kernel_jit_load_context,
-        },
-    );
-    compute.require_f32_linears = self.arch_config == .embedding_gemma2;
-    compute.qwen35_ocr_deferred_attention = switch (self.arch_config) {
+fn makeMetalHostedComputeBackend(self: *ArchSession, allocator: std.mem.Allocator, run_budget: ?*runtime.tier.memory.RunBudget) !ops.ComputeBackend {
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    const deferred_attention = switch (self.arch_config) {
         .gpt => |cfg| cfg.hasQwen35VisionArchitectureContract() and
             ((cfg.hidden_size == 1024 and cfg.intermediate_size == 3584 and cfg.num_hidden_layers == 24) or
                 (cfg.hidden_size == 2560 and cfg.intermediate_size == 9216 and cfg.num_hidden_layers == 32)),
         else => false,
     };
-    compute.lightonocr3_projections = compute.qwen35_ocr_deferred_attention;
-    // The shared provider belongs to this model, and init holds its execution
-    // lease. Configure encoder normalization before any device work is queued.
-    if (compute.provider_impl.raw_decode_runtime) |raw| {
-        @import("../backends/metal_runtime.zig").termite_metal_decode_runtime_set_embeddinggemma2_rms_norm(raw, @intFromBool(self.arch_config == .embedding_gemma2));
-        const qwen35_ocr = switch (self.arch_config) {
-            .gpt => |cfg| cfg.hasQwen35VisionArchitectureContract() and
-                ((cfg.hidden_size == 1024 and cfg.intermediate_size == 3584 and cfg.num_hidden_layers == 24) or
-                    (cfg.hidden_size == 2560 and cfg.intermediate_size == 9216 and cfg.num_hidden_layers == 32)),
-            else => false,
-        };
-        @import("../backends/metal_runtime.zig").termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(raw, @intFromBool(qwen35_ocr));
-        @import("../backends/metal_runtime.zig").termite_metal_decode_runtime_set_lightonocr3_projections(raw, @intFromBool(compute.lightonocr3_projections));
-    }
-    return compute.ownedComputeBackend();
+    return @import("../backends/compute_factory.zig").createMetal(allocator, gpuBackendData(self), run_budget, self.io, .{
+        .config = self.kernel_jit_config,
+        .scope = self.metal_jit_scope,
+        .load_context = self.kernel_jit_load_context,
+    }, .{
+        .require_f32_linears = self.arch_config == .embedding_gemma2,
+        .encoder_rms_norm = self.arch_config == .embedding_gemma2,
+        .deferred_attention = deferred_attention,
+        .projection_fusions = deferred_attention,
+    });
 }
 
 fn initGpuHostedPrefetch(self: *ArchSession) !void {
@@ -7096,44 +7065,21 @@ fn makeComputeBackend(
         }
     }
     return switch (self.backend_type) {
-        .native => blk: {
-            const compute = try allocator.create(NativeCompute);
-            compute.* = if (self.io) |io_handle|
-                NativeCompute.initWithIo(allocator, &self.backend_data.native, run_budget, io_handle)
-            else
-                NativeCompute.init(allocator, &self.backend_data.native, run_budget);
-            // Encoder embeddings must not change when a request changes the
-            // matrix shape (single input versus a padded batch). Keep quantized
-            // weights, but use the same f32 activation arithmetic as Metal.
-            if (self.arch_config == .gliner_boundary or self.arch_config == .bert)
-                compute.quantized_activation_policy = .strict_f32;
-            compute.borrow_bf16_linear_weights = self.arch_config == .gpt and self.arch_config.gpt.family == .qwen3;
-            compute.cache_embeddinggemma2_bf16_weights = self.arch_config == .embedding_gemma2;
-            break :blk compute.computeBackend();
-        },
+        .native => try @import("../backends/compute_factory.zig").createNative(allocator, &self.backend_data.native, run_budget, self.io, .{
+            .quantized_activations = if (self.arch_config == .gliner_boundary or self.arch_config == .bert) .strict_f32 else .automatic,
+            .borrow_bf16_linear_weights = self.arch_config == .gpt and self.arch_config.gpt.family == .qwen3,
+            .cache_bf16_weight_mirrors = self.arch_config == .embedding_gemma2,
+        }),
         .metal => try makeGpuHostedComputeBackend(self, allocator, run_budget),
         // PJRT does not have a generic ComputeBackend VTable of its own.
         // Non-partitioned ops (weight loads, sampling, etc.) run on native CPU.
         // Compiled partitions are executed via PjrtExecutor through the
         // multi_executor pipeline; see generation.zig attachPjrtExecutors.
-        .pjrt => blk: {
-            const compute = try allocator.create(NativeCompute);
-            compute.* = if (self.io) |io_handle|
-                NativeCompute.initWithIo(allocator, &self.backend_data.pjrt.native, run_budget, io_handle)
-            else
-                NativeCompute.init(allocator, &self.backend_data.pjrt.native, run_budget);
-            break :blk compute.computeBackend();
-        },
-        .cuda => if (comptime build_options.enable_cuda) blk: {
-            // CudaCompute is shared session state: bind the request-local
-            // budget through the scoped handle so the handle's deinit
-            // unbinds it instead of the shared compute retaining a pointer
-            // into a completed request.
-            if (run_budget) |budget| {
-                break :blk self.backend_data.cuda.compute.computeBackendWithScopedRunBudget(budget);
-            }
-            break :blk self.backend_data.cuda.compute.computeBackend();
-        } else return error.CudaNotEnabled,
+        .pjrt => try @import("../backends/compute_factory.zig").createNative(allocator, &self.backend_data.pjrt.native, run_budget, self.io, .{}),
+        .cuda => if (comptime build_options.enable_cuda)
+            try @import("../backends/compute_factory.zig").acquireCuda(&self.backend_data.cuda.compute, run_budget)
+        else
+            return error.CudaNotEnabled,
         .wasm => return error.WasmNotSupportedHere,
     };
 }
@@ -7502,25 +7448,13 @@ pub fn runFlorenceDecoderResident(
 }
 
 /// Get a ComputeBackend from an architecture session.
-fn bindCudaVideoAdmission(session: Session, cb: *const ops.ComputeBackend) !void {
-    if (comptime !build_options.enable_cuda) return;
-    if (cb.kind() != .cuda) return;
-    const compute: *cuda_compute_mod.CudaCompute = @ptrCast(@alignCast(cb.ptr));
-    try compute.configureEmbeddingGemma2Admission(if (session.run_admission) |admission| .{
-        .controller = admission.controller,
-        .limits = admission.limits,
-        .check_live_memory = admission.check_live_memory,
-    } else null);
-}
-
 pub fn getComputeBackend(session: Session, allocator: std.mem.Allocator) !ops.ComputeBackend {
     if (session.compute_backend_provider != null) return session.acquireComputeBackend(allocator, .{});
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     var cb = try makeComputeBackend(self, allocator, null);
     errdefer cb.deinit();
-    try bindCudaVideoAdmission(session, &cb);
-    try cb.beginRequest();
+    try @import("../backends/compute_factory.zig").beginRequest(session, &cb);
     return cb;
 }
 
@@ -7747,23 +7681,11 @@ pub fn getComputeBackendBorrowingSharedProvider(session: Session, allocator: std
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     if (self.backend_type != .metal) return getComputeBackend(session, allocator);
     if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
-    const compute = try allocator.create(MetalCompute);
-    errdefer allocator.destroy(compute);
-    compute.* = try MetalCompute.initBorrowingSharedProvider(
-        allocator,
-        gpuBackendData(self),
-        self.io,
-        .{
-            .config = self.kernel_jit_config,
-            .scope = self.metal_jit_scope,
-            .load_context = self.kernel_jit_load_context,
-        },
-    );
-    compute.require_f32_linears = self.arch_config == .embedding_gemma2;
-    var cb = compute.ownedComputeBackend();
-    errdefer cb.deinit();
-    try cb.beginRequest();
-    return cb;
+    return @import("../backends/compute_factory.zig").borrowMetalProvider(allocator, gpuBackendData(self), self.io, .{
+        .config = self.kernel_jit_config,
+        .scope = self.metal_jit_scope,
+        .load_context = self.kernel_jit_load_context,
+    }, self.arch_config == .embedding_gemma2);
 }
 
 /// Compatibility names for the backend-owned request lifetime protocol.
@@ -7799,30 +7721,7 @@ fn prepareGlinerBoundaryResidentImpl(session: Session, published: Session, contr
     if (self.backend_type != .metal or self.arch_config != .gliner_boundary) return;
     const data = gpuBackendData(self);
     const owner = data.boundary_resident orelse return;
-    const effective = control orelse InferenceExecutionControl{};
-    try effective.check();
-    if (owner.isReady()) return;
-    var protection = try effective.enterUninterruptible(published.interruption());
-    defer protection.deinit();
-    errdefer owner.abortPreparation();
-    {
-        // Physical tensor ownership records produced for constants must belong
-        // to this session allocator, never to a caller's request arena.
-        var cb = try getComputeBackend(session, self.allocator);
-        defer cb.deinit();
-        cb.execution_control = control;
-        const provider = data.shared_metal_native_provider orelse return error.UnsupportedGlinerBoundaryDevice;
-        const runtime_identity: *anyopaque = @ptrCast(provider.raw_decode_runtime orelse return error.UnsupportedGlinerBoundaryDevice);
-        try owner.prepare(data.tensor_store orelse return error.UnsupportedGlinerBoundaryBundle, runtime_identity, control);
-        try cb.glinerBoundaryResidentPreparation(true);
-        var preparation_access = true;
-        defer if (preparation_access) cb.glinerBoundaryResidentPreparation(false) catch {};
-        try @import("gliner/boundary_engine_device.zig").prepareResidentConstants(&cb, self.allocator, &self.arch_config.gliner_boundary, control);
-        try cb.glinerBoundaryResidentPreparation(false);
-        preparation_access = false;
-    }
-    try effective.check();
-    try owner.finishPreparation();
+    try @import("../models/resident_preparation.zig").prepareBoundary(.{ .ptr = self, .session = session, .create = createPreparationBackend, .runtime_identity = preparationRuntimeIdentity }, published, self.allocator, owner, data.tensor_store, &self.arch_config.gliner_boundary, control);
 }
 
 /// Read only while holding the session/model lifetime and serialization lease.
@@ -8114,8 +8013,7 @@ pub fn getComputeBackendWithBudget(
     // unconditional request boundary here, before prompt-cache selection can
     // bypass KV-hook provisioning, so no graph or pinned-address ABI survives
     // from the preceding request.
-    try bindCudaVideoAdmission(session, &cb);
-    try cb.beginRequest();
+    try @import("../backends/compute_factory.zig").beginRequest(session, &cb);
     return cb;
 }
 
@@ -8492,6 +8390,19 @@ fn acquireArchComputeBackend(ctx: *anyopaque, session: Session, allocator: std.m
     }
     if (options.run_budget) |budget| return getComputeBackendWithBudget(owner_session, allocator, budget);
     return getComputeBackend(owner_session, allocator);
+}
+
+fn preparationRuntimeIdentity(raw: *anyopaque) !*anyopaque {
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    const self: *ArchSession = @ptrCast(@alignCast(raw));
+    const provider = gpuBackendData(self).shared_metal_native_provider orelse return error.UnsupportedGlinerBoundaryDevice;
+    return @ptrCast(provider.raw_decode_runtime orelse return error.UnsupportedGlinerBoundaryDevice);
+}
+
+fn createPreparationBackend(raw: *anyopaque, session: Session, allocator: std.mem.Allocator, begin_request: bool) !ops.ComputeBackend {
+    if (begin_request) return getComputeBackend(session, allocator);
+    const self: *ArchSession = @ptrCast(@alignCast(raw));
+    return makeComputeBackend(self, allocator, null);
 }
 
 fn prepareArchResident(ctx: *anyopaque, published: Session, control: ?InferenceExecutionControl) !void {
