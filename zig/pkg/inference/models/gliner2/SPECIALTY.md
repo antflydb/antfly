@@ -157,6 +157,41 @@ All 12 sanitizer lanes passed. Memcheck and initcheck were unfiltered;
 racecheck and synccheck covered project kernels matching `^termite_.*`,
 excluding unmatched vendor kernels. Metal hardware qualification was not run.
 
+### Post-merge check (2026-11-01–02)
+
+After merging `main` at `70fb539fee`, the DGX Spark GB10/SM121 passed the
+ReleaseFast CUDA regression run: 191 tests passed and 94 optional model-fixture
+or Metal tests skipped. Both specialty profiles ran their complete pinned
+native and CUDA head oracles and public CUDA serving tests, including the
+128-item/512-token geometry, cancellation, admission recovery and reload.
+
+Production HTTP passed all 23 cases at request cardinalities one and eight,
+with 10 warmups and 50 measured iterations per workload. Maximum public
+confidence error remained `6.32e-6` against the unchanged `5e-4` bound. All four
+conflicting global attention diagnostics retained the specialty FP32 policy.
+The artifact-drift gate also passed. These checks do not rerun the earlier
+paired PyTorch performance comparison.
+
+The 300-second, concurrency-eight soak completed 11,593 requests and 57,309
+items with zero capacity retries. Late-window host process-group PSS growth
+was 126 KiB against the 64 MiB bound, with no change in numerical error.
+
+Initcheck exposed uninitialized inputs in the shared cuBLAS BF16 startup
+warmup, which the merged capability policy enables on GB10. Warmup now uploads
+zero inputs and weights and drains queued work before releasing their storage,
+including on error paths. Specialty model execution continues to enforce FP32.
+Sanitizer receipts now record the warmup setting and other CUDA controls.
+With the fix and warmup enabled, all 12 sanitizer lanes passed: unfiltered
+memcheck/initcheck and project-kernel racecheck/synccheck (`^termite_.*`).
+
+The default fatbin was regenerated from the merged CUDA source using CUDA
+13.2. Local SASS inspection verified non-stub specialty kernel bodies for A100
+(SM80), L4 (SM89), GB10's compatible SM120 image, and the standalone L4 cubin.
+Dispatch-policy tests passed with fatbin, portable PTX and SM89 build settings.
+L4 and A100 hardware execution was not performed. The qualification harness
+now accepts all three GPUs and records the selected CUDA device rather than
+inferring it from the physical GPU inventory.
+
 [Reproduction commands](../../scripts/gliner25/specialty/README.md) keep model
 weights, full intermediate captures and machine-specific receipts in the
 ignored `.specialty-artifacts/` directory. Only small regression fixtures and

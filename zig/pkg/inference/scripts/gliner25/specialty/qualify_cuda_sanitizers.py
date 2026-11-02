@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Run fail-closed GB10 CUDA sanitizer lanes against an existing test executable.
+"""Run fail-closed CUDA sanitizer lanes against an existing test executable.
 
 Default coverage is both GRU residual modes and every frozen PII/GLiGuard head
 case under all four tools. --include-http adds the full public loopback HTTP
@@ -27,7 +27,7 @@ import sys
 import time
 import traceback
 
-from qualify_http import MANIFEST, PACKAGE, REPO, digest_file, hardware, terminate_server, verify_inputs
+from qualify_http import MANIFEST, PACKAGE, REPO, backend_environment_receipt, digest_file, hardware, terminate_server, verify_inputs
 
 TOOLS = ("memcheck", "initcheck", "racecheck", "synccheck")
 SUITES = {
@@ -288,8 +288,10 @@ def qualify(args, report):
     for profile, prefix in [("pii", "ANTFLY_GLINER_PII"), ("gliguard", "ANTFLY_GLIGUARD")]:
         environment[prefix + "_MODEL_DIR"] = str(args.models_root / profile)
         environment[prefix + "_CAPTURE"] = str(args.models_root / manifest["models"][profile]["oracle"]["path"])
+    environment.setdefault("ANTFLY_INFERENCE_CUDA_CUBLASLT_WARMUP", "1")
     report["backend_environment"] = {key: value for key, value in environment.items() if key.startswith(("ANTFLY_GLINER_", "ANTFLY_GLIGUARD")) or key in (
         "TERMITE_REQUIRE_CUDA_TESTS", "ANTFLY_INFERENCE_REQUIRED_BACKEND", "ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE", "ANTFLY_CUDA_DEBERTA_GENERATED_TC_AUTO")}
+    report["backend_environment"].update(backend_environment_receipt(environment))
     report["lanes"] = []
     for tool in args.tool or TOOLS:
         for name in args.filter or (*BASE_SUITES, *( ("pii-http", "gliguard-http") if args.include_http else () )):
@@ -388,7 +390,7 @@ def main():
         if getattr(args, name) is not None:
             setattr(args, name, getattr(args, name).resolve())
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    report = {"format_version": 1, "status": "failed", "campaign": "GB10 CUDA specialty sanitizer correctness",
+    report = {"format_version": 1, "status": "failed", "campaign": "CUDA specialty sanitizer correctness",
         "started_unix_seconds": time.time(), "tools": list(args.tool or TOOLS),
         "requested_suites": list(args.filter or (*BASE_SUITES, *( ("pii-http", "gliguard-http") if args.include_http else () ))),
         "case_selection": args.case, "sanitizer_kernel_filter": args.kernel_regex,

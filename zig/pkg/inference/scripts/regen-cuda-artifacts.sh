@@ -335,6 +335,9 @@ required_symbols=(
   termite_primitive_concat_f32
   termite_primitive_slice_f32
   termite_gliner_gather_concat_relu_f32
+  termite_gliner_gru_combine_f32
+  termite_concat_lastdim_f32
+  termite_take_rows_f32
   termite_split_last_dim3_f32
   termite_qwen3vl_mrope_f32
   termite_qwen3vl_vision_rope_f32

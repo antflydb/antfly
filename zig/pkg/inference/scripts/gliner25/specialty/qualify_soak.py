@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Run an owned GB10 production server through mixed traffic and lifecycle gates.
+"""Run an owned CUDA production server through mixed traffic and lifecycle gates.
 
 Uses canonical managed installs. Every successful extraction is checked against
 frozen outputs, including original-text offsets in each public coordinate unit.
@@ -417,7 +417,7 @@ def main():
     for field in ('server', 'models_root', 'artifacts_root', 'output'):
         setattr(args, field, getattr(args, field).resolve())
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    report = {'format_version': 1, 'campaign': 'GB10 managed specialty production soak',
+    report = {'format_version': 1, 'campaign': 'CUDA managed specialty production soak',
         'status': 'failed', 'started_unix_seconds': time.time(), 'duration_seconds': args.duration,
         'concurrency': args.concurrency, 'memory_scope': 'Public admission + host PSS; CUDA owned-buffer peaks proven separately in internal service gate'}
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))

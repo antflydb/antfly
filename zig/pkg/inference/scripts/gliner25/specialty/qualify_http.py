@@ -10,6 +10,7 @@ they are not exposed by the public HTTP API.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import math
@@ -249,13 +250,13 @@ class ProcessGroupCleanupError(RuntimeError):
 
 
 def process_group_members(group):
-    """Live Linux members of the same owned PGID sampled by the GB10 PSS gate.
+    """Live Linux members of the same owned PGID sampled by the specialty PSS gate.
 
     Zombies have released CUDA contexts and mappings; their eventual reaping
     belongs to their parent. The directly owned Popen leader is always waited.
     """
     if not Path("/proc").is_dir():
-        raise RuntimeError("GB10 process-group cleanup requires Linux /proc")
+        raise RuntimeError("specialty process-group cleanup requires Linux /proc")
     members = []
     for directory in Path("/proc").iterdir():
         if not directory.name.isdigit():
@@ -323,12 +324,57 @@ def quantile(values, q):
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower)
 
 
+GPU_TARGETS = {"gb10": ("GB10", (12, 1)), "l4": ("L4", (8, 9)), "a100": ("A100", (8, 0))}
+
+
+def cuda_device_identity():
+    """Query CUDA ordinal zero, honoring CUDA visibility and device ordering.
+
+    nvidia-smi lists physical GPUs independently of CUDA_VISIBLE_DEVICES. Using
+    the driver also identifies a selected A100 MIG instance without confusing
+    it with an unrelated physical device on a multi-GPU runner.
+    """
+    driver = ctypes.CDLL("libcuda.so.1")
+
+    def checked(name, *arguments):
+        status = getattr(driver, name)(*arguments)
+        if status != 0:
+            raise ValueError(f"{name} failed with CUDA status {status}")
+
+    checked("cuInit", ctypes.c_uint(0))
+    device = ctypes.c_int()
+    checked("cuDeviceGet", ctypes.byref(device), ctypes.c_int(0))
+    name = ctypes.create_string_buffer(256)
+    checked("cuDeviceGetName", name, ctypes.c_int(len(name)), device)
+    major, minor, version = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+    checked("cuDeviceGetAttribute", ctypes.byref(major), ctypes.c_int(75), device)
+    checked("cuDeviceGetAttribute", ctypes.byref(minor), ctypes.c_int(76), device)
+    checked("cuDriverGetVersion", ctypes.byref(version))
+    total_memory = ctypes.c_size_t()
+    checked("cuDeviceTotalMem_v2", ctypes.byref(total_memory), device)
+    device_uuid = (ctypes.c_ubyte * 16)()
+    checked("cuDeviceGetUuid_v2", device_uuid, device)
+    return {"name": name.value.decode(), "compute_capability": [major.value, minor.value],
+            "cuda_driver_version": version.value, "total_memory_bytes": total_memory.value,
+            "uuid_hex": bytes(device_uuid).hex(), "cuda_ordinal": 0}
+
+
 def hardware():
+    identity = cuda_device_identity()
+    capability = tuple(identity["compute_capability"])
+    targets = [target for target, (name, cc) in GPU_TARGETS.items()
+               if re.search(r"\b" + name + r"\b", identity["name"]) and capability == cc]
+    if len(targets) != 1:
+        raise ValueError(f"specialty qualification requires GB10/SM121, L4/SM89 or A100/SM80; found {identity}")
+    target = targets[0]
+    expected = os.environ.get("ANTFLY_GLINER_SPECIALTY_EXPECT_GPU")
+    if expected is not None and expected != target:
+        raise ValueError(f"expected GPU target {expected!r}, selected {target!r}")
     result = subprocess.run(["nvidia-smi", "--query-gpu=name,uuid,compute_cap,driver_version,memory.total",
                              "--format=csv,noheader"], capture_output=True, text=True, timeout=20, check=True)
-    if "GB10" not in result.stdout:
-        raise ValueError(f"this qualification campaign requires NVIDIA GB10; found {result.stdout.strip()}")
-    return {"nvidia_smi": result.stdout.strip(), "platform": platform.platform(),
+    return {"target": target, "expected_target": expected, "selected_cuda_device": identity,
+            "cuda_visibility": {key: os.environ[key] for key in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER") if key in os.environ},
+            "nvidia_smi": result.stdout.strip(), "platform": platform.platform(),
             "machine": platform.machine(), "python": platform.python_version()}
 
 
@@ -449,7 +495,7 @@ def main():
     for key in ("server", "models_root", "output"):
         setattr(args, key, getattr(args, key).resolve())
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    report = {"format_version": 1, "status": "failed", "campaign": "GB10 CUDA specialty public HTTP",
+    report = {"format_version": 1, "status": "failed", "campaign": "CUDA specialty public HTTP",
         "confidence_abs_tolerance": SCORE_TOLERANCE, "started_unix_seconds": time.time(),
         "timing_scope": "Loopback HTTP request send through complete response read; separate TCP request per sample; excludes model load, validation, warmups, and client JSON decode/checks",
         "cuda_transfers": {"available": False, "reason": "Public HTTP does not expose CUDA transfers; see separately measured Zig service receipts"},

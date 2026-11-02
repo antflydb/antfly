@@ -73,6 +73,19 @@ the small decoder fixture separately from model inference.
 
 ## Build and run regressions
 
+The same FP32 qualification tools accept DGX Spark GB10 (SM121), L4 (SM89),
+and A100 (SM80). The hardware receipt queries CUDA ordinal zero, honoring
+`CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER`, including A100 MIG instances.
+Set `ANTFLY_GLINER_SPECIALTY_EXPECT_GPU=gb10`, `l4`, or `a100` to fail if the
+selected device differs from the intended target. Results qualify only the
+device recorded in the receipt.
+
+Use the default `-Dcuda-artifacts=fatbin` for a binary containing all three
+targets. GB10 loads the compatible SM120 SASS image; A100 and L4 have native
+SM80 and SM89 images. `-Dcuda-artifacts=sm89` is L4-only. Build the host binary
+for the runner's CPU architecture (Spark is aarch64; typical L4/A100 hosts are
+x86_64). CUDA libraries are loaded on the target host.
+
 ```bash
 cd zig/pkg/inference
 ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global" zig build \
@@ -88,6 +101,23 @@ python3 -m unittest discover -s zig/pkg/inference/scripts/gliner25/specialty -p 
 Model-independent tests require only the small checked-in fixtures. Full oracle
 and serving tests are opt-in through the four environment variables above;
 Metal tests additionally require a Metal-enabled build and host.
+
+After merging CUDA source changes, regenerate all images with the pinned CUDA
+13.2 toolkit and inspect each target's specialty kernel bodies locally:
+
+```bash
+mkdir -p .specialty-artifacts/tmp
+TMPDIR="$PWD/.specialty-artifacts/tmp" \
+ZIG_GLOBAL_CACHE_DIR="$PWD/zig/pkg/inference/.zig-cache/global" \
+  bash zig/pkg/inference/scripts/regen-cuda-artifacts.sh --write --all
+python3 zig/pkg/inference/scripts/gliner25/specialty/verify_cuda_artifacts.py \
+  --output .specialty-artifacts/cuda-artifact-images.json
+```
+
+Image inspection checks that the FP32 attention, GRU, span, row-gather and
+projection entry points have compiled SASS bodies in every target image,
+including the separate L4 cubin. It does not establish numerical parity,
+sanitizer correctness or performance on hardware that was not executed.
 
 ## HTTP, artifact and memory checks
 

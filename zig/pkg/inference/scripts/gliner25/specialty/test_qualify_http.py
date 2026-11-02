@@ -24,6 +24,43 @@ def marker(profile):
 POLICY = marker('pii') + marker('gliguard')
 
 
+class HardwareEvidenceTests(unittest.TestCase):
+    def detect(self, name, capability, expected=None):
+        identity = {"name": name, "compute_capability": capability, "cuda_ordinal": 0}
+        environment = {} if expected is None else {"ANTFLY_GLINER_SPECIALTY_EXPECT_GPU": expected}
+        with mock.patch.object(gate, 'cuda_device_identity', return_value=identity), \
+             mock.patch.object(gate.subprocess, 'run', return_value=SimpleNamespace(stdout='physical inventory')), \
+             mock.patch.dict(gate.os.environ, environment, clear=True):
+            return gate.hardware()
+
+    def test_accepts_supported_devices_with_matching_compute_capability(self):
+        for target, name, cc in [('gb10', 'NVIDIA GB10', [12, 1]),
+                                 ('l4', 'NVIDIA L4', [8, 9]),
+                                 ('a100', 'NVIDIA A100-SXM4-80GB', [8, 0]),
+                                 ('a100', 'NVIDIA A100-PCIE-40GB', [8, 0])]:
+            with self.subTest(name=name):
+                receipt = self.detect(name, cc, target)
+                self.assertEqual(target, receipt['target'])
+                self.assertEqual(cc, receipt['selected_cuda_device']['compute_capability'])
+
+    def test_rejects_wrong_or_unqualified_gpu_instead_of_blessing_the_inventory(self):
+        for name, cc, expected in [('NVIDIA GB10', [8, 9], None),
+                                   ('NVIDIA H100', [9, 0], None),
+                                   ('NVIDIA L40', [8, 9], None),
+                                   ('NVIDIA L4', [8, 9], 'a100'),
+                                   ('NVIDIA GB10', [12, 1], 'typo')]:
+            with self.subTest(name=name, expected=expected):
+                with self.assertRaises(ValueError):
+                    self.detect(name, cc, expected)
+
+    def test_driver_failure_cannot_fall_back_to_physical_gpu_inventory(self):
+        with mock.patch.object(gate, 'cuda_device_identity', side_effect=ValueError('CUDA unavailable')), \
+             mock.patch.object(gate.subprocess, 'run') as inventory:
+            with self.assertRaisesRegex(ValueError, 'CUDA unavailable'):
+                gate.hardware()
+            inventory.assert_not_called()
+
+
 class PolicyEvidenceTests(unittest.TestCase):
     def test_requires_both_fp32_policy_receipts_independently_of_surrounding_logs(self):
         receipts = gate.parse_cuda_policy('unrelated startup log\n' + POLICY + 'listening\n')
@@ -80,6 +117,7 @@ class PolicyEvidenceTests(unittest.TestCase):
     def test_records_visibility_math_and_cuda_controls_without_secrets(self):
         controls = {'CUDA_VISIBLE_DEVICES': '0', 'CUDA_DEVICE_ORDER': 'PCI_BUS_ID',
                     'NVIDIA_TF32_OVERRIDE': '0', 'CUBLAS_WORKSPACE_CONFIG': ':4096:8',
+                    'ANTFLY_INFERENCE_CUDA_CUBLASLT_WARMUP': '1',
                     'CUDA_MODULE_LOADING': 'LAZY', 'ANTFLY_CUDA_TEST_CONTROL': '1',
                     'TERMITE_CUDA_TEST_CONTROL': '2', 'ANTFLY_INFERENCE_CUDA_TEST_CONTROL': '3'}
         env = {**controls, 'ANTFLY_CUDA_API_KEY': 'secret', 'TERMITE_CUDA_TOKEN': 'secret',

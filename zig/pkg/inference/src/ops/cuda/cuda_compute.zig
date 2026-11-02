@@ -8116,10 +8116,16 @@ fn warmupCublasLtBf16(cublaslt: *cublaslt_mod.CublasLt, ctx: *context_mod.CudaCo
     defer weight.free(ctx);
     var dst = buffer_mod.DeviceBuffer.alloc(ctx, rows * dim * @sizeOf(f32)) catch return;
     defer dst.free(ctx);
-    // Inputs stay uninitialized: the result is discarded, only the library
-    // load and heuristic init matter.
+    // Even discarded warmup outputs must consume initialized inputs. This
+    // path also runs before a specialty session installs its FP32 policy.
+    // Drain async copies and matmul before stack storage or buffers retire,
+    // including a partial-copy or heuristic failure.
+    defer ctx.synchronize() catch {};
+    const zeros: [dim * dim]u16 = @splat(0);
+    const zero_bytes = std.mem.asBytes(&zeros);
+    input.copyFromHost(ctx, zero_bytes[0..input.len]) catch return;
+    weight.copyFromHost(ctx, zero_bytes) catch return;
     cublaslt.matmulBf16WeightF32Out(ctx, dst, input, weight, .{}, rows, dim, dim) catch return;
-    ctx.driver.check(ctx.driver.fns.cuStreamSynchronize(ctx.stream)) catch {};
 }
 
 fn cudaShouldDequantizeWeightOnUpload(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
