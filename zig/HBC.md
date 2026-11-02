@@ -58,7 +58,7 @@ They describe the same residual against the same centroid with B bits per
 dimension, so their distance estimates and error bounds are much tighter.
 
 - **Why:** leaf scoring admits the best `k * rerank_factor` 1-bit estimates
-  into the candidate heap before any f16 or exact scoring. With 1-bit codes,
+  into the candidate heap before any exact scoring. With 1-bit codes,
   true neighbors often miss that cut (see the measurements below), and the
   loose bounds make boundary rerank score most of the heap exactly.
 - **`quantization_refine: near_cutoff` (default):** score with the 1-bit
