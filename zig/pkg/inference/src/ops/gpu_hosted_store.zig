@@ -293,6 +293,7 @@ pub fn startPrefetchWorker(data: *WeightStore) !void {
 }
 
 pub fn stopPrefetchWorker(data: *WeightStore) void {
+    if (!data.prefetch_initialized) return;
     data.prefetch.stop();
 }
 
@@ -631,4 +632,22 @@ test "jina lora adapter merges matching safetensors sidecar into loaded base wei
         2.0, 3.5,  5.5,
         4.0, 11.0, 8.0,
     }, base_weight.tensor.asFloat32());
+}
+
+test "GPU cold prefetch teardown never touches an uninitialized queue" {
+    const Probe = struct {
+        fn process(_: *anyopaque, _: *LazyWeightEntry) void {}
+    };
+    var marker: u8 = 0;
+    var store = WeightStore{ .allocator = std.testing.allocator, .prefix = "", .lazy_weights = .empty };
+    // A valid canary makes an accidental access deterministic without reading
+    // undefined bytes. The publication flag deliberately remains false.
+    store.prefetch = @TypeOf(store.prefetch).init(std.testing.allocator, &marker, Probe.process);
+    defer store.prefetch.deinit();
+    store.prefetch.worker_enabled = true;
+    stopPrefetchWorker(&store);
+    stopPrefetchWorker(&store);
+    try std.testing.expect(store.prefetch.worker_enabled);
+    try std.testing.expect(!store.prefetch_initialized);
+    deinitPrefetchQueue(&store);
 }

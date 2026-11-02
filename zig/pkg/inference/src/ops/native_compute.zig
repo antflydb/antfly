@@ -4033,6 +4033,7 @@ pub fn startPrefetchWorker(data: *WeightStore) !void {
 }
 
 pub fn stopPrefetchWorker(data: *WeightStore) void {
+    if (!data.prefetch_initialized) return;
     data.prefetch.stop();
 }
 
@@ -50968,4 +50969,22 @@ test "explicit dense workload overrides checkpoint names without a kernel fork" 
     try std.testing.expect(!shouldUseQuantizedDequantSgemm("span_rep.weight", 16, 512, &storage));
     storage.dense_workload = null;
     try std.testing.expect(shouldUseQuantizedDequantSgemm("span_rep.weight", 16, 512, &storage));
+}
+
+test "native cold prefetch teardown never touches an uninitialized queue" {
+    const Probe = struct {
+        fn process(_: *anyopaque, _: *LazyWeightEntry) void {}
+    };
+    var marker: u8 = 0;
+    var store = WeightStore{ .allocator = std.testing.allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    // A valid canary makes an accidental access deterministic without reading
+    // undefined bytes. The publication flag deliberately remains false.
+    store.prefetch = @TypeOf(store.prefetch).init(std.testing.allocator, &marker, Probe.process);
+    defer store.prefetch.deinit();
+    store.prefetch.worker_enabled = true;
+    stopPrefetchWorker(&store);
+    stopPrefetchWorker(&store);
+    try std.testing.expect(store.prefetch.worker_enabled);
+    try std.testing.expect(!store.prefetch_initialized);
+    deinitPrefetchQueue(&store);
 }

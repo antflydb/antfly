@@ -130,6 +130,7 @@ test {
     // Keep host-only ownership/descriptor tests reachable under narrow filters.
     if (!build_options.enable_wasm) _ = @import("ops/cuda/embedded_module.zig");
     _ = @import("ops/kernel_geometry.zig");
+    _ = @import("ops/gpu_hosted_store.zig");
     _ = execution.sequence_pool;
     _ = execution.text_inputs;
     _ = execution.submission;
