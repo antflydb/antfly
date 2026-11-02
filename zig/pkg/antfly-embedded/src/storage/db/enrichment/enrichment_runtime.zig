@@ -16748,7 +16748,7 @@ fn processDocumentExtractionAsset(
     // thread constraint.
     try extraction_lease_guard.check();
     try publication_spool.replay(runtime, window, max_window_items, &resource_tracker);
-    try flushGeneratedReplayWindow(runtime, window);
+    try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
     recordArtifactBytes(runtime, .asset, manifest.len);
     // A successful extraction can legitimately produce no chunk artifacts (for
     // example, an image-only PDF whose OCR output is rejected as trivial). No
@@ -16756,7 +16756,7 @@ fn processDocumentExtractionAsset(
     // that source, so make the final outcome explicit after publication.
     if (desired_chunk_keys.items.len == 0) {
         try finalizeEmptyDocumentExtractionCoverage(runtime, window, request, manifest);
-        try flushGeneratedReplayWindow(runtime, window);
+        try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
     }
 }
 
@@ -23151,7 +23151,9 @@ const RuntimeDocumentPublicationSpool = struct {
                     ),
                 }
                 if (window.itemCount() >= max_window_items) {
-                    try flushGeneratedReplayWindow(runtime, window);
+                    // Publication can succeed while later OCR pages fail.
+                    // Only the enclosing request lane may retire retry debt.
+                    try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
                     // reserveAdditional is conservative while a window is being
                     // assembled. Reconcile after every durable flush so a large
                     // document is bounded by one window rather than accumulating
@@ -34680,6 +34682,16 @@ test "durable enrichment retry progress preserves unrelated request debt across 
 
     var persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u32, 0), persisted.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 91), persisted.retry_failure_fingerprint);
+    try std.testing.expectEqual(@as(u32, 4), persisted.retry_failure_count);
+
+    // A PDF can durably publish usable text while OCR pages still fail.
+    // That intermediate publish must neither clear the owner's attempt budget
+    // nor read/change the scanner thread's independently owned identity.
+    runtime.active_failure_fingerprint = 91;
+    try noteDurableRetryProgress(&runtime, 0);
+    persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u64, 91), runtime.active_failure_fingerprint);
     try std.testing.expectEqual(@as(u64, 91), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 4), persisted.retry_failure_count);
 
