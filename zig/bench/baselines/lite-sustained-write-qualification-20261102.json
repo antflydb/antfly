@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "local sustained gate passed; local correctness gates passed; matched final-host qualification in progress",
+  "status": "Local correctness and matched optimized sustained-write gates passed; full end-to-end qualification in progress",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -946,10 +946,787 @@
     "final_file_bytes": 22945792
   },
   "pending": [
-    "Matched wolfspider Debug and ReleaseFast comparisons",
-    "All frozen original-importer inputs and three-writer/one-reader contention",
-    "Optimized ten-minute active-write qualification, index catch-up, integrity, search and reopen",
-    "Warm large-file batch/SQL cost comparison",
-    "Repository aggregate CI and factory qualification"
-  ]
+    "Optimized changing-text ten-minute gate and latest/replaced-posting verification",
+    "All 15 original-importer inputs with normalized semantic comparison and equivalent drained/compacted payload accounting",
+    "Original unchanged-importer three-writer/one-reader contention and primary/integrity checks",
+    "Matched Debug and optimized short churn/append comparisons",
+    "Multi-GB retained-file warm batch/SQL cost comparisons",
+    "Human-triggered repository aggregate CI",
+    "External factory deployment remains unlocated and unverified"
+  ],
+  "final_host": {
+    "environment": {
+      "historical_controls": [
+        {
+          "tag": "1436-wolf-debug",
+          "sha256": "715af115012042cc38cdf2e1848d0b6c2259682ef51aaffc92fa79f6fab9fe98",
+          "deployment": "26.6.2",
+          "provenance": "Native 15a0088a5a checkout for 1436 controls; original experiment artifacts for f91c9c0e46 and 207cd9ca3b. Historical artifacts remain distinct from freshly built matched main controls."
+        },
+        {
+          "tag": "1436-wolf-release",
+          "sha256": "9cb9a50c178e0ac1536497a83bdba876ec29bcc05dcae87cd15471edf866dc4a",
+          "deployment": "26.6.2",
+          "provenance": "Native 15a0088a5a checkout for 1436 controls; original experiment artifacts for f91c9c0e46 and 207cd9ca3b. Historical artifacts remain distinct from freshly built matched main controls."
+        },
+        {
+          "tag": "f91c9c0e46",
+          "sha256": "4818a03026f7fa58927339129a84b314565899e79d31605bc47a06be9453f7a1",
+          "deployment": "27.0.1",
+          "provenance": "Native 15a0088a5a checkout for 1436 controls; original experiment artifacts for f91c9c0e46 and 207cd9ca3b. Historical artifacts remain distinct from freshly built matched main controls."
+        },
+        {
+          "tag": "207cd9ca3b",
+          "sha256": "ef3c87e963330323b13a99973fc1268d697226c0212fdbdba0a3edcb82c97b7b",
+          "deployment": "27.0.1",
+          "provenance": "Native 15a0088a5a checkout for 1436 controls; original experiment artifacts for f91c9c0e46 and 207cd9ca3b. Historical artifacts remain distinct from freshly built matched main controls."
+        }
+      ],
+      "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
+      "harness_commit": "d00f595e43d2d701bb62608762cb9e380fc5dfa5",
+      "builds": [
+        {
+          "tag": "final-8ec7-debug",
+          "revision": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
+          "mode": "debug",
+          "started_utc": "2026-11-02T11:49:25Z",
+          "command": [
+            "/opt/homebrew/bin/python3",
+            "tools/run_bounded_zig_build.py",
+            "--zig",
+            "/Users/ajroetker/bin/zig-aarch64-macos-0.17.0/zig",
+            "--max-rss-cap",
+            "30064771072",
+            "--",
+            "build",
+            "capi",
+            "capi-smoke",
+            "--cache-dir",
+            "/Users/ajroetker/antfly/.worktrees/perf-lite-sustained-write-qualification/zig/.zig-cache",
+            "-Doptimize=debug",
+            "-j1"
+          ],
+          "exit_code": 0,
+          "seconds": 102.35140637494624,
+          "library_sha256": "670d862d27826c993318fc9b9407f808e34604e175672d983f1918696a4a6378",
+          "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+          "platform": "26.6.2",
+          "reused_verified_artifact": true
+        },
+        {
+          "tag": "final-8ec7-release",
+          "revision": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
+          "mode": "fast",
+          "started_utc": "2026-11-02T11:51:07Z",
+          "command": [
+            "/opt/homebrew/bin/python3",
+            "tools/run_bounded_zig_build.py",
+            "--zig",
+            "/Users/ajroetker/bin/zig-aarch64-macos-0.17.0/zig",
+            "--max-rss-cap",
+            "30064771072",
+            "--",
+            "build",
+            "capi",
+            "capi-smoke",
+            "--cache-dir",
+            "/Users/ajroetker/antfly/.worktrees/perf-lite-sustained-write-qualification/zig/.zig-cache",
+            "-Doptimize=fast",
+            "-j1"
+          ],
+          "exit_code": 0,
+          "seconds": 758.6428381670266,
+          "library_sha256": "645a19ae5529c33e62fac30148ef0803eb8d7e851bc456baaf298f7cb959f0d3",
+          "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+          "platform": "26.6.2",
+          "reused_verified_artifact": true
+        },
+        {
+          "tag": "base70-debug",
+          "revision": "70fb539fee7c11f4f98d312ae76cb5192a294667",
+          "mode": "debug",
+          "started_utc": "2026-11-02T08:42:27Z",
+          "command": [
+            "/opt/homebrew/bin/python3",
+            "tools/run_bounded_zig_build.py",
+            "--zig",
+            "/Users/ajroetker/bin/zig-aarch64-macos-0.17.0/zig",
+            "--max-rss-cap",
+            "30064771072",
+            "--",
+            "build",
+            "capi",
+            "capi-smoke",
+            "--cache-dir",
+            "/Users/ajroetker/antfly/.worktrees/perf-lite-sustained-main-control/zig/.zig-cache",
+            "-Doptimize=debug",
+            "-j1"
+          ],
+          "exit_code": 0,
+          "seconds": 241.5220635002479,
+          "library_sha256": "4474e172e04849426e30b002a285ce54e452f485504a74deb972706f587a1d77",
+          "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+          "platform": "26.6.2",
+          "reused_verified_artifact": true
+        },
+        {
+          "tag": "base70-release",
+          "revision": "70fb539fee7c11f4f98d312ae76cb5192a294667",
+          "mode": "fast",
+          "started_utc": "2026-11-02T12:06:32Z",
+          "command": [
+            "/opt/homebrew/bin/python3",
+            "tools/run_bounded_zig_build.py",
+            "--zig",
+            "/Users/ajroetker/bin/zig-aarch64-macos-0.17.0/zig",
+            "--max-rss-cap",
+            "30064771072",
+            "--",
+            "build",
+            "capi",
+            "capi-smoke",
+            "--cache-dir",
+            "/Users/ajroetker/antfly/.worktrees/perf-lite-sustained-main-control/zig/.zig-cache",
+            "-Doptimize=fast",
+            "-j1"
+          ],
+          "exit_code": 0,
+          "seconds": 1337.5392684577964,
+          "library_sha256": "5574a077b6dd73b18ef71f6f326b84264894db3645b8fbe878e0bce408cee880",
+          "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+          "platform": "26.6.2"
+        }
+      ],
+      "compiler_processes": [],
+      "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t26.6.2\nBuildVersion:\t\t25G83\n",
+      "hardware": "Apple M4 Max\n38654705664\n",
+      "initial_load": [
+        1.453125,
+        1.57080078125,
+        1.57177734375
+      ]
+    },
+    "phases": [
+      {
+        "phase": "first-imports",
+        "tag": "final-8ec7-debug",
+        "control": [
+          "base70-debug",
+          "1436-wolf-debug"
+        ],
+        "command": [
+          "/Users/ajroetker/antfly/.worktrees/perf-lite-sustained-write-qualification/.tools/qualification-python/bin/python",
+          "/Users/ajroetker/antfly/.worktrees/perf-lite-sustained-write-qualification/.tools/import-regression/longterm_final_qualification.py",
+          "--tag",
+          "final-8ec7-debug",
+          "--phase",
+          "first-imports",
+          "--controls",
+          "base70-debug",
+          "1436-wolf-debug"
+        ],
+        "started_utc": "2026-11-02T12:29:24Z",
+        "exit_code": 0,
+        "seconds": 197.05639450019225
+      },
+      {
+        "phase": "first-imports",
+        "tag": "final-8ec7-release",
+        "control": [
+          "base70-release",
+          "1436-wolf-release",
+          "f91c9c0e46",
+          "207cd9ca3b"
+        ],
+        "command": [
+          "/Users/ajroetker/antfly/.worktrees/perf-lite-sustained-write-qualification/.tools/qualification-python/bin/python",
+          "/Users/ajroetker/antfly/.worktrees/perf-lite-sustained-write-qualification/.tools/import-regression/longterm_final_qualification.py",
+          "--tag",
+          "final-8ec7-release",
+          "--phase",
+          "first-imports",
+          "--controls",
+          "base70-release",
+          "1436-wolf-release",
+          "f91c9c0e46",
+          "207cd9ca3b"
+        ],
+        "started_utc": "2026-11-02T12:32:41Z",
+        "exit_code": 0,
+        "seconds": 129.50237216614187
+      },
+      {
+        "phase": "soak",
+        "tag": "base70-release",
+        "control": null,
+        "command": [
+          "/Users/ajroetker/antfly/.worktrees/perf-lite-sustained-write-qualification/.tools/qualification-python/bin/python",
+          "/Users/ajroetker/antfly/.worktrees/perf-lite-sustained-write-qualification/.tools/import-regression/longterm_final_qualification.py",
+          "--tag",
+          "base70-release",
+          "--phase",
+          "soak"
+        ],
+        "started_utc": "2026-11-02T12:34:50Z",
+        "exit_code": 1,
+        "seconds": 625.5617660838179
+      },
+      {
+        "phase": "soak",
+        "tag": "final-8ec7-release",
+        "control": null,
+        "command": [
+          "/Users/ajroetker/antfly/.worktrees/perf-lite-sustained-write-qualification/.tools/qualification-python/bin/python",
+          "/Users/ajroetker/antfly/.worktrees/perf-lite-sustained-write-qualification/.tools/import-regression/longterm_final_qualification.py",
+          "--tag",
+          "final-8ec7-release",
+          "--phase",
+          "soak"
+        ],
+        "started_utc": "2026-11-02T12:45:16Z",
+        "exit_code": 0,
+        "seconds": 604.8161804159172
+      }
+    ],
+    "first_inputs": {
+      "debug": {
+        "a": {
+          "final-8ec7-debug": {
+            "completion": {
+              "total_import_seconds": 18.252715040929615,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 18.252715040929615,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 54345728,
+                "child_user_seconds": 15.234905,
+                "child_system_seconds": 0.889053,
+                "max_rss": 374374400
+              }
+            ]
+          },
+          "1436-wolf-debug": {
+            "completion": {
+              "total_import_seconds": 59.48694350011647,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 59.48694350011647,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 54915072,
+                "child_user_seconds": 23.278023,
+                "child_system_seconds": 28.236642,
+                "max_rss": 377683968
+              }
+            ]
+          },
+          "base70-debug": {
+            "completion": {
+              "total_import_seconds": 19.28194204159081,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 19.28194204159081,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 54935552,
+                "child_user_seconds": 15.227526,
+                "child_system_seconds": 1.168154,
+                "max_rss": 368623616
+              }
+            ]
+          }
+        },
+        "b": {
+          "final-8ec7-debug": {
+            "completion": {
+              "total_import_seconds": 18.252527208067477,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 18.252527208067477,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 54345728,
+                "child_user_seconds": 15.16778,
+                "child_system_seconds": 0.881496,
+                "max_rss": 376832000
+              }
+            ]
+          },
+          "1436-wolf-debug": {
+            "completion": {
+              "total_import_seconds": 59.760921666864306,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 59.760921666864306,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 55033856,
+                "child_user_seconds": 23.373543,
+                "child_system_seconds": 28.42316,
+                "max_rss": 368918528
+              }
+            ]
+          },
+          "base70-debug": {
+            "completion": {
+              "total_import_seconds": 18.740446916781366,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 18.740446916781366,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 54231040,
+                "child_user_seconds": 15.181097,
+                "child_system_seconds": 1.068449,
+                "max_rss": 366428160
+              }
+            ]
+          }
+        }
+      },
+      "release": {
+        "a": {
+          "1436-wolf-release": {
+            "completion": {
+              "total_import_seconds": 39.896982999984175,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 39.896982999984175,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 54153216,
+                "child_user_seconds": 4.09705,
+                "child_system_seconds": 28.592174,
+                "max_rss": 328220672
+              }
+            ]
+          },
+          "final-8ec7-release": {
+            "completion": {
+              "total_import_seconds": 5.323899125214666,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 5.323899125214666,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 56553472,
+                "child_user_seconds": 2.3367,
+                "child_system_seconds": 1.162636,
+                "max_rss": 305233920
+              }
+            ]
+          },
+          "207cd9ca3b": {
+            "completion": {
+              "total_import_seconds": 5.824462582822889,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 5.824462582822889,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 55898112,
+                "child_user_seconds": 2.58736,
+                "child_system_seconds": 1.106423,
+                "max_rss": 320471040
+              }
+            ]
+          },
+          "f91c9c0e46": {
+            "completion": {
+              "total_import_seconds": 6.274616041220725,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 6.274616041220725,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 54579200,
+                "child_user_seconds": 2.775697,
+                "child_system_seconds": 1.287212,
+                "max_rss": 313032704
+              }
+            ]
+          },
+          "base70-release": {
+            "completion": {
+              "total_import_seconds": 5.319762457627803,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 5.319762457627803,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 54403072,
+                "child_user_seconds": 2.352399,
+                "child_system_seconds": 1.253464,
+                "max_rss": 316162048
+              }
+            ]
+          }
+        },
+        "b": {
+          "1436-wolf-release": {
+            "completion": {
+              "total_import_seconds": 41.75895499996841,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 41.75895499996841,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 54747136,
+                "child_user_seconds": 4.184817,
+                "child_system_seconds": 29.929661,
+                "max_rss": 326467584
+              }
+            ]
+          },
+          "final-8ec7-release": {
+            "completion": {
+              "total_import_seconds": 5.1583840418607,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 5.1583840418607,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 54419456,
+                "child_user_seconds": 2.358739,
+                "child_system_seconds": 1.126747,
+                "max_rss": 307200000
+              }
+            ]
+          },
+          "207cd9ca3b": {
+            "completion": {
+              "total_import_seconds": 5.581137791741639,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 5.581137791741639,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 54337536,
+                "child_user_seconds": 2.542546,
+                "child_system_seconds": 1.078818,
+                "max_rss": 325058560
+              }
+            ]
+          },
+          "f91c9c0e46": {
+            "completion": {
+              "total_import_seconds": 6.2428595828823745,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 6.2428595828823745,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 54521856,
+                "child_user_seconds": 2.7604,
+                "child_system_seconds": 1.279266,
+                "max_rss": 311902208
+              }
+            ]
+          },
+          "base70-release": {
+            "completion": {
+              "total_import_seconds": 5.533445457927883,
+              "completed": 1,
+              "all_successful": true
+            },
+            "inputs": [
+              {
+                "index": 0,
+                "seconds": 5.533445457927883,
+                "exit_code": 0,
+                "imported_summary": [
+                  "1",
+                  "0",
+                  "0"
+                ],
+                "file_bytes_before_status": 54386688,
+                "child_user_seconds": 2.344571,
+                "child_system_seconds": 1.191641,
+                "max_rss": 311476224
+              }
+            ]
+          }
+        }
+      }
+    },
+    "full_inputs": {},
+    "native": {
+      "base70-release-soak": {
+        "status": "sustained_qualification_failed",
+        "library_sha256": "5574a077b6dd73b18ef71f6f326b84264894db3645b8fbe878e0bce408cee880",
+        "workload": "churn",
+        "successful_calls": 18363,
+        "busy_calls": 0,
+        "elapsed_seconds": 600.6889487910084,
+        "success_p50_ns": 125334709,
+        "success_p95_ns": 878337625,
+        "success_p99_ns": 1519418166,
+        "file_bytes": 3213369344,
+        "peak_file_bytes": 3213369344,
+        "sustained_qualification": {
+          "active_visibility": {
+            "passed": false,
+            "reason": "active_visibility_did_not_reach_prior_target"
+          },
+          "late_to_early_throughput_fraction": 0.3801470588235294,
+          "minute_successful_calls": [
+            10436,
+            1729,
+            1282,
+            1069,
+            912,
+            755,
+            629,
+            506,
+            573,
+            472
+          ],
+          "passed": false,
+          "policy": {
+            "maximum_tail_growth_fraction": 0.25,
+            "minimum_growth_allowance_bytes": 16777216,
+            "minimum_late_throughput_fraction": 0.75,
+            "warmup_seconds": 180
+          },
+          "tail_growth_allowance_bytes": 274070528.0,
+          "tail_growth_bytes": 2117087232,
+          "tail_initial_file_bytes": 1096282112
+        },
+        "allocator_proof_walks": 0,
+        "allocator_proof_ns": 0,
+        "verified_latest_writes": 1024,
+        "integrity": {
+          "valid": true,
+          "file_size": 3213369344,
+          "compact_size": 8192000,
+          "live_bytes": 4336347,
+          "live_file_count": 19933,
+          "live_accounting": {
+            "control_documents": {
+              "key_bytes": 427199,
+              "records": 18349,
+              "value_bytes": 428380
+            },
+            "documents": {
+              "key_bytes": 21605,
+              "records": 1536,
+              "value_bytes": 3179008
+            },
+            "index_catalog": {
+              "key_bytes": 2781,
+              "records": 47,
+              "value_bytes": 277325
+            },
+            "metadata_catalog": {
+              "key_bytes": 33,
+              "records": 1,
+              "value_bytes": 16
+            }
+          }
+        }
+      },
+      "final-8ec7-release-soak": {
+        "status": "ok",
+        "library_sha256": "645a19ae5529c33e62fac30148ef0803eb8d7e851bc456baaf298f7cb959f0d3",
+        "workload": "churn",
+        "successful_calls": 214820,
+        "busy_calls": 0,
+        "elapsed_seconds": 600.0239080418833,
+        "success_p50_ns": 20801958,
+        "success_p95_ns": 39289583,
+        "success_p99_ns": 47506958,
+        "file_bytes": 19881984,
+        "peak_file_bytes": 19881984,
+        "sustained_qualification": {
+          "active_visibility": {
+            "maximum_allowed_seconds": 60,
+            "maximum_watermark_visibility_upper_seconds": 5.137573500163853,
+            "passed": true,
+            "samples": 119
+          },
+          "late_to_early_throughput_fraction": 0.8839413875598087,
+          "minute_successful_calls": [
+            25497,
+            23729,
+            22377,
+            20774,
+            19699,
+            21968,
+            21658,
+            20590,
+            19444,
+            19084
+          ],
+          "passed": true,
+          "policy": {
+            "maximum_tail_growth_fraction": 0.25,
+            "minimum_growth_allowance_bytes": 16777216,
+            "minimum_late_throughput_fraction": 0.75,
+            "warmup_seconds": 180
+          },
+          "tail_growth_allowance_bytes": 16777216,
+          "tail_growth_bytes": 1306624,
+          "tail_initial_file_bytes": 18575360
+        },
+        "allocator_proof_walks": 1,
+        "allocator_proof_ns": 3373583,
+        "verified_latest_writes": 1024,
+        "integrity": {
+          "valid": true,
+          "file_size": 19881984,
+          "compact_size": 8941568,
+          "live_bytes": 5116981,
+          "live_file_count": 17849,
+          "live_accounting": {
+            "control_documents": {
+              "key_bytes": 406445,
+              "records": 16274,
+              "value_bytes": 315090
+            },
+            "documents": {
+              "key_bytes": 21605,
+              "records": 1536,
+              "value_bytes": 3180032
+            },
+            "index_catalog": {
+              "key_bytes": 2245,
+              "records": 38,
+              "value_bytes": 1191515
+            },
+            "metadata_catalog": {
+              "key_bytes": 33,
+              "records": 1,
+              "value_bytes": 16
+            }
+          }
+        }
+      }
+    },
+    "catchup": {},
+    "concurrency": {},
+    "settled": {},
+    "semantic_comparisons": {},
+    "large_warm": {}
+  }
 }
