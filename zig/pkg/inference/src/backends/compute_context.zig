@@ -51,7 +51,7 @@ pub const BackendContext = union(enum) {
                 if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
                 const compute = try allocator.create(CudaCompute);
                 errdefer allocator.destroy(compute);
-                compute.* = try CudaCompute.init(allocator);
+                try compute.initInPlace(allocator);
                 break :blk .{ .cuda = compute };
             },
             .native => blk: {
@@ -367,7 +367,6 @@ test "shared backend context retains exact compute backend identity" {
     try std.testing.expectEqual(first.vtable, second.vtable);
     try std.testing.expectEqual(BackendType.native, shared.backendType());
 }
-
 
 fn expectSimpleAddRoundTrip(ctx: *BackendContext, allocator: std.mem.Allocator) !void {
     var cb = ctx.computeBackend();

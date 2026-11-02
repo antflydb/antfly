@@ -158,3 +158,47 @@ pub fn initializeMetalWeightPrefetch(allocator: std.mem.Allocator, weights: *Met
     metal.initPrefetchQueue(weights, allocator);
     if (weights.lazy_weights.count() > 0 and start_worker) try metal.startPrefetchWorker(weights);
 }
+
+/// Model-owned CUDA compute stays at one address from construction through
+/// upload, request reuse and capture retirement. Request handles only borrow it.
+pub fn createCuda(allocator: std.mem.Allocator, config: @import("../graph/kernel_jit.zig").Config, profile: if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig").CapabilityProfile else void, scope: if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig").KernelJitRouteScope else void, load_context: @import("../graph/kernel_jit.zig").LoadContext) !*if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig").CudaCompute else void {
+    if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+    const compute = try allocator.create(@import("../ops/cuda/cuda_compute.zig").CudaCompute);
+    errdefer allocator.destroy(compute);
+    try compute.initInPlaceWithKernelJitForScopeAndLoadContext(allocator, config, profile, scope, load_context);
+    return compute;
+}
+
+pub fn closeCuda(allocator: std.mem.Allocator, compute: *if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig").CudaCompute else void) void {
+    if (comptime !build_options.enable_cuda) return;
+    compute.deinit();
+    allocator.destroy(compute);
+}
+
+test "backend factory CUDA request handles borrow one stable model owner" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const compute = createCuda(a, .{}, .bert_encoder, .{}, .dynamic) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer closeCuda(a, compute);
+    const owner_address = @intFromPtr(compute);
+    var first = try acquireCuda(compute, null);
+    const input = try first.fromFloat32Shape(&.{ -1, 2, -3, 4 }, &.{ 2, 2 });
+    defer first.free(input);
+    const held = try first.add(input, input);
+    defer first.free(held);
+    first.deinit();
+    var second = try acquireCuda(compute, null);
+    defer second.deinit();
+    try std.testing.expectEqual(owner_address, @intFromPtr(second.ptr));
+    const output = try second.multiply(input, input);
+    defer second.free(output);
+    const values = try second.toFloat32(output, a);
+    defer a.free(values);
+    const retained = try second.toFloat32(held, a);
+    defer a.free(retained);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 4, 9, 16 }, values);
+    try std.testing.expectEqualSlices(f32, &.{ -2, 4, -6, 8 }, retained);
+}

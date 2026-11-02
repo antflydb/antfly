@@ -5110,6 +5110,33 @@ pub const CudaCompute = struct {
         load_context: kernel_jit.LoadContext,
         device_memory_limit: usize,
     ) !CudaCompute {
+        var result: CudaCompute = undefined;
+        try result.initInPlaceWithKernelJitProfile(allocator, jit_config, profile, scope, load_context, device_memory_limit);
+        return result;
+    }
+
+    /// Initialize at the final address before caches, captures or uploaded
+    /// resources can borrow state from this owner.
+    pub fn initInPlaceWithKernelJitForScopeAndLoadContext(
+        self: *CudaCompute,
+        allocator: std.mem.Allocator,
+        jit_config: kernel_jit.Config,
+        profile: CapabilityProfile,
+        scope: KernelJitRouteScope,
+        load_context: kernel_jit.LoadContext,
+    ) !void {
+        try self.initInPlaceWithKernelJitProfile(allocator, jit_config, profile, scope, load_context, std.math.maxInt(usize));
+    }
+
+    fn initInPlaceWithKernelJitProfile(
+        self: *CudaCompute,
+        allocator: std.mem.Allocator,
+        jit_config: kernel_jit.Config,
+        profile: ?CapabilityProfile,
+        scope: KernelJitRouteScope,
+        load_context: kernel_jit.LoadContext,
+        device_memory_limit: usize,
+    ) !void {
         try jit_config.validate();
         if (jit_config.mode.failClosed() and
             (!scope.enabled() or !scope.conformance_complete or
@@ -5230,7 +5257,7 @@ pub const CudaCompute = struct {
         };
         const lighton_device = @import("lighton_device_policy.zig").Device{ .major = ctx.info.compute_major, .minor = ctx.info.compute_minor, .driver_version = ctx.info.driver_version };
         const lighton_auto = lighton_device.automatic(profile == .lightonocr3, cublaslt != null and cudaCublasLtEnabled(), null);
-        const result: CudaCompute = .{
+        self.* = .{
             .allocator = allocator,
             .capability_profile = profile,
             .lighton_attention_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_ATTENTION", profile == .lightonocr3 and @import("paged_attention_bf16.zig").packetSupported(ctx.info.compute_major, ctx.info.driver_version)),
@@ -5297,14 +5324,17 @@ pub const CudaCompute = struct {
             .runtime_jit_shape_gating = jit_config.mode.activates(),
         };
         std.log.info("cuda_generated_q4_policy compute={d}.{d} portable_matmul_capable={} evidence_target=sm_89 mmv={} mm={} pair={}", .{ ctx.info.compute_major, ctx.info.compute_minor, quant_kernel_catalog.portableCudaDeviceSupported(ctx.info.compute_major, ctx.info.compute_minor), generated_q4_0_gates.mmv, generated_q4_0_gates.mm, generated_q4_0_gates.pair });
-        if (profile == .lightonocr3) std.log.info("lighton_cuda_policy compute={d}.{d} driver={d} automatic={} graph={s} specialized_kernels={}", .{ ctx.info.compute_major, ctx.info.compute_minor, ctx.info.driver_version, lighton_auto, @tagName(result.lightOnGraphDecision()), lighton_device.specializedKernels() });
-        return result;
+        if (profile == .lightonocr3) std.log.info("lighton_cuda_policy compute={d}.{d} driver={d} automatic={} graph={s} specialized_kernels={}", .{ ctx.info.compute_major, ctx.info.compute_minor, ctx.info.driver_version, lighton_auto, @tagName(self.lightOnGraphDecision()), lighton_device.specializedKernels() });
+    }
+
+    pub fn initInPlace(self: *CudaCompute, allocator: std.mem.Allocator) !void {
+        try self.initInPlaceWithKernelJitProfile(allocator, .{}, null, .{}, .dynamic, std.math.maxInt(usize));
     }
 
     pub fn create(allocator: std.mem.Allocator) !*CudaCompute {
         const self = try allocator.create(CudaCompute);
         errdefer allocator.destroy(self);
-        self.* = try CudaCompute.init(allocator);
+        try self.initInPlace(allocator);
         self.owned_by_backend = true;
         return self;
     }
