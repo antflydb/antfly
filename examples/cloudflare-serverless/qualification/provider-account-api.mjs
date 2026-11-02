@@ -15,7 +15,9 @@
 
 import{readCounterToken}from'./independent-counters.mjs';
 // Account authorization stays transient and local. No credential file fallback.
-export function providerAccountApi(account,{authenticate=readCounterToken,fetch:request=fetch}={}){
+// A separate token keeps observability privileges out of deployment authentication.
+const accountAuthorization=()=>process.env.ANTFLY_OBSERVABILITY_API_TOKEN??readCounterToken();
+export function providerAccountApi(account,{authenticate=accountAuthorization,fetch:request=fetch}={}){
  if(!/^[a-f0-9]{32}$/.test(account??''))throw Error('ProviderAccountInvalid');let credential;
  return async(route,method='GET',body)=>{
   if(!/^workers\/observability\/destinations(?:\/[a-zA-Z0-9_-]+)?$/.test(route)||!['GET','POST','DELETE'].includes(method))throw Error('ProviderRouteInvalid');

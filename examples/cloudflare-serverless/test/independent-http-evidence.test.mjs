@@ -41,3 +41,9 @@ test('portable evidence catalogs restore only JSON windows inside the downloaded
 test('only observability metadata is excluded from serving configuration pins',async()=>{
  const{measuredConfig}=await import('../qualification/observation-runs.mjs'),config={limits:{cpu_ms:30000},vars:{POOL:2},durable_objects:{bindings:[{name:'OWNER',class_name:'Owner'}]},observability:{enabled:false}},attached={...config,observability:{enabled:true},tail_consumers:[{service:'observer'}]};assert.deepEqual(measuredConfig(config),measuredConfig(attached));for(const change of[{limits:{cpu_ms:60000}},{vars:{POOL:3}},{durable_objects:{bindings:[]}}])assert.notDeepEqual(measuredConfig(config),measuredConfig({...attached,...change}));
 });
+
+
+test('dedicated account authorization is scoped to observability and does not replace deployment auth',async()=>{
+ const prior=process.env.ANTFLY_OBSERVABILITY_API_TOKEN,deployment=process.env.CLOUDFLARE_API_TOKEN,token='test-only-observability-account-token';process.env.ANTFLY_OBSERVABILITY_API_TOKEN=token;let requests=0;
+ try{const api=providerAccountApi('a'.repeat(32),{fetch:async(url,init)=>{requests++;assert.equal(url,'https://api.cloudflare.com/client/v4/accounts/'+'a'.repeat(32)+'/workers/observability/destinations');assert.equal(init.headers.Authorization,'Bearer '+token);return Response.json({success:true,result:[]});}});await assert.rejects(api('workers/scripts'),/RouteInvalid/);assert.equal(requests,0);await api('workers/observability/destinations');assert.equal(requests,1);assert.equal(process.env.CLOUDFLARE_API_TOKEN,deployment);}finally{if(prior===undefined)delete process.env.ANTFLY_OBSERVABILITY_API_TOKEN;else process.env.ANTFLY_OBSERVABILITY_API_TOKEN=prior;}
+});

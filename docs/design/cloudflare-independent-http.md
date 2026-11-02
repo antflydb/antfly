@@ -113,7 +113,11 @@ Run the external client manually from a clean, source-pinned checkout on a quiet
 machine separate from the Cloudflare app. No CI workflow, repository secrets or
 default-branch registration is required. Supply the newly authorized disposable
 baseline/candidate/observer tokens through the process environment, never in the
-public plan or command arguments. Do not use account credentials or a legacy token.
+public plan or command arguments. Application API tokens and account credentials
+are separate: use `ANTFLY_OBSERVABILITY_API_TOKEN` only for the scoped account
+export/delivery APIs when the deployment login lacks those permissions. It stays
+in process memory; Wrangler deployment authentication is unchanged. Never install
+the account credential as a Worker application secret or include it in reports.
 
 ```sh
 node qualification/independent-http-trial.mjs --plan=PUBLIC_PLAN --out=FRESH_RESULT_DIRECTORY --claims=PERSISTENT_CLAIM_DIRECTORY --dedicated-client
