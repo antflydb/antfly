@@ -18,6 +18,8 @@
 // Given a model directory path, loads the manifest, creates a tokenizer
 // and backend session, and returns a pipeline ready for inference.
 
+const session_loader = @import("../models/session_loader.zig");
+const load_plan = @import("../models/load_plan.zig");
 const std = @import("std");
 const lightonocr3_reader = @import("../readers/lightonocr3.zig");
 const execution_control_mod = @import("../execution_control.zig");
@@ -4098,79 +4100,11 @@ const CompositeLoadTask = struct {
     }
 };
 
-fn admissionBackendClassForRuntime(
-    backend_runtime: backends.BackendRuntime,
-) runtime.tier.memory.BackendClass {
-    return if (backend_runtime.usesGpuHostedSession()) .gpu else .cpu;
-}
+const admissionBackendClassForRuntime = load_plan.admissionBackendClassForRuntime;
 
-fn qwenEmbeddingAdmissionConfig(
-    backend: backends.BackendType,
-    man: ?*const manifest_mod.ModelManifest,
-    config: ?@import("../architectures/gpt.zig").Config,
-) ?@import("../architectures/gpt.zig").Config {
-    if (backend != .metal) return null;
-    const manifest = man orelse return null;
-    if (manifest.model_type != .embedder or !manifest.isLastTokenDecoderEmbedder()) return null;
-    const cfg = config orelse return null;
-    if (!@import("../architectures/gpt.zig").denseQwen3PrefillEligible(cfg)) return null;
-    return cfg;
-}
+const attachSessionRunAdmission = load_plan.attachSessionRunAdmission;
 
-fn attachSessionRunAdmission(
-    allocator: std.mem.Allocator,
-    session: *backends.Session,
-    controller: *runtime.tier.memory.AdmissionController,
-    backend_runtime: backends.BackendRuntime,
-    limits: runtime.tier.memory.Limits,
-    resident: runtime.tier.memory.AdmissionAmounts,
-    man: ?*const manifest_mod.ModelManifest,
-) !void {
-    const backend_class = admissionBackendClassForRuntime(backend_runtime);
-    try session_factory.configureSharedCacheAdmissionForSession(
-        session.*,
-        allocator,
-        controller,
-        backend_class,
-        limits,
-        resident,
-    );
-    const weight_bytes = std.math.add(
-        usize,
-        resident.host_weight_bytes,
-        resident.backend_weight_bytes,
-    ) catch std.math.maxInt(usize);
-    const qwen_cfg = if (backend_runtime.backend == .metal and
-        metal_runtime.appleSimdgroupFeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
-        session_factory.getGptConfig(session.*)
-    else
-        null;
-    session.run_admission = .{
-        .controller = controller,
-        .backend_class = backend_class,
-        .limits = limits,
-        .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
-        .model_profile = sessionRunAdmissionModelProfile(backend_runtime, man, qwen_cfg),
-    };
-}
-
-fn sessionRunAdmissionModelProfile(
-    backend_runtime: backends.BackendRuntime,
-    man: ?*const manifest_mod.ModelManifest,
-    config: ?@import("../architectures/gpt.zig").Config,
-) @import("../backends/session.zig").RunAdmission.ModelProfile {
-    const manifest = man orelse return .{};
-    const qwen_cfg = qwenEmbeddingAdmissionConfig(backend_runtime.backend, man, config);
-    return .{
-        .hidden_size = manifest.hidden_size,
-        .intermediate_size = manifest.intermediate_size,
-        .attention_heads = manifest.num_attention_heads,
-        .embedding_gemma2_cuda = manifest.embedding_style == .embedding_gemma2 and backend_runtime.backend == .cuda,
-        .qwen_dense_workspace = qwen_cfg != null,
-        .query_width = if (qwen_cfg) |cfg| @as(usize, cfg.num_attention_heads) * cfg.headDim() else 0,
-        .kv_width = if (qwen_cfg) |cfg| @as(usize, cfg.effectiveKVHeads()) * cfg.headDim() else 0,
-    };
-}
+const sessionRunAdmissionModelProfile = load_plan.sessionRunAdmissionModelProfile;
 
 test "Qwen embedding admission preserves reranker capacity and gates dense workspace" {
     const Session = @import("../backends/session.zig").Session;
@@ -6527,129 +6461,7 @@ pub const ModelManager = struct {
         source_session_manager: *const backends.SessionManager,
         control: ?InferenceExecutionControl,
     ) !ManagedSession {
-        if (control) |active| try active.update(.loading_model, 0, 1);
-        var required_backend_scratch: [1]backends.BackendType = undefined;
-        const effective_backends = try source_session_manager.requiredBackendCandidates(
-            preferred_backends,
-            &required_backend_scratch,
-        );
-        var first_err: ?anyerror = null;
-        var artifact_estimate = if (self.admission_enabled)
-            try ComponentArtifactEstimate.init(self.allocator, model_path)
-        else
-            ComponentArtifactEstimate.disabled;
-        defer artifact_estimate.deinit();
-
-        for (effective_backends) |backend| {
-            if (control) |active| try active.check();
-            if (!backend.supportsDirectSessionLoad()) continue;
-            if (shared_backend_ctx) |shared| {
-                if (shared.backendType() != backend) continue;
-            }
-
-            var single_backend = [_]backends.BackendType{backend};
-            var session_manager = sessionManagerForPreferredBackends(
-                self.allocator,
-                single_backend[0..],
-                source_session_manager,
-            );
-            const backend_runtime = session_manager.resolveBackendRuntime(backend) catch |err| {
-                rememberPreferredLoadError(&first_err, err);
-                continue;
-            };
-
-            var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
-            defer if (resource_lease) |*lease| lease.release();
-            var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
-            var admission_limits = runtime.tier.memory.Limits{};
-            if (self.admission_enabled) {
-                const artifact_bytes = artifact_estimate.encodedBytes() catch |err| {
-                    rememberPreferredLoadError(&first_err, err);
-                    continue;
-                };
-                const plan = if (artifact_estimate == .onnx)
-                    onnxModelLoadAdmission(artifact_bytes, backend_runtime)
-                else
-                    nativeModelLoadAdmission(
-                        artifact_bytes,
-                        backend_runtime.backend,
-                        artifact_estimate.extraBackendResidentAmounts(backend_runtime.backend),
-                    );
-                const admission_plan = plan catch |err| {
-                    rememberPreferredLoadError(&first_err, err);
-                    continue;
-                };
-                resident_amounts = admission_plan.resident;
-                admission_limits = self.admissionLimitsForModelPath(
-                    model_path,
-                    backend_runtime,
-                    admission_plan.limit_floor,
-                ) catch |err| {
-                    rememberPreferredLoadError(&first_err, err);
-                    continue;
-                };
-                resource_lease = self.acquireAmountsWithEviction(
-                    admissionBackendClassForRuntime(backend_runtime),
-                    admission_limits,
-                    admission_plan.peak,
-                ) catch |err| {
-                    rememberPreferredLoadError(&first_err, err);
-                    continue;
-                };
-            }
-
-            var construction = enterSessionConstruction(control, backend_runtime) catch |err| {
-                if (err == error.ProcessIsolationRequired) {
-                    // An in-process caller can still use a later cooperative
-                    // backend. A required backend has a single candidate and
-                    // therefore remains fail-closed.
-                    rememberPreferredLoadError(&first_err, err);
-                    continue;
-                }
-                return err;
-            };
-            defer construction.deinit();
-            var close_protection = self.prepareSessionClose(backend_runtime) catch |err| {
-                if (err == error.ProcessIsolationRequired) {
-                    rememberPreferredLoadError(&first_err, err);
-                    continue;
-                }
-                return err;
-            };
-            defer if (close_protection) |protection| protection.release();
-            if (session_manager.loadModelWithImportedOnnxContext(
-                model_path,
-                shared_backend_ctx,
-            )) |loaded_session| {
-                var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
-                std.debug.assert(loaded.session.close_protection == null);
-                loaded.session.close_protection = close_protection;
-                close_protection = null;
-                resource_lease = null;
-                defer loaded.deinit();
-                if (control) |active| try active.check();
-                if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
-                if (self.admission_enabled) {
-                    const session_admission_limits = self.admissionLimitsForSession(
-                        backend_runtime,
-                        loaded.session,
-                    );
-                    try attachSessionRunAdmission(
-                        self.allocator,
-                        &loaded.session,
-                        self.admissionController(),
-                        backend_runtime,
-                        session_admission_limits,
-                        resident_amounts,
-                        null,
-                    );
-                }
-                return loaded.take();
-            } else |err| {
-                rememberPreferredLoadError(&first_err, err);
-            }
-        }
-        return first_err orelse error.NoBackendAvailable;
+        return session_loader.loadComponent(self.allocator, SessionLoadHost.services(self), model_path, preferred_backends, shared_backend_ctx, source_session_manager, control);
     }
 
     fn loadManagedHfTokenizerFile(
@@ -9972,40 +9784,14 @@ test "model cache idle expiration can be disabled" {
     allocator.free(expired.?.key);
 }
 
-fn preferredModelPathForBackend(
-    model_dir: []const u8,
-    man: manifest_mod.ModelManifest,
-    backend: backends.BackendType,
-) ?[]const u8 {
-    return switch (backend) {
-        .native, .metal, .cuda, .wasm => if (!manifestHasNativeAssets(man) and man.onnx_path != null)
-            man.onnx_path.?
-        else
-            model_dir,
-        .pjrt => null,
-    };
-}
+const preferredModelPathForBackend = session_loader.preferredModelPathForBackend;
 
 fn sessionManagerForPreferredBackends(
     allocator: std.mem.Allocator,
     preferred_backends: []const backends.BackendType,
     source: *const backends.SessionManager,
 ) backends.SessionManager {
-    return .{
-        .allocator = allocator,
-        .preferred_backends = preferred_backends,
-        .required_backend = source.required_backend,
-        .required_backend_invalid = source.required_backend_invalid,
-        .graph_runtime_strategy = source.graph_runtime_strategy,
-        .kernel_jit = source.kernel_jit,
-        .kernel_jit_load_context = source.kernel_jit_load_context,
-        .a4b_inference_request = source.a4b_inference_request,
-        .gliner_cuda_precision = source.gliner_cuda_precision,
-        .test_allow_unqualified_gliner_cuda_precision = source.test_allow_unqualified_gliner_cuda_precision,
-        .io = source.io,
-        .process_termination_available = source.process_termination_available,
-        .native_call_policy = source.native_call_policy,
-    };
+    return source.withPreferredBackends(allocator, preferred_backends);
 }
 
 test "session manager load clones preserve process isolation policy" {
@@ -10033,34 +9819,7 @@ test "GLiNER CUDA load clones retain per-manager qualification policy" {
     try std.testing.expect(!ordinary.test_allow_unqualified_gliner_cuda_precision);
 }
 
-pub const ManagedSession = struct {
-    session: backends.Session,
-    resource_lease: ?runtime.tier.memory.AdmissionLease = null,
-    owns_session: bool = true,
-
-    pub fn deinit(self: *ManagedSession) void {
-        if (self.owns_session) self.session.close();
-        if (self.resource_lease) |*lease| lease.release();
-        self.resource_lease = null;
-        self.owns_session = false;
-    }
-
-    /// Move the session and its admission together. A deferred deinit remains
-    /// safe on the emptied source, including across fallible publication work.
-    pub fn take(self: *ManagedSession) ManagedSession {
-        const owned = self.*;
-        self.resource_lease = null;
-        self.owns_session = false;
-        return owned;
-    }
-
-    /// Transfer session ownership while leaving admission accounting with the
-    /// caller. Useful for pipelines that already own and close their sessions.
-    pub fn disownSession(self: *ManagedSession) backends.Session {
-        self.owns_session = false;
-        return self.session;
-    }
-};
+pub const ManagedSession = session_loader.ManagedSession;
 
 pub const ManagedHfTokenizer = struct {
     tokenizer: *hf_tokenizer.HfTokenizer,
@@ -10112,207 +9871,21 @@ pub const GenerationAdmissionLease = struct {
     }
 };
 
-const ModelLoadAdmissionPlan = struct {
-    /// Maximum simultaneous bytes while parsing/importing/repacking.
-    peak: runtime.tier.memory.AdmissionAmounts,
-    /// Bytes retained by the completed backend session.
-    resident: runtime.tier.memory.AdmissionAmounts,
-    /// Minimum serving envelope justified by the same resolved load plan.
-    /// Operator overrides are applied after this floor.
-    limit_floor: runtime.tier.memory.Limits = .{},
-    /// CUDA A4B serving excludes temporary GGUF staging and reuses the
-    /// resident KV/scratch reservation through a bounded session sub-ledger.
-    serving_floor: ?runtime.tier.memory.Limits = null,
-};
+const ModelLoadAdmissionPlan = load_plan.ModelLoadAdmissionPlan;
 
-fn modelRunWorkspaceAllowance(weight_bytes: usize) usize {
-    const min_workspace = 16 * 1024 * 1024;
-    const max_workspace = 1024 * 1024 * 1024;
-    return std.math.clamp(weight_bytes / 8, min_workspace, max_workspace);
-}
-
-const TokenizerArtifactKind = enum {
-    huggingface,
-    sentencepiece,
-    wordpiece,
-};
-
-const tokenizer_fixed_resident_bytes = 16 * 1024 * 1024;
-const tokenizer_fixed_peak_bytes = 24 * 1024 * 1024;
-
-fn checkedScaledBytes(base: usize, multiplier: usize, fixed: usize) !usize {
-    return std.math.add(
-        usize,
-        std.math.mul(usize, base, multiplier) catch
-            return error.ResourceLimitExceeded,
-        fixed,
-    ) catch return error.ResourceLimitExceeded;
-}
+const tokenizer_fixed_resident_bytes = load_plan.tokenizer_fixed_resident_bytes;
+const tokenizer_fixed_peak_bytes = load_plan.tokenizer_fixed_peak_bytes;
 
 /// Tokenizer parsers expand compact JSON/protobuf vocabularies into multiple
 /// owned hash maps and tries. Reserve a deliberately conservative construction
 /// peak before reading the artifact, then retain the estimated live structures.
-fn tokenizerAdmissionPlan(encoded_bytes: usize, kind: TokenizerArtifactKind) !ModelLoadAdmissionPlan {
-    const factors: struct { resident: usize, peak: usize } = switch (kind) {
-        .huggingface => .{ .resident = 10, .peak = 13 },
-        .wordpiece => .{ .resident = 7, .peak = 9 },
-        .sentencepiece => .{ .resident = 5, .peak = 7 },
-    };
-    return .{
-        .peak = .{
-            .host_weight_bytes = try checkedScaledBytes(
-                encoded_bytes,
-                factors.peak,
-                tokenizer_fixed_peak_bytes,
-            ),
-        },
-        .resident = .{
-            .host_weight_bytes = try checkedScaledBytes(
-                encoded_bytes,
-                factors.resident,
-                tokenizer_fixed_resident_bytes,
-            ),
-        },
-    };
-}
+const tokenizerAdmissionPlan = load_plan.tokenizerAdmissionPlan;
 
-fn tokenizerFileAdmissionPlan(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    kind: TokenizerArtifactKind,
-) !ModelLoadAdmissionPlan {
-    const encoded_u64 = try c_file.fileSize(allocator, path);
-    const encoded = std.math.cast(usize, encoded_u64) orelse
-        return error.ResourceLimitExceeded;
-    return tokenizerAdmissionPlan(encoded, kind);
-}
+const tokenizerFileAdmissionPlan = load_plan.tokenizerFileAdmissionPlan;
 
-fn tokenizerLoadAdmissionPlan(
-    allocator: std.mem.Allocator,
-    model_dir: []const u8,
-    man: *const manifest_mod.ModelManifest,
-    tokenizer_type: manifest_mod.TokenizerType,
-) !ModelLoadAdmissionPlan {
-    // Admission and loading must inspect the same catalog-selected artifacts,
-    // including export-local vocabularies and root metadata fallbacks.
-    if (tokenizer_type == .huggingface) {
-        if (man.tokenizer_json_path) |path| return tokenizerFileAdmissionPlan(allocator, path, .huggingface);
-        if (man.vocab_txt_path) |path| {
-            var encoded: usize = 0;
-            for ([_]?[]const u8{ path, man.tokenizer_config_path, man.special_tokens_map_path }) |candidate| {
-                if (candidate) |selected| {
-                    const size = std.math.cast(usize, try c_file.fileSize(allocator, selected)) orelse return error.ResourceLimitExceeded;
-                    encoded = std.math.add(usize, encoded, size) catch return error.ResourceLimitExceeded;
-                }
-            }
-            return tokenizerAdmissionPlan(encoded, .wordpiece);
-        }
-    } else {
-        var encoded: usize = 0;
-        var found_sentencepiece = false;
-        const sidecars = [_][]const u8{
-            "tokenizer.model",
-            "tokenizer.json",
-            "added_tokens.json",
-        };
-        for (sidecars) |name| {
-            const path = try std.fs.path.join(allocator, &.{ model_dir, name });
-            defer allocator.free(path);
-            if (!c_file.fileExists(allocator, path)) continue;
-            const size = std.math.cast(
-                usize,
-                try c_file.fileSize(allocator, path),
-            ) orelse return error.ResourceLimitExceeded;
-            encoded = std.math.add(usize, encoded, size) catch
-                return error.ResourceLimitExceeded;
-            if (std.mem.eql(u8, name, "tokenizer.model")) {
-                found_sentencepiece = true;
-            }
-        }
-        if (found_sentencepiece) {
-            return tokenizerAdmissionPlan(encoded, .sentencepiece);
-        }
-    }
-    if (man.gguf_path) |path| {
-        var region = try c_file.MmapRegion.init(allocator, path);
-        defer region.deinit();
-        const encoded = try gguf_format.encodedMetadataBytesWithPrefix(
-            region.data,
-            "tokenizer.",
-        );
-        if (encoded == 0) return error.NoTokenizerFound;
-        var plan = try tokenizerAdmissionPlan(
-            encoded,
-            if (tokenizer_type == .huggingface)
-                .huggingface
-            else
-                .sentencepiece,
-        );
-        // The tokenizer loader currently parses the complete GGUF metadata and
-        // tensor-info header before extracting tokenizer arrays. Account for
-        // those temporary copied keys/names/dimensions in the construction peak.
-        const header_bytes = try gguf_format.encodedHeaderBytes(region.data);
-        if (header_bytes < encoded) return error.InvalidTokenizerMetadata;
-        const non_tokenizer_header = header_bytes - encoded;
-        plan.peak.host_weight_bytes = std.math.add(
-            usize,
-            plan.peak.host_weight_bytes,
-            std.math.mul(usize, non_tokenizer_header, 3) catch
-                return error.ResourceLimitExceeded,
-        ) catch return error.ResourceLimitExceeded;
-        return plan;
-    }
-    return error.NoTokenizerFound;
-}
+const tokenizerLoadAdmissionPlan = load_plan.tokenizerLoadAdmissionPlan;
 
-const ComponentArtifactEstimate = union(enum) {
-    disabled,
-    onnx: usize,
-    native: manifest_mod.ModelManifest,
-
-    fn init(allocator: std.mem.Allocator, model_path: []const u8) !ComponentArtifactEstimate {
-        if (std.mem.endsWith(u8, model_path, ".onnx")) {
-            var artifacts = try backends.imported_onnx_session.inspectArtifactSet(
-                allocator,
-                model_path,
-            );
-            defer artifacts.deinit();
-            return .{ .onnx = artifacts.encoded_bytes };
-        }
-
-        // Native sessions accept directories as well as direct GGUF paths.
-        // Loading the manifest is essential here: a directory's stat size only
-        // describes its entries and bears no relation to resident model bytes.
-        return .{ .native = try manifest_mod.loadFromDir(allocator, model_path) };
-    }
-
-    pub fn deinit(self: *ComponentArtifactEstimate) void {
-        switch (self.*) {
-            .native => |*man| man.deinit(),
-            .disabled, .onnx => {},
-        }
-        self.* = .disabled;
-    }
-
-    fn encodedBytes(self: *const ComponentArtifactEstimate) !usize {
-        return switch (self.*) {
-            .disabled => 0,
-            .onnx => |bytes| bytes,
-            .native => |man| estimateModelArtifactBytes(man),
-        };
-    }
-
-    fn extraBackendResidentAmounts(
-        self: *const ComponentArtifactEstimate,
-        backend: backends.BackendType,
-    ) runtime.tier.memory.AdmissionAmounts {
-        if (backend != .metal) return .{};
-        return switch (self.*) {
-            .native => |man| session_factory.metalDebertaFastPathAdmissionAmounts(man),
-            .disabled, .onnx => .{},
-        };
-    }
-};
+const ComponentArtifactEstimate = load_plan.ComponentArtifactEstimate;
 
 test "tokenizer admission reserves parse peak and retains live structures" {
     const encoded: usize = 2 * 1024 * 1024;
@@ -10360,34 +9933,7 @@ test "admission eviction only selects leases that relieve the rejected constrain
     ));
 }
 
-fn addArtifactBytes(total: *usize, allocator: std.mem.Allocator, maybe_path: ?[]const u8) !void {
-    const path = maybe_path orelse return;
-    const size = if (std.mem.endsWith(u8, path, ".onnx")) blk: {
-        var artifacts = try backends.imported_onnx_session.inspectArtifactSet(allocator, path);
-        defer artifacts.deinit();
-        break :blk artifacts.encoded_bytes;
-    } else std.math.cast(usize, try c_file.fileSize(allocator, path)) orelse
-        return error.ResourceLimitExceeded;
-    total.* = std.math.add(usize, total.*, size) catch return error.ResourceLimitExceeded;
-}
-
-fn estimateModelArtifactBytes(man: manifest_mod.ModelManifest) !usize {
-    var total: usize = 0;
-    const uses_native_weights = manifestHasNativeAssets(man);
-    if (uses_native_weights) {
-        const native_weight_bytes = std.math.cast(
-            usize,
-            try session_factory.estimateNativeWeightBytes(man.allocator, man),
-        ) orelse return error.ResourceLimitExceeded;
-        total = std.math.add(usize, total, native_weight_bytes) catch
-            return error.ResourceLimitExceeded;
-    } else {
-        try addArtifactBytes(&total, man.allocator, man.onnx_path);
-    }
-
-    if (total == 0) return error.NoModelFileFound;
-    return total;
-}
+const estimateModelArtifactBytes = load_plan.estimateModelArtifactBytes;
 
 /// A multimodal projector is opened, mapped, and consumed by an individual
 /// generation request; it is not part of the decoder session's retained
@@ -10423,89 +9969,7 @@ pub fn projectorRunAdmissionAmounts(
     };
 }
 
-fn estimateModelLoadAdmission(
-    model_path: []const u8,
-    man: manifest_mod.ModelManifest,
-    backend_runtime: backends.BackendRuntime,
-    a4b_request: ?backend_contracts.A4bInferenceRequest,
-    laya_packed: bool,
-) !ModelLoadAdmissionPlan {
-    const weights = try estimateModelArtifactBytes(man);
-    if (!manifestHasNativeAssets(man)) return onnxModelLoadAdmission(weights, backend_runtime);
-    if (backend_runtime.backend == .metal) {
-        if (!laya_packed) {
-            if (try session_factory.layaResidentLoadAmounts(man, weights)) |resident| {
-                return .{ .peak = resident.peak, .resident = resident.resident };
-            }
-        }
-        if (try session_factory.glinerBoundaryResidentLoadAmounts(man, weights)) |resident| {
-            return .{ .peak = resident.peak, .resident = resident.resident };
-        }
-    }
-    if (backend_runtime.backend == .metal or backend_runtime.backend == .cuda) {
-        const config = if (backend_runtime.backend == .cuda)
-            try session_factory.resolveCudaA4bInferenceConfigForModelListing(
-                man.allocator,
-                model_path,
-                man,
-                a4b_request,
-            )
-        else
-            try session_factory.resolveA4bInferenceConfigForModelListing(
-                man.allocator,
-                model_path,
-                man,
-                a4b_request,
-            );
-        if (config) |resolved| {
-            return a4bGpuModelLoadAdmission(resolved, weights, backend_runtime.backend);
-        }
-    }
-    const extra_backend_resident = if (backend_runtime.backend == .metal)
-        session_factory.metalDebertaFastPathAdmissionAmounts(man)
-    else
-        runtime.tier.memory.AdmissionAmounts{};
-    return nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
-}
-
-fn a4bGpuModelLoadAdmission(
-    config: backend_contracts.A4bInferenceConfig,
-    encoded_artifact_bytes: usize,
-    backend: backends.BackendType,
-) ModelLoadAdmissionPlan {
-    const budget: usize = @intCast(config.memory_budget_bytes);
-    const kv: usize = @intCast(config.kv_budget_bytes);
-    const scratch: usize = @intCast(config.safety_reserve_bytes);
-    const weights = budget -| kv -| scratch;
-    const resident = runtime.tier.memory.AdmissionAmounts{
-        .backend_weight_bytes = weights,
-        .backend_kv_bytes = kv,
-        .backend_scratch_bytes = scratch,
-    };
-    var peak = resident;
-    // CUDA constructs a temporary native GGUF session while uploading its
-    // resident representation. Metal maps the encoded artifact directly and
-    // does not retain a second host copy.
-    if (backend == .cuda) peak.host_weight_bytes = encoded_artifact_bytes;
-    const host_staging = if (backend == .cuda) encoded_artifact_bytes else 0;
-    return .{
-        .peak = peak,
-        .resident = resident,
-        .limit_floor = .{
-            .host_limit_bytes = host_staging,
-            .backend_limit_bytes = budget,
-            .combined_limit_bytes = budget +| host_staging,
-            .kv_limit_bytes = kv,
-            .scratch_limit_bytes = scratch,
-        },
-        .serving_floor = if (backend == .cuda) .{
-            .backend_limit_bytes = budget,
-            .combined_limit_bytes = budget,
-            .kv_limit_bytes = kv,
-            .scratch_limit_bytes = scratch,
-        } else null,
-    };
-}
+const a4bGpuModelLoadAdmission = load_plan.a4bGpuModelLoadAdmission;
 
 test "A4B GPU admission lease equals the configured memory envelope" {
     const config = try backend_contracts.buildCudaA4bInferenceConfig(
@@ -10674,90 +10138,57 @@ test "CUDA A4B operator cap remains authoritative over load-plan floor" {
     );
 }
 
-fn onnxModelLoadAdmission(
-    weights: usize,
-    backend_runtime: backends.BackendRuntime,
-) !ModelLoadAdmissionPlan {
-    return switch (backend_runtime.backend) {
-        .metal, .cuda => .{
-            .peak = .{
-                // The importer retains encoded host bytes while constructing device
-                // parameters and graph metadata.
-                .backend_weight_bytes = weights,
-                .host_weight_bytes = weights,
-            },
-            .resident = .{ .backend_weight_bytes = weights },
-        },
-        .native, .wasm => .{
-            .peak = .{
-                // The current ONNX path reads the encoded protobuf and then owns the
-                // converted parameter storage, so reserve both copies.
-                .host_weight_bytes = std.math.mul(usize, weights, 2) catch
-                    return error.ResourceLimitExceeded,
-            },
-            .resident = .{ .host_weight_bytes = weights },
-        },
-        .pjrt => return error.UnsupportedBackend,
-    };
-}
+const onnxModelLoadAdmission = load_plan.onnxModelLoadAdmission;
 
-fn nativeModelLoadAdmission(
-    weights: usize,
-    backend: backends.BackendType,
-    extra_backend_resident: runtime.tier.memory.AdmissionAmounts,
-) !ModelLoadAdmissionPlan {
-    return switch (backend) {
-        .metal => blk: {
-            const encoded_resident = try session_factory.estimateBackendWeightResidencyBytes(.metal, weights);
-            var resident = extra_backend_resident;
-            resident.backend_weight_bytes = std.math.add(
-                usize,
-                encoded_resident,
-                resident.backend_weight_bytes,
-            ) catch return error.ResourceLimitExceeded;
-            var peak = resident;
-            peak.host_weight_bytes = weights / 4;
-            break :blk .{
-                // Device weights plus persistent architecture caches, bounded
-                // graph-plan scratch, and conservative host import staging.
-                .peak = peak,
-                .resident = resident,
-            };
-        },
-        .cuda => .{
-            .peak = .{
-                // CUDA construction currently builds a complete native session first,
-                // then uploads every resident weight before releasing the native copy.
-                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
-                .host_weight_bytes = weights,
-            },
-            .resident = .{
-                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
-            },
-        },
-        .native, .wasm => .{
-            .peak = .{
-                // Native import may retain a source mapping while materializing or
-                // repacking resident weights.
-                .host_weight_bytes = std.math.add(usize, weights, weights / 4) catch
-                    return error.ResourceLimitExceeded,
-            },
-            .resident = .{ .host_weight_bytes = weights },
-        },
-        .pjrt => return error.UnsupportedBackend,
-    };
-}
+const nativeModelLoadAdmission = load_plan.nativeModelLoadAdmission;
 
-/// All managed constructors share this boundary. Keep the returned guard in
-/// the attempt's scope until post-construction checks and rollback finish.
-fn enterSessionConstruction(
-    control: ?InferenceExecutionControl,
-    backend_runtime: backends.BackendRuntime,
-) !execution_control_mod.UninterruptibleGuard {
-    const active = control orelse return .{};
-    try active.check();
-    return active.enterUninterruptible(backend_runtime.loadInterruption());
-}
+/// Serving services borrowed by the independent loader during construction.
+const SessionLoadHost = struct {
+    fn services(manager: *ModelManager) session_loader.Host {
+        return .{
+            .context = manager,
+            .admission_enabled = manager.admission_enabled,
+            .unhealthy_fn = unhealthy,
+            .limits_fn = limitsForPath,
+            .reserve_fn = reserve,
+            .protect_close_fn = protectClose,
+            .attach_admission_fn = attachAdmission,
+        };
+    }
+
+    fn unhealthy(context: *anyopaque, model_dir: []const u8, backend: backends.BackendType) bool {
+        const manager: *ModelManager = @ptrCast(@alignCast(context));
+        return modelBackendIsUnhealthy(manager, model_dir, backend);
+    }
+
+    fn limitsForPath(context: *anyopaque, model_dir: []const u8, backend_runtime: backends.BackendRuntime, floor: runtime.tier.memory.Limits) !runtime.tier.memory.Limits {
+        const manager: *ModelManager = @ptrCast(@alignCast(context));
+        return manager.admissionLimitsForModelPath(model_dir, backend_runtime, floor);
+    }
+
+    fn reserve(context: *anyopaque, model_dir: []const u8, backend_runtime: backends.BackendRuntime, limits: runtime.tier.memory.Limits, plan: load_plan.ModelLoadAdmissionPlan) !session_loader.Reservation {
+        const manager: *ModelManager = @ptrCast(@alignCast(context));
+        // No construction or driver call begins before the full peak is leased.
+        const lease = manager.acquireAmountsWithEviction(admissionBackendClassForRuntime(backend_runtime), limits, plan.peak) catch |err| {
+            std.log.warn(
+                "loadModel({s}) backend {s} admission failed: {s}; peak_host={d} peak_backend={d} host_limit={d} backend_limit={d} combined_limit={d}",
+                .{ model_dir, @tagName(backend_runtime.backend), @errorName(err), plan.peak.host_weight_bytes +| plan.peak.host_kv_bytes +| plan.peak.host_scratch_bytes, plan.peak.backend_weight_bytes +| plan.peak.backend_kv_bytes +| plan.peak.backend_scratch_bytes, limits.host_limit_bytes, limits.backend_limit_bytes, limits.combined_limit_bytes },
+            );
+            return err;
+        };
+        return .{ .lease = lease, .resident = plan.resident, .serving_floor = plan.serving_floor };
+    }
+
+    fn protectClose(context: *anyopaque, backend_runtime: backends.BackendRuntime) !?backends.Session.CloseProtection {
+        const manager: *ModelManager = @ptrCast(@alignCast(context));
+        return manager.prepareSessionClose(backend_runtime);
+    }
+
+    fn attachAdmission(context: *anyopaque, session: *backends.Session, backend_runtime: backends.BackendRuntime, resident: runtime.tier.memory.AdmissionAmounts, man: ?*const manifest_mod.ModelManifest) !void {
+        const manager: *ModelManager = @ptrCast(@alignCast(context));
+        try attachSessionRunAdmission(manager.allocator, session, manager.admissionController(), backend_runtime, manager.admissionLimitsForSession(backend_runtime, session.*), resident, man);
+    }
+};
 
 fn loadSessionForPreferredBackends(
     manager: *ModelManager,
@@ -10767,194 +10198,7 @@ fn loadSessionForPreferredBackends(
     source_session_manager: *const backends.SessionManager,
     control: ?InferenceExecutionControl,
 ) !LoadedSessionPlan {
-    if (control) |active| try active.check();
-    var required_backend_scratch: [1]backends.BackendType = undefined;
-    const policy_backends = try source_session_manager.requiredBackendCandidates(
-        preferred_backends,
-        &required_backend_scratch,
-    );
-    const effective_backends = policy_backends;
-    const fail_closed_cuda_a4b = source_session_manager.a4b_inference_request == null and
-        backends.backendOrderSelectsCudaBeforeCpu(effective_backends) and
-        (try session_factory.resolveCudaA4bInferenceConfigForModelListing(
-            manager.allocator,
-            model_dir,
-            man,
-            null,
-        )) != null;
-    // Keep the first real failure. Reporting a blanket NoModelFileFound hides the
-    // actionable cause: a GGUF whose tensors could not be resolved fails with
-    // MissingRequiredWeights, and callers were being told the file did not exist.
-    var first_err: ?anyerror = null;
-    var laya_resident_attempted = false;
-    const laya_packed = man.hasCapability("typed_decisions") and session_factory.isPackedLayaModel(manager.allocator, model_dir);
-    for (effective_backends) |backend| {
-        if (source_session_manager.gliner_cuda_precision != null and backend != .cuda) continue;
-        // Once opted-in Metal residency is attempted, preserve its actionable
-        // admission/load error rather than silently publishing a CPU session.
-        if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
-        if (backend == .metal and man.hasCapability("typed_decisions") and !laya_packed and @import("../ops/laya_metal.zig").enabled()) laya_resident_attempted = true;
-        if (control) |active| try active.check();
-        if (modelBackendIsUnhealthy(manager, model_dir, backend)) {
-            rememberPreferredLoadError(&first_err, error.ModelBackendUnhealthy);
-            continue;
-        }
-        if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) {
-            std.log.err(
-                "loadModel({s}) qualified CUDA A4B artifact rejected CPU fallback after GPU admission failure",
-                .{model_dir},
-            );
-            return first_err orelse error.A4bCudaAutoFallbackForbidden;
-        }
-        if (!backend.supportsDirectSessionLoad()) continue;
-        if (source_session_manager.a4b_inference_request != null and
-            backend != .metal and backend != .cuda)
-        {
-            rememberPreferredLoadError(&first_err, error.A4bRequiresGpu);
-            continue;
-        }
-        if (source_session_manager.kernel_jit.mode.failClosed() and
-            !backend.supportsKernelJitSession()) continue;
-        const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
-        if (control) |active| try active.updateDetail(
-            .preparing_weights,
-            0,
-            1,
-            model_dir,
-            @tagName(backend),
-        );
-        if (source_session_manager.kernel_jit.mode.failClosed() and
-            std.mem.endsWith(u8, candidate_path, ".onnx")) continue;
-        var single_backend = [_]backends.BackendType{backend};
-        var backend_session_manager = sessionManagerForPreferredBackends(manager.allocator, single_backend[0..], source_session_manager);
-        const backend_runtime = backend_session_manager.resolveBackendRuntime(backend) catch |err| {
-            rememberPreferredLoadError(&first_err, err);
-            continue;
-        };
-        var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
-            if (err == error.ProcessIsolationRequired) {
-                rememberPreferredLoadError(&first_err, err);
-                continue;
-            }
-            return err;
-        };
-        defer hard_cancellation.deinit();
-        var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
-        // This attempt owns admission until the successful result explicitly
-        // takes it. Includes cancellation, guard-arm failure, and fallback.
-        defer if (resource_lease) |*lease| lease.release();
-        var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
-        var admission_limits = runtime.tier.memory.Limits{};
-        var serving_floor: ?runtime.tier.memory.Limits = null;
-        if (manager.admission_enabled) {
-            const admission_plan = estimateModelLoadAdmission(
-                model_dir,
-                man,
-                backend_runtime,
-                source_session_manager.a4b_inference_request,
-                laya_packed,
-            ) catch |err| {
-                rememberPreferredLoadError(&first_err, err);
-                continue;
-            };
-            resident_amounts = admission_plan.resident;
-            serving_floor = admission_plan.serving_floor;
-            admission_limits = manager.admissionLimitsForModelPath(
-                model_dir,
-                backend_runtime,
-                admission_plan.limit_floor,
-            ) catch |err| {
-                rememberPreferredLoadError(&first_err, err);
-                continue;
-            };
-            if (control) |active| try active.check();
-            resource_lease = manager.acquireAmountsWithEviction(
-                admissionBackendClassForRuntime(backend_runtime),
-                admission_limits,
-                admission_plan.peak,
-            ) catch |err| {
-                std.log.warn(
-                    "loadModel({s}) backend {s} admission failed: {s}; peak_host={d} peak_backend={d} host_limit={d} backend_limit={d} combined_limit={d}",
-                    .{
-                        model_dir,
-                        @tagName(backend),
-                        @errorName(err),
-                        admission_plan.peak.host_weight_bytes +| admission_plan.peak.host_kv_bytes +| admission_plan.peak.host_scratch_bytes,
-                        admission_plan.peak.backend_weight_bytes +| admission_plan.peak.backend_kv_bytes +| admission_plan.peak.backend_scratch_bytes,
-                        admission_limits.host_limit_bytes,
-                        admission_limits.backend_limit_bytes,
-                        admission_limits.combined_limit_bytes,
-                    },
-                );
-                rememberPreferredLoadError(&first_err, err);
-                continue;
-            };
-        }
-        var close_protection = manager.prepareSessionClose(backend_runtime) catch |err| {
-            if (err == error.ProcessIsolationRequired) {
-                rememberPreferredLoadError(&first_err, err);
-                continue;
-            }
-            return err;
-        };
-        defer if (close_protection) |protection| protection.release();
-        if (backend_session_manager.loadModel(candidate_path)) |loaded_session| {
-            var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
-            std.debug.assert(loaded.session.close_protection == null);
-            loaded.session.close_protection = close_protection;
-            close_protection = null;
-            resource_lease = null;
-            defer loaded.deinit();
-            if (control) |active| try active.check();
-            if (manager.admission_enabled) {
-                if (serving_floor) |floor| session_factory.configureReservedGenerationWorkspace(
-                    &loaded.session,
-                    floor,
-                    resident_amounts,
-                );
-                const session_admission_limits = manager.admissionLimitsForSession(
-                    backend_runtime,
-                    loaded.session,
-                );
-                try attachSessionRunAdmission(
-                    manager.allocator,
-                    &loaded.session,
-                    manager.admissionController(),
-                    backend_runtime,
-                    session_admission_limits,
-                    resident_amounts,
-                    &man,
-                );
-            }
-            // Resident preparation can populate the shared weight cache.
-            // Install its owner and hard limits while it is still empty,
-            // keeping the construction peak leased until preparation drains.
-            try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
-            try session_factory.prepareLayaResident(loaded.session, control);
-            if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
-            return loaded.take();
-        } else |err| {
-            std.log.warn("loadModel({s}) backend {s} failed: {s}", .{ model_dir, @tagName(backend), @errorName(err) });
-            rememberPreferredLoadError(&first_err, err);
-        }
-    }
-
-    if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
-    // A missing process boundary is an expected fail-closed policy decision,
-    // not an artifact/import failure.
-    if (first_err) |err| if (err == error.ProcessIsolationRequired) return err;
-    std.log.err("loadModel({s}) failed: no backend accepted model", .{model_dir});
-    std.log.err("manifest paths onnx={?s} visual={?s} audio={?s} text_projection={?s} visual_projection={?s} audio_projection={?s}", .{
-        man.onnx_path,
-        man.visual_model_path,
-        man.audio_model_path,
-        man.text_projection_path,
-        man.visual_projection_path,
-        man.audio_projection_path,
-    });
-    // NoModelFileFound only when nothing was even attempted.
-    if (first_err) |err| return err;
-    return error.NoModelFileFound;
+    return session_loader.loadPreferred(manager.allocator, SessionLoadHost.services(manager), preferred_backends, model_dir, man, source_session_manager, control);
 }
 
 fn writeCancellationTestModel(dir: std.Io.Dir, allocator: std.mem.Allocator) !void {
@@ -11432,30 +10676,7 @@ test "preferred load cancellation after construction releases retained admission
     }
 }
 
-fn loadErrorPriority(err: anyerror) u2 {
-    return switch (err) {
-        // Admission pressure is actionable at the HTTP boundary: callers can
-        // retry it after the current model request or eviction completes.
-        error.ResourceTemporarilyUnavailable => 3,
-        // A stable capacity-policy rejection is more useful than a backend
-        // probe miss, but must not replace a retryable alternative.
-        error.ResourceLimitExceeded => 2,
-        // These are expected while walking a preferred-backend list and carry
-        // less information than an actual import or model-contract failure.
-        error.NoBackendAvailable, error.UnsupportedBackend => 0,
-        else => 1,
-    };
-}
-
-fn rememberPreferredLoadError(selected: *?anyerror, candidate: anyerror) void {
-    const current = selected.* orelse {
-        selected.* = candidate;
-        return;
-    };
-    if (loadErrorPriority(candidate) > loadErrorPriority(current)) {
-        selected.* = candidate;
-    }
-}
+const rememberPreferredLoadError = session_loader.rememberPreferredLoadError;
 
 test "external resource ownership fails closed until budget is attached" {
     const allocator = std.testing.allocator;

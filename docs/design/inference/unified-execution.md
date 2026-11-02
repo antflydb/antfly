@@ -125,10 +125,19 @@ preparation API do not by themselves complete these remaining requirements:
   weights and prefetch ownership. CUDA reuses its admitted manifest snapshot
   when opening that source, retaining early device/artifact preflight. Prefetch
   guards are installed only after the final session owner is in place.
+  `models/load_plan.zig` derives checked artifact/tokenizer preparation peaks,
+  retained weights and run-admission geometry. `models/session_loader.zig` owns
+  primary/component backend attempts, artifact selection, construction guards,
+  preparation order and failure rollback. Serving supplies health, admission
+  limits/leases, eviction and close protection through synchronous borrowed
+  services; its callback context never becomes the loaded model owner. The
+  session's resident-preparation provider retains the actual model context
+  through wrappers while receiving the published admission/interruption policy.
+  Construction peaks remain leased until preparation succeeds; component load
+  ordering and immediate cancellation checkpoints retain their existing rules.
   `compute_context.zig`, prepared executables and model candidates separate
-  further responsibilities. The session factory, model
-  manager and generation pipeline still contain model-specific loading and
-  physical execution decisions. Optional specialized hooks now use typed
+  further responsibilities. Architecture constructors/preparation internals and
+  remaining generation physical choices still need responsibility migration. Optional specialized hooks now use typed
   operation regions (decoder, replay, relative/window attention, encoder,
   projection, vision/audio, speculative verification and token selection).
   Historical public method names are compatibility adapters; new implementations

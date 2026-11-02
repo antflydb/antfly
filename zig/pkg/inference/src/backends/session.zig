@@ -676,10 +676,20 @@ pub const ComputeBackendProvider = struct {
     acquire: *const fn (ctx: *anyopaque, session: Session, allocator: std.mem.Allocator, options: ComputeBackendOptions) anyerror!ops.ComputeBackend,
 };
 
+/// Session-owned immutable preparation entry point. Context is retained by the
+/// loaded model and copied with its handle, including through session wrappers.
+/// Preparation is synchronous and runs before serving publication, while the
+/// caller still holds the construction peak and model serialization lease.
+pub const ResidentPreparation = struct {
+    ptr: *anyopaque,
+    prepare: *const fn (*anyopaque, Session, ?InferenceExecutionControl) anyerror!void,
+};
+
 /// Loaded model execution handle. Copies preserve the resolved model contract.
 pub const Session = struct {
     model_contract: ModelContract = .{},
     compute_backend_provider: ?ComputeBackendProvider = null,
+    resident_preparation: ?ResidentPreparation = null,
     /// Borrowed common preparation owner. Staged models retain it when loaded;
     /// resident outputs retain it independently of the publishing session.
     shared_compute_context: ?*@import("compute_context.zig").SharedBackendContext = null,
@@ -714,6 +724,11 @@ pub const Session = struct {
     /// contention is resolved by workspace acquisition after chunk selection.
     pub fn generationWorkspaceCapacity(self: Session) ?memory.AdmissionAmounts {
         return if (self.generation_workspace) |workspace| workspace.capacity else null;
+    }
+
+    pub fn prepareResident(self: Session, control: ?InferenceExecutionControl) !void {
+        const preparation = self.resident_preparation orelse return;
+        try preparation.prepare(preparation.ptr, self, control);
     }
 
     pub fn configureExecutionDiagnostics(self: Session, enabled: bool) bool {
@@ -2237,4 +2252,47 @@ test "embeddinggemma2 explicit phase workspace replaces only the generic model a
     try std.testing.expectEqual(@as(usize, 6144), (try admission.estimateRequest(request, &.{})).backend_scratch_bytes);
     request.workspace_bytes = 0;
     try std.testing.expectError(error.ResourceLimitExceeded, admission.estimateRequest(request, &.{}));
+}
+
+test "resident preparation retains model owner and published policy through wrappers" {
+    const Probe = struct {
+        calls: usize = 0,
+        published_ptr: *anyopaque,
+        fail: bool = false,
+        fn prepare(raw: *anyopaque, published: Session, control: ?InferenceExecutionControl) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(published.ptr == self.published_ptr);
+            try std.testing.expect(published.model_contract.resident_text_embeddings);
+            try std.testing.expect(published.generation_workspace != null);
+            try (control orelse return error.MissingControl).check();
+            self.calls += 1;
+            if (self.fail) return error.PreparationFailed;
+        }
+        fn cancelled(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var wrapper: u8 = 0;
+    var workspace: memory.ReservedGenerationWorkspace = undefined;
+    var probe = Probe{ .published_ptr = &wrapper };
+    const wrapped = Session{
+        .ptr = &wrapper,
+        .vtable = undefined,
+        .model_contract = .{ .resident_text_embeddings = true },
+        .generation_workspace = &workspace,
+        .resident_preparation = .{ .ptr = &probe, .prepare = Probe.prepare },
+    };
+    // Deliberately no usable vtable: preparation addresses its retained model
+    // owner and receives the wrapper's policy without rediscovering its type.
+    try wrapped.prepareResident(.{});
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectError(error.Cancelled, wrapped.prepareResident(.{ .check_fn = Probe.cancelled }));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    probe.fail = true;
+    try std.testing.expectError(error.PreparationFailed, wrapped.prepareResident(.{}));
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    var unsupported = wrapped;
+    unsupported.resident_preparation = null;
+    try unsupported.prepareResident(.{});
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
 }

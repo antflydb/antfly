@@ -556,6 +556,10 @@ pub fn layaResidentLoadAmounts(mf: manifest_mod.ModelManifest, source_bytes: usi
 }
 
 pub fn prepareLayaResident(session: Session, control: ?InferenceExecutionControl) !void {
+    return prepareLayaResidentImpl(session, session, control);
+}
+
+fn prepareLayaResidentImpl(session: Session, published: Session, control: ?InferenceExecutionControl) !void {
     if (comptime !build_options.enable_metal) return;
     if (session.vtable != &arch_vtable or !@import("../ops/laya_metal.zig").enabled()) return;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
@@ -564,7 +568,7 @@ pub fn prepareLayaResident(session: Session, control: ?InferenceExecutionControl
     if (!@import("../ops/laya_metal.zig").enabledFor(self.arch_config.modern_bert.laya.?)) return;
     const active = control orelse InferenceExecutionControl{};
     try active.check();
-    var protection = if (control) |c| try c.enterUninterruptible(session.interruption()) else null;
+    var protection = if (control) |c| try c.enterUninterruptible(published.interruption()) else null;
     defer if (protection) |*p| p.deinit();
     var cb = try makeComputeBackend(self, self.allocator, null);
     defer cb.deinit();
@@ -7823,6 +7827,10 @@ pub fn getManagedComputeBackend(
 /// synchronous device preparation, CB cleanup, and failed partial-table cleanup.
 /// CPU and reduced artifacts retain their existing storage and execution path.
 pub fn prepareGlinerBoundaryResident(session: Session, control: ?InferenceExecutionControl) !void {
+    return prepareGlinerBoundaryResidentImpl(session, session, control);
+}
+
+fn prepareGlinerBoundaryResidentImpl(session: Session, published: Session, control: ?InferenceExecutionControl) !void {
     if (comptime !build_options.enable_metal) return;
     if (session.vtable != &arch_vtable) return;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
@@ -7832,7 +7840,7 @@ pub fn prepareGlinerBoundaryResident(session: Session, control: ?InferenceExecut
     const effective = control orelse InferenceExecutionControl{};
     try effective.check();
     if (owner.isReady()) return;
-    var protection = try effective.enterUninterruptible(session.interruption());
+    var protection = try effective.enterUninterruptible(published.interruption());
     defer protection.deinit();
     errdefer owner.abortPreparation();
     {
@@ -8509,6 +8517,16 @@ fn acquireArchComputeBackend(ctx: *anyopaque, session: Session, allocator: std.m
     return getComputeBackend(owner_session, allocator);
 }
 
+fn prepareArchResident(ctx: *anyopaque, published: Session, control: ?InferenceExecutionControl) !void {
+    // Preserve the published admission/interruption contract while addressing
+    // the actual model owner, rather than a transient wrapper implementation.
+    var owner_session = published;
+    owner_session.ptr = ctx;
+    owner_session.vtable = &arch_vtable;
+    try prepareGlinerBoundaryResidentImpl(owner_session, published, control);
+    try prepareLayaResidentImpl(owner_session, published, control);
+}
+
 /// Publish architecture metadata once. Serving can combine this with format
 /// metadata without depending on ArchSession's private implementation identity.
 fn archSessionHandle(impl: *ArchSession) Session {
@@ -8520,6 +8538,7 @@ fn archSessionHandle(impl: *ArchSession) Session {
         .ptr = impl,
         .vtable = &arch_vtable,
         .compute_backend_provider = .{ .ptr = impl, .acquire = acquireArchComputeBackend },
+        .resident_preparation = .{ .ptr = impl, .prepare = prepareArchResident },
         .model_contract = .{
             .task = impl.task,
             .decoder_config = if (impl.arch_config == .gpt) &impl.arch_config.gpt else null,
