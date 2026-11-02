@@ -71,6 +71,7 @@ pub const SharedModules = struct {
     jsonschema: ?*std.Build.Module = null,
     image: ?*std.Build.Module = null,
     pdf: ?*std.Build.Module = null,
+    pdf_source: ?*std.Build.Module = null,
     hash: ?*std.Build.Module = null,
     // Entrypoints choose these implementations explicitly; missing source
     // must fail its consumer rather than select a compatibility fallback.
@@ -108,6 +109,7 @@ pub const Config = struct {
 };
 
 pub const Graph = struct {
+    pdf_source_mod: *std.Build.Module,
     document_runs_mod: *std.Build.Module,
     runtime_abi_mod: *std.Build.Module,
     build_info_mod: *std.Build.Module,
@@ -468,6 +470,7 @@ pub fn create(config: Config) Graph {
         const fonts = b.createModule(.{ .root_source_file = files.add("pdf_standard_fonts.zig", pdf_standard_fonts_source), .target = target, .optimize = optimize });
         const font = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/font/src/mod.zig")), .target = target, .optimize = optimize });
         const pdf = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/mod.zig")), .target = target, .optimize = optimize });
+        pdf.addImport("pdf_values", b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/pdf/src/values.zig")), .target = target, .optimize = optimize }));
         pdf.addImport("antfly_image", image_mod);
         pdf.addImport("antfly_hash", hash_mod);
         pdf.addImport("antfly_font", font);
@@ -546,6 +549,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("inference_internal", inference_internal_mod);
 
     return .{
+        .pdf_source_mod = shared.pdf_source orelse pdf_mod,
         .document_runs_mod = document_runs_mod,
         .runtime_abi_mod = runtime_abi_mod,
         .build_info_mod = shared.build_info_mod,
@@ -998,4 +1002,14 @@ pub fn addX86Kernels(b: *std.Build, module: *std.Build.Module, root: std.Build.L
         }),
     });
     module.addObject(object);
+}
+
+/// Source library suites use the original PDF package without changing the
+/// production document module's native owner selection.
+pub fn sourceDocumentsModule(b: *std.Build, original: *std.Build.Module, pdf: *std.Build.Module) *std.Build.Module {
+    const copy = b.createModule(.{ .root_source_file = original.root_source_file, .target = original.resolved_target, .optimize = original.optimize, .link_libc = original.link_libc });
+    var imports = original.import_table.iterator();
+    while (imports.next()) |entry| copy.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    copy.addImport("antfly_pdf", pdf);
+    return copy;
 }

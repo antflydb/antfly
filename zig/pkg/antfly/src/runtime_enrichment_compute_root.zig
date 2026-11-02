@@ -30,6 +30,7 @@ const exportInternal = process.exportInternal;
 const enrichment_compute_exports = @import("antfly_local_sources").storage_enrichment_compute_provider;
 
 comptime {
+    enrichment_compute_exports.exportPdfNativeOperations();
     exportInternal(&enrichment_compute_exports.extractStream, "antfly_enrichment_extract_stream");
     exportInternal(&enrichment_compute_exports.renderPdfPagePng, "antfly_enrichment_render_pdf_page_png");
     exportInternal(&enrichment_compute_exports.pdfSessionOpen, "antfly_enrichment_pdf_session_open");

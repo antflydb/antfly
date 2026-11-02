@@ -1,7 +1,8 @@
-# Template PDF owner migration candidate
+# Template PDF owner migration
 
-Status: implemented behind `-Dshared-pdf-templates=true`; native product
-regression passed, but library-size and compiler-memory gates did not improve. This is a P1b slice of [the production plan](../production-cost-plan.md),
+Status: the native regression passed; the user accepted the measured library
+size tradeoff on 2026-11-02. Template routing now defaults to true;
+`-Dshared-pdf-templates=false` retains an explicit comparison path. This is a P1b slice of [the production plan](../production-cost-plan.md),
 not completion of all PDF/image migration.
 
 The default production template backend delegates complete text extraction and
@@ -42,7 +43,8 @@ Focused verification so far:
   allocator admission/resizing/cleanup.
 - Formatting, licenses and the control source-catalog checker passed.
 
-The experiment remains off by default because the screened C library grew.
+The user accepted the 347,008-byte library increase for the 6,719,536-byte
+server reduction. Template routing is now enabled by default.
 Prior native CPU artifacts at `f5c0c79fe8` were preserved and SHA256-verified under
 `.benchmark-results/compile-costs/baseline-f5c0c79fe8/` before the candidate run.
 The full first-phase baseline is 229,621,752 bytes for `antfly` and 80,026,400
@@ -93,8 +95,8 @@ subsequently passed against the SHA-verified installed candidate in 21.94 second
 | `libantfly.dylib` | 80,026,400 | 80,373,408 | +347,008 (+0.43%) |
 
 The candidate server is also 2,737,680 bytes below the older same-profile
-pre-query-owner baseline. These improvements require the opt-in flag; they are
-not default build results.
+pre-query-owner baseline. These artifacts were measured with the explicit flag before its accepted
+default changed. The retained-reader migration is a separate follow-up.
 
 Candidate SHA256:
 
@@ -128,7 +130,7 @@ a controlled cold-build comparison. No build-time or compiler-memory gain is
 established, and no scheduler reservation is lowered.
 
 Next: migrate the retained PDF analysis, batch/raster and fork-cache consumers
-before enabling this option by default. The library regression is a concrete
+to remove the remaining implementation copies. The library regression is a concrete
 reason to finish P1b, rather than infer success from the server-only size win.
 
 Additional receipts: `shared-template-pdf-products.{build.log,memory.json,rss.tsv}`,

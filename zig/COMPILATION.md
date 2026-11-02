@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-11-01
+Last updated: 2026-11-02
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -35,6 +35,18 @@ compiler timings and memory reservations are historical, not measurements of
 the current source roots. The matched x86_64 GNU release measurement below
 updates admission claims only for that measured profile; ARM64/musl and GPU
 profiles still need their own release measurements.
+
+## Retained PDF operation owner
+
+Production template PDF helpers now use the shared media owner by default.
+The accepted native screen reduced the server by 6.72 MB and increased the C
+library by 347 KB; `-Dshared-pdf-templates=false` permits comparison.
+
+The separately selectable `-Dshared-pdf-sessions=true` migration routes retained
+readers, fork caches, analysis and complete PNG/raster batches through that same
+owner. Shared PDF values import no implementation. Its eight-phase cache matrix
+preserves the client object across reader/renderer edits. Whole-product size and
+memory qualification remains separate; see the [retained-owner evidence](../docs/design/compilation/history/retained-pdf-owner-2026-11-02.md).
 
 ## Compile-cost experiments
 

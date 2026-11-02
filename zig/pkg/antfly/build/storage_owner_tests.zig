@@ -27,7 +27,7 @@ pub const test_sources = [_][]const u8{
 
 /// Exercise the same storage archive linked by serving and embedded consumers.
 /// Root composition attaches these runs to the owning test aggregates.
-pub const Result = struct { runs: [5]*std.Build.Step.Run, benchmark: *std.Build.Step.Compile };
+pub const Result = struct { runs: []const *std.Build.Step.Run, benchmark: *std.Build.Step.Compile };
 
 pub fn add(
     b: *std.Build,
@@ -47,6 +47,7 @@ pub fn add(
         .version = "test",
     });
     var runs: [5]*std.Build.Step.Run = undefined;
+    var additional_runs: std.ArrayList(*std.Build.Step.Run) = .empty;
     var benchmark: *std.Build.Step.Compile = undefined;
     inline for (.{ "storage_kernel_owner_test_root.zig", "storage_kernel_provisioned_source_test_root.zig", "enrichment_compute_test_root.zig", "storage_boundary_bench.zig" }, 0..) |root, index| {
         const module = b.createModule(.{
@@ -115,6 +116,18 @@ pub fn add(
     });
     pdf_client.addImport("enrichment_compute_abi", imports.storage_boundary.enrichment);
     pdf_client.addImport("kernel_error_identity", imports.storage_boundary.identity);
+    if (imports.pdf_native_contract) |contract| {
+        const client = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/pdf_native_owner_test_root.zig"), .target = target, .optimize = optimize });
+        client.link_libc = true;
+        client.addImport("pdf", imports.pdf);
+        client.addImport("pdf_native_contract", contract);
+        @import("../../../build_support/embedded/source_owner.zig").registerStorageIndependent(client);
+        const tests = @import("linked_tests.zig").add(b, .{ .name = "pdf-native-owner-tests", .root_module = client, .filters = &.{"compiled PDF native"}, .max_rss = 2 * 1024 * 1024 * 1024 });
+        tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
+        const run = tests.run(b);
+        additional_runs.append(b.allocator, run) catch @panic("OOM");
+        b.step("compiled-pdf-native-test", "Test retained analysis, fork caches, raster and bounded PDF batches").dependOn(&run.step);
+    }
     const pdf_consumer = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/opaque_pdf_session_test_root.zig"),
         .target = target,
@@ -153,7 +166,9 @@ pub fn add(
         .max_rss = 2 * 1024 * 1024 * 1024,
     });
     template_tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
-    b.step("compiled-template-pdf-test", "Check compiled template PDF default, exact errors and backend overrides").dependOn(&template_tests.run(b).step);
+    const template_run = template_tests.run(b);
+    additional_runs.append(b.allocator, template_run) catch @panic("OOM");
+    b.step("compiled-template-pdf-test", "Check compiled template PDF default, exact errors and backend overrides").dependOn(&template_run.step);
     const opaque_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/opaque_query_owner_test_root.zig"), .target = target, .optimize = optimize });
     opaque_module.link_libc = true;
     opaque_module.addImport("kernel_owner_abi", imports.storage_boundary.owner);
@@ -196,5 +211,5 @@ pub fn add(
         handoff_tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
     b.step("antfly-storage-owner-handoff-reopen-test", "Run physical shared-context owner handoff receipt reopen regression")
         .dependOn(&handoff_tests.run(b).step);
-    return .{ .runs = runs, .benchmark = benchmark };
+    return .{ .runs = std.mem.concat(b.allocator, *std.Build.Step.Run, &.{ &runs, additional_runs.items }) catch @panic("OOM"), .benchmark = benchmark };
 }

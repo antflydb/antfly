@@ -341,8 +341,8 @@ const ImageDecodeTarget = struct {
     max_dimension: u32,
 };
 
-pub const default_max_decoded_stream_bytes: usize = 64 * 1024 * 1024;
-pub const default_max_decode_working_set_bytes: usize = 128 * 1024 * 1024;
+pub const default_max_decoded_stream_bytes = @import("pdf_values").default_max_decoded_stream_bytes;
+pub const default_max_decode_working_set_bytes = @import("pdf_values").default_max_decode_working_set_bytes;
 const jbig2_work_units_per_expected_pixel: u64 = 8;
 const jbig2_work_unit_floor: u64 = 4_000_000;
 // A hard ceiling keeps unusually large but valid output dimensions from
@@ -354,15 +354,7 @@ const jbig2_work_unit_ceiling: u64 = 256_000_000;
 /// intentionally separate: chained filters and predictors retain their input
 /// until the next output has been produced. Image XObjects share that same
 /// working-set budget across codec scratch space and their complete mask tree.
-pub const DecodeLimits = struct {
-    max_decoded_stream_bytes: usize = default_max_decoded_stream_bytes,
-    max_working_set_bytes: usize = default_max_decode_working_set_bytes,
-
-    pub fn validate(self: DecodeLimits) !void {
-        if (self.max_decoded_stream_bytes == 0 or self.max_working_set_bytes == 0)
-            return error.InvalidPdfDecodeLimits;
-    }
-};
+pub const DecodeLimits = @import("pdf_values").DecodeLimits;
 
 const DecodeBudgetAllocator = struct {
     backing: Allocator,
@@ -1251,144 +1243,19 @@ const TextExtractionState = struct {
     current_font_index: ?usize = null,
 };
 
-pub const TextOutputSpan = struct {
-    start: usize,
-    end: usize,
-};
+pub const TextOutputSpan = @import("pdf_values").TextOutputSpan;
 
-pub const TextFallbackReason = enum {
-    missing_font,
-    unsupported_font,
-    missing_text_data,
-    missing_glyph,
-    invalid_font_program,
-    outline_too_complex,
-    unsupported_resource,
-    materialization_limit,
-    vector_work_limit,
-    font_work_limit,
-    other,
-};
+pub const TextFallbackReason = @import("pdf_values").TextFallbackReason;
 
-pub const PageRenderDiagnostics = struct {
-    text_groups: u32 = 0,
-    vector_text_groups: u32 = 0,
-    fallback_text_groups: u32 = 0,
-    vector_text_runs: u32 = 0,
-    fallback_text_runs: u32 = 0,
-    first_fallback_reason: ?TextFallbackReason = null,
-    fallback_reason_counts: [@typeInfo(TextFallbackReason).@"enum".field_names.len]u32 =
-        @as([@typeInfo(TextFallbackReason).@"enum".field_names.len]u32, @splat(0)),
-    text_materialization_bytes: u64 = 0,
-    peak_operator_materialization_bytes: u64 = 0,
-    remaining_edge_tests: u64 = 0,
-    remaining_scanline_work: u64 = 0,
-    remaining_points: u64 = 0,
-    remaining_resource_bytes: u64 = 0,
-    remaining_materialization_bytes: u64 = 0,
-    remaining_font_operations: u64 = 0,
-    glyph_outline_cache_hits: u32 = 0,
-    glyph_outline_cache_misses: u32 = 0,
-    glyph_outline_cache_bytes: u64 = 0,
+pub const PageRenderDiagnostics = @import("pdf_values").PageRenderDiagnostics;
 
-    fn recordFallback(self: *PageRenderDiagnostics, reason: TextFallbackReason, run_count: usize) void {
-        self.fallback_text_groups +|= 1;
-        self.fallback_text_runs +|= @intCast(@min(run_count, std.math.maxInt(u32)));
-        self.fallback_reason_counts[@backingInt(reason)] +|= 1;
-        if (self.first_fallback_reason == null) self.first_fallback_reason = reason;
-    }
-};
-
-pub const CancellationProbe = struct {
-    context: ?*const anyopaque = null,
-    is_cancelled_fn: ?*const fn (?*const anyopaque) bool = null,
-
-    pub fn check(self: CancellationProbe) !void {
-        if (self.is_cancelled_fn) |is_cancelled| if (is_cancelled(self.context)) return error.Canceled;
-    }
-};
+pub const CancellationProbe = @import("pdf_values").CancellationProbe;
 
 fn jpeg2000CancellationProbe(probe: CancellationProbe) image_lib.jpeg2000.CancellationProbe {
     return .{ .context = probe.context, .is_cancelled_fn = probe.is_cancelled_fn };
 }
 
-pub const TextRun = struct {
-    text: []const u8,
-    raw_text: ?[]const u8 = null,
-    font_index: ?u16 = null,
-    /// Render-time font resource for text nested inside a Form XObject. Form
-    /// font indices are local to their resource dictionary and cannot be
-    /// interpreted against the page font slice. This borrow is consumed and
-    /// cleared before PageRenderRuns escapes the Reader call.
-    render_font: ?*const PageFont = null,
-    vectorizable: bool = false,
-    fallback_reason: ?TextFallbackReason = null,
-    x: f64,
-    y: f64,
-    font_size: f64,
-    a: f64 = 1,
-    b: f64 = 0,
-    c: f64 = 0,
-    d: f64 = 1,
-    /// Graphics CTM at the point where this text run was painted. The text
-    /// basis above is already transformed, but pattern space is defined by
-    /// the graphics CTM and must not be reconstructed from the glyph basis.
-    graphics_matrix: GraphicsMatrix = .{},
-    alpha: u8 = 0xff,
-    stroke_alpha: u8 = 0xff,
-    render_mode: i64 = 0,
-    fill_color: [4]u8 = .{ 0, 0, 0, 0xff },
-    stroke_color: [4]u8 = .{ 0, 0, 0, 0xff },
-    stroke_width: f64 = 1,
-    horizontal_scale: f64 = 1.0,
-    vertical: bool = false,
-    char_spacing: f64 = 0,
-    word_spacing: f64 = 0,
-    advance_width: f64 = 0,
-    ascent: f64 = 0,
-    descent: f64 = 0,
-    paint_order: usize = 0,
-    /// Consistent TJ positioning measured on both sides of authored whitespace.
-    /// Only matching local gaps between glyph fragments count as tracking.
-    text_show_tracking_gap: ?f64 = null,
-    paint_phase: usize = 0,
-    output_span: ?TextOutputSpan = null,
-
-    blend_mode: BlendMode = .normal,
-    group_id: ?u32 = null,
-    group_parent_id: ?u32 = null,
-    group_isolated: bool = true,
-    group_knockout: bool = false,
-    group_alpha: u8 = 0xff,
-    group_blend_mode: BlendMode = .normal,
-    fill_pattern_name: ?[]const u8 = null,
-    stroke_pattern_name: ?[]const u8 = null,
-    clip_box: ?PageBox = null,
-    clip_points: ?[]const [2]f64 = null,
-    clip_fill_rule: FillRule = .nonzero,
-
-    /// Page-space bounds of horizontal text, including its transformed basis
-    /// and font ascent/descent. Vertical writing needs per-glyph vertical
-    /// origins; leave that geometry unknown rather than inventing a rectangle.
-    pub fn bounds(self: TextRun) ?PageBox {
-        if (self.vertical) return null;
-        inline for (.{ self.x, self.y, self.a, self.b, self.c, self.d, self.advance_width, self.ascent, self.descent }) |value| if (!std.math.isFinite(value)) return null;
-        if (self.ascent < 0 or self.descent < 0) return null;
-        const box = textRunBounds(self);
-        inline for (.{ box.min_x, box.min_y, box.max_x, box.max_y }) |value| if (!std.math.isFinite(value)) return null;
-        if (box.min_x >= box.max_x or box.min_y >= box.max_y) return null;
-        return .{ .min_x = box.min_x, .min_y = box.min_y, .max_x = box.max_x, .max_y = box.max_y };
-    }
-
-    pub fn deinit(self: *TextRun, alloc: Allocator) void {
-        if (self.clip_points) |points| alloc.free(points);
-        if (self.fill_pattern_name) |name| alloc.free(name);
-        if (self.stroke_pattern_name) |name| alloc.free(name);
-        if (self.raw_text) |raw| alloc.free(raw);
-        alloc.free(self.text);
-        self.* = undefined;
-    }
-};
+pub const TextRun = @import("pdf_values").TextRun;
 const LayoutTextRun = struct {
     text: []const u8,
     x: f64,
@@ -1432,38 +1299,9 @@ fn contentHasNontextPaint(alloc: Allocator, bytes: []const u8, cancellation: Can
     }
 }
 
-pub const PageTextAnalysis = struct {
-    text: []u8,
-    runs: []TextRun,
-    outline_fallback: bool = false,
-    has_nontext_visual: bool = false,
-    has_unrendered_annotations: bool = false,
+pub const PageTextAnalysis = @import("pdf_values").PageTextAnalysis;
 
-    pub fn deinit(self: *PageTextAnalysis, alloc: Allocator) void {
-        alloc.free(self.text);
-        for (self.runs) |*run| run.deinit(alloc);
-        if (self.runs.len > 0) alloc.free(self.runs);
-        self.* = undefined;
-    }
-};
-
-const SharedImageRgba = struct {
-    bytes: []u8,
-    references: usize = 1,
-
-    fn retain(self: *SharedImageRgba) void {
-        self.references = std.math.add(usize, self.references, 1) catch std.math.maxInt(usize);
-    }
-
-    fn release(self: *SharedImageRgba, alloc: Allocator) void {
-        std.debug.assert(self.references > 0);
-        self.references -= 1;
-        if (self.references == 0) {
-            alloc.free(self.bytes);
-            alloc.destroy(self);
-        }
-    }
-};
+const SharedImageRgba = @import("pdf_values").SharedImageRgba;
 
 const CachedPageImage = struct {
     shared_rgba: *SharedImageRgba,
@@ -1498,240 +1336,29 @@ const DecodedImageCache = struct {
     }
 };
 
-pub const ImageRun = struct {
-    rgba: []u8,
-    /// Decoded XObject samples are immutable and shared by every `Do`
-    /// occurrence. Ad-hoc callers may leave this null and retain the legacy
-    /// owned-slice behavior.
-    shared_rgba: ?*SharedImageRgba = null,
-    width: u32,
-    height: u32,
-    interpolate: bool = false,
-    /// True when the source is one-bit scan/line-art data. OCR rendering may
-    /// use coverage-preserving minification without changing exact PDF mode.
-    bilevel: bool = false,
-    /// Whole-image premultiplied coverage summary. OCR minification uses this
-    /// only when a full-source footprint cannot afford exact integration.
-    bilevel_fallback: ?[4]u8 = null,
-    ocr_coverage_minify: bool = false,
-    /// PDF image masks are stencils: their decoded samples provide coverage,
-    /// while the active nonstroking color at each `Do` provides paint. Keep
-    /// that color on the occurrence instead of mutating shared decoded RGBA.
-    stencil_color: ?[4]u8 = null,
-    /// A graphics-state soft mask whose group is a single image covering the
-    /// painted image. The mask is sampled in the same normalized image space.
-    opacity_mask_rgba: ?[]u8 = null,
-    opacity_mask_shared_rgba: ?*SharedImageRgba = null,
-    opacity_mask_width: u32 = 0,
-    opacity_mask_height: u32 = 0,
-    opacity_mask_luminosity: bool = false,
-    opacity_mask_interpolate: bool = false,
-    alpha: u8 = 0xff,
-    paint_order: usize = 0,
-    paint_phase: usize = 0,
-    blend_mode: BlendMode = .normal,
-    group_id: ?u32 = null,
-    group_parent_id: ?u32 = null,
-    group_isolated: bool = true,
-    group_knockout: bool = false,
-    group_alpha: u8 = 0xff,
-    group_blend_mode: BlendMode = .normal,
-    clip_box: ?PageBox = null,
-    clip_points: ?[]const [2]f64 = null,
-    clip_fill_rule: FillRule = .nonzero,
-    a: f64,
-    b: f64,
-    c: f64,
-    d: f64,
-    e: f64,
-    f: f64,
-    x: f64,
-    y: f64,
-    draw_width: f64,
-    draw_height: f64,
+pub const ImageRun = @import("pdf_values").ImageRun;
 
-    pub fn deinit(self: *ImageRun, alloc: Allocator) void {
-        if (self.clip_points) |points| alloc.free(points);
-        if (self.opacity_mask_shared_rgba) |shared|
-            shared.release(alloc)
-        else if (self.opacity_mask_rgba) |mask|
-            alloc.free(mask);
-        if (self.shared_rgba) |shared| shared.release(alloc) else alloc.free(self.rgba);
-        self.* = undefined;
-    }
-};
-
-const shading_uniform_color_sample_count: usize = 64;
-const shading_color_sample_capacity: usize = 128;
-const shading_color_sample_count = shading_uniform_color_sample_count;
-const shading_discontinuity_capacity: usize = (shading_color_sample_capacity - shading_uniform_color_sample_count) / 2;
+const shading_uniform_color_sample_count = @import("pdf_values").shading_uniform_color_sample_count;
+const shading_color_sample_capacity = @import("pdf_values").shading_color_sample_capacity;
+const shading_color_sample_count = @import("pdf_values").shading_color_sample_count;
+const shading_discontinuity_capacity = @import("pdf_values").shading_discontinuity_capacity;
 const shading_function_node_capacity: u16 = 128;
 
-pub const ShadingRun = struct {
-    kind: enum { axial, radial },
-    paint_order: usize = 0,
-    paint_phase: usize = 0,
-    blend_mode: BlendMode = .normal,
-    group_id: ?u32 = null,
-    group_parent_id: ?u32 = null,
-    group_isolated: bool = true,
-    group_knockout: bool = false,
-    group_alpha: u8 = 0xff,
-    group_blend_mode: BlendMode = .normal,
-    clip_box: ?PageBox = null,
-    clip_points: ?[]const [2]f64 = null,
-    clip_fill_rule: FillRule = .nonzero,
-    x0: f64,
-    y0: f64,
-    r0: f64 = 0,
-    x1: f64,
-    y1: f64,
-    r1: f64 = 0,
-    c0: [4]u8,
-    c1: [4]u8,
-    color_samples: [shading_color_sample_capacity][4]u8 = @as([shading_color_sample_capacity][4]u8, @splat(.{ 0, 0, 0, 0xff })),
-    color_sample_positions: [shading_color_sample_capacity]f64 = @splat(0),
-    color_sample_count: u8 = 0,
-    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = @as([shading_discontinuity_capacity][4]u8, @splat(.{ 0, 0, 0, 0xff })),
-    exact_boundary_positions: [shading_discontinuity_capacity]f64 = @splat(0),
-    exact_boundary_count: u8 = 0,
-    extend_start: bool = false,
-    extend_end: bool = false,
+pub const ShadingRun = @import("pdf_values").ShadingRun;
 
-    pub fn deinit(self: *ShadingRun, alloc: Allocator) void {
-        if (self.clip_points) |points| alloc.free(points);
-        self.* = undefined;
-    }
-};
+pub const PatternRun = @import("pdf_values").PatternRun;
 
-pub const PatternRun = struct {
-    kind: enum { fill, stroke },
-    mode: enum { tiling, shading } = .tiling,
-    paint_order: usize = 0,
-    /// Orders multiple paint phases emitted by one PDF operator, independent
-    /// of backing paint type. Synthesized outlines use fill then stroke;
-    /// Type3 glyphs retain their intrinsic CharProc operator sequence.
-    paint_phase: usize = 0,
-    blend_mode: BlendMode = .normal,
-    group_id: ?u32 = null,
-    group_parent_id: ?u32 = null,
-    group_isolated: bool = true,
-    group_knockout: bool = false,
-    group_alpha: u8 = 0xff,
-    group_blend_mode: BlendMode = .normal,
-    fill_rule: FillRule = .nonzero,
-    line_cap: @FieldType(ShapeRun, "line_cap") = .butt,
-    line_join: @FieldType(ShapeRun, "line_join") = .miter,
-    miter_limit: f64 = 10,
-    dash_array: ?[]f64 = null,
-    dash_phase: f64 = 0,
-    stroke_width: f64 = 1,
-    closed: bool = true,
-    clip_box: ?PageBox = null,
-    clip_points: ?[]const [2]f64 = null,
-    clip_fill_rule: FillRule = .nonzero,
-    points: [][2]f64,
-    subpath_starts: ?[]usize = null,
-    subpath_closed: ?[]bool = null,
-    /// A Pattern-colored image mask uses the image only as target coverage.
-    /// Keeping the immutable decoded mask here avoids premature rasterization
-    /// and preserves the pattern cell, transform, clip, and blend semantics.
-    stencil_mask: ?ImageRun = null,
-    pattern_matrix: GraphicsMatrix = .{},
-    pattern_bbox: PageBox,
-    pattern_x_step: f64,
-    pattern_y_step: f64,
-    base_color: ?[4]u8 = null,
-    shading: ?ShadingRun = null,
-    tile_text_runs: []TextRun = &.{},
-    tile_image_runs: []ImageRun = &.{},
-    tile_shading_runs: []ShadingRun = &.{},
-    tile_pattern_runs: []PatternRun = &.{},
-    tile_shape_runs: []ShapeRun = &.{},
+pub const PageBox = @import("pdf_values").PageBox;
 
-    pub fn deinit(self: *PatternRun, alloc: Allocator) void {
-        if (self.dash_array) |dash| alloc.free(dash);
-        if (self.clip_points) |clip| alloc.free(clip);
-        if (self.subpath_starts) |starts| alloc.free(starts);
-        if (self.subpath_closed) |closed| alloc.free(closed);
-        alloc.free(self.points);
-        if (self.stencil_mask) |*mask| mask.deinit(alloc);
-        if (self.shading) |*shading| shading.deinit(alloc);
-        for (self.tile_text_runs) |*run| run.deinit(alloc);
-        if (self.tile_text_runs.len > 0) alloc.free(self.tile_text_runs);
-        for (self.tile_image_runs) |*run| run.deinit(alloc);
-        if (self.tile_image_runs.len > 0) alloc.free(self.tile_image_runs);
-        for (self.tile_shading_runs) |*run| run.deinit(alloc);
-        if (self.tile_shading_runs.len > 0) alloc.free(self.tile_shading_runs);
-        for (self.tile_pattern_runs) |*run| run.deinit(alloc);
-        if (self.tile_pattern_runs.len > 0) alloc.free(self.tile_pattern_runs);
-        for (self.tile_shape_runs) |*run| run.deinit(alloc);
-        if (self.tile_shape_runs.len > 0) alloc.free(self.tile_shape_runs);
-        self.* = undefined;
-    }
-};
+const FillRule = @import("pdf_values").FillRule;
 
-pub const PageBox = struct {
-    min_x: f64,
-    min_y: f64,
-    max_x: f64,
-    max_y: f64,
-};
+pub const BlendMode = @import("pdf_values").BlendMode;
 
-const FillRule = enum { nonzero, even_odd };
+pub const ShapeKind = @import("pdf_values").ShapeKind;
+pub const ShapeLineCap = @import("pdf_values").ShapeLineCap;
+pub const ShapeLineJoin = @import("pdf_values").ShapeLineJoin;
 
-pub const BlendMode = enum {
-    normal,
-    multiply,
-    screen,
-    overlay,
-    darken,
-    lighten,
-};
-
-pub const ShapeRun = struct {
-    kind: enum { fill, stroke },
-    paint_order: usize = 0,
-    paint_phase: usize = 0,
-    blend_mode: BlendMode = .normal,
-    group_id: ?u32 = null,
-    group_parent_id: ?u32 = null,
-    group_isolated: bool = true,
-    group_knockout: bool = false,
-    group_alpha: u8 = 0xff,
-    group_blend_mode: BlendMode = .normal,
-    fill_rule: FillRule = .nonzero,
-    line_cap: enum { butt, round, square } = .butt,
-    line_join: enum { miter, round, bevel } = .miter,
-    miter_limit: f64 = 10,
-    dash_array: ?[]f64 = null,
-    dash_phase: f64 = 0,
-    color: [4]u8,
-    stroke_width: f64,
-    closed: bool,
-    clip_box: ?PageBox = null,
-    clip_points: ?[]const [2]f64 = null,
-    clip_fill_rule: FillRule = .nonzero,
-    points: [][2]f64,
-    antialias: bool = false,
-    /// Start offsets for independently closed subpaths in `points`. Font
-    /// glyphs need all contours painted as one path so counter contours
-    /// (the holes in O, B, 8, and similar glyphs) participate in winding.
-    subpath_starts: ?[]usize = null,
-    /// Per-subpath closure for compound stroked paths. Filled paths close
-    /// implicitly, but PDF permits one stroke operator to mix open and closed
-    /// contours; one page-wide `closed` bit cannot represent that faithfully.
-    subpath_closed: ?[]bool = null,
-
-    pub fn deinit(self: *ShapeRun, alloc: Allocator) void {
-        if (self.dash_array) |dash| alloc.free(dash);
-        if (self.clip_points) |clip| alloc.free(clip);
-        if (self.subpath_starts) |starts| alloc.free(starts);
-        if (self.subpath_closed) |closed| alloc.free(closed);
-        alloc.free(self.points);
-        self.* = undefined;
-    }
-};
+pub const ShapeRun = @import("pdf_values").ShapeRun;
 
 const RenderTarget = struct { width: u32, height: u32 };
 // Detailed embedded display fonts and traced CJK subsets routinely contain
@@ -2060,29 +1687,7 @@ fn appendOwnedValue(comptime T: type, alloc: Allocator, out: *std.ArrayList(T), 
     try out.append(alloc, owned);
 }
 
-pub const PageRenderRuns = struct {
-    page_box: PageBox = .{ .min_x = 0, .min_y = 0, .max_x = 612, .max_y = 792 },
-    text_runs: []TextRun = &.{},
-    image_runs: []ImageRun = &.{},
-    shading_runs: []ShadingRun = &.{},
-    pattern_runs: []PatternRun = &.{},
-    shape_runs: []ShapeRun = &.{},
-    diagnostics: PageRenderDiagnostics = .{},
-
-    pub fn deinit(self: *PageRenderRuns, alloc: Allocator) void {
-        for (self.text_runs) |*run| run.deinit(alloc);
-        if (self.text_runs.len > 0) alloc.free(self.text_runs);
-        for (self.image_runs) |*run| run.deinit(alloc);
-        if (self.image_runs.len > 0) alloc.free(self.image_runs);
-        for (self.shading_runs) |*run| run.deinit(alloc);
-        if (self.shading_runs.len > 0) alloc.free(self.shading_runs);
-        for (self.pattern_runs) |*run| run.deinit(alloc);
-        if (self.pattern_runs.len > 0) alloc.free(self.pattern_runs);
-        for (self.shape_runs) |*run| run.deinit(alloc);
-        if (self.shape_runs.len > 0) alloc.free(self.shape_runs);
-        self.* = undefined;
-    }
-};
+pub const PageRenderRuns = @import("pdf_values").PageRenderRuns;
 
 const TextRunState = struct {
     current_font_index: ?usize = null,
@@ -2168,14 +1773,7 @@ const TextRunStackEntry = struct {
     }
 };
 
-const GraphicsMatrix = struct {
-    a: f64 = 1,
-    b: f64 = 0,
-    c: f64 = 0,
-    d: f64 = 1,
-    e: f64 = 0,
-    f: f64 = 0,
-};
+const GraphicsMatrix = @import("pdf_values").GraphicsMatrix;
 
 /// Content operands are released after every operator, so color-space state
 /// must not retain their name slices. Keep it as a value and make unsupported
@@ -5480,7 +5078,7 @@ pub const Reader = struct {
     }
 
     fn fontForTextRun(fonts: []const PageFont, run: TextRun) ?*const PageFont {
-        if (run.render_font) |font| return font;
+        if (run.render_font) |font| return @ptrCast(@alignCast(font));
         const index = run.font_index orelse return null;
         if (index >= fonts.len) return null;
         return &fonts[index];
@@ -17941,34 +17539,9 @@ fn textRunForwardGap(previous: anytype, current: anytype) f64 {
         (current.y - previous_end_y) * (previous.b / axis);
 }
 
-const TextRunBounds = struct {
-    min_x: f64,
-    min_y: f64,
-    max_x: f64,
-    max_y: f64,
+const TextRunBounds = @import("pdf_values").TextRunBounds;
 
-    fn include(self: *TextRunBounds, other: TextRunBounds) void {
-        self.min_x = @min(self.min_x, other.min_x);
-        self.min_y = @min(self.min_y, other.min_y);
-        self.max_x = @max(self.max_x, other.max_x);
-        self.max_y = @max(self.max_y, other.max_y);
-    }
-};
-
-fn textRunBounds(run: anytype) TextRunBounds {
-    const end_x = run.x + run.a * run.advance_width;
-    const end_y = run.y + run.b * run.advance_width;
-    const top_x = run.c * run.ascent;
-    const top_y = run.d * run.ascent;
-    const bottom_x = -run.c * run.descent;
-    const bottom_y = -run.d * run.descent;
-    return .{
-        .min_x = @min(@min(run.x + top_x, run.x + bottom_x), @min(end_x + top_x, end_x + bottom_x)),
-        .min_y = @min(@min(run.y + top_y, run.y + bottom_y), @min(end_y + top_y, end_y + bottom_y)),
-        .max_x = @max(@max(run.x + top_x, run.x + bottom_x), @max(end_x + top_x, end_x + bottom_x)),
-        .max_y = @max(@max(run.y + top_y, run.y + bottom_y), @max(end_y + top_y, end_y + bottom_y)),
-    };
-}
+const textRunBounds = @import("pdf_values").preciseTextRunBounds;
 
 fn textRunIsVertical(run: anytype) bool {
     return if (comptime @hasField(@TypeOf(run), "vertical"))
@@ -29443,7 +29016,7 @@ test "reader extracts text and shapes through form xobject" {
     try std.testing.expectEqual(@as(u32, 1), render_runs.diagnostics.vector_text_groups);
     try std.testing.expectEqual(@as(u32, 0), render_runs.diagnostics.fallback_text_groups);
     try std.testing.expect(render_runs.shape_runs.len > shape_runs.len);
-    try std.testing.expectEqual(@as(?*const PageFont, null), render_runs.text_runs[0].render_font);
+    try std.testing.expectEqual(@as(?*const anyopaque, null), render_runs.text_runs[0].render_font);
 }
 
 test "reader text analysis ignores raster resources while preserving form positions" {

@@ -658,7 +658,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .platform_mod = platform_mod,
     });
     const run_lib_pdf_tests = pdf_tests.run_lib_pdf_tests;
-    const documents_tests = b.addTest(.{ .root_module = b.modules.get("antfly_documents").? });
+    const documents_tests = b.addTest(.{ .root_module = inference_runtime_build.sourceDocumentsModule(b, b.modules.get("antfly_documents").?, shared.pdf_mod) });
     const run_documents_tests = b.addRunArtifact(documents_tests);
     b.step("lib-documents-test", "Run checked OOXML, DrawingML, slide and layout tests without inference").dependOn(&run_documents_tests.step);
     const pdf_integration = antfly_tests_build.createPdfIntegration(b, .{

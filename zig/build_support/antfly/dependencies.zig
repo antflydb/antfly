@@ -233,9 +233,11 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, false);
     const standalone_runtime_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, true, false);
     const production_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, true);
-    const shared_pdf_templates = b.option(bool, "shared-pdf-templates", "Experiment: route production template PDF work through the shared media owner") orelse false;
+    const shared_pdf_templates = b.option(bool, "shared-pdf-templates", "Route production template PDF work through the shared media owner") orelse true;
     if (shared_pdf_templates and (target.result.os.tag == .linux or target.result.os.tag == .macos) and (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64))
         production_build_options.addOption(bool, "shared_pdf_templates", true);
+    const shared_pdf_sessions_requested = b.option(bool, "shared-pdf-sessions", "Route retained PDF readers, forks and batches through the media owner") orelse false;
+    const shared_pdf_sessions = shared_pdf_sessions_requested and (target.result.os.tag == .linux or target.result.os.tag == .macos) and (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options, platform_mod);
     const raft_engine_mod = b.createModule(.{
         .root_source_file = b.path("lib/raft/src/root.zig"),
@@ -774,6 +776,22 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // storage/API validation. CI can qualify that mixed product without
     // optimizing the much larger database and server ownership graph.
     const inference_optimize = b.option(std.lang.Optimize, "inference-optimize", "Optimization mode for the model execution graph (defaults to the product mode)") orelse optimize;
+    const engine_error_names = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine_errors.zig"), .target = target, .optimize = optimize });
+    const pdf_native_contract = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/pdf_native_contract.zig"), .target = target, .optimize = optimize });
+    pdf_native_contract.addImport("pdf_values", pdf_mod.import_table.get("pdf_values").?);
+    pdf_native_contract.addImport("antfly_runtime_abi", runtime_abi_mod);
+    pdf_native_contract.addImport("engine_errors", engine_error_names);
+    const pdf_facade = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/pdf_facade.zig"), .target = target, .optimize = optimize });
+    pdf_facade.addImport("pdf_native_contract", pdf_native_contract);
+    pdf_facade.addImport("antfly_font", font_mod);
+    pdf_facade.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
+    const facade_syntax = b.createModule(.{ .root_source_file = b.path("lib/pdf/src/syntax.zig"), .target = target, .optimize = optimize });
+    const facade_text = b.createModule(.{ .root_source_file = b.path("lib/pdf/src/text_encoding.zig"), .target = target, .optimize = optimize });
+    facade_text.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
+    pdf_facade.addImport("pdf_syntax", facade_syntax);
+    pdf_facade.addImport("pdf_text_encoding", facade_text);
+
+    pdf_facade.addImport("engine_errors", engine_error_names);
     const inference_config: inference_runtime_build.Config = .{
         .b = b,
         .target = target,
@@ -814,7 +832,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .regex = regex_mod,
             .jsonschema = jsonschema_mod,
             .image = image_mod,
-            .pdf = pdf_mod,
+            .pdf = if (shared_pdf_sessions) pdf_facade else pdf_mod,
+            .pdf_source = pdf_mod,
             .hash = hash_mod,
             .prometheus = prometheus_mod,
             .structlog = structlog_mod,
@@ -1211,7 +1230,6 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     engine_options.addOption(bool, "shared_inference_core", shared_inference_core);
     const inference_engine_mod = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine.zig"), .target = target, .optimize = optimize });
     inference_engine_mod.addOptions("engine_options", engine_options);
-    const engine_error_names = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine_errors.zig"), .target = target, .optimize = optimize });
     inference_engine_mod.addImport("engine_errors", engine_error_names);
     inference_engine_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     inference_engine_mod.addImport("inference_server", inference_server_mod);
@@ -1413,6 +1431,11 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     antfly_imports.storage_boundary.configureSources(storage_mod, false, false);
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;
+    if (shared_pdf_sessions and antfly_imports.storage_boundary.shared_core) {
+        production_antfly_imports.pdf = pdf_facade;
+        production_antfly_imports.pdf_implementation = pdf_mod;
+        production_antfly_imports.pdf_native_contract = pdf_native_contract;
+    }
     production_antfly_imports.shared_pdf_templates = shared_pdf_templates and antfly_imports.storage_boundary.shared_core;
 
     return .{

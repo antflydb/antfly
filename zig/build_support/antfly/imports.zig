@@ -59,6 +59,8 @@ pub const AntflyRootImports = struct {
     build_info: @import("../../lib/build_info/build_support.zig").BuildInfo,
     build_options: *std.Build.Step.Options,
     shared_pdf_templates: bool = false,
+    pdf_implementation: ?*std.Build.Module = null,
+    pdf_native_contract: ?*std.Build.Module = null,
     lite_options: *std.Build.Module,
     // HTTP schema serving is opt-in at the owning compilation roots.
     embedded_openapi: *std.Build.Module,
@@ -397,6 +399,7 @@ pub const AntflyRootImports = struct {
     pub fn configureEnrichment(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         const options = b.addOptions();
         options.addOption(bool, "bench_minimal_deps", false);
+        options.addOption(bool, "pdf_native_provider", self.pdf_native_contract != null);
         mod.addOptions("build_options", options);
         // Document/media compute has no physical storage handle, including in
         // the independently compiled public embedded enrichment archive.
@@ -411,6 +414,8 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_runtime_fs", self.runtime_fs);
         mod.link_libc = link_libc;
         inline for (.{ "image", "font", "pdf", "json", "scraping", "scraping_openapi", "reader_config", "chunking", "hash", "httpx", "structlog" }) |field| self.addImport(mod, field);
+        if (self.pdf_implementation) |implementation| mod.addImport("antfly_pdf", implementation);
+        if (self.pdf_native_contract) |contract| mod.addImport("pdf_native_contract", contract);
     }
 
     pub fn configureApi(self: @This(), mod: *std.Build.Module, link_libc: bool) void {

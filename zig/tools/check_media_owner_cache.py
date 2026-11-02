@@ -39,26 +39,42 @@ ZIG_ROOT = Path(__file__).resolve().parents[1]
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument(
+        "--retained",
+        action="store_true",
+        help="Check native retained readers, rendering implementation and pure value contracts",
+    )
     args = parser.parse_args()
     report_path = args.report.resolve()
     report_path.parent.mkdir(parents=True, exist_ok=True)
     overlay_parent = ZIG_ROOT / ".zig-cache/media-owner-overlays"
     overlay_parent.mkdir(parents=True, exist_ok=True)
     report = dict(
-        scope="compiled media owner and source-free PDF caller", passed=False, phases=[]
+        scope="compiled retained PDF owner and reader-free client"
+        if args.retained
+        else "compiled media owner and source-free PDF caller",
+        passed=False,
+        phases=[],
     )
     with tempfile.TemporaryDirectory(dir=overlay_parent) as directory:
         root = Path(directory) / "zig"
         link_children(ZIG_ROOT, root)
-        changed_sources = {
-            phase: own(root, path)
-            for phase, path in {
-                "provider": "pkg/antfly-embedded/src/storage/enrichment_compute_provider.zig",
-                "client": "pkg/antfly-embedded/src/storage/pdf_session_client.zig",
-                "contract": "pkg/antfly-embedded/src/storage/enrichment_compute_abi.zig",
-            }.items()
+        paths = {
+            "provider": "pkg/antfly-embedded/src/storage/enrichment_compute_provider.zig",
+            "client": "pkg/antfly-embedded/src/storage/pdf_session_client.zig",
+            "contract": "pkg/antfly-embedded/src/storage/enrichment_compute_abi.zig",
         }
-        for phase in ("initial", "warm", "provider", "client", "contract"):
+        if args.retained:
+            paths = {
+                "provider": "pkg/antfly-embedded/src/storage/pdf_native_provider.zig",
+                "reader": "lib/pdf/src/reader.zig",
+                "renderer": "lib/pdf/src/render.zig",
+                "client": "pkg/antfly-embedded/src/storage/pdf_facade.zig",
+                "contract": "lib/pdf/src/values.zig",
+                "protocol": "pkg/antfly-embedded/src/storage/pdf_native_contract.zig",
+            }
+        changed_sources = {phase: own(root, path) for phase, path in paths.items()}
+        for phase in ("initial", "warm", *paths):
             if phase in changed_sources:
                 path = changed_sources[phase]
                 path.write_text(
@@ -72,7 +88,10 @@ def main():
                     "tools/run_bounded_zig_build.py",
                     "--",
                     "build",
-                    "opaque-pdf-session-test",
+                    "compiled-pdf-native-test"
+                    if args.retained
+                    else "opaque-pdf-session-test",
+                    *(["-Dshared-pdf-sessions=true"] if args.retained else []),
                     "-Doptimize=fast",
                     "-Dstrip=true",
                     "-Dcpu=baseline",
@@ -127,7 +146,13 @@ def main():
             actual = {}
             for name, kind, artifact in (
                 ("provider", "lib", "antfly-runtime-enrichment_compute"),
-                ("client", "test_obj", "opaque-pdf-session-tests"),
+                (
+                    "client",
+                    "test_obj",
+                    "pdf-native-owner-tests"
+                    if args.retained
+                    else "opaque-pdf-session-tests",
+                ),
             ):
                 match = re.search(
                     rf"compile {kind} {artifact} fast \S+ (cached|success)\b", output
@@ -137,10 +162,11 @@ def main():
                 actual[name] = match[1]
             expected = dict(
                 provider="success"
-                if phase in ("initial", "provider", "contract")
+                if phase
+                in ("initial", "provider", "reader", "renderer", "contract", "protocol")
                 else "cached",
                 client="success"
-                if phase in ("initial", "client", "contract")
+                if phase in ("initial", "client", "contract", "protocol")
                 else "cached",
             )
             row.update(compilers=actual, expected=expected)

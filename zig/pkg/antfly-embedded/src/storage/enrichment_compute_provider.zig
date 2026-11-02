@@ -385,3 +385,9 @@ pub fn bufferDestroy(buffer: *abi.OwnedBytes) callconv(.c) void {
     if (buffer.ptr) |ptr| std.heap.c_allocator.free(ptr[0..@intCast(buffer.len)]);
     buffer.* = .{};
 }
+
+/// Hidden operation accessors keep unused PDF operations dead-strippable.
+pub fn exportPdfNativeOperations() void {
+    if (@hasDecl(@import("build_options"), "pdf_native_provider") and @import("build_options").pdf_native_provider)
+        @import("pdf_native_provider.zig").exportOperations();
+}
