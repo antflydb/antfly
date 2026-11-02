@@ -150,8 +150,17 @@ preparation API do not by themselves complete these remaining requirements:
   `graph/decoder_work.zig` owns borrowed queued prefill/decode records, resident
   prefix geometry and validation. Bounded device bursts read an immutable token
   budget rather than dereferencing task continuation state. Task publication and
-  the physical scheduled executor are still in generation; extracting the latter
-  remains required before claiming runtime ownership of the entire step loop.
+  stopping/streaming policy remain in generation. The physical scheduled forward
+  is owned by `graph/decoder_step_executor.zig`: it receives explicit context,
+  queued work, padding, continuation control and lane access, without a task
+  pipeline or tokenizer. It owns frame submission/readback cleanup, bounded
+  device bursts, KV reservation rollback and CUDA epoch retirement. The reader
+  epoch calls it directly; a separate task adapter publishes completed results
+  while retaining the scheduler turn and lane. A shared execution-access record
+  preserves FIFO/phase priority and cancellation-independent cleanup.
+  Sampled eager/replay/compiled forward uses the same typed entry point in the
+  runtime and generation. General KV pool policy, every eager fast path and all
+  resident task transitions have not yet migrated behind that owner.
 - `execution/testing/model_formats.zig` compares deterministic one-layer BERT
   and sliding-window decoder graphs loaded through real ONNX, safetensors and
   GGUF parsers. Deliberately lossy Q8_0 weights use an independently rounded CPU

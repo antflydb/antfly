@@ -35,6 +35,7 @@ const Options = struct {
     output: ?[]const u8 = null,
     decoder_steps: usize = 0,
     decoder_request_contexts: bool = false,
+    decoder_scheduled: bool = false,
     diagnostics: bool = false,
     soak_seconds: u64 = 0,
     soak_pause_ms: u64 = 1000,
@@ -47,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
     var options = Options{};
     while (args.next()) |arg| {
         const value = args.next() orelse return error.MissingArgument;
-        if (std.mem.eql(u8, arg, "--primitive")) options.primitive = std.meta.stringToEnum(Primitive, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--rows")) options.rows = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--dim")) options.dim = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = value else if (std.mem.eql(u8, arg, "--backend")) options.backend = backend_choice.parse(value) orelse return error.InvalidBackend else if (std.mem.eql(u8, arg, "--batch")) options.batch = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--seq-len")) options.seq_len = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--warmup-iters")) options.warmup = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--measure-iters")) options.iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--output")) options.output = value else if (std.mem.eql(u8, arg, "--diagnostics")) options.diagnostics = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-request-contexts")) options.decoder_request_contexts = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-steps")) options.decoder_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--soak-seconds")) options.soak_seconds = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-pause-ms")) options.soak_pause_ms = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-allocator")) options.soak_allocator = std.meta.stringToEnum(@TypeOf(options.soak_allocator), value) orelse return error.InvalidArgument else return error.InvalidArgument;
+        if (std.mem.eql(u8, arg, "--primitive")) options.primitive = std.meta.stringToEnum(Primitive, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--rows")) options.rows = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--dim")) options.dim = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = value else if (std.mem.eql(u8, arg, "--backend")) options.backend = backend_choice.parse(value) orelse return error.InvalidBackend else if (std.mem.eql(u8, arg, "--batch")) options.batch = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--seq-len")) options.seq_len = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--warmup-iters")) options.warmup = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--measure-iters")) options.iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--output")) options.output = value else if (std.mem.eql(u8, arg, "--diagnostics")) options.diagnostics = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-request-contexts")) options.decoder_request_contexts = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-scheduled")) options.decoder_scheduled = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-steps")) options.decoder_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--soak-seconds")) options.soak_seconds = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-pause-ms")) options.soak_pause_ms = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-allocator")) options.soak_allocator = std.meta.stringToEnum(@TypeOf(options.soak_allocator), value) orelse return error.InvalidArgument else return error.InvalidArgument;
     }
     if (options.primitive) |primitive| {
         if (options.backend != .native or options.rows == 0 or options.dim == 0 or options.iterations == 0 or options.soak_seconds != 0) return error.InvalidGeometry;
@@ -57,6 +58,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (options.model_dir.len == 0 or options.batch == 0 or options.seq_len < 4 or options.iterations == 0) return error.InvalidGeometry;
+    if ((options.decoder_request_contexts or options.decoder_scheduled) and options.decoder_steps == 0) return error.InvalidGeometry;
+    if (options.decoder_request_contexts and options.decoder_scheduled) return error.InvalidGeometry;
     // Keep the timing allocator unchanged; the C backing isolates long-run
     // library ownership from the SMP allocator's unreleased free-list slabs.
     var bounded = inference.runtime.bounded_allocator.BoundedAllocator{ .backing = if (options.soak_allocator == .c) std.heap.c_allocator else std.heap.smp_allocator, .limit = 8 * 1024 * 1024 * 1024 };
@@ -75,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
     const model_loaded = inference.platform.time.awakeNs(init.io);
     const session = model.session;
     if (options.decoder_steps != 0) {
-        if (options.decoder_request_contexts) try runDecoderRequests(init, model, a, options) else try runDecoder(init, model, a, options, &bounded);
+        if (options.decoder_scheduled) try runScheduledDecoder(init, model, a, options) else if (options.decoder_request_contexts) try runDecoderRequests(init, model, a, options) else try runDecoder(init, model, a, options, &bounded);
         return;
     }
     if (@hasDecl(inference.backends.Session, "configureExecutionDiagnostics")) _ = session.configureExecutionDiagnostics(options.diagnostics);
@@ -339,6 +342,95 @@ fn runSoak(init: std.process.Init, session: inference.backends.Session, inputs: 
         if (options.soak_pause_ms != 0) try init.io.sleep(.fromMilliseconds(@intCast(options.soak_pause_ms)), .awake);
     }
     std.debug.print("soak_complete backend={s} iterations={d} elapsed_s={d} strict_resident={} alternating_inputs=true\n", .{ @tagName(session.backend()), iterations, (inference.platform.time.awakeNs(init.io) - start) / std.time.ns_per_s, @hasDecl(inference, "execution") });
+}
+
+/// Exercise the production scheduler handoff, physical forward and per-work
+/// publication against the frozen pipeline implementation with identical inputs.
+fn runScheduledDecoder(init: std.process.Init, model: *inference.server.model_manager.LoadedModel, a: std.mem.Allocator, options: Options) !void {
+    if (options.batch != 1 or options.soak_seconds != 0) return error.UnsupportedDecoderBatch;
+    const generation = inference.pipelines.generation;
+    const Pipeline = generation.NativeGenerationPipeline;
+    const scheduler = inference.runtime.scheduler.native_generate;
+    const factory = inference.architectures.session_factory;
+    const config = factory.getGptConfig(model.session) orelse return error.MissingDecoderConfig;
+    var cb = try factory.getComputeBackend(model.session, a);
+    defer cb.deinit();
+    var mutex: std.atomic.Mutex = .unlocked;
+    var pipeline = Pipeline{ .allocator = a, .io = init.io, .cb = cb, .gpt_config = config, .session = model.session, .tokenizer = model.getTokenizer(), .execution_lock = &mutex };
+    defer pipeline.deinit();
+    const kind: inference.runtime.kv.pool.BackendKind = switch (model.session.backend()) {
+        .metal => .metal,
+        .cuda => .cuda,
+        else => .native,
+    };
+    const pool_config = generation.kvPoolConfig(kind, .f16, config, false);
+    var kv = inference.runtime.kv.manager.KvManager.init(a);
+    defer kv.deinit();
+    const pool = try kv.addPool(generation.requestKvManagerPoolConfig(pool_config));
+    var storage = try inference.runtime.kv.storage_runtime.KvStorageRuntime.init(a, pool_config);
+    defer storage.deinit();
+    try cb.provisionKvDeviceWriteHook(&storage);
+    const prompt = try a.alloc(i64, options.seq_len);
+    defer a.free(prompt);
+    for (prompt, 0..) |*token, index| token.* = @intCast(1 + index % @max(@as(usize, 1), config.vocab_size - 1));
+    const samples = try a.alloc(u64, options.iterations);
+    defer a.free(samples);
+    var reference = std.ArrayListUnmanaged(f32).empty;
+    defer reference.deinit(a);
+    for (0..options.warmup + options.iterations) |iteration| {
+        var state = generation.NativeDecodeState.initPaged(a, &kv, pool, null);
+        defer state.deinit();
+        state.kv_storage = &storage;
+        state.configureForGptConfig(config);
+        var coordinator = scheduler.NativeGenerateCoordinator.init(a);
+        defer coordinator.deinit();
+        var lease = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = prompt.len * 8, .max_tokens = std.math.cast(i32, options.decoder_steps) orelse return error.InvalidGeometry });
+        defer coordinator.release(lease);
+        var slots: [64]scheduler.StepItem = undefined;
+        var step_items = std.ArrayListUnmanaged(scheduler.StepItem).empty;
+        var values = std.ArrayListUnmanaged(f32).empty;
+        defer values.deinit(a);
+        const start = inference.platform.time.awakeNs(init.io);
+        {
+            var work = Pipeline.PendingPrefillBatchWork{ .allocator = a, .decode_state = &state, .token_ids = prompt, .seq_len = prompt.len, .query_seq_len = prompt.len, .wants_last_logits = true };
+            defer if (work.logits) |logits| a.free(logits);
+            try coordinator.enqueuePrefillWork(lease, &work, prompt.len, prompt.len, 0, 0, .{});
+            var claimed = coordinator.claimNextStep(coordinator.defaultStepBudget(), &slots, &step_items) orelse return error.NoScheduledWork;
+            pipeline.executeClaimedStep(&coordinator, &claimed, step_items.items);
+            if (!work.ready.load(.acquire)) return error.ScheduledWorkNotPublished;
+            if (work.failure) |err| return err;
+            const logits = work.logits orelse return error.MissingDecoderOutput;
+            if (logits.len != config.vocab_size) return error.InvalidDecoderOutput;
+            try values.appendSlice(a, logits);
+            coordinator.notePrefillProgress(&lease, prompt.len, prompt.len);
+        }
+        coordinator.beginDecode(&lease, prompt.len);
+        for (0..options.decoder_steps) |step| {
+            try state.appendGeneratedToken();
+            var decode_runtime = inference.graph.decode_state_runtime.BorrowedDecodeStateRuntime.init(&state);
+            const context = decode_runtime.makeDecodeContext(state.total_tokens, 1);
+            var work = Pipeline.PendingDecodeBatchWork{ .allocator = a, .decode_state = &state, .token_id = @intCast(11 + step), .seq_len = state.total_tokens };
+            defer if (work.logits) |logits| a.free(logits);
+            try coordinator.enqueueDecodeWork(lease, &work, state.total_tokens, context.kv_sequence_len, context.kv_position_offset, .{});
+            var claimed = coordinator.claimNextStep(coordinator.defaultStepBudget(), &slots, &step_items) orelse return error.NoScheduledWork;
+            pipeline.executeClaimedStep(&coordinator, &claimed, step_items.items);
+            if (!work.ready.load(.acquire)) return error.ScheduledWorkNotPublished;
+            if (work.failure) |err| return err;
+            const logits = work.logits orelse return error.MissingDecoderOutput;
+            if (logits.len != config.vocab_size) return error.InvalidDecoderOutput;
+            try values.appendSlice(a, logits);
+            coordinator.noteDecodeProgress(&lease, step + 1);
+        }
+        const elapsed = inference.platform.time.awakeNs(init.io) - start;
+        for (values.items) |value| if (!std.math.isFinite(value)) return error.NonFiniteOutput;
+        if (iteration == 0) try reference.appendSlice(a, values.items) else if (!std.mem.eql(f32, reference.items, values.items)) return error.DecoderResetOutputChanged;
+        if (iteration >= options.warmup) samples[iteration - options.warmup] = elapsed;
+    }
+    if (options.output) |path| try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(reference.items) });
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    var checksum: f64 = 0;
+    for (reference.items) |value| checksum += value;
+    std.debug.print("unified_decoder_scheduled backend={s} prompt={d} decode_steps={d} iterations={d} output_elements={d} checksum={d:.9} p50_ns={d} p95_ns={d} min_ns={d} reset_parity=exact\n", .{ @tagName(model.session.backend()), prompt.len, options.decoder_steps, options.iterations, reference.items.len, checksum, samples[samples.len / 2], samples[@min(samples.len - 1, samples.len * 95 / 100)], samples[0] });
 }
 
 /// Include request-wrapper construction and retirement. Alternating arenas

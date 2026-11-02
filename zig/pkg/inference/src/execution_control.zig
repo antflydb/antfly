@@ -674,3 +674,50 @@ test "LightOnOCR3 execution lane cleanup survives cancellation of its owning Io 
     try std.testing.expect(done.load(.acquire));
     try std.testing.expect(!lane.owned and lane.head == null and lane.tail == null);
 }
+
+/// Borrowed admission for a physical backend lane. Callers retain all fields
+/// through the final drain and release; cleanup always ignores cancellation.
+pub const ExecutionAccess = struct {
+    mutex: ?*std.atomic.Mutex = null,
+    gate: ?*ExecutionLane = null,
+    io: ?std.Io = null,
+    control: ?InferenceExecutionControl = null,
+    contention_wait_ns: u64 = 0,
+    phase_waiters: ?*std.atomic.Value(usize) = null,
+    phase_wake: ?*std.Io.Event = null,
+    phase_wake_io: ?std.Io = null,
+
+    fn finishPhaseWait(self: ExecutionAccess) void {
+        const count = self.phase_waiters orelse return;
+        if (count.fetchSub(1, .acq_rel) == 1) if (self.phase_wake) |event| {
+            if (self.phase_wake_io) |io| event.set(io);
+        };
+    }
+
+    pub fn acquire(self: ExecutionAccess) !void {
+        const mutex = self.mutex orelse return;
+        if (self.phase_waiters) |count| _ = count.fetchAdd(1, .acq_rel);
+        defer self.finishPhaseWait();
+        var control = self.control orelse InferenceExecutionControl{};
+        if (control.io == null) control.io = self.io;
+        const queued = if (self.gate) |lane| try lane.acquireWithPriority(control, self.phase_waiters != null) else null;
+        errdefer if (queued) |lease| lease.release();
+        try control.lockWithPoll(mutex, self.contention_wait_ns);
+    }
+
+    pub fn acquireForCleanup(self: ExecutionAccess) void {
+        const mutex = self.mutex orelse return;
+        if (self.phase_waiters) |count| _ = count.fetchAdd(1, .acq_rel);
+        defer self.finishPhaseWait();
+        if (self.gate) |lane| _ = lane.acquireForCleanup(self.io, self.phase_waiters != null);
+        if (self.phase_waiters != null) {
+            (InferenceExecutionControl{}).lockWithPoll(mutex, if (self.contention_wait_ns == 0) 100 * std.time.ns_per_us else self.contention_wait_ns) catch unreachable;
+        } else @import("antfly_platform").sync.lockYielding(mutex);
+    }
+
+    pub fn release(self: ExecutionAccess) void {
+        const mutex = self.mutex orelse return;
+        mutex.unlock();
+        if (self.gate) |lane| (ExecutionLane.Lease{ .lane = lane }).release();
+    }
+};
