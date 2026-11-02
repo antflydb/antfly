@@ -1661,12 +1661,14 @@ const Execution = struct {
         const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
         const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .allow_partial = self.predicate_allow_partial and !std.mem.eql(u8, json, self.predicate_exclusion_json), .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
         var result = (try resolver.resolve(a, json)) orelse return null;
-        errdefer result.bitmap.deinit();
+        errdefer result.deinit();
         if (self.overlay) |overlay| {
             if (!result.exact) {
-                result.bitmap.deinit();
+                result.deinit();
                 return null;
             }
+            var recent = local.encoding_roaring.RoaringBitmap.init(a);
+            defer recent.deinit();
             const filter = try std.json.parseFromSliceLeaky(std.json.Value, self.arena, json, .{});
             var offset: u32 = 0;
             for (snapshot.segments, 0..) |segment, ordinal| {
@@ -1678,10 +1680,11 @@ const Execution = struct {
                     const id = try snapshot.storedIdScoped(self.arena, offset + @as(u32, @intCast(doc))) orelse continue;
                     const row = overlay.row(id) orelse continue;
                     try self.context.ensureActive();
-                    if (try local.storage_db_query_graph_exec.jsonDocMatchesPatternFilter(self.arena, id, row, filter)) try result.bitmap.add(offset + @as(u32, @intCast(doc)));
+                    if (try local.storage_db_query_graph_exec.jsonDocMatchesPatternFilter(self.arena, id, row, filter)) try recent.add(offset + @as(u32, @intCast(doc)));
                 }
                 offset = try std.math.add(u32, offset, segment.reader.doc_count);
             }
+            try @import("lake_index_recent_predicate.zig").append(a, &result, identities.offsets[identities.offsets.len - 1], &recent, self.context);
         }
         return result;
     }
