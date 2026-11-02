@@ -16,7 +16,10 @@ stable allocator callback context until close.
 
 The render request accepts a synchronous output allocator. The new client
 charges the retained PNG directly to that allocator and returns it without a
-second full-output copy. The existing one-shot operation still returns a
+second full-output copy. The current allocation bridge exposes allocate/free,
+with resize/remap fallback; runtime peak-allocation behavior still needs
+qualification before migrating callers that can resize buffers in place. The
+existing one-shot operation still returns a
 provider-owned buffer, preserves its operation identity and delegates to the
 same session implementation. No external/public CAPI exports were added.
 
@@ -97,7 +100,8 @@ actual per-declaration `sema_count` field. The collector connects after the buil
 summary because this compiler announces its socket before configuring its graph;
 an earlier connection can panic in the compiler. Raw frames and logs are kept.
 
-Run it from `zig/`, for example:
+These measurement commands require Python 3.11 or newer (native screening used
+Python 3.13). Run from `zig/`, for example:
 
 ```sh
 python3 ../scripts/collect_zig_time_report.py --output ../media-timings.json -- \
@@ -127,6 +131,55 @@ per-process and same-poll aggregate measurements remain separate.
 Receipts are ignored under `.benchmark-results/compile-costs/`: `pdf-session-v3.*`,
 `media-owner-regressions.log`, `media-owner-debug.log`, `media-owner-cache*.json/log`,
 `pdf-consumer-time-report.*`, `media-owner-time-report.*`, and
-`libantfly-link-map.json`. No new production binaries have been qualified by this
-slice. P0 server attribution and controlled production baseline, P1b/P1c, and
+`libantfly-link-map.json`. The native product regression below does not qualify a performance gain.
+P0 server attribution and controlled production baseline, P1b/P1c, and
 P2–P7 retain the plan's original exit criteria.
+
+## Combined native product regression
+
+The frozen production source at `f5c0c79fe8` completed the native CPU Fast/stripped
+combined build and selected integration checks: **133/133 build steps succeeded**.
+This included 57 storage-owner tests and three opaque-query-owner tests without
+skips/leaks, CAPI smoke checks, linked-inference ABI integration, CLI checks and
+verification of exactly 134 public CAPI exports with no internal exports.
+The HTTP query/deadline regression selection also passed all 10 tests.
+
+| Installed artifact | Bytes | Change from `9b3fda9f22` |
+| --- | ---: | ---: |
+| `antfly` | 229,621,752 | 0 |
+| `libantfly.dylib` | 80,026,400 | 0 |
+| Storage archive | 64,326,696 | +24 |
+| Inference archive | 47,953,232 | 0; identical SHA256 |
+
+Server SHA256:
+`5625169022d2962c5acf8c30fcead5af7d5b539c7476d21d32f08270f83e22c2`.
+C-library SHA256:
+`71c40b8e86ba8c7c9ee6eb3c2ae4af2536ca29d30d31ae40612fa7e6dfaaaa60`.
+The earlier pre-query-owner server cost remains +3,981,856 bytes.
+
+The new verified linker map reports 66,600,616 text bytes, four bytes above the
+baseline despite unchanged page-aligned file size. The new session exports and
+the existing one-shot render export are dead-stripped from this library. The
+three retained PDF image decoders and the nominal 3,848,196-byte repeated-name
+candidate total remain: this prototype has **not** removed production PDF/image
+duplication. Full caller migration remains necessary.
+
+This regression run took 2,856 seconds, with sampled individual and same-poll
+compiler RSS peaks both about 8.89 GiB. It was not a controlled paired timing or
+memory qualification: other work ran on the host, and earlier cached outputs
+were absent. Rebuilding the inference archive produced identical bytes; this
+observation alone does not diagnose cache-key invalidation. Memory reservations
+remain unchanged.
+
+A subsequent correctly rooted warm check passed 110/110 steps, with the physical
+storage, inference, API and media owners cached and both media suites passing.
+An initial warm invocation from the repository root used incorrect fixture paths
+and different cache arguments; only that invocation was stopped. Its failed log
+is retained separately and is not counted as a regression or timing measurement.
+The new PDF suite is now included in the existing storage/integration aggregates,
+as well as its explicit `opaque-pdf-session-test` entry point.
+
+Receipts: `media-session-products.*`, `media-session-products-artifacts.json`,
+`media-session-libantfly.map`, `media-session-libantfly-link-map.json`,
+`media-session-final-warm-corrected.log`, and `media-session-http.log`.
+The raw map and its cached dylib were SHA256 matched before cache cleanup.

@@ -131,9 +131,15 @@ jobs:
             --output .benchmark-results/compile-costs/archive-work.json
       - name: Attribute linked symbols and embedded asset candidates
         if: ${{ success() && !inputs.strip && (inputs.step == 'products' || inputs.step == 'antfly') }}
+        env:
+          BUILD_STEP: ${{ inputs.step }}
         run: |
           python3 scripts/report_zig_binary_size.py zig/zig-out/bin/antfly --source-root zig \
             --output .benchmark-results/compile-costs/binary-size.json
+          if [ "$BUILD_STEP" = products ]; then
+            python3 scripts/report_zig_binary_size.py zig/zig-out/lib/libantfly.so --source-root zig \
+              --output .benchmark-results/compile-costs/capi-binary-size.json
+          fi
           # This is an attribution profile, not a substitute for -Dstrip=true.
           llvm-strip --strip-all -o .benchmark-results/compile-costs/antfly.stripped zig/zig-out/bin/antfly
           stat -c '%s' .benchmark-results/compile-costs/antfly.stripped > .benchmark-results/compile-costs/postlink-stripped-bytes.txt

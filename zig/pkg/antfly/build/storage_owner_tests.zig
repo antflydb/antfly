@@ -27,7 +27,7 @@ pub const test_sources = [_][]const u8{
 
 /// Exercise the same storage archive linked by serving and embedded consumers.
 /// Root composition attaches these runs to the owning test aggregates.
-pub const Result = struct { runs: [4]*std.Build.Step.Run, benchmark: *std.Build.Step.Compile };
+pub const Result = struct { runs: [5]*std.Build.Step.Run, benchmark: *std.Build.Step.Compile };
 
 pub fn add(
     b: *std.Build,
@@ -46,7 +46,7 @@ pub fn add(
         .optimize = optimize,
         .version = "test",
     });
-    var runs: [4]*std.Build.Step.Run = undefined;
+    var runs: [5]*std.Build.Step.Run = undefined;
     var benchmark: *std.Build.Step.Compile = undefined;
     inline for (.{ "storage_kernel_owner_test_root.zig", "storage_kernel_provisioned_source_test_root.zig", "enrichment_compute_test_root.zig", "storage_boundary_bench.zig" }, 0..) |root, index| {
         const module = b.createModule(.{
@@ -130,7 +130,8 @@ pub fn add(
         .max_rss = 1024 * 1024 * 1024,
     });
     pdf_tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
-    b.step("opaque-pdf-session-test", "Test retained PDF state from a source-free client").dependOn(&pdf_tests.run(b).step);
+    runs[4] = pdf_tests.run(b);
+    b.step("opaque-pdf-session-test", "Test retained PDF state from a source-free client").dependOn(&runs[4].step);
     b.step("opaque-pdf-consumer-compile", "Compile the PDF client without building its implementation owner").dependOn(&pdf_tests.object.step);
     const opaque_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/opaque_query_owner_test_root.zig"), .target = target, .optimize = optimize });
     opaque_module.link_libc = true;

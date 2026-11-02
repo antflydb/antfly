@@ -21,7 +21,8 @@ rejected mutation outlining experiment are recorded in
 | P2–P7 redesigns | Open, apart from the media cache matrix above; acceptance gates remain unchanged |
 
 P1a and the measurement tools do not establish smaller production binaries or
-faster complete builds. No new whole-product size or cold-build claim is made.
+faster complete builds. The native product regression passed; both installed product sizes remained
+unchanged. No whole-product size reduction or cold-build speedup is claimed.
 
 ## Decision
 
@@ -517,8 +518,8 @@ This work accompanies P0–P6 rather than waiting until the end.
 | More schema/JSON deduplication | One schema parser in CAPI already; server has several candidates. Use actual retained size and per-declaration cost to select a concrete operation. |
 | Backend capability census | Extend the successful disabled-CUDA approach to genuinely disabled implementations. Maintain allowlists for portable planners/stubs; a name containing `metal` or `cuda` is not proof of accidental GPU execution. |
 | Full physical index split | The existing lifecycle probe is incomplete. Move complete query/mutation/persistence operations only after a measured family is selected. Per-posting/backend callbacks or a second backend implementation fail the boundary policy. |
-| Safe identical-code folding | Small ELF-only relink experiment if the pinned toolchain can expose it. Verify address-significance/function-pointer semantics and all exports. Similar source or normalized fragments are not proof that a linker can fold the code. |
-| ThinLTO | Capability spike only. The installed Zig help exposes `-flto`, not a verified `-flto=thin` interface. Do not assume Clang commands apply. Test compatibility with the external Mach-O CAPI link, backend concurrency, cache invalidation and memory before integration. |
+| Safe identical-code folding | The pinned driver rejects `-Wl,--icf=safe`; no external LLD is installed locally. Keep this deferred pending a qualified external ELF linker. Verify address-significance/function-pointer semantics and all exports. Similar source is not proof of foldability. |
+| ThinLTO | Tiny cross-library ELF probes passed with `.lto = .thin`, but the pinned compiler rejects Mach-O LTO (`LTO requires using LLD`; forcing LLD: `using LLD to link macho files is unsupported`). Do not integrate into the shared default product. Linux-only experiments still need production concurrency, cache and memory qualification. See [capability receipt](history/linker-capabilities-2026-11-01.md). |
 | Full LTO | Avoid as the default solution to memory pressure: it recombines optimization work. |
 | ReleaseSmall | Outside the current ReleaseFast product constraint. A separate product decision, not an equivalent comparison. |
 | Fonts/tokenizer compression | Secondary: the measured large literals are already small relative to code. Measure startup/decompression memory and asset access before changing delivery. |
