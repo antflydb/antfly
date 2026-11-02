@@ -77,9 +77,35 @@ class StorageTestShardAuditTest(unittest.TestCase):
             )
         manifest.write_text('_ = @import("owner.zig");\n')
         self.assertEqual(
-            ["test source missing from manifest: db/query.zig"],
+            [
+                "test source missing from manifest: db/query.zig "
+                '(add `_ = @import("antfly_local_sources").local_query;` '
+                "to test_manifest.zig)"
+            ],
             audit.audit_manifest(
                 self.root / "local/storage", manifest, ["storage.db."], catalog=catalog
+            ),
+        )
+
+    def test_rejects_local_source_missing_from_catalog_and_manifest(self):
+        # Regression for a local storage source added without registering it
+        # in either the catalog or the manifest (both must gain an entry).
+        self.write("local/storage/lite/ledger_digest.zig", 'test "ledger" {}\n')
+        self.write("local/source_catalog.zig", "")
+        self.write("server/storage/test_manifest.zig", "")
+        self.assertEqual(
+            [
+                "test source missing from manifest: lite/ledger_digest.zig "
+                "(add `pub const storage_lite_ledger_digest = "
+                '@import("storage/lite/ledger_digest.zig");` to source_catalog.zig, '
+                'then `_ = @import("antfly_local_sources").storage_lite_ledger_digest;` '
+                "to test_manifest.zig)"
+            ],
+            audit.audit_manifest(
+                self.root / "local/storage",
+                self.root / "server/storage/test_manifest.zig",
+                ["storage.lite."],
+                catalog=self.root / "local/source_catalog.zig",
             ),
         )
 
@@ -121,7 +147,10 @@ class StorageTestShardAuditTest(unittest.TestCase):
         self.write("db/query/scan.zig", 'test "scan" {}\n')
         self.write("test_manifest.zig", "")
         self.assertEqual(
-            ["test source missing from manifest: db/query/scan.zig"],
+            [
+                "test source missing from manifest: db/query/scan.zig "
+                '(add `_ = @import("db/query/scan.zig");` to test_manifest.zig)'
+            ],
             self.audit(["storage.db.query."]),
         )
 
