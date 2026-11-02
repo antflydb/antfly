@@ -43,6 +43,17 @@ table read/write permission; catalog initialization and maintenance remain admin
 operations. Resume the seed producer's existing durable epoch/checkpoint when
 qualifying or launching it, rather than introducing a second CDC owner.
 
+The seed producer created with RC.8 uses an indexed revision-4 `.aflite` file;
+RC.9 uses revision 7 and rejects that physical file. Migrate through a portable
+`.afb` backup using the matching RC.8 binary/library for export and RC.9 for
+restore, as described in [Lite backup and restore](../../docs/guides/lite.mdx).
+Use the producer writer lock to capture a stable copy, retain the original, and
+restore into a new file. Compare every logical key/document, the source epoch,
+checkpoint, cohort and pending intent before promotion. Do not initialize a new
+CDC owner or silently reset a pending intent. Qualification restored all 497
+seed-state documents with identical logical digest, epoch and checkpoint 2;
+the original owner file remains unchanged until an explicitly managed switch.
+
 The plan defaults to the exact published RC.9 OCI index in `runtime.json`. An
 optional `--image` accepts a registry mirror only when its digest matches that pin.
 Generate reviewable requests in a new directory, without contacting Cloud:
