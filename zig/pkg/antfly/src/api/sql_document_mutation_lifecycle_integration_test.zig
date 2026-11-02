@@ -193,6 +193,8 @@ pub const SourceCampaign = struct {
             try probe(ctx, "INSERT INTO usage_records(id,status) VALUES ('u3','collision')", "23505");
         } else if (std.mem.eql(u8, self.entry.id, "sql-0591")) {
             try probe(ctx, "INSERT INTO prices(sku,status) VALUES ('a','collision')", "23505");
+        } else if (std.mem.eql(u8, self.entry.id, "sql-0015")) {
+            try probe(ctx, "INSERT INTO usage_records(id,status) VALUES ('a','collision')", "23505");
         } else if (std.mem.eql(u8, self.entry.id, "sql-0008")) {
             try probe(ctx, "INSERT INTO usage_records(id,status) VALUES ('u1','collision')", "23505");
         } else if (std.mem.eql(u8, self.entry.id, "sql-0009") or std.mem.eql(u8, self.entry.id, "sql-0010")) {
@@ -1565,4 +1567,56 @@ test "mounted SQL original index and constraint comments preserve schemas rows a
             .final = .{ .columns = &.{ "id", "status" }, .column_oids = &.{ 25, 25 }, .rows = &rows },
         }},
     } } });
+}
+
+// This uses the unchanged original SQL, real Raft-backed metadata/data owners,
+// authenticated HTTP, durable sessions, native UNIQUE claims and cold reopen.
+test "mounted SQL original writable CTE preserves PostgreSQL rollback and cold identities" {
+    const WritableCteCampaign = struct {
+        pub const native_sessions = true;
+        pub const native_auth = true;
+        pub const cold_catalog = true;
+        inner: SourceCampaign,
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.inner.beforeRestart(ctx);
+            var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+            defer corpus.deinit();
+            const original = try corpus.get("sql-0015");
+            try @import("sql_prepared_source_test_client.zig").runRejected(ctx, original.sql, "21000");
+            try self.inner.verifyRows(ctx);
+            try self.inner.fingerprints(ctx, .prepared);
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.inner.afterRestart(ctx);
+            var corpus = try local.sql_parity_fixtures.Corpus.init(ctx.alloc);
+            defer corpus.deinit();
+            const original = try corpus.get("sql-0015");
+            try @import("sql_prepared_source_test_client.zig").runRejected(ctx, original.sql, "21000");
+            try self.inner.verifyRows(ctx);
+            try self.inner.fingerprints(ctx, .cold);
+        }
+    };
+    const a = std.testing.allocator;
+    var retained = std.heap.ArenaAllocator.init(a);
+    defer retained.deinit();
+    const owned = retained.allocator();
+    const reference = try std.json.parseFromSliceLeaky(Json, owned, local.sql_parity_fixtures.mutation_cte_reference, .{});
+    const entry = for (reference.object.get("entries").?.array.items) |item| {
+        if (item.object.get("id")) |id| if (std.mem.eql(u8, id.string, "sql-0015")) break item;
+    } else return error.MissingWritableCteReference;
+    try std.testing.expectEqualStrings("21000", entry.object.get("sqlstate").?.string);
+    const names = [_][]const u8{ "usage_records", "source_records", "archived_records" };
+    const tables = try owned.alloc(SourceTable, names.len);
+    for (tables, names) |*table, name| {
+        const seed = if (std.mem.eql(u8, name, "archived_records"))
+            try owned.dupe(u8, "INSERT INTO archived_records(id,status,v,a,n) SELECT id,status,v,a,n FROM usage_records WHERE false")
+        else
+            try std.fmt.allocPrint(owned, "INSERT INTO {s}(id,status,v,a,n) VALUES ('a','queued',1,ARRAY[1,NULL,3],9007199254740993.0100),('b','closed',2,ARRAY[]::integer[],NULL)", .{name});
+        const raw_rows = entry.object.get("tables").?.object.get(name).?.array.items;
+        const rows = try owned.alloc([]const Json, raw_rows.len);
+        for (rows, raw_rows) |*row, value| row.* = value.array.items;
+        table.* = .{ .name = name, .create = try std.fmt.allocPrint(owned, "CREATE TABLE {s} (id TEXT PRIMARY KEY,status TEXT,v INTEGER DEFAULT 0,a INTEGER[],n NUMERIC(20,4))", .{name}), .seed = seed, .read = try std.fmt.allocPrint(owned, "SELECT id,status,v,a,n FROM {s} ORDER BY id", .{name}), .final = .{ .columns = &.{ "id", "status", "v", "a", "n" }, .column_oids = &.{ 25, 25, 23, 1007, 1700 }, .rows = rows } };
+    }
+    const original: SourceEntry = .{ .id = "sql-0015", .profile = "mutation_cte_atomic_cardinality", .sqlstate = "21000", .command_tag = "", .affected = 0, .output = .{ .columns = &.{}, .column_oids = &.{}, .rows = &.{} }, .tables = tables };
+    try fixture.runWithState(WritableCteCampaign, .{ .inner = .{ .entry = original, .retained = &retained } });
 }

@@ -1660,7 +1660,26 @@ pub const CopyFilter = struct {
 };
 
 pub const Backend = struct {
+    pub const StatementMutations = struct {
+        ptr: *anyopaque,
+        bind: ?*const fn (*anyopaque, @import("describe.zig").BoundStatement) anyerror!void = null,
+        finish: *const fn (*anyopaque) anyerror!void,
+        abort: *const fn (*anyopaque) void,
+    };
     pub const PreparedRead = struct { name: ast.Name, relation: ReadRelation };
+    /// Immutable name/type scope pinned by one statement-effect binding.
+    statement_ctes: ?*const @import("statement_cte_scope.zig").Scope = null,
+    statement_cte_visibility: usize = std.math.maxInt(usize),
+    /// Execution-owned typed replays and per-command tuple ownership.
+    statement_effect_execution: ?@import("statement_cte_scope.zig").Execution = null,
+    /// Private command collection, followed by one native validated stage.
+    /// finish runs after statement read leases close; abort always retires the
+    /// owner and discards unpublished effects, including on finish failure.
+    statement_mutations: ?struct {
+        ptr: *anyopaque,
+        begin: *const fn (*anyopaque, std.mem.Allocator) anyerror!StatementMutations,
+    } = null,
+
     /// Bound callbacks retain their native receiver when a backend decorator
     /// replaces ptr/vtable for authorization or prepared-read routing.
     validate_persisted_expressions: ?struct { ptr: *anyopaque, validate: *const fn (*anyopaque, std.mem.Allocator, ast.Statement) anyerror!void } = null,

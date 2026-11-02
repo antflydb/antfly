@@ -33,11 +33,13 @@ const Capture = @import("result_cursor.zig").Cursor;
 /// an adapter for scalar preparation fixtures, not an execution representation.
 const RowSource = union(enum) {
     capture: *Capture,
+    one: []const scalar.Datum,
     json: struct { rows: []const []const std.json.Value, nulls: []const []const bool },
 
     fn count(self: RowSource) usize {
         return switch (self) {
             .capture => |capture| capture.count(),
+            .one => 1,
             .json => |json| json.rows.len,
         };
     }
@@ -47,6 +49,10 @@ const RowSource = union(enum) {
             .capture => |capture| {
                 if (capture.width != width) return error.InvalidSqlBackendResponse;
                 return .{ .source = self, .width = width, .typed = try capture.openReplayReader() };
+            },
+            .one => |row| {
+                if (row.len != width) return error.InvalidSqlBackendResponse;
+                return .{ .source = self, .width = width };
             },
             .json => |json| {
                 if (json.rows.len != json.nulls.len) return error.InvalidSqlBackendResponse;
@@ -67,7 +73,7 @@ const RowSource = union(enum) {
             if (self.index == self.source.count()) return null;
             const cells = if (self.typed) |reader|
                 (try reader.next()) orelse return error.InvalidSqlBackendResponse
-            else blk: {
+            else if (self.source == .one) self.source.one else blk: {
                 const json = self.source.json;
                 const row = json.rows[self.index];
                 const flags = json.nulls[self.index];
@@ -325,9 +331,49 @@ pub const Candidates = struct {
         return self.prepareWithPageLimits(alloc, scratch_allocator, backend, .{ .capture = capture }, parameters, max_rows, max_bytes, page_limits);
     }
 
+    pub const Preparation = struct {
+        allocator: Allocator,
+        keys: std.StringHashMapUnmanaged(void) = .empty,
+        affected: std.StringHashMapUnmanaged(void) = .empty,
+        domain_admissions: []const ?@import("../schema/domain_row.zig").Admission,
+        old_layout: ?*const catalog.Row.TypedLayout,
+        retained: usize = 0,
+
+        pub fn init(alloc: Allocator, bound: Candidates) !Preparation {
+            const domain_admissions = try alloc.alloc(?@import("../schema/domain_row.zig").Admission, bound.arms.len);
+            for (bound.arms, domain_admissions) |arm, *admission| {
+                const assignments: []const BoundAssignment = switch (arm.action) {
+                    .update, .insert => |items| items,
+                    .delete, .nothing => &.{},
+                };
+                const provenance = try @import("domain_mutation.zig").Builder.init(alloc, bound.target, arm.action != .insert);
+                for (assignments) |assignment| try provenance.set(assignment.column, if (assignment.program) |program| program.output_type.domainView() else null, assignment.program == null);
+                admission.* = provenance.admission();
+            }
+            var old_layout: ?*const catalog.Row.TypedLayout = null;
+            if (bound.returning) {
+                var names: std.ArrayList([]const u8) = .empty;
+                for (bound.target.columns, bound.field_ordinals) |field, ordinal| {
+                    if (ordinal != null) try names.append(alloc, field.path);
+                }
+                old_layout = try catalog.Row.TypedLayout.init(alloc, names.items);
+            }
+            return .{ .allocator = alloc, .domain_admissions = domain_admissions, .old_layout = old_layout };
+        }
+    };
+
+    pub fn prepareOne(self: Candidates, alloc: Allocator, scratch: Allocator, backend: catalog.Backend, cells: []const scalar.Datum, parameters: []const std.json.Value, max_bytes: usize, state: *Preparation) !Prepared {
+        return self.prepareWithState(alloc, scratch, backend, .{ .one = cells }, parameters, 1, max_bytes, .{ .row_limit = 1, .byte_limit = max_bytes }, state);
+    }
+
     fn prepareWithPageLimits(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, backend: catalog.Backend, source: RowSource, parameters: []const std.json.Value, max_rows: usize, max_bytes: usize, page_limits: decision_eval.PageBudget) !Prepared {
+        var state = try Preparation.init(alloc, self);
+        return self.prepareWithState(alloc, scratch_allocator, backend, source, parameters, max_rows, max_bytes, page_limits, &state);
+    }
+
+    fn prepareWithState(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, backend: catalog.Backend, source: RowSource, parameters: []const std.json.Value, max_rows: usize, max_bytes: usize, page_limits: decision_eval.PageBudget, state: *Preparation) !Prepared {
         if (source.count() > max_rows) return error.SqlResultTooLarge;
-        var ordered = false;
+        var ordered = source == .one;
         for (self.arms) |arm| {
             if (arm.predicate) |*program| ordered = ordered or decision_eval.hasSequences(program);
             switch (arm.action) {
@@ -347,39 +393,12 @@ pub const Candidates = struct {
         defer scratch.deinit();
         var mutations: std.ArrayList(catalog.Mutation) = .empty;
         var source_rows: std.ArrayList(usize) = .empty;
-        var keys: std.StringHashMapUnmanaged(void) = .empty;
-        const domain_admissions = try alloc.alloc(?@import("../schema/domain_row.zig").Admission, self.arms.len);
-        for (self.arms, domain_admissions) |arm, *admission| {
-            const assignments: []const BoundAssignment = switch (arm.action) {
-                .update, .insert => |items| items,
-                .delete, .nothing => &.{},
-            };
-            const provenance = try @import("domain_mutation.zig").Builder.init(alloc, self.target, arm.action != .insert);
-            for (assignments) |assignment| try provenance.set(assignment.column, if (assignment.program) |program| program.output_type.domainView() else null, assignment.program == null);
-            admission.* = provenance.admission();
-        }
-        var affected: std.StringHashMapUnmanaged(void) = .empty;
-        var retained: usize = 0;
-        var old_layout: ?*const catalog.Row.TypedLayout = null;
-        if (self.returning) {
-            var names: std.ArrayList([]const u8) = .empty;
-            for (self.target.columns, self.field_ordinals) |field, ordinal| {
-                if (ordinal != null) try names.append(alloc, field.path);
-            }
-            old_layout = try catalog.Row.TypedLayout.init(alloc, names.items);
-        }
         for (0..source.count()) |source_index| {
             _ = scratch.reset(.retain_capacity);
             const cells = (try reader.next(scratch.allocator(), false)) orelse return error.InvalidSqlBackendResponse;
             try backend.vtable.checkpoint(backend.ptr);
             const selected = if (selections) |selected_rows| selected_rows[source_index] else try self.selectArmWithLimits(scratch.allocator(), cells, parameters, backend.decision_provider, decision_eval.limitsFor(backend));
             const arm_index = selected orelse continue;
-            if (ordered and (self.arms[arm_index].action == .update or self.arms[arm_index].action == .delete)) {
-                if (cells[0].sql_null or cells[0].value != .string) return error.InvalidSqlBackendResponse;
-                const slot = try affected.getOrPut(alloc, cells[0].value.string);
-                if (slot.found_existing) return error.SqlMutationCardinalityViolation;
-                slot.key_ptr.* = try alloc.dupe(u8, cells[0].value.string);
-            }
             if (self.arms[arm_index].action == .nothing) continue;
             const arm = self.arms[arm_index];
             const assignments: []const BoundAssignment = switch (arm.action) {
@@ -430,6 +449,15 @@ pub const Candidates = struct {
             }
             var key: ?[]const u8 = if (inserting) null else try alloc.dupe(u8, cells[0].value.string);
             const values = if (assignment_values) |computed| computed[source_index] orelse &.{} else try self.evaluateValuesWithLimits(scratch.allocator(), arm_index, cells, parameters, backend.decision_provider, decision_eval.limitsFor(backend));
+            // PostgreSQL evaluates a selected MERGE action before rejecting
+            // a repeated target. Its sequence effects survive the statement's
+            // rollback; ON CONFLICT has a different ownership/error boundary.
+            if (ordered and (self.arms[arm_index].action == .update or self.arms[arm_index].action == .delete)) {
+                if (cells[0].sql_null or cells[0].value != .string) return error.InvalidSqlBackendResponse;
+                const slot = try state.affected.getOrPut(state.allocator, cells[0].value.string);
+                if (slot.found_existing) return error.SqlMutationCardinalityViolation;
+                slot.key_ptr.* = try state.allocator.dupe(u8, cells[0].value.string);
+            }
             for (assignments, values) |assignment, datum| {
                 if (assignment.program == null) continue; // DEFAULT: native preparation fills the absent cell.
                 const field = assignment.column;
@@ -450,7 +478,9 @@ pub const Candidates = struct {
             if (inserting and key == null) key = try (backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(backend.ptr, alloc);
             const identity = key orelse return error.InvalidSqlBackendResponse;
             if (identity.len == 0 or !std.unicode.utf8ValidateSlice(identity)) return error.SqlRowIdentityRequired;
-            if ((try keys.getOrPut(alloc, identity)).found_existing) return error.DuplicateSqlRow;
+            const key_slot = try state.keys.getOrPut(state.allocator, identity);
+            if (key_slot.found_existing) return error.DuplicateSqlRow;
+            key_slot.key_ptr.* = try state.allocator.dupe(u8, identity);
             const version: u64 = if (inserting) 0 else blk: {
                 if (cells[1].sql_null or cells[1].value != .string) return error.InvalidSqlBackendResponse;
                 break :blk std.fmt.parseInt(u64, cells[1].value.string, 10) catch return error.InvalidSqlBackendResponse;
@@ -473,24 +503,24 @@ pub const Candidates = struct {
                     if (index >= cells.len) return error.InvalidSqlBackendResponse;
                     try preimage_values.append(scratch.allocator(), cells[index]);
                     try presence.append(alloc, present.contains(field.name));
-                    retained = std.math.add(usize, retained, try @import("operators.zig").datumBytes(cells[index])) catch return error.SqlProgramLimitExceeded;
+                    state.retained = std.math.add(usize, state.retained, try @import("operators.zig").datumBytes(cells[index])) catch return error.SqlProgramLimitExceeded;
                 }
-                if (retained > max_bytes) return error.SqlProgramLimitExceeded;
+                if (state.retained > max_bytes) return error.SqlProgramLimitExceeded;
                 const old = try alloc.create(catalog.Row);
-                old.* = try catalog.Row.fromDatums(alloc, identity, old_layout.?, preimage_values.items);
+                old.* = try catalog.Row.fromDatums(alloc, identity, state.old_layout.?, preimage_values.items);
                 old.version = version;
                 old.expected_content_digest = digest;
                 old.typed_cells.?.presence = presence.items;
                 if (!cells[3].sql_null) {
-                    retained = std.math.add(usize, retained, jsonSize(cells[3].value)) catch return error.SqlProgramLimitExceeded;
-                    if (retained > max_bytes) return error.SqlProgramLimitExceeded;
+                    state.retained = std.math.add(usize, state.retained, jsonSize(cells[3].value)) catch return error.SqlProgramLimitExceeded;
+                    if (state.retained > max_bytes) return error.SqlProgramLimitExceeded;
                     old.document = try @import("runtime.zig").clone(alloc, cells[3].value);
                 }
                 break :previous old;
             } else null;
-            const mutation: catalog.Mutation = .{ .key = identity, .expected_version = version, .expected_content_digest = digest, .unique_absence = inserting, .row = if (deleting) null else .{ .object = object }, .json_null_fields = json_null_fields.items, .previous = previous, .domain_admission = domain_admissions[arm_index] };
-            retained = std.math.add(usize, retained, identity.len +| jsonSize(.{ .object = object })) catch return error.SqlProgramLimitExceeded;
-            if (retained > max_bytes) return error.SqlProgramLimitExceeded;
+            const mutation: catalog.Mutation = .{ .key = identity, .expected_version = version, .expected_content_digest = digest, .unique_absence = inserting, .row = if (deleting) null else .{ .object = object }, .json_null_fields = json_null_fields.items, .previous = previous, .domain_admission = state.domain_admissions[arm_index] };
+            state.retained = std.math.add(usize, state.retained, identity.len +| jsonSize(.{ .object = object })) catch return error.SqlProgramLimitExceeded;
+            if (state.retained > max_bytes) return error.SqlProgramLimitExceeded;
             try mutations.append(alloc, mutation);
             if (self.returning) try source_rows.append(alloc, source_index);
         }
@@ -1340,6 +1370,10 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
     var selected_live = true;
     defer if (selected_live) selected.close();
     const prepared = try bound.prepareCaptured(context.arena, context.alloc, context.backend, selected, context.parameters, context.limits.mutation_rows, context.limits.retained_bytes, .{ .row_limit = context.limits.page_rows, .byte_limit = context.limits.page_bytes });
+    // Claim before RETURNING: a same-command target conflict must not evaluate
+    // volatile result expressions before reporting MERGE cardinality failure.
+    const claimed = try context.claimStatementMutations(bound.target, prepared.mutations, "MERGE");
+    if (claimed.len != prepared.mutations.len) return error.InvalidSqlBackendResponse;
     if (bound.returning_plan) |plan| {
         if (prepared.mutations.len > context.limits.result_rows or prepared.source_rows.len != prepared.mutations.len) return error.SqlResultTooLarge;
         const normalized = if (prepared.mutations.len == 0) prepared.mutations else blk: {
@@ -1347,95 +1381,170 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
             break :blk try prepare(context.backend.ptr, context.arena, bound.target, prepared.mutations);
         };
         if (normalized.len != prepared.mutations.len) return error.InvalidSqlBackendResponse;
-        const output_rows = try context.arena.alloc([]const std.json.Value, normalized.len);
-        const output_nulls = try context.arena.alloc([]const bool, normalized.len);
-        const native_rows = if (context.limits.native_result) try context.arena.alloc([]const scalar.Datum, normalized.len) else null;
-        var external = false;
-        for (plan.programs) |*program| external = external or decision_eval.hasExternal(program);
-        const returning_cells = if (external) try context.arena.alloc([]const scalar.Datum, normalized.len) else null;
-        const cells = try context.arena.alloc(scalar.Datum, bound.query.columns.len);
-        const reader = try selected.openReplayReader();
-        var reader_live = true;
-        defer if (reader_live) reader.close();
-        for (normalized, prepared.mutations, prepared.source_rows, output_rows, output_nulls, 0..) |mutation, original, source_index, *values, *nulls, returning_index| {
-            try context.checkpoint();
-            if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or
-                !std.meta.eql(mutation.expected_content_digest, original.expected_content_digest) or
-                mutation.unique_absence != original.unique_absence or mutation.conflict_guard != original.conflict_guard or
-                mutation.predicate_only != original.predicate_only or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
-            if (source_index >= selected.count() or source_index < reader.index) return error.InvalidSqlBackendResponse;
-            while (reader.index < source_index) _ = (try reader.next()) orelse return error.InvalidSqlBackendResponse;
-            const input = (try reader.next()) orelse return error.InvalidSqlBackendResponse;
-            if (input.len != cells.len) return error.InvalidSqlBackendResponse;
-            @memcpy(cells, input);
-            if (mutation.row) |row| {
-                if (row != .object) return error.InvalidSqlBackendResponse;
-                cells[0] = .{ .value = .{ .string = mutation.key }, .sql_null = false };
-                if (bound.document_root_ordinal) |index| {
-                    if (index >= cells.len) return error.InvalidSqlBackendResponse;
-                    cells[index] = scalar.Datum.json(row);
-                }
-                for (bound.target.columns, bound.field_ordinals) |field, ordinal| {
-                    const index = ordinal orelse continue;
-                    if (index >= cells.len) return error.InvalidSqlBackendResponse;
-                    const value = row.object.get(field.path) orelse .null;
-                    const json_null = for (mutation.json_null_fields) |name| {
-                        if (std.mem.eql(u8, name, field.path)) break true;
-                    } else false;
-                    cells[index] = try @import("document_row.zig").declaredCell(context.arena, field, .{ .value = value, .sql_null = value == .null and !json_null });
-                }
-            }
-            if (returning_cells) |all| {
-                const owned = try context.arena.alloc(scalar.Datum, cells.len);
-                for (cells, owned) |cell, *out| out.* = try @import("operators.zig").cloneDatum(context.arena, cell);
-                all[returning_index] = owned;
-                continue;
-            }
-            const evaluated = try context.arena.alloc(scalar.Datum, plan.programs.len);
-            for (plan.programs, evaluated) |program, *datum| datum.* = try context.evaluate(context.arena, program, cells);
-            const row = try context.resultRow(evaluated, plan.columns);
-            values.* = row.json;
-            nulls.* = row.nulls;
-            if (native_rows) |native_output| native_output[returning_index] = row.native.?;
-        }
-        if (returning_cells) |all| {
-            var arena = std.heap.ArenaAllocator.init(context.alloc);
-            defer arena.deinit();
-            var first: usize = 0;
-            while (first < all.len) {
-                try context.checkpoint();
-                if (!arena.reset(.retain_capacity)) return error.OutOfMemory;
-                const scratch = arena.allocator();
-                var budget: decision_eval.PageBudget = .{ .row_limit = context.limits.page_rows, .byte_limit = context.limits.page_bytes };
-                var end = first;
-                while (end < all.len) {
-                    const full = try budget.add(all[end]);
-                    end += 1;
-                    if (full) break;
-                }
-                const evaluated_rows = try decision_eval.evaluateProgramsBatchWithLimits(scratch, context.backend.decision_provider, plan.programs, all[first..end], context.parameters, decision_eval.limitsFor(context.backend));
-                for (first..end) |index| {
-                    const evaluated = evaluated_rows[index - first];
-                    const row = try context.resultRow(evaluated, plan.columns);
-                    output_rows[index] = row.json;
-                    output_nulls[index] = row.nulls;
-                    if (native_rows) |native_output| native_output[index] = row.native.?;
-                }
-                first = end;
-            }
-        }
-        reader.close();
-        reader_live = false;
+        if (context.backend.statement_effect_execution != null)
+            _ = try context.commitPreparedMutations(bound.target, normalized, "MERGE");
+        var output = try returningOutput(context, bound, plan, prepared, normalized, .{ .capture = selected });
         selected.close();
         selected_live = false;
-        var output = try context.commitPreparedMutations(bound.target, normalized, "MERGE");
-        output.columns = plan.columns;
-        output.rows = if (native_rows == null) output_rows else &.{};
-        output.native_rows = native_rows;
-        output.sql_nulls = if (native_rows == null) output_nulls else null;
+        if (context.backend.statement_effect_execution == null)
+            output.mutation_outcome = (try context.commitPreparedMutations(bound.target, normalized, "MERGE")).mutation_outcome;
         return output;
     }
     selected.close();
     selected_live = false;
     return context.commitMutations(bound.target, prepared.mutations, "MERGE", null);
 }
+
+fn returningOutput(context: @import("runtime.zig").Context, bound: Candidates, plan: Returning, prepared: Candidates.Prepared, normalized: []const catalog.Mutation, source: RowSource) !@import("runtime.zig").Output {
+    const output_rows = try context.arena.alloc([]const std.json.Value, normalized.len);
+    const output_nulls = try context.arena.alloc([]const bool, normalized.len);
+    const native_rows = if (context.limits.native_result) try context.arena.alloc([]const scalar.Datum, normalized.len) else null;
+    var external = false;
+    for (plan.programs) |*program| external = external or decision_eval.hasExternal(program);
+    const returning_cells = if (external) try context.arena.alloc([]const scalar.Datum, normalized.len) else null;
+    const cells = try context.arena.alloc(scalar.Datum, bound.query.columns.len);
+    var reader = try source.open(bound.query.columns.len);
+    defer reader.close();
+    for (normalized, prepared.mutations, prepared.source_rows, output_rows, output_nulls, 0..) |mutation, original, source_index, *values, *nulls, returning_index| {
+        try context.checkpoint();
+        if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or
+            !std.meta.eql(mutation.expected_content_digest, original.expected_content_digest) or
+            mutation.unique_absence != original.unique_absence or mutation.conflict_guard != original.conflict_guard or
+            mutation.predicate_only != original.predicate_only or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
+        if (source_index >= source.count() or source_index < reader.index) return error.InvalidSqlBackendResponse;
+        while (reader.index < source_index) _ = (try reader.next(context.arena, false)) orelse return error.InvalidSqlBackendResponse;
+        const input = (try reader.next(context.arena, false)) orelse return error.InvalidSqlBackendResponse;
+        if (input.len != cells.len) return error.InvalidSqlBackendResponse;
+        @memcpy(cells, input);
+        if (mutation.row) |row| {
+            if (row != .object) return error.InvalidSqlBackendResponse;
+            cells[0] = .{ .value = .{ .string = mutation.key }, .sql_null = false };
+            if (bound.document_root_ordinal) |index| {
+                if (index >= cells.len) return error.InvalidSqlBackendResponse;
+                cells[index] = scalar.Datum.json(row);
+            }
+            for (bound.target.columns, bound.field_ordinals) |field, ordinal| {
+                const index = ordinal orelse continue;
+                if (index >= cells.len) return error.InvalidSqlBackendResponse;
+                const value = row.object.get(field.path) orelse .null;
+                const json_null = for (mutation.json_null_fields) |name| {
+                    if (std.mem.eql(u8, name, field.path)) break true;
+                } else false;
+                cells[index] = try @import("document_row.zig").declaredCell(context.arena, field, .{ .value = value, .sql_null = value == .null and !json_null });
+            }
+        }
+        if (returning_cells) |all| {
+            const owned = try context.arena.alloc(scalar.Datum, cells.len);
+            for (cells, owned) |cell, *out| out.* = try @import("operators.zig").cloneDatum(context.arena, cell);
+            all[returning_index] = owned;
+            continue;
+        }
+        const evaluated = try context.arena.alloc(scalar.Datum, plan.programs.len);
+        for (plan.programs, evaluated) |program, *datum| datum.* = try context.evaluate(context.arena, program, cells);
+        const row = try context.resultRow(evaluated, plan.columns);
+        values.* = row.json;
+        nulls.* = row.nulls;
+        if (native_rows) |native_output| native_output[returning_index] = row.native.?;
+    }
+    if (returning_cells) |all| {
+        var arena = std.heap.ArenaAllocator.init(context.alloc);
+        defer arena.deinit();
+        var first: usize = 0;
+        while (first < all.len) {
+            try context.checkpoint();
+            if (!arena.reset(.retain_capacity)) return error.OutOfMemory;
+            const scratch = arena.allocator();
+            var budget: decision_eval.PageBudget = .{ .row_limit = context.limits.page_rows, .byte_limit = context.limits.page_bytes };
+            var end = first;
+            while (end < all.len) {
+                const full = try budget.add(all[end]);
+                end += 1;
+                if (full) break;
+            }
+            const evaluated_rows = try decision_eval.evaluateProgramsBatchWithLimits(scratch, context.backend.decision_provider, plan.programs, all[first..end], context.parameters, decision_eval.limitsFor(context.backend));
+            for (first..end) |index| {
+                const evaluated = evaluated_rows[index - first];
+                const row = try context.resultRow(evaluated, plan.columns);
+                output_rows[index] = row.json;
+                output_nulls[index] = row.nulls;
+                if (native_rows) |native_output| native_output[index] = row.native.?;
+            }
+            first = end;
+        }
+    }
+    return .{ .columns = plan.columns, .rows = if (native_rows == null) output_rows else &.{}, .native_rows = native_rows, .sql_nulls = if (native_rows == null) output_nulls else null, .rows_affected = normalized.len, .command_tag = "MERGE", .mutation_outcome = .committed };
+}
+
+/// Ordered MERGE shares arm conversion and RETURNING with batched execution.
+/// Metadata/tuple directories survive pulls; candidate scratch never does.
+pub const Stream = struct {
+    context: @import("runtime.zig").Context,
+    bound: Candidates,
+    metadata: std.heap.ArenaAllocator,
+    row: std.heap.ArenaAllocator,
+    input: ?@import("mutation_input.zig").Input = null,
+    preparation: ?catalog.MutationPreparation = null,
+    candidates: ?Candidates.Preparation = null,
+    finished: bool = false,
+    affected: usize = 0,
+
+    pub fn create(context: @import("runtime.zig").Context, bound: Candidates) !*Stream {
+        if (context.backend.statement_effect_execution == null or context.backend.statement_mutations == null) return error.SqlStatementSnapshotRequired;
+        const self = try context.alloc.create(Stream);
+        self.* = .{ .context = context, .bound = bound, .metadata = .init(context.alloc), .row = .init(context.alloc) };
+        errdefer self.close();
+        var read = context;
+        read.binding = bound.input.*;
+        self.input = try @import("mutation_input.zig").Input.init(read, self.metadata.allocator());
+        self.candidates = try Candidates.Preparation.init(self.metadata.allocator(), bound);
+        return self;
+    }
+    pub fn close(self: *Stream) void {
+        if (self.input) |*input| input.close();
+        if (self.preparation) |owner| owner.close(owner.ptr);
+        self.row.deinit();
+        self.metadata.deinit();
+        self.context.alloc.destroy(self);
+    }
+    fn finish(self: *Stream) !void {
+        if (self.input) |*input| input.close();
+        self.input = null;
+        if (self.preparation) |owner| {
+            try owner.finish(owner.ptr, self.row.allocator());
+            owner.close(owner.ptr);
+            self.preparation = null;
+        }
+        self.finished = true;
+    }
+    pub fn next(self: *Stream) anyerror!?[]const scalar.Datum {
+        if (self.finished) return null;
+        while (true) {
+            try self.context.checkpoint();
+            if (!self.row.reset(.{ .retain_with_limit = 32 * 1024 })) return error.OutOfMemory;
+            const a = self.row.allocator();
+            const cells = try self.input.?.next(a) orelse {
+                try self.finish();
+                return null;
+            };
+            var context = self.context;
+            context.arena = a;
+            context.typed_output = true;
+            context.limits.native_result = true;
+            context.limits.page_rows = 1;
+            const prepared = try self.bound.prepareOne(a, a, context.backend, cells, context.parameters, context.limits.retained_bytes, &self.candidates.?);
+            if (prepared.mutations.len == 0) continue;
+            if (prepared.mutations.len != 1) return error.InvalidSqlBackendResponse;
+            if (self.preparation == null) self.preparation = try (context.backend.vtable.open_mutation_preparation orelse return error.UnsupportedSqlExecution)(context.backend.ptr, self.metadata.allocator(), self.bound.target, prepared.mutations[0].key, self.bound.returning or self.bound.target.storage_mode == .document);
+            const owner = self.preparation.?;
+            const normalized = try owner.prepare(owner.ptr, a, prepared.mutations);
+            if (normalized.len != 1) return error.InvalidSqlBackendResponse;
+            const admitted = try context.commitPreparedMutations(self.bound.target, normalized, "MERGE");
+            self.affected += admitted.rows_affected;
+            const plan = self.bound.returning_plan orelse continue;
+            const output = try returningOutput(context, self.bound, plan, prepared, normalized, .{ .one = cells });
+            const rows = output.native_rows orelse return error.InvalidSqlBackendResponse;
+            if (rows.len != 1) return error.InvalidSqlBackendResponse;
+            return rows[0];
+        }
+    }
+};

@@ -67,6 +67,13 @@ pub fn cursors(self: *const Capture, plan: *const relation.Bound) ![]const catal
 
 fn collect(a: std.mem.Allocator, bound: describe.BoundStatement, entries: *std.ArrayList(Entry), scans: *std.ArrayList(catalog.StatementScan), depth: usize) anyerror!void {
     if (depth >= 64) return error.SqlProgramLimitExceeded;
+    if (bound.effect_graph) |graph| {
+        for (graph.steps, graph.scope.definitions) |step, definition| {
+            if (!step.mutation and (!step.demanded or definition.inline_read)) continue;
+            try collect(a, step.binding, entries, scans, depth + 1);
+        }
+        try collect(a, graph.root.binding, entries, scans, depth + 1);
+    }
     if (bound.relation) |plan| {
         for (entries.items) |entry| if (entry.plan == plan) return;
         if (entries.items.len >= 64 or plan.scans.len > 64 - scans.items.len) return error.SqlProgramLimitExceeded;

@@ -103,6 +103,10 @@ fn changes(update: contract.TableCommitRequest, key: []const u8) bool {
 }
 
 pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const sessions.OwnedTransactionCommitRequest, candidate: *sessions.OwnedTransactionCommitRequest, statement: *const sessions.OwnedTransactionCommitRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
+    return validateWithEvents(server, alloc, previous, candidate, statement, &.{}, context);
+}
+
+pub fn validateWithEvents(server: anytype, alloc: std.mem.Allocator, previous: ?*const sessions.OwnedTransactionCommitRequest, candidate: *sessions.OwnedTransactionCommitRequest, statement: *const sessions.OwnedTransactionCommitRequest, events: []const contract.TableCommitRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
     var original = try statement.clone(alloc);
     defer original.deinit(alloc);
     const incoming_view = try original.distributedTables(alloc);
@@ -118,7 +122,7 @@ pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const ses
     const staged_view = try before.distributedTables(alloc);
     defer staged_view.deinit();
     const staged = staged_view.tables;
-    var prepared = integrity.prepareSessionStatementWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context, candidate.constraint_timing.items) catch |err| refreshed: {
+    var prepared = (if (events.len == 0) integrity.prepareSessionStatementWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context, candidate.constraint_timing.items) else integrity.prepareSessionCommandWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, events, context, candidate.constraint_timing.items)) catch |err| refreshed: {
         // This is read-only preparation of an unpublished session candidate,
         // not a retry of staging or commit. Share REST's bounded authoritative
         // refresh when a data-node metadata cache trails a completed DDL.
@@ -127,7 +131,7 @@ pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const ses
         server.source.freeAdminSnapshot(&snapshot);
         snapshot = authoritative;
         if (!try integrity.metadataRequiresCoordination(alloc, snapshot.tables, incoming)) return;
-        break :refreshed try integrity.prepareSessionStatementWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context, candidate.constraint_timing.items);
+        break :refreshed try (if (events.len == 0) integrity.prepareSessionStatementWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context, candidate.constraint_timing.items) else integrity.prepareSessionCommandWithTiming(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, events, context, candidate.constraint_timing.items));
     };
     defer prepared.deinit();
     try server.authorizeAndBindIntegrityMutations(alloc, context, prepared.tables, candidate);

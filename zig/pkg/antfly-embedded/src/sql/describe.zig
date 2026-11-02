@@ -143,6 +143,7 @@ pub fn scanOrder(a: std.mem.Allocator, binding: BoundStatement, statement: ast.S
     return result;
 }
 pub const BoundStatement = struct {
+    effect_graph: ?*const @import("statement_effects.zig").Bound = null,
     copy_filter: ?bound_scalars.Bound = null,
     parameter_invocation: ?*@import("parameter_binding.zig").Invocation = null,
     procedure: ?@import("procedure.zig").Call = null,
@@ -456,6 +457,7 @@ pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, comp
 }
 
 fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_input: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
+    if (compiled_input.statement == .effect_block) return @import("statement_effects.zig").bind(allocator, backend, compiled_input, explicit_parameter_types);
     if (compiled_input.statement == .call) {
         const parameters = try allocator.alloc(?ast.ColumnType, compiled_input.parameter_count);
         @memset(parameters, null);
@@ -483,7 +485,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
         return bindInternal(allocator, backend, &lowered, explicit_parameter_types);
     }
     if (compiled.statement == .select) try @import("window_binding.zig").validatePlacement(compiled.statement.select);
-    if (compiled.statement == .select and compiled.statement.select.source == null and compiled.statement.select.table != null and backend.vtable.resolve_read != null and backend.prepared_read == null and !@import("relation_binding.zig").acceptsWithCatalog(compiled.statement.select, backend.routine_resolver) and !@import("subquery_lowering.zig").accepts(compiled.statement.select)) {
+    if (compiled.statement == .select and compiled.statement.select.source == null and compiled.statement.select.table != null and backend.vtable.resolve_read != null and backend.prepared_read == null and !(backend.statement_ctes != null or @import("relation_binding.zig").acceptsWithCatalog(compiled.statement.select, backend.routine_resolver)) and !@import("subquery_lowering.zig").accepts(compiled.statement.select)) {
         const name = compiled.statement.select.table.?;
         const resolved = try backend.resolveRead(allocator, name);
         if (resolved == .view) {
@@ -540,7 +542,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
             return bindInternal(allocator, backend, &lowered, explicit_parameter_types);
         }
     }
-    if (compiled.statement == .select and @import("relation_binding.zig").acceptsWithCatalog(compiled.statement.select, backend.routine_resolver)) {
+    if (compiled.statement == .select and (backend.statement_ctes != null or @import("relation_binding.zig").acceptsWithCatalog(compiled.statement.select, backend.routine_resolver))) {
         const relations = @import("relation_binding.zig");
         const parameters = try allocator.alloc(?ast.ColumnType, compiled.parameter_count);
         @memset(parameters, null);
@@ -752,7 +754,9 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
     if (returning_select) |selection| {
         if (@import("aggregate_binding.zig").accepts(selection)) return error.UnsupportedSqlShape;
         var adapter: @import("relation_binding.zig").TargetResolveAdapter = .{ .backend = backend, .table = table, .name = target.name, .prepared_images = true };
-        try @import("relation_binding.zig").inferExpected(allocator, adapter.iface(), selection, parameters, &.{});
+        var returning_backend = adapter.iface();
+        if (!relational_returning) returning_backend.statement_ctes = null;
+        try @import("relation_binding.zig").inferExpected(allocator, returning_backend, selection, parameters, &.{});
     }
     const contexts = try allocator.alloc(?ast.ColumnType, compiled.parameter_count);
     defer allocator.free(contexts);
@@ -879,7 +883,12 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
         var adapter: @import("relation_binding.zig").TargetResolveAdapter = .{ .backend = backend, .table = table, .name = target.name, .prepared_images = true };
         const returning_compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = selection }, .parameter_count = compiled.parameter_count };
         const returning_bound = try allocator.create(BoundStatement);
-        returning_bound.* = try bindInternal(allocator, adapter.iface(), &returning_compiled, result.parameter_types);
+        var returning_backend = adapter.iface();
+        // Scalar RETURNING names belong to the pinned target. A surrounding
+        // WITH scope must not force relation lowering and replace those names
+        // with internal scan aliases. Subqueries retain their lexical scope.
+        if (!relational_returning) returning_backend.statement_ctes = null;
+        returning_bound.* = try bindInternal(allocator, returning_backend, &returning_compiled, result.parameter_types);
         // Only a native owner with a retained transaction stamp can bind new
         // versions before commit. Never substitute the old version predicate.
         if (table.storage_mode == .document and compiled.statement != .delete and !backend.supports_write_versions) {
@@ -893,6 +902,34 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled_inp
         result.parameter_types = returning_bound.parameter_types;
     }
     return result;
+}
+
+/// Locate physical dependencies through complete statement graphs. Receipt
+/// validation must include producers and nested input/RETURNING plans even
+/// when LIMIT 0 prevents their physical cursors from opening.
+pub fn findPhysicalTable(bound: BoundStatement, id: u64) !?catalog.Table {
+    var remaining: usize = 16384;
+    return findPhysicalTableInner(bound, id, 0, &remaining);
+}
+fn findPhysicalTableInner(bound: BoundStatement, id: u64, depth: usize, remaining: *usize) anyerror!?catalog.Table {
+    if (depth >= 64 or remaining.* == 0) return error.SqlProgramLimitExceeded;
+    remaining.* -= 1;
+    if (bound.relation) |relation| {
+        for (relation.scans) |scan| if (scan.table.id == id) return scan.table;
+    } else if (bound.table) |table| if (table.id == id) return table;
+    if (bound.effect_graph) |graph| {
+        for (graph.steps, graph.scope.definitions) |step, definition| {
+            if (!step.mutation and (!step.demanded or definition.inline_read)) continue;
+            if (try findPhysicalTableInner(step.binding, id, depth + 1, remaining)) |table| return table;
+        }
+        if (try findPhysicalTableInner(graph.root.binding, id, depth + 1, remaining)) |table| return table;
+    }
+    if (bound.window) |window| if (try findPhysicalTableInner(window.input.*, id, depth + 1, remaining)) |table| return table;
+    if (bound.joined_mutation) |mutation| if (try findPhysicalTableInner(mutation.input.*, id, depth + 1, remaining)) |table| return table;
+    if (bound.merge_mutation) |mutation| if (try findPhysicalTableInner(mutation.input.*, id, depth + 1, remaining)) |table| return table;
+    if (bound.insert_source) |input| if (try findPhysicalTableInner(input.*, id, depth + 1, remaining)) |table| return table;
+    if (bound.returning) |output| if (try findPhysicalTableInner(output.*, id, depth + 1, remaining)) |table| return table;
+    return null;
 }
 
 pub fn returningReads(projections: ?[]const ast.Projection) bool {
@@ -1128,8 +1165,6 @@ const Context = struct {
             const key_column = identity_column orelse return error.SqlRowIdentityRequired;
             for (value_rows, 0..) |_, row_index| if (statement.isDefault(row_index, key_column)) return error.SqlRowIdentityRequired;
         }
-        var literal_keys: std.StringHashMapUnmanaged(void) = .empty;
-        defer literal_keys.deinit(self.allocator);
         for (statement.rows, 0..) |row, row_index| {
             try self.backend.vtable.checkpoint(self.backend.ptr);
             if (row.len != columns.len) return error.InvalidSqlParameters;
@@ -1146,7 +1181,6 @@ const Context = struct {
                 .string => |key| {
                     if (key.len == 0) return error.SqlRowIdentityRequired;
                     if (!std.unicode.utf8ValidateSlice(key)) return error.SqlTypeMismatch;
-                    if ((try literal_keys.getOrPut(self.allocator, key)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return @import("conflict.zig").duplicateRowError(statement.conflict);
                 },
                 else => return error.SqlRowIdentityRequired,
             }
@@ -1780,7 +1814,10 @@ test "SQL describe validates identity predicates without inventing execution val
     }
     var duplicate = try compiler.compile(std.testing.allocator, "INSERT INTO things (_id,age) VALUES ('x',1),('x',2)", .{});
     defer duplicate.deinit();
-    try std.testing.expectError(error.DuplicateSqlRow, describe(std.testing.allocator, fake.backend(), &duplicate, &.{}));
+    // Duplicate values are a runtime constraint failure. Describe must not
+    // bypass preceding sequence/default effects by enforcing data constraints.
+    var described_duplicate = try describe(std.testing.allocator, fake.backend(), &duplicate, &.{});
+    defer described_duplicate.deinit();
 }
 
 test "SQL JSON literal coercion preserves exact number text and typed parameters remain values" {

@@ -790,6 +790,7 @@ fn Engine(comptime Context: type) type {
         expanded_rows: usize = 0,
         work: usize = 0,
         cache_arena: std.heap.ArenaAllocator,
+        ordered_effects: ?@import("statement_effects.zig").Effects = null,
         planning_budget: @import("memory_budget.zig") = undefined,
         planning_arena: ?std.heap.ArenaAllocator = null,
         static_rows: std.AutoHashMapUnmanaged(*const binding.Node, *Replay) = .empty,
@@ -1041,9 +1042,19 @@ fn Engine(comptime Context: type) type {
             if (cursor.set_dynamic_filter == null) return false;
             return wants(cursor.ptr, columns[0..keys_.len]);
         }
+        fn ordered(self: *Self, node: *const binding.Node) !bool {
+            if (self.ordered_effects == null) self.ordered_effects = .{ .a = self.cache_arena.allocator(), .ordered_only = true };
+            return self.ordered_effects.?.node(node, 0);
+        }
         fn preferLeftBuild(self: *Self, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) !bool {
             const left = join.left;
             const right = join.right;
+            // Keep an ordered producer on the probe side. Eagerly building
+            // it would consume future sequence/default effects before an
+            // enclosing mutation or RETURNING expression can fail.
+            const left_ordered = try self.ordered(left);
+            const right_ordered = try self.ordered(right);
+            if (left_ordered != right_ordered) return right_ordered;
             // A native exact probe avoids opening source pages altogether.
             // Preserve that access path before comparing scan/build sizes;
             // scan-only estimates do not price index seeks or covering payloads.
@@ -1177,6 +1188,10 @@ fn Engine(comptime Context: type) type {
                 }
                 switch (node.operation) {
                     .materialized_ref => |source| self.cached_reader = try (try engine.prefixRows(source)).openReader(),
+                    .statement_cte => |slot| {
+                        const execution = engine.context.backend.statement_effect_execution orelse return error.InvalidSqlBackendResponse;
+                        self.cached_reader = try execution.open(execution.ptr, slot.slot);
+                    },
                     .join => |join| {
                         // An outer-reference attachment is a proven singleton,
                         // not an estimated small table. Keep it on the right
@@ -1321,7 +1336,7 @@ fn Engine(comptime Context: type) type {
                     };
                     if (eligible) return self.nextQueryBatch(a, maximum, query, failure);
                 }
-                if (self.cached_reader == null and self.node.operation == .scan) {
+                if (self.cached_reader == null and !self.prefix_producer and self.node.operation == .scan) {
                     const scan = self.node.operation.scan;
                     const cursor = self.engine.cursors[scan.index];
                     if (cursor.next_columns) |pull| {
@@ -1331,9 +1346,11 @@ fn Engine(comptime Context: type) type {
                         _ = self.arena.reset(.free_all);
                         self.pages += 1;
                         if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
+                        try self.engine.context.admitScanPage();
                         const page = try pull(cursor.ptr, self.arena.allocator(), @intCast(maximum));
                         try page.validate();
                         if (page.selection.len > maximum or page.selection.len > self.engine.context.limits.scan_rows -| self.engine.visited) return error.SqlProgramLimitExceeded;
+                        try self.engine.context.admitScanRows(page.selection.len);
                         self.engine.visited += page.selection.len;
                         self.eof = page.after == null;
                         const definitions = try a.alloc(scalar.Column, self.node.columns.len);
@@ -1447,7 +1464,7 @@ fn Engine(comptime Context: type) type {
                 if (self.cached_reader) |reader| return reader.next();
                 return switch (self.node.operation) {
                     .unnest => |function| self.nextUnnest(alloc, function),
-                    .materialized_ref => unreachable,
+                    .materialized_ref, .statement_cte => unreachable,
                     .recursive => blk: {
                         const state = try self.engine.recursive(self.node, self.output_index);
                         if (self.output_index == state.rows.items.len) break :blk null;
@@ -1521,6 +1538,7 @@ fn Engine(comptime Context: type) type {
                                 _ = self.arena.reset(.free_all);
                                 self.pages += 1;
                                 if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
+                                try self.engine.context.admitScanPage();
                                 const wanted: u32 = @intCast(@min(if (self.prefix_producer) std.math.maxInt(usize) else self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16)))));
                                 self.column_page = try pull(cursor.ptr, self.arena.allocator(), wanted);
                                 try self.column_page.?.validate();
@@ -1531,6 +1549,7 @@ fn Engine(comptime Context: type) type {
                             const page = self.column_page.?;
                             const index = self.page_index;
                             self.page_index += 1;
+                            try self.engine.context.admitScanRows(1);
                             self.engine.visited += 1;
                             if (self.engine.visited > self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
                             const values = try alloc.alloc(Datum, self.node.columns.len);
@@ -1553,6 +1572,7 @@ fn Engine(comptime Context: type) type {
                             _ = self.arena.reset(.free_all);
                             self.pages += 1;
                             if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
+                            try self.engine.context.admitScanPage();
                             const wanted = @min(if (self.prefix_producer) std.math.maxInt(usize) else self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.page_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16))));
                             self.page = try cursor.next(cursor.ptr, self.arena.allocator(), @intCast(wanted));
                             if (self.page.?.rows.len > wanted) return error.InvalidSqlBackendResponse;
@@ -1561,6 +1581,7 @@ fn Engine(comptime Context: type) type {
                         }
                         const row = self.page.?.rows[self.page_index];
                         self.page_index += 1;
+                        try self.engine.context.admitScanRows(1);
                         self.engine.visited += 1;
                         if (self.engine.visited > self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
                         const values = try alloc.alloc(Datum, self.node.columns.len);
@@ -2847,6 +2868,7 @@ fn Engine(comptime Context: type) type {
 
         const Adapter = struct {
             engine: *Self,
+            ordered_input: bool = false,
             iterator: *Iterator,
             table: catalog.Table,
             ordinal: u64 = 0,
@@ -2854,7 +2876,7 @@ fn Engine(comptime Context: type) type {
             pending_failure: ?anyerror = null,
 
             fn iface(self: *Adapter) catalog.Backend {
-                return .{ .clock_values = self.engine.context.backend.clock_values, .statement_clock = self.engine.context.backend.statement_clock, .clock_source = self.engine.context.backend.clock_source, .transaction_start = self.engine.context.backend.transaction_start, .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .routine_resolver = self.engine.context.backend.routine_resolver, .sequence_resolver = self.engine.context.backend.sequence_resolver, .sequence_provider = self.engine.context.backend.sequence_provider, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
+                return .{ .statement_ctes = self.engine.context.backend.statement_ctes, .statement_cte_visibility = self.engine.context.backend.statement_cte_visibility, .statement_effect_execution = self.engine.context.backend.statement_effect_execution, .clock_values = self.engine.context.backend.clock_values, .statement_clock = self.engine.context.backend.statement_clock, .clock_source = self.engine.context.backend.clock_source, .transaction_start = self.engine.context.backend.transaction_start, .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .routine_resolver = self.engine.context.backend.routine_resolver, .sequence_resolver = self.engine.context.backend.sequence_resolver, .sequence_provider = self.engine.context.backend.sequence_provider, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
             }
             fn openAggregatePartials(ptr: *anyopaque, a: Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
@@ -2907,7 +2929,7 @@ fn Engine(comptime Context: type) type {
             fn nextColumns(ptr: *anyopaque, a: Allocator, limit: u32) anyerror!catalog.ColumnPage {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (self.pending_failure) |err| return err;
-                const wanted = @min(limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.iterator.node.columns.len * @sizeOf(Datum) * 16)));
+                const wanted = @min(if (self.ordered_input) @min(limit, 1) else limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.iterator.node.columns.len * @sizeOf(Datum) * 16)));
                 var failure: ?anyerror = null;
                 const batch = try self.iterator.nextBatch(a, wanted, &failure);
                 self.pending_failure = failure;
@@ -2932,7 +2954,7 @@ fn Engine(comptime Context: type) type {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 // Row adapters share the same memory-aware demand ceiling as
                 // typed pages; an aggregate does not need oversized row pages.
-                const wanted = @min(limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.iterator.node.columns.len * @sizeOf(Datum) * 16)));
+                const wanted = @min(if (self.ordered_input) @min(limit, 1) else limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.iterator.node.columns.len * @sizeOf(Datum) * 16)));
                 var rows: std.ArrayList(catalog.Row) = .empty;
                 var bytes: usize = 0;
                 var stopped_for_bytes = false;
@@ -2970,6 +2992,9 @@ fn Source(comptime Context: type) type {
         adapter: Engine(Context).Adapter = undefined,
 
         fn create(context: Context) !*Self {
+            return createProjected(context, false, false);
+        }
+        fn createProjected(context: Context, complete_query: bool, force_prefix: bool) !*Self {
             const relation = context.binding.relation orelse return error.InvalidSqlBackendResponse;
             const self = try context.alloc.create(Self);
             self.* = .{ .alloc = context.alloc, .regex_execution = .init(context.alloc, @min(16 * 1024 * 1024, context.limits.retained_bytes)), .engine = .{ .context = context, .cursors = &.{}, .cache_arena = .init(context.alloc) } };
@@ -3023,8 +3048,32 @@ fn Source(comptime Context: type) type {
                 _ = self.engine.planning_arena.?.reset(.free_all);
                 break :fallback relation.root;
             };
-            self.iterator = try Engine(Context).Iterator.create(&self.engine, root);
-            self.adapter = .{ .engine = &self.engine, .iterator = self.iterator.?, .table = relation.table };
+            var cursor_root = root;
+            if (complete_query) {
+                const a = self.engine.cache_arena.allocator();
+                const columns = try a.alloc(binding.Column, context.binding.columns.len);
+                for (context.binding.columns, columns, 0..) |column, *out, index| out.* = .{
+                    .name = column.name,
+                    .internal = try std.fmt.allocPrint(a, "\x00query_cursor_{d}", .{index}),
+                    .qualifier = "",
+                    .type = column.type,
+                    .temporal_kind = column.temporal_kind,
+                    .element_type = column.element_type,
+                    .numeric_modifier = column.numeric_modifier,
+                    .enum_view = column.enum_view,
+                    .domain_view = column.domain_view,
+                    .nullable = true,
+                    .untyped_null = column.untyped_null,
+                };
+                const projected = try a.create(binding.Node);
+                projected.* = .{ .columns = columns, .operation = .{ .query = .{ .source = root, .statement = relation.statement, .binding = context.binding } } };
+                cursor_root = projected;
+            }
+            self.iterator = try Engine(Context).Iterator.create(&self.engine, cursor_root);
+            self.adapter = .{ .engine = &self.engine, .iterator = self.iterator.?, .table = relation.table, .ordered_input = try self.engine.ordered(cursor_root) };
+            // Ordering applies to expression effects, not immutable raw-page
+            // I/O. Keep physical prefetch bounded at its normal batch size.
+            if (force_prefix or self.adapter.ordered_input) self.iterator.?.markPrefixProducer();
             return self;
         }
         fn close(self: *Self) void {
@@ -3048,6 +3097,21 @@ fn Source(comptime Context: type) type {
             self.close();
         }
     };
+}
+
+/// Pull the complete bound SELECT, including projection and blocking operators,
+/// while retaining the original physical capture identity. No synthetic scan
+/// or independently refreshed read is introduced for a mutation producer.
+pub fn openQueryCursor(context: anytype) !catalog.Cursor {
+    const owner = try Source(@TypeOf(context)).createProjected(context, true, false);
+    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .close = @TypeOf(owner.*).closeCursor };
+}
+
+/// Mutation arms may be ordered even when their input expressions are pure.
+/// Preserve physical page batching independently of logical one-row demand.
+pub fn openMutationCursor(context: anytype) !catalog.Cursor {
+    const owner = try Source(@TypeOf(context)).createProjected(context, true, true);
+    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .close = @TypeOf(owner.*).closeCursor };
 }
 
 pub fn openCursor(context: anytype) !catalog.Cursor {

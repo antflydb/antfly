@@ -2552,6 +2552,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_source_mutation_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original source mutations preserve constrained postimages errors defaults and cold identities"});
     sql_source_mutation_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-source-mutation-lifecycle-test", "Verify original source mutations with constrained owners and complete cold postimages").dependOn(&sql_source_mutation_run.step);
+    const sql_writable_cte_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original writable CTE preserves PostgreSQL rollback and cold identities"});
+    sql_writable_cte_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-writable-cte-lifecycle-test", "Verify original writable CTE rollback, authenticated native sessions, unique enforcement and cold identities")
+        .dependOn(&sql_writable_cte_run.step);
     const sql_prepared_source_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original prepared CTE sources preserve deferral exact protocol results and cold identities"});
     sql_prepared_source_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-prepared-source-lifecycle-test", "Verify original PREPARE EXECUTE deferral and complete constrained source postimages through cold recovery")

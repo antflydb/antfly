@@ -175,3 +175,64 @@ fn once(ctx: *fixture.Context, original: []const u8, name: []const u8, expected:
     }
     return true;
 }
+
+/// An unchanged statement whose defined PostgreSQL result is an atomic error.
+/// No admission retry can replay it after any command acknowledgement.
+pub fn runRejected(ctx: *fixture.Context, original: []const u8, sqlstate: []const u8) !void {
+    const a = ctx.alloc;
+    const api = if (ctx.data.http_server) |*value| value else return error.MissingNativeSqlApi;
+    try std.testing.expect(api.cfg.auth_enabled);
+    var adapter: @import("sql_pgwire.zig").Adapter = .{ .server = api };
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    const startup = "user\x00pk-rewriter\x00database\x00default\x00\x00";
+    try input.writer.writeInt(u32, @intCast(startup.len + 8), .big);
+    try input.writer.writeInt(u32, 196608, .big);
+    try input.writer.writeAll(startup);
+    try frame(&input.writer, 'p', "pk-rewrite-durable-password\x00");
+    try frame(&input.writer, 'Q', try std.fmt.allocPrint(a, "{s}\x00", .{original}));
+    try frame(&input.writer, 'X', "");
+    var reader = std.Io.Reader.fixed(input.written());
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    var session: protocol.Session = .{ .alloc = a, .io = ctx.io, .source = adapter.backend(), .reader = &reader, .writer = &output.writer };
+    defer session.deinit();
+    try session.run();
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    var authenticated = false;
+    var errors: usize = 0;
+    var ready: usize = 0;
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        if (length < 4) return error.ProtocolViolation;
+        const payload = try cursor.take(length - 4);
+        var body: protocol.Cursor = .{ .bytes = payload };
+        switch (tag) {
+            'R' => {
+                const method = try body.int(u32);
+                if (method == 0) authenticated = true else try std.testing.expectEqual(@as(u32, 3), method);
+            },
+            'Z' => {
+                try std.testing.expectEqualStrings("I", payload);
+                ready += 1;
+            },
+            'E' => {
+                var code: ?[]const u8 = null;
+                while (try body.int(u8) != 0) {
+                    const field = body.bytes[body.offset - 1];
+                    const value = try body.string();
+                    if (field == 'C') code = value;
+                }
+                try std.testing.expectEqualStrings(sqlstate, code orelse return error.MissingSqlstate);
+                try std.testing.expect(std.mem.indexOf(u8, payload, "transaction_id") == null);
+                errors += 1;
+            },
+            'C', 'D', 'T' => return error.UnexpectedMutationAcknowledgement,
+            else => {},
+        }
+    }
+    try std.testing.expect(authenticated);
+    try std.testing.expectEqual(@as(usize, 1), errors);
+    try std.testing.expectEqual(@as(usize, 2), ready);
+}

@@ -17,8 +17,8 @@
 """PostgreSQL witnesses for atomic data-modifying CTE statement graphs."""
 
 import argparse
-from decimal import Decimal
 import json
+from decimal import Decimal
 
 from generate_sql_postgres_reference import FIXTURES, postgres
 
@@ -119,6 +119,250 @@ def reference():
             "WITH changed AS (UPDATE source_records SET n=n+0.0001 RETURNING id,a,n) SELECT a.id,a.a,a.n,b.n FROM changed a JOIN changed b ON a.id=b.id ORDER BY a.id",
         ),
     ]
+    profiles.extend(
+        [
+            (
+                "fk_child_then_parent",
+                "WITH added AS (INSERT INTO fk_children VALUES ('new-child','new-parent','new') RETURNING parent_id) INSERT INTO fk_parents SELECT parent_id FROM added RETURNING id",
+            ),
+            (
+                "fk_delete_then_child_update",
+                "WITH removed AS (DELETE FROM fk_parents WHERE id='a' RETURNING id) UPDATE fk_children SET status='seen' WHERE parent_id IN(SELECT id FROM removed) RETURNING id,status",
+            ),
+            (
+                "fk_delete_then_parent_reinsert",
+                "WITH removed AS (DELETE FROM fk_parents WHERE id='a' RETURNING id) INSERT INTO fk_parents SELECT id FROM removed RETURNING id",
+            ),
+            (
+                "referenced_own_insert_upsert",
+                "WITH added AS (INSERT INTO fk_parents VALUES ('new') RETURNING id) INSERT INTO fk_parents SELECT id FROM added ON CONFLICT(id) DO UPDATE SET id=excluded.id RETURNING id",
+            ),
+            (
+                "referenced_own_insert_do_nothing",
+                "WITH added AS (INSERT INTO fk_parents VALUES ('new') RETURNING id) INSERT INTO fk_parents SELECT id FROM added ON CONFLICT(id) DO NOTHING RETURNING id",
+            ),
+            (
+                "shared_read_with_mutation",
+                "WITH old AS MATERIALIZED (SELECT id,status FROM source_records), changed AS (UPDATE source_records SET status='ready' RETURNING id) SELECT a.id,a.status,b.status FROM old a JOIN old b USING(id) JOIN changed USING(id) ORDER BY a.id",
+            ),
+            (
+                "inlined_read_with_mutation",
+                "WITH old AS NOT MATERIALIZED (SELECT id,status FROM source_records), changed AS (UPDATE source_records SET status='ready' RETURNING id) SELECT old.id,old.status FROM old JOIN changed USING(id) ORDER BY old.id",
+            ),
+            (
+                "volatile_read_not_materialized",
+                "WITH sampled AS NOT MATERIALIZED (SELECT id,nextval('effect_sequence') v FROM source_records), changed AS (UPDATE source_records SET status='ready' RETURNING id) SELECT a.id,a.v,b.v FROM sampled a JOIN sampled b USING(id) JOIN changed USING(id) ORDER BY a.id",
+            ),
+            (
+                "recursive_read_with_mutation",
+                "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<3), changed AS (UPDATE source_records SET status='ready' RETURNING id) SELECT n FROM numbers ORDER BY n",
+            ),
+            (
+                "read_shadow_scope",
+                "WITH outer_read AS (SELECT id FROM source_records), changed AS (UPDATE source_records SET status='ready' RETURNING id) SELECT old.id FROM (WITH outer_read AS (SELECT id FROM archived_records) SELECT id FROM outer_read) old JOIN changed USING(id)",
+            ),
+        ]
+    )
+    profiles.extend(
+        [
+            (
+                "plan_insert_source_error",
+                "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) INSERT INTO archived_records(id,v) SELECT id,1/0 FROM changed",
+            ),
+            (
+                "plan_insert_values_error",
+                "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) INSERT INTO archived_records(id,v) VALUES ('new',1/0)",
+            ),
+            (
+                "plan_update_false_error",
+                "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) UPDATE usage_records SET v=1/0 WHERE false",
+            ),
+            (
+                "plan_select_limit_error",
+                "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) SELECT 1/0 FROM changed LIMIT 0",
+            ),
+            (
+                "plan_unused_read_error",
+                "WITH unused AS (SELECT 1/0), changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) SELECT id FROM changed",
+            ),
+            (
+                "plan_inactive_merge_error",
+                "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) MERGE INTO usage_records t USING changed s ON t.id=s.id WHEN MATCHED AND false THEN UPDATE SET v=1/0",
+            ),
+            (
+                "plan_false_conflict_error",
+                "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) INSERT INTO usage_records(id,v) SELECT id,2 FROM changed ON CONFLICT(id) DO UPDATE SET v=1/0 WHERE false RETURNING id",
+            ),
+            (
+                "plan_false_returning_error",
+                "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id), invalid AS (UPDATE usage_records SET v=2 WHERE false RETURNING 1/0) SELECT 7",
+            ),
+            (
+                "updated_owner_upsert",
+                "WITH changed AS (UPDATE source_records SET v=v+1 RETURNING id) INSERT INTO source_records(id,v) SELECT id,2 FROM changed ON CONFLICT(id) DO UPDATE SET v=excluded.v RETURNING id,v",
+            ),
+            (
+                "updated_owner_false_upsert",
+                "WITH changed AS (UPDATE source_records SET v=v+1 RETURNING id) INSERT INTO source_records(id,v) SELECT id,2 FROM changed ON CONFLICT(id) DO UPDATE SET v=excluded.v WHERE false RETURNING id,v",
+            ),
+            (
+                "updated_owner_do_nothing",
+                "WITH changed AS (UPDATE source_records SET v=v+1 RETURNING id) INSERT INTO source_records(id,v) SELECT id,2 FROM changed ON CONFLICT(id) DO NOTHING RETURNING id,v",
+            ),
+            (
+                "retired_owner_upsert",
+                "WITH removed AS (DELETE FROM source_records RETURNING id) INSERT INTO source_records(id,v) SELECT id,2 FROM removed ON CONFLICT(id) DO UPDATE SET v=excluded.v RETURNING id,v",
+            ),
+            (
+                "retired_owner_do_nothing",
+                "WITH removed AS (DELETE FROM source_records RETURNING id) INSERT INTO source_records(id,v) SELECT id,2 FROM removed ON CONFLICT(id) DO NOTHING RETURNING id,v",
+            ),
+            (
+                "mutation_error_interleaving",
+                "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING v) SELECT v/(v-v) FROM changed",
+            ),
+        ]
+    )
+    profiles.extend(
+        [
+            (
+                "ordered_returning_error",
+                "WITH changed AS (UPDATE source_records SET v=v RETURNING nextval('effect_sequence') AS n) SELECT n/(n-n) FROM changed",
+            ),
+            (
+                "ordered_delete_returning_error",
+                "WITH changed AS (DELETE FROM source_records RETURNING nextval('effect_sequence') AS n) SELECT n/(n-n) FROM changed",
+            ),
+            (
+                "ordered_mutation_limit_one",
+                "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING v) SELECT v FROM changed LIMIT 1",
+            ),
+            (
+                "ordered_mutation_limit_zero",
+                "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING v) SELECT v FROM changed LIMIT 0",
+            ),
+            (
+                "ordered_unused_no_returning",
+                "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence')) SELECT 7",
+            ),
+            (
+                "ordered_shared_returning",
+                "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id,v) SELECT a.id,a.v,b.v FROM changed a JOIN changed b USING(id) ORDER BY a.id",
+            ),
+            (
+                "ordered_root_returning_error",
+                "WITH unused AS (UPDATE archived_records SET v=v WHERE false) UPDATE source_records SET v=nextval('effect_sequence') RETURNING v/(v-v)",
+            ),
+            (
+                "ordered_root_returning",
+                "WITH unused AS (UPDATE archived_records SET v=v WHERE false) UPDATE source_records SET v=nextval('effect_sequence') RETURNING v",
+            ),
+        ]
+    )
+    profiles.extend(
+        [
+            (
+                "ordered_insert_values_error",
+                "WITH added AS (INSERT INTO archived_records(id,v) VALUES ('c',nextval('effect_sequence')),('d',nextval('effect_sequence')) RETURNING v) SELECT v/(v-v) FROM added",
+            ),
+            (
+                "ordered_insert_returning_error",
+                "WITH added AS (INSERT INTO archived_records(id,v) VALUES ('c',1),('d',2) RETURNING nextval('effect_sequence') n) SELECT n/(n-n) FROM added",
+            ),
+            (
+                "ordered_insert_source_error",
+                "WITH added AS (INSERT INTO archived_records(id,v) SELECT id,nextval('effect_sequence') FROM source_records RETURNING v) SELECT v/(v-v) FROM added",
+            ),
+            (
+                "ordered_insert_source_returning_error",
+                "WITH added AS (INSERT INTO archived_records(id,v) SELECT id,v FROM source_records RETURNING nextval('effect_sequence') n) SELECT n/(n-n) FROM added",
+            ),
+            (
+                "ordered_insert_limit_zero",
+                "WITH added AS (INSERT INTO archived_records(id,v) VALUES ('c',nextval('effect_sequence')),('d',nextval('effect_sequence')) RETURNING v) SELECT v FROM added LIMIT 0",
+            ),
+            (
+                "ordered_insert_limit_one",
+                "WITH added AS (INSERT INTO archived_records(id,v) SELECT id,nextval('effect_sequence') FROM source_records RETURNING v) SELECT v FROM added LIMIT 1",
+            ),
+            (
+                "ordered_insert_unused",
+                "WITH added AS (INSERT INTO archived_records(id,v) SELECT id,nextval('effect_sequence') FROM source_records) SELECT 7",
+            ),
+            (
+                "ordered_insert_root_error",
+                "WITH unused AS (UPDATE archived_records SET v=v WHERE false) INSERT INTO archived_records(id,v) VALUES ('c',nextval('effect_sequence')),('d',nextval('effect_sequence')) RETURNING v/(v-v)",
+            ),
+            (
+                "ordered_insert_root",
+                "WITH unused AS (UPDATE archived_records SET v=v WHERE false) INSERT INTO archived_records(id,v) SELECT id,nextval('effect_sequence') FROM source_records RETURNING v",
+            ),
+            (
+                "ordered_insert_duplicate_error",
+                "WITH added AS (INSERT INTO archived_records(id,v) VALUES ('c',nextval('effect_sequence')),('c',nextval('effect_sequence')),('d',nextval('effect_sequence')) RETURNING v) SELECT v FROM added",
+            ),
+            (
+                "ordered_insert_source_duplicate_error",
+                "WITH added AS (INSERT INTO archived_records(id,v) SELECT 'c',nextval('effect_sequence') FROM source_records RETURNING v) SELECT v FROM added",
+            ),
+        ]
+    )
+    profiles.extend(
+        [
+            (
+                "ordered_merge_update_error",
+                "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v) SELECT v/(v-v) FROM changed",
+            ),
+            (
+                "ordered_merge_returning_error",
+                "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=t.v RETURNING nextval('effect_sequence') n) SELECT n/(n-n) FROM changed",
+            ),
+            (
+                "ordered_merge_delete_error",
+                "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN DELETE RETURNING nextval('effect_sequence') n) SELECT n/(n-n) FROM changed",
+            ),
+            (
+                "ordered_merge_insert_error",
+                "WITH changed AS (MERGE INTO source_records t USING (VALUES('c'),('d')) s(k) ON t.id=s.k WHEN NOT MATCHED THEN INSERT (id,v) VALUES(s.k,nextval('effect_sequence')) RETURNING t.v) SELECT v/(v-v) FROM changed",
+            ),
+            (
+                "ordered_merge_limit_zero",
+                "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v) SELECT v FROM changed LIMIT 0",
+            ),
+            (
+                "ordered_merge_limit_one",
+                "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v) SELECT v FROM changed LIMIT 1",
+            ),
+            (
+                "ordered_merge_unused",
+                "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence')) SELECT 7",
+            ),
+            (
+                "ordered_merge_root_error",
+                "WITH unused AS (UPDATE archived_records SET v=v WHERE false) MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v/(t.v-t.v)",
+            ),
+            (
+                "ordered_merge_root",
+                "WITH unused AS (UPDATE archived_records SET v=v WHERE false) MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v",
+            ),
+            (
+                "ordered_merge_duplicate_error",
+                "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('a')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v) SELECT v FROM changed",
+            ),
+            (
+                "ordered_same_command_merge_error",
+                "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id,v) MERGE INTO source_records t USING changed s ON t.id=s.id WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v",
+            ),
+            (
+                "ordered_insert_duplicate_nothing",
+                "WITH added AS (INSERT INTO archived_records(id,v) VALUES ('c',nextval('effect_sequence')),('c',nextval('effect_sequence')) ON CONFLICT(id) DO NOTHING RETURNING v) SELECT v FROM added",
+            ),
+            (
+                "ordered_insert_duplicate_update",
+                "WITH added AS (INSERT INTO archived_records(id,v) VALUES ('c',nextval('effect_sequence')),('c',nextval('effect_sequence')) ON CONFLICT(id) DO UPDATE SET v=excluded.v RETURNING v) SELECT v FROM added",
+            ),
+        ]
+    )
     entries = []
     with postgres() as db:
         for ordinal, (name, query) in enumerate(profiles):
@@ -135,6 +379,14 @@ def reference():
                     + table
                     + " VALUES('a','queued',1,ARRAY[1,NULL,3],9007199254740993.0100),('b','closed',2,ARRAY[]::integer[],NULL)"
                 )
+            db.execute("CREATE TABLE fk_parents(id text PRIMARY KEY)")
+            db.execute(
+                "CREATE TABLE fk_children(id text PRIMARY KEY,parent_id text REFERENCES fk_parents(id) ON DELETE CASCADE,status text)"
+            )
+            db.execute("INSERT INTO fk_parents VALUES ('a'),('b')")
+            db.execute(
+                "INSERT INTO fk_children VALUES ('ca','a','old'),('cb','b','old')"
+            )
             entry = {"name": name, "sql": query}
             if ordinal == 0:
                 entry.update(
@@ -161,6 +413,16 @@ def reference():
                     ).fetchall()
                 )
                 for table in ("usage_records", "source_records", "archived_records")
+            }
+            entry["fk_tables"] = {
+                "fk_parents": value(
+                    db.execute("SELECT id FROM fk_parents ORDER BY id").fetchall()
+                ),
+                "fk_children": value(
+                    db.execute(
+                        "SELECT id,parent_id,status FROM fk_children ORDER BY id"
+                    ).fetchall()
+                ),
             }
             entry["sequence"] = value(
                 db.execute(

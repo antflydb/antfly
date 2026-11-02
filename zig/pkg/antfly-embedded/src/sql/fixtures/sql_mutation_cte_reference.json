@@ -1,0 +1,6344 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18 data-modifying WITH semantics",
+  "entries": [
+    {
+      "name": "original_merge_double_write",
+      "sql": "WITH source_rows AS (UPDATE usage_records SET status = 'ready' RETURNING id, status) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status",
+      "id": "sql-0015",
+      "source_entry_sha256": "52a155dad459aac7c9f19b5a7263709b7bb99050b4cb1fc0b7009e940a9b1cb3",
+      "params": [],
+      "sqlstate": "21000",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "disjoint_merge",
+      "sql": "WITH changed AS (UPDATE source_records SET status='ready' RETURNING id,status) MERGE INTO usage_records t USING changed s ON t.id=s.id WHEN MATCHED THEN UPDATE SET status=s.status",
+      "command_tag": "MERGE 2",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "ready",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "ready",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "ready",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "ready",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "unused_update",
+      "sql": "WITH changed AS (UPDATE source_records SET status='ready' RETURNING id) SELECT 7 AS answer",
+      "command_tag": "SELECT 1",
+      "columns": [
+        {
+          "name": "answer",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          7
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "ready",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "ready",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "zero_demand",
+      "sql": "WITH changed AS (UPDATE source_records SET status='ready' RETURNING id) SELECT id FROM changed LIMIT 0",
+      "command_tag": "SELECT 0",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        }
+      ],
+      "rows": [],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "ready",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "ready",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "snapshot_and_returning",
+      "sql": "WITH changed AS (UPDATE source_records SET status='ready' RETURNING id,status) SELECT old.id,old.status,changed.status FROM source_records old JOIN changed ON old.id=changed.id ORDER BY old.id",
+      "command_tag": "SELECT 2",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "status",
+          "oid": 25
+        },
+        {
+          "name": "status",
+          "oid": 25
+        }
+      ],
+      "rows": [
+        [
+          "a",
+          "queued",
+          "ready"
+        ],
+        [
+          "b",
+          "closed",
+          "ready"
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "ready",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "ready",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "shared_volatile_producer",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id,v) SELECT a.id,a.v,b.v FROM changed a JOIN changed b ON a.id=b.id ORDER BY a.id",
+      "command_tag": "SELECT 2",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "v",
+          "oid": 23
+        },
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          "a",
+          1,
+          1
+        ],
+        [
+          "b",
+          2,
+          2
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "dependent_mutations",
+      "sql": "WITH changed AS (UPDATE source_records SET status='ready' RETURNING id,status), copied AS (INSERT INTO archived_records(id,status) SELECT id,status FROM changed RETURNING id,status) SELECT id,status FROM copied ORDER BY id",
+      "command_tag": "SELECT 2",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "status",
+          "oid": 25
+        }
+      ],
+      "rows": [
+        [
+          "a",
+          "ready"
+        ],
+        [
+          "b",
+          "ready"
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "ready",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "ready",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": [
+          [
+            "a",
+            "ready",
+            0,
+            null,
+            null
+          ],
+          [
+            "b",
+            "ready",
+            0,
+            null,
+            null
+          ]
+        ]
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "no_returning_unused",
+      "sql": "WITH changed AS (UPDATE source_records SET status='ready') SELECT 7 AS answer",
+      "command_tag": "SELECT 1",
+      "columns": [
+        {
+          "name": "answer",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          7
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "ready",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "ready",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "no_returning_reference",
+      "sql": "WITH changed AS (UPDATE source_records SET status='ready') SELECT * FROM changed",
+      "sqlstate": "0A000",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "nested_write",
+      "sql": "SELECT * FROM (WITH changed AS (UPDATE source_records SET status='ready' RETURNING id) SELECT * FROM changed) q",
+      "sqlstate": "0A000",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "recursive_write",
+      "sql": "WITH RECURSIVE changed AS (UPDATE source_records SET status='ready' FROM changed c WHERE source_records.id=c.id RETURNING source_records.id) SELECT * FROM changed",
+      "sqlstate": "42P19",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "rollback_all",
+      "sql": "WITH changed AS (UPDATE source_records SET status='ready' RETURNING id) UPDATE usage_records SET v=1/(v-v) WHERE id IN(SELECT id FROM changed)",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "same_target_update",
+      "sql": "WITH changed AS (UPDATE usage_records SET v=v+1 RETURNING id) UPDATE usage_records SET v=v+10 WHERE id IN(SELECT id FROM changed) RETURNING id,v",
+      "command_tag": "UPDATE 0",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            2,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            3,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "same_target_delete",
+      "sql": "WITH changed AS (UPDATE usage_records SET v=v+1 RETURNING id) DELETE FROM usage_records WHERE id IN(SELECT id FROM changed) RETURNING id,v",
+      "command_tag": "DELETE 0",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            2,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            3,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "own_insert_upsert",
+      "sql": "WITH inserted AS (INSERT INTO archived_records(id,status) VALUES('x','first') RETURNING id) INSERT INTO archived_records(id,status) VALUES('x','second') ON CONFLICT(id) DO UPDATE SET status=excluded.status RETURNING id,status",
+      "sqlstate": "23505",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "own_insert_upsert_false",
+      "sql": "WITH inserted AS (INSERT INTO archived_records(id,status) VALUES('x','first') RETURNING id) INSERT INTO archived_records(id,status) VALUES('x','second') ON CONFLICT(id) DO UPDATE SET status=excluded.status WHERE false RETURNING id,status",
+      "sqlstate": "23505",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "own_insert_do_nothing",
+      "sql": "WITH inserted AS (INSERT INTO archived_records(id,status) VALUES('x','first') RETURNING id) INSERT INTO archived_records(id,status) VALUES('x','second') ON CONFLICT(id) DO NOTHING RETURNING id,status",
+      "sqlstate": "23505",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "own_insert_duplicate",
+      "sql": "WITH inserted AS (INSERT INTO archived_records(id,status) VALUES('x','first') RETURNING id) INSERT INTO archived_records(id,status) VALUES('x','second') RETURNING id,status",
+      "sqlstate": "23505",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "delete_producer",
+      "sql": "WITH deleted AS (DELETE FROM source_records WHERE id='a' RETURNING id,status) INSERT INTO archived_records(id,status) SELECT id,status FROM deleted RETURNING id,status",
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "status",
+          "oid": 25
+        }
+      ],
+      "rows": [
+        [
+          "a",
+          "queued"
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": [
+          [
+            "a",
+            "queued",
+            0,
+            null,
+            null
+          ]
+        ]
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "merge_producer",
+      "sql": "WITH changed AS (MERGE INTO usage_records t USING source_records s ON t.id=s.id WHEN MATCHED THEN UPDATE SET status='merged' RETURNING t.id,t.status) SELECT id,status FROM changed ORDER BY id",
+      "command_tag": "SELECT 2",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "status",
+          "oid": 25
+        }
+      ],
+      "rows": [
+        [
+          "a",
+          "merged"
+        ],
+        [
+          "b",
+          "merged"
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "merged",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "merged",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "typed_capture",
+      "sql": "WITH changed AS (UPDATE source_records SET n=n+0.0001 RETURNING id,a,n) SELECT a.id,a.a,a.n,b.n FROM changed a JOIN changed b ON a.id=b.id ORDER BY a.id",
+      "command_tag": "SELECT 2",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "a",
+          "oid": 1007
+        },
+        {
+          "name": "n",
+          "oid": 1700
+        },
+        {
+          "name": "n",
+          "oid": 1700
+        }
+      ],
+      "rows": [
+        [
+          "a",
+          [
+            1,
+            null,
+            3
+          ],
+          "9007199254740993.0101",
+          "9007199254740993.0101"
+        ],
+        [
+          "b",
+          [],
+          null,
+          null
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0101"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "fk_child_then_parent",
+      "sql": "WITH added AS (INSERT INTO fk_children VALUES ('new-child','new-parent','new') RETURNING parent_id) INSERT INTO fk_parents SELECT parent_id FROM added RETURNING id",
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        }
+      ],
+      "rows": [
+        [
+          "new-parent"
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ],
+          [
+            "new-parent"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ],
+          [
+            "new-child",
+            "new-parent",
+            "new"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "fk_delete_then_child_update",
+      "sql": "WITH removed AS (DELETE FROM fk_parents WHERE id='a' RETURNING id) UPDATE fk_children SET status='seen' WHERE parent_id IN(SELECT id FROM removed) RETURNING id,status",
+      "command_tag": "UPDATE 1",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "status",
+          "oid": 25
+        }
+      ],
+      "rows": [
+        [
+          "ca",
+          "seen"
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "fk_delete_then_parent_reinsert",
+      "sql": "WITH removed AS (DELETE FROM fk_parents WHERE id='a' RETURNING id) INSERT INTO fk_parents SELECT id FROM removed RETURNING id",
+      "command_tag": "INSERT 0 1",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        }
+      ],
+      "rows": [
+        [
+          "a"
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "referenced_own_insert_upsert",
+      "sql": "WITH added AS (INSERT INTO fk_parents VALUES ('new') RETURNING id) INSERT INTO fk_parents SELECT id FROM added ON CONFLICT(id) DO UPDATE SET id=excluded.id RETURNING id",
+      "sqlstate": "21000",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "referenced_own_insert_do_nothing",
+      "sql": "WITH added AS (INSERT INTO fk_parents VALUES ('new') RETURNING id) INSERT INTO fk_parents SELECT id FROM added ON CONFLICT(id) DO NOTHING RETURNING id",
+      "command_tag": "INSERT 0 0",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        }
+      ],
+      "rows": [],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ],
+          [
+            "new"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "shared_read_with_mutation",
+      "sql": "WITH old AS MATERIALIZED (SELECT id,status FROM source_records), changed AS (UPDATE source_records SET status='ready' RETURNING id) SELECT a.id,a.status,b.status FROM old a JOIN old b USING(id) JOIN changed USING(id) ORDER BY a.id",
+      "command_tag": "SELECT 2",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "status",
+          "oid": 25
+        },
+        {
+          "name": "status",
+          "oid": 25
+        }
+      ],
+      "rows": [
+        [
+          "a",
+          "queued",
+          "queued"
+        ],
+        [
+          "b",
+          "closed",
+          "closed"
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "ready",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "ready",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "inlined_read_with_mutation",
+      "sql": "WITH old AS NOT MATERIALIZED (SELECT id,status FROM source_records), changed AS (UPDATE source_records SET status='ready' RETURNING id) SELECT old.id,old.status FROM old JOIN changed USING(id) ORDER BY old.id",
+      "command_tag": "SELECT 2",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "status",
+          "oid": 25
+        }
+      ],
+      "rows": [
+        [
+          "a",
+          "queued"
+        ],
+        [
+          "b",
+          "closed"
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "ready",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "ready",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "volatile_read_not_materialized",
+      "sql": "WITH sampled AS NOT MATERIALIZED (SELECT id,nextval('effect_sequence') v FROM source_records), changed AS (UPDATE source_records SET status='ready' RETURNING id) SELECT a.id,a.v,b.v FROM sampled a JOIN sampled b USING(id) JOIN changed USING(id) ORDER BY a.id",
+      "command_tag": "SELECT 2",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "v",
+          "oid": 20
+        },
+        {
+          "name": "v",
+          "oid": 20
+        }
+      ],
+      "rows": [
+        [
+          "a",
+          1,
+          1
+        ],
+        [
+          "b",
+          2,
+          2
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "ready",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "ready",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "recursive_read_with_mutation",
+      "sql": "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<3), changed AS (UPDATE source_records SET status='ready' RETURNING id) SELECT n FROM numbers ORDER BY n",
+      "command_tag": "SELECT 3",
+      "columns": [
+        {
+          "name": "n",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "ready",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "ready",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "read_shadow_scope",
+      "sql": "WITH outer_read AS (SELECT id FROM source_records), changed AS (UPDATE source_records SET status='ready' RETURNING id) SELECT old.id FROM (WITH outer_read AS (SELECT id FROM archived_records) SELECT id FROM outer_read) old JOIN changed USING(id)",
+      "command_tag": "SELECT 0",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        }
+      ],
+      "rows": [],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "ready",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "ready",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "plan_insert_source_error",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) INSERT INTO archived_records(id,v) SELECT id,1/0 FROM changed",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "plan_insert_values_error",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) INSERT INTO archived_records(id,v) VALUES ('new',1/0)",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "plan_update_false_error",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) UPDATE usage_records SET v=1/0 WHERE false",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "plan_select_limit_error",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) SELECT 1/0 FROM changed LIMIT 0",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "plan_unused_read_error",
+      "sql": "WITH unused AS (SELECT 1/0), changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) SELECT id FROM changed",
+      "command_tag": "SELECT 2",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        }
+      ],
+      "rows": [
+        [
+          "a"
+        ],
+        [
+          "b"
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "plan_inactive_merge_error",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) MERGE INTO usage_records t USING changed s ON t.id=s.id WHEN MATCHED AND false THEN UPDATE SET v=1/0",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "plan_false_conflict_error",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id) INSERT INTO usage_records(id,v) SELECT id,2 FROM changed ON CONFLICT(id) DO UPDATE SET v=1/0 WHERE false RETURNING id",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "plan_false_returning_error",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id), invalid AS (UPDATE usage_records SET v=2 WHERE false RETURNING 1/0) SELECT 7",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "updated_owner_upsert",
+      "sql": "WITH changed AS (UPDATE source_records SET v=v+1 RETURNING id) INSERT INTO source_records(id,v) SELECT id,2 FROM changed ON CONFLICT(id) DO UPDATE SET v=excluded.v RETURNING id,v",
+      "sqlstate": "21000",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "updated_owner_false_upsert",
+      "sql": "WITH changed AS (UPDATE source_records SET v=v+1 RETURNING id) INSERT INTO source_records(id,v) SELECT id,2 FROM changed ON CONFLICT(id) DO UPDATE SET v=excluded.v WHERE false RETURNING id,v",
+      "sqlstate": "21000",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "updated_owner_do_nothing",
+      "sql": "WITH changed AS (UPDATE source_records SET v=v+1 RETURNING id) INSERT INTO source_records(id,v) SELECT id,2 FROM changed ON CONFLICT(id) DO NOTHING RETURNING id,v",
+      "command_tag": "INSERT 0 0",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            2,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            3,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "retired_owner_upsert",
+      "sql": "WITH removed AS (DELETE FROM source_records RETURNING id) INSERT INTO source_records(id,v) SELECT id,2 FROM removed ON CONFLICT(id) DO UPDATE SET v=excluded.v RETURNING id,v",
+      "command_tag": "INSERT 0 2",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          "a",
+          2
+        ],
+        [
+          "b",
+          2
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            null,
+            2,
+            null,
+            null
+          ],
+          [
+            "b",
+            null,
+            2,
+            null,
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "retired_owner_do_nothing",
+      "sql": "WITH removed AS (DELETE FROM source_records RETURNING id) INSERT INTO source_records(id,v) SELECT id,2 FROM removed ON CONFLICT(id) DO NOTHING RETURNING id,v",
+      "command_tag": "INSERT 0 2",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          "a",
+          2
+        ],
+        [
+          "b",
+          2
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            null,
+            2,
+            null,
+            null
+          ],
+          [
+            "b",
+            null,
+            2,
+            null,
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        false
+      ]
+    },
+    {
+      "name": "mutation_error_interleaving",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING v) SELECT v/(v-v) FROM changed",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_returning_error",
+      "sql": "WITH changed AS (UPDATE source_records SET v=v RETURNING nextval('effect_sequence') AS n) SELECT n/(n-n) FROM changed",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_delete_returning_error",
+      "sql": "WITH changed AS (DELETE FROM source_records RETURNING nextval('effect_sequence') AS n) SELECT n/(n-n) FROM changed",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_mutation_limit_one",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING v) SELECT v FROM changed LIMIT 1",
+      "command_tag": "SELECT 1",
+      "columns": [
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_mutation_limit_zero",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING v) SELECT v FROM changed LIMIT 0",
+      "command_tag": "SELECT 0",
+      "columns": [
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_unused_no_returning",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence')) SELECT 7",
+      "command_tag": "SELECT 1",
+      "columns": [
+        {
+          "name": "?column?",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          7
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_shared_returning",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id,v) SELECT a.id,a.v,b.v FROM changed a JOIN changed b USING(id) ORDER BY a.id",
+      "command_tag": "SELECT 2",
+      "columns": [
+        {
+          "name": "id",
+          "oid": 25
+        },
+        {
+          "name": "v",
+          "oid": 23
+        },
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          "a",
+          1,
+          1
+        ],
+        [
+          "b",
+          2,
+          2
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_root_returning_error",
+      "sql": "WITH unused AS (UPDATE archived_records SET v=v WHERE false) UPDATE source_records SET v=nextval('effect_sequence') RETURNING v/(v-v)",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_root_returning",
+      "sql": "WITH unused AS (UPDATE archived_records SET v=v WHERE false) UPDATE source_records SET v=nextval('effect_sequence') RETURNING v",
+      "command_tag": "UPDATE 2",
+      "columns": [
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_insert_values_error",
+      "sql": "WITH added AS (INSERT INTO archived_records(id,v) VALUES ('c',nextval('effect_sequence')),('d',nextval('effect_sequence')) RETURNING v) SELECT v/(v-v) FROM added",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_insert_returning_error",
+      "sql": "WITH added AS (INSERT INTO archived_records(id,v) VALUES ('c',1),('d',2) RETURNING nextval('effect_sequence') n) SELECT n/(n-n) FROM added",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_insert_source_error",
+      "sql": "WITH added AS (INSERT INTO archived_records(id,v) SELECT id,nextval('effect_sequence') FROM source_records RETURNING v) SELECT v/(v-v) FROM added",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_insert_source_returning_error",
+      "sql": "WITH added AS (INSERT INTO archived_records(id,v) SELECT id,v FROM source_records RETURNING nextval('effect_sequence') n) SELECT n/(n-n) FROM added",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_insert_limit_zero",
+      "sql": "WITH added AS (INSERT INTO archived_records(id,v) VALUES ('c',nextval('effect_sequence')),('d',nextval('effect_sequence')) RETURNING v) SELECT v FROM added LIMIT 0",
+      "command_tag": "SELECT 0",
+      "columns": [
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": [
+          [
+            "c",
+            null,
+            1,
+            null,
+            null
+          ],
+          [
+            "d",
+            null,
+            2,
+            null,
+            null
+          ]
+        ]
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_insert_limit_one",
+      "sql": "WITH added AS (INSERT INTO archived_records(id,v) SELECT id,nextval('effect_sequence') FROM source_records RETURNING v) SELECT v FROM added LIMIT 1",
+      "command_tag": "SELECT 1",
+      "columns": [
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": [
+          [
+            "a",
+            null,
+            1,
+            null,
+            null
+          ],
+          [
+            "b",
+            null,
+            2,
+            null,
+            null
+          ]
+        ]
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_insert_unused",
+      "sql": "WITH added AS (INSERT INTO archived_records(id,v) SELECT id,nextval('effect_sequence') FROM source_records) SELECT 7",
+      "command_tag": "SELECT 1",
+      "columns": [
+        {
+          "name": "?column?",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          7
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": [
+          [
+            "a",
+            null,
+            1,
+            null,
+            null
+          ],
+          [
+            "b",
+            null,
+            2,
+            null,
+            null
+          ]
+        ]
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_insert_root_error",
+      "sql": "WITH unused AS (UPDATE archived_records SET v=v WHERE false) INSERT INTO archived_records(id,v) VALUES ('c',nextval('effect_sequence')),('d',nextval('effect_sequence')) RETURNING v/(v-v)",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_insert_root",
+      "sql": "WITH unused AS (UPDATE archived_records SET v=v WHERE false) INSERT INTO archived_records(id,v) SELECT id,nextval('effect_sequence') FROM source_records RETURNING v",
+      "command_tag": "INSERT 0 2",
+      "columns": [
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": [
+          [
+            "a",
+            null,
+            1,
+            null,
+            null
+          ],
+          [
+            "b",
+            null,
+            2,
+            null,
+            null
+          ]
+        ]
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_insert_duplicate_error",
+      "sql": "WITH added AS (INSERT INTO archived_records(id,v) VALUES ('c',nextval('effect_sequence')),('c',nextval('effect_sequence')),('d',nextval('effect_sequence')) RETURNING v) SELECT v FROM added",
+      "sqlstate": "23505",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_insert_source_duplicate_error",
+      "sql": "WITH added AS (INSERT INTO archived_records(id,v) SELECT 'c',nextval('effect_sequence') FROM source_records RETURNING v) SELECT v FROM added",
+      "sqlstate": "23505",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_merge_update_error",
+      "sql": "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v) SELECT v/(v-v) FROM changed",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_merge_returning_error",
+      "sql": "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=t.v RETURNING nextval('effect_sequence') n) SELECT n/(n-n) FROM changed",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_merge_delete_error",
+      "sql": "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN DELETE RETURNING nextval('effect_sequence') n) SELECT n/(n-n) FROM changed",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_merge_insert_error",
+      "sql": "WITH changed AS (MERGE INTO source_records t USING (VALUES('c'),('d')) s(k) ON t.id=s.k WHEN NOT MATCHED THEN INSERT (id,v) VALUES(s.k,nextval('effect_sequence')) RETURNING t.v) SELECT v/(v-v) FROM changed",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_merge_limit_zero",
+      "sql": "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v) SELECT v FROM changed LIMIT 0",
+      "command_tag": "SELECT 0",
+      "columns": [
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_merge_limit_one",
+      "sql": "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v) SELECT v FROM changed LIMIT 1",
+      "command_tag": "SELECT 1",
+      "columns": [
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_merge_unused",
+      "sql": "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence')) SELECT 7",
+      "command_tag": "SELECT 1",
+      "columns": [
+        {
+          "name": "?column?",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          7
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_merge_root_error",
+      "sql": "WITH unused AS (UPDATE archived_records SET v=v WHERE false) MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v/(t.v-t.v)",
+      "sqlstate": "22012",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        1,
+        true
+      ]
+    },
+    {
+      "name": "ordered_merge_root",
+      "sql": "WITH unused AS (UPDATE archived_records SET v=v WHERE false) MERGE INTO source_records t USING (VALUES('a'),('b')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v",
+      "command_tag": "MERGE 2",
+      "columns": [
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_merge_duplicate_error",
+      "sql": "WITH changed AS (MERGE INTO source_records t USING (VALUES('a'),('a')) s(k) ON t.id=s.k WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v) SELECT v FROM changed",
+      "sqlstate": "21000",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_same_command_merge_error",
+      "sql": "WITH changed AS (UPDATE source_records SET v=nextval('effect_sequence') RETURNING id,v) MERGE INTO source_records t USING changed s ON t.id=s.id WHEN MATCHED THEN UPDATE SET v=nextval('effect_sequence') RETURNING t.v",
+      "sqlstate": "21000",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_insert_duplicate_nothing",
+      "sql": "WITH added AS (INSERT INTO archived_records(id,v) VALUES ('c',nextval('effect_sequence')),('c',nextval('effect_sequence')) ON CONFLICT(id) DO NOTHING RETURNING v) SELECT v FROM added",
+      "command_tag": "SELECT 1",
+      "columns": [
+        {
+          "name": "v",
+          "oid": 23
+        }
+      ],
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": [
+          [
+            "c",
+            null,
+            1,
+            null,
+            null
+          ]
+        ]
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    },
+    {
+      "name": "ordered_insert_duplicate_update",
+      "sql": "WITH added AS (INSERT INTO archived_records(id,v) VALUES ('c',nextval('effect_sequence')),('c',nextval('effect_sequence')) ON CONFLICT(id) DO UPDATE SET v=excluded.v RETURNING v) SELECT v FROM added",
+      "sqlstate": "21000",
+      "tables": {
+        "usage_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "source_records": [
+          [
+            "a",
+            "queued",
+            1,
+            [
+              1,
+              null,
+              3
+            ],
+            "9007199254740993.0100"
+          ],
+          [
+            "b",
+            "closed",
+            2,
+            [],
+            null
+          ]
+        ],
+        "archived_records": []
+      },
+      "fk_tables": {
+        "fk_parents": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "fk_children": [
+          [
+            "ca",
+            "a",
+            "old"
+          ],
+          [
+            "cb",
+            "b",
+            "old"
+          ]
+        ]
+      },
+      "sequence": [
+        2,
+        true
+      ]
+    }
+  ]
+}

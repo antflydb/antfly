@@ -99,6 +99,10 @@ fn inputDecisionFunctions(alloc: Allocator, bound: describe.BoundStatement, func
 fn mutationDecisionFunctions(alloc: Allocator, bound: describe.BoundStatement, functions: *std.ArrayList([]const u8)) !void {
     try boundDecisionFunctions(alloc, bound, functions);
     if (bound.returning) |returning| try boundDecisionFunctions(alloc, returning.*, functions);
+    if (bound.effect_graph) |graph| {
+        for (graph.steps) |step| try inputDecisionFunctions(alloc, step.binding, functions);
+        try inputDecisionFunctions(alloc, graph.root.binding, functions);
+    }
     if (bound.insert_source) |source| try inputDecisionFunctions(alloc, source.*, functions);
     if (bound.joined_mutation) |joined| try inputDecisionFunctions(alloc, joined.input.*, functions);
     if (bound.conflict) |conflict| {
@@ -139,6 +143,7 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
         .singleton => .{ .node_type = "Values" },
         .literal_rows => .{ .node_type = "Values" },
         .prepared_rows => .{ .node_type = "Prepared Mutation Images" },
+        .statement_cte => .{ .node_type = "CTE Scan" },
         .recursive_ref => .{ .node_type = "Recursive Reference" },
         .outer_ref => .{ .node_type = "Outer Reference" },
         .unnest => |function| .{ .node_type = "Unnest", .plans = try alloc.dupe(Plan, &.{try relationPlan(alloc, bound, function.source, verbose, depth + 1, remaining)}) },

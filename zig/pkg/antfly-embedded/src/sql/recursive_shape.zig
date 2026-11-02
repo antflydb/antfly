@@ -59,19 +59,33 @@ fn relationReferences(value: *const ast.Relation, name: []const u8, depth: usize
             for (function.args) |arg| count += try scalarReferences(arg, name, depth + 1);
             break :blk count;
         },
-        .table => |table| @intFromBool(table.search == null and table.name.database == null and table.name.namespace == null and std.mem.eql(u8, table.name.table, name)),
+        .table => |table| @intFromBool(!table.mutation_target and table.search == null and table.name.database == null and table.name.namespace == null and std.mem.eql(u8, table.name.table, name)),
         .derived => |derived| references(derived.query.*, name, depth + 1),
         .join => |join| try relationReferences(join.left, name, depth + 1) + try relationReferences(join.right, name, depth + 1) +
             (if (join.condition) |condition| try scalarReferences(condition, name, depth + 1) else @as(usize, 0)) +
             (if (join.demand) |demand| try scalarReferences(demand, name, depth + 1) else @as(usize, 0)),
     };
 }
+const PrefixReferences = struct { count: usize, shadowed: bool };
+fn prefixReferences(ctes: []const ast.Cte, name: []const u8, depth: usize) anyerror!PrefixReferences {
+    // RECURSIVE names cover the entire WITH list. Ordinary WITH introduces
+    // each name after its own body, so earlier definitions still see the outer
+    // relation. A later local name must not erase those dependencies.
+    for (ctes) |cte| if (cte.recursive and std.mem.eql(u8, cte.name, name)) return .{ .count = 0, .shadowed = true };
+    var count: usize = 0;
+    var shadowed = false;
+    for (ctes) |cte| {
+        if (!shadowed) count += try references(cte.query.*, name, depth + 1);
+        if (std.mem.eql(u8, cte.name, name)) shadowed = true;
+    }
+    return .{ .count = count, .shadowed = shadowed };
+}
+
 pub fn references(query: ast.Select, name: []const u8, depth: usize) anyerror!usize {
     if (depth > 64) return error.SqlProgramLimitExceeded;
-    // An inner WITH declaration shadows this relation name in its own query.
-    for (query.ctes) |cte| if (std.mem.eql(u8, cte.name, name)) return 0;
-    var count: usize = 0;
-    for (query.ctes) |cte| count += try references(cte.query.*, name, depth + 1);
+    const prefix = try prefixReferences(query.ctes, name, depth + 1);
+    if (prefix.shadowed) return prefix.count;
+    var count = prefix.count;
     for (query.values_arms) |arm| count += try references(arm.*, name, depth + 1);
     if (query.set_operation) |set| return count + try references(set.left.*, name, depth + 1) + try references(set.right.*, name, depth + 1);
     if (query.source) |source| count += try relationReferences(source, name, depth + 1) else if (query.table) |table| {
@@ -87,6 +101,69 @@ pub fn references(query: ast.Select, name: []const u8, depth: usize) anyerror!us
         count += try scalarReferences(expression, name, depth + 1);
     };
     return count;
+}
+
+fn returningReferences(output: ?[]const ast.Projection, name: []const u8, depth: usize) !usize {
+    var count: usize = 0;
+    for (output orelse &.{}) |column| if (column.expression) |expression| {
+        count += try scalarReferences(expression, name, depth + 1);
+    };
+    return count;
+}
+fn assignmentReferences(values: []const ast.Assignment, name: []const u8, depth: usize) !usize {
+    var count: usize = 0;
+    for (values) |value| {
+        if (value.expression) |expression| count += try scalarReferences(expression, name, depth + 1);
+        if (value.capture_expression) |expression| count += try scalarReferences(expression, name, depth + 1);
+    }
+    return count;
+}
+
+/// Read dependencies of one command. Mutation targets are physical identities,
+/// never CTE references. Use the same lexical shadowing rules as SELECT.
+pub fn statementReferences(statement: ast.Statement, name: []const u8, depth: usize) anyerror!usize {
+    if (depth > 64) return error.SqlProgramLimitExceeded;
+    return switch (statement) {
+        .select => |query| references(query, name, depth + 1),
+        .insert => |value| blk: {
+            var count = if (value.source) |query| try references(query.*, name, depth + 1) else @as(usize, 0);
+            for (value.expressions) |row| for (row) |expression| {
+                if (expression) |input| count += try scalarReferences(input, name, depth + 1);
+            };
+            if (value.conflict) |conflict| {
+                count += try assignmentReferences(conflict.assignments, name, depth + 1);
+                if (conflict.predicate) |predicate| count += try scalarReferences(predicate, name, depth + 1);
+                if (conflict.arbiter_predicate) |predicate| count += try scalarReferences(predicate, name, depth + 1);
+                for (conflict.expressions) |expression| count += try scalarReferences(expression, name, depth + 1);
+            }
+            break :blk count + try returningReferences(value.returning, name, depth + 1);
+        },
+        inline .update, .delete => |value| blk: {
+            const prefix = try prefixReferences(value.ctes, name, depth + 1);
+            if (prefix.shadowed) break :blk prefix.count;
+            var count = prefix.count + (if (value.source) |source| try relationReferences(source, name, depth + 1) else @as(usize, 0));
+            if (value.predicate) |predicate| count += try predicateReferences(predicate, name, depth + 1);
+            if (comptime @hasField(@TypeOf(value), "assignments")) count += try assignmentReferences(value.assignments, name, depth + 1);
+            break :blk count + try returningReferences(value.returning, name, depth + 1);
+        },
+        .merge => |value| blk: {
+            const prefix = try prefixReferences(value.ctes, name, depth + 1);
+            if (prefix.shadowed) break :blk prefix.count;
+            var count = prefix.count + try relationReferences(value.source, name, depth + 1) + try scalarReferences(value.condition, name, depth + 1);
+            for (value.arms) |arm| {
+                if (arm.predicate) |predicate| count += try scalarReferences(predicate, name, depth + 1);
+                switch (arm.action) {
+                    .update => |values| count += try assignmentReferences(values, name, depth + 1),
+                    .insert => |values| for (values.values) |expression| {
+                        if (expression) |input| count += try scalarReferences(input, name, depth + 1);
+                    },
+                    .delete, .nothing => {},
+                }
+            }
+            break :blk count + try returningReferences(value.returning, name, depth + 1);
+        },
+        else => return error.UnsupportedSqlShape,
+    };
 }
 
 fn validateRelation(value: *const ast.Relation, name: []const u8, depth: usize) anyerror!void {

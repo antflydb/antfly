@@ -207,3 +207,5 @@ pub const bytea_reference = @embedFile("fixtures/sql_bytea_reference.json");
 pub const trigger_reference = @embedFile("fixtures/sql_trigger_reference.json");
 
 pub const phonetic_reference = @embedFile("fixtures/sql_phonetic_reference.json");
+
+pub const mutation_cte_reference = @embedFile("fixtures/sql_mutation_cte_reference.json");

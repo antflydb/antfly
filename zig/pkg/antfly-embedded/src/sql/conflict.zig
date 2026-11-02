@@ -384,6 +384,23 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
         const conflict_owner = owner_by_key.get(mutation.key);
         if (conflict_owner) |owner| if (owner.key == null) continue;
         const lookup_key = if (conflict_owner) |owner| owner.key.? else mutation.key;
+        if (context.backend.statement_effect_execution) |execution| {
+            if (execution.pending_owner(execution.ptr, table, lookup_key)) |pending_owner| {
+                // A retired tuple permits insertion; its original fence is
+                // already retained by the command journal. A live tuple is a
+                // same-command conflict even when the UPDATE WHERE is false.
+                if (pending_owner.retired) continue;
+                if (clause.assignments.len != 0) return error.SqlMutationCardinalityViolation;
+                mutation.key = pending_owner.key;
+                mutation.expected_version = pending_owner.version;
+                mutation.expected_content_digest = pending_owner.digest;
+                mutation.unique_absence = false;
+                mutation.predicate_only = true;
+                mutation.row = null;
+                mutation.json_null_fields = &.{};
+                continue;
+            }
+        }
         if (point_pages >= context.limits.scan_pages) return error.SqlProgramLimitExceeded;
         // A point read can carry a large native page/continuation even though
         // only its fenced row image survives this iteration. Reclaim that

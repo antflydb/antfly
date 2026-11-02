@@ -124,7 +124,7 @@ pub fn prepare(a: A, record: records.Record, resolver: ?@import("routine_binding
     // do not let child ordinals alias the caller's sequence/decision receipts.
     if (@import("decision_eval.zig").hasExternal(program)) return error.UnsupportedSqlShape;
     const resolved = try a.create(@import("routine_bindings.zig").Resolved);
-    resolved.* = .{ .id = record.id, .generation = record.generation, .arguments = descriptors, .output = result, .program = program, .strict = record.definition.strict };
+    resolved.* = .{ .id = record.id, .generation = record.generation, .arguments = descriptors, .output = result, .program = program, .strict = record.definition.strict, .volatility = std.meta.stringToEnum(scalar.Volatility, @tagName(record.definition.volatility)).? };
     return resolved;
 }
 

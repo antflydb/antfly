@@ -6810,7 +6810,7 @@ pub const AntflyApiHandler = struct {
             if (self.prepared_mode == .prepare) {
                 if (self.statement.len > prepared.max_statement_bytes) return error.SqlProgramLimitExceeded;
                 switch (compiled.statement) {
-                    .select, .insert, .update, .delete, .merge => {},
+                    .effect_block, .select, .insert, .update, .delete, .merge => {},
                     else => return error.UnsupportedSqlExecution,
                 }
                 var bindings: std.ArrayListUnmanaged(prepared.Binding) = .empty;
@@ -6844,10 +6844,7 @@ pub const AntflyApiHandler = struct {
                 self.prepared_response = response;
                 return;
             }
-            self.is_write = switch (compiled.statement) {
-                .select, .explain, .copy_to, .copy_from => false,
-                .call, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction, .prepared_transaction => true,
-            };
+            self.is_write = compiled.statement.requiresWriteAdmission();
             var execution = self.adapter.server.acquireSqlExecution(self.is_write) catch |err| {
                 self.failure = err;
                 return;

@@ -363,7 +363,7 @@ fn runWithBinding(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: c
         owns_frame = true;
     };
     defer if (owns_frame) binding.parameter_invocation.?.deinitFrame();
-    if (compiled.statement == .select and !expressions_prepared) try @import("execution_prepare.zig").validate(alloc, backend, binding);
+    if ((compiled.statement == .select or compiled.statement == .effect_block) and !expressions_prepared) try @import("execution_prepare.zig").validate(alloc, backend, binding);
     const prepared_parameters = if (binding.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else parameters;
     var manager: ?@import("spill.zig").Manager = null;
     defer if (manager) |*owned| owned.deinit();
@@ -662,13 +662,14 @@ pub const Context = struct {
         }
     };
 
-    fn run(unscoped: Context, input: ast.Statement) !Output {
+    pub fn run(unscoped: Context, input: ast.Statement) !Output {
+        if (unscoped.binding.effect_graph) |graph| return @import("statement_effect_runtime.zig").execute(unscoped, graph);
         var context = unscoped;
         context.backend = @import("decision_eval.zig").scopedBackend(context.backend, context.binding);
         if (input != .select) try @import("decision_eval.zig").validateStatement(context.arena, context.backend.decision_provider, context.binding, context.parameters);
         var capture: ?@import("mutation_capture.zig") = null;
         defer if (capture) |*owner| owner.deinit();
-        if (context.binding.returning_query != null) {
+        if (context.statement_capture == null and context.binding.returning_query != null) {
             capture = try @import("mutation_capture.zig").open(context.alloc, context.backend, context.binding, context.parameters);
             context.statement_capture = &capture.?;
         }
@@ -692,7 +693,18 @@ pub const Context = struct {
     }
 
     pub fn checkpoint(self: Context) !void {
+        if (self.backend.statement_effect_execution) |execution| try execution.checkpoint(execution.ptr);
         try self.backend.vtable.checkpoint(self.backend.ptr);
+    }
+    pub fn admitScanPage(self: Context) !void {
+        if (self.backend.statement_effect_execution) |execution| try execution.scan_page(execution.ptr);
+    }
+    pub fn admitScanRows(self: Context, row_count: usize) !void {
+        if (self.backend.statement_effect_execution) |execution| try execution.scan_rows(execution.ptr, row_count);
+    }
+    pub fn claimStatementMutations(self: Context, table: catalog.Table, mutations: []const catalog.Mutation, tag: []const u8) ![]const catalog.Mutation {
+        if (self.backend.statement_effect_execution) |execution| return execution.claim(execution.ptr, self.arena, table, mutations, tag);
+        return mutations;
     }
 
     fn expressionAccessCheckpoint(raw: ?*anyopaque) !void {
@@ -1657,6 +1669,14 @@ pub const Context = struct {
 
     fn insert(self: Context, statement: ast.Insert) !Output {
         if (statement.source) |source| return self.insertSelect(statement, source.*);
+        return self.insertValues(statement, 0, statement.rows.len, null);
+    }
+
+    pub const InsertPreparation = struct { allocator: std.mem.Allocator, owner: ?catalog.MutationPreparation = null };
+
+    pub fn insertValues(self: Context, original: ast.Insert, first_row: usize, last_row: usize, shared: ?*InsertPreparation) !Output {
+        var statement = original;
+        statement.rows = statement.rows[0..last_row];
         const table_def = self.binding.table orelse return error.InvalidSqlBackendResponse;
         try table_def.validateDocumentWriteColumns(statement.columns);
         if (statement.rows.len > self.limits.mutation_rows) return error.SqlProgramLimitExceeded;
@@ -1682,20 +1702,22 @@ pub const Context = struct {
             break :blk images;
         } else null;
         var selected: std.ArrayList(catalog.Mutation) = .empty;
-        const mutations = try self.arena.alloc(catalog.Mutation, statement.rows.len);
+        const mutations = try self.arena.alloc(catalog.Mutation, last_row - first_row);
         const domain_seed = try @import("domain_mutation.zig").Builder.init(self.arena, table_def, false);
         var keys: std.StringHashMapUnmanaged(void) = .empty;
         var retained: usize = 0;
-        var preparation: ?catalog.MutationPreparation = null;
-        defer if (preparation) |owner| owner.close(owner.ptr);
+        var preparation: ?catalog.MutationPreparation = if (shared) |owner| owner.owner else null;
+        defer if (shared) |owner| {
+            owner.owner = preparation;
+        } else if (preparation) |owner| owner.close(owner.ptr);
         var stateful_defaults = false;
         for (table_def.columns) |column| stateful_defaults = stateful_defaults or column.sequence_default != null;
-        var first: usize = 0;
+        var first: usize = first_row;
         while (first < statement.rows.len) {
-            var page_arena = std.heap.ArenaAllocator.init(self.alloc);
+            var page_arena = std.heap.ArenaAllocator.init(if (shared != null) self.arena else self.alloc);
             defer page_arena.deinit();
             const page = try self.insertDecisionPage(page_arena.allocator(), statement, first);
-            for (statement.rows[first..page.end], mutations[first..page.end], first..) |row, *mutation, row_index| {
+            for (statement.rows[first..page.end], mutations[first - first_row .. page.end - first_row], first..) |row, *mutation, row_index| {
                 try self.checkpoint();
                 if (row.len != columns.len) return error.InvalidSqlParameters;
                 const key_datum: @import("scalar.zig").Datum = if (key_index) |key_at| blk: {
@@ -1742,9 +1764,9 @@ pub const Context = struct {
                 if (filter == null and !stateful_defaults) try self.validateInsertRequired(table_def, object);
                 mutation.* = .{ .key = key.string, .expected_version = 0, .unique_absence = true, .row = document, .json_null_fields = json_null_fields.items, .domain_admission = domain_provenance.admission() };
                 if (filter != null) {
-                    if (preparation == null) preparation = try (self.backend.vtable.open_mutation_preparation orelse return error.UnsupportedSqlExecution)(self.backend.ptr, self.arena, table_def, mutation.key, table_def.storage_mode == .document);
+                    if (preparation == null) preparation = try (self.backend.vtable.open_mutation_preparation orelse return error.UnsupportedSqlExecution)(self.backend.ptr, if (shared) |owner| owner.allocator else self.arena, table_def, mutation.key, table_def.storage_mode == .document);
                     const owner = preparation.?;
-                    const candidates = try (owner.candidates orelse return error.UnsupportedSqlExecution)(owner.ptr, self.arena, mutations[row_index .. row_index + 1]);
+                    const candidates = try (owner.candidates orelse return error.UnsupportedSqlExecution)(owner.ptr, self.arena, mutations[row_index - first_row .. row_index - first_row + 1]);
                     if (candidates.len != 1) return error.InvalidSqlBackendResponse;
                     const image = try filter_images.?.row(page_arena.allocator(), candidates[0], mutation.*);
                     const cells = try filter.?.cells(page_arena.allocator(), image);
@@ -1757,9 +1779,9 @@ pub const Context = struct {
                     if (normalized.len != 1) return error.InvalidSqlBackendResponse;
                     try selected.append(self.arena, normalized[0]);
                 } else if (stateful_defaults) {
-                    if (preparation == null) preparation = try (self.backend.vtable.open_mutation_preparation orelse return error.UnsupportedSqlExecution)(self.backend.ptr, self.arena, table_def, mutation.key, statement.returning != null or statement.conflict != null or table_def.storage_mode == .document);
+                    if (preparation == null) preparation = try (self.backend.vtable.open_mutation_preparation orelse return error.UnsupportedSqlExecution)(self.backend.ptr, if (shared) |owner| owner.allocator else self.arena, table_def, mutation.key, statement.returning != null or statement.conflict != null or table_def.storage_mode == .document);
                     const owner = preparation.?;
-                    const normalized = try owner.prepare(owner.ptr, self.arena, mutations[row_index .. row_index + 1]);
+                    const normalized = try owner.prepare(owner.ptr, self.arena, mutations[row_index - first_row .. row_index - first_row + 1]);
                     if (normalized.len != 1) return error.InvalidSqlBackendResponse;
                     mutation.* = normalized[0];
                 }
@@ -1767,20 +1789,26 @@ pub const Context = struct {
             first = page.end;
             try self.checkpoint();
         }
-        if (preparation) |owner| {
+        if (shared == null) if (preparation) |owner| {
             try owner.finish(owner.ptr, self.arena);
             owner.close(owner.ptr);
             preparation = null;
-        }
+        };
         const effective = if (filter != null) selected.items else mutations;
         const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table_def, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, effective, &.{}) else effective;
-        return self.commitMutationsInner(table_def, resolved, "INSERT", statement.returning, filter != null or (stateful_defaults and statement.conflict == null));
+        var ready = resolved;
+        var did_prepare = filter != null or (stateful_defaults and statement.conflict == null);
+        if (shared != null and !did_prepare and statement.conflict == null and ready.len != 0) {
+            if (preparation == null) preparation = try (self.backend.vtable.open_mutation_preparation orelse return error.UnsupportedSqlExecution)(self.backend.ptr, shared.?.allocator, table_def, ready[0].key, statement.returning != null or table_def.storage_mode == .document);
+            ready = try preparation.?.prepare(preparation.?.ptr, self.arena, ready);
+            if (ready.len != resolved.len) return error.InvalidSqlBackendResponse;
+            did_prepare = true;
+        }
+        return self.commitMutationsInner(table_def, ready, "INSERT", statement.returning, did_prepare);
     }
 
     fn insertSelect(self: Context, statement: ast.Insert, source: ast.Select) !Output {
         const table = self.binding.table orelse return error.InvalidSqlBackendResponse;
-        var stateful_defaults = false;
-        for (table.columns) |column| stateful_defaults = stateful_defaults or column.sequence_default != null;
         try table.validateDocumentWriteColumns(statement.columns);
         const bound = self.binding.insert_source orelse return error.InvalidSqlBackendResponse;
         const target_columns = try self.arena.alloc(catalog.Column, statement.columns.len);
@@ -1818,39 +1846,54 @@ pub const Context = struct {
                 }
                 captured[row_index] = cells;
             } else captured[row_index] = &.{};
-            var object: std.json.ObjectMap = .empty;
-            var json_null_fields: std.ArrayList([]const u8) = .empty;
-            var key: ?[]const u8 = null;
-            for (target_columns, bound.columns[0..statement.columns.len], row[0..statement.columns.len], 0..) |target, source_column, value_, cell_index| {
-                if (statement.isDefault(row_index, cell_index) or statement.ignoresIdentity(target)) continue;
-                if (!value_.sql_null and source_column.type != target.type and target.type != .string and !@import("builtin_cast.zig").numericAssignmentAllowed(source_column.type, target.type) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json or target.type == .uuid))) return error.SqlTypeMismatch;
-                var assignment_column = target;
-                if (stateful_defaults and !table.isDocumentRoot(target.name)) assignment_column.nullable = true;
-                const typed = try self.storageDatumTyped(value_, assignment_column, @import("scalar.zig").assignmentSourceIdentity(source_column.type, source_column.element_type));
-                if (std.mem.eql(u8, target.name, "_id")) {
-                    if (value_.sql_null or typed != .string or typed.string.len == 0) return error.SqlRowIdentityRequired;
-                    if (!std.unicode.utf8ValidateSlice(typed.string)) return error.SqlTypeMismatch;
-                    key = typed.string;
-                } else if (table.isDocumentRoot(target.name)) {
-                    if (value_.sql_null or typed != .object) return error.SqlTypeMismatch;
-                    object = typed.object;
-                    try json_null_fields.appendSlice(self.arena, try table.documentRootNulls(self.arena, typed));
-                } else {
-                    if (target.type == .json and !value_.sql_null and typed == .null) try json_null_fields.append(self.arena, target.path);
-                    try target.assignStorageValue(self.arena, &object, typed, value_.sql_null and !stateful_defaults);
-                }
-            }
-            const identity = key orelse try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena);
-            if (identity.len == 0 or !std.unicode.utf8ValidateSlice(identity)) return error.InvalidSqlBackendResponse;
-            if ((try keys.getOrPut(self.arena, identity)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return @import("conflict.zig").duplicateRowError(statement.conflict);
-            retained = std.math.add(usize, retained, jsonSize(.{ .object = object }) + identity.len) catch return error.SqlProgramLimitExceeded;
+            mutation.* = try self.insertSourceRow(statement, .{ .columns = target_columns, .source = bound, .domain_admission = domain_provenance.admission() }, row, row_index);
+            if ((try keys.getOrPut(self.arena, mutation.key)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return @import("conflict.zig").duplicateRowError(statement.conflict);
+            retained = std.math.add(usize, retained, jsonSize(mutation.row.?) + mutation.key.len) catch return error.SqlProgramLimitExceeded;
             if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
-            if (!stateful_defaults) try self.validateInsertRequired(table, object);
-            mutation.* = .{ .key = identity, .expected_version = 0, .unique_absence = true, .row = .{ .object = object }, .json_null_fields = json_null_fields.items, .domain_admission = domain_provenance.admission() };
         }
         try self.checkpoint();
         const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, mutations, captured) else mutations;
         return self.commitMutations(table, resolved, "INSERT", statement.returning);
+    }
+
+    pub const InsertSourceBuilder = struct {
+        columns: []const catalog.Column,
+        source: *const describe.BoundStatement,
+        domain_admission: @FieldType(catalog.Mutation, "domain_admission"),
+    };
+
+    pub fn insertSourceRow(self: Context, statement: ast.Insert, builder: InsertSourceBuilder, row: []const Datum, row_index: usize) !catalog.Mutation {
+        const table = self.binding.table orelse return error.InvalidSqlBackendResponse;
+        var stateful_defaults = false;
+        for (table.columns) |column| stateful_defaults = stateful_defaults or column.sequence_default != null;
+        var object: std.json.ObjectMap = .empty;
+        var json_null_fields: std.ArrayList([]const u8) = .empty;
+        var key: ?[]const u8 = null;
+        for (builder.columns, builder.source.columns[0..statement.columns.len], row[0..statement.columns.len], 0..) |target, source_column, value_, cell_index| {
+            if (statement.isDefault(row_index, cell_index) or statement.ignoresIdentity(target)) continue;
+            if (!value_.sql_null and source_column.type != target.type and target.type != .string and !@import("builtin_cast.zig").numericAssignmentAllowed(source_column.type, target.type) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json or target.type == .uuid))) return error.SqlTypeMismatch;
+            var assignment_column = target;
+            if (stateful_defaults and !table.isDocumentRoot(target.name)) assignment_column.nullable = true;
+            const typed = try self.storageDatumTyped(value_, assignment_column, @import("scalar.zig").assignmentSourceIdentity(source_column.type, source_column.element_type));
+            if (std.mem.eql(u8, target.name, "_id")) {
+                if (value_.sql_null or typed != .string or typed.string.len == 0) return error.SqlRowIdentityRequired;
+                if (!std.unicode.utf8ValidateSlice(typed.string)) return error.SqlTypeMismatch;
+                key = typed.string;
+            } else if (table.isDocumentRoot(target.name)) {
+                if (value_.sql_null or typed != .object) return error.SqlTypeMismatch;
+                object = typed.object;
+                try json_null_fields.appendSlice(self.arena, try table.documentRootNulls(self.arena, typed));
+            } else {
+                if (target.type == .json and !value_.sql_null and typed == .null) try json_null_fields.append(self.arena, target.path);
+                try target.assignStorageValue(self.arena, &object, typed, value_.sql_null and !stateful_defaults);
+            }
+        }
+        const identity = key orelse try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena);
+        if (identity.len == 0 or !std.unicode.utf8ValidateSlice(identity)) return error.InvalidSqlBackendResponse;
+
+        if (jsonSize(.{ .object = object }) +| identity.len > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
+        if (!stateful_defaults) try self.validateInsertRequired(table, object);
+        return .{ .key = identity, .expected_version = 0, .unique_absence = true, .row = .{ .object = object }, .json_null_fields = json_null_fields.items, .domain_admission = builder.domain_admission };
     }
 
     const InsertDecisionPage = struct { end: usize, values: []const []const ?Datum };
@@ -2180,12 +2223,16 @@ pub const Context = struct {
         return self.commitMutationsInner(table, all, tag, null, true);
     }
 
+    pub fn commitPreparedReturning(self: Context, table: catalog.Table, all: []const catalog.Mutation, tag: []const u8, returning: ?[]const ast.Projection) !Output {
+        return self.commitMutationsInner(table, all, tag, returning, true);
+    }
+
     fn commitMutationsInner(self: Context, table: catalog.Table, all: []const catalog.Mutation, tag: []const u8, returning: ?[]const ast.Projection, already_prepared: bool) !Output {
         var fences: std.ArrayList(catalog.Mutation) = .empty;
         for (all) |mutation| if (mutation.predicate_only) {
             try fences.append(self.arena, mutation);
         };
-        const input: []const catalog.Mutation = if (fences.items.len == 0) all else blk: {
+        var input: []const catalog.Mutation = if (fences.items.len == 0) all else blk: {
             const effective = try self.arena.alloc(catalog.Mutation, all.len - fences.items.len);
             var index: usize = 0;
             for (all) |mutation| if (!mutation.predicate_only) {
@@ -2194,6 +2241,7 @@ pub const Context = struct {
             };
             break :blk effective;
         };
+        input = try self.claimStatementMutations(table, input, tag);
         var output: Output = .{ .command_tag = tag, .rows_affected = input.len };
         var prepared = input;
         var did_prepare = already_prepared;
@@ -2203,16 +2251,28 @@ pub const Context = struct {
             did_prepare = true;
             if (prepared.len != input.len) return error.InvalidSqlBackendResponse;
         }
+        if (returning != null and !did_prepare and input.len != 0 and table.storage_mode != .document and !std.mem.eql(u8, tag, "DELETE")) {
+            prepared = try (self.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution)(self.backend.ptr, self.arena, table, input);
+            did_prepare = true;
+            if (prepared.len != input.len) return error.InvalidSqlBackendResponse;
+        }
+        // Projection, quotas and normalization can fail only BEFORE commit.
+        // No post-commit lookup or allocation can replace the known outcome.
+        for (input, prepared) |original, mutation| {
+            if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or
+                !std.meta.eql(mutation.expected_content_digest, original.expected_content_digest) or
+                mutation.unique_absence != original.unique_absence or mutation.predicate_only != original.predicate_only or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
+            if (mutation.conflict_guard != original.conflict_guard) return error.InvalidSqlBackendResponse;
+        }
+        // Command-private admission must precede RETURNING: its expressions
+        // can pull sibling producers whose unique lookups depend on this row.
+        // Ordinary statements retain their publish-after-projection boundary.
+        if (self.backend.statement_effect_execution != null)
+            output.mutation_outcome = try self.applyPreparedMutations(table, prepared, fences.items, returning, did_prepare);
         if (returning != null) {
             const projections = self.binding.returning_projections orelse return error.InvalidSqlBackendResponse;
             if (input.len > self.limits.result_rows) return error.SqlResultTooLarge;
             const binding = self.binding.returning orelse return error.InvalidSqlBackendResponse;
-            if (!did_prepare and input.len != 0 and table.storage_mode != .document and !std.mem.eql(u8, tag, "DELETE")) {
-                const prepare = self.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
-                prepared = try prepare(self.backend.ptr, self.arena, table, input);
-                did_prepare = true;
-                if (prepared.len != input.len) return error.InvalidSqlBackendResponse;
-            }
             var context = self;
             context.binding = binding.*;
             if (self.binding.returning_query) |query| {
@@ -2265,21 +2325,21 @@ pub const Context = struct {
                 output.sql_nulls = if (native_rows == null) flags else null;
             }
         }
-        // Projection, quotas and normalization can fail only BEFORE commit.
-        // No post-commit lookup or allocation can replace the known outcome.
-        for (input, prepared) |original, mutation| {
-            if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or
-                !std.meta.eql(mutation.expected_content_digest, original.expected_content_digest) or
-                mutation.unique_absence != original.unique_absence or mutation.predicate_only != original.predicate_only or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
-            if (mutation.conflict_guard != original.conflict_guard) return error.InvalidSqlBackendResponse;
-        }
+        if (self.backend.statement_effect_execution == null)
+            output.mutation_outcome = try self.applyPreparedMutations(table, prepared, fences.items, returning, did_prepare);
+        return output;
+    }
+
+    fn applyPreparedMutations(self: Context, table: catalog.Table, prepared: []const catalog.Mutation, fences: []const catalog.Mutation, returning: ?[]const ast.Projection, did_prepare: bool) !catalog.MutationOutcome {
         try self.checkpoint();
         // No iterator may borrow the captured cut past publication. Native
         // proof/version fences have already joined the atomic write read-set.
-        if (self.statement_capture) |capture| capture.release();
-        const committed_base = if (fences.items.len == 0) prepared else blk: {
-            try fences.appendSlice(self.arena, prepared);
-            break :blk fences.items;
+        if (self.backend.statement_effect_execution == null) if (self.statement_capture) |capture| capture.release();
+        const committed_base = if (fences.len == 0) prepared else blk: {
+            const all = try self.arena.alloc(catalog.Mutation, fences.len + prepared.len);
+            @memcpy(all[0..fences.len], fences);
+            @memcpy(all[fences.len..], prepared);
+            break :blk all;
         };
         // Provenance belongs to each effective mutation, not the enclosing
         // batch: ON CONFLICT and MERGE can mix inserts, updates and deletes.
@@ -2302,11 +2362,10 @@ pub const Context = struct {
         // serialization capacity before the statement result is released.
         var commit_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer commit_arena.deinit();
-        output.mutation_outcome = if (committed.len == 0) .committed else if (did_prepare)
+        return if (committed.len == 0) .committed else if (did_prepare)
             try (self.backend.vtable.mutate_prepared orelse return error.UnsupportedSqlExecution)(self.backend.ptr, commit_arena.allocator(), self.alloc, table, committed)
         else
             try self.backend.vtable.mutate(self.backend.ptr, commit_arena.allocator(), self.alloc, table, committed);
-        return output;
     }
 
     pub const ReturningImages = struct {
@@ -8476,4 +8535,646 @@ test "SQL bytea buffered native queries match PostgreSQL across page ownership b
             }
         }
     }
+}
+
+/// Command-boundary fixture: base scans always use the pre-command snapshot;
+/// mutation callbacks collect privately and finish is the only publication.
+const EffectTestSequence = struct {
+    const sequences = @import("sequence_effects.zig");
+    calls: i64 = 0,
+    fn resolve(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !sequences.Reference {
+        return .{ .identity = .{ .incarnation = @splat(1), .id = 7 }, .namespace_id = 2, .target = .{ .table = "numbers" } };
+    }
+    fn invoke(raw: *anyopaque, _: std.mem.Allocator, _: sequences.Function, _: ?sequences.Reference, _: []const Datum) !i64 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        return self.calls;
+    }
+    fn flush(_: *anyopaque) !void {}
+};
+
+const EffectTestBackend = struct {
+    base: TestBackend = .{ .row_count = 2, .group_every = 1 },
+    pending: usize = 0,
+    batches: usize = 0,
+    preparations: usize = 0,
+    point_opens: usize = 0,
+    point_closes: usize = 0,
+    preparation_opens: usize = 0,
+    preparation_finishes: usize = 0,
+    preparation_closes: usize = 0,
+    published: usize = 0,
+    begins: usize = 0,
+    finishes: usize = 0,
+    aborts: usize = 0,
+    active: bool = false,
+    fail_finish: bool = false,
+    deny_write: bool = false,
+    fn owner(raw: *anyopaque) *@This() {
+        const base: *TestBackend = @ptrCast(@alignCast(raw));
+        return @fieldParentPtr("base", base);
+    }
+    fn backend(self: *@This()) catalog.Backend {
+        return .{ .ptr = &self.base, .atomic_statement_read_set = true, .predicate_only_mutations = true, .statement_mutations = .{ .ptr = &self.base, .begin = begin }, .vtable = &.{ .resolve = resolve, .scan = TestBackend.scan, .open_scan = openPoint, .open_statement = TestBackend.openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepare, .open_mutation_preparation = openPreparation, .checkpoint = TestBackend.checkpoint } };
+    }
+    const Point = struct {
+        owner: *EffectTestBackend,
+        allocator: std.mem.Allocator,
+        table: catalog.Table,
+        request: catalog.Scan,
+        done: bool = false,
+        fn next(raw: *anyopaque, a: std.mem.Allocator, _: u32) !catalog.Page {
+            const self: *Point = @ptrCast(@alignCast(raw));
+            if (self.done) return .{ .rows = &.{} };
+            self.done = true;
+            const key = self.request.primary_key orelse return error.UnexpectedBackendCall;
+            _ = std.fmt.parseInt(usize, key, 10) catch {
+                self.owner.base.point_reads += 1;
+                return .{ .rows = &.{} };
+            };
+            // Publication is the only writer of this fixture's base snapshot.
+            // Point conflict lookup cannot see command-private row admissions.
+            return TestBackend.scan(&self.owner.base, a, self.table, self.request);
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *Point = @ptrCast(@alignCast(raw));
+            self.owner.point_closes += 1;
+            self.allocator.destroy(self);
+        }
+    };
+    fn openPoint(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+        if (request.primary_key == null or !request.include_primary_digest) return error.UnexpectedBackendCall;
+        const cursor = try a.create(Point);
+        cursor.* = .{ .owner = owner(raw), .allocator = a, .table = table, .request = request };
+        owner(raw).point_opens += 1;
+        return .{ .ptr = cursor, .next = Point.next, .close = Point.close };
+    }
+    fn resolve(raw: *anyopaque, a: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+        if (action != .read and owner(raw).deny_write) return error.Forbidden;
+        return TestBackend.resolve(raw, a, name, action);
+    }
+    fn begin(raw: *anyopaque, _: std.mem.Allocator) !catalog.Backend.StatementMutations {
+        const self = owner(raw);
+        try std.testing.expect(!self.active);
+        self.active = true;
+        self.begins += 1;
+        return .{ .ptr = raw, .finish = finish, .abort = abort };
+    }
+    fn finish(raw: *anyopaque) !void {
+        const self = owner(raw);
+        try std.testing.expect(self.active);
+        // Every native read lease must close before durable staging.
+        try std.testing.expectEqual(self.base.statement_opens, self.base.statement_closes);
+        if (self.fail_finish) return error.ForeignKeyParentMissing;
+        self.published += self.pending;
+        self.pending = 0;
+        self.finishes += 1;
+    }
+    fn abort(raw: *anyopaque) void {
+        const self = owner(raw);
+        self.pending = 0;
+        self.active = false;
+        self.aborts += 1;
+    }
+    fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {
+        owner(raw).preparations += 1;
+        return input;
+    }
+    fn openPreparation(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const u8, _: bool) !catalog.MutationPreparation {
+        owner(raw).preparation_opens += 1;
+        return .{ .ptr = raw, .prepare = prepareRow, .finish = finishPreparation, .close = closePreparation };
+    }
+    fn prepareRow(raw: *anyopaque, _: std.mem.Allocator, input: []const catalog.Mutation) ![]const catalog.Mutation {
+        owner(raw).preparations += 1;
+        return input;
+    }
+    fn finishPreparation(raw: *anyopaque, _: std.mem.Allocator) !void {
+        owner(raw).preparation_finishes += 1;
+    }
+    fn closePreparation(raw: *anyopaque) void {
+        owner(raw).preparation_closes += 1;
+    }
+
+    fn mutate(raw: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+        const self = owner(raw);
+        try std.testing.expect(self.active);
+        try std.testing.expectEqual(@as(usize, 0), self.published);
+        self.batches += 1;
+        for (input) |mutation| if (!mutation.predicate_only) {
+            self.pending += 1;
+        };
+        return .committed;
+    }
+};
+
+test "SQL statement effect CTE execution shares snapshots captures and command completion" {
+    const Case = struct { sql: []const u8, rows: usize, writes: usize, affected: usize = 0, parameters: []const Json = &.{}, expected: ?[]const []const Json = null };
+    const cases = [_]Case{
+        .{ .sql = "WITH changed AS (UPDATE things SET id=$1+id RETURNING id) SELECT id FROM changed ORDER BY id", .rows = 2, .writes = 2, .parameters = &.{.{ .integer = 10 }}, .expected = &.{ &.{.{ .string = "10" }}, &.{.{ .string = "11" }} } },
+        .{ .sql = "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<3), changed AS (UPDATE things SET id=10 RETURNING id) SELECT n FROM numbers ORDER BY n", .rows = 3, .writes = 2, .expected = &.{ &.{.{ .string = "1" }}, &.{.{ .string = "2" }}, &.{.{ .string = "3" }} } },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING _id,id) SELECT * FROM changed ORDER BY _id", .rows = 2, .writes = 2 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING id) SELECT 7", .rows = 1, .writes = 2 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING id) SELECT * FROM changed LIMIT 0", .rows = 0, .writes = 2 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10) SELECT 7", .rows = 1, .writes = 2 },
+        .{ .sql = "WITH changed AS (DELETE FROM things RETURNING _id) SELECT * FROM changed", .rows = 2, .writes = 2 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING _id,id) SELECT a.id,b.id FROM changed a JOIN changed b ON a._id=b._id", .rows = 2, .writes = 2 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING id) SELECT id FROM things ORDER BY id", .rows = 2, .writes = 2 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING _id,id) UPDATE things SET id=20 WHERE _id IN(SELECT _id FROM changed) RETURNING id", .rows = 0, .writes = 2 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING _id,id) DELETE FROM things WHERE _id IN(SELECT _id FROM changed) RETURNING id", .rows = 0, .writes = 2 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING _id,id), readback AS MATERIALIZED (SELECT * FROM changed) SELECT a.id,b.id FROM readback a JOIN readback b ON a._id=b._id", .rows = 2, .writes = 2 },
+        .{ .sql = "WITH old AS MATERIALIZED (SELECT _id,id FROM things), changed AS (UPDATE things SET id=10 RETURNING _id) SELECT old.id FROM old JOIN changed USING(_id)", .rows = 2, .writes = 2 },
+        .{ .sql = "WITH old AS NOT MATERIALIZED (SELECT _id,id FROM things), changed AS (UPDATE things SET id=10 RETURNING _id) SELECT old.id FROM old JOIN changed USING(_id)", .rows = 2, .writes = 2 },
+        .{ .sql = "WITH changed AS (INSERT INTO things (_id,id) VALUES ('new',10) RETURNING _id,id) SELECT * FROM changed", .rows = 1, .writes = 1 },
+        .{ .sql = "WITH changed AS (DELETE FROM things WHERE _id='0' RETURNING _id,id) INSERT INTO things (_id,id) SELECT _id,id FROM changed RETURNING id", .rows = 1, .writes = 2, .affected = 1 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 WHERE _id='0' RETURNING _id), other AS (UPDATE things SET id=20 WHERE _id='1' RETURNING _id) SELECT * FROM changed UNION ALL SELECT * FROM other", .rows = 2, .writes = 2 },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("effect case: {s}\n", .{case.sql});
+        var provider: EffectTestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, provider.backend(), &compiled, case.parameters, .{ .page_rows = 1, .execution_batch_rows = 1 });
+        defer result.deinit();
+        if (case.expected) |expected| try std.testing.expectEqualDeep(expected, result.output.rows);
+        try std.testing.expectEqual(case.rows, result.output.rowCount());
+        try std.testing.expectEqual(case.affected, result.output.rows_affected);
+        try std.testing.expectEqual(case.writes, provider.published);
+        try std.testing.expectEqual(@as(usize, 1), provider.begins);
+        try std.testing.expectEqual(@as(usize, 1), provider.finishes);
+        try std.testing.expectEqual(@as(usize, 1), provider.aborts);
+        try std.testing.expectEqual(provider.base.statement_opens, provider.base.statement_closes);
+        try std.testing.expect(!provider.active);
+    }
+}
+
+test "SQL statement effect CTE failures cannot publish partial producers" {
+    const Case = struct { sql: []const u8, failure: anyerror, limits: Limits = .{}, finish_failure: bool = false, deny_write: bool = false };
+    const cases = [_]Case{
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING id) SELECT id/(id-id) FROM changed", .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING _id,id) MERGE INTO things t USING changed s ON t._id=s._id WHEN MATCHED THEN UPDATE SET id=s.id", .failure = error.SqlMutationCardinalityViolation },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING _id) UPDATE things SET id=20 WHERE _id='1' RETURNING id", .failure = error.ForeignKeyParentMissing, .finish_failure = true },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING id) SELECT 7", .failure = error.Forbidden, .deny_write = true },
+        .{ .sql = "WITH a AS (UPDATE things SET id=10 WHERE _id='0'), b AS (UPDATE things SET id=20 WHERE _id='1') SELECT 7", .failure = error.SqlProgramLimitExceeded, .limits = .{ .mutation_rows = 1 } },
+        .{ .sql = "WITH a AS (UPDATE things SET id=10 WHERE _id='0'), b AS (UPDATE things SET id=20 WHERE _id='1') SELECT 7", .failure = error.SqlProgramLimitExceeded, .limits = .{ .scan_rows = 1 } },
+        .{ .sql = "WITH a AS (UPDATE things SET id=10 WHERE _id='0'), b AS (UPDATE things SET id=20 WHERE _id='1') SELECT 7", .failure = error.SqlProgramLimitExceeded, .limits = .{ .scan_pages = 1 } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("effect failure case: {s}\n", .{case.sql});
+        var provider: EffectTestBackend = .{ .fail_finish = case.finish_failure, .deny_write = case.deny_write };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.failure, execute(std.testing.allocator, provider.backend(), &compiled, &.{}, case.limits));
+        try std.testing.expectEqual(@as(usize, 0), provider.published);
+        try std.testing.expectEqual(@as(usize, 0), provider.pending);
+        try std.testing.expectEqual(@as(usize, 0), provider.finishes);
+        try std.testing.expect(!provider.active);
+        try std.testing.expectEqual(provider.begins, provider.aborts);
+        try std.testing.expectEqual(provider.base.statement_opens, provider.base.statement_closes);
+    }
+}
+
+test "SQL statement effect CTE volatile read producers retain PostgreSQL materialization demand" {
+    const Owner = EffectTestSequence;
+    const Case = struct { sql: []const u8, rows: usize, calls: i64 };
+    for ([_]Case{
+        .{ .sql = "WITH sampled AS NOT MATERIALIZED (SELECT _id,nextval('numbers') v FROM things), changed AS (UPDATE things SET id=10 RETURNING id) SELECT _id FROM sampled WHERE _id='0'", .rows = 1, .calls = 2 },
+        .{ .sql = "WITH sampled AS (SELECT _id,nextval('numbers') v FROM things), changed AS (UPDATE things SET id=10 RETURNING id) SELECT a.v,b.v FROM sampled a JOIN sampled b USING(_id) ORDER BY a._id", .rows = 2, .calls = 2 },
+        .{ .sql = "WITH sampled AS (SELECT nextval('numbers') v FROM things), changed AS (UPDATE things SET id=10 RETURNING id) SELECT 7", .rows = 1, .calls = 0 },
+        .{ .sql = "WITH sampled AS MATERIALIZED (SELECT nextval('numbers') v FROM things), changed AS (UPDATE things SET id=10 RETURNING id) SELECT v FROM sampled LIMIT 0", .rows = 0, .calls = 0 },
+    }) |case| {
+        errdefer std.debug.print("volatile command case: {s}\n", .{case.sql});
+        var provider: EffectTestBackend = .{};
+        var owner: Owner = .{};
+        var backend = provider.backend();
+        backend.execution_io = std.testing.io;
+        backend.sequence_resolver = .{ .ptr = &owner, .resolve = Owner.resolve };
+        backend.sequence_provider = .{ .ptr = &owner, .invoke = Owner.invoke, .flush = Owner.flush };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(case.calls, owner.calls);
+        try std.testing.expectEqual(case.rows, result.output.rowCount());
+        try std.testing.expectEqual(@as(usize, 2), provider.published);
+        if (case.calls != 0 and result.output.columns.len == 2) for (result.output.rows) |row| try std.testing.expectEqualDeep(row[0], row[1]);
+    }
+}
+
+test "SQL statement effect CTE shared producer allocation failures retire command and read owners" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var provider: EffectTestBackend = .{};
+            defer {
+                std.debug.assert(!provider.active);
+                std.debug.assert(provider.pending == 0);
+                std.debug.assert(provider.base.statement_opens == provider.base.statement_closes);
+            }
+            var compiled = try compiler.compile(a, "WITH changed AS (UPDATE things SET id=10 RETURNING _id,id) SELECT a.id,b.id FROM changed a JOIN changed b USING(_id)", .{});
+            defer compiled.deinit();
+            var result = try execute(a, provider.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rowCount());
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL statement effect CTE replay retains typed arrays and exact integer values" {
+    var provider: EffectTestBackend = .{ .base = .{ .row_count = 3, .stored_arrays = true } };
+    var compiled = try compiler.compile(std.testing.allocator, "WITH changed AS (UPDATE things SET id=id RETURNING _id,id,tags) SELECT a.id,a.tags,b.tags FROM changed a JOIN changed b USING(_id) ORDER BY a._id", .{});
+    defer compiled.deinit();
+    var result = try execute(std.testing.allocator, provider.backend(), &compiled, &.{}, .{ .native_result = true, .page_rows = 1 });
+    defer result.deinit();
+    const rows = result.output.native_rows orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    for (rows) |row| {
+        try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].value.integer);
+        try std.testing.expectEqualDeep(row[1], row[2]);
+    }
+    try std.testing.expectEqual(@as(usize, 3), rows[0][1].array.?.elements.len);
+    try std.testing.expect(rows[0][1].array.?.elements[1].sql_null);
+    try std.testing.expectEqual(@as(usize, 0), rows[1][1].array.?.elements.len);
+    try std.testing.expect(rows[2][1].sql_null);
+    try std.testing.expectEqual(@as(usize, 3), provider.published);
+}
+
+test "SQL statement effect CTE planning errors precede sequence effects across mutation plans" {
+    const Owner = EffectTestSequence;
+    for ([_][]const u8{
+        "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING _id) INSERT INTO things (_id,id) SELECT _id,1/0 FROM changed",
+        "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING _id) INSERT INTO things (_id,id) VALUES ('new',1/0)",
+        "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING _id) UPDATE things SET id=1/0 WHERE false",
+        "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING _id) SELECT 1/0 FROM changed LIMIT 0",
+        "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING _id) MERGE INTO things t USING changed s ON t._id=s._id WHEN MATCHED AND false THEN UPDATE SET id=1/0",
+        "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING _id) INSERT INTO things (_id,id) SELECT _id,2 FROM changed ON CONFLICT(_id) DO UPDATE SET id=1/0 WHERE false RETURNING id",
+        "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING _id), invalid AS (UPDATE things SET id=2 WHERE false RETURNING 1/0) SELECT 7",
+    }) |sql| {
+        errdefer std.debug.print("planning boundary case: {s}\n", .{sql});
+        var provider: EffectTestBackend = .{};
+        var owner: Owner = .{};
+        var backend = provider.backend();
+        backend.execution_io = std.testing.io;
+        backend.predicate_only_mutations = true;
+        backend.sequence_resolver = .{ .ptr = &owner, .resolve = Owner.resolve };
+        backend.sequence_provider = .{ .ptr = &owner, .invoke = Owner.invoke, .flush = Owner.flush };
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlDivisionByZero, execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(i64, 0), owner.calls);
+        try std.testing.expectEqual(@as(usize, 0), provider.begins);
+        try std.testing.expectEqual(@as(usize, 0), provider.base.statement_opens);
+        try std.testing.expectEqual(@as(usize, 0), provider.published);
+    }
+    // Binding still validates names/types in unused reads, but planning never
+    // evaluates their expressions or invokes their external-effect providers.
+    var provider: EffectTestBackend = .{};
+    var owner: Owner = .{};
+    var backend = provider.backend();
+    backend.execution_io = std.testing.io;
+    backend.sequence_resolver = .{ .ptr = &owner, .resolve = Owner.resolve };
+    backend.sequence_provider = .{ .ptr = &owner, .invoke = Owner.invoke, .flush = Owner.flush };
+    var compiled = try compiler.compile(std.testing.allocator, "WITH unused AS (SELECT 1/0), changed AS (UPDATE things SET id=nextval('numbers') RETURNING _id) SELECT _id FROM changed", .{});
+    defer compiled.deinit();
+    var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 2), owner.calls);
+    try std.testing.expectEqual(@as(usize, 2), provider.published);
+}
+
+test "SQL statement effect CTE ordered producers preserve error prefixes and successful completion" {
+    const Owner = EffectTestSequence;
+    const Case = struct { sql: []const u8, rows: usize = 0, calls: i64, failure: ?anyerror = null };
+    const cases = [_]Case{
+        .{ .sql = "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING id) SELECT id/(id-id) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=id RETURNING nextval('numbers') n) SELECT n/(n-n) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (DELETE FROM things RETURNING nextval('numbers') n) SELECT n/(n-n) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (UPDATE things t SET id=nextval('numbers') FROM (VALUES('0',10),('1',20)) s(k,x) WHERE t._id=s.k RETURNING s.x) SELECT x/(x-x) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (UPDATE things t SET id=nextval('numbers') FROM (VALUES('0',10),('1',20)) s(k,x) WHERE t._id=s.k RETURNING (SELECT s.x) AS x) SELECT x/(x-x) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (DELETE FROM things t USING (VALUES('0',10),('1',20)) s(k,x) WHERE t._id=s.k RETURNING nextval('numbers') AS n,s.x) SELECT n/(n-n) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING id) SELECT id FROM changed LIMIT 1", .rows = 1, .calls = 2 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING id) SELECT id FROM changed LIMIT 0", .rows = 0, .calls = 2 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING id) SELECT 7", .rows = 1, .calls = 2 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=nextval('numbers')) SELECT 7", .rows = 1, .calls = 2 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING _id,id) SELECT a.id,b.id FROM changed a JOIN changed b USING(_id)", .rows = 2, .calls = 2 },
+    };
+    for (cases) |case| for ([_]u32{ 1, 256 }) |page_rows| {
+        errdefer std.debug.print("ordered producer page_rows={d}: {s}\n", .{ page_rows, case.sql });
+        var provider: EffectTestBackend = .{};
+        var owner: Owner = .{};
+        var backend = provider.backend();
+        backend.execution_io = std.testing.io;
+        backend.sequence_resolver = .{ .ptr = &owner, .resolve = Owner.resolve };
+        backend.sequence_provider = .{ .ptr = &owner, .invoke = Owner.invoke, .flush = Owner.flush };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        if (case.failure) |failure| {
+            try std.testing.expectError(failure, execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = page_rows }));
+            try std.testing.expectEqual(@as(usize, 0), provider.published);
+        } else {
+            var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = page_rows });
+            defer result.deinit();
+            try std.testing.expectEqual(case.rows, result.output.rowCount());
+            try std.testing.expectEqual(@as(usize, 2), provider.published);
+        }
+        try std.testing.expectEqual(case.calls, owner.calls);
+        try std.testing.expect(!provider.active);
+        try std.testing.expectEqual(provider.base.statement_opens, provider.base.statement_closes);
+    };
+}
+
+test "SQL statement effect CTE ordered roots preserve RETURNING errors and command counts" {
+    const Owner = EffectTestSequence;
+    for ([_]bool{ false, true }) |failure| {
+        var provider: EffectTestBackend = .{};
+        var owner: Owner = .{};
+        var backend = provider.backend();
+        backend.execution_io = std.testing.io;
+        backend.sequence_resolver = .{ .ptr = &owner, .resolve = Owner.resolve };
+        backend.sequence_provider = .{ .ptr = &owner, .invoke = Owner.invoke, .flush = Owner.flush };
+        const sql = if (failure)
+            "WITH unused AS (UPDATE things SET id=id WHERE false) UPDATE things SET id=nextval('numbers') RETURNING id/(id-id)"
+        else
+            "WITH unused AS (UPDATE things SET id=id WHERE false) UPDATE things SET id=nextval('numbers') RETURNING id";
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        if (failure) {
+            try std.testing.expectError(error.SqlDivisionByZero, execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
+            try std.testing.expectEqual(@as(i64, 1), owner.calls);
+            try std.testing.expectEqual(@as(usize, 0), provider.published);
+        } else {
+            var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows_affected);
+            try std.testing.expectEqual(@as(usize, 2), result.output.rowCount());
+            try std.testing.expectEqualStrings("UPDATE", result.output.command_tag);
+            try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+            try std.testing.expectEqualStrings("2", result.output.rows[1][0].string);
+            try std.testing.expectEqual(@as(i64, 2), owner.calls);
+        }
+    }
+}
+
+test "SQL statement effect CTE ordered stream allocation failures release suspended producers" {
+    const Fixture = struct {
+        const sequences = @import("sequence_effects.zig");
+        calls: i64 = 0,
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !sequences.Reference {
+            return .{ .identity = .{ .incarnation = @splat(1), .id = 7 }, .namespace_id = 2, .target = .{ .table = "numbers" } };
+        }
+        fn invoke(raw: *anyopaque, _: std.mem.Allocator, _: sequences.Function, _: ?sequences.Reference, _: []const Datum) !i64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return self.calls;
+        }
+        fn flush(_: *anyopaque) !void {}
+        fn run(a: std.mem.Allocator) !void {
+            var owner: @This() = .{};
+            var provider: EffectTestBackend = .{};
+            defer {
+                std.debug.assert(!provider.active);
+                std.debug.assert(provider.pending == 0);
+                std.debug.assert(provider.base.statement_opens == provider.base.statement_closes);
+            }
+            var backend = provider.backend();
+            backend.execution_io = std.testing.io;
+            backend.sequence_resolver = .{ .ptr = &owner, .resolve = resolve };
+            backend.sequence_provider = .{ .ptr = &owner, .invoke = invoke, .flush = flush };
+            var compiled = try compiler.compile(a, "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING id) SELECT id FROM changed LIMIT 1", .{});
+            defer compiled.deinit();
+            var result = try execute(a, backend, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, 2), owner.calls);
+            try std.testing.expectEqual(@as(usize, 1), result.output.rowCount());
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL statement effect CTE pending conflict owners distinguish modified and retired tuples" {
+    const Case = struct { sql: []const u8, writes: usize = 0, affected: usize = 0, failure: ?anyerror = null };
+    const cases = [_]Case{
+        .{ .sql = "WITH added AS (INSERT INTO things (_id,id) VALUES ('new',1) RETURNING _id,id) INSERT INTO things (_id,id) SELECT _id,id FROM added ON CONFLICT(_id) DO UPDATE SET id=excluded.id RETURNING id", .failure = error.SqlMutationCardinalityViolation },
+        .{ .sql = "WITH added AS (INSERT INTO things (_id,id) VALUES ('new',1) RETURNING _id,id) INSERT INTO things (_id,id) SELECT _id,id FROM added ON CONFLICT(_id) DO UPDATE SET id=excluded.id WHERE false RETURNING id", .failure = error.SqlMutationCardinalityViolation },
+        .{ .sql = "WITH added AS (INSERT INTO things (_id,id) VALUES ('new',1) RETURNING _id,id) INSERT INTO things (_id,id) SELECT _id,id FROM added ON CONFLICT(_id) DO NOTHING RETURNING id", .writes = 1 },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING _id,id) INSERT INTO things (_id,id) SELECT _id,id FROM changed ON CONFLICT(_id) DO UPDATE SET id=excluded.id WHERE false RETURNING id", .failure = error.SqlMutationCardinalityViolation },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=10 RETURNING _id,id) INSERT INTO things (_id,id) SELECT _id,id FROM changed ON CONFLICT(_id) DO NOTHING RETURNING id", .writes = 2 },
+        .{ .sql = "WITH removed AS (DELETE FROM things RETURNING _id,id) INSERT INTO things (_id,id) SELECT _id,id FROM removed ON CONFLICT(_id) DO UPDATE SET id=excluded.id RETURNING id", .writes = 4, .affected = 2 },
+        .{ .sql = "WITH removed AS (DELETE FROM things RETURNING _id,id) INSERT INTO things (_id,id) SELECT _id,id FROM removed ON CONFLICT(_id) DO NOTHING RETURNING id", .writes = 4, .affected = 2 },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("pending conflict case: {s}\n", .{case.sql});
+        var provider: EffectTestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        if (case.failure) |failure| {
+            try std.testing.expectError(failure, execute(std.testing.allocator, provider.backend(), &compiled, &.{}, .{}));
+            try std.testing.expectEqual(@as(usize, 0), provider.published);
+        } else {
+            var result = try execute(std.testing.allocator, provider.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(case.writes, provider.published);
+            try std.testing.expectEqual(case.affected, result.output.rows_affected);
+            try std.testing.expectEqual(case.affected, result.output.rowCount());
+        }
+        try std.testing.expectEqual(@as(usize, 0), provider.base.point_reads);
+        try std.testing.expect(!provider.active);
+    }
+}
+
+test "SQL statement effect CTE pure batches and ordered streams share one schema owner" {
+    for ([_]bool{ false, true }) |ordered| {
+        var provider: EffectTestBackend = .{ .base = .{ .row_count = 128, .group_every = 1 } };
+        var sequence: EffectTestSequence = .{};
+        var backend = provider.backend();
+        backend.execution_io = std.testing.io;
+        backend.sequence_resolver = .{ .ptr = &sequence, .resolve = EffectTestSequence.resolve };
+        backend.sequence_provider = .{ .ptr = &sequence, .invoke = EffectTestSequence.invoke, .flush = EffectTestSequence.flush };
+        const sql = if (ordered) "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING id) SELECT count(*) FROM changed" else "WITH changed AS (UPDATE things SET id=10 RETURNING id) SELECT count(*) FROM changed";
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 128), provider.published);
+        try std.testing.expectEqual(@as(usize, if (ordered) 128 else 1), provider.batches);
+        try std.testing.expectEqual(@as(usize, if (ordered) 128 else 1), provider.preparations);
+        try std.testing.expectEqual(@as(usize, @intFromBool(ordered)), provider.preparation_opens);
+        try std.testing.expectEqual(provider.preparation_opens, provider.preparation_finishes);
+        try std.testing.expectEqual(provider.preparation_opens, provider.preparation_closes);
+        try std.testing.expectEqual(provider.point_opens, provider.point_closes);
+        try std.testing.expectEqual(@as(i64, if (ordered) 128 else 0), sequence.calls);
+        try std.testing.expectEqual(@as(usize, 1), provider.base.statement_opens);
+        try std.testing.expectEqual(@as(usize, 1), provider.base.pages);
+        try std.testing.expectEqual(@as(usize, 1), provider.finishes);
+    }
+}
+
+test "SQL statement effect CTE ordered INSERT producers preserve source and RETURNING prefixes" {
+    const Case = struct { sql: []const u8, calls: i64, rows: usize = 0, writes: usize = 2, failure: ?anyerror = null, root: bool = false };
+    const cases = [_]Case{
+        .{ .sql = "WITH changed AS (INSERT INTO things (_id,id) VALUES ('a',nextval('numbers')),('b',nextval('numbers')) RETURNING id) SELECT id/(id-id) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (INSERT INTO things (_id,id) VALUES ('a',1),('b',2) RETURNING nextval('numbers') n) SELECT n/(n-n) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (INSERT INTO things (_id,id) SELECT _id||'a',nextval('numbers') FROM things RETURNING id) SELECT id/(id-id) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (INSERT INTO things (_id,id) SELECT _id||'a',id FROM things RETURNING nextval('numbers') n) SELECT n/(n-n) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (INSERT INTO things (_id,id) VALUES ('a',nextval('numbers')),('b',nextval('numbers')) RETURNING id) SELECT id FROM changed LIMIT 0", .calls = 2 },
+        .{ .sql = "WITH changed AS (INSERT INTO things (_id,id) SELECT _id||'a',nextval('numbers') FROM things RETURNING id) SELECT id FROM changed LIMIT 1", .calls = 2, .rows = 1 },
+        .{ .sql = "WITH changed AS (INSERT INTO things (_id,id) SELECT _id||'a',nextval('numbers') FROM things) SELECT 7", .calls = 2, .rows = 1 },
+        .{ .sql = "WITH unused AS (UPDATE things SET id=id WHERE false) INSERT INTO things (_id,id) VALUES ('a',nextval('numbers')),('b',nextval('numbers')) RETURNING id/(id-id)", .calls = 1, .failure = error.SqlDivisionByZero, .root = true },
+        .{ .sql = "WITH unused AS (UPDATE things SET id=id WHERE false) INSERT INTO things (_id,id) SELECT _id||'a',nextval('numbers') FROM things RETURNING id", .calls = 2, .rows = 2, .root = true },
+        .{ .sql = "WITH changed AS (INSERT INTO things (_id,id) VALUES ('a',nextval('numbers')),('a',nextval('numbers')),('c',nextval('numbers')) RETURNING id) SELECT id FROM changed", .calls = 2, .failure = error.DuplicateSqlRow },
+        .{ .sql = "WITH changed AS (INSERT INTO things (_id,id) SELECT 'a',nextval('numbers') FROM things RETURNING id) SELECT id FROM changed", .calls = 2, .failure = error.DuplicateSqlRow },
+        .{ .sql = "WITH changed AS (INSERT INTO things (_id,id) VALUES ('a',nextval('numbers')),('a',nextval('numbers')) ON CONFLICT(_id) DO NOTHING RETURNING id) SELECT id FROM changed", .calls = 2, .rows = 1, .writes = 1 },
+        .{ .sql = "WITH changed AS (INSERT INTO things (_id,id) VALUES ('a',nextval('numbers')),('a',nextval('numbers')) ON CONFLICT(_id) DO UPDATE SET id=excluded.id RETURNING id) SELECT id FROM changed", .calls = 2, .failure = error.SqlMutationCardinalityViolation },
+    };
+    for (cases) |case| for ([_]u32{ 1, 256 }) |page_rows| {
+        var provider: EffectTestBackend = .{};
+        var sequence: EffectTestSequence = .{};
+        var backend = provider.backend();
+        backend.execution_io = std.testing.io;
+        backend.sequence_resolver = .{ .ptr = &sequence, .resolve = EffectTestSequence.resolve };
+        backend.sequence_provider = .{ .ptr = &sequence, .invoke = EffectTestSequence.invoke, .flush = EffectTestSequence.flush };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        errdefer std.debug.print("ordered INSERT sql={s} calls={d}\n", .{ case.sql, sequence.calls });
+        if (case.failure) |failure| {
+            try std.testing.expectError(failure, execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = page_rows }));
+            try std.testing.expectEqual(@as(usize, 0), provider.published);
+        } else {
+            var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = page_rows });
+            defer result.deinit();
+            try std.testing.expectEqual(case.rows, result.output.rowCount());
+            try std.testing.expectEqual(case.writes, provider.published);
+            if (case.root) {
+                try std.testing.expectEqualStrings("INSERT", result.output.command_tag);
+                try std.testing.expectEqual(case.writes, result.output.rows_affected);
+            }
+        }
+        try std.testing.expectEqual(case.calls, sequence.calls);
+        try std.testing.expect(!provider.active);
+        try std.testing.expectEqual(provider.preparation_opens, provider.preparation_closes);
+        try std.testing.expectEqual(provider.point_opens, provider.point_closes);
+        try std.testing.expectEqual(provider.base.statement_opens, provider.base.statement_closes);
+    };
+}
+
+test "SQL statement effect CTE ordered MERGE producers preserve arm and RETURNING prefixes" {
+    const Case = struct { sql: []const u8, calls: i64, rows: usize = 0, failure: ?anyerror = null, root: bool = false };
+    const cases = [_]Case{
+        .{ .sql = "WITH changed AS (MERGE INTO things t USING (VALUES('0'),('1')) s(k) ON t._id=s.k WHEN MATCHED THEN UPDATE SET id=nextval('numbers') RETURNING t.id) SELECT id/(id-id) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (MERGE INTO things t USING (VALUES('0'),('1')) s(k) ON t._id=s.k WHEN MATCHED THEN UPDATE SET id=t.id RETURNING nextval('numbers') n) SELECT n/(n-n) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (MERGE INTO things t USING (VALUES('0'),('1')) s(k) ON t._id=s.k WHEN MATCHED THEN DELETE RETURNING nextval('numbers') n) SELECT n/(n-n) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (MERGE INTO things t USING (VALUES('a'),('b')) s(k) ON t._id=s.k WHEN NOT MATCHED THEN INSERT (_id,id) VALUES(s.k,nextval('numbers')) RETURNING t.id) SELECT id/(id-id) FROM changed", .calls = 1, .failure = error.SqlDivisionByZero },
+        .{ .sql = "WITH changed AS (MERGE INTO things t USING (VALUES('0'),('1')) s(k) ON t._id=s.k WHEN MATCHED THEN UPDATE SET id=nextval('numbers') RETURNING t.id) SELECT id FROM changed LIMIT 0", .calls = 2 },
+        .{ .sql = "WITH changed AS (MERGE INTO things t USING (VALUES('0'),('1')) s(k) ON t._id=s.k WHEN MATCHED THEN UPDATE SET id=nextval('numbers') RETURNING t.id) SELECT id FROM changed LIMIT 1", .calls = 2, .rows = 1 },
+        .{ .sql = "WITH changed AS (MERGE INTO things t USING (VALUES('0'),('1')) s(k) ON t._id=s.k WHEN MATCHED THEN UPDATE SET id=nextval('numbers')) SELECT 7", .calls = 2, .rows = 1 },
+        .{ .sql = "WITH unused AS (UPDATE things SET id=id WHERE false) MERGE INTO things t USING (VALUES('0'),('1')) s(k) ON t._id=s.k WHEN MATCHED THEN UPDATE SET id=nextval('numbers') RETURNING t.id/(t.id-t.id)", .calls = 1, .failure = error.SqlDivisionByZero, .root = true },
+        .{ .sql = "WITH unused AS (UPDATE things SET id=id WHERE false) MERGE INTO things t USING (VALUES('0'),('1')) s(k) ON t._id=s.k WHEN MATCHED THEN UPDATE SET id=nextval('numbers') RETURNING t.id", .calls = 2, .rows = 2, .root = true },
+        .{ .sql = "WITH changed AS (MERGE INTO things t USING (VALUES('0'),('0')) s(k) ON t._id=s.k WHEN MATCHED THEN UPDATE SET id=nextval('numbers') RETURNING t.id) SELECT id FROM changed", .calls = 2, .failure = error.SqlMutationCardinalityViolation },
+        .{ .sql = "WITH changed AS (UPDATE things SET id=nextval('numbers') RETURNING _id,id) MERGE INTO things t USING changed s ON t._id=s._id WHEN MATCHED THEN UPDATE SET id=nextval('numbers') RETURNING t.id", .calls = 2, .failure = error.SqlMutationCardinalityViolation },
+    };
+    for (cases) |case| for ([_]u32{ 1, 256 }) |page_rows| {
+        var provider: EffectTestBackend = .{};
+        var sequence: EffectTestSequence = .{};
+        var backend = provider.backend();
+        backend.execution_io = std.testing.io;
+        backend.sequence_resolver = .{ .ptr = &sequence, .resolve = EffectTestSequence.resolve };
+        backend.sequence_provider = .{ .ptr = &sequence, .invoke = EffectTestSequence.invoke, .flush = EffectTestSequence.flush };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        errdefer std.debug.print("ordered MERGE sql={s} calls={d}\n", .{ case.sql, sequence.calls });
+        if (case.failure) |failure| {
+            try std.testing.expectError(failure, execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = page_rows }));
+            try std.testing.expectEqual(@as(usize, 0), provider.published);
+        } else {
+            var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = page_rows });
+            defer result.deinit();
+            try std.testing.expectEqual(case.rows, result.output.rowCount());
+            try std.testing.expectEqual(@as(usize, 2), provider.published);
+            if (case.root) {
+                try std.testing.expectEqualStrings("MERGE", result.output.command_tag);
+                try std.testing.expectEqual(@as(usize, 2), result.output.rows_affected);
+            }
+        }
+        try std.testing.expectEqual(case.calls, sequence.calls);
+        try std.testing.expect(!provider.active);
+        try std.testing.expectEqual(provider.preparation_opens, provider.preparation_closes);
+        try std.testing.expectEqual(provider.point_opens, provider.point_closes);
+        try std.testing.expectEqual(provider.base.statement_opens, provider.base.statement_closes);
+    };
+}
+
+test "SQL statement effect CTE ordered INSERT and MERGE allocation failures retire all owners" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator, sql: []const u8) !void {
+            var sequence: EffectTestSequence = .{};
+            var provider: EffectTestBackend = .{};
+            defer {
+                std.debug.assert(!provider.active and provider.pending == 0);
+                std.debug.assert(provider.base.statement_opens == provider.base.statement_closes);
+                std.debug.assert(provider.preparation_opens == provider.preparation_closes);
+                std.debug.assert(provider.point_opens == provider.point_closes);
+            }
+            var backend = provider.backend();
+            backend.execution_io = std.testing.io;
+            backend.sequence_resolver = .{ .ptr = &sequence, .resolve = EffectTestSequence.resolve };
+            backend.sequence_provider = .{ .ptr = &sequence, .invoke = EffectTestSequence.invoke, .flush = EffectTestSequence.flush };
+            var compiled = try compiler.compile(a, sql, .{});
+            defer compiled.deinit();
+            var result = try execute(a, backend, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, 2), sequence.calls);
+            try std.testing.expectEqual(@as(usize, 2), provider.published);
+            try std.testing.expectEqual(@as(usize, 1), result.output.rowCount());
+        }
+    };
+    for ([_][]const u8{
+        "WITH changed AS (INSERT INTO things (_id,id) VALUES ('a',nextval('numbers')),('b',nextval('numbers')) RETURNING id) SELECT id FROM changed LIMIT 1",
+        "WITH changed AS (INSERT INTO things (_id,id) SELECT _id||'a',nextval('numbers') FROM things RETURNING id) SELECT id FROM changed LIMIT 1",
+        "WITH changed AS (MERGE INTO things t USING (VALUES('0'),('1')) s(k) ON t._id=s.k WHEN MATCHED THEN UPDATE SET id=nextval('numbers') RETURNING t.id) SELECT id FROM changed LIMIT 1",
+        "WITH changed AS (MERGE INTO things t USING (VALUES('a'),('b')) s(k) ON t._id=s.k WHEN NOT MATCHED THEN INSERT (_id,id) VALUES(s.k,nextval('numbers')) RETURNING t.id) SELECT id FROM changed LIMIT 1",
+    }) |sql| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{sql});
+}
+
+test "SQL statement effect CTE ordered INSERT and MERGE retain physical batches and schema owners" {
+    for ([_][]const u8{
+        "WITH changed AS (INSERT INTO things (_id,id) SELECT _id||'a',nextval('numbers') FROM things RETURNING id) SELECT count(*) FROM changed",
+        "WITH changed AS (MERGE INTO things t USING (SELECT _id FROM things) s ON t._id=s._id WHEN MATCHED THEN UPDATE SET id=nextval('numbers') RETURNING t.id) SELECT count(*) FROM changed",
+    }) |sql| {
+        var provider: EffectTestBackend = .{ .base = .{ .row_count = 128, .group_every = 1 } };
+        var sequence: EffectTestSequence = .{};
+        var backend = provider.backend();
+        backend.execution_io = std.testing.io;
+        backend.sequence_resolver = .{ .ptr = &sequence, .resolve = EffectTestSequence.resolve };
+        backend.sequence_provider = .{ .ptr = &sequence, .invoke = EffectTestSequence.invoke, .flush = EffectTestSequence.flush };
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 128), provider.published);
+        try std.testing.expectEqual(@as(usize, 128), provider.batches);
+        try std.testing.expectEqual(@as(usize, 128), provider.preparations);
+        try std.testing.expectEqual(@as(usize, 1), provider.preparation_opens);
+        try std.testing.expectEqual(provider.preparation_opens, provider.preparation_finishes);
+        try std.testing.expectEqual(provider.preparation_opens, provider.preparation_closes);
+        try std.testing.expectEqual(provider.point_opens, provider.point_closes);
+        try std.testing.expectEqual(@as(i64, 128), sequence.calls);
+        try std.testing.expectEqual(@as(usize, 1), provider.base.statement_opens);
+        // INSERT scans its input once; MERGE has independent source/target
+        // scans, each prefetched once despite row-at-a-time expression order.
+        try std.testing.expectEqual(@as(usize, if (compiled.statement.effect_block.definitions[0].body.mutation.* == .merge) 2 else 1), provider.base.pages);
+        try std.testing.expectEqual(@as(usize, 1), provider.finishes);
+    }
+}
+
+test "SQL statement effect CTE receipt dependencies include producers below zero demand" {
+    var provider: EffectTestBackend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "WITH changed AS (UPDATE things SET id=id RETURNING id) SELECT id FROM changed LIMIT 0", .{});
+    defer compiled.deinit();
+    var description = try describe.describe(std.testing.allocator, provider.backend(), &compiled, &.{});
+    defer description.deinit();
+    const target = description.binding.effect_graph.?.steps[0].binding.table.?;
+    const found = (try describe.findPhysicalTable(description.binding, target.id)) orelse return error.TestExpectedPhysicalTable;
+    try std.testing.expectEqualStrings(target.physical_name, found.physical_name);
+    try std.testing.expect(try describe.findPhysicalTable(description.binding, 99999) == null);
+    try std.testing.expectEqual(@as(usize, 0), provider.base.statement_opens);
+    try std.testing.expectEqual(@as(usize, 0), provider.begins);
 }

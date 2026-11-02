@@ -26,6 +26,7 @@ pub const Resolved = struct {
     output: scalar.Type,
     program: *const scalar.Program,
     strict: bool = false,
+    volatility: scalar.Volatility = .@"volatile",
 };
 pub const Aggregate = struct {
     id: u64,

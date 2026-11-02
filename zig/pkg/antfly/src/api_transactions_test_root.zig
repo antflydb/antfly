@@ -38,6 +38,8 @@ test {
     _ = distributed_entity_sink;
     _ = internal_group_operations;
     _ = restore_catalog;
+    _ = @import("api/sql_command_mutations.zig");
+    _ = @import("api/sql_execution.zig");
     _ = transactions;
 }
 

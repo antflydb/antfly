@@ -18011,3 +18011,86 @@ contracts, and the remaining declaration/test-root checks. Normal API/client
 generation, full formatting, license/boundary checks, the independent PostgreSQL
 reference check and inventory integrity pass. The inventory remains incomplete
 with 98 unresolved originals; this is not a release-readiness result.
+
+### Atomic writable WITH command graph (in progress, 2026-11-02)
+
+Writable WITH now has typed statement-local relation slots, rather than
+fabricated catalog tables. Binding authorizes every producer, shares one
+parameter invocation, computes a dependency order, and preserves ordinary read
+CTE inlining. Volatile read CTEs remain materialized even with a single reference
+and `NOT MATERIALIZED`. Recursive reads use the existing recursive operator.
+An execution owner shares typed replay, mutation-tuple ownership and resource
+admission across the graph. Referenced mutation producers run exactly once;
+unreferenced producers still finish when the root returns no rows or uses
+`LIMIT 0`. Captured physical readers close before final native staging.
+
+The native boundary collects prepared mutation events privately and folds final
+row images through a key directory. Original version/digest predicates survive
+DELETE followed by reinsert. FK preparation retains the ordered parent
+retirement events separately: a later reinsert cannot erase an earlier DELETE
+cascade. End-of-command FK checks see all explicit postimages, permitting a
+child producer followed by a parent INSERT in the root. Unique-owner arbitration
+has a separate unique-only preparation path; it must not execute pending FK
+actions or pay for their reference-closure expansion while resolving an upsert.
+The existing durable SQL session CAS and participant 2PC remain the only
+publication machinery.
+
+PostgreSQL 18 independently reproduces 77 witness profiles, including the
+unchanged original `sql-0015`, command rollback, snapshot/RETURNING separation,
+shared sequence effects, no-RETURNING visibility, recursion, mixed read/write
+CTEs, immediate FK timing and DELETE/reinsert. Component qualification includes
+command failure/cleanup, shared physical-scan limits, allocation-failure sweeps,
+typed arrays/NULLs and integers above 2^53. These witnesses and component tests
+are not original-case credit.
+
+Ordered INSERT, UPDATE, DELETE and MERGE producers and roots now pull through
+shared native conversion/preparation and RETURNING evaluators. INSERT supports
+both VALUES and projected SELECT input. MERGE retains immutable per-arm domain
+metadata and cross-pull target directories. All ordered drivers share one typed
+projected-input owner; scratch resets between rows and schema preparation stays
+pinned until completion. Pure shapes retain existing batch admission. An observable-effect trait follows
+statement-local relations through a memoized IR walk. Pure producers retain
+batch execution; PostgreSQL ordered effects and native defaults select
+incremental execution. Materialization volatility is distinct from execution
+ordering: inference decisions retain their existing request-batch contract. Immutable raw pages still prefetch in normal batches. The 128-row
+work-count fixture observes one physical page and one final command boundary in
+both UPDATE modes, one mutation batch for the pure shape, and one reusable
+native schema/preparation owner for the ordered shape. The INSERT-source fixture
+uses one physical page for 128 ordered rows. MERGE uses two, one for each source
+and target scan; it previously opened 129 pages under one-row result demand.
+Hash joins keep a sole ordered producer on the probe side rather than consuming
+its future effects into the build table before the first mutation can fail. This is work-count evidence,
+not a production throughput claim. Error-prefix fixtures check sequence effects
+at response page sizes one and 256. Allocation-failure sweeps retire suspended
+producers and their preparation/read owners. Reusable native validator leases
+also use the preparation owner's allocator, including the uncached fallback;
+resetting one row's scratch cannot invalidate the following row's validator.
+
+Unique arbitration now has a command-only target overlay, separate from ordinary
+snapshot scans. Same-command live tuple conflicts reject DO UPDATE before its
+WHERE predicate, including WHERE false. DO NOTHING retains the original physical
+observation; a retired tuple allows reinsert. Component/native fixtures cover
+these cases and show that overlay descriptors borrow owned prepared payloads
+without mutating the preceding session snapshot.
+
+Public activation remains unfinished. The API backend must attach the native
+command port after establishing its guarded SQL session and validate graph
+receipt/prepared bindings. Native immediate unique admission still needs reuse
+of compiled unique plans/claim directories instead of expanding accumulated
+target rows for each ordered candidate. The new producer drivers do not by
+themselves activate that native unique boundary. Mounted multi-owner, cold-recovery and failure campaigns
+are required before marking `sql-0015` implemented. The inventory remains 911
+implemented, 138 rejected, 449 superseded and 88 unresolved; 64 unresolved entries
+are DDL. No component-only witness receives original-case credit.
+
+The PostgreSQL witnesses distinguish MERGE action timing from ON CONFLICT:
+MERGE evaluates a repeated target's selected assignment before cardinality
+failure, while ON CONFLICT rejects a command-owned UPDATE target before its
+WHERE/RHS. Duplicate literal INSERT identities are therefore checked during
+execution rather than Describe; Describe cannot suppress preceding sequence
+calls by enforcing row uniqueness early. Scalar RETURNING also stays in the
+pinned target's namespace despite surrounding statement-CTE bindings. Error
+prefixes, successful LIMIT completion, same-command MERGE conflicts, all three
+MERGE write arms, duplicate upserts and exhaustive allocation failures cover
+these component contracts. Public transport/native durability qualification is
+still required before original-case credit.

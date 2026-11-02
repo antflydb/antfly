@@ -2215,7 +2215,7 @@ const Parser = struct {
         if (!self.keyword(.returning)) return null;
         var columns: std.ArrayList(ast.Projection) = .empty;
         while (true) {
-            try columns.append(self.alloc, try self.parseProjection(false));
+            try columns.append(self.alloc, try self.parseProjection(true));
             if (!self.take(.comma)) break;
         }
         if (columns.items.len == 1 and columns.items[0].wildcard and columns.items[0].field.len == 0) columns.clearRetainingCapacity();
@@ -4349,6 +4349,8 @@ const Parser = struct {
             defer self.relation_depth -= 1;
             if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL CTE nesting limit exceeded");
             var ctes: std.ArrayList(ast.Cte) = .empty;
+            var effects: std.ArrayList(ast.StatementCte) = .empty;
+            var has_effects = false;
             while (true) {
                 const cte_name = try self.identifier();
                 var column_names: std.ArrayList([]const u8) = .empty;
@@ -4366,14 +4368,42 @@ const Parser = struct {
                 } else .automatic;
                 try self.expect(.lparen);
                 const cte_statement = try self.statement();
-                if (cte_statement != .select) return self.fail(error.UnsupportedSqlShape, "CTEs require SELECT queries");
                 try self.expect(.rparen);
-                const query = try self.alloc.create(ast.Select);
-                query.* = cte_statement.select;
-                try ctes.append(self.alloc, .{ .name = cte_name, .columns = try column_names.toOwnedSlice(self.alloc), .query = query, .recursive = recursive, .materialization = materialization });
+                const names = try column_names.toOwnedSlice(self.alloc);
+                if (cte_statement == .select) {
+                    const query = try self.alloc.create(ast.Select);
+                    query.* = cte_statement.select;
+                    if (has_effects) {
+                        try effects.append(self.alloc, .{ .name = cte_name, .columns = names, .body = .{ .query = query }, .materialization = materialization });
+                    } else {
+                        try ctes.append(self.alloc, .{ .name = cte_name, .columns = names, .query = query, .recursive = recursive, .materialization = materialization });
+                    }
+                } else switch (cte_statement) {
+                    .insert, .update, .delete, .merge => {
+                        if (self.relation_depth != 1) return self.fail(error.UnsupportedSqlShape, "WITH containing a data-modifying statement must be at the top level");
+                        if (!has_effects) {
+                            has_effects = true;
+                            for (ctes.items) |prior| try effects.append(self.alloc, .{ .name = prior.name, .columns = prior.columns, .body = .{ .query = prior.query }, .materialization = prior.materialization });
+                        }
+                        const mutation = try self.alloc.create(ast.Statement);
+                        mutation.* = cte_statement;
+                        try effects.append(self.alloc, .{ .name = cte_name, .columns = names, .body = .{ .mutation = mutation }, .materialization = materialization });
+                    },
+                    else => return self.fail(error.UnsupportedSqlShape, "WITH queries require SELECT, INSERT, UPDATE, DELETE or MERGE"),
+                }
+                if (effects.items.len > 64 or ctes.items.len > 64) return self.fail(error.SqlLimitExceeded, "SQL WITH definition limit exceeded");
                 if (!self.take(.comma)) break;
             }
             var result = try self.statement();
+            if (has_effects) {
+                switch (result) {
+                    .select, .insert, .update, .delete, .merge => {},
+                    else => return self.fail(error.UnsupportedSqlShape, "data-modifying WITH requires a query or mutation"),
+                }
+                const root = try self.alloc.create(ast.Statement);
+                root.* = result;
+                return .{ .effect_block = .{ .definitions = try effects.toOwnedSlice(self.alloc), .statement = root, .recursive = recursive } };
+            }
             switch (result) {
                 .update => |*mutation| {
                     try ctes.appendSlice(self.alloc, mutation.ctes);
@@ -6635,5 +6665,100 @@ test "SQL native index original full-text declarations retain typed intent and r
     for ([_][]const u8{ "sql-0719", "sql-0720", "sql-0721" }) |id| {
         const original = try corpus.get(id);
         try std.testing.expectError(error.UnsupportedSqlShape, compile(a, original.sql, .{}));
+    }
+}
+
+test "SQL statement effect CTE compiler preserves PostgreSQL producer shapes and read fast path" {
+    const a = std.testing.allocator;
+    const fixture = try std.json.parseFromSlice(std.json.Value, a, @embedFile("fixtures/sql_mutation_cte_reference.json"), .{});
+    defer fixture.deinit();
+    var count: usize = 0;
+    for (fixture.value.object.get("entries").?.array.items) |entry| {
+        const name = entry.object.get("name").?.string;
+        const statement = entry.object.get("sql").?.string;
+        if (std.mem.eql(u8, name, "nested_write")) {
+            try std.testing.expectError(error.UnsupportedSqlShape, compile(a, statement, .{}));
+            continue;
+        }
+        var result = try compile(a, statement, .{});
+        defer result.deinit();
+        try std.testing.expect(result.statement == .effect_block);
+        try std.testing.expect(result.statement.effect_block.definitions.len != 0);
+        if (std.mem.eql(u8, name, "original_merge_double_write")) {
+            const block = result.statement.effect_block;
+            try std.testing.expectEqualStrings("sql-0015", entry.object.get("id").?.string);
+            try std.testing.expectEqualStrings("usage_records", block.definitions[0].body.mutation.update.table.table);
+            try std.testing.expect(block.statement.* == .merge);
+        }
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 76), count);
+    var read = try compile(a, "WITH x AS (SELECT 1 AS id) SELECT id FROM x", .{});
+    defer read.deinit();
+    try std.testing.expect(read.statement == .select);
+    try std.testing.expectEqual(@as(usize, 1), read.statement.select.ctes.len);
+}
+
+test "SQL statement effect CTE compiler shares parameter and write-version classification" {
+    var result = try compile(std.testing.allocator, "WITH x AS (UPDATE t SET v=$1 WHERE id=$2 RETURNING _version) SELECT * FROM x WHERE _version=$3", .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.parameter_count);
+    try std.testing.expect(ast.returningWriteVersion(result.statement));
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT * FROM (WITH x AS (DELETE FROM t RETURNING id) SELECT * FROM x) q", .{}));
+}
+
+test "SQL statement effect CTE binds typed slots without fabricated tables and requires native staged publication" {
+    const Fixture = struct {
+        writes: usize = 0,
+        cuts: usize = 0,
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, name: ast.Name, _: @import("catalog.zig").Action) !@import("catalog.zig").Table {
+            if (!std.mem.eql(u8, name.table, "t")) return error.UnexpectedCteCatalogLookup;
+            return .{ .id = 1, .physical_name = "t", .schema_version = 1, .storage_mode = .relational, .columns = &.{
+                .{ .name = "id", .path = "id", .type = .string },
+                .{ .name = "v", .path = "v", .type = .integer },
+            } };
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: @import("catalog.zig").Table, _: @import("catalog.zig").Scan) !@import("catalog.zig").Page {
+            return error.UnexpectedCteRead;
+        }
+        fn cut(raw: *anyopaque, _: std.mem.Allocator, _: []const @import("catalog.zig").StatementScan) !@import("catalog.zig").StatementRead {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cuts += 1;
+            return error.UnexpectedCteRead;
+        }
+        fn mutate(raw: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: @import("catalog.zig").Table, _: []const @import("catalog.zig").Mutation) !@import("catalog.zig").MutationOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.writes += 1;
+            return error.UnexpectedCteMutation;
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture: Fixture = .{};
+    const backend: @import("catalog.zig").Backend = .{ .ptr = &fixture, .atomic_statement_read_set = true, .vtable = &.{ .resolve = Fixture.resolve, .scan = Fixture.scan, .open_statement = Fixture.cut, .mutate = Fixture.mutate, .checkpoint = Fixture.checkpoint } };
+    var compiled = try compile(a, "WITH changed AS (UPDATE t SET v=2 RETURNING id,v) SELECT id,v FROM changed", .{});
+    defer compiled.deinit();
+    var description = try @import("describe.zig").describe(a, backend, &compiled, &.{});
+    defer description.deinit();
+    try std.testing.expect(description.binding.table == null);
+    try std.testing.expectEqualStrings("v", description.binding.columns[1].name);
+    try std.testing.expectEqual(ast.ColumnType.integer, description.binding.columns[1].type);
+    try std.testing.expectEqual(@import("catalog.zig").Action.read_write, description.binding.action);
+    try std.testing.expectError(error.SqlStatementSnapshotRequired, @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.cuts);
+    try std.testing.expectEqual(@as(usize, 0), fixture.writes);
+}
+
+test "SQL statement effect CTE transports share mutation admission classification" {
+    for ([_]struct { sql: []const u8, writing: bool }{
+        .{ .sql = "WITH changed AS (UPDATE things SET id=1 RETURNING id) SELECT id FROM changed", .writing = true },
+        .{ .sql = "WITH rows AS (SELECT 1 AS id) SELECT id FROM rows", .writing = false },
+        .{ .sql = "SELECT 1", .writing = false },
+        .{ .sql = "INSERT INTO things(id) VALUES(1)", .writing = true },
+        .{ .sql = "BEGIN", .writing = true },
+    }) |case| {
+        var compiled = try compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(case.writing, compiled.statement.requiresWriteAdmission());
     }
 }

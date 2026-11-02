@@ -136,6 +136,7 @@ pub const Node = struct {
     row_filter: ?catalog.ViewRowFilter = null,
     operation: union(enum) {
         singleton,
+        statement_cte: struct { slot: usize, ordered: bool },
         recursive_ref: usize,
         outer_ref: usize,
         recursive: struct { id: usize, seed: *const Node, step: *const Node, all: bool },
@@ -326,6 +327,9 @@ pub const ResolveAdapter = struct {
     table: catalog.Table,
     pub fn iface(self: *ResolveAdapter) catalog.Backend {
         var result = self.backend;
+        // The source graph already resolved every lexical CTE. Its virtual
+        // row binder must not enter relation lowering a second time.
+        if (std.mem.eql(u8, self.table.physical_name, virtual_table_name)) result.statement_ctes = null;
         result.ptr = self;
         result.prepared_read = null;
         result.vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint };
@@ -961,7 +965,11 @@ const Builder = struct {
         return result;
     }
     fn repeatable(program: scalar.Program) bool {
-        for (program.instructions) |instruction| if (instruction.operation == .call and instruction.operation.call.function.volatility() == .@"volatile") return false;
+        for (program.instructions) |instruction| if (instruction.operation == .call) {
+            const call = instruction.operation.call;
+            const volatility = if (call.function == .@"$routine") (if (call.routine) |routine| routine.volatility else .@"volatile") else call.function.volatility();
+            if (volatility == .@"volatile") return false;
+        };
         return true;
     }
     fn replayPolicy(operation: @FieldType(Node, "operation")) Node.ReplayPolicy {
@@ -1792,6 +1800,9 @@ const Builder = struct {
                         i -= 1;
                         const cte = scope[i];
                         if (std.mem.eql(u8, cte.name, reference.name.table)) {
+                            const previous_cte_visibility = self.backend.statement_cte_visibility;
+                            defer self.backend.statement_cte_visibility = previous_cte_visibility;
+                            if (cte.statement_cte_visibility) |visible| self.backend.statement_cte_visibility = @min(visible, previous_cte_visibility);
                             const saved_scope = self.outer_scope;
                             defer self.outer_scope = saved_scope;
                             while (self.outer_scope) |frame| {
@@ -1822,6 +1833,29 @@ const Builder = struct {
                         }
                     }
                 }
+                if (reference.search == null and !reference.mutation_target and !reference.prepared_rows and reference.name.database == null and reference.name.namespace == null) {
+                    if (self.backend.statement_ctes) |scope_owner| if (scope_owner.binding_scope == self.backend.binding_scope) {
+                        if (try scope_owner.lookup(reference.name.table, self.backend.statement_cte_visibility)) |slot| {
+                            const definition = scope_owner.definitions[slot];
+                            const columns = try self.alloc.alloc(Column, definition.columns.len);
+                            for (definition.columns, columns) |descriptor, *column| column.* = .{
+                                .name = descriptor.name,
+                                .internal = try self.internal(),
+                                .qualifier = reference.alias orelse reference.name.table,
+                                .type = descriptor.type,
+                                .element_type = descriptor.element_type,
+                                .numeric_modifier = descriptor.numeric_modifier,
+                                .enum_view = descriptor.enum_view,
+                                .domain_view = descriptor.domain_view,
+                                .temporal_kind = descriptor.temporal_kind,
+                                .nullable = true,
+                                .untyped_null = descriptor.untyped_null,
+                            };
+                            if (self.shape_only) for (columns) |column| try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column), .temporal_kind = column.temporal_kind, .nullable = column.nullable });
+                            break :blk try self.node(columns, .{ .statement_cte = .{ .slot = slot, .ordered = definition.ordered_effects } });
+                        }
+                    };
+                }
                 const identity = try std.fmt.allocPrint(self.alloc, "{d}\x00{s}\x00{s}\x00{s}", .{ self.backend.binding_scope, reference.name.database orelse "", reference.name.namespace orelse "", reference.name.table });
                 const entry = try self.identities.getOrPut(self.alloc, identity);
                 if (!entry.found_existing) entry.value_ptr.* = try self.backend.resolveRead(self.alloc, reference.name);
@@ -1850,6 +1884,7 @@ const Builder = struct {
                     if (invocation) |owner| owner.routine_resolver = view.backend.routine_resolver;
                     self.backend.settings_view = previous_backend.settings_view orelse view.backend.settings_view;
                     self.backend.prepared_read = null;
+                    self.backend.statement_ctes = null;
                     self.outer_scope = null;
                     defer {
                         if (invocation) |owner| owner.routine_resolver = previous_routines;
@@ -2371,7 +2406,7 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
             for (function.arrays) |program| for (program.required_columns) |ordinal| try needed.put(builder.alloc, function.source.columns[ordinal].internal, {});
             try projectScans(builder, function.source, needed);
         },
-        .singleton, .recursive_ref, .outer_ref, .literal_rows => {},
+        .singleton, .statement_cte, .recursive_ref, .outer_ref, .literal_rows => {},
         .prepared_rows => |names| {
             if (builder.prepared_scope != null) for (node.columns, names) |column, name| {
                 if (needed.contains(column.internal)) try builder.prepared_demands.put(builder.alloc, name, {});

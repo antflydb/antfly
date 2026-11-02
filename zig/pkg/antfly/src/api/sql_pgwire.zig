@@ -1074,10 +1074,7 @@ const Job = struct {
             effective.uses_sequences = effective.uses_sequences or source.uses_sequences;
         };
         const compiled = &effective;
-        const write = self.kind == .execute and switch (compiled.statement) {
-            .select, .explain, .copy_to, .copy_from => false,
-            .call, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction, .prepared_transaction => true,
-        };
+        const write = self.kind == .execute and compiled.statement.requiresWriteAdmission();
         const server = self.adapter.server;
         var admission = try server.acquireSqlExecution(write);
         defer admission.release();

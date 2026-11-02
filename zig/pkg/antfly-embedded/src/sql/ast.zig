@@ -194,6 +194,8 @@ pub const Cte = struct {
     query: *const Select,
     recursive: bool = false,
     materialization: Materialization = .automatic,
+    /// A statement-effect definition binds only earlier sibling slots.
+    statement_cte_visibility: ?usize = null,
 };
 pub const Search = struct { request: Value, limit: ?Value = null };
 pub const Relation = union(enum) {
@@ -726,7 +728,23 @@ pub const Explain = struct {
 
 pub const PreparedTransaction = struct { action: enum { prepare, commit, rollback }, gid: []const u8 };
 
+/// One immutable statement-level WITH graph. Read-only WITH keeps Select.ctes;
+/// only graphs containing mutation producers use this boundary. Query bodies
+/// stay Select-sized so ordinary WITH does not acquire Statement allocations.
+pub const StatementCte = struct {
+    name: []const u8,
+    columns: []const []const u8 = &.{},
+    materialization: Cte.Materialization = .automatic,
+    body: union(enum) { query: *const Select, mutation: *const Statement },
+};
+pub const EffectBlock = struct {
+    definitions: []const StatementCte,
+    statement: *const Statement,
+    recursive: bool = false,
+};
+
 pub const Statement = union(enum) {
+    effect_block: EffectBlock,
     /// Read plan plus output contract. Ordinary execute must never silently
     /// expose this as SELECT; the COPY-capable stream owns protocol framing.
     copy_to: struct { query: *const Select, options: CopyOptions, implicit_columns: bool = false },
@@ -752,11 +770,27 @@ pub const Statement = union(enum) {
     set_transaction: @import("session.zig").Characteristics,
     prepared_transaction: PreparedTransaction,
     call: struct { name: Name, arguments: []const *const Scalar },
+
+    /// Shared by HTTP and pgwire admission. COPY streams own their separate
+    /// writer admission; writable WITH always reserves the mutation lane.
+    pub fn requiresWriteAdmission(self: Statement) bool {
+        return switch (self) {
+            .select, .explain, .copy_to, .copy_from => false,
+            .effect_block, .call, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction, .prepared_transaction => true,
+        };
+    }
 };
 
 /// Only target postimages need a reserved write stamp. DELETE retains its
 /// captured preimage; SELECT and literal strings never start a transaction.
 pub fn returningWriteVersion(statement: Statement) bool {
+    if (statement == .effect_block) {
+        for (statement.effect_block.definitions) |definition| switch (definition.body) {
+            .query => {},
+            .mutation => |mutation| if (returningWriteVersion(mutation.*)) return true,
+        };
+        return returningWriteVersion(statement.effect_block.statement.*);
+    }
     const projections = switch (statement) {
         .insert => |v| v.returning,
         .update => |v| v.returning,

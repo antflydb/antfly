@@ -51,6 +51,13 @@ pub fn validateStatement(a: std.mem.Allocator, inherited_provider: ?decisions.De
     // Nested statements can select a different physical table from their
     // enclosing statement. Preflight must bind the same route as execution.
     const provider = if (inherited_provider) |active| active.withSourceTable(sourceTable(bound, active.source_table)) else null;
+    if (bound.effect_graph) |graph| {
+        for (graph.steps, graph.scope.definitions) |step, definition| {
+            if (!step.mutation and (!step.demanded or definition.inline_read)) continue;
+            try validateStatement(a, provider, step.binding, parameters);
+        }
+        try validateStatement(a, provider, graph.root.binding, parameters);
+    }
     try bound.scalars.validateDecisions(a, parameters, provider);
     if (bound.insert_source) |source| try validateStatement(a, provider, source.*, parameters);
     if (bound.returning) |returning| try validateStatement(a, provider, returning.*, parameters);

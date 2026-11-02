@@ -78,11 +78,21 @@ const State = struct {
             try self.program(projection);
         };
         for (value.orders) |optional| if (optional) |*ordering| try self.program(ordering);
+        for (value.assignments) |optional| if (optional) |*assignment| try self.program(assignment);
+        for (value.insert_rows) |row| for (row) |optional| if (optional) |*cell| try self.program(cell);
     }
     fn bound(self: *@This(), value: describe.BoundStatement, needed: ?[]const bool, depth: usize) anyerror!void {
         if (depth > 64 or self.visited == 16384) return error.SqlProgramLimitExceeded;
         self.visited += 1;
         try check(self);
+        if (value.effect_graph) |graph| {
+            for (graph.steps, graph.scope.definitions) |step, definition| {
+                if (!step.mutation and (!step.demanded or definition.inline_read)) continue;
+                try self.bound(step.binding, null, depth + 1);
+            }
+            try self.bound(graph.root.binding, needed, depth + 1);
+            return;
+        }
         try self.scalars(value.scalars, if (value.aggregate != null or value.window != null) null else needed);
         if (value.aggregate) |aggregate| {
             try self.scalars(aggregate.input, null);
@@ -96,6 +106,31 @@ const State = struct {
             try self.list(window.outputs);
             try self.list(window.orders);
         }
+        if (value.insert_source) |source| try self.bound(source.*, null, depth + 1);
+        if (value.joined_mutation) |mutation| {
+            try self.bound(mutation.input.*, null, depth + 1);
+            if (mutation.returning_binding) |binding| try self.bound(binding.*, null, depth + 1);
+            if (mutation.returning_plan) |output| try self.list(output.programs);
+        }
+        if (value.merge_mutation) |mutation| {
+            try self.bound(mutation.input.*, null, depth + 1);
+            for (mutation.arms) |arm| {
+                if (arm.predicate) |*predicate| try self.program(predicate);
+                switch (arm.action) {
+                    .update, .insert => |assignments| for (assignments) |assignment| {
+                        if (assignment.program) |*expression| try self.program(expression);
+                    },
+                    else => {},
+                }
+            }
+            if (mutation.returning_plan) |output| try self.list(output.programs);
+        }
+        if (value.conflict) |conflict| {
+            for (conflict.assignments) |optional| if (optional) |*assignment| try self.program(assignment);
+            if (conflict.predicate) |*predicate| try self.program(predicate);
+            for (conflict.deferred) |optional| if (optional) |deferred| try self.bound(deferred.binding.*, null, depth + 1);
+        }
+        if (value.returning) |output| try self.bound(output.*, null, depth + 1);
         if (value.relation) |input| try self.node(input.root, depth + 1);
     }
     fn node(self: *@This(), value: *const relation.Node, depth: usize) anyerror!void {
@@ -135,7 +170,7 @@ const State = struct {
                 try self.list(unnest.arrays);
                 try self.node(unnest.source, depth + 1);
             },
-            .singleton, .scan, .recursive_ref, .outer_ref, .literal_rows, .prepared_rows => {},
+            .singleton, .scan, .statement_cte, .recursive_ref, .outer_ref, .literal_rows, .prepared_rows => {},
         }
     }
 };
