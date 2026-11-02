@@ -98,6 +98,27 @@ Those modules pass 623 JavaScript tests, 209 object-store checks (two provider s
 actual-workerd checks. This is functional evidence, not a new latency comparison.
 The approved control remains immutable; rebuilt modules do not replace its bytes.
 
+The current short local comparison completed both execution orders on the rebuilt
+modules above, four tenants of 512 documents, 20 ms injected storage delay and
+zero-delay setup. It offered 128 reads at 16 reads/s with one write per sixteen
+reads, per case, using fresh stores and required fences plus latest-read checks.
+
+| Local p95, ms, both orders | Resident incumbent | Durable cold pipeline |
+| --- | ---: | ---: |
+| Read | 66.1–66.5 | 40.1 |
+| Write | 371.2–374.5 | 187.9–189.6 |
+| Reconstructed read | 411.1–424.7 | 198.7–201.2 |
+
+Four cases contain 512 measured reads, 32 writes and 48 separate reconstruction
+reads. All 544 mixed requests have valid HTTP/owner profiles. Exact body/fence/count,
+module/bundle hashes, activation, physical settlement and error-history guards pass.
+No offered failures occur; maximum dispatch lag is below 1.9 ms. Batching stays off.
+These are small emulator populations, with only eight writes/case and twelve cold
+cohort members/case, not independent physical cold boots. They compare the current
+resident incumbent with the durable pipeline, **not approved control c44896ac8c**.
+They do not replace hosted qualification or establish a statistical SLO. Reports
+and negative earlier runs remain under local `dist/qualification/`.
+
 Run a short 512-document comparison on the current source before longer tests.
 For local diagnosis use `read-state-latency.mjs`, separate fresh output directories,
 explicit variant flags, both orders and complete phase profiles. An incumbent

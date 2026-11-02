@@ -81,7 +81,7 @@ Do not reuse consumed execution IDs or reserved cold epochs.
 
 From `examples/cloudflare-serverless`, `cold-pilot.mjs prepare ACCOUNT_ID
 --documents=512` prepares the candidate; add `--control-source=CONTROL_EXAMPLE_DIR`
-for the exact approved control. Prepare emits the scoped `run.json` path. Run
+for the exact approved control. Add `--phase-profile` on the candidate only. Prepare emits the scoped `run.json` path. Run
 `seal`, then `deploy` and the explicitly authorized disposable `upload-token` action
 with that manifest. These create paid resources; preparation/sealing alone are local.
 The lifecycle removes queues/triggers/AI bindings for this bounded diagnostic.
