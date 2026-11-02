@@ -26,8 +26,29 @@ import{captureReadView,metadataKeys}from"../read-view.mjs";
 import{instantiateHost}from"../../../zig/lib/objectstore/wasm/asyncify.mjs";
 import{createR2Transport}from"../../../zig/lib/objectstore/wasm/r2.mjs";
 import{withCommitCoordinator}from"../../../zig/lib/objectstore/wasm/coordinated.mjs";
-import{nextPublicationBudget,publicationExecutionFailure,publicationFailureReducesBudget}from"../publication-budget.mjs";
+import{admittedPublicationBudget,publicationAdmission,nextPublicationBudget,publicationExecutionFailure,publicationFailureReducesBudget}from"../publication-budget.mjs";
 
+test("unmeasured publication admission starts with one record and retained feedback is bounded",async()=>{
+ assert.equal(admittedPublicationBudget(64),1);
+ assert.equal(admittedPublicationBudget(64,32),32);
+ assert.equal(admittedPublicationBudget(8,32),8);
+ for(const bad of[0,-1,1.5,257,NaN,'8'])assert.throws(()=>admittedPublicationBudget(64,bad),/InvalidPublicationBudget/);
+ const rows=new Map(),tx={get:async key=>rows.get(key)},env={PUBLICATION_CONTINUATIONS:'true',PAGED_TEXT:'true',PAGED_PROJECTIONS:'true'};
+ assert.deepEqual(await publicationAdmission(tx,64,env),{budget:1,resumable:false});
+ rows.set('__antfly_publication_budget',64);
+ assert.equal((await publicationAdmission(tx,64,env)).budget,1,'old feedback is not calibrated under the current policy');
+ rows.set('__antfly_publication_admission_format',1);
+ assert.equal((await publicationAdmission(tx,64,env)).budget,64);
+ let reads=0;const batched={getMany:async keys=>{reads++;return keys.map(key=>rows.get(key));}};
+ assert.equal((await publicationAdmission(batched,64,env)).budget,64);assert.equal(reads,1,'one native metadata read admits the whole policy');
+ assert.equal((await publicationAdmission(tx,8,env)).budget,8);
+ rows.set('__antfly_publication_admission_format',2);await assert.rejects(publicationAdmission(tx,64,env),/InvalidPublicationBudget/);
+ rows.delete('__antfly_publication_admission_format');rows.delete('__antfly_publication_budget');
+ rows.set('__antfly_publication_requires_slice',true);
+ assert.deepEqual(await publicationAdmission(tx,64,env),{budget:1,resumable:true});
+ assert.equal((await publicationAdmission(tx,64,{...env,PAGED_TEXT:'false'})).resumable,false);
+ rows.set('__antfly_publication_requires_slice','true');await assert.rejects(publicationAdmission(tx,64,env),/InvalidPublicationBudget/);
+});
 test("publication feedback separates fixed network wait from admitted capacity",()=>{
  const healthy={records:64,operations:36,transferred_bytes:130000,working_set_peak_bytes:100000,native_elapsed_ms:14000,native_io_wait_ms:13900};
  assert.equal(nextPublicationBudget(64,64,healthy),64);

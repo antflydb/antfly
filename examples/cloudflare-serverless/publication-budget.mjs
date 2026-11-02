@@ -16,6 +16,30 @@
 // These are guard bands inside the unchanged host limits, not larger limits.
 const operations=1024*.75,bytes=32*1024*1024*.75;
 const nativeDeadlineGuardMs=30000*.75;
+// A configured ceiling is not a measured safe prefix. Persisted feedback survives
+// actor eviction; new publishers establish capacity with one record first.
+export function admittedPublicationBudget(maximum,persisted){
+ if(!Number.isSafeInteger(maximum)||maximum<1||maximum>256||persisted!=null&&(!Number.isSafeInteger(persisted)||persisted<1||persisted>256))throw Error('InvalidPublicationBudget');
+ return Math.min(maximum,persisted??1);
+}
+const admissionKeys=['__antfly_publication_admission_format','__antfly_publication_budget','__antfly_publication_requires_slice'];
+const readAdmissionRows=(tx,keys)=>tx.getMany?tx.getMany(keys):Promise.all(keys.map(key=>tx.get(key)));
+function versionedBudget(maximum,format,persisted){
+ if(format!=null&&format!==1)throw Error('InvalidPublicationBudget');
+ const retained=admittedPublicationBudget(maximum,persisted);
+ return format===1?retained:1;
+}
+export async function readPublicationBudget(tx,maximum){
+ const[format,persisted]=await readAdmissionRows(tx,admissionKeys.slice(0,2));
+ return versionedBudget(maximum,format,persisted);
+}
+export function publicationSupportsSlices(env){return env.PUBLICATION_CONTINUATIONS==='true'&&env.PAGED_TEXT==='true'&&env.PAGED_PROJECTIONS==='true';}
+export async function publicationAdmission(tx,maximum,env){
+ const[format,persisted,required]=await readAdmissionRows(tx,admissionKeys);
+ const budget=versionedBudget(maximum,format,persisted);
+ if(required!=null&&typeof required!=='boolean')throw Error('InvalidPublicationBudget');
+ return{budget,resumable:publicationSupportsSlices(env)&&required===true};
+}
 export function nextPublicationBudget(current,maximum,sample,{targetComputeMs=2000,workingSetBytes=20*1024*1024}={}){
  if(!Number.isSafeInteger(maximum)||maximum<1||maximum>256||!Number.isSafeInteger(current)||current<1||current>256)throw Error('InvalidPublicationBudget');
  if(!Number.isSafeInteger(targetComputeMs)||targetComputeMs<250||targetComputeMs>10000)throw Error('InvalidPublicationSlice');

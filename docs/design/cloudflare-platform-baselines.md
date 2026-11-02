@@ -126,14 +126,41 @@ resource/wall capacity rather than blindly doubling a slow successful prefix.
 Near-guard successful prefixes shrink before hitting the hard limit. Resource
 failure feedback runs in the shared publication runtime after lease cleanup, so
 HTTP and Queue callers both reduce capacity once per failed execution. Queue
-reindex retains its existing separate feedback path. Local slow-storage models
-and workerd admission/failure/retry checks cover this feedback; these changes do
-not establish a hosted latency improvement, bound the first unobserved prefix,
-or provide a continuation inside an ordinary fast batch. Those remain work
-before another hosted qualification attempt.
+reindex retains its existing separate feedback path.
 
-Current validation after the ownership fix: all 630 Node tests and all 18 R2
-workerd checks pass, including simulated slow-storage capacity recovery,
+New object-backed publishers admit one record, then grow from measured feedback
+under the configured ceiling. A versioned admission marker distinguishes current
+measurements from an older persisted configured maximum. Both the measured
+budget and resource-failure feedback survive eviction. Admission fields use one
+batched metadata read, avoiding new serial policy reads. Existing unversioned
+feedback is recalibrated; unknown future policy formats fail closed.
+
+When an eligible paged publisher exhausts its budget at one record, it durably
+requests the existing guarded native continuation protocol for that prefix,
+regardless of payload size. A successful one-record fast prefix near the wall
+guard also requests this mode for the next prefix. Intermediate checkpoints do
+not advance public HEAD or the published WAL cutoff. The mode survives eviction,
+and a committed publication clears it atomically so cheap subsequent prefixes
+can return to fast batching. Nonpaged layouts retain bounded-prefix retries and
+require compatible paged projections before this continuation mode can apply.
+Fast batches still commit atomically; there is no new multirecord checkpoint
+format.
+
+Actual-workerd tests use steady 10 ms and variable 2–40 ms GET/PUT delays plus an
+explicitly injected publication-budget failure. They verify small-record
+continuations, eviction, unchanged cutoff before completion, exact body/count,
+receipt replay, indexed search and return to fast batching. The injected failure
+checks control flow; these local delays do not recreate the hosted 30-second
+exhaustion. No hosted latency improvement or full-gate pass is claimed. Measure
+the larger corpus and publication throughput before a fresh hosted rehearsal. The
+current Mac reached a one-minute load average around 110 during validation, so
+the 512-document timing comparison is deferred until a quieter run; correctness
+test durations are not latency benchmark populations.
+
+Current validation passes all 631 Node tests, 20 R2 workerd checks and 18
+qualification workerd checks. Epoch setup drains `has_more` before requiring
+published indexes; existing query/fencing assertions remain intact. These checks
+include simulated slow-storage capacity recovery,
 publication failure/retry through HTTP and Queue, exact count/body verification,
 and repeated updates in both affected backends. The two earlier failures were
 native `unreachable` traps on a second

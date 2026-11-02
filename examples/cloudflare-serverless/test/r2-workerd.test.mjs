@@ -27,12 +27,19 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
   const options={modulesRoot:output,modules:[{type:"ESModule",path:join(output,"r2-harness.mjs"),contents:`
     import worker, {R2CommitCoordinator as R2Base,CommitCoordinator as LegacyBase,R2ReadRuntime,R2BuildRuntime} from "./worker.js";
     export {R2ReadRuntime,R2BuildRuntime};
+    const delayedBuckets=new WeakMap();
+    function delayedEnvironment(env){
+      if(!env.TEST_IO_DELAYS)return env;
+      if(delayedBuckets.has(env.DATABASE))return{...env,DATABASE:delayedBuckets.get(env.DATABASE)};
+      const delays=JSON.parse(env.TEST_IO_DELAYS);let step=0;
+      const delayed=new Proxy(env.DATABASE,{get(target,key){const value=Reflect.get(target,key,target);if(typeof value!=="function")return value;if(key!=="get"&&key!=="put")return value.bind(target);return async(...args)=>{await new Promise(r=>setTimeout(r,delays[step++%delays.length]));return value.apply(target,args);};}});delayedBuckets.set(env.DATABASE,delayed);return{...env,DATABASE:delayed};
+    }
     export class R2CommitCoordinator extends R2Base {
       constructor(ctx,env){
         // Native coordination must remain independent of the platform SQL/KV
         // database, including initialization and recovery after actor eviction.
         for(const key of ["sql","kv"])Object.defineProperty(ctx.storage,key,{get(){throw Error("UnexpectedPlatformDatabaseAccess:"+key);}});
-        super(ctx,env);
+        super(ctx,delayedEnvironment(env));
       }
       armPlanRetry(code){const original=this.retryCommitOriginal??=this.store.commitWal.bind(this.store);let first=true;this.planRetryIds=[];this.store.commitWal=async(plan,options)=>{this.planRetryIds.push(plan.id);if(first){first=false;await this.store.transaction(tx=>tx.put("unrelated-retry",code));if(code==="dependency-conflict")return{applied:false,state:this.store.state};throw Error(code);}return original(plan,options);};}
       planRetryDiagnostics(){return this.planRetryIds;}
@@ -44,7 +51,7 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
       async beginPublication(...args){this.begins=(this.begins??0)+1;if(this.publicationTestDelay)await new Promise(r=>setTimeout(r,this.publicationTestDelay));return super.beginPublication(...args);}
       finalizePublication(...args){this.finals=(this.finals??0)+1;this.publicationObservation=args[1];if(this.publicationTestFailure){const code=this.publicationTestFailure;this.publicationTestFailure=null;throw Error(code);}return super.finalizePublication(...args);}
       lowerPublicationBudget(...args){this.publicationReductions=(this.publicationReductions??0)+1;return super.lowerPublicationBudget(...args);}
-      async publicationTest(input){if(input.arm){this.publicationTestDelay=80;this.publicationTestFailure=input.failure??null;}return{observation:this.publicationObservation??null,reductions:this.publicationReductions??0,budget:await this.publicationBudget(Number(this.env.PUBLICATION_RECORDS))};}
+      async publicationTest(input){if(input.arm){this.publicationTestDelay=80;this.publicationTestFailure=input.failure??null;}const{budget,resumable}=await this.openPublicationPlan(Number(this.env.PUBLICATION_RECORDS));return{observation:this.publicationObservation??null,reductions:this.publicationReductions??0,budget,resumable};}
       publicationCall(...args){this.legacyCalls=(this.legacyCalls??0)+1;return super.publicationCall(...args);}
       latencyDiagnostics(){return{views:this.views??0,begins:this.begins??0,finals:this.finals??0,legacy:this.legacyCalls??0};}
       loseMaintenanceFinish(){this.loseFinish=true;return true;}
@@ -58,6 +65,7 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
       diagnostics(){return {state:this.journal.state(),...this.ctx.storage.sql.exec("SELECT COUNT(*) AS tasks, SUM(done=0) AS pending FROM collection_tasks").toArray()[0],...this.ctx.storage.sql.exec("SELECT COUNT(*) AS marks FROM collection_marks").toArray()[0]};}
     }
     export default {async fetch(request,env,ctx){
+      env=delayedEnvironment(env);
       const path=new URL(request.url).pathname,stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION),source=(env.LEGACY_COMMITS??env.COMMITS).getByName(env.ANTFLY_INCARNATION);
       if(path==="/scheduled-queue"){
         const sent=[],local={...env,MAINTENANCE:{async send(message){sent.push(message);}}};
@@ -362,7 +370,7 @@ for(const planned of[false,true])test(`publication feedback includes admission a
   await f.call({op:'publish'},'/api',409);
   let diagnostic=await f.call({},'/publication-test');
   assert.equal(diagnostic.reductions,1,'HTTP publication must record resource feedback exactly once');
-  assert.equal(diagnostic.budget,4);
+  assert.equal(diagnostic.budget,1,'a new publisher must not admit the configured eight-record maximum');
   assert.ok(diagnostic.observation.elapsed_ms>=80,'feedback includes beginPublication admission wait');
   while((await f.call({op:'publish'})).has_more){}
   diagnostic=await f.call({},'/publication-test');assert.equal(diagnostic.reductions,1);
@@ -376,5 +384,31 @@ for(const planned of[false,true])test(`publication feedback includes admission a
   assert.equal(diagnostic.budget,Math.max(1,Math.floor(priorBudget/2)));
   while((await f.call({op:'publish'})).has_more){}
   assert.equal((await f.call({op:'count'})).count,'9');
+ }finally{await f.close();}
+});
+
+for(const delays of[[10],[2,7,25,40]])test(`ordinary record publication switches to guarded slices and resumes after eviction (${delays.join(',')} ms storage)`,{timeout:120000},async()=>{
+ const f=await fixture('small-record-slices-'+delays.join('-'),false,true);
+ try{
+  Object.assign(f.options.bindings,{TEST_IO_DELAYS:JSON.stringify(delays),PUBLICATION_RECORDS:'64',PUBLICATION_CONTINUATIONS:'true',PUBLICATION_PREPARED_SLICES:'true',PUBLICATION_ADAPTIVE_SLICES:'true',PUBLICATION_UNITS:'16',PAGED_TEXT:'true',PAGED_PROJECTIONS:'true'});await f.reopen();
+  assert.equal((await f.call({},'/publication-test')).budget,1,'first admission is independent of the configured ceiling');
+  const body='{"text":"ordinary tiny record"}',mutation={op:'mutate',operation_id:'seed',mutations:[{kind:'upsert',doc_id:'one',body}]},accepted=await f.call(mutation);
+  await f.call({arm:true,failure:'PublicationExecutionBudgetExceeded'},'/publication-test');
+  assert.match((await f.call({op:'publish'},'/api',503)).error,/PublicationExecutionBudgetExceeded/);
+  let diagnostic=await f.call({},'/publication-test');assert.equal(diagnostic.budget,1);assert.equal(diagnostic.resumable,true);
+  await f.reopen();assert.equal((await f.call({},'/publication-test')).resumable,true,'admission feedback must survive actor eviction');
+  const started=await f.call({op:'publish'});assert.ok(started.job_id,'a small payload must use durable continuations after single-record exhaustion');assert.equal(started.wal_end_lsn,'0');
+  await f.call({op:'publish',publication_job_id:started.job_id});await f.reopen();
+  assert.equal((await f.call({op:'lookup',doc_id:'one',required_visibility:accepted.visibility})).body,body,'accepted data remains readable before publication completes');
+  let completed;
+  for(let step=0;step<64;step++){const result=await f.call({op:'publish',publication_job_id:started.job_id});assert.equal(result.job_id,started.job_id);if(result.published){completed=result;break;}assert.equal(result.wal_end_lsn,'0');}
+  assert.ok(completed,'guarded ordinary-record slices must complete');assert.equal(completed.wal_end_lsn,'1');
+  assert.equal((await f.call({},'/publication-test')).resumable,false,'completion must restore measured fast batching');
+  assert.deepEqual(await f.call({op:'publish',publication_action:'status',publication_job_id:started.job_id}),completed);
+  assert.equal((await f.call(mutation)).visibility,accepted.visibility,'receipt replay survives publication and eviction');
+  await f.call({op:'mutate',operation_id:'later',mutations:[{kind:'upsert',doc_id:'two',body:'{"text":"second ordinary record"}'}]});
+  const fast=await f.call({op:'publish'});assert.equal(fast.published,true);assert.equal(fast.job_id,undefined,'one slow prefix must not force every future prefix through a job');
+  assert.equal((await f.call({op:'count'})).count,'2');assert.equal((await f.call({op:'lookup',doc_id:'one'})).body,body);
+  assert.equal((await f.call({op:'search',text:'tiny'})).hits[0].doc_id,'one');
  }finally{await f.close();}
 });

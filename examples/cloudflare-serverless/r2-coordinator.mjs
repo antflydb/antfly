@@ -29,7 +29,7 @@ import {FreshReadAdmissions} from "./fresh-read-admissions.mjs";
 import {metadataObjectCall} from "./metadata-object-call.mjs";
 import {applyPublication} from "./prepared-publication.mjs";
 import {CriticalPath} from "./trace.mjs";
-import {nextPublicationBudget} from "./publication-budget.mjs";
+import {nextPublicationBudget,readPublicationBudget,publicationAdmission,publicationSupportsSlices} from "./publication-budget.mjs";
 import {encode} from "./r2-coordinator-store.mjs";
 import {publicationKeys,publicationCall,publicationSnapshot} from "./publication-view.mjs";
 import {metadataKernel,readObservationKernel,buildKernel,residentKernel,enableOwnerReads,sharedCache,boundRows,kernelMetrics} from "./kernels.mjs";
@@ -200,7 +200,7 @@ export class R2CommitCoordinator extends DurableObject {
     return this.transaction(async tx=>{
       const lease=await this.nativePublication(tx,"publication_acquire",null,crypto.randomUUID());
       await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION),{immutable:false});
-      return{format:continuations?3:2,lease,posting_limit:await tx.get("__antfly_publication_quantum_limit")??4096,budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)};
+      return{format:continuations?3:2,lease,posting_limit:await tx.get("__antfly_publication_quantum_limit")??4096,...await publicationAdmission(tx,maximum,this.env),entries:await publicationSnapshot(tx,keys)};
     },{priority:"maintenance"});
   }
   compactionIdentity(id){return compactionIdentity(id,{max_documents:Number(this.env.COMPACTION_MAX_DOCUMENTS??1000),max_artifact_bytes:Number(this.env.COMPACTION_MAX_ARTIFACT_BYTES??4*1024*1024)});}
@@ -280,19 +280,24 @@ export class R2CommitCoordinator extends DurableObject {
       await applyPublication(tx,entries.map(([key])=>key),batch);
       const head=batch.writes.find(([key])=>key===`antfly/progress/${this.env.ANTFLY_INCARNATION}/HEAD`);
       if(head){if(this.env.RESIDENT_BOOTSTRAP==="true"){if(prepared.boot)tx.put("__antfly_serving_boot/"+this.env.ANTFLY_INCARNATION,prepared.boot);else tx.delete("__antfly_serving_boot/"+this.env.ANTFLY_INCARNATION);}}
+      if(head&&observation?.records>0)tx.delete("__antfly_publication_requires_slice");
       if(head)writeReadHints(tx,this.env.ANTFLY_INCARNATION,new TextDecoder().decode(head[1].body).trim(),readHints);
       if(!(await this.nativePublication(tx,"publication_release",batch.lease)).released)throw Error("WorkLeaseLost");
       if(this.env.PUBLICATION_ADAPTIVE_SLICES==="true"&&Number.isSafeInteger(observation?.posting_quantum)&&observation.posting_quantum>=1&&observation.posting_quantum<=4096)tx.put("__antfly_publication_quantum_limit",observation.posting_quantum);
       if(observation&&Number.isFinite(observation.elapsed_ms)&&observation.elapsed_ms>=0&&Number.isInteger(observation.records)&&observation.records>=1&&observation.records<=256){
         const maximum=Number(this.env.PUBLICATION_RECORDS??16),target=Number(this.env.PUBLICATION_SLICE_MS??2000);
         if(!Number.isSafeInteger(target)||target<250||target>10000)throw Error("InvalidPublicationSlice");
-        const current=Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum);
+        const current=await readPublicationBudget(tx,maximum);
         // Add preparation and validation to the same observation; the 25%
         // deadline guard reserves headroom for the remaining durable commit.
         const feedback={...observation,elapsed_ms:observation.elapsed_ms+performance.now()-finalizeStarted};
         const next=nextPublicationBudget(current,maximum,feedback,{targetComputeMs:target,workingSetBytes:Number(this.env.WORKING_SET_BYTES??20*1024*1024)});
         if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.publication_feedback",current,next,maximum,...feedback}));
-        if(next!==current)tx.put("__antfly_publication_budget",next);
+        tx.put("__antfly_publication_admission_format",1);
+        tx.put("__antfly_publication_budget",next);
+        // A slow one-record fast batch has no smaller prefix. Use the existing
+        // guarded native job for the next prefix, then reconsider fast batching.
+        if(batch.format===2&&current===1&&observation.records===1&&feedback.elapsed_ms>=18000&&publicationSupportsSlices(this.env))tx.put("__antfly_publication_requires_slice",true);
       }
       return{committed:true};
     },{priority:"maintenance",...prepared});
@@ -341,11 +346,18 @@ export class R2CommitCoordinator extends DurableObject {
   }
   publicationBudget(maximum) {
     if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 256) throw new Error("InvalidPublicationBudget");
-    return this.transaction(async tx => Math.min(maximum, await tx.get("__antfly_publication_budget") ?? maximum));
+    return this.transaction(async tx => await readPublicationBudget(tx,maximum));
   }
   lowerPublicationBudget(maximum) {
     if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 256) throw new Error("InvalidPublicationBudget");
-    return this.transaction(async tx => {const next = Math.max(1, Math.floor(Math.min(maximum, await tx.get("__antfly_publication_budget") ?? maximum)/2)); tx.put("__antfly_publication_budget", next); if(this.env.PUBLICATION_ADAPTIVE_SLICES==="true")tx.put("__antfly_publication_quantum_limit",Math.max(1,Math.floor((await tx.get("__antfly_publication_quantum_limit")??128)/2))); return next;});
+    return this.transaction(async tx=>{
+      const current=await readPublicationBudget(tx,maximum),next=Math.max(1,Math.floor(current/2));
+      tx.put("__antfly_publication_admission_format",1);
+      tx.put("__antfly_publication_budget",next);
+      if(current===1&&publicationSupportsSlices(this.env))tx.put("__antfly_publication_requires_slice",true);
+      if(this.env.PUBLICATION_ADAPTIVE_SLICES==="true")tx.put("__antfly_publication_quantum_limit",Math.max(1,Math.floor((await tx.get("__antfly_publication_quantum_limit")??128)/2)));
+      return next;
+    });
   }
   ensureEmbeddingProfile(profile) {
     if (!profile.model?.startsWith("@cf/") || !Number.isSafeInteger(profile.dimensions) || profile.dimensions < 1 || profile.dimensions > 1536 || typeof (profile.revision ?? "1") !== "string" || !(profile.revision ?? "1").length || (profile.revision ?? "1").length > 256) return false;
@@ -368,11 +380,11 @@ export class R2CommitCoordinator extends DurableObject {
     // Advisory immutable preparation does not acquire a lease or extend a pin.
     // Native publication binds the eventual batch to this generation and all
     // mutations still validate the current native HEAD guard atomically.
-    return this.transaction(async tx=>({posting_limit:await tx.get("__antfly_publication_quantum_limit")??4096,budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)}),{priority:"maintenance"});
+    return this.transaction(async tx=>({posting_limit:await tx.get("__antfly_publication_quantum_limit")??4096,...await publicationAdmission(tx,maximum,this.env),entries:await publicationSnapshot(tx,keys)}),{priority:"maintenance"});
   }
   async openPublication(maximum) {
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION);
-    return this.transaction(async tx=>{await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION),{immutable:false});return{budget:Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum),entries:await publicationSnapshot(tx,keys)};},{priority:"maintenance"});
+    return this.transaction(async tx=>{await captureReadView(tx,await metadataKeys(this.env.ANTFLY_INCARNATION),{immutable:false});return{...await publicationAdmission(tx,maximum,this.env),entries:await publicationSnapshot(tx,keys)};},{priority:"maintenance"});
   }
   async publicationCall(request,body,expected,readHints) {
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION,this.env.PUBLICATION_CONTINUATIONS==="true");

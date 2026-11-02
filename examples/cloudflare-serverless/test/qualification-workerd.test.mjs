@@ -91,9 +91,10 @@ for(const batched of[true,false])test('qualification epochs reopen one logical R
  }));
  const mf=new Miniflare(convertV4MiniflareOptions({workers}));
  const call=async(input,epoch=0,path='/api')=>{const response=await mf.dispatchFetch('https://qualification.invalid'+path,{method:'POST',headers:{Authorization:'Bearer qualification-test','X-Antfly-Physical-Epoch':String(epoch)},body:JSON.stringify(input)});return{status:response.status,value:await response.json()};};
+ const publishAll=async()=>{for(let step=0;step<32;step++){const result=await call({op:'publish'});assert.equal(result.status,200,JSON.stringify(result.value));if(!result.value.has_more)return;}throw Error('PublicationSetupIncomplete');};
  try{
   const input={op:'mutate',operation_id:'seed',mutations:[{kind:'upsert',doc_id:'one',body:'{"text":"durable","embedding":[0,1]}'},{kind:'upsert',doc_id:'a',body:'{"embedding":[1,1.0002]}'},{kind:'upsert',doc_id:'z',body:'{"embedding":[1,1.0001]}'}]},seed=await call(input);assert.equal(seed.status,200);
-  assert.equal((await call({op:'publish'})).status,200);
+  await publishAll();
   const diagnostic=await call({},0,'/_qualification/publication');assert.equal(diagnostic.status,200);assert.ok(diagnostic.value.budget>0);assert.equal(diagnostic.value.publication.last_execution.result.published,true);assert.ok(diagnostic.value.publication.last_execution.trace.spans.length>0);
   const admissionPath='/_test/admissions',prior=(await call({action:'counts'},0,admissionPath)).value,before=prior.count,localBefore=prior.local_count;
   assert.ok((await call({action:'durable-hints',epoch:1},0,admissionPath)).value.count>=2,'new physical coordinators must recover hints from the committed snapshot');
@@ -110,7 +111,7 @@ for(const batched of[true,false])test('qualification epochs reopen one logical R
   const query={op:'search',mode:'vector',vector:[1,0],search_effort:1,limit:1,fresh:true};
   let scan=await call(query);assert.equal(scan.status,200,JSON.stringify(scan.value));assert.equal(scan.value.complete,false);assert.deepEqual(scan.value.hits,[]);const original=scan.value.cursor;
   assert.equal((await call({op:'mutate',operation_id:'after-scan',mutations:[{kind:'upsert',doc_id:'a',body:'{"embedding":[1,0]}'}]})).status,200);
-  assert.equal((await call({op:'publish'})).status,200);
+  await publishAll();
   const tampered=await call({...query,cursor:original.slice(0,-4)+'AAAA'});assert.equal(tampered.status,409);
   let steps=1;while(!scan.value.complete){scan=await call({...query,cursor:scan.value.cursor},1);assert.equal(scan.status,200,JSON.stringify(scan.value));assert.ok(++steps<10);}
   assert.equal(scan.value.hits[0].doc_id,'z');assert.equal(scan.value.cursor,null);
