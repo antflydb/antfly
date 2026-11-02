@@ -226,6 +226,7 @@ pub const SegmentShared = struct {
     /// generation sharing this segment observes the same live count without
     /// reading roaring containers or taking the deletion lock.
     deleted_count: std.atomic.Value(u32) = .init(0),
+    deletion_revision: std.atomic.Value(u64) = .init(0),
     deletion_lock: std.atomic.Value(u32) = .init(0),
     /// Lazily populated physical column summaries plus an atomically
     /// maintained count of missing values that still belong to live
@@ -279,6 +280,7 @@ pub const SegmentShared = struct {
         const previous = self.deletion_lock.fetchOr(deletion_writer_bit, .acq_rel);
         std.debug.assert((previous & deletion_writer_bit) == 0);
         while (self.deletion_lock.load(.acquire) != deletion_writer_bit) spinOrYield();
+        _ = self.deletion_revision.fetchAdd(1, .acq_rel);
     }
 
     fn unlockDeletionExclusive(self: *SegmentShared) void {
@@ -939,6 +941,329 @@ const BM25BoundTableKey = struct {
 const BM25BoundTableCache = std.AutoHashMapUnmanaged(BM25BoundTableKey, *inverted.BM25BoundTable);
 const max_bm25_bound_tables_per_snapshot: usize = 4;
 
+/// Snapshot-owned scalar membership only; no query reader or capability is
+/// retained. Both entry count and cloned physical storage have hard ceilings.
+pub const GraphPredicateCache = struct {
+    pub const max_bytes: usize = 64 * 1024 * 1024;
+    const Entry = struct {
+        key: []u8,
+        rows: roaring.RoaringBitmap,
+        bytes: usize,
+        refs: std.atomic.Value(usize) = .init(1),
+        owner: *GraphPredicateCache,
+        alloc: Allocator,
+        reservation: resource_manager_mod.Reservation,
+
+        fn release(self: *@This()) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            const owner = self.owner;
+            const bytes = self.bytes;
+            const a = self.alloc;
+            var reservation = self.reservation;
+            a.free(self.key);
+            self.rows.deinit();
+            a.destroy(self);
+            _ = owner.resident_bytes.fetchSub(bytes, .acq_rel);
+            reservation.release();
+        }
+    };
+    entries: [16]?*Entry = @splat(null),
+    bytes: usize = 0,
+    // Includes builders and evicted entries still pinned by readers.
+    resident_bytes: std.atomic.Value(usize) = .init(0),
+    cursor: usize = 0,
+    hits: usize = 0,
+    misses: usize = 0,
+    mutex: std.atomic.Mutex = .unlocked,
+    flights: [8]std.atomic.Mutex = @splat(.unlocked),
+    // The process owner outlives every snapshot reservation and reclaimer.
+    manager: std.atomic.Value(?*resource_manager_mod.ResourceManager) = .init(null),
+    reclaimer_id: u64 = 0,
+
+    fn attachManager(self: *@This(), manager: ?*resource_manager_mod.ResourceManager) void {
+        const owner = manager orelse return;
+        _ = self.manager.cmpxchgStrong(null, owner, .acq_rel, .acquire);
+    }
+    fn ensureReclaimer(self: *@This(), manager: *resource_manager_mod.ResourceManager) bool {
+        if (!self.mutex.tryLock()) return false;
+        defer self.mutex.unlock();
+        if (self.reclaimer_id == 0) self.reclaimer_id = manager.registerReclaimer(.graph_predicate_cache, self, reclaim) catch return false;
+        return true;
+    }
+    fn reclaim(raw: *anyopaque, target: u64) u64 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var freed: u64 = 0;
+        for (0..self.entries.len) |_| {
+            if (freed >= target or !self.mutex.tryLock()) break;
+            const retired = blk: {
+                defer self.mutex.unlock();
+                for (self.entries, 0..) |entry, i| if (entry) |value| {
+                    // Removing a pinned entry cannot release physical bytes.
+                    if (value.refs.load(.acquire) != 1) continue;
+                    break :blk self.remove(i);
+                };
+                break :blk null;
+            };
+            const entry = retired orelse break;
+            const bytes = entry.bytes;
+            entry.release();
+            freed += bytes;
+        }
+        return freed;
+    }
+
+    pub fn lockFlight(self: *@This(), key: []const u8, control: query_mod.ExecutionControl) !*std.atomic.Mutex {
+        const lock = &self.flights[std.hash.Wyhash.hash(0, key) % self.flights.len];
+        while (!lock.tryLock()) {
+            try control.check();
+            spinOrYield();
+        }
+        errdefer lock.unlock();
+        try control.check();
+        return lock;
+    }
+    pub fn get(self: *@This(), a: Allocator, key: []const u8, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
+        try control.check();
+        while (!self.mutex.tryLock()) {
+            try control.check();
+            spinOrYield();
+        }
+        const pinned = blk: {
+            for (self.entries) |entry| if (entry) |value| {
+                if (std.mem.eql(u8, value.key, key)) {
+                    self.hits += 1;
+                    _ = value.refs.fetchAdd(1, .monotonic);
+                    break :blk value;
+                }
+            };
+            self.misses += 1;
+            break :blk null;
+        };
+        self.mutex.unlock();
+        const entry = pinned orelse return null;
+        defer entry.release();
+        try control.check();
+        var rows = try entry.rows.cloneExact(a);
+        errdefer rows.deinit();
+        try control.check();
+        return rows;
+    }
+    // Only directory mutations hold the mutex. Destruction and copying never do.
+    fn remove(self: *@This(), index: usize) ?*Entry {
+        const entry = self.entries[index] orelse return null;
+        self.entries[index] = null;
+        self.bytes -= entry.bytes;
+        return entry;
+    }
+    fn reserve(self: *@This(), bytes: usize) bool {
+        var used = self.resident_bytes.load(.acquire);
+        while (used <= max_bytes - bytes) {
+            used = self.resident_bytes.cmpxchgWeak(used, used + bytes, .acq_rel, .acquire) orelse return true;
+        }
+        return false;
+    }
+    pub fn put(self: *@This(), backing: Allocator, key: []const u8, rows: *const roaring.RoaringBitmap) void {
+        // Optional storage must refund physical bytes when evicted, rather
+        // than leaving allocations retained by a caller's standard arena.
+        const a = @import("antfly_platform").allocator.reclaimingScratch(backing);
+        const bytes = std.math.add(usize, key.len, rows.cloneStorageBound() + @sizeOf(Entry)) catch return;
+        if (bytes > max_bytes) return;
+        // No process owner means no provable shared admission: caching is
+        // optional, while predicate execution still returns its request set.
+        const manager = self.manager.load(.acquire) orelse return;
+        if (!self.ensureReclaimer(manager)) return;
+        if (manager.admissionDecision(.graph_predicate_cache, bytes).pressure != .normal) return;
+        var reservation = manager.reserveWithoutReclaim(.graph_predicate_cache, bytes) catch return;
+        var reservation_owned = true;
+        defer if (reservation_owned) reservation.release();
+        var attempts: usize = 0;
+        while (!self.reserve(bytes)) {
+            // Optional admission never waits behind another cache operation.
+            if (attempts == self.entries.len or !self.mutex.tryLock()) return;
+            const retired = self.remove(self.cursor);
+            self.cursor = (self.cursor + 1) % self.entries.len;
+            self.mutex.unlock();
+            if (retired) |entry| entry.release();
+            attempts += 1;
+        }
+        var admitted = false;
+        defer if (!admitted) {
+            _ = self.resident_bytes.fetchSub(bytes, .acq_rel);
+        };
+        const owned = a.create(Entry) catch return;
+        var installed = false;
+        defer if (!installed) a.destroy(owned);
+        const owned_key = a.dupe(u8, key) catch return;
+        defer if (!installed) a.free(owned_key);
+        var owned_rows = rows.cloneExact(a) catch return;
+        defer if (!installed) owned_rows.deinit();
+        owned.* = .{ .key = owned_key, .rows = owned_rows, .bytes = bytes, .owner = self, .alloc = a, .reservation = reservation };
+        if (!self.mutex.tryLock()) return;
+        const retired = blk: {
+            defer self.mutex.unlock();
+            for (self.entries) |entry| if (entry) |value| if (std.mem.eql(u8, value.key, key)) return;
+            const retired = self.remove(self.cursor);
+            self.entries[self.cursor] = owned;
+            self.bytes += bytes;
+            self.cursor = (self.cursor + 1) % self.entries.len;
+            installed = true;
+            admitted = true;
+            reservation_owned = false;
+            break :blk retired;
+        };
+        if (retired) |entry| entry.release();
+    }
+    pub fn deinit(self: *@This(), _: Allocator) void {
+        // Join callbacks before the snapshot/callback context can disappear.
+        if (self.manager.load(.acquire)) |manager| manager.unregisterReclaimer(self.reclaimer_id);
+        self.reclaimer_id = 0;
+        for (0..self.entries.len) |i| if (self.remove(i)) |entry| entry.release();
+        std.debug.assert(self.resident_bytes.load(.acquire) == 0);
+    }
+};
+
+test "graph predicate cache clones outside locks and pins evicted membership" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var cache = GraphPredicateCache{};
+    cache.attachManager(&manager);
+    const Guard = struct {
+        cache: *GraphPredicateCache,
+        backing: Allocator,
+        evict_on_alloc: bool = false,
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn check(self: *@This()) void {
+            std.debug.assert(self.cache.mutex.tryLock());
+            self.cache.mutex.unlock();
+        }
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.check();
+            if (self.evict_on_alloc) {
+                self.evict_on_alloc = false;
+                std.debug.assert(self.cache.mutex.tryLock());
+                const retired = self.cache.remove(0);
+                self.cache.mutex.unlock();
+                if (retired) |entry| entry.release();
+            }
+            return self.backing.rawAlloc(len, alignment, ret_addr);
+        }
+        fn resize(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.check();
+            return self.backing.rawResize(bytes, alignment, len, ret_addr);
+        }
+        fn remap(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.check();
+            return self.backing.rawRemap(bytes, alignment, len, ret_addr);
+        }
+        fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.check();
+            self.backing.rawFree(bytes, alignment, ret_addr);
+        }
+    };
+    var guard = Guard{ .cache = &cache, .backing = a };
+    defer cache.deinit(a);
+    var rows = roaring.RoaringBitmap.init(a);
+    defer rows.deinit();
+    try rows.add(7);
+    try rows.add(70000);
+    cache.put(guard.allocator(), "permissions", &rows);
+    try std.testing.expect(cache.bytes > 0);
+    guard.evict_on_alloc = true;
+    var cloned = (try cache.get(guard.allocator(), "permissions", .{})).?;
+    defer cloned.deinit();
+    try std.testing.expect(cloned.contains(7) and cloned.contains(70000));
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+    try std.testing.expectEqual(@as(usize, 0), cache.resident_bytes.load(.acquire));
+    // Optional insertion must decline contention rather than wait indefinitely.
+    std.debug.assert(cache.mutex.tryLock());
+    cache.put(a, "contended", &rows);
+    cache.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), cache.resident_bytes.load(.acquire));
+}
+
+test "graph predicate cache shares process admission across pinned generations and indexes" {
+    const a = std.testing.allocator;
+    var rows = roaring.RoaringBitmap.init(a);
+    defer rows.deinit();
+    try rows.add(7);
+    const charge = rows.cloneStorageBound() + @sizeOf(GraphPredicateCache.Entry) + 1;
+    const limit = charge * 3 - 1;
+    var options = resource_manager_mod.Options{ .memory_budget = .{ .hard_limit_bytes = limit } };
+    options.budgets[@backingInt(resource_manager_mod.Slice.graph_predicate_cache)] = .{ .hard_limit_bytes = limit };
+    var manager = resource_manager_mod.ResourceManager.init(options);
+    defer manager.deinit(a);
+    var first = try IndexWriter.init(a);
+    defer first.deinit();
+    first.attachResourceManager(&manager);
+    const old = first.acquireSnapshot();
+    defer old.release();
+    old.graph_predicates.put(a, "a", &rows);
+    try first.sealImmutableCollection(1, &.{});
+    const fresh = first.acquireSnapshot();
+    defer fresh.release();
+    fresh.graph_predicates.put(a, "b", &rows);
+    var second = try IndexWriter.init(a);
+    defer second.deinit();
+    second.attachResourceManager(&manager);
+    const other = second.acquireSnapshot();
+    defer other.release();
+    // Every cache is individually below its ceiling, but the third entry
+    // would exceed the process-wide slice and aggregate host limit.
+    other.graph_predicates.put(a, "c", &rows);
+    try std.testing.expectEqual(@as(usize, 0), other.graph_predicates.bytes);
+    try std.testing.expectEqual(@as(u64, @intCast(2 * charge)), manager.sliceStats(.graph_predicate_cache).used_bytes);
+    const pinned = old.graph_predicates.entries[0].?;
+    _ = pinned.refs.fetchAdd(1, .monotonic);
+    var pinned_owned = true;
+    defer if (pinned_owned) pinned.release();
+    // Pressure in another subsystem evicts all physically releasable values,
+    // including the newer generation, but cannot refund a pinned entry.
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.dense_apply_working_set, limit));
+    try std.testing.expectEqual(@as(u64, @intCast(charge)), manager.sliceStats(.graph_predicate_cache).used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), fresh.graph_predicates.bytes);
+    try std.testing.expectEqual(charge, old.graph_predicates.bytes);
+    pinned.release();
+    pinned_owned = false;
+    var required = try manager.reserve(.dense_apply_working_set, limit);
+    defer required.release();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.graph_predicate_cache).used_bytes);
+    other.graph_predicates.put(a, "c", &rows);
+    try std.testing.expectEqual(@as(usize, 0), other.graph_predicates.bytes);
+    required.release();
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    other.graph_predicates.put(region.allocator(), "c", &rows);
+    try std.testing.expectEqual(@as(usize, 0), region.queryCapacity());
+    try std.testing.expectEqual(@as(u64, @intCast(charge)), manager.sliceStats(.graph_predicate_cache).used_bytes);
+    var cached = (try other.graph_predicates.get(a, "c", .{})).?;
+    defer cached.deinit();
+    try std.testing.expect(cached.contains(7));
+}
+
+test "graph predicate cache declines unmanaged and soft-pressure admission" {
+    const a = std.testing.allocator;
+    var rows = roaring.RoaringBitmap.init(a);
+    defer rows.deinit();
+    try rows.add(7);
+    var cache = GraphPredicateCache{};
+    var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .soft_limit_bytes = 1, .hard_limit_bytes = 1024 * 1024 } });
+    defer manager.deinit(a);
+    defer cache.deinit(a);
+    cache.put(a, "a", &rows);
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+    cache.attachManager(&manager);
+    cache.put(a, "a", &rows);
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.graph_predicate_cache).used_bytes);
+}
+
 /// Immutable, ref-counted snapshot of the index state.
 ///
 /// Snapshots obtained via `acquireSnapshot()` must be released via `release()`.
@@ -948,6 +1273,7 @@ pub const IndexSnapshot = struct {
     alloc: Allocator,
     ref_count: u32,
     epoch: u64,
+    graph_predicates: GraphPredicateCache = .{},
     segments: []SegmentEntry,
     global_total_field_len: std.StringHashMapUnmanaged(u64),
     collection_doc_count: ?u32 = null,
@@ -1339,6 +1665,7 @@ pub const IndexSnapshot = struct {
     fn freeFinal(self: *IndexSnapshot) void {
         self.quiesceOwnedSources();
         const alloc = self.alloc;
+        self.graph_predicates.deinit(alloc);
         self.binding_flights.deinit(alloc);
         var entries = self.bound_segments.valueIterator();
         while (entries.next()) |entry| {
@@ -2262,6 +2589,9 @@ pub const IndexWriter = struct {
 
     /// Publish a new snapshot. Must be the only way `current` is replaced.
     fn publishSnapshot(self: *IndexWriter, new_snap: *IndexSnapshot) void {
+        self.lockMappedResidencyMutex();
+        new_snap.graph_predicates.attachManager(self.resource_manager);
+        self.mapped_residency_mu.unlock();
         self.lockSnapshotMutex();
         @atomicStore(*IndexSnapshot, &self.current, new_snap, .release);
         self.snapshot_mu.unlock();
@@ -2346,6 +2676,7 @@ pub const IndexWriter = struct {
         facade.collection_field_lens = old.collection_field_lens;
         facade.epoch = old.epoch;
         facade.inventory_owner = old;
+        facade.graph_predicates.attachManager(old.graph_predicates.manager.load(.acquire));
         facade.read_context = context;
         facade.binding_allocator = .{ .backing = facade.alloc };
         facade.alloc = facade.binding_allocator.?.allocator();
@@ -2533,6 +2864,7 @@ pub const IndexWriter = struct {
 
         const snap = self.acquireSnapshotRaw();
         defer snap.release();
+        snap.graph_predicates.attachManager(manager);
         self.maybeMaintainMappedResidency(snap, platform_time.monotonicNs());
     }
 

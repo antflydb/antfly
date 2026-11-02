@@ -1938,6 +1938,8 @@ pub const SearchRequest = struct {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Trusted graph admission workspace; never part of the public wire DSL.
+    graph_work_budget: ?*@import("../../graph/work_budget.zig").WorkBudget = null,
     /// Trusted request-local preparation, never decoded from public input.
     value_search_execution: @import("../../search/value_query.zig").Policy = .{},
     value_search_work: ?*@import("../../search/value_query.zig").Work = null,
@@ -2150,6 +2152,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "graph_work_budget",
     // Conditional delivery runs after child authorization and retrieval.
     "field_projection_json",
     "field_projection_plan",

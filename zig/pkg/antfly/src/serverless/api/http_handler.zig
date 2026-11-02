@@ -4551,7 +4551,7 @@ pub const HttpHandler = struct {
             const traversal_overflow = bounded and traversal_nodes.len > remaining;
 
             for (traversal_nodes) |node| {
-                if (named_query.query.params.deduplicate) {
+                if (named_query.query.params.deduplicate and !named_query.query.params.include_paths) {
                     if (!try seen.putIfAbsent(self.alloc, .{ .table = node.target_table, .key = node.key }, {})) continue;
                 }
 
@@ -5117,7 +5117,13 @@ pub const HttpHandler = struct {
         else
             null;
         defer freeFields(self.alloc, projected_fields);
+        var seen = graph_node_identity.BorrowedMap(void){};
+        defer seen.deinit(self.alloc);
         for (nodes) |node| {
+            const ref = graph_node_identity.Ref{ .table = node.table, .key = node.key };
+            if (seen.contains(ref)) continue;
+            try seen.ensureTotalCapacity(self.alloc, hits.items.len + 1);
+            seen.putAssumeCapacityNoClobber(ref, {});
             // This request cache owns one source-table snapshot. Same-table
             // qualifiers are safe; external qualified nodes cannot be
             // hydrated from this snapshot.
@@ -14298,6 +14304,20 @@ test "serverless http handler serves published graph query endpoints" {
     try std.testing.expectEqual(@as(usize, 2), neighbors_from_search.nodes.len);
     try std.testing.expectEqualStrings("doc-b", neighbors_from_search.nodes[0].key);
     try std.testing.expectEqualStrings("doc-c", neighbors_from_search.nodes[1].key);
+
+    // A seed is also a reachable endpoint. Keep both doc-a -> doc-b ->
+    // doc-c and doc-b -> doc-c when paths are requested with node dedup.
+    var overlapping = try handler.handle(.{ .method = .post, .path = "/tables/docs/query", .body =
+        \\{"graph_queries":{"walk":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a","doc-b"]},"edge_types":["cites"],"max_depth":2,"include_paths":true,"deduplicate_nodes":true}}}}
+    });
+    defer overlapping.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), overlapping.status);
+    var parsed_overlapping = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, overlapping.body);
+    defer parsed_overlapping.deinit();
+    const overlapping_nodes = parsed_overlapping.value.responses.?[0].graph_results.?.map.get("walk").?.graph_nodes_result.nodes;
+    try std.testing.expectEqual(@as(usize, 3), overlapping_nodes.len);
+    try std.testing.expectEqualStrings("doc-a", overlapping_nodes[1].path.?[0].key);
+    try std.testing.expectEqualStrings("doc-b", overlapping_nodes[2].path.?[0].key);
 
     // Exercise actual public admission and execution: rejected edges must not
     // enter traversal, path ranking, or MATCH, and literals remain lossless.

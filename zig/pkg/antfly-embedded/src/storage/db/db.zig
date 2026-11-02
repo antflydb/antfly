@@ -44906,6 +44906,11 @@ pub const DB = struct {
         };
     }
 
+    const GraphFilterMemory = struct {
+        local_budget: @import("../../graph/work_budget.zig").WorkBudget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(.{}),
+        tracked: @import("../../graph/work_budget.zig").RetainedAllocator = undefined,
+    };
+
     const AlgebraicDocFilterRequest = struct {
         req: types.SearchRequest,
         index: ?*@import("algebraic/index.zig").Index = null,
@@ -44913,6 +44918,8 @@ pub const DB = struct {
         exclude_doc_ids: [][]u8 = &.{},
         resolved_doc_filter: ?*doc_set.ResolvedDocFilter = null,
         resolved_doc_filter_alloc: ?Allocator = null,
+        graph_memory: ?*GraphFilterMemory = null,
+        graph_memory_alloc: ?Allocator = null,
 
         pub fn deinit(self: *@This()) void {
             if (self.index) |index| {
@@ -44923,6 +44930,10 @@ pub const DB = struct {
                 const alloc = self.resolved_doc_filter_alloc.?;
                 filter.deinit(alloc);
                 alloc.destroy(filter);
+            }
+            if (self.graph_memory) |memory| {
+                std.debug.assert(memory.tracked.live_bytes == 0);
+                self.graph_memory_alloc.?.destroy(memory);
             }
             self.* = undefined;
         }
@@ -46370,6 +46381,7 @@ pub const DB = struct {
         try self.requireGraphEndpointCleanupReady();
         const predicate_aware = graphRequestRequiresAdmission(req, named.query.params.node_filter);
         var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name, named.query.params.node_filter);
+        admission.req.graph_work_budget = budgets.work;
         defer admission.deinit();
         var execution = GraphPredicateExecutionContext{
             .db = self,
@@ -46517,6 +46529,7 @@ pub const DB = struct {
     ) !types.GraphSearchResult {
         const predicate_aware = graphRequestRequiresAdmission(req, named.query.params.node_filter);
         var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name, named.query.params.node_filter);
+        admission.req.graph_work_budget = budgets.work;
         defer admission.deinit();
         var execution = GraphPredicateExecutionContext{
             .db = self,
@@ -46604,12 +46617,68 @@ pub const DB = struct {
         }
     };
 
+    /// Resolve analyzed graph predicates with retrieval's native index planner.
+    /// Stored-document matching cannot reproduce an index's analyzer. Preserve
+    /// any pre-resolved row authorization when intersecting the new predicate.
+    fn graphRequestWithIndexedFilterAlloc(self: *DB, req: types.SearchRequest) !AlgebraicDocFilterRequest {
+        var needs_index = false;
+        for ([_][]const u8{ req.filter_query_json, req.exclusion_query_json }) |json| {
+            if (json.len == 0) continue;
+            var local_budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(req.graph_execution_limits);
+            var workspace = @import("../../graph/work_budget.zig").RetainedAllocator{ .backing = self.alloc, .budget = req.graph_work_budget orelse &local_budget };
+            var parsed = std.json.parseFromSlice(std.json.Value, workspace.allocator(), json, .{}) catch |err| return if (err == error.OutOfMemory and workspace.denied) error.GraphWorkBudgetExceeded else err;
+            defer parsed.deinit();
+            needs_index = needs_index or try db_query_search.patternFilterContainsMatch(parsed.value, 0);
+        }
+        if (!needs_index) return .{ .req = req };
+        const memory = try self.alloc.create(GraphFilterMemory);
+        memory.* = .{ .local_budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(req.graph_execution_limits) };
+        memory.tracked = .{ .backing = self.alloc, .budget = req.graph_work_budget orelse &memory.local_budget };
+        var native = AlgebraicDocFilterRequest{ .req = req, .graph_memory = memory, .graph_memory_alloc = self.alloc };
+        errdefer native.deinit();
+        self.prepareGraphIndexedFilter(&native, req) catch |err| return if (err == error.OutOfMemory and memory.tracked.denied) error.GraphWorkBudgetExceeded else err;
+        return native;
+    }
+
+    fn prepareGraphIndexedFilter(self: *DB, native: *AlgebraicDocFilterRequest, req: types.SearchRequest) !void {
+        const a = native.graph_memory.?.tracked.allocator();
+        const filter = try a.create(doc_set.ResolvedDocFilter);
+        filter.* = .{};
+        native.resolved_doc_filter = filter;
+        native.resolved_doc_filter_alloc = a;
+        const executor = db_query_search.StructuredFilterResolverExecutor{
+            .ctx = self,
+            .text_index_entry = textIndexEntryCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .identity_read_generation = req.identity_read_generation,
+        };
+        if (req.filter_query_json.len > 0) filter.include = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.filter_query_json);
+        if (req.exclusion_query_json.len > 0) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json);
+        if (req.resolved_doc_filter) |raw| {
+            const prior: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(raw));
+            var include = (try doc_set.intersectAlloc(a, &prior.include, &filter.include)) orelse return error.UnsupportedQueryRequest;
+            errdefer include.deinit(a);
+            const exclude = (try doc_set.unionAlloc(a, &prior.exclude, &filter.exclude)) orelse return error.UnsupportedQueryRequest;
+            filter.include.deinit(a);
+            filter.exclude.deinit(a);
+            filter.include = include;
+            filter.exclude = exclude;
+        }
+        native.req.filter_query_json = "";
+        native.req.exclusion_query_json = "";
+        native.req.resolved_doc_filter = filter;
+        native.req.resolved_doc_filter_owned = false;
+    }
+
     fn filterGraphKeysWithOrdinalsAlloc(
         self: *DB,
         alloc: Allocator,
-        req: types.SearchRequest,
+        original_req: types.SearchRequest,
         keys: []const []const u8,
     ) !GraphKeyAdmission {
+        var indexed_filter = try self.graphRequestWithIndexedFilterAlloc(original_req);
+        defer indexed_filter.deinit();
+        const req = indexed_filter.req;
         const ordinals = try self.lookupLiveDocOrdinalsNoLock(
             alloc,
             keys,
@@ -46726,6 +46795,8 @@ pub const DB = struct {
         external_targets: bool,
         node_filter: graph_pattern_mod.NodeFilter,
         prepared_filters: db_query_graph.PreparedPatternFilterCache,
+        indexed_node_filter: ?AlgebraicDocFilterRequest = null,
+        indexed_request_filter: ?AlgebraicDocFilterRequest = null,
         decisions: std.StringHashMapUnmanaged(bool) = .empty,
 
         fn init(
@@ -46753,6 +46824,8 @@ pub const DB = struct {
             while (it.next()) |key| self.alloc.free(key.*);
             self.decisions.deinit(self.alloc);
             self.prepared_filters.deinit();
+            if (self.indexed_node_filter) |*filter| filter.deinit();
+            if (self.indexed_request_filter) |*filter| filter.deinit();
             self.* = undefined;
         }
 
@@ -46770,6 +46843,8 @@ pub const DB = struct {
             nodes: []const GraphNodeRef,
         ) anyerror![]bool {
             const self: *GraphNodeAdmissionCache = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const control = @import("../../search/query.zig").ExecutionControl{ .cancellation = self.req.cancellation, .deadline_ns = self.req.execution_deadline_ns };
+            try control.check();
             const result = try result_alloc.alloc(bool, nodes.len);
             errdefer result_alloc.free(result);
 
@@ -46795,9 +46870,10 @@ pub const DB = struct {
             }
 
             if (missing_keys.items.len > 0) {
+                if (self.indexed_request_filter == null) self.indexed_request_filter = try self.db.graphRequestWithIndexedFilterAlloc(self.req);
                 const missing_mask = try self.db.filterGraphKeysAlloc(
                     result_alloc,
-                    self.req,
+                    self.indexed_request_filter.?.req,
                     missing_keys.items,
                 );
                 defer result_alloc.free(missing_mask);
@@ -46824,19 +46900,32 @@ pub const DB = struct {
                         try query_positions.append(result_alloc, i);
                     }
                     if (query_keys.items.len > 0) {
-                        const loaded = try loadStoredSearchDocumentsMany(
-                            self.db,
-                            result_alloc,
-                            query_keys.items,
-                            null,
-                        );
-                        defer freeOptionalOwnedBytes(result_alloc, loaded);
-                        const prepared = try self.prepared_filters.getOrPrepare(filter_query_json);
-                        for (query_keys.items, query_positions.items, loaded) |key, position, maybe_stored| {
-                            missing_mask[position] = if (maybe_stored) |stored|
-                                try prepared.matchesStored(result_alloc, key, stored)
-                            else
-                                false;
+                        if (self.indexed_node_filter == null) {
+                            var filter_req = self.req;
+                            filter_req.filter_query_json = filter_query_json;
+                            filter_req.exclusion_query_json = "";
+                            filter_req.resolved_doc_filter = null;
+                            self.indexed_node_filter = try self.db.graphRequestWithIndexedFilterAlloc(filter_req);
+                        }
+                        if (self.indexed_node_filter.?.resolved_doc_filter != null) {
+                            const mask = try self.db.filterGraphKeysAlloc(result_alloc, self.indexed_node_filter.?.req, query_keys.items);
+                            defer result_alloc.free(mask);
+                            for (query_positions.items, mask) |position, allowed| missing_mask[position] = allowed;
+                        } else {
+                            const loaded = try loadStoredSearchDocumentsMany(
+                                self.db,
+                                result_alloc,
+                                query_keys.items,
+                                null,
+                            );
+                            defer freeOptionalOwnedBytes(result_alloc, loaded);
+                            const prepared = try self.prepared_filters.getOrPrepare(filter_query_json);
+                            for (query_keys.items, query_positions.items, loaded) |key, position, maybe_stored| {
+                                missing_mask[position] = if (maybe_stored) |stored|
+                                    try prepared.matchesStored(result_alloc, key, stored)
+                                else
+                                    false;
+                            }
                         }
                     }
                 }
@@ -116020,6 +116109,113 @@ test "db reverse graph probe rejects a deleted or replaced index incarnation" {
     const incoming = try db.graphHasIncomingEdgesForInternalRead(alloc, "graph_idx", &.{"absent"}, current, null);
     defer alloc.free(incoming);
     try std.testing.expectEqualSlices(bool, &.{false}, incoming);
+}
+
+test "db graph indexed admission reuses compressed membership and honors cancellation and memory" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("graph-filter-budget");
+    defer tmp.cleanup();
+    var db = try DB.open(a, std.mem.span(tmp.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    const writes = try a.alloc(types.BatchWrite, 8192);
+    defer a.free(writes);
+    var initialized: usize = 0;
+    defer for (writes[0..initialized]) |write| a.free(write.key);
+    for (writes, 0..) |*write, i| {
+        const key = if (i < 2) try a.dupe(u8, if (i == 0) "a" else "b") else try std.fmt.allocPrint(a, "row-{d}", .{i});
+        write.* = .{ .key = key, .value = "{\"allowed\":[\"standard\"]}" };
+        initialized += 1;
+    }
+    try db.batch(.{ .writes = writes, .sync_level = .full_index });
+    const req = types.SearchRequest{ .filter_query_json = "{\"match\":{\"path\":\"allowed\",\"text\":\"standard\"}}" };
+    const entry = db.core.index_manager.textIndex(null).?;
+    const snapshot = entry.acquireSnapshot();
+    defer snapshot.release();
+    const first = try db.filterGraphKeysAlloc(a, req, &.{"a"});
+    defer a.free(first);
+    try std.testing.expect(first[0]);
+    const misses = snapshot.graph_predicates.misses;
+    const second = try db.filterGraphKeysAlloc(a, req, &.{"b"});
+    defer a.free(second);
+    try std.testing.expect(second[0]);
+    try std.testing.expectEqual(misses, snapshot.graph_predicates.misses);
+    try std.testing.expect(snapshot.graph_predicates.hits > 0);
+    // A graph request retains the prepared top-level predicate across hops.
+    {
+        var stop = std.atomic.Value(bool).init(false);
+        var gate_req = req;
+        gate_req.cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&stop);
+        var gate = DB.GraphNodeAdmissionCache.init(&db, a, gate_req, "unused", .{});
+        defer gate.deinit();
+        const one = try gate.iface().filterKeysAlloc(a, &.{"a"}, false);
+        defer a.free(one);
+        const warm_hits = snapshot.graph_predicates.hits;
+        const memory = gate.indexed_request_filter.?.graph_memory.?;
+        const retained = memory.tracked.live_bytes;
+        const two = try gate.iface().filterKeysAlloc(a, &.{"b"}, false);
+        defer a.free(two);
+        try std.testing.expect(one[0] and two[0]);
+        try std.testing.expectEqual(warm_hits, snapshot.graph_predicates.hits);
+        try std.testing.expectEqual(retained, memory.tracked.live_bytes);
+        stop.store(true, .release);
+        try std.testing.expectError(error.Canceled, gate.iface().filterKeysAlloc(a, &.{"b"}, false));
+        try std.testing.expectError(error.Canceled, gate.iface().filterKeysAlloc(a, &.{"row-3"}, false));
+    }
+    // Broad membership remains compressed; the old document-number array
+    // alone used four bytes per match before ordinal conversion and copies.
+    try std.testing.expect(snapshot.graph_predicates.bytes < writes.len * @sizeOf(u32));
+    var low_budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 16 });
+    var bounded = req;
+    bounded.graph_work_budget = &low_budget;
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, db.filterGraphKeysAlloc(a, bounded, &.{"a"}));
+    try std.testing.expectEqual(@as(usize, 0), low_budget.retained_state_bytes);
+    var canceled = std.atomic.Value(bool).init(true);
+    var stopped = req;
+    stopped.cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled);
+    try std.testing.expectError(error.Canceled, db.filterGraphKeysAlloc(a, stopped, &.{"a"}));
+    // Even a warm predicate cache must observe execution controls.
+    var node_req = stopped;
+    node_req.filter_query_json = "";
+    var admission = DB.GraphNodeAdmissionCache.init(&db, a, node_req, "unused", .{ .filter_query_json = req.filter_query_json });
+    defer admission.deinit();
+    try std.testing.expectError(error.Canceled, admission.iface().filterKeysAlloc(a, &.{"a"}, false));
+    var expired = req;
+    expired.execution_deadline_ns = 1;
+    try std.testing.expectError(error.Timeout, db.filterGraphKeysAlloc(a, expired, &.{"a"}));
+    var before = try db.graphRequestWithIndexedFilterAlloc(req);
+    defer before.deinit();
+    var identity = try db.resolveDocSetForIdsAlloc(a, &.{"a"});
+    defer identity.deinit(a);
+    const ordinal = identity.ordinals[0];
+    try std.testing.expect(before.resolved_doc_filter.?.include.containsOrdinal(ordinal));
+    try db.batch(.{ .deletes = &.{"a"}, .sync_level = .full_index });
+    var after = try db.graphRequestWithIndexedFilterAlloc(req);
+    defer after.deinit();
+    try std.testing.expect(!after.resolved_doc_filter.?.include.containsOrdinal(ordinal));
+}
+
+test "db graph analyzed admission intersects resolved row permissions" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("graph-admission");
+    defer tmp.cleanup();
+    var db = try DB.open(a, std.mem.span(tmp.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"allowed_plans\":[\"standard\",\"enterprise\"]}" },
+        .{ .key = "b", .value = "{\"allowed_plans\":[\"standard\"]}" },
+        .{ .key = "c", .value = "{\"allowed_plans\":[\"standard\"]}" },
+        .{ .key = "d", .value = "{\"allowed_plans\":[\"enterprise\"]}" },
+    }, .sync_level = .full_index });
+    var row_permissions = try db.resolvedDocFilterForIdsAlloc(true, &.{ "a", "b", "d" }, &.{}, null);
+    defer row_permissions.deinit(a);
+    const mask = try db.filterGraphKeysAlloc(a, .{
+        .resolved_doc_filter = &row_permissions,
+        .filter_query_json = "{\"match\":{\"path\":\"allowed_plans\",\"text\":\"standard\"}}",
+    }, &.{ "a", "b", "c", "d", "missing" });
+    defer a.free(mask);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, false, false, false }, mask);
 }
 
 test "db graph search filters result nodes and hidden traversal intermediates" {

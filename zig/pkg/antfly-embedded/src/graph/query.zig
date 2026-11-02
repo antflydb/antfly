@@ -2723,7 +2723,7 @@ pub const GraphQueryEngine = struct {
         var result_admission_context = TraverseResultAdmissionContext{
             .alloc = self.alloc,
             .target_keys = &target_set,
-            .seen = if (params.deduplicate) &seen else null,
+            .seen = if (params.deduplicate and !params.include_paths) &seen else null,
         };
         var rules = traversal_mod.TraversalRules{
             .edge_types = params.edge_types,
@@ -2836,7 +2836,7 @@ pub const GraphQueryEngine = struct {
             defer algebraic_path_mod.deinitPathResults(self.alloc, reached);
 
             for (reached) |item| {
-                if (seen.contains(item.node)) continue;
+                if (params.deduplicate and !params.include_paths and seen.contains(item.node)) continue;
                 const node = if (params.include_paths)
                     (try algebraicShortestPathResultNodeAlloc(self.alloc, graph_index, params, start_key, item.node, item)) orelse return null
                 else
@@ -2845,7 +2845,8 @@ pub const GraphQueryEngine = struct {
                 errdefer if (node_owned) freeResultNode(self.alloc, node);
                 try all_results.append(self.alloc, node);
                 node_owned = false;
-                try seen.put(self.alloc, try self.alloc.dupe(u8, item.node), {});
+                if (params.deduplicate and !params.include_paths)
+                    try seen.put(self.alloc, try self.alloc.dupe(u8, item.node), {});
                 if (params.max_results > 0 and all_results.items.len >= params.max_results) break;
             }
             if (params.max_results > 0 and all_results.items.len >= params.max_results) break;
@@ -4290,6 +4291,47 @@ test "traverse: multi-start with depth 2" {
 
     // Should find B, C, D (from A) + Y, Z (from X) = 5 nodes
     try std.testing.expectEqual(@as(usize, 5), result.nodes.len);
+}
+
+test "traverse preserves independent overlapping root paths and bounded cycles" {
+    const a = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(a, "root-path-s", "root-path-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        a.destroy(ctx);
+    }
+    try ctx.graph.addEdge("A", "B", "e", 1, 0, 0, "");
+    try ctx.graph.addEdge("B", "C", "e", 1, 0, 0, "");
+    try ctx.graph.addEdge("C", "A", "e", 1, 0, 0, "");
+    const roots: []const []const u8 = &.{ "A", "B" };
+    var engine = GraphQueryEngine{ .alloc = a };
+    for ([_]bool{ false, true }) |algebraic| {
+        const params = QueryParams{ .max_depth = 3, .include_paths = true, .algebraic_semiring = algebraic };
+        var multi = try engine.execute(&ctx.graph, .{ .query_type = .traverse, .index_name = "test", .start_nodes = .{ .keys = roots }, .params = params }, roots);
+        defer multi.deinit(a);
+        var expected_count: usize = 0;
+        for (roots) |root| {
+            var single = try engine.execute(&ctx.graph, .{ .query_type = .traverse, .index_name = "test", .start_nodes = .{ .keys = &.{root} }, .params = params }, &.{root});
+            defer single.deinit(a);
+            for (single.nodes) |node| {
+                const actual = multi.nodes[expected_count];
+                try std.testing.expectEqualStrings(node.key, actual.key);
+                try std.testing.expectEqual(node.depth, actual.depth);
+                try std.testing.expectEqual(node.path.?.len, actual.path.?.len);
+                for (node.path.?, actual.path.?) |want, got| try std.testing.expectEqualStrings(want, got);
+                try std.testing.expectEqualStrings(root, actual.path.?[0]);
+                expected_count += 1;
+            }
+        }
+        try std.testing.expectEqual(expected_count, multi.nodes.len);
+        var bounded_params = params;
+        bounded_params.max_results = 3;
+        var bounded = try engine.execute(&ctx.graph, .{ .query_type = .traverse, .index_name = "test", .start_nodes = .{ .keys = roots }, .params = bounded_params }, roots);
+        defer bounded.deinit(a);
+        try std.testing.expectEqual(@as(usize, 3), bounded.nodes.len);
+    }
 }
 
 test "graph query engine shares traversal work across start nodes" {

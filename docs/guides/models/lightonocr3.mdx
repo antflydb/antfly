@@ -100,11 +100,52 @@ To OCR scanned PDF pages and images as they are indexed, name the model as the
 
 [Index PDFs and Scanned Documents](/docs/guides/index-documents) walks through the full table setup.
 
+For dense pages, explicitly raise the per-page output budget:
+
+```json
+{
+  "type": "document_extraction",
+  "config": {
+    "ocr": {
+      "reader": {
+        "provider": "antfly",
+        "model": "lightonai/LightOnOCR-3-0.8B",
+        "max_tokens": 8192
+      }
+    }
+  }
+}
+```
+
+The default remains 4096. A page warning containing `ReadOutputTruncated` means
+the model reached its output budget before completing the page. Increase
+`ocr.reader.max_tokens` within model and deployment limits, then reprocess the
+artifact. If it already uses 8192, inspect the generated output for repetition
+before raising other limits; additional memory cannot increase the `/read`
+output ceiling. Incomplete OCR text is rejected.
+
+Memory admission failures have two different remedies. `ResourceLimitExceeded`
+means the page cannot fit its configured budget even when admitted alone. The
+LightOn warning identifies the blocking budget, required bytes, and limit bytes,
+with the applicable inference-server and standalone flags.
+`ResourceTemporarilyUnavailable` means capacity is currently occupied or live
+memory pressure prevents admission; the reader waits with backoff, bounded by
+the request control and a 30-second stall timeout. Wide CUDA cohorts extend the
+stall timeout only when cohort steps advance. The model manager emits at most
+one admission denial diagnostic batch per second; `denied_count` includes
+suppressed attempts.
+
 ## Image size
 
 The runtime takes its pixel limits from the installed image processor, capped at
 4096 merged vision tokens per image. Resize pages before submitting them when
 optimizing latency; LightOn's own speed evaluation uses a 1540-pixel long side.
+
+For PDF ingestion, `ocr.render.max_dimension` and `ocr.render.max_pixels` can
+bound rendering memory. A 2048-pixel cap can help large pages fit, but can also
+remove small print, handwriting strokes, and table detail. Compare transcription
+quality before adopting it for a corpus. Larger memory budgets likewise need
+headroom for concurrent requests and other server work.
 
 Execution details, GPU tuning switches, and measured throughput are in the
 [LightOnOCR-3 runtime notes](../../design/inference/lightonocr3-runtime.md). Published
