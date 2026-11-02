@@ -247,6 +247,7 @@ pub const Work = struct {
         if (v.Value.rank(a) != v.Value.rank(b)) return false;
         if (a == .map and a.map.len != b.map.len) return false;
         if (a == .list and a.list.len != b.list.len) return false;
+        if (a == .string and b == .string) return try self.equalText(a.string, b.string);
         const left = try self.info(a);
         const right = try self.info(b);
         if (identical(a, b)) return if (left.unknown) null else true;
@@ -260,6 +261,7 @@ pub const Work = struct {
             if (a == .number) return @as(u64, @bitCast(a.number)) == @as(u64, @bitCast(b.number));
         }
         if (a == .null or b == .null) return if (nulls_equal) a == .null and b == .null else null;
+        if (a == .string and b == .string) return try self.equalText(a.string, b.string);
         if (a == .map and b == .map) {
             if (a.map.len != b.map.len) return false;
             var unknown = false;
@@ -336,6 +338,11 @@ pub const Work = struct {
             offset = end;
         }
         return std.math.order(a.len, b.len);
+    }
+    fn equalText(self: *Work, a: []const u8, b: []const u8) !bool {
+        if (a.len != b.len) return false;
+        if (a.ptr == b.ptr) return true;
+        return try self.orderText(a, b) == .eq;
     }
     fn orderIdentity(self: *Work, a: v.Identity, b: v.Identity) !std.math.Order {
         const table = try self.orderText(a.table, b.table);
@@ -619,4 +626,32 @@ test "metered ordering matches total Cypher ordering across scalar and container
         .{ .list = &.{ .{ .number = 1 }, .{ .string = "x" } } }, .{ .map = &.{ .{ .name = "b", .value = .{ .integer = 1 } }, .{ .name = "a", .value = .{ .integer = 2 } } } }, .{ .map = &.{ .{ .name = "a", .value = .{ .integer = 2 } }, .{ .name = "b", .value = .null } } }, .{ .map = &.{ .{ .name = "z", .value = .{ .integer = 1 } }, .{ .name = "a", .value = .{ .integer = 2 } } } },
     };
     for (values) |x| for (values) |y| try std.testing.expectEqual(try v.Value.order(x, y), try work.order(x, y));
+}
+
+test "metered scalar equality only reads equal-length string prefixes" {
+    const Counter = struct {
+        left: usize,
+        fn charge(ptr: *anyopaque, count: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (count > self.left) return error.CypherStateBudgetExceeded;
+            self.left -= count;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const left = try a.alloc(u8, 2 << 20);
+    const right = try a.alloc(u8, left.len);
+    @memset(left, 'x');
+    @memset(right, 'x');
+    var counter: Counter = .{ .left = 100 };
+    var work: Work = .{ .a = a, .ptr = &counter, .charge = Counter.charge };
+    for (0..32) |_| try std.testing.expectEqual(@as(?bool, false), try work.equal(.{ .string = left }, .{ .string = "short" }));
+    right[0] = 'y';
+    try std.testing.expectEqual(@as(?bool, false), try work.equal(.{ .string = left }, .{ .string = right }));
+    right[0] = 'x';
+    try std.testing.expectError(error.CypherStateBudgetExceeded, work.equal(.{ .string = left }, .{ .string = right }));
+    counter.left = 100000;
+    try std.testing.expectEqual(@as(?bool, true), try work.equal(.{ .string = left }, .{ .string = right }));
+    try std.testing.expectEqual(@as(usize, 0), work.cache.count());
 }

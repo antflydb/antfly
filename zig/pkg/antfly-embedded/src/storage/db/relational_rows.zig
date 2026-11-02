@@ -872,7 +872,13 @@ pub const Reader = struct {
         }
         if (self.row_filter) |filter| if (!try filter.matchesRow(temporary, document, row)) return null;
         const cells = if (native_cells) try row.projectSqlDatumsMappedAlloc(alloc, self.selected.?, output) else null;
-        const projected = if (!native_cells) try row.projectSqlTypedAlloc(alloc, self.selected.?) else null;
+        const projected = if (!native_cells)
+            if (self.cypher_presence_fields.len != 0 or self.cypher_projection.len != 0)
+                try self.projectCypherPrimary(alloc, temporary, row)
+            else
+                try row.projectSqlTypedAlloc(alloc, self.selected.?)
+        else
+            null;
         var bytes: usize = document.len;
         if (cells) |values| {
             bytes +|= values.presence.len;
@@ -896,6 +902,23 @@ pub const Reader = struct {
             .semantic_hash = row.semanticHash(),
             .expected_content_digest = digest,
         };
+    }
+
+    fn projectCypherPrimary(self: *Reader, alloc: Allocator, scratch: Allocator, row: codec.OrdinalRowView) !codec.OrdinalRowView.TypedProjection {
+        var context: @import("query/streamed_projection.zig").Context = .{
+            .scratch = scratch,
+            .property_projection = self.cypher_projection,
+            .value = .{ .row = .{ .plan = .{ .base = self.selected.?, .arena = .init(scratch) }, .row = row } },
+        };
+        const value = (try context.projectOwned(alloc, scratch, self.cypher_presence_fields)) orelse return error.InvalidRelationalRowsRequest;
+        const sql_nulls = try alloc.alloc(bool, value.object.count());
+        var position: usize = 0;
+        for (self.selected.?.ordinals) |ordinal| if (try row.findCell(ordinal)) |cell| {
+            sql_nulls[position] = cell.is_null;
+            position += 1;
+        };
+        std.debug.assert(position == sql_nulls.len);
+        return .{ .value = value, .sql_nulls = sql_nulls };
     }
 
     pub fn nextTypedPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {

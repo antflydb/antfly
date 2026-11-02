@@ -511,3 +511,141 @@ test "owner count derives its own borrowed membership demand" {
     try expectNames(&.{"body"}, demand.fields.?);
     try std.testing.expect(demand.projection[0].mode == .predicate);
 }
+
+test "read demand propagates observations through computed selectors containers and scopes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "MATCH(d:D) RETURN d=d,d IS NOT NULL,[d]=[d]",
+        "MATCH(d:D) WHERE d=d RETURN count(*)",
+        "MATCH(d:D) WITH coalesce(d,null) AS x RETURN antfly.documentKey(x)",
+        "MATCH(d:D) WITH coalesce(d,null) AS d WITH coalesce(d,d) AS d RETURN antfly.documentKey(d)",
+        "MATCH(d:D) WITH DISTINCT [d] AS xs RETURN count(*)",
+        "MATCH(d:D) WITH DISTINCT {node:d} AS x RETURN count(*)",
+        "MATCH(d:D) WITH [d] AS xs UNWIND xs AS x RETURN antfly.documentKey(x)",
+        "MATCH(d:D) WITH CASE WHEN true THEN d ELSE null END AS x RETURN antfly.documentKey(x)",
+        "MATCH(d:D) CALL { WITH d RETURN coalesce(d,null) AS x } RETURN antfly.documentKey(x)",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand;
+        try expectNames(&.{}, demand.table("docs").?.nodes.fields.?);
+    }
+    for ([_][]const u8{
+        "MATCH(d:D) WITH coalesce(d,null) AS x RETURN x.payload.rank",
+        "MATCH(d:D) WITH coalesce(d.payload,null) AS x RETURN x.rank",
+        "MATCH(d:D) WITH [d] AS xs RETURN head(xs).payload.rank",
+        "MATCH(d:D) WITH {node:d} AS x RETURN x.node.payload.rank",
+        "MATCH(d:D) WITH [d] AS xs UNWIND xs AS x RETURN x.payload.rank",
+        "MATCH(d:D) WITH [d] AS xs RETURN xs[0].payload.rank",
+        "MATCH(d:D) WITH CASE WHEN true THEN d ELSE null END AS x RETURN x.payload.rank",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        try expectNames(&.{"payload"}, demand.fields.?);
+        try std.testing.expectEqualStrings("rank", demand.projection[0].children[0].name);
+    }
+    for ([_][]const u8{
+        "MATCH(d:D) WITH coalesce(d,null) AS x RETURN x",
+        "MATCH(d:D) WITH [d] AS xs RETURN xs",
+        "MATCH(d:D) WITH {node:d} AS x RETURN x",
+        "MATCH(d:D) WITH [d] AS xs UNWIND xs AS x RETURN x",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        try std.testing.expect((try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes.fields == null);
+    }
+}
+
+test "read demand key shapes retain independent scalar and nested value overrides" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "MATCH(d:D) RETURN keys(d)", "MATCH(d:D) RETURN size(keys(coalesce(d,null)))", "MATCH(d:D) RETURN keys(properties(d))" }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        try expectNames(&.{}, demand.fields.?);
+        try std.testing.expect(root.read_fields.rootKeys(demand.projection));
+    }
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(a, "MATCH(d:D) RETURN keys(d),d.rank,keys(d.payload),d.payload.rank,labels(d)", .{}, &diagnostic);
+    defer compiled.deinit();
+    const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+    try std.testing.expect(root.read_fields.rootKeys(demand.projection));
+    const nested = for (demand.projection) |item| {
+        if (std.mem.eql(u8, item.name, "payload")) break item;
+    } else unreachable;
+    try std.testing.expect(nested.keys);
+    try std.testing.expectEqualStrings("rank", nested.children[0].name);
+}
+
+test "read demand retains computed binding domains through optional label constraints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var mapped = graph;
+    mapped.labels = &.{ .{ .name = "D", .table = "docs" }, .{ .name = "C", .table = "categories" } };
+    mapped.relationships = &.{};
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(a, "MATCH(d:D),(c:C) WITH coalesce(c,d) AS x OPTIONAL MATCH(x:D) WITH x.payload AS p RETURN p.rank", .{}, &diagnostic);
+    defer compiled.deinit();
+    const demand = (try root.read_fields.analyze(a, compiled.query, mapped)).demand;
+    for ([_][]const u8{ "docs", "categories" }) |table| {
+        const entity = demand.table(table).?.nodes;
+        try expectNames(&.{"payload"}, entity.fields.?);
+        try std.testing.expectEqualStrings("rank", entity.projection[0].children[0].name);
+    }
+}
+
+test "read demand opaque JSON selectors retain only their owning property" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "MATCH(d:D) RETURN d.payload[0]", "MATCH(d:D) RETURN d.payload[$key]", "MATCH(d:D) WITH coalesce(d,null) AS x RETURN x.payload[0].rank" }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        try expectNames(&.{"payload"}, demand.fields.?);
+    }
+}
+
+test "read demand native authorized projection retains key shapes and value overrides" {
+    const Hooks = struct {
+        allow: bool = true,
+        fn bind(_: *anyopaque, _: root.catalog.Graph) !void {}
+        fn checkpoint(_: *anyopaque) !void {}
+        fn project(ptr: *anyopaque, _: std.mem.Allocator, node: *const root.value.Node) !?*const root.value.Node {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (self.allow) node else null;
+        }
+        fn relationship(_: *anyopaque, _: std.mem.Allocator, item: *const root.value.Relationship) !?*const root.value.Relationship {
+            return item;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var hooks: Hooks = .{};
+    const Adapter = root.native.Adapter(struct {}, void, void);
+    var adapter: Adapter = .{
+        .tables = &.{},
+        .ttl_now_ns = 1,
+        .graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "D", .table = "docs" }}, .relationships = &.{} },
+        .authority = .{ .ptr = &hooks, .bind = Hooks.bind, .checkpoint = Hooks.checkpoint, .project = Hooks.project, .project_stored = Hooks.project, .project_relationship = Hooks.relationship, .storage_projection = true },
+        .read_demand = .{ .tables = &.{.{ .name = "docs", .labels = &.{"D"}, .nodes = .{ .fields = &.{"score"}, .projection = &.{.{ .name = "", .mode = .children, .keys = true, .root = true }} } }} },
+    };
+    const node = (try adapter.node(a, "docs", "d1", "{\"body\":true,\"score\":7,\"nil\":null}")).?;
+    try std.testing.expectEqual(@as(usize, 2), node.properties.len);
+    try std.testing.expectEqual(@as(i64, 7), (root.value.Value{ .node = node }).property("score").integer);
+    try std.testing.expect((root.value.Value{ .node = node }).property("body").boolean);
+    hooks.allow = false;
+    try std.testing.expect(try adapter.node(a, "docs", "d1", "{\"body\":true}") == null);
+}

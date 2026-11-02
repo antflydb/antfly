@@ -15613,7 +15613,13 @@ const Engine = struct {
             // A destination owned by the statement cannot be recycled by a
             // row/producer epoch. Cache its analysis in that same root epoch.
             _ = try (try self.rootInvariantState()).work.info(result);
-        } else _ = try self.values.info(result);
+        } else if (result != .string) {
+            // Row-local strings need no depth certificate. Their consumers
+            // request hashes or meter compared/decoded prefixes on demand;
+            // eagerly hashing here repeats payload-sized work in each row.
+            // Immutable statement owners above keep their reusable metadata.
+            _ = try self.values.info(result);
+        }
         return result;
     }
     fn newStringWork(self: *Engine, allocator: A) @import("string_work.zig").Runtime {

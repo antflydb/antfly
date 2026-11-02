@@ -25,7 +25,7 @@ pub fn decode(a: A, encoded: []const u8) ![]const Projection {
     return if (encoded.len == 0) &.{} else try std.json.parseFromSliceLeaky([]const Projection, a, encoded, .{ .allocate = .alloc_always });
 }
 pub fn find(projection: []const Projection, name: []const u8) ?Projection {
-    for (projection) |item| if (std.mem.eql(u8, item.name, name)) return item;
+    for (projection) |item| if (!item.root and std.mem.eql(u8, item.name, name)) return item;
     return null;
 }
 /// Reconstruct only proved paths, keeping null/missing and non-map ancestors
@@ -40,7 +40,12 @@ fn projectValue(view: *View, node: *View.Node, item: Projection, depth: usize) a
         .predicate => {
             try cypher.value.validateJsonSlice(view.alloc, node.raw, depth);
             if (std.mem.eql(u8, std.mem.trim(u8, node.raw, " \r\n\t"), "null")) return .null;
-            for (item.alternatives) |expected| {
+            const fingerprint = if (item.fingerprints.len == item.alternatives.len and item.alternatives.len > 1)
+                try cypher.read_fields.predicate_fingerprint.raw(view.alloc, node.raw)
+            else
+                null;
+            for (item.alternatives, 0..) |expected, i| {
+                if (fingerprint) |actual| if (!std.mem.eql(u8, &actual, &item.fingerprints[i])) continue;
                 var scanner = std.json.Scanner.initCompleteInput(view.alloc, node.raw);
                 defer scanner.deinit();
                 if ((try predicateEqual(view.alloc, &scanner, expected)) orelse false) return expected;
@@ -52,6 +57,10 @@ fn projectValue(view: *View, node: *View.Node, item: Projection, depth: usize) a
             if (item.validate) try cypher.value.validateJsonSlice(view.alloc, node.raw, depth);
             if (node.kind() != '{') return presenceAtDepth(view.alloc, node.raw, depth);
             var object = std.json.ObjectMap.empty;
+            if (item.keys) for (try memberNames(view, node)) |name| {
+                const child = (try view.field(node, name)).?;
+                try object.put(view.alloc, name, try presenceAtDepth(view.alloc, child.raw, depth + 1));
+            };
             for (item.children) |child| if (try view.field(node, child.name)) |value| {
                 try object.put(view.alloc, child.name, try projectValue(view, value, child, depth + 1));
             };
@@ -72,7 +81,12 @@ fn projectTyped(view: *View, node: *View.Node, item: Projection) anyerror!cypher
     if (item.mode == .presence or !std.mem.eql(u8, tag.string, "map")) return .{ .boolean = true };
     const payload = (try view.field(node, "value")).?;
     var entries: std.ArrayList(cypher.value.Entry) = .empty;
+    if (item.keys) for (try memberNames(view, payload)) |name| {
+        const selected = find(item.children, name);
+        try entries.append(view.alloc, .{ .name = name, .value = try projectTyped(view, (try view.field(payload, name)).?, selected orelse .{ .name = name, .mode = .presence }) });
+    };
     for (item.children) |child| if (try view.field(payload, child.name)) |value| {
+        if (item.keys) continue;
         try entries.append(view.alloc, .{ .name = child.name, .value = try projectTyped(view, value, child) });
     };
     return .{ .map = entries.items };
@@ -192,6 +206,21 @@ pub fn contains(names: []const []const u8, name: []const u8) bool {
     for (names) |item| if (std.mem.eql(u8, item, name)) return true;
     return false;
 }
+fn memberNames(view: *View, node: *View.Node) ![]const []const u8 {
+    _ = try view.children(node);
+    const Named = struct { name: []const u8, index: usize };
+    var ordered: std.ArrayList(Named) = .empty;
+    var iterator = node.object_index.iterator();
+    while (iterator.next()) |entry| if (try view.field(node, entry.key_ptr.*) != null) try ordered.append(view.alloc, .{ .name = entry.key_ptr.*, .index = entry.value_ptr.* });
+    std.mem.sort(Named, ordered.items, {}, struct {
+        fn less(_: void, left: Named, right: Named) bool {
+            return left.index < right.index;
+        }
+    }.less);
+    const names = try view.alloc.alloc([]const u8, ordered.items.len);
+    for (ordered.items, names) |entry, *name| name.* = entry.name;
+    return names;
+}
 pub fn presenceValue(a: A, raw: []const u8) !std.json.Value {
     return presenceAtDepth(a, raw, 1);
 }
@@ -205,7 +234,13 @@ pub fn record(a: A, raw: []const u8, fields: []const []const u8, presence: []con
     const selector: Selector = .{ .prepared = true };
     try view.prepareProjectionWithOptions(&selector, .all, .object_only, .{ .defer_fanout = true });
     var result = std.json.ObjectMap.empty;
+    if (cypher.read_fields.rootKeys(projection)) for (try memberNames(&view, &view.root)) |name| {
+        const node = (try view.field(&view.root, name)).?;
+        const value = if (find(projection, name)) |item| try projectValue(&view, node, item, 1) else if (contains(fields, name) and !contains(presence, name)) try projectValue(&view, node, .{ .name = name, .mode = .value }, 1) else try presenceValue(a, node.raw);
+        try result.put(a, name, value);
+    };
     for (fields) |name| if (try view.field(&view.root, name)) |node| {
+        if (cypher.read_fields.rootKeys(projection)) continue;
         const value = if (find(projection, name)) |item| try projectValue(&view, node, item, 1) else if (contains(presence, name)) try presenceValue(a, node.raw) else try projectValue(&view, node, .{ .name = name, .mode = .value }, 1);
         try result.put(a, name, value);
     };
@@ -254,7 +289,7 @@ const Prepared = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const view = &self.view;
         const headers = self.headers;
-        const fields = demand.fields orelse return error.InvalidArgument;
+        const requested = demand.fields orelse return error.InvalidArgument;
         var private_properties: ?*View.Node = null;
         if ((try view.children(&view.root)).len == 3 and headers.count() == 2 and headers.get("source_table").? == .string and headers.get("target_table").? == .string) {
             if (try view.field(&view.root, "antfly_cypher")) |envelope| if (envelope.kind() == '{' and (try view.children(envelope)).len == 2) {
@@ -266,12 +301,21 @@ const Prepared = struct {
                 }
             };
         }
+        const keys_only = cypher.read_fields.rootKeys(demand.projection);
+        var selected_fields: std.ArrayList([]const u8) = .empty;
+        try selected_fields.appendSlice(a, requested);
+        if (keys_only) {
+            const root = private_properties orelse &view.root;
+            for (try memberNames(view, root)) |name| if (!contains(selected_fields.items, name)) try selected_fields.append(a, name);
+            if (private_properties == null and !contains(selected_fields.items, "weight")) try selected_fields.append(a, "weight");
+        }
+        const fields = selected_fields.items;
         var properties: std.ArrayList(cypher.value.Entry) = .empty;
         for (fields) |name| {
             if (private_properties == null and (std.mem.eql(u8, name, "source_table") or std.mem.eql(u8, name, "target_table") or std.mem.eql(u8, name, "weight"))) continue;
             const root = private_properties orelse &view.root;
             const node = (try view.field(root, name)) orelse continue;
-            const presence = contains(demand.presence, name);
+            const presence = contains(demand.presence, name) or (keys_only and !contains(requested, name));
             const value: cypher.value.Value = if (private_properties != null) value: {
                 if (find(demand.projection, name)) |item| break :value try projectTyped(view, node, item);
                 if (presence) {
@@ -507,4 +551,64 @@ test "Cypher demand projection predicate representatives preserve equality witho
     const scalar = try predicateJson(scratch.allocator(), .{ .string = wide[1 .. wide.len - 1] }, projection);
     try std.testing.expect(scalar == .array);
     try std.testing.expect(quota.peak < 64 << 10);
+}
+
+test "Cypher demand projection key shapes preserve names nulls and independent values" {
+    const a = std.testing.allocator;
+    const wide = try a.alloc(u8, 2 << 20);
+    defer a.free(wide);
+    @memset(wide, 'x');
+    const source = try std.json.Stringify.valueAlloc(a, .{ .empty = wide, .@"a.b" = wide, .rank = 7, .nil = @as(?u8, null), .payload = .{ .body = wide, .rank = 7, .nil = @as(?u8, null) } }, .{});
+    defer a.free(source);
+    const raw = try std.mem.replaceOwned(u8, a, source, "\"empty\":", "\"\":");
+    defer a.free(raw);
+    var quota: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 64 << 10 };
+    var arena = std.heap.ArenaAllocator.init(quota.allocator());
+    defer arena.deinit();
+    const projections = [_]Projection{
+        .{ .name = "", .mode = .children, .root = true, .keys = true },
+        .{ .name = "payload", .mode = .children, .keys = true, .children = &.{.{ .name = "rank", .mode = .value }} },
+    };
+    const projected = try record(arena.allocator(), raw, &.{ "rank", "payload" }, &.{}, &projections);
+    try std.testing.expect(projected.object.get("").?.bool);
+    try std.testing.expect(projected.object.get("a.b").?.bool);
+    try std.testing.expectEqual(@as(i64, 7), projected.object.get("rank").?.integer);
+    try std.testing.expect(projected.object.get("nil").? == .null);
+    const nested = projected.object.get("payload").?.object;
+    try std.testing.expect(nested.get("body").?.bool);
+    try std.testing.expect(nested.get("nil").? == .null);
+    try std.testing.expectEqual(@as(i64, 7), nested.get("rank").?.integer);
+    const names = projected.object.keys();
+    try std.testing.expectEqualStrings("", names[0]);
+    try std.testing.expectEqualStrings("a.b", names[1]);
+    try std.testing.expectEqualStrings("rank", names[2]);
+}
+
+test "Cypher demand projection fingerprints share JSON scanning without changing exact equality" {
+    const a = std.testing.allocator;
+    const Fingerprint = cypher.read_fields.predicate_fingerprint;
+    for ([_][]const u8{ "1", "1.0", "-0.0", "0", "9007199254740993", "9007199254740992.0", "{\"x\":1,\"y\":[true,\"a\\u0042\",null]}", "{\"y\":[true,\"aB\",null],\"x\":1.0}" }) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const value = try cypher.value.Value.fromJson(arena.allocator(), parsed.value);
+        try std.testing.expectEqual(Fingerprint.value(value), try Fingerprint.raw(arena.allocator(), raw));
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const alternatives = try allocator.alloc(std.json.Value, 64);
+    const fingerprints = try allocator.alloc(Fingerprint.Digest, alternatives.len);
+    for (alternatives, fingerprints, 0..) |*alternative, *fingerprint, i| {
+        alternative.* = .{ .string = try std.fmt.allocPrint(allocator, "notmatched_{d}", .{i}) };
+        fingerprint.* = Fingerprint.value(.{ .string = alternative.string });
+    }
+    const item: Projection = .{ .name = "body", .mode = .predicate, .alternatives = alternatives, .fingerprints = fingerprints };
+    const actual = try std.json.Stringify.valueAlloc(allocator, alternatives[37], .{});
+    try std.testing.expectEqualStrings(alternatives[37].string, (try rawValue(allocator, actual, item)).string);
+    // Fingerprints only index candidates. Even deliberately identical digests
+    // cannot turn a false comparison into membership.
+    fingerprints[0] = fingerprints[37];
+    try std.testing.expectEqualStrings(alternatives[37].string, (try rawValue(allocator, actual, item)).string);
 }

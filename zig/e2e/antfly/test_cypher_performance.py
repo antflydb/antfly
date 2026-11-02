@@ -2924,6 +2924,14 @@ def test_authenticated_cypher_identity_membership_and_edge_domains(
                     {"name": "D", "table": name},
                     {"name": "Wide", "table": name, "where": {"body": "notmatched"}},
                     {"name": "Small", "table": name, "where": {"body": "tiny"}},
+                ]
+                + [
+                    {
+                        "name": f"Never{i}",
+                        "table": name,
+                        "where": {"body": f"notmatched_{i}"},
+                    }
+                    for i in range(61)
                 ],
                 "relationships": [
                     {
@@ -2950,6 +2958,83 @@ def test_authenticated_cypher_identity_membership_and_edge_domains(
             "MATCH(d:D) WITH d ORDER BY d RETURN count(*)",
         ):
             assert query(statement)["rows"] == [[integer(2)]]
+        truth = {"type": "boolean", "value": True}
+
+        def string(value):
+            return {"type": "string", "value": value}
+
+        for statement in (
+            "MATCH(d:D) RETURN d=d",
+            "MATCH(d:D) RETURN d IS NOT NULL",
+            "MATCH(d:D) RETURN [d]=[d]",
+        ):
+            assert query(statement)["rows"] == [[truth], [truth]]
+        for statement in (
+            "MATCH(d:D) WHERE d=d RETURN count(*)",
+            "MATCH(d:D) WITH DISTINCT [d] AS xs RETURN count(*)",
+            "MATCH(d:D) WITH DISTINCT {node:d} AS x RETURN count(*)",
+        ):
+            assert query(statement)["rows"] == [[integer(2)]]
+        for expression in ("coalesce(d,null)", "CASE WHEN true THEN d ELSE null END"):
+            assert query(
+                f"MATCH(d:D) WITH {expression} AS x RETURN antfly.documentKey(x) ORDER BY antfly.documentKey(x)"
+            )["rows"] == [[string("d1")], [string("d2")]]
+        for statement in (
+            "MATCH(d:D) WITH coalesce(d,null) AS x RETURN sum(x.payload.rank)",
+            "MATCH(d:D) WITH coalesce(d.payload,null) AS x RETURN sum(x.rank)",
+            "MATCH(d:D) WITH {node:d} AS x RETURN sum(x.node.payload.rank)",
+            "MATCH(d:D) WITH [d] AS xs UNWIND xs AS x RETURN sum(x.payload.rank)",
+            "MATCH(d:D) WITH [d] AS xs RETURN sum(head(xs).payload.rank)",
+        ):
+            assert query(statement)["rows"] == [[integer(7)]]
+        assert query("MATCH(d:D) RETURN size(keys(d)) ORDER BY antfly.documentKey(d)")[
+            "rows"
+        ] == [[integer(4)], [integer(3)]]
+        assert query(
+            "MATCH(d:D) RETURN size(keys(coalesce(d,null))) ORDER BY antfly.documentKey(d)"
+        )["rows"] == [[integer(4)], [integer(3)]]
+        result = query(
+            "MATCH(d:D) RETURN keys(d),d.score,keys(d.payload),d.payload.rank ORDER BY antfly.documentKey(d)"
+        )
+        assert {item["value"] for item in result["rows"][0][0]["value"]} == {
+            "id",
+            "score",
+            "body",
+            "payload",
+        }, result
+        assert result["rows"][0][1] == integer(7) and result["rows"][0][3] == integer(
+            7
+        ), result
+        assert {item["value"] for item in result["rows"][0][2]["value"]} == {
+            "rank",
+            "body",
+        }, result
+        assert result["rows"][1][2] == {"type": "null", "value": None}, result
+        assert query(
+            "MATCH(d:D) RETURN size(keys(properties(d))) ORDER BY antfly.documentKey(d)"
+        )["rows"] == [[integer(4)], [integer(3)]]
+        result = query(
+            "MATCH(d:D) WHERE antfly.documentKey(d) IN ['d1'] RETURN keys(d),d.score"
+        )
+        assert {item["value"] for item in result["rows"][0][0]["value"]} == {
+            "id",
+            "score",
+            "body",
+            "payload",
+        }, result
+        assert result["rows"][0][1] == integer(7), result
+        assert query(
+            "MATCH(d:D) WHERE antfly.documentKey(d) IN ['d1'] RETURN d.payload.rank"
+        )["rows"] == [[integer(7)]]
+        result = query("MATCH(b:D)<-[r:R]-(a:D) RETURN keys(a),a.score")
+        assert result["rows"][0][1] == integer(7), result
+        result = query("MATCH(a:D)-[r:R]->(b:D) RETURN keys(r),r.rank")
+        assert {item["value"] for item in result["rows"][0][0]["value"]} == {
+            "rank",
+            "body",
+            "weight",
+        }, result
+        assert result["rows"][0][1] == integer(7), result
         result = query("MATCH(d:D) RETURN labels(d) ORDER BY antfly.documentKey(d)")
         assert result["rows"] == [
             [
@@ -2960,6 +3045,12 @@ def test_authenticated_cypher_identity_membership_and_edge_domains(
             ]
             for labels in (["D"], ["D", "Small"])
         ], result
+        assert (
+            query(
+                "MATCH(d:D) RETURN labels(coalesce(d,null)) ORDER BY antfly.documentKey(d)"
+            )["rows"]
+            == result["rows"]
+        )
         assert query("MATCH(d:Wide) RETURN count(*)")["rows"] == [[integer(0)]]
         assert query("MATCH(d:Small) RETURN count(*)")["rows"] == [[integer(1)]]
         # A mismatching nonnull predicate field remains nonnull for COUNT.
@@ -2980,6 +3071,18 @@ def test_authenticated_cypher_identity_membership_and_edge_domains(
             result["rows"][0][0]["value"]["properties"]["value"]["body"]["value"]
             == wide
         ), result
+        result = query(
+            "MATCH(d:D) WHERE d.id='d1' WITH coalesce(d,null) AS x RETURN x", 128 << 20
+        )
+        assert (
+            result["rows"][0][0]["value"]["properties"]["value"]["body"]["value"]
+            == wide
+        ), result
+        result = query(
+            "MATCH(d:D) WHERE d.id='d1' UNWIND range(1,32) AS i RETURN d.body=toString(i)",
+            64 << 20,
+        )
+        assert result["rows"] == [[{"type": "boolean", "value": False}]] * 32, result
         result = query("MATCH(a:D)-[r:R]->(b:D) RETURN r", 64 << 20)
         assert (
             result["rows"][0][0]["value"]["properties"]["value"]["body"]["value"]
@@ -3037,6 +3140,20 @@ def test_authenticated_cypher_identity_membership_and_edge_domains(
                                 "value": [
                                     {"type": "string", "value": label}
                                     for label in ["D", "Small"]
+                                ],
+                            }
+                        ]
+                    ],
+                ),
+                (
+                    "MATCH(d:D) RETURN keys(d)",
+                    [
+                        [
+                            {
+                                "type": "list",
+                                "value": [
+                                    {"type": "string", "value": key}
+                                    for key in ["id", "score", "body"]
                                 ],
                             }
                         ]

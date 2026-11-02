@@ -5557,3 +5557,82 @@ Final qualification: all 558 core tests and all ten authenticated performance
 campaigns pass. The native server build, C API, document-predicate/projection,
 borrowed-count, bounded-adjacency and callback-ABI checks pass; Zig/Python
 formatting, Python lint and whitespace checks pass.
+
+### Observation demand across computed bindings
+
+The planner propagates value, identity, nullness, label and key-shape observations
+through captured expression scopes. `coalesce`, CASE branches, literal lists/maps,
+static selectors, `head`/`last` and UNWIND elements preserve their source lineage.
+Comparisons and grouped containers consume entity identities while retaining the
+actual primitive grouping values. A later property read or complete entity return
+upgrades the same source plan. Opaque functions remain complete-value consumers.
+
+Captures own immutable lexical maps and materialize separate working scopes for
+local patterns. Observation memoization bounds repeated traversal of shared alias
+chains; scalar expressions without entity lineage do not create deferred captures.
+Computed bindings retain their original domains across OPTIONAL MATCH constraints.
+Unused property expressions retain eager validation, while observed nested paths
+can omit unrelated sibling payloads.
+
+`keys` uses a private root/member key shape, with explicit value and nested-path
+overrides. Document readers enumerate literal field names; relational readers
+visit the actual present cells. Null entries retain their normal node/map
+semantics, and complete entity observers disable partial projection. Empty and
+punctuated property names cannot become wildcard selectors. The representation
+also applies to relationship metadata and never escapes into public values.
+
+Scalar string equality checks lengths before hashing or scanning and meters the
+prefix actually compared for equal-length strings. Identical immutable strings
+need no body traversal. Structural grouping hashes remain separate from scalar
+predicate equality, so obvious mismatches no longer consume payload-sized work.
+
+Label predicate alternatives are deduplicated and indexed by streamed BLAKE3
+fingerprints. Numeric fingerprints preserve exact INTEGER/FLOAT equality; map
+fingerprints ignore insertion order, and strings hash their decoded bytes without
+owning the stored payload. One fingerprint scan selects possible alternatives;
+every digest match still requires exact Cypher equality. Full selected-value
+validation precedes this indexing, preserving malformed-value, depth and numeric
+errors. Fingerprints are candidate indexes, never membership proofs.
+
+The expanded authenticated document/relational campaigns cover the five review
+findings, including a 64-label catalog, computed and wrapped identities, key/value
+mixtures, nested map keys, complete returns and changing scalar comparison
+operands. Focused tests cover key-shape scratch bounds, fingerprint collisions,
+Unicode/map/numeric normalization and budgeted equal-length comparisons.
+
+The native adapter's final authorized projection retains key carriers alongside
+explicit value fields. Relational point hydration uses the same borrowed
+projector as scans, then owns only the selected result before releasing its
+physical source scope. A 32 KiB ownership regression overwrites the source row
+and checks that retained strings and key carriers remain valid. Point lookups,
+traversal endpoints and row-filtered key queries share these projection rules.
+
+Final authenticated measurements use the same two records with 2 MiB root and
+nested strings. The review baseline had three labels; the expanded regression
+has 64. Query allocator peaks for the identity/key cases are:
+
+| Shape | Review document / relational | Final document / relational |
+| --- | ---: | ---: |
+| Entity equality or nullness | 63.4 / 87.4 MB | 78,546 / 67,044 B |
+| Computed alias followed by document key | 63.4 / 87.4 MB | 80,730 / 69,228 B |
+| DISTINCT list containing a node | 63.4 / 87.4 MB | 136,490 / 124,988 B |
+| `size(keys(d))` | 63.4 / 87.4 MB | 82,384 / 71,102 B |
+
+The changing-operand equality query now returns all 32 rows using 510 work units
+on documents and 540 on relational storage; the review failed at 16 comparisons
+with a one-million-work ceiling. Actual compared properties and complete entity
+returns retain explicit larger memory budgets in the controls.
+
+For the document `labels(d)` workload, local median HTTP latency with 64 labels
+fell from 802 ms to 303 ms. The three-label control stayed approximately flat
+(297 ms before, 293 ms after). The final measurements take seven samples after
+three warmups; these are local native-binary timings, not production throughput
+claims.
+
+Final qualification passes all 565 core tests and all ten authenticated
+performance campaigns, including point reads, traversal endpoints, filtered-reader
+keys and complete-value controls. The native build, C API, document projection,
+owned/borrowed count projection, bounded adjacency and callback ABI checks pass.
+Zig/Python formatting, Python lint and whitespace checks pass. `origin/main` at
+`eb185ad90c` was already merged and remains an ancestor; repository cache cleanup
+completed while preserving active builds and recent output.

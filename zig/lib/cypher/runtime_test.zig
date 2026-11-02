@@ -9083,3 +9083,36 @@ test "correlated property batches preserve duplicates encounter order and row go
     try std.testing.expectEqual(@as(usize, 0), Indexed.bulk_reads);
     try std.testing.expectEqual(@as(i64, 20), counted.rows[0][0].integer);
 }
+
+test "row local scalar string equality does not hash wide inputs before obvious mismatches" {
+    const Source = struct {
+        node: v.Node,
+        fn bind(_: *anyopaque, _: std.mem.Allocator, _: catalog.Graph) !void {}
+        fn checkpoint(_: *anyopaque) !void {}
+        fn scan(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, cursor: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (cursor != null or !std.mem.eql(u8, table, "docs")) return .{ .items = &.{} };
+            return .{ .items = try a.dupe(*const v.Node, &.{&self.node}), .examined = 1, .unfiltered = true };
+        }
+        fn get(ptr: *anyopaque, _: std.mem.Allocator, identity: v.Identity) !?*const v.Node {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (self.node.identity.eql(identity)) &self.node else null;
+        }
+        fn expand(_: *anyopaque, _: std.mem.Allocator, _: catalog.Relationship, _: v.Identity, _: c.ast.Direction, _: ?[]const u8, _: usize) !b.Page(*const v.Relationship) {
+            return .{ .items = &.{} };
+        }
+    };
+    const a = std.testing.allocator;
+    const wide = try a.alloc(u8, 2 << 20);
+    defer a.free(wide);
+    @memset(wide, 'x');
+    var source: Source = .{ .node = .{ .identity = .{ .table = "docs", .key = "wide" }, .labels = &.{"Document"}, .properties = &.{.{ .name = "body", .value = .{ .string = wide } }} } };
+    const backend: b.Backend = .{ .ptr = &source, .vtable = &.{ .bind = Source.bind, .checkpoint = Source.checkpoint, .scan = Source.scan, .get = Source.get, .expand = Source.expand } };
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(a, "MATCH(d:Document) UNWIND range(1,32) AS i RETURN d.body=toString(i)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try runtime.execute(a, backend, graph, &compiled, &.{}, .{ .intermediate_states = 10000, .memory_bytes = 1 << 20 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 32), result.rows.len);
+    for (result.rows) |row| try std.testing.expect(!row[0].boolean);
+}

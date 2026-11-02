@@ -187,22 +187,31 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                         break;
                     }
                 };
-                query.fields = fields.items;
+                query.fields = if (node_demand != null and root.read_fields.rootKeys(node_demand.?.projection)) query.fields else fields.items;
                 if (node_demand) |demand| {
                     query.cypher_presence_fields = demand.presence;
                     query.cypher_projection_json = if (demand.projection.len == 0) "" else try std.json.Stringify.valueAlloc(a, demand.projection, .{});
                 }
             } else if (self.authority.storage_projection) {
                 var fields: std.StringHashMapUnmanaged(void) = .empty;
-                for (required) |field| try fields.put(a, field, {});
-                for (graph.labels) |label| for (label.predicate) |entry| try fields.put(a, entry.name, {});
+                const key_shape = node_demand != null and root.read_fields.rootKeys(node_demand.?.projection);
+                if (key_shape) {
+                    // The key-shape projector enumerates literal field names
+                    // and applies its explicit value overrides itself.
+                    try fields.put(a, "*", {});
+                } else {
+                    for (required) |field| try fields.put(a, field, {});
+                    for (graph.labels) |label| for (label.predicate) |entry| try fields.put(a, entry.name, {});
+                }
                 // Native document selectors interpret path syntax. Preserve
                 // literal Cypher property names by falling back to full reads
                 // whenever a name could be interpreted as a selector.
                 var keys = fields.keyIterator();
-                while (keys.next()) |field| for (field.*) |byte| {
-                    if (!std.ascii.isAlphanumeric(byte) and byte != '_') return opts;
-                };
+                while (keys.next()) |field| {
+                    if (key_shape and std.mem.eql(u8, field.*, "*")) continue;
+                    if (field.len == 0) return opts;
+                    for (field.*) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return opts;
+                }
                 const names = try a.alloc([]const u8, fields.count());
                 var iterator = fields.keyIterator();
                 for (names) |*name| name.* = iterator.next().?.*;
@@ -299,6 +308,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         }
         pub fn node(self: *Self, a: A, table: []const u8, key: []const u8, json: []const u8) !?*const v.Node {
             const fields = (if (self.nodeDemand(table)) |demand| demand.fields else self.read_fields) orelse return self.fullNode(a, table, key, json);
+            const key_shape = if (self.nodeDemand(table)) |demand| root.read_fields.rootKeys(demand.projection) else false;
             // Membership and policies inspect complete documents. Decode them
             // in reclaimable scratch, then retain only the authorized projection.
             var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
@@ -307,12 +317,14 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const authorized = (try self.fullNode(temporary, table, key, json)) orelse return null;
             var projected = authorized.*;
             var properties: std.ArrayList(v.Entry) = .empty;
-            for (authorized.properties) |entry| for (fields) |field| {
-                if (std.mem.eql(u8, entry.name, field)) {
-                    try properties.append(temporary, entry);
-                    break;
-                }
-            };
+            for (authorized.properties) |entry| {
+                for (fields) |field| {
+                    if (std.mem.eql(u8, entry.name, field)) {
+                        try properties.append(temporary, entry);
+                        break;
+                    }
+                } else if (key_shape) try properties.append(temporary, .{ .name = entry.name, .value = if (entry.value == .null) .null else .{ .boolean = true } });
+            }
             projected.properties = properties.items;
             return (try (v.Value{ .node = &projected }).clone(a)).node;
         }
