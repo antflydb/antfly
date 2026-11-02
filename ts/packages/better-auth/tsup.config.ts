@@ -14,12 +14,23 @@
 // limitations under the License.
 
 import { defineConfig } from "tsup";
-export default defineConfig({
-  entry: ["src/index.ts", "src/embedded.ts", "src/remote.ts", "src/testing.ts", "src/cli.ts"],
-  format: ["esm"],
-  dts: true,
-  clean: true,
-  platform: "node",
-  target: "node24",
-  external: ["better-auth", "@antfly/embedded", "@antfly/sdk"],
-});
+export default defineConfig([
+  {
+    entry: ["src/index.ts", "src/embedded.ts", "src/remote.ts", "src/testing.ts", "src/cli.ts"],
+    format: ["esm"],
+    dts: true,
+    clean: false,
+    platform: "node",
+    target: "node24",
+    external: ["better-auth", "@antfly/embedded", "@antfly/sdk"],
+  },
+  {
+    entry: ["src/workers.ts"],
+    format: ["esm"],
+    dts: true,
+    clean: false,
+    platform: "neutral",
+    target: "es2022",
+    external: ["better-auth", "@better-auth/core"],
+  },
+]);

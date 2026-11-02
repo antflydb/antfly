@@ -30,8 +30,9 @@ pub const CancellationToken = struct {
     ptr: ?*const anyopaque = null,
     is_cancelled_fn: ?*const fn (*const anyopaque) bool = null,
     /// Optional fallible checkpoint for scoped execution (for example a
-    /// renewable publication lease). This is authoritative when supplied;
-    /// the boolean callback remains available to transport-only adapters.
+    /// renewable publication lease). This is authoritative for check(). An
+    /// explicit boolean probe may be called from a separately canceled task
+    /// and must not perform checkpoint I/O or inspect task-local cancellation.
     check_fn: ?*const fn (*const anyopaque) anyerror!void = null,
 
     pub const none: CancellationToken = .{};
@@ -50,12 +51,9 @@ pub const CancellationToken = struct {
 
     pub fn isCancelled(self: CancellationToken) bool {
         const ptr = self.ptr orelse return false;
-        if (self.check_fn != null) {
-            self.check() catch return true;
-            return false;
-        }
-        const callback = self.is_cancelled_fn orelse return false;
-        return callback(ptr);
+        if (self.is_cancelled_fn) |callback| return callback(ptr);
+        if (self.check_fn != null) self.check() catch return true;
+        return false;
     }
 
     pub fn check(self: CancellationToken) !void {
@@ -98,5 +96,28 @@ test "cancellation checkpoint uses its foreign dispatcher" {
     var context: u8 = 0;
     const token: CancellationToken = .{ .ptr = &context, .check_fn = Foreign.forbidden, .check_dispatch = Foreign.dispatch };
     try std.testing.expectError(error.DeadlineExceeded, token.check());
+    try std.testing.expect(token.isCancelled());
+}
+
+test "explicit cancellation probes stay separate from fallible checkpoints" {
+    const State = struct {
+        requested: bool = false,
+        checks: usize = 0,
+        fn probe(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).requested;
+        }
+        fn checkpoint(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            return error.DeadlineExceeded;
+        }
+    };
+    var state = State{};
+    const token: CancellationToken = .{ .ptr = &state, .is_cancelled_fn = State.probe, .check_fn = State.checkpoint };
+    try std.testing.expect(!token.isCancelled());
+    try std.testing.expectEqual(@as(usize, 0), state.checks);
+    try std.testing.expectError(error.DeadlineExceeded, token.check());
+    try std.testing.expectEqual(@as(usize, 1), state.checks);
+    state.requested = true;
     try std.testing.expect(token.isCancelled());
 }

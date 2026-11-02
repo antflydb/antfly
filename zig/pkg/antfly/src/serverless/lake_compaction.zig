@@ -167,7 +167,7 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
             const prepared = try catalog.compaction.prepareOutputs(scratch, progress.parent, destination, progress.selection, progress.outputs, progress.timestamp_ms);
             progress.attempt = .{ .id = try std.fmt.allocPrint(scratch, "compact-{s}", .{catalog.types.digestHex(job.operation_id)}), .expected = progress.parent.metadata_location, .body = prepared.body, .timestamp_ms = progress.timestamp_ms, .result = progress.result };
         }
-        var advanced = client.putObject(queue.bucket, key, try encodeProgress(scratch, progress), .{ .if_match_etag = saved.?.metadata.etag orelse return error.MissingObjectEtag, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
+        var advanced = client.compareAndPut(queue.bucket, key, try encodeProgress(scratch, progress), saved.?.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
             error.PreconditionFailed, error.ConditionalCheckFailed => return error.LakeMaintenanceAlreadyStarted,
             else => return err,
         };
@@ -188,7 +188,7 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
     }
 
     progress.result.complete = true;
-    var finished = try client.putObject(queue.bucket, key, try encodeProgress(scratch, progress), .{ .if_match_etag = saved.?.metadata.etag orelse return error.MissingObjectEtag, .cancellation = catalog.types.contextCancellation(&context) });
+    var finished = try client.compareAndPut(queue.bucket, key, try encodeProgress(scratch, progress), saved.?.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = catalog.types.contextCancellation(&context) });
     finished.deinit(client.allocator);
     return progress.result;
 }

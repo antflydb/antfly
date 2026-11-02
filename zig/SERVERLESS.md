@@ -23,6 +23,14 @@ optimization, richer write semantics, deeper graph traversal) are unfinished,
 and there is no Kubernetes operator yet. See "Open work" at the end of this
 document for what remains planned rather than shipped.
 
+A bounded Cloudflare Workers profile now compiles this engine to WASM with
+suspending R2 binding I/O, an indexed object WAL, visibility fences, and recent
+lookup/list/text overlays. See the [hosted design](../docs/design/cloudflare-serverless.md)
+and [Wrangler example](../examples/cloudflare-serverless/README.md). Hosted
+collection now uses bounded durable mark/sweep steps and fenced upload epochs;
+live deployment qualification uses a separate disposable-resource harness.
+This profile does not imply full native capability parity.
+
 The goal is not "run the current Antfly architecture without servers." The goal
 is to build a different storage and control-plane architecture that reuses the
 portable search/indexing parts of this repository while avoiding the current
@@ -1869,3 +1877,24 @@ These are called out inline elsewhere in this document but are not yet done:
 - (from "Current Execution Priorities") evaluate renaming internal `namespace`
   to `serving_namespace`, `publication`, or `generation_family` after the
   public surface is stable
+
+
+### Bounded resident point working sets
+
+`--resident-points true` / `ANTFLY_SERVERLESS_RESIDENT_POINTS=true` enables the
+runtime-owned native point working set for indexed live sessions. It retains at
+most 128 owned results within 256 KiB, including absence, keyed by admitted
+namespace/published source/visibility cut. Updates and tombstones at a new cut
+cannot select an older entry. The cache is synchronized for native hosts and
+freed before its transports; allocation errors remain visible. Fresh metadata
+and WAL admission still precede this portable session cache on S3/GCS hosts.
+
+The separate Cloudflare `RESIDENT_SERVING` adapter additionally binds a new
+namespace to an exclusive provider actor and can capture its committed view
+without rediscovering object storage per read. That capability requires a
+persisted authority protocol and cannot be enabled by extending journal proof
+lifetimes or silently changing an existing namespace. See
+[resident serving shards](../docs/design/cloudflare-serverless.md) for the
+owner contract, migration restrictions, fixed-budget execution lanes and
+qualification plan. A native point cache does not imply a portable leader lease,
+automatic splitting, strong replica reads or a hosted latency guarantee.

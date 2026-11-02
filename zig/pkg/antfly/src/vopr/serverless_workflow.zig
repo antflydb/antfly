@@ -1080,6 +1080,9 @@ test "serverless workflow service rates compose and heal across publish and comp
                 .enrichment_round => 1,
                 .compaction_round => 2,
                 .prune_round => 3,
+                // This fixture qualifies the original four maintenance phases;
+                // it never enables the opt-in managed WAL collector.
+                .wal_collection => return error.UnexpectedWalCollectionInLegacyFixture,
             };
             _ = try self.port.charge(self.operation_ids[index], units);
             self.charges[index] += units;
