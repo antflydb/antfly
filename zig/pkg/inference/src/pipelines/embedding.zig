@@ -1267,7 +1267,14 @@ pub const EmbeddingPipeline = struct {
 
         const embeddings = switch (output_shape.len) {
             3 => try self.pool3D(output, all_mask, batch, effective_len, self.text_projection == null),
-            2 => try self.extract2D(output, batch, self.text_projection == null),
+            2 => if (output_shape[0] == (try std.math.mul(usize, batch, effective_len)) and effective_len > 1) blk: {
+                // Imported graphs may flatten token rows. They still require
+                // the requested pooling, rather than silently taking row zero.
+                var token_output = output.borrowedView(output.name);
+                const token_shape = [_]i64{ @intCast(batch), @intCast(effective_len), output_shape[1] };
+                token_output.shape = &token_shape;
+                break :blk try self.pool3D(&token_output, all_mask, batch, effective_len, self.text_projection == null);
+            } else try self.extract2D(output, batch, self.text_projection == null),
             else => return error.UnexpectedOutputShape,
         };
         errdefer freeEmbeddingSlices(alloc, embeddings);
@@ -5065,4 +5072,32 @@ test "embeddinggemma2 CUDA flat audio and mixed batch dispatch fit production ad
         for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
     }
     try std.testing.expect(pipeline.last_input_tokens > expected_audio.input_tokens);
+}
+
+test "host flattened token outputs honor every requested pooling mode" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        fn run(_: *anyopaque, _: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
+            const outputs = try allocator.alloc(Tensor, 1);
+            errdefer allocator.free(outputs);
+            const nan = std.math.nan(f32);
+            outputs[0] = try Tensor.initFloat32(allocator, "hidden", &.{ 6, 2 }, &.{ 1, 6, 3, 4, nan, nan, 7, 8, 11, 12, 9, 10 });
+            return outputs;
+        }
+    };
+    var session = fakeTextSession(.native, &.{ 2, 3 });
+    var vtable = session.vtable.*;
+    vtable.run = Probe.run;
+    session.vtable = &vtable;
+    var pipeline = EmbeddingPipeline{ .allocator = a, .session = session, .tok = undefined, .config = .{ .normalize = false, .resident_text_encoder = false } };
+    const modes = [_]PoolingStrategy{ .mean, .cls, .max, .last };
+    const expected = [_][4]f32{ .{ 2, 5, 10, 11 }, .{ 1, 6, 7, 8 }, .{ 3, 6, 11, 12 }, .{ 3, 4, 9, 10 } };
+    for (modes, expected) |mode, values| {
+        pipeline.config.pooling = mode;
+        const output = try pipeline.embedTokenized(&.{ 101, 10, 0, 101, 20, 30 }, &.{ 1, 1, 0, 0, 1, 1 }, 2, 3);
+        defer freeEmbeddingSlices(a, output);
+        try std.testing.expectEqual(@as(usize, 2), output.len);
+        try std.testing.expectEqualSlices(f32, values[0..2], output[0]);
+        try std.testing.expectEqualSlices(f32, values[2..4], output[1]);
+    }
 }
