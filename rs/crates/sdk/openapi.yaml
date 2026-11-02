@@ -40001,6 +40001,18 @@ components:
             (about 15x fewer at 4 bits than 1 on NYTimes-256), and codes take bits/8 bytes per dimension:
             4 bits roughly doubles the index against 1. Existing graphs keep their width until they are
             rebuilt.'
+        vector_storage:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum:
+            - transient
+            - persistent
+          description: Whether document embeddings stay stored after the graph covers them. "transient"
+            (the default when possible) keeps only a small stub per document and re-embeds a few candidates
+            per query from the document's field or template through the index's embedder, so the index
+            stores about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the
+            only choice for external vectors, chunked indexes, indexes fed by other enrichments, and the
+            pq quantizer.
         search_ef:
           x-go-type-skip-optional-pointer: true
           type: integer

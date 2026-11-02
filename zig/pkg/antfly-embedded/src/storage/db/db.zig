@@ -5361,6 +5361,9 @@ pub const DB = struct {
             .text_merge_runtime = null,
         };
         self.core.index_manager.setRelationalBaseRows(self.async_context.relational_base_rows);
+        // The async context outlives every index and tracks the attached
+        // enrichment runtime, so it is the re-embedder's stable context.
+        self.core.index_manager.dense_reembedder = .{ .ctx = self.async_context, .embed_fn = reembedDenseForIndexManager };
         self.executor.* = try derived_executor_mod.init(
             self.runtime_alloc,
             executor_config,
@@ -21492,6 +21495,9 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.index_manager.syncAll(force);
+        // Transient LEANN (local mode): stored vectors the just-synced graphs
+        // cover become stubs, under the apply lock that orders primary writes.
+        try self.core.index_manager.elideLocalLeannVectors();
     }
 
     pub const PreparedMergeArtifacts = local_mutation.PreparedMergeArtifacts;
@@ -26482,6 +26488,9 @@ pub const DB = struct {
             var txn = try self.core.store.beginWriteTxn();
             errdefer txn.abort();
             try txn.put(record_key, command.record);
+            // Elide records replace covered stored vectors by stubs here, at
+            // the same log position on every replica.
+            try self.core.index_manager.elideLeannRecordTxn(&txn, command.index_name, command.record);
             var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(entry, &marker_buf);
             try txn.put(marker.key, marker.value);
@@ -26495,6 +26504,22 @@ pub const DB = struct {
         self.core.index_manager.drainLeannRecords(self.core.store) catch |err| {
             std.log.warn("leann record drain deferred index={s} raft_index={d} err={s}", .{ command.index_name, entry.index, @errorName(err) });
         };
+    }
+
+    /// Re-embeds documents for transient LEANN indexes through the attached
+    /// enrichment runtime's document embedder. The runtime is looked up per
+    /// call, so reconfiguring or detaching it needs no extra bookkeeping.
+    fn reembedDenseForIndexManager(
+        ctx: *anyopaque,
+        alloc: std.mem.Allocator,
+        requests: []const enrichment_types.GeneratedEnrichmentRequest,
+        dims: u32,
+        out: []f32,
+        found: []bool,
+    ) anyerror!void {
+        const context: *AsyncContext = @ptrCast(@alignCast(ctx));
+        const runtime = context.enrichment_runtime orelse return error.ReembedUnavailable;
+        try enrichment_runtime_mod.reembedDenseDocuments(runtime, alloc, requests, dims, out, found);
     }
 
     /// Leader only: plans the next LEANN record of every replicated LEANN
@@ -35863,7 +35888,15 @@ pub const DB = struct {
                 state.scanned_entries += 1;
                 try state.updateOwnedKey(&state.last_matching_key, key);
 
-                const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(state.alloc, value) catch |err| {
+                const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(state.alloc, value) catch |err| blk: {
+                    if (err == error.VectorElided and artifact_ref.source == null) {
+                        // Transient LEANN stub: re-embed the document.
+                        const stub = (try enrichment_artifact_codec.elidedDenseEmbedding(value)).?;
+                        break :blk state.db.core.index_manager.reembedElidedDocument(state.alloc, artifact_ref.name, artifact_ref.document_id, stub.dims) catch |reembed_err| switch (reembed_err) {
+                            error.NotFound => return .@"continue",
+                            else => return reembed_err,
+                        };
+                    }
                     if (isRecoverableEmbeddingArtifactError(err)) {
                         return .@"continue";
                     }
@@ -56121,6 +56154,10 @@ fn denseEmbeddingArtifactRepairReasonFromRaw(
     raw: []const u8,
 ) !?types.ArtifactRepairReason {
     const dims_usize: usize = @intCast(dims);
+    // A transient LEANN stub is healthy: the graph holds its vector.
+    if (enrichment_artifact_codec.elidedDenseEmbedding(raw) catch null) |stub| {
+        return if (stub.dims == dims) null else .corrupt_artifact;
+    }
     if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
         if (maybe_view) |view| {
             return if (view.len == dims_usize) null else .corrupt_artifact;

@@ -44,7 +44,8 @@ const replica_mod = @import("leann_replica.zig");
 
 pub const file_name = "leann.store";
 const magic = "LEANNSTR";
-const format_version: u32 = 1;
+/// Version 2 adds the transient-storage elide list.
+const format_version: u32 = 2;
 
 pub const Options = struct {
     dims: u32,
@@ -65,13 +66,23 @@ pub const Options = struct {
     /// Leader replication: graph changes arrive only as committed records
     /// (see leann_replicated.zig); local writes just mark keys dirty.
     replicated: bool = false,
+    /// `vector_storage: transient`: rebuild from RaBitQ codes, and list keys
+    /// the graph covers so the owner can replace their stored vectors by
+    /// stubs (`pendingElide` / `clearElided`).
+    transient: bool = false,
 };
+
+pub const ElideEntry = replicated_mod.ElideEntry;
+pub const vectorDigest = replica_mod.vectorDigest;
 
 /// Loads the exact stored vector for a vector id. Same shape as the HBC
 /// external vector loader, which the adapter passes through.
 pub const VectorLoader = struct {
     ctx: *anyopaque,
     load: *const fn (ctx: *anyopaque, alloc: Allocator, vector_id: u64, metadata: []const u8) anyerror![]f32,
+    /// Optional batch form: fills `out[i * dims ..]` and `found[i]` for each
+    /// id. Entries with empty metadata are skipped (left not found).
+    load_batch: ?*const fn (ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool) anyerror!void = null,
 };
 
 const Node = struct {
@@ -107,6 +118,13 @@ pub const LeannStore = struct {
     pending_of: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     loader: ?VectorLoader = null,
     dirty: bool = false,
+    /// Transient storage, local mode: keys (owned) and vector digests the
+    /// graph covers whose stored vectors may still be full. Persisted with
+    /// the store so a crash before the owner elides them loses nothing.
+    elide: std.ArrayListUnmanaged(ElideEntry) = .empty,
+    /// Entries of `elide` covered by the last persisted state; only these
+    /// may be elided, since later ones exist only in memory.
+    elide_durable: usize = 0,
     /// Set in replicated mode; the local-mode fields above stay empty.
     replicated: ?*replicated_mod.ReplicatedState = null,
     durable_raft_index: u64 = 0,
@@ -168,6 +186,7 @@ pub const LeannStore = struct {
             .search_ef = opts.search_ef,
             .bound_scale = opts.bound_scale,
             .batch_size = opts.batch_size,
+            .transient = opts.transient,
         };
     }
 
@@ -181,6 +200,7 @@ pub const LeannStore = struct {
         self.node_of.deinit(self.alloc);
         self.pending.deinit(self.alloc);
         self.pending_of.deinit(self.alloc);
+        self.elide.deinit(self.alloc);
         self.alloc.free(self.path);
         self.alloc.destroy(self);
     }
@@ -194,6 +214,74 @@ pub const LeannStore = struct {
         for (self.pending.items) |p| self.freePending(p);
         self.pending.clearRetainingCapacity();
         self.pending_of.clearRetainingCapacity();
+        for (self.elide.items) |e| self.alloc.free(e.key);
+        self.elide.clearRetainingCapacity();
+        self.elide_durable = 0;
+    }
+
+    fn noteCovered(self: *LeannStore, key: []const u8, vector: []const f32) !void {
+        if (!self.opts.transient or key.len == 0) return;
+        const owned = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned);
+        try self.elide.append(self.alloc, .{ .key = owned, .digest = replica_mod.vectorDigest(vector) });
+    }
+
+    /// Replay of a document whose stored vector is already an elided stub:
+    /// the graph holds the vector with `digest`. Replicated mode rebinds the
+    /// key to `vector_id` and queues a refresh only when the graph lacks that
+    /// vector. Local mode elides only nodes its persisted graph holds, so it
+    /// has nothing to do.
+    pub fn noteElided(self: *LeannStore, vector_id: u64, key: []const u8, digest: u64) !void {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        if (self.replicated) |state| {
+            try state.noteElided(key, vector_id, digest);
+            self.dirty = true;
+        }
+    }
+
+    /// Whether replay may rely on the graph for an elided vector. Replicated
+    /// mode always can (`noteElided` queues a refresh when needed); local
+    /// mode only when the vector id is already a graph or buffer node.
+    pub fn holdsElided(self: *LeannStore, vector_id: u64) bool {
+        if (self.replicated != null) return true;
+        self.lock.lockSharedUncancelable(self.io);
+        defer self.lock.unlockShared(self.io);
+        return self.node_of.contains(vector_id) or self.pending_of.contains(vector_id);
+    }
+
+    /// Transient storage, local mode: copies of the keys whose stored vector
+    /// the persisted graph covers (free with `freeElide`). Replicated mode
+    /// uses elide records instead.
+    pub fn pendingElideAlloc(self: *LeannStore, alloc: Allocator) ![]ElideEntry {
+        self.lock.lockSharedUncancelable(self.io);
+        defer self.lock.unlockShared(self.io);
+        const items = self.elide.items[0..self.elide_durable];
+        const out = try alloc.alloc(ElideEntry, items.len);
+        var made: usize = 0;
+        errdefer freeElide(alloc, out[0..made]);
+        for (items, out) |e, *o| {
+            o.* = .{ .key = try alloc.dupe(u8, e.key), .digest = e.digest };
+            made += 1;
+        }
+        return out;
+    }
+
+    pub fn freeElide(alloc: Allocator, entries: []ElideEntry) void {
+        for (entries) |e| alloc.free(e.key);
+        alloc.free(entries);
+    }
+
+    /// Drops the first `count` pending entries once the owner has replaced
+    /// (or skipped) their stored vectors.
+    pub fn clearElided(self: *LeannStore, count: usize) void {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        const n = @min(count, self.elide_durable);
+        for (self.elide.items[0..n]) |e| self.alloc.free(e.key);
+        self.elide.replaceRangeAssumeCapacity(0, n, &.{});
+        self.elide_durable -= n;
+        if (n > 0) self.dirty = true;
     }
 
     fn freePending(self: *LeannStore, p: Pending) void {
@@ -203,7 +291,7 @@ pub const LeannStore = struct {
 
     pub fn setLoader(self: *LeannStore, loader: VectorLoader) void {
         self.loader = loader;
-        if (self.replicated) |state| state.loader = .{ .ctx = loader.ctx, .load = loader.load };
+        if (self.replicated) |state| state.loader = .{ .ctx = loader.ctx, .load = loader.load, .load_batch = loader.load_batch };
     }
 
     pub fn isReplicated(self: *const LeannStore) bool {
@@ -345,6 +433,7 @@ pub const LeannStore = struct {
             std.debug.assert(id == self.nodes.items.len);
             self.nodes.appendAssumeCapacity(.{ .vector_id = vector_id, .metadata = owned_meta });
             self.node_of.putAssumeCapacity(vector_id, id);
+            try self.noteCovered(metadata, vector);
             return;
         }
         const owned_meta = try self.alloc.dupe(u8, metadata);
@@ -383,6 +472,7 @@ pub const LeannStore = struct {
 
         try self.nodes.ensureTotalCapacity(self.alloc, n);
         try self.node_of.ensureTotalCapacity(self.alloc, @intCast(n));
+        for (self.pending.items) |p| try self.noteCovered(p.metadata, p.vector);
         for (self.pending.items, 0..) |p, i| {
             self.nodes.appendAssumeCapacity(.{ .vector_id = p.vector_id, .metadata = p.metadata });
             self.node_of.putAssumeCapacity(p.vector_id, @intCast(i));
@@ -396,6 +486,7 @@ pub const LeannStore = struct {
     /// Rebuilds the graph from the live nodes' stored vectors. Falls back to
     /// the exact buffer when too few remain for a graph.
     fn rebuildLocked(self: *LeannStore) !void {
+        if (self.opts.transient) return self.rebuildFromCodesLocked();
         const loader = self.loader orelse return;
         const d: usize = self.opts.dims;
         var live = std.ArrayListUnmanaged(Pending).empty;
@@ -428,6 +519,36 @@ pub const LeannStore = struct {
         }
         live.clearRetainingCapacity();
         if (self.pending.items.len >= self.opts.build_threshold) try self.buildFromPendingLocked();
+    }
+
+    /// Transient storage: rebuilds the graph from the live nodes' RaBitQ
+    /// codes, so no stored vector is needed.
+    fn rebuildFromCodesLocked(self: *LeannStore) !void {
+        const old = &(self.index orelse return);
+        var live = std.ArrayListUnmanaged(u32).empty;
+        defer live.deinit(self.alloc);
+        for (self.nodes.items, 0..) |_, i| if (!old.isDeleted(@intCast(i))) try live.append(self.alloc, @intCast(i));
+        if (live.items.len == 0) return;
+        var rebuilt = try old.rebuildFromCodes(self.alloc, live.items, null);
+        errdefer rebuilt.deinit();
+        var nodes = try std.ArrayListUnmanaged(Node).initCapacity(self.alloc, live.items.len);
+        errdefer nodes.deinit(self.alloc);
+        var node_of = std.AutoHashMapUnmanaged(u64, u32).empty;
+        errdefer node_of.deinit(self.alloc);
+        try node_of.ensureTotalCapacity(self.alloc, @intCast(live.items.len));
+        for (live.items, 0..) |old_id, new_id| {
+            const node = self.nodes.items[old_id];
+            nodes.appendAssumeCapacity(node);
+            node_of.putAssumeCapacity(node.vector_id, @intCast(new_id));
+        }
+        // Commit: free deleted nodes' (empty) metadata, swap everything in.
+        for (self.nodes.items, 0..) |node, i| if (old.isDeleted(@intCast(i))) self.alloc.free(node.metadata);
+        old.deinit();
+        self.index = rebuilt;
+        self.nodes.deinit(self.alloc);
+        self.nodes = nodes;
+        self.node_of.deinit(self.alloc);
+        self.node_of = node_of;
     }
 
     // ---------------------------------------------------------------------
@@ -529,12 +650,31 @@ pub const LeannStore = struct {
             const self: *SourceCtx = @ptrCast(@alignCast(raw));
             const store = self.store;
             const d: usize = store.opts.dims;
+            const loader = store.loader orelse return error.MissingVectorLoader;
+            if (loader.load_batch) |load_batch| {
+                const vector_ids = try store.alloc.alloc(u64, ids.len);
+                defer store.alloc.free(vector_ids);
+                const metas = try store.alloc.alloc([]const u8, ids.len);
+                defer store.alloc.free(metas);
+                const found = try store.alloc.alloc(bool, ids.len);
+                defer store.alloc.free(found);
+                for (ids, vector_ids, metas) |id, *vid, *m| {
+                    const node = store.nodes.items[id];
+                    vid.* = node.vector_id;
+                    m.* = if (store.index.?.isDeleted(id)) "" else node.metadata;
+                }
+                @memset(found, false);
+                try load_batch(loader.ctx, store.alloc, vector_ids, metas, out[0 .. ids.len * d], found);
+                for (found, 0..) |ok, i| if (!ok) for (out[i * d ..][0..d], self.far_from) |*o, x| {
+                    o.* = -1000 * x;
+                };
+                return;
+            }
             for (ids, 0..) |id, i| {
                 const row = out[i * d ..][0..d];
                 const node = store.nodes.items[id];
                 const loaded: ?[]f32 = blk: {
                     if (store.index.?.isDeleted(id) or node.metadata.len == 0) break :blk null;
-                    const loader = store.loader orelse return error.MissingVectorLoader;
                     break :blk loader.load(loader.ctx, store.alloc, node.vector_id, node.metadata) catch |err| switch (err) {
                         error.NotFound => null,
                         else => return err,
@@ -571,7 +711,7 @@ pub const LeannStore = struct {
             return;
         }
         if (self.index) |*index| {
-            if (index.deletedFraction() >= self.opts.rebuild_deleted_fraction and self.loader != null) {
+            if (index.deletedFraction() >= self.opts.rebuild_deleted_fraction and (self.loader != null or self.opts.transient)) {
                 try self.rebuildLocked();
                 self.dirty = true;
             }
@@ -581,6 +721,7 @@ pub const LeannStore = struct {
         defer self.alloc.free(bytes);
         try writeFileAtomicallyDurable(self.alloc, self.io, self.path, bytes);
         self.dirty = false;
+        self.elide_durable = self.elide.items.len;
     }
 
     fn encode(self: *const LeannStore) ![]u8 {
@@ -610,6 +751,12 @@ pub const LeannStore = struct {
             try wr.writeInt(u64, blob.len, .little);
             try wr.writeAll(blob);
         } else try wr.writeByte(0);
+        try wr.writeInt(u32, @intCast(self.elide.items.len), .little);
+        for (self.elide.items) |e| {
+            try wr.writeInt(u32, @intCast(e.key.len), .little);
+            try wr.writeAll(e.key);
+            try wr.writeInt(u64, e.digest, .little);
+        }
         const crc = std.hash.Crc32.hash(w.written());
         try wr.writeInt(u32, crc, .little);
         return w.toOwnedSlice();
@@ -622,7 +769,8 @@ pub const LeannStore = struct {
         var r: std.Io.Reader = .fixed(body);
         const head = r.take(magic.len) catch return error.InvalidLeannStore;
         if (!std.mem.eql(u8, head, magic)) return error.InvalidLeannStore;
-        if ((r.takeInt(u32, .little) catch return error.InvalidLeannStore) != format_version) return error.InvalidLeannStore;
+        const version = r.takeInt(u32, .little) catch return error.InvalidLeannStore;
+        if (version != format_version and version != 1) return error.InvalidLeannStore;
         if ((r.takeInt(u32, .little) catch return error.InvalidLeannStore) != self.opts.dims) return error.DimensionMismatch;
 
         const node_count = r.takeInt(u32, .little) catch return error.InvalidLeannStore;
@@ -656,6 +804,17 @@ pub const LeannStore = struct {
                 try self.node_of.put(self.alloc, node.vector_id, @intCast(i));
             }
         } else if (has_index != 0 or node_count != 0) return error.InvalidLeannStore;
+        if (version >= 2) {
+            const elide_count = r.takeInt(u32, .little) catch return error.InvalidLeannStore;
+            for (0..elide_count) |_| {
+                const len = r.takeInt(u32, .little) catch return error.InvalidLeannStore;
+                const key = try self.alloc.dupe(u8, r.take(len) catch return error.InvalidLeannStore);
+                errdefer self.alloc.free(key);
+                const digest = r.takeInt(u64, .little) catch return error.InvalidLeannStore;
+                try self.elide.append(self.alloc, .{ .key = key, .digest = digest });
+            }
+            self.elide_durable = self.elide.items.len;
+        }
         if (r.bufferedLen() != 0) return error.InvalidLeannStore;
     }
 };

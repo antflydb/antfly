@@ -40,7 +40,8 @@ const replica_mod = @import("leann_replica.zig");
 
 pub const file_name = "leann.replica";
 const magic = "LEANNRST";
-const format_version: u32 = 1;
+/// Version 2 adds the transient-storage `covered` set.
+const format_version: u32 = 2;
 const delete_digest: u64 = 0;
 /// Dirty marker for "re-index from the stored vector": set after an install
 /// for keys the generation lacks. `vectorDigest` values are odd, so even
@@ -51,6 +52,8 @@ const refresh_digest: u64 = 2;
 pub const VectorLoader = struct {
     ctx: *anyopaque,
     load: *const fn (ctx: *anyopaque, alloc: Allocator, vector_id: u64, metadata: []const u8) anyerror![]f32,
+    /// Optional batch form (see `leann_replica.VectorLoader.load_batch`).
+    load_batch: ?*const fn (ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool) anyerror!void = null,
 };
 
 pub const Options = struct {
@@ -67,6 +70,10 @@ pub const Options = struct {
     search_ef: u32 = 0,
     bound_scale: f32 = 1.0,
     batch_size: u32 = 0,
+    /// `vector_storage: transient`: stored vectors the graph covers are
+    /// replaced by stubs (through elide records), so rebuilds use the
+    /// RaBitQ codes instead of loading vectors.
+    transient: bool = false,
 };
 
 /// A planned record, plus generation bytes the leader must make fetchable
@@ -122,6 +129,52 @@ pub fn encodeChunkRecords(alloc: Allocator, blob: Planned.Blob) ![][]u8 {
     return out;
 }
 
+/// Elide records list keys whose stored vector the graph already covers,
+/// with that vector's digest. Applying one replaces each matching stored
+/// vector by a stub inside the Raft apply transaction (see
+/// `IndexManager.elideLeannVectorsTxn`); a vector that changed since (a
+/// different digest) is left alone. Graph state is untouched.
+pub const elide_magic: u8 = 0x45; // 'E'
+
+pub const ElideEntry = struct { key: []const u8, digest: u64 };
+
+pub fn isElideRecord(record: []const u8) bool {
+    return record.len > 0 and record[0] == elide_magic;
+}
+
+pub fn encodeElideRecord(alloc: Allocator, entries: []const ElideEntry) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(alloc);
+    defer w.deinit();
+    const wr = &w.writer;
+    try wr.writeByte(elide_magic);
+    try wr.writeInt(u32, @intCast(entries.len), .little);
+    for (entries) |e| {
+        try writeBytes(wr, e.key);
+        try wr.writeInt(u64, e.digest, .little);
+    }
+    const crc = std.hash.Crc32.hash(w.written());
+    try wr.writeInt(u32, crc, .little);
+    return w.toOwnedSlice();
+}
+
+/// Decodes an elide record; keys borrow from `record`.
+pub fn decodeElideRecord(alloc: Allocator, record: []const u8) ![]ElideEntry {
+    if (record.len < 9 or record[0] != elide_magic) return error.InvalidRecord;
+    const body = record[0 .. record.len - 4];
+    if (std.hash.Crc32.hash(body) != std.mem.readInt(u32, record[record.len - 4 ..][0..4], .little)) return error.InvalidRecord;
+    var r: std.Io.Reader = .fixed(body[1..]);
+    const n = r.takeInt(u32, .little) catch return error.InvalidRecord;
+    if (n > body.len / 12) return error.InvalidRecord;
+    const out = try alloc.alloc(ElideEntry, n);
+    errdefer alloc.free(out);
+    for (out) |*e| {
+        e.key = readBytes(&r) catch return error.InvalidRecord;
+        e.digest = r.takeInt(u64, .little) catch return error.InvalidRecord;
+    }
+    if (r.bufferedLen() != 0) return error.InvalidRecord;
+    return out;
+}
+
 /// Decodes a chunk record; `data` borrows from `record`.
 pub fn decodeChunkRecord(record: []const u8) !Chunk {
     if (record.len < 29 or record[0] != chunk_magic) return error.InvalidRecord;
@@ -156,6 +209,10 @@ pub const ReplicatedState = struct {
     key_of: std.AutoHashMapUnmanaged(u64, []const u8) = .empty,
     /// key -> vector digest awaiting replication (0 = delete). Owns the keys.
     dirty: std.StringHashMapUnmanaged(u64) = .empty,
+    /// Transient storage only: key -> digest of a vector a committed record
+    /// put in the graph whose stored copy may still be full. The leader
+    /// turns these into elide records. Owns the keys.
+    covered: std.StringHashMapUnmanaged(u64) = .empty,
     /// Raft index of the last record applied (or skipped).
     applied_raft_index: u64 = 0,
     /// Earliest Raft index a replica needs to rebuild this state from the
@@ -189,6 +246,9 @@ pub const ReplicatedState = struct {
         var dit = self.dirty.keyIterator();
         while (dit.next()) |k| self.alloc.free(k.*);
         self.dirty.deinit(self.alloc);
+        var cit = self.covered.keyIterator();
+        while (cit.next()) |k| self.alloc.free(k.*);
+        self.covered.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -227,6 +287,15 @@ pub const ReplicatedState = struct {
         }
     }
 
+    /// Replay of a key whose stored vector is an elided stub with `digest`
+    /// (see `LeannStore.noteElided`).
+    pub fn noteElided(self: *ReplicatedState, key: []const u8, vector_id: u64, digest: u64) !void {
+        if (key.len == 0) return error.MissingLeannKey;
+        try self.bind(key, vector_id);
+        const live = self.replica.liveDigest(key);
+        if (live == null or live.? != digest) try self.markDirty(key, refresh_digest);
+    }
+
     fn bind(self: *ReplicatedState, key: []const u8, vector_id: u64) !void {
         if (self.bindings.getEntry(key)) |e| {
             if (e.value_ptr.* == vector_id) return;
@@ -262,6 +331,20 @@ pub const ReplicatedState = struct {
         if (self.dirty.fetchRemove(key)) |kv| self.alloc.free(kv.key);
     }
 
+    fn markCovered(self: *ReplicatedState, key: []const u8, digest: u64) !void {
+        if (self.covered.getPtr(key)) |d| {
+            d.* = digest;
+            return;
+        }
+        const owned = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned);
+        try self.covered.put(self.alloc, owned, digest);
+    }
+
+    fn clearCovered(self: *ReplicatedState, key: []const u8) void {
+        if (self.covered.fetchRemove(key)) |kv| self.alloc.free(kv.key);
+    }
+
     // ---------------------------------------------------------------------
     // Leader planning
     // ---------------------------------------------------------------------
@@ -275,7 +358,10 @@ pub const ReplicatedState = struct {
             self.inflight = false;
         }
         self.inflight_waits = 0;
-        if (self.dirty.count() == 0) return try self.planRebuildIfNeeded(alloc);
+        if (self.dirty.count() == 0) {
+            if (try self.planRebuildIfNeeded(alloc)) |planned| return planned;
+            return try self.planElide(alloc);
+        }
         const loader = self.loader orelse return error.MissingVectorLoader;
 
         var work = std.ArrayListUnmanaged(replica_mod.Work).empty;
@@ -309,13 +395,33 @@ pub const ReplicatedState = struct {
         return .{ .record = record };
     }
 
+    /// Transient storage: once nothing else is pending, ask every replica to
+    /// replace stored vectors the graph covers by stubs.
+    fn planElide(self: *ReplicatedState, alloc: Allocator) !?Planned {
+        if (!self.opts.transient or self.covered.count() == 0) return null;
+        var entries = std.ArrayListUnmanaged(ElideEntry).empty;
+        defer entries.deinit(alloc);
+        var it = self.covered.iterator();
+        while (it.next()) |e| {
+            if (entries.items.len >= self.opts.max_record_keys) break;
+            try entries.append(alloc, .{ .key = e.key_ptr.*, .digest = e.value_ptr.* });
+        }
+        const record = try encodeElideRecord(alloc, entries.items);
+        self.inflight = true;
+        return .{ .record = record };
+    }
+
     fn planRebuildIfNeeded(self: *ReplicatedState, alloc: Allocator) !?Planned {
         const index = self.replica.index orelse return null;
         if (index.deletedFraction() < self.opts.rebuild_deleted_fraction and
             self.replica.version < self.opts.checkpoint_records) return null;
-        const loader = self.loader orelse return error.MissingVectorLoader;
-        var ctx = KeyLoader{ .state = self, .loader = loader };
-        const planned = self.replica.planRebuild(alloc, ctx.keyLoader()) catch |err| switch (err) {
+        const planned = (if (self.opts.transient)
+            self.replica.planRebuildFromCodes(alloc)
+        else blk: {
+            const loader = self.loader orelse return error.MissingVectorLoader;
+            var ctx = KeyLoader{ .state = self, .loader = loader };
+            break :blk self.replica.planRebuild(alloc, ctx.keyLoader());
+        }) catch |err| switch (err) {
             // Nothing live to rebuild from; keep the current graph.
             error.NoLiveVectors => return null,
             else => return err,
@@ -335,7 +441,23 @@ pub const ReplicatedState = struct {
         loader: VectorLoader,
 
         fn keyLoader(self: *KeyLoader) replica_mod.VectorLoader {
-            return .{ .ctx = self, .load = load };
+            return .{ .ctx = self, .load = load, .load_batch = if (self.loader.load_batch != null) loadBatch else null };
+        }
+
+        fn loadBatch(raw: *anyopaque, alloc: Allocator, keys: []const []const u8, out: []f32, found: []bool) anyerror!void {
+            const self: *KeyLoader = @ptrCast(@alignCast(raw));
+            const ids = try alloc.alloc(u64, keys.len);
+            defer alloc.free(ids);
+            // Unbound keys (deleted locally, or deleted nodes' empty keys)
+            // stay not found; the loader skips empty metadata.
+            const metas = try alloc.alloc([]const u8, keys.len);
+            defer alloc.free(metas);
+            for (keys, ids, metas) |k, *id, *m| {
+                const bound = if (k.len == 0) null else self.state.bindings.get(k);
+                id.* = bound orelse 0;
+                m.* = if (bound == null) "" else k;
+            }
+            try self.loader.load_batch.?(self.loader.ctx, alloc, ids, metas, out, found);
         }
 
         fn load(raw: *anyopaque, alloc: Allocator, key: []const u8) anyerror![]f32 {
@@ -355,6 +477,17 @@ pub const ReplicatedState = struct {
     /// generation cannot be fetched yet.
     pub fn applyRecord(self: *ReplicatedState, record: []const u8, raft_index: u64) !replica_mod.Outcome {
         if (raft_index <= self.applied_raft_index) return .stale;
+        if (isElideRecord(record)) {
+            // The stubs were written in the Raft apply transaction; only the
+            // pending set changes here.
+            const entries = try decodeElideRecord(self.alloc, record);
+            defer self.alloc.free(entries);
+            for (entries) |e| if (self.covered.get(e.key)) |d| if (d == e.digest) self.clearCovered(e.key);
+            self.applied_raft_index = raft_index;
+            self.inflight = false;
+            self.inflight_waits = 0;
+            return .applied;
+        }
         if (isChunkRecord(record)) {
             // Stored by the caller; consumed by a later install record. The
             // planner's in-flight rebuild continues.
@@ -368,6 +501,9 @@ pub const ReplicatedState = struct {
             const effects = try replica_mod.Replica.recordEffects(self.alloc, record);
             defer self.alloc.free(effects.effects);
             for (effects.effects) |e| {
+                if (self.opts.transient) {
+                    if (e.digest) |d| try self.markCovered(e.key, d) else self.clearCovered(e.key);
+                }
                 const local = self.dirty.get(e.key) orelse continue;
                 const covered = if (e.digest) |d| local == d or local == refresh_digest else local == delete_digest;
                 if (covered) self.clearDirty(e.key);
@@ -375,6 +511,15 @@ pub const ReplicatedState = struct {
             if (effects.full_state) {
                 self.generation_floor = @min(raft_index, self.last_fetch_floor orelse raft_index);
                 try self.reconcileAfterInstall();
+                // Keep only pending stubs the new state still holds as is.
+                var stale = std.ArrayListUnmanaged([]const u8).empty;
+                defer stale.deinit(self.alloc);
+                var cit = self.covered.iterator();
+                while (cit.next()) |c| {
+                    const live = self.replica.liveDigest(c.key_ptr.*);
+                    if (live == null or live.? != c.value_ptr.*) try stale.append(self.alloc, c.key_ptr.*);
+                }
+                for (stale.items) |k| self.clearCovered(k);
             }
         }
         self.applied_raft_index = raft_index;
@@ -492,6 +637,12 @@ pub const ReplicatedState = struct {
             try writeBytes(wr, e.key_ptr.*);
             try wr.writeInt(u64, e.value_ptr.*, .little);
         }
+        try wr.writeInt(u32, self.covered.count(), .little);
+        var cit = self.covered.iterator();
+        while (cit.next()) |e| {
+            try writeBytes(wr, e.key_ptr.*);
+            try wr.writeInt(u64, e.value_ptr.*, .little);
+        }
         const crc = std.hash.Crc32.hash(w.written());
         try wr.writeInt(u32, crc, .little);
         return w.toOwnedSlice();
@@ -504,7 +655,8 @@ pub const ReplicatedState = struct {
         var r: std.Io.Reader = .fixed(body);
         const head = r.take(magic.len) catch return error.InvalidLeannState;
         if (!std.mem.eql(u8, head, magic)) return error.InvalidLeannState;
-        if ((r.takeInt(u32, .little) catch return error.InvalidLeannState) != format_version) return error.InvalidLeannState;
+        const version = r.takeInt(u32, .little) catch return error.InvalidLeannState;
+        if (version != format_version and version != 1) return error.InvalidLeannState;
         const applied = r.takeInt(u64, .little) catch return error.InvalidLeannState;
         const floor = r.takeInt(u64, .little) catch return error.InvalidLeannState;
         var self = ReplicatedState{
@@ -524,6 +676,13 @@ pub const ReplicatedState = struct {
         for (0..nd) |_| {
             const key = try readBytes(&r);
             try self.markDirty(key, r.takeInt(u64, .little) catch return error.InvalidLeannState);
+        }
+        if (version >= 2) {
+            const nc = r.takeInt(u32, .little) catch return error.InvalidLeannState;
+            for (0..nc) |_| {
+                const key = try readBytes(&r);
+                try self.markCovered(key, r.takeInt(u64, .little) catch return error.InvalidLeannState);
+            }
         }
         if (r.bufferedLen() != 0) return error.InvalidLeannState;
         return self;

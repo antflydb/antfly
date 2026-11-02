@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 
 from ..models.leann_index_config_quantizer import LeannIndexConfigQuantizer
+from ..models.leann_index_config_vector_storage import LeannIndexConfigVectorStorage
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="LeannIndexConfig")
@@ -26,6 +27,11 @@ class LeannIndexConfig:
             default: 4 for rabitq, 1 for pq. More bits tighten the error bounds, so fewer candidates are recomputed (about
             15x fewer at 4 bits than 1 on NYTimes-256), and codes take bits/8 bytes per dimension: 4 bits roughly doubles
             the index against 1. Existing graphs keep their width until they are rebuilt. Default: 0.
+        vector_storage (LeannIndexConfigVectorStorage | Unset): Whether document embeddings stay stored after the graph
+            covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few
+            candidates per query from the document's field or template through the index's embedder, so the index stores
+            about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external
+            vectors, chunked indexes, indexes fed by other enrichments, and the pq quantizer.
         search_ef (int | Unset): Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for
             pq). Default: 0.
         bound_scale (float | Unset): Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates
@@ -36,6 +42,7 @@ class LeannIndexConfig:
     max_degree: int | Unset = 30
     quantizer: LeannIndexConfigQuantizer | Unset = LeannIndexConfigQuantizer.RABITQ
     quantization_bits: int | Unset = 0
+    vector_storage: LeannIndexConfigVectorStorage | Unset = UNSET
     search_ef: int | Unset = 0
     bound_scale: float | Unset = 1.0
     batch_size: int | Unset = 0
@@ -48,6 +55,10 @@ class LeannIndexConfig:
             quantizer = self.quantizer.value
 
         quantization_bits = self.quantization_bits
+
+        vector_storage: str | Unset = UNSET
+        if not isinstance(self.vector_storage, Unset):
+            vector_storage = self.vector_storage.value
 
         search_ef = self.search_ef
 
@@ -64,6 +75,8 @@ class LeannIndexConfig:
             field_dict["quantizer"] = quantizer
         if quantization_bits is not UNSET:
             field_dict["quantization_bits"] = quantization_bits
+        if vector_storage is not UNSET:
+            field_dict["vector_storage"] = vector_storage
         if search_ef is not UNSET:
             field_dict["search_ef"] = search_ef
         if bound_scale is not UNSET:
@@ -87,6 +100,13 @@ class LeannIndexConfig:
 
         quantization_bits = d.pop("quantization_bits", UNSET)
 
+        _vector_storage = d.pop("vector_storage", UNSET)
+        vector_storage: LeannIndexConfigVectorStorage | Unset
+        if isinstance(_vector_storage, Unset):
+            vector_storage = UNSET
+        else:
+            vector_storage = LeannIndexConfigVectorStorage(_vector_storage)
+
         search_ef = d.pop("search_ef", UNSET)
 
         bound_scale = d.pop("bound_scale", UNSET)
@@ -97,6 +117,7 @@ class LeannIndexConfig:
             max_degree=max_degree,
             quantizer=quantizer,
             quantization_bits=quantization_bits,
+            vector_storage=vector_storage,
             search_ef=search_ef,
             bound_scale=bound_scale,
             batch_size=batch_size,

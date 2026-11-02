@@ -59,6 +59,10 @@ pub const Options = struct {
 pub const VectorLoader = struct {
     ctx: *anyopaque,
     load: *const fn (ctx: *anyopaque, alloc: Allocator, key: []const u8) anyerror![]f32,
+    /// Optional batch form: fills `out[i * dims ..]` for each key and sets
+    /// `found[i]`. Search recomputes go through it when present, so a source
+    /// that re-embeds documents makes one embedder call per batch.
+    load_batch: ?*const fn (ctx: *anyopaque, alloc: Allocator, keys: []const []const u8, out: []f32, found: []bool) anyerror!void = null,
 };
 
 /// Fetches the bytes of a generation whose install record did not inline
@@ -256,12 +260,42 @@ pub const Replica = struct {
     /// Returns the install record and the generation bytes; when the bytes
     /// exceed the inline limit the record holds only their digest, and the
     /// caller must make the bytes fetchable by `generation` and digest.
-    pub fn planRebuild(self: *Replica, alloc: Allocator, loader: VectorLoader) !struct { record: []u8, generation: u64, digest: u64, bytes: []u8 } {
+    pub fn planRebuild(self: *Replica, alloc: Allocator, loader: VectorLoader) !PlannedRebuild {
         if (self.index == null) return error.NoGraph;
         var live_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer live_keys.deinit(alloc);
         for (self.keys.items, 0..) |k, i| if (!self.index.?.isDeleted(@intCast(i))) try live_keys.append(alloc, k);
         const bytes = try self.buildGenerationBytes(alloc, live_keys.items, loader);
+        return self.finishRebuild(alloc, bytes);
+    }
+
+    pub const PlannedRebuild = struct { record: []u8, generation: u64, digest: u64, bytes: []u8 };
+
+    /// Plans a rebuild of the graph from the live nodes' RaBitQ codes,
+    /// without loading any vector. Used when stored vectors are transient;
+    /// each key keeps the vector digest it was inserted with.
+    pub fn planRebuildFromCodes(self: *Replica, alloc: Allocator) !PlannedRebuild {
+        const index = &(self.index orelse return error.NoGraph);
+        var live_ids = std.ArrayListUnmanaged(u32).empty;
+        defer live_ids.deinit(alloc);
+        var live_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer live_keys.deinit(alloc);
+        var digests = std.ArrayListUnmanaged(u64).empty;
+        defer digests.deinit(alloc);
+        for (self.keys.items, 0..) |k, i| {
+            if (index.isDeleted(@intCast(i))) continue;
+            try live_ids.append(alloc, @intCast(i));
+            try live_keys.append(alloc, k);
+            try digests.append(alloc, self.digest_of.get(k) orelse return error.InvalidState);
+        }
+        if (live_ids.items.len == 0) return error.NoLiveVectors;
+        var rebuilt = try index.rebuildFromCodes(alloc, live_ids.items, null);
+        defer rebuilt.deinit();
+        const bytes = try encodeGeneration(alloc, live_keys.items, digests.items, &rebuilt);
+        return self.finishRebuild(alloc, bytes);
+    }
+
+    fn finishRebuild(self: *Replica, alloc: Allocator, bytes: []u8) !PlannedRebuild {
         errdefer alloc.free(bytes);
         const generation = self.generation + 1;
         const digest = std.hash.Wyhash.hash(0, bytes);
@@ -316,6 +350,10 @@ pub const Replica = struct {
         for (kept, 0..) |_, i| digests[i] = vectorDigest(flat[i * d ..][0..d]);
         var index = try leann.Index.build(alloc, self.opts.config, flat);
         defer index.deinit();
+        return encodeGeneration(alloc, kept, digests, &index);
+    }
+
+    fn encodeGeneration(alloc: Allocator, kept: []const []const u8, digests: []const u64, index: *const leann.Index) ![]u8 {
         const graph = try index.serialize(alloc);
         defer alloc.free(graph);
         var w: std.Io.Writer.Allocating = .init(alloc);
@@ -726,6 +764,20 @@ pub const Replica = struct {
 
 fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: []const f32, ids: []const u32, out: []f32) !void {
     const d: usize = replica.opts.config.dims;
+    if (loader.load_batch) |load_batch| {
+        const keys = try replica.alloc.alloc([]const u8, ids.len);
+        defer replica.alloc.free(keys);
+        const found = try replica.alloc.alloc(bool, ids.len);
+        defer replica.alloc.free(found);
+        // Deleted nodes get an empty key, which no loader resolves.
+        for (ids, keys) |id, *k| k.* = if (replica.index.?.isDeleted(id)) "" else replica.keys.items[id];
+        @memset(found, false);
+        try load_batch(loader.ctx, replica.alloc, keys, out[0 .. ids.len * d], found);
+        for (found, 0..) |ok, i| if (!ok) for (out[i * d ..][0..d], far_from) |*o, x| {
+            o.* = -1000 * x;
+        };
+        return;
+    }
     for (ids, 0..) |id, i| {
         const row = out[i * d ..][0..d];
         const loaded: ?[]f32 = if (replica.index.?.isDeleted(id))

@@ -39,7 +39,12 @@ pub const Flags = packed struct(u8) {
     portable_unbound_graph_generation: bool = false,
     /// Descriptive origin only, never a substitute for accepted provenance.
     authored: bool = false,
-    _reserved: u4 = 0,
+    /// Dense embedding whose vector was dropped after a LEANN graph covered
+    /// it (`vector_storage: transient`). The payload keeps only the
+    /// dimension count and a digest of the dropped vector; readers that need
+    /// the vector get `error.VectorElided` and must re-embed the source.
+    vector_elided: bool = false,
+    _reserved: u3 = 0,
 };
 
 pub const Header = struct {
@@ -122,6 +127,46 @@ fn encodeDenseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, auth
     return out;
 }
 
+/// Elided stub payload: u32 dims, then the u64 digest of the dropped vector.
+const elided_payload_len: usize = @sizeOf(u32) + @sizeOf(u64);
+
+/// Replaces a stored dense embedding by a stub that keeps its header (source
+/// hash and origin) but not the vector. `vector_digest` identifies the dropped
+/// vector so a later write can tell whether the stub still describes it.
+pub fn encodeElidedDenseEmbeddingAlloc(alloc: Allocator, header: Header, dims: u32, vector_digest: u64) ![]u8 {
+    if (header.kind != .dense_embedding) return error.InvalidArtifactKind;
+    const out = try alloc.alloc(u8, header_len + elided_payload_len);
+    errdefer alloc.free(out);
+    var flags = header.flags;
+    flags.vector_elided = true;
+    writeHeader(out[0..header_len], .{
+        .version = codec_version,
+        .kind = .dense_embedding,
+        .flags = flags,
+        .source_hash = header.source_hash,
+        .payload_len = @intCast(elided_payload_len),
+    });
+    std.mem.writeInt(u32, out[header_len..][0..4], dims, .little);
+    std.mem.writeInt(u64, out[header_len + 4 ..][0..8], vector_digest, .little);
+    return out;
+}
+
+pub const ElidedDenseEmbedding = struct { dims: u32, vector_digest: u64 };
+
+/// Returns the stub's contents, or null for a dense embedding that still
+/// holds its vector.
+pub fn elidedDenseEmbedding(data: []const u8) !?ElidedDenseEmbedding {
+    const header = try decodeHeader(data);
+    if (header.kind != .dense_embedding) return error.InvalidArtifactKind;
+    if (!header.flags.vector_elided) return null;
+    if (header.payload_len != elided_payload_len) return error.InvalidArtifactPayload;
+    const payload = data[header_len..][0..elided_payload_len];
+    return .{
+        .dims = std.mem.readInt(u32, payload[0..4], .little),
+        .vector_digest = std.mem.readInt(u64, payload[4..12], .little),
+    };
+}
+
 pub fn decodeDenseEmbeddingAlloc(alloc: Allocator, data: []const u8) ![]f32 {
     const dims = try decodeDenseEmbeddingDims(data);
     const vector = try alloc.alloc(f32, dims);
@@ -158,7 +203,10 @@ pub fn decodeDenseEmbeddingInto(data: []const u8, out: []f32) ![]const f32 {
     return out[0..dims];
 }
 
+/// Dimension count of a stored dense embedding. Elided stubs keep theirs,
+/// so dimension-only readers (counters, readiness) treat them as present.
 pub fn decodeDenseEmbeddingDims(data: []const u8) !u32 {
+    if (try elidedDenseEmbedding(data)) |stub| return stub.dims;
     const payload = try denseEmbeddingPayload(data);
     return std.mem.readInt(u32, payload[0..4], .little);
 }
@@ -166,6 +214,7 @@ pub fn decodeDenseEmbeddingDims(data: []const u8) !u32 {
 fn denseEmbeddingPayload(data: []const u8) ![]const u8 {
     const header = try decodeHeader(data);
     if (header.kind != .dense_embedding) return error.InvalidArtifactKind;
+    if (header.flags.vector_elided) return error.VectorElided;
     if (header.payload_len < @sizeOf(u32)) return error.InvalidArtifactPayload;
 
     const payload = data[header_len..][0..header.payload_len];
@@ -874,4 +923,23 @@ test "artifact codec reads and fences generation-less v1 graph edges" {
     var rebound = try decodeGraphEdgeAlloc(alloc, bound);
     defer rebound.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 42), rebound.generation);
+}
+
+test "elided dense embeddings keep the header and refuse vector reads" {
+    const alloc = std.testing.allocator;
+    const full = try encodeDenseEmbeddingAlloc(alloc, 0xfeed, &.{ 1, 2, 3 });
+    defer alloc.free(full);
+    try std.testing.expectEqual(@as(?ElidedDenseEmbedding, null), try elidedDenseEmbedding(full));
+    const stub = try encodeElidedDenseEmbeddingAlloc(alloc, try decodeHeader(full), 3, 0xabcdef);
+    defer alloc.free(stub);
+    try std.testing.expect(stub.len < full.len);
+    const header = try decodeHeader(stub);
+    try std.testing.expect(header.flags.has_source_hash);
+    try std.testing.expect(header.flags.vector_elided);
+    try std.testing.expectEqual(@as(u64, 0xfeed), header.source_hash);
+    try std.testing.expectEqual(ElidedDenseEmbedding{ .dims = 3, .vector_digest = 0xabcdef }, (try elidedDenseEmbedding(stub)).?);
+    try std.testing.expectError(error.VectorElided, decodeDenseEmbeddingAlloc(alloc, stub));
+    try std.testing.expectEqual(@as(u32, 3), try decodeDenseEmbeddingDims(stub));
+    var out: [3]f32 = undefined;
+    try std.testing.expectError(error.VectorElided, decodeDenseEmbeddingViewOrInto(stub, &out));
 }

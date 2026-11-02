@@ -4,7 +4,9 @@
 
 Dense `embeddings` indexes accept `algorithm: "leann"` (default `"hbc"`)
 with optional `leann` tuning (`max_degree`, `quantizer`, `quantization_bits`,
-`search_ef`, `bound_scale`, `batch_size`). The algorithm is in
+`vector_storage`, `search_ef`, `bound_scale`, `batch_size`). Embedder-backed
+indexes keep only a small stub per document once the graph covers it and
+re-embed query candidates ([Transient vector storage](#transient-vector-storage)). The algorithm is in
 `lib/vectorindex/src/leann.zig`; the table integration is described in
 [Table integration](#table-integration). Not yet supported for LEANN indexes:
 shard splits, remote dense storage, native index backups (backups use the
@@ -464,24 +466,66 @@ cutoff.
   persistence, rebuild, corrupt file) and the index-manager test
   `leann dense index applies writes, searches, deletes, and reopens`.
 
-### Storage today
+### Transient vector storage
 
 LEANN replaces HBC's index files (quantized tree, posting lists, and the
-full-precision rerank vectors HBC keeps) with a graph plus codes. The
-embedding artifacts Antfly persists for every dense index remain, and LEANN
-reads them for exact distances. So a LEANN index cuts index storage, not yet
-the artifact storage. Dropping artifacts needs re-embedding from text,
-below.
+full-precision rerank vectors HBC keeps) with a graph plus codes. With
+`vector_storage: "transient"` it also drops the embedding Antfly stores per
+document, which is most of the remaining bytes: at 768 dimensions a stored
+embedding takes 3,100 bytes and its stub 36.
+
+`transient` is the default wherever re-embedding can reproduce the vector:
+the index has its own embedder, one unchunked vector per document (a field
+or template), and the RaBitQ quantizer (rebuilds use the codes). External
+vectors, chunked indexes, indexes fed by other enrichments and PQ resolve to
+`persistent`; asking for `transient` there is rejected. Configs written
+before the option are `persistent`.
+
+- **Lifecycle.** Writes are unchanged: the enricher stores the full
+  embedding, derived replay and the leader planner read it, and the graph
+  inserts it. Once the graph durably covers that vector, the stored
+  embedding is replaced by a stub (`artifact_codec.encodeElidedDenseEmbeddingAlloc`):
+  the same header (source hash, origin) plus the dimension count and a
+  digest of the dropped vector. A stub replaces only a stored vector with
+  that digest, so a newer write is never lost, and replacing is idempotent.
+  - **Replicated:** after a committed record covers a key, the leader
+    proposes elide records (`leann_replicated.encodeElideRecord`, keys and
+    digests, once nothing else is pending). `applyLeannRecordBatch` writes
+    the stubs inside the Raft apply transaction, so every replica changes
+    the same data at the same log position. Pending keys are persisted in
+    the replicated state.
+  - **Local (Lite):** `LeannStore` lists keys its persisted graph covers;
+    `DB.syncIndexes` writes their stubs under the apply lock after syncing.
+- **Re-embedding.** The index manager's `DenseReembedder` (installed by the
+  DB; it calls `enrichment_runtime.reembedDenseDocuments`) renders each
+  document's field or template exactly as the dense producer does and
+  embeds the batch in one request-path call. Search recomputes go through a
+  batch loader, so one query makes one embedder call per recompute batch;
+  candidates whose embedding is still stored are read instead. Without an
+  enrichment runtime, reads of stubs fail with `error.ReembedUnavailable`.
+- **No vectors needed otherwise.** Graph rebuilds (deletes, checkpoints)
+  use `leann.Index.rebuildFromCodes`; 4-bit codes match exact rebuilds
+  (see [Multi-bit RaBitQ codes](#multi-bit-rabitq-codes)). Replay of a
+  stubbed document rebinds its vector id, or re-embeds it when the graph
+  lacks it. Unchanged documents still skip embedding through the stub's
+  source hash. Counters, readiness and repair checks read only dimensions,
+  which stubs keep. Filtered exact search runs LEANN's search with the
+  filter instead of re-embedding every candidate. `_embeddings` omits
+  stubbed vectors.
+- **Costs.** Each query re-embeds the candidates the error bounds cannot
+  settle (about 14 per query at 4 bits on NYTimes-256): about 0.1 s for
+  16 short passages with EmbeddingGemma 2 on an Apple M4 Max (Metal),
+  seconds on a small CPU. Restoring a logical backup re-embeds every
+  document, since the graph file is not part of backups yet.
+- **Tests.** `index_manager.zig`: "transient leann vectors become stubs and
+  are re-embedded on demand" (local) and "replicated transient leann
+  replicas stub vectors in log order and rebuild from codes".
 
 ## Remaining work
 
-1. **Re-embed instead of reading artifacts.** Plumb the table's dense
-   embedder into the index manager and implement the vector loader as:
-   vector id → document → render the index's field/template → embedder
-   batch call, with a bounded hot-embedding cache, a per-query deadline and
-   cancellation. Then stop persisting artifacts for LEANN indexes. On CPU,
-   the measured cost (below) makes this practical only for batch retrieval
-   or with a GPU embedder.
+1. **Transient storage follow-ups.** A per-query deadline and
+   cancellation inside re-embedding, a bounded hot-embedding cache, and
+   include `leann.store` in backups so restores need not re-embed.
 2. **Splits.** Rebuild both children from the parent's stored vectors (or
    re-embedded text) during handoff.
 3. **Remote storage and native backups.** Store `leann.store` through the

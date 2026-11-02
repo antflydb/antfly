@@ -3154,7 +3154,11 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try out.appendSlice(alloc, dims_json);
     try out.appendSlice(alloc, ",\"metric\":");
     try appendJsonString(alloc, &out, metric);
-    if (leann_algorithm) try appendLeannIndexConfig(alloc, &out, root);
+    // Transient vector storage re-embeds candidates from the document's own
+    // field or template, so it needs the index's embedder and one vector per
+    // document: no external vectors, chunking, or artifacts from other
+    // enrichments.
+    if (leann_algorithm) try appendLeannIndexConfig(alloc, &out, root, !external and !artifact_backed and chunker_json == null and embedder_json != null);
     if (artifact_sources.len > 0) {
         try appendArtifactIndexSources(alloc, &out, artifact_sources);
     } else {
@@ -3222,13 +3226,14 @@ const leann_default_rabitq_bits: i64 = 4;
 /// Emits the normalized internal `"algorithm":"leann","leann":{...}` fields,
 /// validating the public LeannIndexConfig ranges. Every knob is written so
 /// the stored config (and its hash) is explicit.
-fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), root: std.json.ObjectMap) !void {
+fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), root: std.json.ObjectMap, can_reembed: bool) !void {
     var max_degree: i64 = 30;
     var quantizer: []const u8 = "rabitq";
     var search_ef: i64 = 0;
     var bound_scale: f64 = 1.0;
     var batch_size: i64 = 0;
     var quantization_bits: i64 = 0;
+    var vector_storage: ?[]const u8 = null;
     if (root.get("leann")) |leann| {
         if (leann != .object) return error.InvalidCreateTableRequest;
         var it = leann.object.iterator();
@@ -3254,6 +3259,10 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
                 batch_size = try jsonIntegerInRange(value, 0, 1024);
             } else if (std.mem.eql(u8, key, "quantization_bits")) {
                 quantization_bits = try jsonIntegerInRange(value, 0, 8);
+            } else if (std.mem.eql(u8, key, "vector_storage")) {
+                if (value != .string) return error.InvalidCreateTableRequest;
+                if (!std.mem.eql(u8, value.string, "transient") and !std.mem.eql(u8, value.string, "persistent")) return error.InvalidCreateTableRequest;
+                vector_storage = value.string;
             } else return error.InvalidCreateTableRequest;
         }
     }
@@ -3261,10 +3270,17 @@ fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
     const rabitq = std.mem.eql(u8, quantizer, "rabitq");
     if (!rabitq and quantization_bits > 1) return error.InvalidCreateTableRequest;
     if (quantization_bits == 0) quantization_bits = if (rabitq) leann_default_rabitq_bits else 1;
+    // Transient storage rebuilds graphs from RaBitQ codes, so PQ keeps
+    // vectors. It is the default wherever re-embedding is possible.
+    const transient_allowed = can_reembed and rabitq;
+    if (vector_storage) |requested| {
+        if (std.mem.eql(u8, requested, "transient") and !transient_allowed) return error.InvalidCreateTableRequest;
+    }
+    const resolved_storage = vector_storage orelse if (transient_allowed) "transient" else "persistent";
     const json = try std.fmt.allocPrint(
         alloc,
-        ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"quantization_bits\":{d},\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d}}}",
-        .{ max_degree, quantizer, quantization_bits, search_ef, bound_scale, batch_size },
+        ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"quantization_bits\":{d},\"vector_storage\":\"{s}\",\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d}}}",
+        .{ max_degree, quantizer, quantization_bits, resolved_storage, search_ef, bound_scale, batch_size },
     );
     defer alloc.free(json);
     try out.appendSlice(alloc, json);
@@ -3287,6 +3303,34 @@ test "managed embedder translates leann algorithm into dense config" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"max_degree\":16") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"quantizer\":\"rabitq\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"quantization_bits\":4") != null);
+    // External vectors cannot be re-embedded, so they stay persistent.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"vector_storage\":\"persistent\"") != null);
+
+    for ([_][2][]const u8{
+        // An embedder-backed field index defaults to transient storage.
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann"}
+            ,
+            "\"vector_storage\":\"transient\"",
+        },
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"persistent"}}
+            ,
+            "\"vector_storage\":\"persistent\"",
+        },
+        // PQ graphs rebuild from vectors, so they keep them.
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"quantizer":"pq"}}
+            ,
+            "\"vector_storage\":\"persistent\"",
+        },
+    }) |case| {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, case[0], .{});
+        defer p.deinit();
+        const translated = try translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", p.value, .{});
+        defer alloc.free(translated);
+        try std.testing.expect(std.mem.indexOf(u8, translated, case[1]) != null);
+    }
 
     for ([_][2][]const u8{
         .{
@@ -3319,6 +3363,12 @@ test "managed embedder translates leann algorithm into dense config" {
         \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"quantization_bits":9}}
         ,
         \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"quantizer":"pq","quantization_bits":4}}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"vector_storage":"transient"}}
+        ,
+        \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"quantizer":"pq","vector_storage":"transient"}}
+        ,
+        \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"sometimes"}}
         ,
     }) |bad| {
         var p = try std.json.parseFromSlice(std.json.Value, alloc, bad, .{});

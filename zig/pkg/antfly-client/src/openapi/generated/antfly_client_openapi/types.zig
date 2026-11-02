@@ -34407,6 +34407,8 @@ pub const LeannIndexConfig = struct {
     quantizer: ?[]const u8 = null,
     /// RaBitQ bits per dimension (rabitq only; pq allows only 0 or 1). 0 picks the default: 4 for rabitq, 1 for pq. More bits tighten the error bounds, so fewer candidates are recomputed (about 15x fewer at 4 bits than 1 on NYTimes-256), and codes take bits/8 bytes per dimension: 4 bits roughly doubles the index against 1. Existing graphs keep their width until they are rebuilt.
     quantization_bits: ?i64 = null,
+    /// Whether document embeddings stay stored after the graph covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few candidates per query from the document's field or template through the index's embedder, so the index stores about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external vectors, chunked indexes, indexes fed by other enrichments, and the pq quantizer.
+    vector_storage: ?[]const u8 = null,
     /// Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for pq).
     search_ef: ?i64 = null,
     /// Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates and loses fewer true neighbors.
@@ -34419,6 +34421,7 @@ pub const LeannIndexConfig = struct {
         .{ "max_degree", "max_degree", true },
         .{ "quantizer", "quantizer", true },
         .{ "quantization_bits", "quantization_bits", true },
+        .{ "vector_storage", "vector_storage", true },
         .{ "search_ef", "search_ef", true },
         .{ "bound_scale", "bound_scale", true },
         .{ "batch_size", "batch_size", true },
@@ -34444,6 +34447,10 @@ pub const LeannIndexConfig = struct {
         }
         if (self.quantization_bits) |value| {
             try jw.objectField("quantization_bits");
+            try jw.write(value);
+        }
+        if (self.vector_storage) |value| {
+            try jw.objectField("vector_storage");
             try jw.write(value);
         }
         if (self.search_ef) |value| {
