@@ -29,6 +29,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "api.http_server.test.authoritative catalog mutation boundaries reject orphaned semantic producers",
             "api.indexes.consumerTests.Suite.test.actionable repair remains visible while retained generation stays queryable",
             "api.indexes.consumerTests.Suite.test.artifact replacement repairs obsolete inline extraction without dropping its index",
+            "api.indexes.consumerTests.Suite.test.artifact replacement preserves inherited inline embedding producers",
             "api.indexes.consumerTests.Suite.test.complete partial embeddings coverage is ready after active generation proof",
             "api.indexes.consumerTests.Suite.test.external embeddings index readiness does not require table doc coverage",
             "api.indexes.consumerTests.Suite.test.managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
