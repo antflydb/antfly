@@ -219,7 +219,7 @@ pub fn layaQuantizesWeights(arch_config: ArchConfig) !bool {
 }
 
 /// Load one dense Laya linear weight and quantize it to Q8_0 storage.
-pub fn layaQ8Weight(allocator: std.mem.Allocator, store: tensor_store_mod.TensorStore, full_name: []const u8, name: []const u8) !LoadedWeight {
+fn layaQ8Weight(allocator: std.mem.Allocator, store: tensor_store_mod.TensorStore, full_name: []const u8, name: []const u8) !LoadedWeight {
     var tensor_ref = try store.describeTensor(allocator, full_name);
     defer tensor_ref.deinit(allocator);
     var dense = try store.loadTensorRef(&tensor_ref);
@@ -344,7 +344,7 @@ pub fn buildGgufInspectionReportFromFile(
     return report;
 }
 
-pub fn collectLargestDenseTensorSamples(
+fn collectLargestDenseTensorSamples(
     allocator: std.mem.Allocator,
     file: *const gguf_mod.format.File,
     out: *std.ArrayListUnmanaged(GgufTensorSample),
@@ -384,7 +384,7 @@ pub fn collectLargestDenseTensorSamples(
     }
 }
 
-pub fn collectQuantizedTensorSamples(
+fn collectQuantizedTensorSamples(
     allocator: std.mem.Allocator,
     file: *const gguf_mod.format.File,
     out: *std.ArrayListUnmanaged([]const u8),
@@ -396,7 +396,7 @@ pub fn collectQuantizedTensorSamples(
     }
 }
 
-pub fn collectTensorTypes(
+fn collectTensorTypes(
     allocator: std.mem.Allocator,
     file: *const gguf_mod.format.File,
     all_out: *std.ArrayListUnmanaged(UnsupportedTensorTypeCount),
@@ -486,12 +486,12 @@ pub fn collectNormalizedGgufNames(
     }
 }
 
-pub fn putNameIfAbsent(allocator: std.mem.Allocator, names: *std.StringHashMapUnmanaged(void), name: []const u8) !void {
+fn putNameIfAbsent(allocator: std.mem.Allocator, names: *std.StringHashMapUnmanaged(void), name: []const u8) !void {
     if (names.contains(name)) return;
     try names.put(allocator, try allocator.dupe(u8, name), {});
 }
 
-pub fn shouldRecordUnmappedGgufTensor(arch_config: ArchConfig, raw_name: []const u8, normalized_name: []const u8, current_count: usize) bool {
+fn shouldRecordUnmappedGgufTensor(arch_config: ArchConfig, raw_name: []const u8, normalized_name: []const u8, current_count: usize) bool {
     if (current_count >= 16) return false;
     if (!std.mem.eql(u8, raw_name, normalized_name)) return false;
     return switch (arch_config) {
@@ -743,7 +743,7 @@ pub fn collectMissingRequiredGlinerModernBertClassifier(
     }) |name| try appendMissingWeight(allocator, names, missing, name);
 }
 
-pub fn isPackedMoeExpertTensor(raw_name: []const u8) bool {
+fn isPackedMoeExpertTensor(raw_name: []const u8) bool {
     return std.mem.endsWith(u8, raw_name, ".ffn_gate_exps.weight") or
         std.mem.endsWith(u8, raw_name, ".ffn_down_exps.weight") or
         std.mem.endsWith(u8, raw_name, ".ffn_up_exps.weight") or
@@ -754,7 +754,7 @@ pub fn isPackedMoeExpertTensor(raw_name: []const u8) bool {
 /// encode gate/up as two tensors or as one interleaved gate_up tensor; mixing
 /// both representations in a layer would make lazy weight registration order
 /// dependent and is rejected.
-pub fn qualifiedA4bPackedExpertLayout(arch_config: ArchConfig, file: *const gguf_mod.format.File) bool {
+fn qualifiedA4bPackedExpertLayout(arch_config: ArchConfig, file: *const gguf_mod.format.File) bool {
     const config = switch (arch_config) {
         .gpt => |cfg| cfg,
         else => return false,
@@ -798,7 +798,7 @@ pub fn qualifiedA4bPackedExpertLayout(arch_config: ArchConfig, file: *const gguf
     return true;
 }
 
-pub fn appendMissingFmt(
+fn appendMissingFmt(
     allocator: std.mem.Allocator,
     names: *const std.StringHashMapUnmanaged(void),
     missing: *std.ArrayListUnmanaged([]const u8),
@@ -810,7 +810,7 @@ pub fn appendMissingFmt(
     try appendMissingWeight(allocator, names, missing, name);
 }
 
-pub fn appendMissingWeight(
+fn appendMissingWeight(
     allocator: std.mem.Allocator,
     names: *const std.StringHashMapUnmanaged(void),
     missing: *std.ArrayListUnmanaged([]const u8),
@@ -974,7 +974,7 @@ pub fn findTensorNameByPriority(all_names: [][]const u8, candidates: []const []c
     return null;
 }
 
-pub fn leadingTensorDim(
+fn leadingTensorDim(
     allocator: std.mem.Allocator,
     store: tensor_store_mod.TensorStore,
     name: []const u8,
@@ -1209,7 +1209,7 @@ pub fn appendPackedMoeLazyWeights(
     return true;
 }
 
-pub fn appendDeepseekV4MoeLazyWeights(
+fn appendDeepseekV4MoeLazyWeights(
     allocator: std.mem.Allocator,
     lazy_weights: anytype,
     store: tensor_store_mod.TensorStore,
@@ -1298,7 +1298,7 @@ pub fn parsePackedMoeTensor(full_name: []const u8) ?PackedMoeTensor {
     return null;
 }
 
-pub fn normalizeGgufMoeExpertWeight(layer: usize, suffix: []const u8, prefix: []const u8, proj: []const u8, buf: *[256]u8) ?[]const u8 {
+fn normalizeGgufMoeExpertWeight(layer: usize, suffix: []const u8, prefix: []const u8, proj: []const u8, buf: *[256]u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, suffix, prefix) or !std.mem.endsWith(u8, suffix, ".weight")) return null;
     const expert_str = suffix[prefix.len .. suffix.len - ".weight".len];
     if (expert_str.len == 0) return null;
@@ -1306,7 +1306,7 @@ pub fn normalizeGgufMoeExpertWeight(layer: usize, suffix: []const u8, prefix: []
     return std.fmt.bufPrint(buf, "model.layers.{d}.block_sparse_moe.experts.{d}.{s}.weight", .{ layer, expert, proj }) catch null;
 }
 
-pub fn refineArchConfigFromWeights(arch_config: *ArchConfig, weights: *const std.StringHashMapUnmanaged(LoadedWeight)) void {
+fn refineArchConfigFromWeights(arch_config: *ArchConfig, weights: *const std.StringHashMapUnmanaged(LoadedWeight)) void {
     switch (arch_config.*) {
         .gpt => |*cfg| refineGptConfigFromWeights(cfg, weights),
         else => {},
@@ -1322,19 +1322,19 @@ pub fn shouldLazyLoadWeight(store_kind: tensor_store_mod.StoreKind, arch_config:
     };
 }
 
-pub fn storeTensorIsQuantized(allocator: std.mem.Allocator, store: tensor_store_mod.TensorStore, name: []const u8) !bool {
+fn storeTensorIsQuantized(allocator: std.mem.Allocator, store: tensor_store_mod.TensorStore, name: []const u8) !bool {
     var ref = try store.describeTensor(allocator, name);
     defer ref.deinit(allocator);
     return ref.quantized;
 }
 
-pub fn ggufEncoderHasQuantizedTensors(store: tensor_store_mod.TensorStore) bool {
+fn ggufEncoderHasQuantizedTensors(store: tensor_store_mod.TensorStore) bool {
     const file = store.ggufFile() orelse return false;
     for (file.tensors) |tensor| if (tensor.tensor_type.isQuantized()) return true;
     return false;
 }
 
-pub fn shouldKeepResidentWeightQuantizedOnly(
+fn shouldKeepResidentWeightQuantizedOnly(
     allocator: std.mem.Allocator,
     store: tensor_store_mod.TensorStore,
     arch_config: ArchConfig,
@@ -1385,7 +1385,7 @@ pub fn shouldKeepResidentWeightQuantizedOnly(
     };
 }
 
-pub fn shouldKeepResidentClipClapWeightQuantizedOnly(
+fn shouldKeepResidentClipClapWeightQuantizedOnly(
     key: []const u8,
     tensor_type: ?gguf_mod.tensor_types.TensorType,
 ) bool {
@@ -1431,7 +1431,7 @@ pub fn shouldKeepResidentClipClapWeightQuantizedOnly(
         std.mem.endsWith(u8, key, ".output.dense.weight");
 }
 
-pub fn isGptEmbeddingTableKey(key: []const u8) bool {
+fn isGptEmbeddingTableKey(key: []const u8) bool {
     return std.mem.eql(u8, key, "model.embed_tokens.weight") or
         std.mem.eql(u8, key, "model.per_layer_input.per_layer_token_embd.weight");
 }
@@ -1447,7 +1447,7 @@ pub fn shouldKeepResidentGptEmbeddingQuantizedOnly(
     };
 }
 
-pub fn isCudaResidentEmbeddingQuantType(tensor_type: gguf_mod.tensor_types.TensorType) bool {
+fn isCudaResidentEmbeddingQuantType(tensor_type: gguf_mod.tensor_types.TensorType) bool {
     return std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q8_0 }) or
         std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_0 }) or
         std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_K }) or
@@ -1561,7 +1561,7 @@ pub fn projectionMaskForWeightKey(key: []const u8) u8 {
     return 0;
 }
 
-pub fn refineGptConfigFromWeights(config: *gpt_mod.Config, weights: *const std.StringHashMapUnmanaged(LoadedWeight)) void {
+fn refineGptConfigFromWeights(config: *gpt_mod.Config, weights: *const std.StringHashMapUnmanaged(LoadedWeight)) void {
     if (weights.get("model.embed_tokens.weight")) |embed| {
         if (embed.tensor.shape.len >= 2) {
             config.vocab_size = @intCast(embed.tensor.shape[0]);
@@ -1587,7 +1587,7 @@ pub fn refineGptConfigFromWeights(config: *gpt_mod.Config, weights: *const std.S
 /// [in_features, out_features] instead of the standard [out_features, in_features].
 /// This function transposes those 2D weight tensors in-place so the rest of
 /// the pipeline sees the standard layout.
-pub fn transposeGpt2Conv1dWeights(
+fn transposeGpt2Conv1dWeights(
     allocator: std.mem.Allocator,
     weights: *std.StringHashMapUnmanaged(LoadedWeight),
 ) !void {
@@ -1600,7 +1600,7 @@ pub fn transposeGpt2Conv1dWeights(
     }
 }
 
-pub fn transposeGpt2Conv1dLoadedWeightInPlace(
+fn transposeGpt2Conv1dLoadedWeightInPlace(
     allocator: std.mem.Allocator,
     key: []const u8,
     weight: *LoadedWeight,
@@ -1693,7 +1693,7 @@ pub fn jinaRetrievalAdapterPaths(
     return .{ .config = config_path, .weights = weights_path };
 }
 
-pub fn applyJinaV5RetrievalAdapterIfPresent(
+fn applyJinaV5RetrievalAdapterIfPresent(
     allocator: std.mem.Allocator,
     model_path: []const u8,
     mf: manifest_mod.ModelManifest,
@@ -1715,7 +1715,7 @@ pub fn applyJinaV5RetrievalAdapterIfPresent(
     }
 }
 
-pub fn isGpt2Conv1dWeight(key: []const u8) bool {
+fn isGpt2Conv1dWeight(key: []const u8) bool {
     // GPT-2 Conv1D weight keys:
     //   h.N.attn.c_attn.weight
     //   h.N.attn.c_proj.weight

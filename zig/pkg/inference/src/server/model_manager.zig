@@ -37,13 +37,12 @@ const manifest_mod = @import("../models/manifest.zig");
 const model_compatibility = @import("../models/compatibility.zig");
 const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
 const managed_receipt = @import("../registry/managed_receipt.zig");
-const safetensors_mod = @import("../models/safetensors.zig");
+
 const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
 const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const gguf_writer = @import("../gguf/writer.zig");
-const clipclap_format_mod = @import("../architectures/clipclap_format.zig");
-const projector_format_mod = @import("../architectures/projector_format.zig");
+
 const gemma4_projector = @import("../architectures/gemma4_projector.zig");
 const qwen3vl_reranker = @import("../architectures/qwen3vl_reranker.zig");
 const florence_arch = @import("../architectures/florence.zig");
@@ -54,7 +53,7 @@ const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
 const encoder_decoder = @import("../pipelines/encoder_decoder.zig");
 const vision_config = @import("../readers/vision_config.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
-const metal_runtime = @import("../backends/metal_runtime.zig");
+
 const EmbeddingPipeline = embedding_mod.EmbeddingPipeline;
 const EmbeddingConfig = embedding_mod.EmbeddingConfig;
 const PoolingStrategy = embedding_mod.PoolingStrategy;

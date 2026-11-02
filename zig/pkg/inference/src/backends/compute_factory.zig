@@ -120,3 +120,41 @@ pub fn beginRequest(session: @import("session.zig").Session, backend: *const ops
     // hit will bypass normal KV-hook provisioning.
     try backend.beginRequest();
 }
+
+pub fn closeMetalWeights(allocator: std.mem.Allocator, weights: *MetalWeights) void {
+    if (comptime !build_options.enable_metal) return;
+    metal.stopPrefetchWorker(weights);
+    if (weights.boundary_resident) |owner| {
+        owner.destroy();
+        weights.boundary_resident = null;
+    }
+    metal.deinitSharedNativeProvider(weights);
+    metal.deinitPrefetchQueue(weights);
+    var it = weights.lazy_weights.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
+        if (entry.value_ptr.host_loaded) |*host_loaded| host_loaded.deinit();
+        entry.value_ptr.tensor_ref.deinit(allocator);
+        allocator.free(entry.key_ptr.*);
+    }
+    weights.lazy_weights.deinit(allocator);
+    metal.deinitPackedExpertViews(weights, allocator);
+    if (weights.residency) |*residency| residency.deinit();
+    if (weights.jina_lora_adapter) |adapter| adapter.destroy();
+    if (weights.tensor_store) |store| store.deinit();
+    if (weights.tier_cache) |*tier_cache|
+        tier_cache.deinitAdmission();
+}
+
+pub fn prepareMetalProvider(allocator: std.mem.Allocator, weights: *MetalWeights, jit: MetalJitOptions) !void {
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    if (!jit.config.mode.compiles()) return;
+    var prepared = try metal.MetalCompute.initWithKernelJitScopeAndLoadContext(allocator, weights, null, jit.config, jit.scope, jit.load_context);
+    prepared.deinit();
+}
+
+pub fn initializeMetalWeightPrefetch(allocator: std.mem.Allocator, weights: *MetalWeights, start_worker: bool) !void {
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    metal.initPrefetchQueue(weights, allocator);
+    if (weights.lazy_weights.count() > 0 and start_worker) try metal.startPrefetchWorker(weights);
+}
