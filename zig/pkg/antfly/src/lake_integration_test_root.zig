@@ -85,6 +85,7 @@ test {
     _ = @import("api/lake_index_sql_rows.zig");
     _ = @import("api/lake_index_text_query.zig");
     _ = @import("api/lake_index_text_predicate.zig");
+    _ = @import("api/lake_index_recent_predicate.zig");
     _ = @import("api/lake_index_pack_proof.zig");
     _ = @import("api/lake_index_sort_stream.zig");
     _ = @import("api/lake_artifact_ranges.zig");
