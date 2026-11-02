@@ -162,8 +162,8 @@ fn runGroupSourceMaintenanceSlice(self: *DB, state: *DB.GroupSourceMaintenanceSt
     return .{ .value = self.runGroupSourceMaintenanceSlice(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, shadow: bool) engine.Outcome(bool) {
-    return .{ .value = self.runBackgroundTurnWithCancellation(cancellation, shadow) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, phase: types.BackgroundMaintenancePhase) engine.Outcome(bool) {
+    return .{ .value = self.runBackgroundTurnWithCancellation(cancellation, phase) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runBackgroundMaintenanceWithCancellation(self: *DB, cancellation: types.CancellationToken) engine.Outcome(bool) {

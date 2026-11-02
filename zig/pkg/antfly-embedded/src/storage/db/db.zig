@@ -31900,6 +31900,9 @@ pub const DB = struct {
         drain_relational_indexes: bool = true,
         drain_graph_replacements: bool = true,
         bounded_replay: bool = false,
+        /// Native replay releases its primary snapshot before artifact work.
+        /// Explicit idle and hosted owners retain the complete drain below.
+        source_work_only: bool = false,
         group_source_state: ?*GroupSourceMaintenanceState = null,
         /// Run the foreground enrichment catch-up pass to full completion
         /// instead of bounding it at the request-visibility default
@@ -31929,6 +31932,15 @@ pub const DB = struct {
             try replayPendingDerivedBatches(self, null, null, options);
             try ensureSnapshotActive(options.cancellation);
             return;
+        }
+        if (options.source_work_only) {
+            const state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
+            self.executor.notifySequence(sequence);
+            return self.executor.waitForAllWithVisibilityWait(sequence, .{
+                .cancellation = options.cancellation,
+                .replay_budget = &state.replay_budget,
+                .replay_record_cap = if (state.replay_retirement.watermark != 0) docstore_mod.ReplayRetirement.record_cap else 2048,
+            });
         }
         if (options.cancellation.ptr != null) {
             return try self.runDerivedUntilWithVisibilityWait(sequence, .{
@@ -32172,7 +32184,7 @@ pub const DB = struct {
 
             const next_target = self.core.nextDerivedSequence();
             if (options.bounded_replay or next_target <= stable_target) {
-                try waitForManagedIndexesApplied(self, sequence, sync_targets.all_indexes);
+                if (!options.source_work_only) try waitForManagedIndexesApplied(self, sequence, sync_targets.all_indexes);
                 _ = try self.runArtifactRepairMetadataMaintenancePass();
                 return;
             }
@@ -33638,8 +33650,12 @@ pub const DB = struct {
         _ = try self.evaluateAlgebraicAdaptiveCandidates();
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
         try self.flushAppliedSequencesForIdle();
-        try self.drainScheduledTextMerges();
-        try self.runArtifactRepairMetadataMaintenanceUntilIdle();
+        // Native detached turns release primary history before artifact work.
+        // Explicit idle callers still fully drain both phases.
+        if (!options.source_work_only) try self.drainScheduledTextMerges();
+        if (options.source_work_only) {
+            _ = try self.runArtifactRepairMetadataMaintenancePass();
+        } else try self.runArtifactRepairMetadataMaintenanceUntilIdle();
         if (options.drain_relational_indexes) {
             try self.runRelationalIndexMaintenanceUntilIdle(options.cancellation, options.deadline_ns);
         } else {
@@ -33666,7 +33682,9 @@ pub const DB = struct {
         // then let the normal LSM idle drain include this small control write.
         _ = try finalizeCoveredDenseProjectionCheckpointsIfIdle(self.async_context);
         try self.saveAllLiveIndexStatusSnapshots(self.alloc);
-        _ = try self.runLsmMaintenanceUntilIdle();
+        if (options.source_work_only) {
+            _ = try self.runSourcePinCleanupStep();
+        } else _ = try self.runLsmMaintenanceUntilIdle();
     }
 
     pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
@@ -34155,10 +34173,52 @@ pub const DB = struct {
     /// Detached Lite turns alternate replay with generation-scoped shadow
     /// construction. Never chase a moving write tip or rebuild shadows while
     /// retaining a serving-index publication footprint.
-    pub fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, shadow: bool) !bool {
-        if (comptime storage_engine.enabled) return storage_engine.call("runBackgroundTurnWithCancellation", .{ self, cancellation, shadow });
+    pub fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, phase: types.BackgroundMaintenancePhase) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runBackgroundTurnWithCancellation", .{ self, cancellation, phase });
         try ensureSnapshotActive(cancellation);
-        if (shadow) {
+        const state = self.borrowed_group_source_state orelse &self.group_source_owner.state;
+        const split_retirement = phase == .replay or phase == .retirement;
+        const old_retirement = self.core.store.deferred_replay_retirement;
+        const old_bounded = self.core.store.bounded_replay_retirement;
+        defer if (split_retirement) {
+            self.core.store.deferred_replay_retirement = old_retirement;
+            self.core.store.bounded_replay_retirement = old_bounded;
+        };
+        if (split_retirement) self.core.store.deferred_replay_retirement = &state.replay_retirement;
+        if (phase == .retirement) {
+            self.core.store.bounded_replay_retirement = true;
+            if (state.replay_retirement.watermark != 0) try truncateReplaySequenceAsync(self.async_context, state.replay_retirement.watermark);
+            return state.replay_retirement.runnable;
+        }
+        if (phase == .artifacts) {
+            // No primary snapshot may enclose this work. Captured SST/segment
+            // inputs own immutable leases, and Native index-catalog reads join
+            // their owner's short validated admission before taking a read pin.
+            const merged = blk: {
+                var snapshot_replay = try self.acquireSnapshotReplayMutation();
+                defer snapshot_replay.release();
+                try self.lockApplyForPortableRuntime();
+                defer self.core.unlockApply();
+                break :blk try self.core.index_manager.runTextMergeScheduler(1);
+            };
+            try ensureSnapshotActive(cancellation);
+            // Finish maintenance of these fixed captured index inputs before
+            // closing their runtime. Dropping it after one slice discards LSM
+            // continuations. This drain retains no primary history and cannot
+            // chase peer primary writes; changed index inputs refuse admission.
+            while (true) {
+                try ensureSnapshotActive(cancellation);
+                const progressed = if (try self.core.index_manager.runLsmObsoleteReclaimDue()) true else try self.core.index_manager.runLsmMaintenanceStep();
+                if (!progressed) break;
+            }
+            // Reclamation can finish during the backend unlock. Report debt,
+            // not completed work, and clear hints left by that final slice.
+            // Otherwise each fresh runtime's local cleanup schedules another
+            // replay turn even though its durable inputs are already settled.
+            self.core.index_manager.refreshLsmMaintenanceDebtHint();
+            return merged != 0 or self.core.index_manager.lsmMaintenanceScore() != 0;
+        }
+        if (phase == .shadow) {
             if (self.hasConfiguredResolvers()) {
                 if (self.resolution_runtime == null) try self.initResolutionRuntime();
                 if (self.promotion_runtime == null) try self.initPromotionRuntime();
@@ -34171,9 +34231,13 @@ pub const DB = struct {
             .drain_relational_indexes = false,
             .drain_graph_replacements = false,
             .bounded_replay = true,
+            .source_work_only = phase == .replay,
             .max_windows_per_index = 1,
         });
         const finalized = try self.finalizeDenseProjectionLifecycleForIdle();
+        // Primary LSM/source maintenance still belongs to the source phase.
+        // Deferring only index work must not strand this lane at idle.
+        if (phase == .replay) _ = try self.runPrimaryLsmMaintenanceStep();
         return finalized or self.core.nextDerivedSequence() > before or self.executor.snapshotStats().workers_with_replay_debt != 0 or
             self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending();
     }
@@ -141645,7 +141709,7 @@ test "capi resolver background replacement source pages remain byte bounded" {
     _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"next_links\"}]}" });
     var observed = false;
     for (0..8) |_| {
-        _ = try db.runBackgroundTurnWithCancellation(.none, true);
+        _ = try db.runBackgroundTurnWithCancellation(.none, .shadow);
         const jobs = try db.graphReplacementStatusAlloc(a);
         defer jobs.deinit();
         try std.testing.expectEqual(@as(usize, 1), jobs.value.len);

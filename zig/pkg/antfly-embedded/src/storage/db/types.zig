@@ -15,6 +15,12 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+
+/// Detached Lite replay needs primary history; index maintenance instead owns
+/// immutable artifact leases and uses validated, short catalog-read admissions.
+/// Hosted/full drains retain their existing complete lifecycle behavior.
+pub const BackgroundMaintenancePhase = enum { replay, retirement, artifacts, shadow, complete };
+
 /// Shared transient/permanent classification and operator hints for
 /// enrichment and repair failures.
 pub const repair_failure = @import("repair_failure.zig");

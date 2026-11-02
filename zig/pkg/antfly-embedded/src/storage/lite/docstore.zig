@@ -1416,7 +1416,7 @@ var next_score_cache_owner: std.atomic.Value(u64) = .init(1);
 /// Optional owner admission around every document/index publication.
 /// Detached computation can retain this Store without retaining a file
 /// writer lease; admission must validate its checkpoint before mutation.
-pub const PublicationScope = enum { primary, index, reclamation, artifact_lease, allocator_service };
+pub const PublicationScope = enum { primary, index, reclamation, artifact_lease, allocator_service, index_read };
 
 pub const WriterAdmission = struct {
     ptr: *anyopaque,
@@ -1479,6 +1479,9 @@ pub const Store = struct {
     /// Short-lived capture runtimes fence artifact readers instead of changing
     /// the durable catalog merely to open their existing immutable inputs.
     artifact_reader_fence: bool = false,
+    /// Artifact-only detached work has no turn-wide primary pin. Each catalog
+    /// lookup must refresh/validate under owner admission before pinning pages.
+    index_reads_require_admission: bool = false,
     artifact_cleanup_cursor: artifact_source.SweepCursor = .{},
     artifact_marker_sweep: artifact_source.MarkerSweep = .{},
     maintenance_policy: reclamation.Policy = .{},
@@ -1763,6 +1766,10 @@ pub const Store = struct {
     /// Initialize after the returned Store has its stable address. Sources
     /// independently own their runtime and descriptor.
     pub fn openArtifactSource(self: *Store, key: []const u8) !@import("../../segment_source.zig").Source {
+        // The optional pool lookup reads the catalog before lease publication.
+        // Refresh first; a late lease cannot protect an already reused root.
+        const admission = try self.acquireIndexReadAdmission();
+        defer if (admission) |held| held.leave(held.ptr);
         lockStore(self);
         const registry = self.artifact_registry orelse blk: {
             const created = artifact_source.Registry.create(self.allocator, self) catch |err| {
@@ -3008,6 +3015,21 @@ pub const Store = struct {
 
     pub fn beginRead(self: *Store) !Txn {
         return try Txn.openRead(self);
+    }
+
+    fn acquireIndexReadAdmission(self: *Store) !?WriterAdmission {
+        if (!self.index_reads_require_admission) return null;
+        const admission = self.writer_admission orelse return error.EnrichmentWaitCanceled;
+        try admission.enter(admission.ptr, .index_read);
+        return admission;
+    }
+
+    /// Register a current read pin while detached artifact admission excludes
+    /// peer publication. The old captured catalog need not remain retained.
+    pub fn beginIndexRead(self: *Store) !Txn {
+        const admission = try self.acquireIndexReadAdmission();
+        defer if (admission) |held| held.leave(held.ptr);
+        return self.beginRead();
     }
 
     /// Pin both checkpoint and file generation while inspecting metadata.

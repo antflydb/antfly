@@ -114,9 +114,7 @@ fn lockStore(store: *docstore.Store) void {
 }
 
 fn pinSnapshot(store: *docstore.Store) !docstore.Txn {
-    // Admission pins the inode across replacement, then the reader frontier
-    // fences in-place reuse for the full metadata/value read or traversal.
-    return store.beginRead();
+    return store.beginIndexRead();
 }
 
 fn pathContains(prefix: []const u8, path: []const u8) bool {
@@ -2327,6 +2325,46 @@ test "lite artifact leases share immutable inputs across serving owners without 
     try std.testing.expectEqualSlices(u8, changed[123..][0..out.len], &out);
     try two.readInto(123, &out);
     try std.testing.expectEqualSlices(u8, payload[123..][0..out.len], &out);
+}
+
+test "lite detached artifact read admission also fences pooled sources" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "detached-pooled-admission.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = Store.init(a, &docs);
+    const storage = store.storage();
+    try storage.writeFileAbsolute("/leased", "immutable payload");
+    var original = try storage.openLeasedImmutableSource(a, "/leased");
+    defer original.close();
+    const Admission = struct {
+        reads: usize = 0,
+        fn enter(ptr: *anyopaque, scope: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (scope == .index_read) {
+                self.reads += 1;
+                return error.EnrichmentWaitCanceled;
+            }
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    var admission: Admission = .{};
+    docs.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer docs.writer_admission = null;
+    docs.index_reads_require_admission = true;
+    defer docs.index_reads_require_admission = false;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, storage.readFileAlloc(a, "/leased", 100));
+    // A matching pooled input must not bypass validation of the current
+    // catalog. Lease publication alone is too late to fence this lookup.
+    try std.testing.expectError(error.EnrichmentWaitCanceled, storage.openLeasedImmutableSource(a, "/leased"));
+    try std.testing.expectEqual(@as(usize, 2), admission.reads);
+    var actual: [17]u8 = undefined;
+    try original.readInto(0, &actual);
+    try std.testing.expectEqualStrings("immutable payload", &actual);
 }
 
 test "lite artifact leases transfer retired inode accounting between readers" {

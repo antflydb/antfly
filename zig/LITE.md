@@ -1285,6 +1285,48 @@ committed/visibility-pending diagnostic. Resume derived work rather than replayi
 the batch, especially for transforms such as `$inc`. Pre-commit Busy refusals keep
 their existing retry behavior. SQL retains its committed-pending outcome.
 
+Native revision-7 background turns separate source-derived replay from immutable
+artifact maintenance. After the replay window and its source-dependent lifecycle
+work, the owner releases its primary snapshot before running at most one text
+merge and draining LSM maintenance of the captured index inputs. LSM
+continuations finish before their runtime closes, without chasing new primary
+writes; cancellation is checked between maintenance steps. Immutable inputs retain their own range
+leases. Artifact catalog reads first acquire short owner/path admission, validate
+the namespace and logical index identity, refresh the checkpoint, and register a
+read pin before releasing admission. They never traverse an old catalog root
+without a retained epoch: matching page numbers can conceal page reuse. Any
+foreign logical index change invalidates the detached artifact work, including a
+physical-root ABA. Hosted owners, legacy files without logical identities, and
+explicit idle drains preserve their existing complete maintenance lifecycle.
+
+The native manual executor uses the same per-kind adaptive replay controller as
+other detached replay paths: one bounded window per worker, with a cooperative
+25 ms quantum and bounded record/payload budgets. Partial applied watermarks are
+persisted before yielding; a background turn never waits again for the original
+full visibility target. Explicit foreground visibility waits still complete their
+requested target. An individual indivisible record can exceed the quantum.
+
+Replay-journal retirement records its requested watermark during source work,
+then runs after releasing the primary snapshot. Short owner/path admission
+revalidates the catalog and clamps deletion against current enrichment,
+resolver, graph-replacement and repair checkpoints. Each turn scans at most one
+round of journal lanes and commits at most 256 key deletions. Empty lanes do not
+consume separate turns; the namespace continuation advances only after successful
+publication, and blocked consumer watermarks do not force an idle spin. While
+retirement is outstanding, replay's record cap allows cleanup to service even the
+maximum fan-out of journal lanes. Errors and partial progress retain safe retry
+state across runtime refresh.
+
+Sustained-write qualification must measure progress and storage while writers
+remain active. `scripts/bench/lite_contention.py native --require-sustained`
+requires at least ten minutes of churn, acknowledged-write and integrity checks,
+per-worker minute progress, bounded file growth after a three-minute warmup, and
+late throughput of at least 75% of the early steady window. Its recorded policy
+allows tail growth of 25% of the warm file size or 16 MiB, whichever is larger.
+These are workload-specific regression tolerances; an idle shrink or a successful
+integrity check alone does not establish a storage plateau. Index catch-up,
+visibility under active load, search and reopen checks remain separate gates.
+
 Physical maintenance releases detached catalog/source pins before starting
 allocator service or a vacuum assessment. Bounded allocator/orphan service joins
 the fair writer queue and starts from the current checkpoint; prepared vacuum

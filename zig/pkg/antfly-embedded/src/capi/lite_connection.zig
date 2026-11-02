@@ -247,6 +247,13 @@ pub const PreparedPublication = struct {
     };
 
     fn indexInputsUnchanged(self: *@This(), captured: *native.NativeFile, latest: *native.NativeFile) !bool {
+        if (self.snapshot_root.owned_lite_backend.?.native_docstore.?.index_reads_require_admission == true) {
+            // Once the primary epoch ends, the old catalog pages may already
+            // have been reused. Compare durable no-ABA identities without
+            // dereferencing the unretained captured catalog.
+            return captured.header.indexed_reclamation and latest.header.indexed_reclamation and
+                std.mem.eql(u8, &captured.activeCheckpoint().logical.indexes, &latest.activeCheckpoint().logical.indexes);
+        }
         if (self.shadow_scopes.len == 0) return captured.indexCatalogPrefixUnchanged(latest, self.index_prefix);
         for (self.shadow_scopes) |scope| if (!try captured.indexCatalogPrefixUnchanged(latest, scope.prefix)) return false;
         return true;
@@ -264,7 +271,7 @@ pub const PreparedPublication = struct {
             const captured_stat = snapshot.file.file.stat(snapshot.file.runtime()) catch null;
             const same_inode = live_stat != null and captured_stat != null and live_stat.?.inode == captured_stat.?.inode;
             if (same_inode) {
-                if (snapshot.file.activeCheckpoint().index_catalog_root_page != file.activeCheckpoint().index_catalog_root_page) {
+                if (snapshot.index_reads_require_admission or snapshot.file.activeCheckpoint().index_catalog_root_page != file.activeCheckpoint().index_catalog_root_page) {
                     const unchanged = self.indexInputsUnchanged(&snapshot.file, file) catch false;
                     if (!unchanged) self.index_inputs_changed = true;
                 }
@@ -1167,7 +1174,7 @@ pub const Owner = struct {
         // allowing primary transactions to read the rebased checkpoint and
         // persist that completed progress. Otherwise replay repeats its own
         // output forever without advancing its durable watermark.
-        if (scope == .index) if (root.maintenance_publication) |p| if (p.index_inputs_changed) {
+        if (scope == .index or scope == .index_read) if (root.maintenance_publication) |p| if (p.index_inputs_changed) {
             self.publication_stats.index_input_refusals +|= 1;
             return error.EnrichmentWaitCanceled;
         };
@@ -1202,10 +1209,10 @@ pub const Owner = struct {
             var latest = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer latest.close();
             if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
-            if (file.activeCheckpoint().index_catalog_root_page != latest.activeCheckpoint().index_catalog_root_page) {
+            if (root.owned_lite_backend.?.native_docstore.?.index_reads_require_admission or file.activeCheckpoint().index_catalog_root_page != latest.activeCheckpoint().index_catalog_root_page) {
                 if (!try publication.indexInputsUnchanged(file, &latest)) {
                     publication.index_inputs_changed = true;
-                    if (scope == .index) {
+                    if (scope == .index or scope == .index_read) {
                         self.publication_stats.index_input_refusals +|= 1;
                         return error.EnrichmentWaitCanceled;
                     }
@@ -1662,6 +1669,7 @@ pub const Owner = struct {
         root.maintenance_owner = self;
         root.maintenance_publication = &publication;
         const store = root.owned_lite_backend.?.native_docstore.?;
+        const split_index_work = independent and store.file.header.indexed_reclamation;
         const foreground_header = foreground.owned_lite_backend.?.native_docstore.?.file.header;
         const maintenance_entry_header = store.file.header;
         if (run_database) if (database.enrichment_runtime) |runtime| {
@@ -1691,7 +1699,7 @@ pub const Owner = struct {
             maintenance_error = err;
             break :blk false;
         } else false;
-        var pending = if (maintenance_error != null) true else if (run_database and !projected) database.runBackgroundTurnWithCancellation(cancellation, shadow_scopes.items.len != 0) catch |err| blk: {
+        var pending = if (maintenance_error != null) true else if (run_database and !projected) database.runBackgroundTurnWithCancellation(cancellation, if (shadow_scopes.items.len != 0) .shadow else if (split_index_work) .replay else .complete) catch |err| blk: {
             maintenance_error = err;
             break :blk true;
         } else projected;
@@ -1700,9 +1708,36 @@ pub const Owner = struct {
             runtime.generated_publication = null;
         };
         if (run_database) database.async_context.replay_publication = null;
-        root.maintenance_publication = null;
         if (source_read) |*read| read.abort();
         source_read = null;
+        publication.source_read = null;
+        if (split_index_work and run_database and !projected and shadow_scopes.items.len == 0 and maintenance_error == null) {
+            // Merges need their leased immutable inputs, not every primary
+            // page visible when replay began. Keep only short validated read
+            // admissions while one artifact job advances outside the gate.
+            store.index_reads_require_admission = true;
+            defer store.index_reads_require_admission = false;
+            // Revalidate the current catalog and consumer fences while holding
+            // path admission through a bounded journal-retirement transaction.
+            const retirement_more = blk: {
+                enterMaintenanceWriter(root, .index) catch |err| {
+                    maintenance_error = err;
+                    break :blk true;
+                };
+                defer leaveMaintenanceWriter(root);
+                break :blk database.runBackgroundTurnWithCancellation(cancellation, .retirement) catch |err| {
+                    maintenance_error = err;
+                    break :blk true;
+                };
+            };
+            pending = pending or retirement_more;
+            const more = database.runBackgroundTurnWithCancellation(cancellation, .artifacts) catch |err| blk: {
+                maintenance_error = err;
+                break :blk true;
+            };
+            pending = pending or more;
+        }
+        root.maintenance_publication = null;
         // No detached computation/publication can use the catalog now. Drop
         // its checkpoint pin before physical service, which otherwise retains
         // an obsolete reader fence throughout its own reuse/vacuum attempt.
@@ -4482,6 +4517,82 @@ test "capi native allocator proof issue1431 physical maintenance releases detach
     try std.testing.expect(probe.calls != 0);
     try std.testing.expect(probe.captured);
     if (probe.failure) |err| return err;
+}
+
+test "capi native artifact maintenance releases primary history before merging" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("artifact-phase-primary-history", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    const Probe = struct {
+        root: ?*h.Handle = null,
+        calls: usize = 0,
+        reused: bool = false,
+        fn capture(ptr: *anyopaque, root: *h.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.root = root;
+            @import("../storage/db/catalog/index_manager.zig").test_before_text_merge_step = .{ .manager = root.db.core.index_manager, .ptr = self, .notify = merge };
+        }
+        fn merge(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const root = self.root.?;
+            const publication = root.maintenance_publication.?;
+            try std.testing.expect(publication.source_read == null);
+            const store = root.owned_lite_backend.?.native_docstore.?;
+            try std.testing.expect(store.index_reads_require_admission);
+            // A physical-root ABA must still reject changed logical inputs.
+            // Poisoning both old roots proves this comparison reads no pages.
+            var old = store.file;
+            old.header.checkpoints[old.header.active_checkpoint].index_catalog_root_page = std.math.maxInt(u64);
+            var latest = old;
+            try std.testing.expect(try publication.indexInputsUnchanged(&old, &latest));
+            latest.header.checkpoints[latest.header.active_checkpoint].logical.indexes[0] ^= 1;
+            try std.testing.expect(!try publication.indexInputsUnchanged(&old, &latest));
+            const io = h.handleLockIo();
+            {
+                const locked = try std.Io.Dir.cwd().openFile(io, store.file.path, .{ .mode = .read_write, .lock = .exclusive, .lock_nonblocking = true });
+                defer locked.close(io);
+                const epochs = try @import("../storage/lite/reader_epochs.zig").scan(alloc, io, store.file.path, store.file.header.reader_epoch_namespace, (try locked.stat(io)).inode);
+                try std.testing.expect(epochs.data == null);
+            }
+            {
+                var lease = try native.lockWriterPathWithIo(alloc, io, store.file.path);
+                defer lease.close();
+                var peer = try native.NativeFile.openWithIo(alloc, io, store.file.path, .{ .externally_locked = true, .no_sync = true });
+                defer peer.close();
+                try peer.inheritAllocatorVerification(&store.file);
+                peer.allocator_certificate_on_commit = true;
+                const before = (try peer.allocatorStats()).?.reused_pages;
+                var value: [8192]u8 = @splat('v');
+                for (0..128) |i| {
+                    std.mem.writeInt(u64, value[0..8], i, .little);
+                    try peer.putDocument("artifact-phase-peer", &value);
+                }
+                self.reused = (try peer.allocatorStats()).?.reused_pages > before;
+                try std.testing.expect(self.reused);
+                try std.testing.expect((try peer.check()).valid);
+            }
+            // A catalog read after peer reuse must first rebase under a short
+            // admission, without touching the unretained old catalog pages.
+            try Owner.enterMaintenanceWriter(root, .index_read);
+            Owner.leaveMaintenanceWriter(root);
+        }
+    };
+    var probe: Probe = .{};
+    defer @import("../storage/db/catalog/index_manager.zig").test_before_text_merge_step = null;
+    owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.capture };
+    defer owner.test_after_capture = null;
+    for (0..8) |_| {
+        owner.maintenance_pending = true;
+        _ = try owner.maintenanceTurn();
+        if (probe.calls != 0) break;
+    }
+    try std.testing.expect(probe.calls != 0);
+    try std.testing.expect(probe.reused);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.read));
+    try fixture.expectWritten(.batch, true);
 }
 
 test "capi native allocator proof issue1431 refreshed readers distinguish current and old tips" {

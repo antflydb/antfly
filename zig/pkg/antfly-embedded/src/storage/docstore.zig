@@ -451,6 +451,19 @@ fn updateGraphEndpointCleanupAdmission(txn: anytype, alloc: Allocator, key: []co
     try txn.put(internal_keys.graph_endpoint_cleanup_count_key, &bytes);
 }
 
+/// Namespace-owned retirement continuation. No snapshot or borrowed key survives a turn.
+pub const ReplayRetirement = struct {
+    pub const max_keys = 256;
+    // Even a record copied into every lane must retire faster than bounded
+    // replay creates journal debt once cleanup is outstanding.
+    pub const record_cap = max_keys / (replay_hints.len + 1);
+    watermark: u64 = 0,
+    lane: usize = 0,
+    clean_lanes: usize = 0,
+    sweep_bound: u64 = 0,
+    runnable: bool = false,
+};
+
 pub const DocStore = struct {
     payload_store: ?artifact_payload.Store = null,
     payload_capture_inline: bool = false,
@@ -474,6 +487,8 @@ pub const DocStore = struct {
     owns_runtime_store: bool,
     owned_lsm_backend: ?lsm_backend.BackendHandle,
     replay_index_state: std.atomic.Value(u8),
+    deferred_replay_retirement: ?*ReplayRetirement = null,
+    bounded_replay_retirement: bool = false,
     next_replay_sequence_cached: AtomicU64,
     // Reservations are not visibility. Zero means the durable committed cut
     // has not yet been loaded; intentional persisted replay floors count.
@@ -2847,7 +2862,70 @@ pub const DocStore = struct {
     }
 
     pub fn truncateReplayUpTo(self: *DocStore, alloc: Allocator, up_to_sequence: u64) !void {
+        if (self.deferred_replay_retirement) |state| {
+            if (!self.bounded_replay_retirement) {
+                if (up_to_sequence > state.watermark) state.clean_lanes = 0;
+                state.watermark = @max(state.watermark, up_to_sequence);
+                return;
+            }
+            return self.truncateReplaySlice(alloc, up_to_sequence, state);
+        }
         try self.truncateReplayEntries(alloc, up_to_sequence);
+    }
+
+    // At most one atomic batch and one bounded sweep of lanes per turn. The watermark is reclamped by
+    // the DB against current consumer/repair checkpoints under owner admission.
+    fn truncateReplaySlice(self: *DocStore, alloc: Allocator, up_to_sequence: u64, state: *ReplayRetirement) !void {
+        state.runnable = false;
+        if (up_to_sequence == 0) return;
+        var lane = state.lane;
+        var clean_lanes = if (state.sweep_bound == up_to_sequence) state.clean_lanes else 0;
+        var deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (deletes.items) |key| alloc.free(key);
+            deletes.deinit(alloc);
+        }
+        // Skip empty lanes within the same bounded turn. A quiet lane must
+        // not consume the service capacity needed by an active journal lane.
+        for (0..replay_hints.len + 1) |_| {
+            const before = deletes.items.len;
+            const ordinal = if (lane < replay_hints.len) replayHintOrdinal(replay_hints[lane]) else internal_keys.replay_all_kind;
+            {
+                var txn = try self.beginReplayLaneScanTxn(ordinal, 0);
+                defer txn.abort();
+                var cur = try txn.openCursor();
+                defer cur.close();
+                const lower = internal_keys.replayRangeLower(ordinal, 0);
+                const upper = internal_keys.replayRangeUpper(ordinal);
+                cur.setUpperBound(&upper);
+                var entry = try cur.seekAtOrAfter(&lower);
+                while (entry) |kv| : (entry = try cur.next()) {
+                    if (std.mem.order(u8, kv.key, &upper) != .lt) break;
+                    const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
+                    if (sequence > up_to_sequence) break;
+                    const key = try alloc.dupe(u8, kv.key);
+                    errdefer alloc.free(key);
+                    try deletes.append(alloc, key);
+                    if (deletes.items.len == ReplayRetirement.max_keys) break;
+                }
+            }
+            clean_lanes = if (before == deletes.items.len) clean_lanes + 1 else 0;
+            lane = (lane + 1) % (replay_hints.len + 1);
+            if (deletes.items.len == ReplayRetirement.max_keys or clean_lanes >= replay_hints.len + 1) break;
+        }
+        if (deletes.items.len != 0) {
+            var batch = try self.beginWriteBatch();
+            errdefer batch.abort();
+            for (deletes.items) |key| try batch.delete(key);
+            try batch.commit();
+        }
+        // Publish continuation only after successful commit. A failed turn
+        // retries the same lane and bound without claiming unchecked work clean.
+        state.lane = lane;
+        state.clean_lanes = clean_lanes;
+        state.sweep_bound = up_to_sequence;
+        state.runnable = clean_lanes < replay_hints.len + 1;
+        if (!state.runnable and up_to_sequence >= state.watermark) state.watermark = 0;
     }
 
     fn truncateReplayEntries(self: *DocStore, alloc: Allocator, up_to_sequence: u64) !void {
@@ -5242,6 +5320,64 @@ test "docstore replay retirement pages keys within bounded memory and preserves 
         try std.testing.expectEqual(cutoff + 1, decoded.record.sequence);
     }
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+}
+
+test "docstore replay retirement defers source work and bounds fair cleanup across lanes" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const hints = [_]u8{ internal_keys.replay_all_kind, replayHintOrdinal(.dense_vector) };
+    {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(&internal_keys.replay_meta_init_key, "1");
+        for (1..602) |sequence| for (hints) |hint| {
+            const key = internal_keys.replayEntryKey(hint, @intCast(sequence));
+            try batch.put(&key, "payload");
+        };
+        try batch.commit();
+    }
+    var state: ReplayRetirement = .{};
+    store.deferred_replay_retirement = &state;
+    defer store.deferred_replay_retirement = null;
+    try store.truncateReplayUpTo(alloc, 600);
+    const first_key = internal_keys.replayEntryKey(hints[0], 1);
+    const retained = try store.get(alloc, &first_key);
+    alloc.free(retained);
+    try std.testing.expectEqual(@as(u64, 600), state.watermark);
+    store.bounded_replay_retirement = true;
+    const before_failure = state;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, store.truncateReplayUpTo(failing.allocator(), 300));
+    try std.testing.expectEqualDeep(before_failure, state);
+    // Late consumers can lower the safe bound after source work finishes.
+    for (0..(replay_hints.len + 1) * 5) |_| try store.truncateReplayUpTo(alloc, 300);
+    try std.testing.expect(!state.runnable);
+    try std.testing.expectEqual(@as(u64, 600), state.watermark);
+    for (hints) |hint| {
+        const key = internal_keys.replayEntryKey(hint, 301);
+        const value = try store.get(alloc, &key);
+        alloc.free(value);
+    }
+    state.lane = replay_hints.len;
+    try store.truncateReplayUpTo(alloc, 600);
+    // A single turn deletes at most 256 rows in one lane.
+    const boundary = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 557);
+    const value = try store.get(alloc, &boundary);
+    alloc.free(value);
+    try std.testing.expect(state.lane == 0);
+    for (0..(replay_hints.len + 1) * 5) |_| try store.truncateReplayUpTo(alloc, 600);
+    try std.testing.expectEqual(@as(u64, 0), state.watermark);
+    for (hints) |hint| {
+        const retired = internal_keys.replayEntryKey(hint, 600);
+        try std.testing.expectError(error.NotFound, store.get(alloc, &retired));
+        const live = internal_keys.replayEntryKey(hint, 601);
+        const payload = try store.get(alloc, &live);
+        alloc.free(payload);
+    }
 }
 
 test "docstore indexes replay rows by hint and truncates them" {

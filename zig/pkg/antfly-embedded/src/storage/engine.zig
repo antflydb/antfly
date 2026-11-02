@@ -508,7 +508,7 @@ pub const VTable = struct {
     runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation: *const fn (*DB, types.CancellationToken) Outcome(void),
     finishBackgroundGraphReplacement: *const fn (*DB, []const u8, u64) Outcome(bool),
     runGroupSourceMaintenanceSlice: *const fn (*DB, *DB.GroupSourceMaintenanceState) Outcome(bool),
-    runBackgroundTurnWithCancellation: *const fn (*DB, types.CancellationToken, bool) Outcome(bool),
+    runBackgroundTurnWithCancellation: *const fn (*DB, types.CancellationToken, types.BackgroundMaintenancePhase) Outcome(bool),
     runBackgroundMaintenanceWithCancellation: *const fn (*DB, types.CancellationToken) Outcome(bool),
     registry: *const fn () Outcome(*anyopaque),
     writeValidateGroupedSourceBatch: *const fn (std.mem.Allocator, *DB, []const types.BatchWrite, []const []const u8, []const types.DocumentTransform) Outcome(void),

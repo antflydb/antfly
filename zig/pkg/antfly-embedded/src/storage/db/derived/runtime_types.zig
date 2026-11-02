@@ -46,6 +46,8 @@ const platform_time = @import("antfly_platform").time;
 
 /// Deadline and its clock travel together across executor implementations.
 pub const VisibilityWait = struct {
+    replay_budget: ?*@import("replay_budget.zig").Controller = null,
+    replay_record_cap: usize = 2048,
     cancellation: types.CancellationToken = .none,
     deadline_ns: ?u64 = null,
     clock: ?platform_clock.Clock = null,

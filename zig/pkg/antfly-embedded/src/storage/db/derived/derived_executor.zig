@@ -359,7 +359,7 @@ const ManualRuntime = struct {
         token: CatchUpSessionToken,
     };
 
-    fn catchUpWorker(self: *ManualRuntime, worker: *ManualWorker) !CatchUpResult {
+    fn catchUpWorker(self: *ManualRuntime, worker: *ManualWorker, wait: VisibilityWait) !CatchUpResult {
         const token = if (self.begin_catch_up_fn) |begin_catch_up|
             try begin_catch_up(self.ctx, worker.kind)
         else
@@ -380,6 +380,18 @@ const ManualRuntime = struct {
             }
         };
         var session = ApplySession{ .runtime = self, .token = token };
+        const lane: usize = switch (worker.kind.kind) {
+            .full_text => 0,
+            .dense_vector => 1,
+            .sparse_vector => 2,
+            .graph => 3,
+            .algebraic => 4,
+        };
+        var budget = if (wait.replay_budget) |controller| controller.budget(lane) else @import("replay_budget.zig").Budget{};
+        budget.records = @min(budget.records, wait.replay_record_cap);
+        const started = @import("antfly_platform").time.monotonicNs();
+        var completed = false;
+        defer if (!completed) if (wait.replay_budget) |controller| controller.observe(lane, budget, @import("antfly_platform").time.monotonicNs() -| started, 0, true);
         const stats = try derived_worker.catchUpIndexWithOptions(
             self.alloc,
             self.replay_source,
@@ -389,8 +401,16 @@ const ManualRuntime = struct {
             ApplySession.apply,
             .{
                 .resource_manager = self.backlog.resource_manager,
+                .max_records_per_window = if (wait.replay_budget != null) budget.records else derived_worker.catch_up_max_records_per_window_default,
+                .max_chunk_bytes = if (wait.replay_budget != null) budget.bytes else derived_worker.catch_up_max_chunk_bytes_default,
+                .max_windows_per_call = if (wait.replay_budget != null) 1 else 0,
+                .max_call_ns = if (wait.replay_budget != null) @import("replay_budget.zig").Controller.quantum_ns else 0,
+                .max_call_bytes = if (wait.replay_budget != null) budget.bytes else 0,
+                .target_sequence = if (wait.replay_budget != null) worker.target_sequence else 0,
             },
         );
+        completed = true;
+        if (wait.replay_budget) |controller| controller.observe(lane, budget, @import("antfly_platform").time.monotonicNs() -| started, stats.scanned_entries, false);
         catch_up_open = false;
         return .{ .stats = stats, .token = token };
     }
@@ -403,7 +423,7 @@ const ManualRuntime = struct {
             if (worker.paused) return error.DerivedWorkerPaused;
             try wait.check();
 
-            const result = try self.catchUpWorker(worker);
+            const result = try self.catchUpWorker(worker, wait);
             var session_open = true;
             defer {
                 if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
@@ -428,6 +448,7 @@ const ManualRuntime = struct {
                 if (!finish_result.applied_sequence_persisted) {
                     while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
                         try wait.check();
+                        if (wait.replay_budget != null) return error.EnrichmentWaitCanceled;
                         std.atomic.spinLoopHint();
                     }
                 }
@@ -453,7 +474,7 @@ const ManualRuntime = struct {
             if (worker.paused) return error.DerivedWorkerPaused;
             try wait.check();
 
-            const result = try self.catchUpWorker(worker);
+            const result = try self.catchUpWorker(worker, wait);
             var session_open = true;
             defer {
                 if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
@@ -478,6 +499,7 @@ const ManualRuntime = struct {
                 if (!finish_result.applied_sequence_persisted) {
                     while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
                         try wait.check();
+                        if (wait.replay_budget != null) return error.EnrichmentWaitCanceled;
                         std.atomic.spinLoopHint();
                     }
                 }
@@ -830,4 +852,57 @@ fn ioThreadedWaitForAll(ptr: *anyopaque, sequence: u64, wait: VisibilityWait) !v
 fn ioThreadedWaitForIndexes(ptr: *anyopaque, sequence: u64, index_names: []const []const u8, wait: VisibilityWait) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     return try runtime.waitForIndexesWithVisibilityWait(sequence, index_names, wait);
+}
+
+test "manual replay background budget persists partial progress and leaves foreground waits complete" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try @import("../../docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    for (1..65) |sequence| {
+        const payload = try @import("change_journal.zig").encodeRecord(alloc, .{
+            .sequence = @intCast(sequence),
+            .changed_doc_keys = &.{"doc"},
+            .target_hints = &.{.full_text},
+        });
+        defer alloc.free(payload);
+        try store.appendReplayOpaque(alloc, @intCast(sequence), payload);
+    }
+    const Probe = struct {
+        persisted: u64 = 0,
+        retired: u64 = 0,
+        refuse: bool = false,
+        fn apply(_: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
+            return true;
+        }
+        fn persist(ptr: *anyopaque, _: []const u8, sequence: u64, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.refuse) return false;
+            self.persisted = sequence;
+            return true;
+        }
+        fn truncate(ptr: *anyopaque, sequence: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.retired = sequence;
+        }
+    };
+    var probe: Probe = .{};
+    var executor = try initManual(alloc, replay_source_mod.Source.fromPrimaryStore(&store, null, null), &probe, Probe.apply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    defer executor.deinit(alloc);
+    try executor.addWorker("ft", .{ .name = "ft", .kind = .full_text }, 0);
+    var controller: @import("replay_budget.zig").Controller = .{};
+    const wait: VisibilityWait = .{ .replay_budget = &controller, .replay_record_cap = 8 };
+    probe.refuse = true;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, executor.waitForAllWithVisibilityWait(64, wait));
+    try std.testing.expectEqual(@as(u64, 0), executor.appliedSequence("ft").?);
+    probe.refuse = false;
+    try executor.waitForAllWithVisibilityWait(64, wait);
+    const partial = executor.appliedSequence("ft").?;
+    try std.testing.expect(partial > 0 and partial < 64);
+    try std.testing.expectEqual(partial, probe.persisted);
+    try std.testing.expectEqual(partial, probe.retired);
+    try std.testing.expect(controller.snapshot().observations >= 2);
+    try executor.waitForAll(64);
+    try std.testing.expectEqual(@as(u64, 64), executor.appliedSequence("ft").?);
 }
