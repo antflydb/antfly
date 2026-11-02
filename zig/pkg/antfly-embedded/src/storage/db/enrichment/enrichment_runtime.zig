@@ -11278,12 +11278,18 @@ test "shared PDF enrollment skips completed metadata and byte fingerprints befor
         try std.testing.expect(completed.prepared and completed.completed and !completed.enabled);
         try std.testing.expectEqual(calls_before, harness.capability_calls);
 
-        // A failure manifest must still retry even with matching source state.
-        try storePutPrivateBatchWithRetry(&runtime, &runtime.store, &.{.{ .key = manifest_key, .value = "{\"generation\":1,\"last_error\":\"failed\"}" }}, &.{});
-        var failed = SharedPdfWindowScheduler.Consumer{};
-        defer if (failed.owned_config) failed.config.deinit(alloc);
-        try std.testing.expectError(error.InferenceCapabilitiesUnavailable, scheduler.prepareConsumer(&failed, request, "{\"url\":\"https://example.test/source.pdf\"}"));
-        try std.testing.expectEqual(calls_before + 1, harness.capability_calls);
+        // Neither top-level failure nor partial failed OCR coverage is a
+        // completed extraction, even with identical source fingerprints.
+        for ([_][]const u8{
+            "{\"generation\":1,\"last_error\":\"failed\"}",
+            "{\"generation\":1,\"chunk_count\":3,\"ocr_failed_count\":1,\"ocr_failure_details\":[{\"retryable\":true}]}",
+        }, 0..) |failure_manifest, attempt| {
+            try storePutPrivateBatchWithRetry(&runtime, &runtime.store, &.{.{ .key = manifest_key, .value = failure_manifest }}, &.{});
+            var failed = SharedPdfWindowScheduler.Consumer{};
+            defer if (failed.owned_config) failed.config.deinit(alloc);
+            try std.testing.expectError(error.InferenceCapabilitiesUnavailable, scheduler.prepareConsumer(&failed, request, "{\"url\":\"https://example.test/source.pdf\"}"));
+            try std.testing.expectEqual(calls_before + attempt + 1, harness.capability_calls);
+        }
     }
 }
 
@@ -14357,7 +14363,17 @@ fn processAsset(
         const manifest = try storeGetOptionalAllocWithRetry(runtime, key);
         defer if (manifest) |value| runtime.alloc.free(value);
         if (manifest) |value| {
-            if (!try documentExtractionManifestHasLastError(runtime.alloc, value) and
+            const coverage = try @import("document_extraction_completion.zig").inspect(runtime.alloc, value);
+            if (coverage.failed and !try documentExtractionEmptyCoverageIsTerminalFailure(runtime.alloc, value)) {
+                // Partial embedded text must not acknowledge failed OCR pages.
+                // Publication is durable already; use the existing per-request
+                // retry budget/backoff and repair ledger for remaining work.
+                if (coverage.retryable and scope.shouldYield(runtime, error.ReadTransientFailure))
+                    return error.ReadTransientFailure;
+                const cause = try documentExtractionFailureCauseAlloc(runtime.alloc, value);
+                defer if (cause) |name| runtime.alloc.free(name);
+                try recordIsolatedRequestErrorNamed(runtime, window, request, cause orelse @errorName(error.DocumentExtractionProducedNoUsableText), requestAttemptNumberFor(runtime, scope.fingerprint));
+            } else if (!try documentExtractionManifestHasLastError(runtime.alloc, value) and
                 !try documentExtractionEmptyCoverageIsTerminalFailure(runtime.alloc, value))
                 try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
         }
@@ -16053,6 +16069,7 @@ fn skipRuntimeDocumentExtractionByFingerprint(
         !documentExtractionStateHasChunkUnitFingerprints(runtime.alloc, state)) return false;
     const manifest = existing_manifest orelse return false;
     if (try documentExtractionManifestHasLastError(runtime.alloc, manifest)) return false;
+    if ((try @import("document_extraction_completion.zig").inspect(runtime.alloc, manifest)).failed) return false;
     const navigation_ready = ensureRuntimeDocumentExtractionNavigationIndex(
         runtime,
         doc_key,
@@ -16488,7 +16505,9 @@ fn processDocumentExtractionAsset(
     if (existing_state) |state| {
         if (!force_reprocess and std.mem.eql(u8, state, new_state)) {
             if (existing_manifest) |value| {
-                if (!(try documentExtractionManifestHasLastError(runtime.alloc, value))) {
+                if (!(try documentExtractionManifestHasLastError(runtime.alloc, value)) and
+                    !(try @import("document_extraction_completion.zig").inspect(runtime.alloc, value)).failed)
+                {
                     _ = try ensureRuntimeDocumentExtractionNavigationIndex(
                         runtime,
                         request.doc_key,
@@ -32236,6 +32255,9 @@ fn finalizeEmptyDocumentExtractionCoverage(
 ) !void {
     const outcome = try documentExtractionEmptyCoverageOutcome(runtime.alloc, manifest_json);
     if (outcome == .terminal_failed) {
+        const coverage = try @import("document_extraction_completion.zig").inspect(runtime.alloc, manifest_json);
+        if (coverage.retryable and shouldYieldRequestErrorFor(runtime, requestFailureFingerprint(request), error.ReadTransientFailure))
+            return error.ReadTransientFailure;
         // Mainline coverage transitions revalidate terminal outcomes against
         // durable repair debt. Publish that debt before queueing the guarded
         // transition so an empty OCR failure cannot look like a healthy skip.
@@ -32243,7 +32265,7 @@ fn finalizeEmptyDocumentExtractionCoverage(
         // refusal) when there is one, not the generic empty-result wrapper.
         const cause = try documentExtractionFailureCauseAlloc(runtime.alloc, manifest_json);
         defer if (cause) |value| runtime.alloc.free(value);
-        try recordIsolatedRequestErrorNamed(runtime, window, request, cause orelse @errorName(error.DocumentExtractionProducedNoUsableText), requestAttemptNumber(runtime));
+        try recordIsolatedRequestErrorNamed(runtime, window, request, cause orelse @errorName(error.DocumentExtractionProducedNoUsableText), requestAttemptNumberFor(runtime, requestFailureFingerprint(request)));
         return;
     }
     try queueCoverageOutcomeForRequest(runtime, window, request, outcome);
