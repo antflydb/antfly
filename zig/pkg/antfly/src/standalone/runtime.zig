@@ -231,6 +231,7 @@ const InferenceRuntimeConfigWire = struct {
         ttl_ms: u64 = 300_000,
     };
 
+    audio_readers: []const antfly.transcribing.NamedConfig = &.{},
     embedded_enabled: bool = true,
     worker_environment: []const struct { name: []const u8, value: []const u8 } = &.{},
     resources: platform.resource_policy.Resources = .{},
@@ -5183,7 +5184,10 @@ pub fn runFromIterator(
     if (cli.inference_combined_budget_mb) |value| inference_resource_policy.inference.memory.max_combined_bytes = try mibToBytes(value);
     if (cli.inference_kv_budget_mb) |value| inference_resource_policy.inference.memory.max_kv_bytes = try mibToBytes(value);
     if (cli.inference_scratch_budget_mb) |value| inference_resource_policy.inference.memory.max_scratch_bytes = try mibToBytes(value);
+    const audio_readers = if (loaded_cfg) |cfg| try cfg.transcribers.hostedReaders(alloc) else try alloc.alloc(antfly.transcribing.NamedConfig, 0);
+    defer alloc.free(audio_readers);
     const inference_runtime_config_json = try std.json.Stringify.valueAlloc(alloc, InferenceRuntimeConfigWire{
+        .audio_readers = audio_readers,
         .embedded_enabled = embedded_inference_enabled,
         .worker_environment = worker_environment.items,
         .resources = inference_resource_policy,

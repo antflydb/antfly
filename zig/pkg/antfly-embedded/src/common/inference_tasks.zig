@@ -406,27 +406,12 @@ pub const Executor = struct {
             if ((asr.provider == .vertex or asr.provider == .apple) and options.language == null) options.language = "en-US";
             request.audio_options = options;
             try transcribing.validateReadOptions(asr, options);
-            if (asr.provider != .antfly) {
-                if (request.images.len != 0 or request.documents.len != 0) return error.UnsupportedAudioReadCapability;
-                if (request.prompt != null or request.max_tokens != null) return error.UnsupportedAudioReadCapability;
-                const audio_url = try readers.audioSourceUrl(a, request.audio orelse return error.InvalidInferenceRequest);
-                var result = self.transcribe(a, target.configured.name, .{
-                    .url = audio_url,
-                    .language = options.language,
-                    .timestamps = (options.timestamps orelse false) or (options.diarization orelse false),
-                    .diarization = options.diarization orelse false,
-                }) catch |err| switch (err) {
-                    error.UnsupportedTranscriptionOptions, error.UnsupportedAppleTranscriptionOptions => return error.UnsupportedAudioReadCapability,
-                    else => return err,
-                };
-                defer transcribing.deinitResponse(a, &result);
-                const json = try transcribing.readResponseJsonAlloc(a, name, asr, result, options);
-                defer a.free(json);
-                const items = try readers.documentResults(a, json);
-                return .{ .items = items, .execution = .{ .requested_items = items.len, .serial_items = items.len } };
-            }
         }
-        var cfg = try self.view.readConfig(target);
+        var cfg = if (target == .configured and target.configured.task == .transcribe and
+            (try self.view.transcribers.?.getConfig(target.configured.name)).provider != .antfly)
+            readers.Config{ .provider = .antfly, .model = try target.idAlloc(a) }
+        else
+            try self.view.readConfig(target);
         const uses_default = cfg.provider == .antfly and cfg.resolvedUrl() == null;
         if (cfg.provider == .antfly and cfg.resolvedUrl() == null and self.antfly_provider == null) if (self.inference_api_url) |endpoint| {
             cfg.api_url = try gateway.apiBaseAlloc(a, endpoint);
@@ -922,7 +907,7 @@ test "provider registry gateway qualified audio reads preserve real ASR and gene
     }
 }
 
-test "provider registry gateway hosted ASR reads preserve named defaults and original recording evidence" {
+test "provider registry gateway hosted ASR delegates document sources and defaults to the unified runtime" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -931,16 +916,19 @@ test "provider registry gateway hosted ASR reads preserve named defaults and ori
     const io = threaded.io();
     const Check = struct {
         fn request(req: httpx.testing_mod.RequestInfo) !void {
-            try std.testing.expect(std.mem.indexOf(u8, req.body, "name=\"language\"\r\n\r\nfr") != null);
-            try std.testing.expect(std.mem.indexOf(u8, req.body, "verbose_json") != null);
+            const body = try std.json.parseFromSlice(Json, std.testing.allocator, req.body, .{});
+            defer body.deinit();
+            try std.testing.expectEqualStrings("transcribers/speech", body.value.object.get("model").?.string);
+            try std.testing.expectEqualStrings("fr", body.value.object.get("audio_options").?.object.get("language").?.string);
+            try std.testing.expect(body.value.object.get("documents").?.array.items.len == 1);
         }
     };
     var server = try httpx.TestServer.start(std.testing.allocator, io, &.{.{
         .method = .POST,
-        .path = "/audio/transcriptions",
+        .path = "/ai/v1/read",
         .assert_request = Check.request,
         .respond = .{ .body =
-        \\{"text":"hello","language":"french","duration":90,"segments":[{"text":"hello","start":65,"end":66}]}
+        \\{"object":"list","model":"transcribers/speech","data":[{"object":"read","index":0,"text":"hello","source_id":"audio-0","kind":"audio","coordinate_space":"none","status":"complete","audio":{"duration_ms":90000,"language":"fr","language_source":"forced","segments":[{"text":"hello","start_ms":65000,"end_ms":66000,"text_start":0,"text_end":5}]}}]}
         },
     }});
     defer server.deinit();
@@ -951,9 +939,8 @@ test "provider registry gateway hosted ASR reads preserve named defaults and ori
     var asr = transcribing.Registry.init(a);
     defer asr.deinit();
     try asr.registerConfig("speech", .{ .provider = .openai, .model = "whisper-1", .base_url = server.baseUrl(), .api_key = "fixture", .language_code = "fr", .timestamps = true });
-    const executor = Executor{ .view = .{ .providers = &providers, .transcribers = &asr }, .http = &http, .context = .{ .io = io, .deadline_ns = null } };
+    const executor = Executor{ .view = .{ .providers = &providers, .transcribers = &asr }, .http = &http, .context = .{ .io = io, .deadline_ns = null }, .inference_api_url = server.baseUrl() };
     try std.testing.expectError(error.UnsupportedAudioReadCapability, executor.read(a, "transcribers/speech", .{ .audio = "ZmFrZQ==", .audio_options = .{ .diarization = true } }));
-    try std.testing.expectError(error.UnsupportedAudioReadCapability, executor.read(a, "transcribers/speech", .{ .audio = "ZmFrZQ==", .images = &.{"image"} }));
     var failure: ?anyerror = null;
     var group = std.Io.Group.init;
     defer group.cancel(io);
@@ -965,7 +952,7 @@ test "provider registry gateway hosted ASR reads preserve named defaults and ori
         }
     };
     try group.concurrent(io, Serve.run, .{ &server, &failure });
-    var result = try executor.read(a, "transcribers/speech", .{ .audio = "ZmFrZQ==" });
+    var result = try executor.read(a, "transcribers/speech", .{ .documents = &.{.{ .id = "audio-0", .url = "data:audio/wav;base64,ZmFrZQ==", .media_type = "audio/wav" }} });
     defer result.deinit(a);
     try group.await(io);
     if (failure) |err| return err;

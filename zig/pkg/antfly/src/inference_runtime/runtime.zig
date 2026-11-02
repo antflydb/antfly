@@ -667,7 +667,10 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         },
     );
 
+    const audio_readers = if (loaded_config) |*config| try config.transcribers.hostedReaders(alloc) else &.{};
+    defer alloc.free(audio_readers);
     var node = try InferenceNode.init(alloc, .{
+        .audio_readers = audio_readers,
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .max_loaded_models = model_settings.max_loaded_models,

@@ -788,3 +788,21 @@ def test_audio_read_preserves_options_and_temporal_evidence(duration_ms):
     client = AntflyClient("http://test")
     install_transport(client, httpx.MockTransport(handle))
     assert client.read(request).to_dict() == payload
+
+
+@pytest.mark.parametrize("model", ["transcribers/meeting", "generators/multimodal"])
+@pytest.mark.parametrize("duration_ms", [500, None])
+def test_untimed_audio_read_decodes_actual_null_metadata(model, duration_ms):
+    from antfly.client_generated.models import InferenceReadRequest
+
+    payload = {
+        "object": "list", "model": model, "usage": None,
+        "data": [{"object": "read", "index": 0, "kind": "audio",
+                  "coordinate_space": "none", "origin": "transcription",
+                  "status": "complete", "text": "hello",
+                  "audio": {"duration_ms": duration_ms, "language": None,
+                            "language_source": "unknown", "segments": None, "speakers": None}}],
+    }
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(lambda _: httpx.Response(200, json=payload)))
+    assert client.read(InferenceReadRequest(model=model, audio="AAAA")).to_dict() == payload

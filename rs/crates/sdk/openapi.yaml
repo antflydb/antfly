@@ -51582,6 +51582,7 @@ components:
           type: string
         granularity:
           type: string
+          nullable: true
           enum:
             - phrase
             - window
@@ -51609,6 +51610,7 @@ components:
           description: Exclusive end UTF-8 byte offset in the containing read result text.
         speaker:
           type: string
+          nullable: true
           description: Speaker label when diarization was requested and established.
     InferenceAudioReadMetadata:
       type: object
@@ -51626,6 +51628,7 @@ components:
             does not report duration.
         language:
           type: string
+          nullable: true
         language_source:
           type: string
           enum:
@@ -51634,10 +51637,12 @@ components:
             - unknown
         segments:
           type: array
+          nullable: true
           items:
             $ref: '#/components/schemas/InferenceAudioReadSegment'
         speakers:
           type: array
+          nullable: true
           items:
             type: string
     InferenceReadRequest:

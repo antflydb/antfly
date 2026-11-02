@@ -79,18 +79,18 @@ pub const AudioReadCapabilities = struct {
 pub const AudioReadMetadata = struct {
     /// Decoded recording duration in milliseconds. Null when a remote recognition provider does not report duration.
     duration_ms: ?i64,
-    language: ?[]const u8 = null,
+    language: OpenApiOptionalNullable([]const u8) = .absent,
     language_source: ?[]const u8 = null,
-    segments: ?[]const AudioReadSegment = null,
-    speakers: ?[]const []const u8 = null,
+    segments: OpenApiOptionalNullable([]const AudioReadSegment) = .absent,
+    speakers: OpenApiOptionalNullable([]const []const u8) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "duration_ms", "duration_ms", false },
-        .{ "language", "language", true },
+        .{ "language", "language", false },
         .{ "language_source", "language_source", true },
-        .{ "segments", "segments", true },
-        .{ "speakers", "speakers", true },
+        .{ "segments", "segments", false },
+        .{ "speakers", "speakers", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -105,21 +105,42 @@ pub const AudioReadMetadata = struct {
         try jw.beginObject();
         try jw.objectField("duration_ms");
         try jw.write(self.duration_ms);
-        if (self.language) |value| {
-            try jw.objectField("language");
-            try jw.write(value);
+        switch (self.language) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("language");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("language");
+                try jw.write(value);
+            },
         }
         if (self.language_source) |value| {
             try jw.objectField("language_source");
             try jw.write(value);
         }
-        if (self.segments) |value| {
-            try jw.objectField("segments");
-            try jw.write(value);
+        switch (self.segments) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("segments");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("segments");
+                try jw.write(value);
+            },
         }
-        if (self.speakers) |value| {
-            try jw.objectField("speakers");
-            try jw.write(value);
+        switch (self.speakers) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("speakers");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("speakers");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -170,7 +191,7 @@ pub const AudioReadOptions = struct {
 pub const AudioReadSegment = struct {
     text: []const u8,
     /// phrase uses recognizer-supplied phrase clocks; window provides only the original recognition-window bounds. Neither claims word alignment. Absent means unspecified.
-    granularity: ?[]const u8 = null,
+    granularity: OpenApiOptionalNullable([]const u8) = .absent,
     /// Start in milliseconds relative to the original recording.
     start_ms: i64,
     /// Exclusive end in milliseconds relative to the original recording.
@@ -180,34 +201,22 @@ pub const AudioReadSegment = struct {
     /// Exclusive end UTF-8 byte offset in the containing read result text.
     text_end: i64,
     /// Speaker label when diarization was requested and established.
-    speaker: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "text", "text", false },
-        .{ "granularity", "granularity", true },
-        .{ "start_ms", "start_ms", false },
-        .{ "end_ms", "end_ms", false },
-        .{ "text_start", "text_start", false },
-        .{ "text_end", "text_end", false },
-        .{ "speaker", "speaker", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
+    speaker: OpenApiOptionalNullable([]const u8) = .absent,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("text");
         try jw.write(self.text);
-        if (self.granularity) |value| {
-            try jw.objectField("granularity");
-            try jw.write(value);
+        switch (self.granularity) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("granularity");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("granularity");
+                try jw.write(value);
+            },
         }
         try jw.objectField("start_ms");
         try jw.write(self.start_ms);
@@ -217,9 +226,16 @@ pub const AudioReadSegment = struct {
         try jw.write(self.text_start);
         try jw.objectField("text_end");
         try jw.write(self.text_end);
-        if (self.speaker) |value| {
-            try jw.objectField("speaker");
-            try jw.write(value);
+        switch (self.speaker) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("speaker");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("speaker");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }

@@ -283,6 +283,9 @@ pub fn Service(comptime Node: type) type {
             const def: c.Definition = if (known_definition) |known| known else if (definition_bytes) |data| (try c.Definition.parse(a, data)).value else .{
                 .models = try a.dupe(c.Binding, &.{.{ .name = "reader", .model = request.model, .operation = .read, .input = if (audio_request) .audio else .image }}),
                 .read = .{ .reader = "reader" },
+                // A direct invocation explicitly selects its deployment leaf.
+                // Composed definitions retain their own remote-call policy.
+                .allow_remote = true,
                 // Keep one-shot ASR source and execution headroom. The node's
                 // content-security, admission and caller deadline still cap
                 // these defaults; composed definitions own their own budgets.
@@ -576,8 +579,10 @@ pub fn Service(comptime Node: type) type {
                     }
                     if (graph.get(key) == null) try graph.plans.append(a, .{ .key = key, .definition = child });
                     try preflight(node, a, key, child, graph, next_stack, remote_allowed and def.allow_remote);
-                } else if (graph.snapshot(binding) == null) {
-                    try graph.snapshots.append(a, try node.documentResolveBinding(a, binding));
+                } else {
+                    const pinned = graph.snapshot(binding) orelse try node.documentResolveBinding(a, binding);
+                    if (pinned.remote and (!remote_allowed or !def.allow_remote)) return error.RemoteDocumentModelDenied;
+                    if (graph.snapshot(binding) == null) try graph.snapshots.append(a, pinned);
                 }
             }
         }

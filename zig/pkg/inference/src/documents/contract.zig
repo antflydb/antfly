@@ -43,7 +43,7 @@ pub const Binding = struct {
     max_total_tokens: ?u64 = null,
 };
 /// Captured before inference. Paths never appear in public run metadata.
-pub const Snapshot = struct { binding: Binding, path: []const u8, identity: [32]u8, max_total_tokens: u64 = 131072 };
+pub const Snapshot = struct { remote: bool = false, binding: Binding, path: []const u8, identity: [32]u8, max_total_tokens: u64 = 131072 };
 pub const Limits = struct {
     max_sources: usize = 64,
     max_pages: usize = 1024,

@@ -19893,6 +19893,7 @@ test "httpx inference gateway preserves framed media through raw and named nativ
         operation: []const u8 = "",
         calls: usize = 0,
         chunk: bool = false,
+        expected_model: []const u8 = "backend",
         fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
             check(context) catch |err| return inference_connection_abi.statusFromError(err);
             return .ok;
@@ -19911,13 +19912,13 @@ test "httpx inference gateway preserves framed media through raw and named nativ
             const parsed = try std.json.parseFromSlice(std.json.Value, a, envelope.metadata, .{});
             defer parsed.deinit();
             const model = if (self.chunk) parsed.value.object.get("config").?.object.get("model").? else parsed.value.object.get("model").?;
-            try std.testing.expectEqualStrings(if (self.chunk) "fixed" else "backend", model.string);
+            try std.testing.expectEqualStrings(if (self.chunk) "fixed" else self.expected_model, model.string);
             context.out_response.* = .{ .status = 200, .body = .{ .ptr = (try a.dupe(u8, "{}")).ptr, .len = 2 } };
         }
     };
     const a = std.testing.allocator;
     var config = try common_config.Config.parseFromSlice(a,
-        \\{"public_inference":{"enabled":true},"inference_capabilities":{"generators/native":{"images":"supported"}},"chunkers":{"paragraphs":{"provider":"antfly","model":"fixed"}},"extractors":{"entities":{"connection":"local-inference","model":"backend"}},"generators":{"native":{"provider":"antfly","model":"backend"}}}
+        \\{"public_inference":{"enabled":true},"inference_capabilities":{"generators/native":{"images":"supported","audio":"supported"}},"transcribers":{"speech":{"provider":"openai","model":"whisper-1"}},"chunkers":{"paragraphs":{"provider":"antfly","model":"fixed"}},"extractors":{"entities":{"connection":"local-inference","model":"backend"}},"generators":{"native":{"provider":"antfly","model":"backend"}}}
     );
     defer config.deinit();
     var state: State = .{};
@@ -19925,14 +19926,18 @@ test "httpx inference gateway preserves framed media through raw and named nativ
     var server = ApiHttpServer.init(a, .{ .node_config = &config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &state, .invoke = State.invoke } }, source.iface(), null, null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
-    const Case = struct { path: []const u8, operation: []const u8, body: []const u8 };
+    const Case = struct { path: []const u8, operation: []const u8, body: []const u8, model: []const u8 = "backend" };
     for ([_]Case{
+        .{ .path = "read", .operation = "read", .model = "transcribers/speech", .body = "{\"model\":\"transcribers/speech\",\"audio\":\"attachment:0\",\"retain_artifact\":true}" },
         .{ .path = "read", .operation = "read", .body = "{\"model\":\"local/backend\",\"images\":[{\"url\":\"attachment:0\"}]}" },
+        .{ .path = "read", .operation = "read", .body = "{\"model\":\"generators/native\",\"images\":[{\"url\":\"attachment:0\"}]}" },
+        .{ .path = "read", .operation = "read", .body = "{\"model\":\"generators/native\",\"audio\":\"attachment:0\"}" },
         .{ .path = "read", .operation = "read", .body = "{\"model\":\"local/backend\",\"audio\":\"attachment:0\",\"audio_options\":{\"timestamps\":true}}" },
         .{ .path = "extract", .operation = "extract", .body = "{\"model\":\"extractors/entities\",\"input\":[{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}]}" },
         .{ .path = "chunk", .operation = "chunk", .body = "{\"model\":\"chunkers/paragraphs\",\"input\":{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}}" },
         .{ .path = "generate", .operation = "generate", .body = "{\"model\":\"generators/native\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"media\",\"data\":\"attachment:0\",\"mime_type\":\"image/png\"}]}]}" },
     }) |case| {
+        state.expected_model = case.model;
         state.operation = case.operation;
         state.chunk = std.mem.eql(u8, case.path, "chunk");
         const url = try std.fmt.allocPrint(a, "http://localhost/ai/v1/{s}", .{case.path});

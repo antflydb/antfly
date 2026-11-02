@@ -406,6 +406,14 @@ credentials when inheriting the runtime URL: `bearer_token` takes precedence
 over `api_key`, followed by the default runtime credential. Sessions preserve
 the selected alias and its credential policy for every follow-up.
 
+Hosted OpenAI, Cloudflare, Vertex, and Apple recognizers are audio leaves in the
+same document service as local ASR. Configure the named `transcribers` on the
+inference host (standalone forwards these configs to its embedded runtime).
+Reads accept audio document sources and `retain_artifact`, preserving source
+IDs and temporal evidence. Composed readers bind `transcribers/<name>` with
+`input: audio`; hosted network calls require `allow_remote: true` throughout
+the composition. Provider credentials stay in deployment configuration.
+
 Synthesis uses existing `text_to_speech` configs. OpenAI supports its configured
 speech formats; Vertex supports MP3, WAV and Ogg Opus; ElevenLabs currently
 supports MP3 at normal speed. Unsupported formats and S3-output options fail

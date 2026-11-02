@@ -2905,25 +2905,27 @@ components:
       required: [text, start_ms, end_ms, text_start, text_end]
       properties:
         text: {type: string}
-        granularity: {type: string, enum: [phrase, window], description: "phrase uses recognizer-supplied phrase clocks; window provides only the original recognition-window bounds. Neither claims word alignment. Absent means unspecified."}
+        granularity: {type: string, nullable: true, enum: [phrase, window], description: "phrase uses recognizer-supplied phrase clocks; window provides only the original recognition-window bounds. Neither claims word alignment. Absent means unspecified."}
         start_ms: {type: integer, format: int64, minimum: 0, description: Start in milliseconds relative to the original recording.}
         end_ms: {type: integer, format: int64, minimum: 0, description: Exclusive end in milliseconds relative to the original recording.}
         text_start: {type: integer, format: int64, minimum: 0, description: Start UTF-8 byte offset in the containing read result text.}
         text_end: {type: integer, format: int64, minimum: 0, description: Exclusive end UTF-8 byte offset in the containing read result text.}
-        speaker: {type: string, description: Speaker label when diarization was requested and established.}
+        speaker: {type: string, nullable: true, description: Speaker label when diarization was requested and established.}
     AudioReadMetadata:
       type: object
       required: [duration_ms]
       description: Recognition evidence for the audio track only. Video frames are not captioned. Absent segments and speakers make no alignment or speaker claim.
       properties:
         duration_ms: {type: integer, format: int64, nullable: true, minimum: 0, description: Decoded recording duration in milliseconds. Null when a remote recognition provider does not report duration.}
-        language: {type: string}
+        language: {type: string, nullable: true}
         language_source: {type: string, enum: [forced, detected, unknown]}
         segments:
           type: array
+          nullable: true
           items: {$ref: '#/components/schemas/AudioReadSegment'}
         speakers:
           type: array
+          nullable: true
           items: {type: string}
     ReadRequest:
       type: object

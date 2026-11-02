@@ -24,38 +24,52 @@ class InferenceAudioReadMetadata:
         Attributes:
             duration_ms (int | None): Decoded recording duration in milliseconds. Null when a remote recognition provider
                 does not report duration.
-            language (str | Unset):
+            language (None | str | Unset):
             language_source (InferenceAudioReadMetadataLanguageSource | Unset):
-            segments (list[InferenceAudioReadSegment] | Unset):
-            speakers (list[str] | Unset):
+            segments (list[InferenceAudioReadSegment] | None | Unset):
+            speakers (list[str] | None | Unset):
     """
 
     duration_ms: int | None
-    language: str | Unset = UNSET
+    language: None | str | Unset = UNSET
     language_source: InferenceAudioReadMetadataLanguageSource | Unset = UNSET
-    segments: list[InferenceAudioReadSegment] | Unset = UNSET
-    speakers: list[str] | Unset = UNSET
+    segments: list[InferenceAudioReadSegment] | None | Unset = UNSET
+    speakers: list[str] | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         duration_ms: int | None
         duration_ms = self.duration_ms
 
-        language = self.language
+        language: None | str | Unset
+        if isinstance(self.language, Unset):
+            language = UNSET
+        else:
+            language = self.language
 
         language_source: str | Unset = UNSET
         if not isinstance(self.language_source, Unset):
             language_source = self.language_source.value
 
-        segments: list[dict[str, Any]] | Unset = UNSET
-        if not isinstance(self.segments, Unset):
+        segments: list[dict[str, Any]] | None | Unset
+        if isinstance(self.segments, Unset):
+            segments = UNSET
+        elif isinstance(self.segments, list):
             segments = []
-            for segments_item_data in self.segments:
-                segments_item = segments_item_data.to_dict()
-                segments.append(segments_item)
+            for segments_type_0_item_data in self.segments:
+                segments_type_0_item = segments_type_0_item_data.to_dict()
+                segments.append(segments_type_0_item)
 
-        speakers: list[str] | Unset = UNSET
-        if not isinstance(self.speakers, Unset):
+        else:
+            segments = self.segments
+
+        speakers: list[str] | None | Unset
+        if isinstance(self.speakers, Unset):
+            speakers = UNSET
+        elif isinstance(self.speakers, list):
+            speakers = self.speakers
+
+        else:
             speakers = self.speakers
 
         field_dict: dict[str, Any] = {}
@@ -89,7 +103,14 @@ class InferenceAudioReadMetadata:
 
         duration_ms = _parse_duration_ms(d.pop("duration_ms"))
 
-        language = d.pop("language", UNSET)
+        def _parse_language(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        language = _parse_language(d.pop("language", UNSET))
 
         _language_source = d.pop("language_source", UNSET)
         language_source: InferenceAudioReadMetadataLanguageSource | Unset
@@ -98,16 +119,44 @@ class InferenceAudioReadMetadata:
         else:
             language_source = InferenceAudioReadMetadataLanguageSource(_language_source)
 
-        _segments = d.pop("segments", UNSET)
-        segments: list[InferenceAudioReadSegment] | Unset = UNSET
-        if _segments is not UNSET:
-            segments = []
-            for segments_item_data in _segments:
-                segments_item = InferenceAudioReadSegment.from_dict(segments_item_data)
+        def _parse_segments(data: object) -> list[InferenceAudioReadSegment] | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, list):
+                    raise TypeError()
+                segments_type_0 = []
+                _segments_type_0 = data
+                for segments_type_0_item_data in _segments_type_0:
+                    segments_type_0_item = InferenceAudioReadSegment.from_dict(segments_type_0_item_data)
 
-                segments.append(segments_item)
+                    segments_type_0.append(segments_type_0_item)
 
-        speakers = cast(list[str], d.pop("speakers", UNSET))
+                return segments_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(list[InferenceAudioReadSegment] | None | Unset, data)
+
+        segments = _parse_segments(d.pop("segments", UNSET))
+
+        def _parse_speakers(data: object) -> list[str] | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, list):
+                    raise TypeError()
+                speakers_type_0 = cast(list[str], data)
+
+                return speakers_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(list[str] | None | Unset, data)
+
+        speakers = _parse_speakers(d.pop("speakers", UNSET))
 
         inference_audio_read_metadata = cls(
             duration_ms=duration_ms,

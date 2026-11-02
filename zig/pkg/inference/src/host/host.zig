@@ -112,6 +112,7 @@ const LinkedResourceBudgetContext = struct {
 };
 
 const InferenceRuntimeConfig = struct {
+    audio_readers: []const @import("antfly_transcribing").NamedConfig = &.{},
     embedded_enabled: bool = true,
     /// Environment forwarded only when a server host launches its worker.
     worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
@@ -831,6 +832,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     errdefer if (owned_ml_dir) |path| alloc.free(path);
 
     var node_config = inference.server.NodeConfig{
+        .audio_readers = runtime_config.value.audio_readers,
         .models_dir = context.models_dir.slice() orelse owned_models_dir.?,
         .ml_dir = context.ml_dir.slice() orelse owned_ml_dir.?,
         .generation_budget_overrides = .{

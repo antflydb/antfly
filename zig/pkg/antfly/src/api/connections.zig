@@ -532,6 +532,21 @@ fn resolveInferenceConnection(
     }
 
     const config = node_config orelse return error.ConnectionNotFound;
+    if (std.mem.startsWith(u8, connection_id, "generators/")) {
+        if (!std.mem.eql(u8, operation, "read")) return error.UnsupportedInferenceOperation;
+        const cfg = config.registry.getGeneratorConfig(connection_id["generators/".len..]) catch return error.ConnectionNotFound;
+        if (cfg.provider != .antfly) return error.ProviderNotAntflyCompatible;
+        const uses_default = cfg.url.len == 0;
+        if (uses_default) if (local_target) |target| return .{ .local = target };
+        const url = if (uses_default) config.inference.api_url orelse return error.ConnectionURLMissing else cfg.url;
+        if (!validInferenceURL(url)) return error.InvalidConnectionURL;
+        return .{ .remote = .{
+            .url = url,
+            .api_key = cfg.api_key orelse (if (uses_default) config.inference.api_key else null),
+            .preserve_api_path = !uses_default,
+            .credential_env = "ANTFLY_INFERENCE_API_KEY",
+        } };
+    }
     inline for (.{ "readers", "transcribers" }) |family| {
         const prefix = family ++ "/";
         if (std.mem.startsWith(u8, connection_id, prefix)) {
@@ -2723,4 +2738,29 @@ test "httpx inference connection reading replaces one-shot transcription" {
     try std.testing.expect(inferenceCapability("transcribe") == null);
     try std.testing.expectEqualStrings("models.transcribe", inferenceCapability("dictate").?);
     try std.testing.expectEqualStrings("models.transcribe", inferenceCapability("transcription/sessions").?);
+}
+
+test "httpx inference gateway generator read aliases retain endpoint credentials and admission" {
+    const Local = struct {
+        fn invoke(_: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            return .ok;
+        }
+    };
+    const a = std.testing.allocator;
+    var cfg = try common_config.Config.parseFromSlice(a, "{\"inference\":{\"api_url\":\"https://runtime\",\"api_key\":\"default-token\"}}");
+    defer cfg.deinit();
+    try cfg.registry.registerGeneratorConfig("inherited", .{ .provider = .antfly, .model = "gemma", .url = "" });
+    try cfg.registry.registerGeneratorConfig("remote", .{ .provider = .antfly, .model = "gemma", .url = "https://remote/custom/ai/v1", .api_key = "generator-token" });
+    try cfg.registry.registerGeneratorConfig("unkeyed", .{ .provider = .antfly, .model = "gemma", .url = "https://unkeyed/ai/v1" });
+    var marker: u8 = 0;
+    const local: LocalInferenceConnectionTarget = .{ .capabilities = 0, .context = &marker, .invoke = Local.invoke };
+    try std.testing.expectEqual(InferenceAdmissionOwner.target, try inferenceConnectionAdmissionOwner(&cfg, local, "generators/inherited", "read"));
+    const inherited = try resolveInferenceConnection(&cfg, null, "generators/inherited", "read");
+    try std.testing.expectEqualStrings("default-token", inherited.remote.api_key.?);
+    const remote = try resolveInferenceConnection(&cfg, local, "generators/remote", "read");
+    try std.testing.expectEqualStrings("https://remote/custom/ai/v1", remote.remote.url);
+    try std.testing.expectEqualStrings("generator-token", remote.remote.api_key.?);
+    try std.testing.expect(remote.remote.preserve_api_path);
+    try std.testing.expectEqual(InferenceAdmissionOwner.caller, try inferenceConnectionAdmissionOwner(&cfg, local, "generators/remote", "read"));
+    try std.testing.expect((try resolveInferenceConnection(&cfg, local, "generators/unkeyed", "read")).remote.api_key == null);
 }

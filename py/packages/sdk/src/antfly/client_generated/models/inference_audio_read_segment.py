@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -24,7 +24,7 @@ class InferenceAudioReadSegment:
         granularity (InferenceAudioReadSegmentGranularity | Unset): phrase uses recognizer-supplied phrase clocks;
             window provides only the original recognition-window bounds. Neither claims word alignment. Absent means
             unspecified.
-        speaker (str | Unset): Speaker label when diarization was requested and established.
+        speaker (None | str | Unset): Speaker label when diarization was requested and established.
     """
 
     text: str
@@ -33,7 +33,7 @@ class InferenceAudioReadSegment:
     text_start: int
     text_end: int
     granularity: InferenceAudioReadSegmentGranularity | Unset = UNSET
-    speaker: str | Unset = UNSET
+    speaker: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -51,7 +51,11 @@ class InferenceAudioReadSegment:
         if not isinstance(self.granularity, Unset):
             granularity = self.granularity.value
 
-        speaker = self.speaker
+        speaker: None | str | Unset
+        if isinstance(self.speaker, Unset):
+            speaker = UNSET
+        else:
+            speaker = self.speaker
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -91,7 +95,14 @@ class InferenceAudioReadSegment:
         else:
             granularity = InferenceAudioReadSegmentGranularity(_granularity)
 
-        speaker = d.pop("speaker", UNSET)
+        def _parse_speaker(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        speaker = _parse_speaker(d.pop("speaker", UNSET))
 
         inference_audio_read_segment = cls(
             text=text,

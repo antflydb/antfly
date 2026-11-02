@@ -214,6 +214,11 @@ pub fn getActiveRuntime() ?*const Runtime {
     return active_runtime;
 }
 
+/// Deployment-owned audio leaves available to document orchestration.
+/// Names stay in the transcribers namespace; credentials never enter requests
+/// or document definitions.
+pub const NamedConfig = struct { name: []const u8, config: Config };
+
 pub const Registry = struct {
     allocator: Allocator,
     configs: std.StringArrayHashMapUnmanaged(Config) = .{},
@@ -221,6 +226,16 @@ pub const Registry = struct {
 
     pub fn init(alloc: Allocator) Registry {
         return .{ .allocator = alloc };
+    }
+
+    /// Borrow configuration strings for the lifetime of this registry.
+    pub fn hostedReaders(self: *const Registry, a: Allocator) ![]NamedConfig {
+        var out = std.ArrayList(NamedConfig).empty;
+        errdefer out.deinit(a);
+        for (self.configs.keys(), self.configs.values()) |name, cfg| {
+            if (cfg.provider != .antfly) try out.append(a, .{ .name = name, .config = cfg });
+        }
+        return out.toOwnedSlice(a);
     }
 
     pub fn deinit(self: *Registry) void {
@@ -921,7 +936,7 @@ pub fn readResponseJsonAlloc(a: Allocator, model: []const u8, cfg: Config, respo
                 };
                 if (!known) try speakers.append(a, label);
             }
-            try segments.append(a, .{ .text = content, .granularity = "phrase", .text_start = @intCast(offset), .text_end = @intCast(cursor), .start_ms = start, .end_ms = end, .speaker = speaker });
+            try segments.append(a, .{ .text = content, .granularity = .{ .value = "phrase" }, .text_start = @intCast(offset), .text_end = @intCast(cursor), .start_ms = start, .end_ms = end, .speaker = .fromNullable(speaker) });
         }
         if (text.len > 0 and segments.items.len == 0) return error.UnsupportedAudioReadCapability;
     }
@@ -937,10 +952,10 @@ pub fn readResponseJsonAlloc(a: Allocator, model: []const u8, cfg: Config, respo
         .status = response.status orelse if (text.len == 0) "unresolved" else "complete",
         .audio = .{
             .duration_ms = response.duration_ms,
-            .language = options.language orelse response.language,
+            .language = .fromNullable(options.language orelse response.language),
             .language_source = if (options.language != null) "forced" else if (response.language != null and (cfg.provider == .openai or cfg.provider == .cloudflare)) "detected" else "unknown",
-            .segments = if (alignment) segments.items else null,
-            .speakers = if (options.diarization orelse false) speakers.items else null,
+            .segments = .fromNullable(if (alignment) segments.items else null),
+            .speakers = .fromNullable(if (options.diarization orelse false) speakers.items else null),
         },
     }};
     return std.json.Stringify.valueAlloc(a, inference_api.ReadResponse{ .object = "list", .model = model, .data = &items, .usage = null }, .{});
@@ -964,8 +979,8 @@ test "audio read hosted adapters preserve temporal evidence and reject unsupport
     const item = parsed.value.data[0];
     try std.testing.expectEqualStrings("truncated", item.status.?);
     try std.testing.expectEqualStrings("forced", item.audio.?.language_source.?);
-    try std.testing.expectEqual(@as(i64, 65000), item.audio.?.segments.?[0].start_ms);
-    try std.testing.expectEqual(@as(i64, 5), item.audio.?.segments.?[0].text_end);
+    try std.testing.expectEqual(@as(i64, 65000), item.audio.?.segments.valueOrNull().?[0].start_ms);
+    try std.testing.expectEqual(@as(i64, 5), item.audio.?.segments.valueOrNull().?[0].text_end);
     try std.testing.expect(parsed.value.usage == null);
     const unknown = try readResponseJsonAlloc(a, "speech", cfg, .{ .text = "" }, .{});
     defer a.free(unknown);
@@ -984,9 +999,9 @@ pub fn fromReadObjectAlloc(alloc: Allocator, first: inference_api.types.ReadObje
     };
     errdefer deinitResponse(alloc, &response);
     response.status = try dupOpt(alloc, first.status);
-    response.language = try dupOpt(alloc, if (metadata) |value| value.language else null);
-    if (if (metadata) |value| value.segments else null) |api_segments| response.segments = try antflySegmentsAlloc(alloc, api_segments);
-    if (if (metadata) |value| value.speakers else null) |api_speakers| response.speakers = try antflySpeakersAlloc(alloc, api_speakers);
+    response.language = try dupOpt(alloc, if (metadata) |value| value.language.valueOrNull() else null);
+    if (if (metadata) |value| value.segments.valueOrNull() else null) |api_segments| response.segments = try antflySegmentsAlloc(alloc, api_segments);
+    if (if (metadata) |value| value.speakers.valueOrNull() else null) |api_speakers| response.speakers = try antflySpeakersAlloc(alloc, api_speakers);
     return response;
 }
 
@@ -1009,7 +1024,7 @@ fn antflySegmentsAlloc(alloc: Allocator, api_segments: []const inference_api.typ
             .start_ms = api_segment.start_ms,
             .end_ms = api_segment.end_ms,
             .words = words,
-            .speaker = try dupOpt(alloc, api_segment.speaker),
+            .speaker = try dupOpt(alloc, api_segment.speaker.valueOrNull()),
         };
         filled += 1;
     }

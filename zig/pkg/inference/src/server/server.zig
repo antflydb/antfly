@@ -1241,6 +1241,7 @@ pub fn httpBodyLimitBytesFromMib(mib: usize) error{InvalidHttpBodyLimit}!usize {
 pub const RequestLimits = platform.resource_policy.InferenceRequestLimits;
 
 pub const NodeConfig = struct {
+    audio_readers: []const transcribing_api.NamedConfig = &.{},
     chunking_limits: @import("../pipelines/media_chunk_limits.zig").Limits = .{},
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -20437,6 +20438,7 @@ pub const Node = struct {
     /// Read spans reader/ASR/generator storage. Other operations retain their
     /// own task namespace and may intentionally share a model identifier.
     pub fn documentDefinition(self: *Node, a: std.mem.Allocator, name: []const u8, operation: document_contract.Operation) !?[]const u8 {
+        if (self.hostedAudioReader(name) != null) return null;
         if (std.mem.eql(u8, name, "antfly/native-document") or std.fs.path.isAbsolute(name)) return null;
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*owned| owned.deinit();
@@ -20467,6 +20469,17 @@ pub const Node = struct {
     }
 
     pub fn documentResolveBinding(self: *Node, a: std.mem.Allocator, binding: document_contract.Binding) !document_contract.Snapshot {
+        if (self.hostedAudioReader(binding.model)) |cfg| {
+            if (binding.operation != .read or binding.input != .audio) return error.DocumentCapabilityMismatch;
+            // Physical model identity excludes credentials and request defaults:
+            // two aliases for one recognizer cannot act as independent verifiers.
+            var identity: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ .provider = cfg.provider, .model = cfg.model, .endpoint = cfg.resolvedUrl(), .account = cfg.account_id, .project = cfg.project_id, .location = cfg.location }, .{}), &identity, .{});
+            if (binding.model_identity) |expected| {
+                if (!std.mem.eql(u8, expected, &std.fmt.bytesToHex(identity, .lower))) return error.DocumentModelRevisionMismatch;
+            }
+            return .{ .remote = cfg.provider != .apple, .binding = binding, .path = binding.model, .identity = identity };
+        }
         if (std.mem.eql(u8, binding.model, "antfly/native-document") and binding.operation == .read and binding.input == .image) return .{ .binding = binding, .path = binding.model, .identity = @splat(0) };
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*owned| owned.deinit();
@@ -20723,9 +20736,75 @@ pub const Node = struct {
         origin: document_contract.Origin = .transcription,
     };
 
+    fn hostedAudioReader(self: *Node, name: []const u8) ?transcribing_api.Config {
+        const prefix = "transcribers/";
+        if (!std.mem.startsWith(u8, name, prefix)) return null;
+        for (self.config.audio_readers) |entry| {
+            if (std.mem.eql(u8, name[prefix.len..], entry.name)) return entry.config;
+        }
+        return null;
+    }
+
+    fn hostedAudioOptions(cfg: transcribing_api.Config, supplied: AudioOptions) AudioOptions {
+        const defaults = transcribing_api.requestDefaults(cfg);
+        var options = supplied.withDefaults(.{ .language = defaults.language, .timestamps = defaults.timestamps, .diarization = defaults.diarization });
+        if ((cfg.provider == .vertex or cfg.provider == .apple) and options.language == null) options.language = "en-US";
+        return options;
+    }
+
+    fn readHostedAudio(self: *Node, a: std.mem.Allocator, name: []const u8, original: transcribing_api.Config, bytes: []const u8, supplied: AudioOptions, control: InferenceExecutionControl) !AudioReadOutput {
+        try control.check();
+        const options = hostedAudioOptions(original, supplied);
+        var cfg = original;
+        // Hosted leaves consume the source already downloaded and verified by
+        // the document service, including its aggregate byte budget.
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*owned| owned.deinit();
+        const io = self.inferenceIo(a, control.io, &owned_io);
+        var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer client.deinit();
+        if (cfg.provider == .cloudflare and cfg.bearer_token == null and cfg.api_key == null) cfg.bearer_token = platform.env.getenv("CLOUDFLARE_API_TOKEN");
+        const Cancel = struct {
+            fn cancelled(raw: *const anyopaque) bool {
+                const current: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+                return if (current.cancellation) |token| token.isCancelled() else false;
+            }
+        };
+        var response = try transcribing_api.transcribeWithConfig(a, &client, cfg, .{
+            .url = "antfly:resolved-audio",
+            .language = options.language,
+            .timestamps = (options.timestamps orelse false) or (options.diarization orelse false),
+            .diarization = options.diarization orelse false,
+        }, .{
+            .resolved_audio = bytes,
+            .timeout_ms = if (control.deadline_ns) |deadline| @max(1, (deadline -| platform.time.monotonicNs()) / std.time.ns_per_ms) else null,
+            .cancellation = httpx.CancellationToken.fromCallback(&control, Cancel.cancelled),
+        });
+        defer transcribing_api.deinitResponse(a, &response);
+        try control.check();
+        const json = try transcribing_api.readResponseJsonAlloc(a, name, cfg, response, .{ .language = options.language, .timestamps = options.timestamps, .diarization = options.diarization });
+        defer a.free(json);
+        var parsed = try std.json.parseFromSlice(api.ReadResponse, a, json, .{});
+        defer parsed.deinit();
+        const row = parsed.value.data[0];
+        const text = try a.dupe(u8, row.text);
+        errdefer a.free(text);
+        return .{
+            .text = text,
+            .truncated = if (row.status) |status| std.mem.eql(u8, status, "truncated") else false,
+            .unresolved = if (row.status) |status| std.mem.eql(u8, status, "unresolved") else text.len == 0,
+            .audio_json = try std.json.Stringify.valueAlloc(a, row.audio.?, .{}),
+        };
+    }
+
     /// Validate the selected backend before source download or model loading.
     /// Storage namespaces are independent of the public read operation.
     pub fn documentValidateAudioOptions(self: *Node, a: std.mem.Allocator, path: []const u8, options: AudioOptions, prompt: ?[]const u8, max_tokens: ?i64) !void {
+        if (self.hostedAudioReader(path)) |cfg| {
+            if (prompt != null or max_tokens != null) return error.UnsupportedAudioReadCapability;
+            const effective = hostedAudioOptions(cfg, options);
+            return transcribing_api.validateReadOptions(cfg, .{ .language = effective.language, .timestamps = effective.timestamps, .diarization = effective.diarization });
+        }
         var manifest = try manifest_mod.loadListingFromDir(a, path);
         defer manifest.deinit();
         try @import("../documents/audio.zig").capabilities(manifest.model_type == .transcriber).validate(options);
@@ -20741,6 +20820,7 @@ pub const Node = struct {
     /// service; this adapter owns physical decode/model admission and release.
     pub fn documentReadAudio(self: *Node, a: std.mem.Allocator, model_path: []const u8, bytes: []const u8, prompt: ?[]const u8, max_tokens: ?i64, options: AudioOptions, supplied_control: InferenceExecutionControl) !AudioReadOutput {
         try self.documentValidateAudioOptions(a, model_path, options, prompt, max_tokens);
+        if (self.hostedAudioReader(model_path)) |cfg| return self.readHostedAudio(a, model_path, cfg, bytes, options, supplied_control);
         const control = self.bindExecutionControl(null, supplied_control);
         try control.check();
         var manifest = try manifest_mod.loadListingFromDir(a, model_path);
@@ -47484,4 +47564,80 @@ test "LightOnOCR3 serial and cohort CUDA admission charge persistent recurrent s
     try std.testing.expectEqual(first.backend_scratch_bytes * 2, cohort.amounts.backend_scratch_bytes);
     try std.testing.expectEqual(first.backend_kv_bytes * 2, cohort.amounts.backend_kv_bytes);
     try std.testing.expectEqual(peak, cohort.decoder_backend_peak);
+}
+
+test "hosted audio document sources composition and retained artifacts share orchestration" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "name=\"language\"\r\n\r\nfr") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "verbose_json") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "RIFF") != null);
+        }
+    };
+    const reply = httpx.testing_mod.ResponseSpec{ .body =
+        \\{"text":"hello","language":"french","duration":90,"segments":[{"text":"hello","start":65,"end":66}]}
+    };
+    var upstream = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/audio/transcriptions", .assert_request = Check.request, .respond = reply },
+        .{ .method = .POST, .path = "/audio/transcriptions", .assert_request = Check.request, .respond = reply },
+    });
+    defer upstream.deinit();
+    var failure: ?anyerror = null;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    const Serve = struct {
+        fn run(server: *httpx.TestServer, err: *?anyerror) std.Io.Cancelable!void {
+            for (0..2) |_| server.handleOne() catch |problem| {
+                err.* = problem;
+                return;
+            };
+        }
+    };
+    try group.concurrent(io, Serve.run, .{ &upstream, &failure });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "readers/test/composed");
+    try tmp.dir.writeFile(io, .{ .sub_path = "readers/test/composed/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "readers/test/composed/document_agent.json", .data =
+        \\{"allow_remote":true,"models":[{"name":"speech","model":"transcribers/meeting","operation":"read","input":"audio"}],"read":{"reader":"speech"}}
+    });
+    const models = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(models);
+    const configs = [_]transcribing_api.NamedConfig{.{ .name = "meeting", .config = .{ .provider = .openai, .model = "whisper-1", .base_url = upstream.baseUrl(), .api_key = "fixture", .language_code = "fr", .timestamps = true } }};
+    var node = try Node.init(a, .{ .models_dir = models, .audio_readers = &configs });
+    defer node.deinit();
+    try node.attachIo(io);
+    try std.testing.expectError(error.UnsupportedAudioReadCapability, node.documentValidateAudioOptions(a, "transcribers/meeting", .{ .diarization = true }, null, null));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const wav = "RIFF\x26\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00data\x02\x00\x00\x00\x00\x00";
+    const encoded = try work.alloc(u8, std.base64.standard.Encoder.calcSize(wav.len));
+    _ = std.base64.standard.Encoder.encode(encoded, wav);
+    const uri = try std.fmt.allocPrint(work, "data:audio/wav;base64,{s}", .{encoded});
+    for ([_][]const u8{ "transcribers/meeting", "test/composed" }) |model| {
+        const body = try std.json.Stringify.valueAlloc(work, .{ .model = model, .retain_artifact = true, .documents = .{.{ .id = "recording", .url = uri, .media_type = "audio/wav" }} }, .{});
+        const output = try node.readDocumentsJsonWithControl(a, body, .{ .io = io });
+        defer a.free(output);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, work, output, .{});
+        const row = parsed.object.get("data").?.array.items[0].object;
+        try std.testing.expectEqualStrings("recording", row.get("source_id").?.string);
+        try std.testing.expectEqualStrings("complete", row.get("status").?.string);
+        try std.testing.expectEqualStrings("hello", row.get("text").?.string);
+        const metadata = row.get("audio").?.object;
+        try std.testing.expectEqualStrings("fr", metadata.get("language").?.string);
+        try std.testing.expectEqual(@as(i64, 65000), metadata.get("segments").?.array.items[0].object.get("start_ms").?.integer);
+        const handle = parsed.object.get("document").?.object.get("artifact_id").?.string;
+        const retained = try node.readDocumentArtifact(a, handle);
+        defer a.free(retained);
+        const saved = try std.json.parseFromSliceLeaky(std.json.Value, work, retained, .{});
+        try std.testing.expectEqualStrings("hello", saved.object.get("data").?.array.items[0].object.get("text").?.string);
+    }
+    try group.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
 }

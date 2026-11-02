@@ -23605,9 +23605,9 @@ export interface components {
             text: string;
             /**
              * @description phrase uses recognizer-supplied phrase clocks; window provides only the original recognition-window bounds. Neither claims word alignment. Absent means unspecified.
-             * @enum {string}
+             * @enum {string|null}
              */
-            granularity?: "phrase" | "window";
+            granularity?: "phrase" | "window" | null;
             /**
              * Format: int64
              * @description Start in milliseconds relative to the original recording.
@@ -23629,7 +23629,7 @@ export interface components {
              */
             text_end: number;
             /** @description Speaker label when diarization was requested and established. */
-            speaker?: string;
+            speaker?: string | null;
         };
         /** @description Recognition evidence for the audio track only. Video frames are not captioned. Absent segments and speakers make no alignment or speaker claim. */
         InferenceAudioReadMetadata: {
@@ -23638,11 +23638,11 @@ export interface components {
              * @description Decoded recording duration in milliseconds. Null when a remote recognition provider does not report duration.
              */
             duration_ms: number | null;
-            language?: string;
+            language?: string | null;
             /** @enum {string} */
             language_source?: "forced" | "detected" | "unknown";
-            segments?: components["schemas"]["InferenceAudioReadSegment"][];
-            speakers?: string[];
+            segments?: components["schemas"]["InferenceAudioReadSegment"][] | null;
+            speakers?: string[] | null;
         };
         /** @description Read exactly one of images, documents, or audio using capability-aware reader dispatch, with provenance and completion status. Supported video containers are read from their audio track only. */
         InferenceReadRequest: {
