@@ -46,6 +46,47 @@ pub const LiveInterval = struct {
     buffer_slot: u32 = 0,
 };
 
+/// Execution order and output lifetime are policy; dependency analysis is
+/// shared by interval planning, interpreters and physical allocation plans.
+pub const LivenessOptions = struct {
+    reachable: ?[]const bool = null,
+    /// Node ID to execution ordinal. The caller establishes unique ordinals.
+    positions: ?[]const u32 = null,
+    outputs: ?[]const NodeId = null,
+    output_end: u32 = std.math.maxInt(u32),
+    unused: enum { unbounded, creation } = .unbounded,
+    validate_schedule: bool = false,
+};
+
+pub fn computeLastUse(allocator: std.mem.Allocator, graph: *const Graph, options: LivenessOptions) ![]u32 {
+    const count = graph.nodeCount();
+    if (options.reachable) |reachable| if (reachable.len != count) return error.InvalidReachability;
+    if (options.positions) |positions| if (positions.len != count) return error.InvalidExecutionSchedule;
+    const last_use = try allocator.alloc(u32, count);
+    errdefer allocator.free(last_use);
+    @memset(last_use, std.math.maxInt(u32));
+    for (0..count) |i| {
+        if (options.reachable) |reachable| if (!reachable[i]) continue;
+        const position = if (options.positions) |positions| positions[i] else @as(u32, @intCast(i));
+        if (position >= count) return error.InvalidExecutionSchedule;
+        for (graph.node(@intCast(i)).getInputs()) |input| {
+            if (input == null_node) continue;
+            if (input >= count) return error.InvalidGraphInput;
+            const producer = if (options.positions) |positions| positions[input] else input;
+            if (options.validate_schedule and producer >= position) return error.InvalidExecutionSchedule;
+            if (last_use[input] == std.math.maxInt(u32) or position > last_use[input]) last_use[input] = position;
+        }
+    }
+    if (options.unused == .creation) for (last_use, 0..) |*end, i| {
+        if (end.* == std.math.maxInt(u32)) end.* = if (options.positions) |positions| positions[i] else @intCast(i);
+    };
+    for (options.outputs orelse graph.outputs.items) |output| {
+        if (output >= count) return error.InvalidGraphOutput;
+        last_use[output] = @max(last_use[output], options.output_end);
+    }
+    return last_use;
+}
+
 /// Compute liveness intervals for all reachable nodes.
 pub fn computeLiveness(
     allocator: std.mem.Allocator,
@@ -54,28 +95,12 @@ pub fn computeLiveness(
 ) ![]LiveInterval {
     const count = graph.nodeCount();
 
-    // Compute last-use for each node
-    const last_use = try allocator.alloc(u32, count);
+    const last_use = try computeLastUse(allocator, graph, .{ .reachable = reachable });
     defer allocator.free(last_use);
-    @memset(last_use, std.math.maxInt(u32));
-
-    for (0..count) |i| {
-        if (!reachable[i]) continue;
-        const n = graph.node(@intCast(i));
-        for (n.getInputs()) |input_id| {
-            if (input_id != null_node and input_id < count) {
-                last_use[input_id] = @intCast(i);
-            }
-        }
-    }
-
-    // Mark output nodes as live forever
-    for (graph.outputs.items) |out_id| {
-        last_use[out_id] = std.math.maxInt(u32);
-    }
 
     // Build intervals for reachable nodes
     var intervals = std.ArrayListUnmanaged(LiveInterval).empty;
+    errdefer intervals.deinit(allocator);
     for (0..count) |i| {
         if (!reachable[i]) continue;
         const node_id: NodeId = @intCast(i);
@@ -132,6 +157,7 @@ pub fn planBuffers(
     reachable: []const bool,
 ) !BufferPlan {
     const intervals = try computeLiveness(allocator, graph, reachable);
+    errdefer allocator.free(intervals);
 
     // Track which slots are free (end time of current occupant)
     var slot_ends = std.ArrayListUnmanaged(u32).empty;
@@ -281,4 +307,76 @@ test "planBuffers output gets unique slot" {
     const x_slot = plan.slotForNode(x).?;
     const out_slot = plan.slotForNode(out).?;
     try std.testing.expect(x_slot != out_slot);
+}
+
+test "shared liveness preserves reachable handles and scheduled physical lifetimes" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const x = try b.parameter("x", Shape.init(.f32, &.{4}));
+    const early = try b.neg(x);
+    const late = try b.sqrt(x);
+    const out = try b.add(early, late);
+    _ = try b.neg(x); // Unreachable for interpretation, scheduled by the caller below.
+    try g.markOutput(out);
+    try std.testing.expectEqual(@as(u32, 5), g.nodeCount());
+    const reachable = try dce.computeReachable(a, &g);
+    defer a.free(reachable);
+    const handles = try computeLastUse(a, &g, .{ .reachable = reachable });
+    defer a.free(handles);
+    const forever = std.math.maxInt(u32);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 3, forever, forever }, handles);
+    const physical = try computeLastUse(a, &g, .{
+        .positions = &.{ 0, 2, 1, 3, 4 },
+        .output_end = 5,
+        .unused = .creation,
+        .validate_schedule = true,
+    });
+    defer a.free(physical);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 3, 3, 5, 4 }, physical);
+    const selected = try computeLastUse(a, &g, .{ .outputs = &.{early}, .output_end = 5, .unused = .creation });
+    defer a.free(selected);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 5, 3, 3, 4 }, selected);
+}
+
+test "shared liveness rejects malformed schedules and graph edges without leaking" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const x = try b.parameter("x", Shape.init(.f32, &.{4}));
+    const y = try b.neg(x);
+    try g.markOutput(y);
+    try std.testing.expectError(error.InvalidReachability, computeLastUse(a, &g, .{ .reachable = &.{true} }));
+    try std.testing.expectError(error.InvalidExecutionSchedule, computeLastUse(a, &g, .{ .positions = &.{0} }));
+    try std.testing.expectError(error.InvalidExecutionSchedule, computeLastUse(a, &g, .{ .positions = &.{ 1, 0 }, .validate_schedule = true }));
+    try std.testing.expectError(error.InvalidExecutionSchedule, computeLastUse(a, &g, .{ .positions = &.{ 0, 2 } }));
+    try std.testing.expectError(error.InvalidGraphOutput, computeLastUse(a, &g, .{ .outputs = &.{2} }));
+    g.nodeMut(y).inputs[0] = 2;
+    try std.testing.expectError(error.InvalidGraphInput, computeLastUse(a, &g, .{}));
+}
+
+fn checkPlanningAllocationFailures(a: std.mem.Allocator, graph: *const Graph, reachable: []const bool) !void {
+    const intervals = try computeLiveness(a, graph, reachable);
+    defer a.free(intervals);
+    var plan = try planBuffers(a, graph, reachable);
+    defer plan.deinit();
+}
+
+test "memory planning cleans intervals on every allocation failure" {
+    const a = std.testing.allocator;
+    // The short chain reaches failures after intervals transfer to planBuffers;
+    // the long chain also fails while the liveness interval list is growing.
+    for ([_]usize{ 2, 24 }) |length| {
+        var g = Graph.init(a);
+        defer g.deinit();
+        var b = Builder.init(&g);
+        var output = try b.parameter("x", Shape.init(.f32, &.{4}));
+        for (0..length) |_| output = try b.neg(output);
+        try g.markOutput(output);
+        const reachable = try dce.computeReachable(a, &g);
+        defer a.free(reachable);
+        try std.testing.checkAllAllocationFailures(a, checkPlanningAllocationFailures, .{ &g, reachable });
+    }
 }

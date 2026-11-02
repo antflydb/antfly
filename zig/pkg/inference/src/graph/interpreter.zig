@@ -567,26 +567,7 @@ fn markReachable(graph: *const Graph, reachable: []bool, id: NodeId) void {
 /// Compute the last node index that uses each node as an input.
 /// Used for liveness-based tensor freeing.
 pub fn computeLastUse(allocator: std.mem.Allocator, graph: *const Graph, reachable: []const bool) ![]u32 {
-    const count = graph.nodeCount();
-    const last_use = try allocator.alloc(u32, count);
-    @memset(last_use, std.math.maxInt(u32)); // "no use" sentinel
-
-    for (0..count) |i| {
-        if (!reachable[i]) continue;
-        const n = graph.node(@intCast(i));
-        for (n.getInputs()) |input_id| {
-            if (input_id != null_node and input_id < count) {
-                last_use[input_id] = @intCast(i);
-            }
-        }
-    }
-
-    // Output nodes are live beyond the graph — mark them as never freed
-    for (graph.outputs.items) |out_id| {
-        last_use[out_id] = std.math.maxInt(u32);
-    }
-
-    return last_use;
+    return ml.graph.passes.memory.computeLastUse(allocator, graph, .{ .reachable = reachable });
 }
 
 /// Compute the last use of every backing-storage alias group.

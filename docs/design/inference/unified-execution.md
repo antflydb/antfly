@@ -93,6 +93,13 @@ preparation API do not by themselves complete these remaining requirements:
   remain workload-specific. Traced resources are scoped to the exact backend
   context; switching contexts retires device bindings while preserving semantic
   graphs and analysis. ONNX initializers retain their shared immutable context.
+- ML interval planning, interpreter/native/Metal handle retirement and the
+  physical buffer plan share one dependency liveness analyzer in
+  `lib/ml/graph/passes/memory.zig`. Reachability, actual submission ordinals,
+  selected outputs and their lifetime bounds are explicit policy. Physical
+  backing-view propagation and conservative donation groups retain their
+  storage-specific rules. Allocation-failure tests cover interval growth and
+  transfer of interval ownership into the reusable-slot plan.
 - Assigned outputs/workspace cover admitted native/CUDA descriptors, while Metal
   consumes its existing physical allocation plan. Prepared CUDA graphs with full
   assigned-kernel coverage can capture the plan's stable output, workspace,

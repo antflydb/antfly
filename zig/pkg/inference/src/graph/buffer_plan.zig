@@ -641,36 +641,17 @@ fn lifetimesOverlap(a_first: u32, a_last: u32, b_first: u32, b_last: u32) bool {
     return a_first <= b_last and b_first <= a_last;
 }
 
-fn computeLastUse(
-    allocator: std.mem.Allocator,
-    graph: *const Graph,
-    output_nodes: []const NodeId,
-    positions: []const u32,
-) ![]u32 {
-    const node_count: usize = @intCast(graph.nodeCount());
-    const last_use = try allocator.alloc(u32, node_count);
-    errdefer allocator.free(last_use);
-    @memcpy(last_use, positions);
-
-    for (0..node_count) |i| {
-        const node_id: NodeId = @intCast(i);
-        const n = graph.node(node_id);
-        for (n.getInputs()) |input_id| {
-            if (input_id == null_node) continue;
-            const input_index: usize = @intCast(input_id);
-            if (input_index >= node_count) return error.InvalidGraphInput;
-            if (positions[input_index] >= positions[i]) return error.InvalidPartitionSchedule;
-            last_use[input_index] = @max(last_use[input_index], positions[i]);
-        }
-    }
-
-    const output_last_use: u32 = @intCast(node_count);
-    for (output_nodes) |node_id| {
-        const index: usize = @intCast(node_id);
-        if (index >= node_count) return error.InvalidGraphOutput;
-        last_use[index] = @max(last_use[index], output_last_use);
-    }
-    return last_use;
+fn computeLastUse(allocator: std.mem.Allocator, graph: *const Graph, output_nodes: []const NodeId, positions: []const u32) ![]u32 {
+    return ml.graph.passes.memory.computeLastUse(allocator, graph, .{
+        .positions = positions,
+        .outputs = output_nodes,
+        .output_end = @intCast(graph.nodeCount()),
+        .unused = .creation,
+        .validate_schedule = true,
+    }) catch |err| switch (err) {
+        error.InvalidExecutionSchedule => error.InvalidPartitionSchedule,
+        else => err,
+    };
 }
 
 fn markOutputs(
