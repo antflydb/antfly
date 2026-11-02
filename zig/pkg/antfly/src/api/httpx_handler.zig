@@ -1638,6 +1638,9 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    const ha_catalog_replication_sources_unsupported_body =
+        "{\"error\":\"REPLICATION_SOURCES_REQUIRE_CLUSTER\",\"message\":\"Postgres CDC replication sources are not supported with a hot-standby catalog; run a cluster to use CDC\"}";
+
     fn respondJsonErrorBody(ctx: *httpx.Context, status: u16, body: []const u8) !httpx.Response {
         _ = ctx.status(status);
         try ctx.setHeader("content-type", "application/json");
@@ -8066,6 +8069,7 @@ pub const AntflyApiHandler = struct {
             },
             error.EmbeddingProbeUnavailable => {
                 _ = ctx.status(503);
+                try ctx.setHeader("Retry-After", "1");
                 return ctx.text("table index validation probe unavailable");
             },
             else => return err,
@@ -8095,6 +8099,7 @@ pub const AntflyApiHandler = struct {
             },
             error.EmbeddingProbeUnavailable => {
                 _ = ctx.status(503);
+                try ctx.setHeader("Retry-After", "1");
                 return ctx.text("table index validation probe unavailable");
             },
             error.InvalidCreateTableRequest, error.ChatGPTInteractiveOnly => {
@@ -8272,6 +8277,7 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("initial foreign key generations require coordinated parent-owner publication; create the table without foreign keys, then add them through a schema update");
                 },
                 error.ObjectTablePlacementUnsupported => return textResponse(ctx, 400, "object tables do not accept num_shards or replication sources"),
+                error.HACatalogReplicationSourcesUnsupported => return respondJsonErrorBody(ctx, 400, ha_catalog_replication_sources_unsupported_body),
                 error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => {
                     _ = ctx.status(400);
                     return ctx.text("vector_store requires a fresh local single-shard standalone table without replication");
@@ -9250,7 +9256,13 @@ pub const AntflyApiHandler = struct {
         const binding = (try self.resolvePublicTableBinding(ctx, name, &identity)) orelse return ctx.response.build();
         defer binding.deinit(ctx.allocator);
         const module = @import("managed_sources.zig");
-        const bytes = (if (mutate) module.configure(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity), (try ctx.body()) orelse "") else module.status(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity))) catch |err| return jsonErrorResponse(ctx, @import("lake_catalog_http.zig").errorStatus(err), @errorName(err));
+        const bytes = (if (mutate) module.configure(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity), (try ctx.body()) orelse "") else module.status(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity))) catch |err| {
+            // Same typed rejection table creation uses: an HA primary never
+            // replicates, so this reports it the same way regardless of
+            // which endpoint tripped over the restriction.
+            if (err == error.HACatalogReplicationSourcesUnsupported) return respondJsonErrorBody(ctx, 400, ha_catalog_replication_sources_unsupported_body);
+            return jsonErrorResponse(ctx, @import("lake_catalog_http.zig").errorStatus(err), @errorName(err));
+        };
         defer ctx.allocator.free(bytes);
         try ctx.setHeader("content-type", "application/json");
         _ = ctx.response.body(bytes);

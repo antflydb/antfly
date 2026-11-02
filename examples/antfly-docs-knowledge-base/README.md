@@ -21,6 +21,9 @@ and lets Antfly do the rest:
 It runs on embedded Antfly Lite (a single `.aflite` file) by default, or
 against a running Antfly server with `-url` or `ANTFLY_URL`.
 
+The [knowledge graph guide](../../docs/guides/knowledge-graph.mdx) walks
+through the same index configuration with `curl` against a server.
+
 Sections are tagged by path: `guide` (docs/guides and top-level docs pages),
 `reference`, `design` (subsystem docs), `plan` (docs/plans), and `work-log`
 (dated history).

@@ -32,8 +32,20 @@ const platform_time = @import("antfly_platform").time;
 const provider_limits = @import("../common/provider_limits.zig");
 const credential_identity = @import("../common/credential_source_identity.zig");
 const provider_defaults = @import("antfly_inference_provider_defaults");
+const repair_failure = @import("../storage/db/repair_failure.zig");
 
 const remote_generate_max_timeout_ms: u64 = 300_000;
+
+/// The embedded engine reports an admission refusal (work that never ran)
+/// differently depending on the call route: the ABI boundary preserves the
+/// raw `error.ResourceTemporarilyUnavailable`-class error the shared
+/// `repair_failure` classifier recognizes, while the JSON/tool-calling route
+/// decodes a structured 503 into `error.GenerationCapacityUnavailable`.
+/// Treat either as retryable with a bounded wait, like the enrichment and
+/// probe paths.
+fn isEmbeddedGenerationAdmissionRefusal(err: anyerror) bool {
+    return repair_failure.isAdmissionRefusal(err) or err == error.GenerationCapacityUnavailable;
+}
 
 pub const ChatGPTFailure = chatgpt_responses.Failure;
 pub const Role = lib.Role;
@@ -704,6 +716,15 @@ const BackendState = struct {
                 const has_tool_history = for (messages) |message| {
                     if (message.tool_calls != null or message.tool_call_id != null or message.role == .tool) break true;
                 } else false;
+                // Used only to check and wait during admission retries below;
+                // the dispatch calls keep passing self.request_context (which
+                // may be null) unchanged. Hoisted above the JSON branch so
+                // every admission-retry loop in this provider arm shares one
+                // deadline/cancellation view instead of each guarding
+                // self.request_context separately.
+                const linked_context = self.request_context orelse self.execution.requestContext(
+                    self.execution.io orelse self.io orelse std.Io.Threaded.global_single_threaded.io(),
+                );
                 if (self.require_completion and local.generate_json == null) return error.UnsupportedInferenceFeature;
                 if (local.generate_json != null and (self.require_completion or self.cfg.tools_json != null or self.cfg.tool_choice_json != null or self.cfg.response_format_json != null or has_tool_history)) {
                     const body = try inference.types.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .termite_native, .{
@@ -724,24 +745,49 @@ const BackendState = struct {
                     });
                     defer alloc.free(body);
                     self.notifyLocalSubmission();
-                    const response = try local.generateJson(alloc, body, self.request_context);
+                    // An admission refusal means this generation request never
+                    // ran: retry it with a bounded wait, like the enrichment and
+                    // probe paths, instead of failing the query immediately on a
+                    // transient model-loading or scratch-budget race.
+                    const response = admit_json: {
+                        var attempt: u32 = 1;
+                        var remaining_budget_ns: u64 = repair_failure.default_admission_retry_budget_ns;
+                        while (true) {
+                            try repair_failure.checkAdmissionDispatch(linked_context);
+                            if (local.generateJson(alloc, body, self.request_context)) |value| break :admit_json value else |err| {
+                                if (!isEmbeddedGenerationAdmissionRefusal(err)) return err;
+                                const delay_ns = (try repair_failure.nextAdmissionRetryDelayNs(linked_context, attempt, &remaining_budget_ns)) orelse return err;
+                                try repair_failure.admissionRetryWaitNs(linked_context, delay_ns);
+                                attempt += 1;
+                            }
+                        }
+                    };
                     defer alloc.free(response);
                     if (self.usage_observer) |usage_sink| if (provider_limits.responseUsage(response)) |usage| usage_sink.record(usage.input_tokens, usage.output_tokens);
                     break :blk try antfly_provider.Provider.parseGenerationResponse(alloc, response, self.cfg.tools_json, self.cfg.tool_choice_json);
                 }
                 if (self.cfg.tools_json != null or self.cfg.tool_choice_json != null or self.cfg.response_format_json != null) return error.UnsupportedGeneratorProvider;
                 const options = try inference.GenerationOptions.fromMaxTokens(self.cfg.max_tokens);
-                const linked_context = self.request_context orelse self.execution.requestContext(
-                    self.execution.io orelse self.io orelse std.Io.Threaded.global_single_threaded.io(),
-                );
                 if (local.generate_messages_with_context) |generate_messages| {
                     self.notifyLocalSubmission();
-                    const content = try managed_embedder.AntflyProviderBoundary.call(
-                        "generate_messages_with_context",
-                        local.boundary_dispatch,
-                        generate_messages,
-                        .{ local.ptr, alloc, model, messages, options, linked_context },
-                    );
+                    const content = admit_msg_ctx: {
+                        var attempt: u32 = 1;
+                        var remaining_budget_ns: u64 = repair_failure.default_admission_retry_budget_ns;
+                        while (true) {
+                            try repair_failure.checkAdmissionDispatch(linked_context);
+                            if (managed_embedder.AntflyProviderBoundary.call(
+                                "generate_messages_with_context",
+                                local.boundary_dispatch,
+                                generate_messages,
+                                .{ local.ptr, alloc, model, messages, options, linked_context },
+                            )) |value| break :admit_msg_ctx value else |err| {
+                                if (!isEmbeddedGenerationAdmissionRefusal(err)) return err;
+                                const delay_ns = (try repair_failure.nextAdmissionRetryDelayNs(linked_context, attempt, &remaining_budget_ns)) orelse return err;
+                                try repair_failure.admissionRetryWaitNs(linked_context, delay_ns);
+                                attempt += 1;
+                            }
+                        }
+                    };
                     break :blk inference.GenerateResult{
                         .content = content,
                         .allocator = alloc,
@@ -749,12 +795,24 @@ const BackendState = struct {
                 }
                 if (local.generate_messages) |generate_messages| {
                     self.notifyLocalSubmission();
-                    const content = try managed_embedder.AntflyProviderBoundary.call(
-                        "generate_messages",
-                        local.boundary_dispatch,
-                        generate_messages,
-                        .{ local.ptr, alloc, model, messages, options },
-                    );
+                    const content = admit_msg: {
+                        var attempt: u32 = 1;
+                        var remaining_budget_ns: u64 = repair_failure.default_admission_retry_budget_ns;
+                        while (true) {
+                            try repair_failure.checkAdmissionDispatch(linked_context);
+                            if (managed_embedder.AntflyProviderBoundary.call(
+                                "generate_messages",
+                                local.boundary_dispatch,
+                                generate_messages,
+                                .{ local.ptr, alloc, model, messages, options },
+                            )) |value| break :admit_msg value else |err| {
+                                if (!isEmbeddedGenerationAdmissionRefusal(err)) return err;
+                                const delay_ns = (try repair_failure.nextAdmissionRetryDelayNs(linked_context, attempt, &remaining_budget_ns)) orelse return err;
+                                try repair_failure.admissionRetryWaitNs(linked_context, delay_ns);
+                                attempt += 1;
+                            }
+                        }
+                    };
                     break :blk inference.GenerateResult{
                         .content = content,
                         .allocator = alloc,
@@ -772,22 +830,35 @@ const BackendState = struct {
                     contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
                 }
                 if (local.generate_text_with_context != null or local.generate_text != null) self.notifyLocalSubmission();
-                const content = if (local.generate_text_with_context) |generate_text|
-                    try managed_embedder.AntflyProviderBoundary.call(
-                        "generate_text_with_context",
-                        local.boundary_dispatch,
-                        generate_text,
-                        .{ local.ptr, alloc, model, roles, contents, options, linked_context },
-                    )
-                else if (local.generate_text) |generate_text|
-                    try managed_embedder.AntflyProviderBoundary.call(
-                        "generate_text",
-                        local.boundary_dispatch,
-                        generate_text,
-                        .{ local.ptr, alloc, model, roles, contents, options },
-                    )
-                else
-                    return error.UnsupportedGeneratorProvider;
+                const content = admit_text: {
+                    var attempt: u32 = 1;
+                    var remaining_budget_ns: u64 = repair_failure.default_admission_retry_budget_ns;
+                    while (true) {
+                        try repair_failure.checkAdmissionDispatch(linked_context);
+                        const attempt_result = if (local.generate_text_with_context) |generate_text|
+                            managed_embedder.AntflyProviderBoundary.call(
+                                "generate_text_with_context",
+                                local.boundary_dispatch,
+                                generate_text,
+                                .{ local.ptr, alloc, model, roles, contents, options, linked_context },
+                            )
+                        else if (local.generate_text) |generate_text|
+                            managed_embedder.AntflyProviderBoundary.call(
+                                "generate_text",
+                                local.boundary_dispatch,
+                                generate_text,
+                                .{ local.ptr, alloc, model, roles, contents, options },
+                            )
+                        else
+                            return error.UnsupportedGeneratorProvider;
+                        if (attempt_result) |value| break :admit_text value else |err| {
+                            if (!isEmbeddedGenerationAdmissionRefusal(err)) return err;
+                            const delay_ns = (try repair_failure.nextAdmissionRetryDelayNs(linked_context, attempt, &remaining_budget_ns)) orelse return err;
+                            try repair_failure.admissionRetryWaitNs(linked_context, delay_ns);
+                            attempt += 1;
+                        }
+                    }
+                };
                 break :blk inference.GenerateResult{
                     .content = content,
                     .allocator = alloc,
@@ -1167,6 +1238,210 @@ test "generating backend routes antfly and url-less antfly to local provider" {
         .request_context = .{ .io = io, .deadline_ns = null },
     }, &tool_messages));
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
+test "generating backend retries embedded antfly admission refusals within budget" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const FakeLocal = struct {
+        calls: usize = 0,
+        failures_remaining: usize,
+
+        fn embedDenseTexts(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return a.alloc([]f32, 0);
+        }
+        fn embedSparseTexts(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return a.alloc(@import("../storage/db/enrichment/embedder.zig").SparseEmbedding, 0);
+        }
+        fn generateTextWithContext(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            _: []const u8,
+            _: []const []const u8,
+            _: []const []const u8,
+            _: inference.GenerationOptions,
+            context: RequestContext,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            self.calls += 1;
+            if (self.failures_remaining > 0) {
+                self.failures_remaining -= 1;
+                return error.ResourceTemporarilyUnavailable;
+            }
+            return try a.dupe(u8, "recovered");
+        }
+    };
+
+    var fake = FakeLocal{ .failures_remaining = 2 };
+    const local_provider = managed_embedder.AntflyProvider{
+        .ptr = &fake,
+        .embed_dense_texts = FakeLocal.embedDenseTexts,
+        .embed_sparse_texts = FakeLocal.embedSparseTexts,
+        .generate_text_with_context = FakeLocal.generateTextWithContext,
+    };
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
+    const antfly_chain = [_]ChainLink{.{
+        .generator = .{ .provider = .antfly, .model = "local-model", .url = "", .max_tokens = 128 },
+    }};
+    // No deadline: only the shared admission-retry budget bounds the wait,
+    // which has generous headroom above the two short backoffs below spend.
+    var result = try executeChainWithOptions(alloc, &client, &antfly_chain, .{
+        .antfly_provider = local_provider,
+        .request_context = .{ .io = io, .deadline_ns = null },
+    }, &messages);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("recovered", result.content);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "generating backend review retry must not dispatch after deadline" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const FakeLocal = struct {
+        calls: usize = 0,
+        fn embedDenseTexts(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return a.alloc([]f32, 0);
+        }
+        fn embedSparseTexts(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return a.alloc(@import("../storage/db/enrichment/embedder.zig").SparseEmbedding, 0);
+        }
+        fn generateTextWithContext(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            _: []const u8,
+            _: []const []const u8,
+            _: []const []const u8,
+            _: inference.GenerationOptions,
+            _: RequestContext,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = a;
+            self.calls += 1;
+            // Always an admission refusal: a real provider never admits this
+            // call, so any retry attempt beyond the first proves the loop
+            // dispatched again after the deadline should have stopped it.
+            return error.ResourceTemporarilyUnavailable;
+        }
+    };
+
+    var fake = FakeLocal{};
+    const local_provider = managed_embedder.AntflyProvider{
+        .ptr = &fake,
+        .embed_dense_texts = FakeLocal.embedDenseTexts,
+        .embed_sparse_texts = FakeLocal.embedSparseTexts,
+        .generate_text_with_context = FakeLocal.generateTextWithContext,
+    };
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
+    const antfly_chain = [_]ChainLink{.{
+        .generator = .{ .provider = .antfly, .model = "local-model", .url = "", .max_tokens = 128 },
+    }};
+    const started = platform_time.monotonicNs();
+    const result = executeChainWithOptions(alloc, &client, &antfly_chain, .{
+        .antfly_provider = local_provider,
+        .request_context = .{ .io = io, .deadline_ns = started + 50 * std.time.ns_per_ms },
+    }, &messages);
+    const elapsed_ms = (platform_time.monotonicNs() - started) / std.time.ns_per_ms;
+    if (result) |value| {
+        var mutable = value;
+        mutable.deinit();
+    } else |err| {
+        try std.testing.expect(err == error.Timeout or err == error.Cancelled);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    // The pre-fix unconditional sleep held this for the full first backoff
+    // (500ms) regardless of the 50ms deadline; a correct bounded wait never
+    // sleeps meaningfully past the deadline.
+    try std.testing.expect(elapsed_ms < 500);
+}
+
+test "generating backend admission retry cancellation returns promptly" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const FakeLocal = struct {
+        calls: usize = 0,
+        fn embedDenseTexts(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return a.alloc([]f32, 0);
+        }
+        fn embedSparseTexts(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return a.alloc(@import("../storage/db/enrichment/embedder.zig").SparseEmbedding, 0);
+        }
+        fn generateTextWithContext(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            _: []const u8,
+            _: []const []const u8,
+            _: []const []const u8,
+            _: inference.GenerationOptions,
+            _: RequestContext,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = a;
+            self.calls += 1;
+            return error.ResourceTemporarilyUnavailable;
+        }
+    };
+
+    var fake = FakeLocal{};
+    const local_provider = managed_embedder.AntflyProvider{
+        .ptr = &fake,
+        .embed_dense_texts = FakeLocal.embedDenseTexts,
+        .embed_sparse_texts = FakeLocal.embedSparseTexts,
+        .generate_text_with_context = FakeLocal.generateTextWithContext,
+    };
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
+    const antfly_chain = [_]ChainLink{.{
+        .generator = .{ .provider = .antfly, .model = "local-model", .url = "", .max_tokens = 128 },
+    }};
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    const Canceller = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            platform_time.sleepNs(30 * std.time.ns_per_ms);
+            flag.store(true, .release);
+        }
+    };
+    const canceller = try std.Thread.spawn(.{}, Canceller.run, .{&cancelled});
+    defer canceller.join();
+
+    const started = platform_time.monotonicNs();
+    const result = executeChainWithOptions(alloc, &client, &antfly_chain, .{
+        .antfly_provider = local_provider,
+        .request_context = .{
+            .io = io,
+            .deadline_ns = null,
+            .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled),
+        },
+    }, &messages);
+    const elapsed_ms = (platform_time.monotonicNs() - started) / std.time.ns_per_ms;
+    if (result) |value| {
+        var mutable = value;
+        mutable.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(error.Cancelled, err);
+    }
+    // The first backoff is 500ms; cancelling at 30ms must cut the wait short
+    // well before that instead of occupying the worker for the full backoff.
+    try std.testing.expect(elapsed_ms < 300);
 }
 
 test "generating backend passes multimodal messages to local provider callback" {
