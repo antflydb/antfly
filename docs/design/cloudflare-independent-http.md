@@ -1,157 +1,161 @@
-# Independent Cloudflare HTTP measurements
+# Cloudflare qualification procedure
 
-The small approved-control HTTP diagnostic demonstrated a real connection
-bottleneck in its Cloudflare load driver and incomplete service tracing. Its
-results remain preserved separately. This follow-up implements an external
-Node offered-load client and complete service evidence before another hosted
-performance comparison. It does not change native serving code, resource
-ceilings, approved control modules or the original gate policy.
+This is the current operator and acceptance reference for #1278. See
+[architecture](cloudflare-serverless.md), [durability](antfly-object-storage-backend.md),
+[performance findings](cloudflare-platform-baselines.md) and
+[unresolved memory investigation](cloudflare-sqlite-memory.md). Local correctness,
+short hosted diagnostics and the full performance gate are separate verdicts.
+The full hosted gate remains unpassed.
 
-## Actual targets and previous misses
+## Immutable control and acceptance policy
 
-The original `qualification/gate-policy.mjs` requires read/write/cold p95 at
-most **1,000/3,000/5,000 ms**, with paired read/write non-regression. Numeric
-readiness alone cannot pass the original three one-hour trials, corpus,
-recovery-sample, queue/lag/fault/ANN and independent-coverage requirements.
+Use corrected control `c44896ac8c13898c549b7896ab633b1b8b25c04c` with its original
+retained modules, not a rebuild. Its full/compact SHA-256 values are:
 
-| Previous candidate population | Result | Actual numeric miss |
-| --- | ---: | --- |
-| Reverse mixed read | 1,594 ms | Above 1,000 ms |
-| Reverse warm read | 510 ms versus control 483 ms | Regression |
-| Cold read, both orders | 1,424 / 1,721 ms | Neither exceeds 5,000 ms |
-| Mixed write, both orders | 1,703 / 2,326 ms | Neither exceeds 3,000 ms |
+- `563936db3958bdab50c404db4a6ccef15e095e798e49198ab2304d87322dac97`
+- `789469d743cf69bb9cdcc3e3c59caa4f05663fe4e73958908800d780b1d85f77`
 
-The separate design goals are 10× cold and 2× warm/burst/mixed improvement.
-Cold missed both relative goals (938.1 / 823.1 ms); warm missed both
-(342 / 241.5 ms); reverse burst missed 281.5 ms at 394 ms. Forward burst,
-mixed reads and mixed writes met their respective 2× goals. These are small
-samples, not a stable speedup guarantee. `http-latency-targets.mjs` reports
-absolute limits, paired non-regression and design goals separately.
+The approved corrections preserve caller context and suspension-aware clock behavior,
+resource ceilings, batching policy and native algorithms. Actor admission remains
+one active job, eight pending jobs/four MiB/one MiB per job, with 30-second deadlines.
+Mutation admission remains sixteen pending jobs/four MiB/one MiB per request; groups
+have sixteen callers/768 KiB/1,024 records, a two-ms window and five-second aging.
+The caller patch and machine-readable hashes remain under `qualification/` because
+control verification and safe local artifact retention depend on their provenance.
+They are not permission to modify a frozen control or repair failed results.
 
-## Client and execution identity
+`qualification/gate-policy.mjs` is the executable policy. It requires:
 
-`node-http-transport.mjs` owns separate native HTTP agents, with 64 connections
-per side. It returns headers before consuming the bounded response body, keeps
-status/ray/version evidence when the body fails, rejects redirects, and records
-physical completion and pool queueing. Tests overlap sixteen real HTTP requests
-and exercise oversized, broken and canceled response streams.
+| Requirement | Acceptance |
+| --- | --- |
+| Trials | Three distinct paired one-hour executions with fresh identities/corpora |
+| Corpus | Four tenants, 512 documents each, exact bodies and replay receipts |
+| Reads | At least 1,000 per side; candidate p95 ≤1,000 ms; paired non-regression |
+| Writes | At least 300 per side; durable ACK p95 ≤3,000 ms; paired non-regression |
+| Recovery | 100 distinct candidate epochs per trial; one attempt each, correct count, p95 ≤5,000 ms |
+| Maintenance | Publication convergence; lag/backlog/age within policy; zero DLQ |
+| Errors | No client/resource failures, including recovered or late allocation errors |
+| Coverage | All eight role streams and complete canonical/native population reconciliation |
+| Faults/ANN | Required failure evidence and equal-budget synthetic/model ANN evidence |
 
-`independent-http-runner.mjs` precomputes UUIDs and arrival offsets and records
-intent before workload I/O. Both sides share a start clock. Slow replies cannot
-shift later arrivals: overload, excessive dispatch lag, transport queueing,
-failed body/version/fence checks and journal errors fail the run. Offered
-latency includes dispatch delay; service latency is reported separately.
-There are no workload retries. Acknowledged writes advance the receipt only
-when their LSN is newer. Post-load reads verify the highest acknowledged write
-and exact document count; these verification attempts also enter reconciliation.
+The fixed 30-second arrival cadence, publication lag ≤4,096, backlog ≤128 and
+oldest age ≤900,000 ms remain unchanged. Per-tenant lag coverage spans all 60
+minutes and queue growth must remain bounded. ANN compares probes 8/32/all on
+at least 10,000 synthetic and 1,000 model-embedding documents, with required sample,
+recall and physical I/O checks. `evaluateWarmPrerequisites` defers only cold samples;
+it does not relax the other requirements or produce a final pass.
 
-`independent-http-trial.mjs` runs on a GitHub-hosted Linux machine. An explicit
-`--local-diagnostic` supports local debugging but cannot produce an independent
-pass. Public plans pin both stacks, versions, source/module/config hashes,
-corpus and a fresh execution UUID. Each CI plan expires after one hour. The
-workflow claims that UUID with a retained artifact **before workload I/O**,
-rejects previously claimed UUIDs and rejects workflow retries. Failed and
-partial results remain artifacts. Two side executions are joined even after
-failure. The initial profile offers 256 reads at 32 reads/s, with one write per
-sixteen reads, across four tenants. Supported corpus sizes are 64/128/512 per
-tenant. This bounded profile is not the original hour-long gate.
+Tenfold cold and twofold warm/burst/mixed improvement are separate design goals.
+Report them separately from absolute limits and paired non-regression.
 
-## Service and resource closure
+## Retained tooling
 
-The observer accepts the explicit `cold-pair-v1` layout: exactly two cold stack
-names and app/writer/reader/builder roles for each. Existing gate layouts retain
-their original checks. Attaching observation can change only observability
-metadata and Tail consumers; runtime limits, vars, storage/bindings and every
-sealed JavaScript/WASM payload remain pinned. The approved control still uses
-exact `c44896ac8c` modules.
+Use one primary path per task:
 
-Before workload admission, all eight sources must pass the existing positive
-witness readiness protocol. Before/after private boundary witnesses, provider
-Tail counts, canonical log/trace records, immutable windows, stable repeat
-observations and the app's complete physical-attempt ledger are reconciled.
-Quiet services still need their independent boundary evidence. Collection waits
-for settlement and is bounded: missing evidence fails, rather than being
-replaced by successful client responses. Snapshot paths become relative for
-portable artifact download and are checked on restore.
+- `read-state-latency.mjs`: local actual-workerd serving comparisons and inline profiles.
+- `cold-pilot.mjs`: bounded sealed control/candidate stack lifecycle for short HTTP trials.
+- `prepare-independent-http.mjs`, `independent-http-trial.mjs`,
+  `reconcile-independent-http.mjs`: public plan, dedicated external client and offline closure.
+- `paired-observer-lifecycle.mjs`: eight-role observation/export lifecycle and positive witnesses.
+- `prepare-gate.mjs`, `gate-lifecycle.mjs`, `run-gate.mjs`, `evaluate-gate.mjs`:
+  original full-gate preparation, bounded operations, execution and evaluation.
+- `platform-baseline-lifecycle.mjs`: isolated primitive/pressure diagnosis, not an Antfly gate.
+- `provider-contracts.mjs`, native tests, `r2-scale.mjs` and ANN fixtures:
+  separate provider, scale and quality qualification.
+- `prune-local-artifacts.py`: dry-run-first local artifact retention; never credential discovery.
 
-Resource scanning now includes `error_message` and nested `errors` resource
-flags, and canonical compaction retains them. A recovered `SQLITE_NOMEM` inside
-a final `ok` event fails qualification. This corrects a detection gap; it does
-not establish the root cause or resolution of the historical platform-memory
-failure. Linear WASM memory still does not measure total isolate/SQLite memory.
+Shared modules implement workload scheduling, transport, source sealing, error
+classification, collection, independent coverage, source/API scoping and cleanup.
+Their small modules and regression tests are maintained implementation dependencies,
+not separate experiment entry points. Superseded one-off programs and chronological
+design reports are not maintained in the current tree. Git history preserves source;
+local failed evidence remains immutable and rebuilds are not assumed byte-identical.
 
-The hosted result requires numeric readiness and complete canonical/native
-proofs. **It always reports `qualification_ready: false` and
-`full_gate_passed: false`.** Account export-delivery history remains local and
-must be joined afterward. `reconcile-independent-http.mjs` recomputes all eight
-proofs and delivery-history health from downloaded artifacts; missing windows,
-errors, changed versions or gaps cannot become complete. The local monitor's
-earlier window is conservatively required too, so pre-workload errors are not
-discarded. Polling cannot rule out provider errors cleared entirely between
-samples. Neither CLI substitutes for the full original gate.
+## Short rehearsal before the gate
 
-## Operator procedure
+Use fresh sealed stacks and a quiet dedicated client. Preserve exact source/module,
+configuration, corpus, role versions and approved-control hashes. Prepare the control
+from its separate clean checkout and retained original modules; create the candidate
+from the reviewed current source. Both have equal corpus size and unchanged ceilings.
+Do not reuse consumed execution IDs or reserved cold epochs.
 
-Use fresh disposable sealed stacks; the previous trial's stacks were deleted.
-Keep approved control payloads immutable. The steps below name local manifests
-and output files, and contain no credentials:
+From `examples/cloudflare-serverless`, `cold-pilot.mjs prepare ACCOUNT_ID
+--documents=512` prepares the candidate; add `--control-source=CONTROL_EXAMPLE_DIR`
+for the exact approved control. Prepare emits the scoped `run.json` path. Run
+`seal`, then `deploy` and the explicitly authorized disposable `upload-token` action
+with that manifest. These create paid resources; preparation/sealing alone are local.
+The lifecycle removes queues/triggers/AI bindings for this bounded diagnostic.
 
 ```sh
 node qualification/prepare-independent-http.mjs pair BASELINE_RUN CANDIDATE_RUN PAIR_JSON
 node qualification/paired-observer-lifecycle.mjs prepare PAIR_JSON 1 --windowed-evidence
-# Use the emitted OBSERVER_RUN path for seal, deploy, upload-token,
-# deploy-reader, deploy-receiver, then attach, in that order.
+```
+
+Using the emitted observer manifest, seal/deploy it, install its authorized new token,
+deploy reader/receiver and attach observation in lifecycle order. Observe all eight
+roles with positive readiness witnesses before workload admission. Seed both equal
+corpora after attachment, verify versions/receipts, then export the fresh public plan:
+
+```sh
 node qualification/prepare-independent-http.mjs plan BASELINE_RUN CANDIDATE_RUN PUBLIC_PLAN --observer=OBSERVER_RUN
 node qualification/monitor-independent-delivery.mjs OBSERVER_RUN DELIVERY_HISTORY
 ```
 
-Seed the equal corpus and capture final serving versions/receipts after observer
-attachment; export the public plan only after that preparation. Plan preparation
-requires deployed, seeded, credential-ready, sealed stacks. Avoid an overlapping
-workload. Set repository variable `ANTFLY_HTTP_TRIAL_PLAN` to the public JSON.
-Configure only the newly generated disposable baseline/candidate/observer tokens
-as the three `ANTFLY_{BASELINE,CANDIDATE,OBSERVER}_API_TOKEN` secrets. Do not upload
-Wrangler/account credentials or local credential files. Account destination API
-calls use official Wrangler authentication transiently in local memory, with no
-legacy credential-file fallback.
+The initial independent profile offers 256 reads at 32 reads/s, with a write every
+sixteen reads, across four tenants. Each side owns a 64-connection native HTTP pool.
+Arrival times are precomputed; slow responses cannot shift later arrivals. Record
+intent durably before workload I/O and terminal outcomes afterward. Overload,
+dispatch lag >25 ms, transport queueing, failed bodies/fences/versions and journal
+errors fail the population. No workload retries. Join all physical peers on failure.
+Final verification checks the latest acknowledged mutations and exact counts.
 
-The optional `ci:cloudflare` suite uses the repository's existing approval and
-source-pinning system. **Its workflow and suite registration must first land
-on the default branch**; manual workflow dispatch cannot bootstrap a workflow
-that exists only on this feature branch. The controller dispatches default-branch
-workflows, and normal PR execution needs the existing `/ci run <sha>` approval.
-No approval bypass or default-branch merge is performed by these changes.
+A dedicated GitHub-hosted Linux runner is supported by
+`.github/workflows/cloudflare-qualification.yml` and the existing `ci:cloudflare`
+admission system. **The workflow/suite registration must first land on main**;
+GitHub cannot dispatch the workflow while it exists only on this feature branch.
+Normal source approval and pinned checkout still apply. Do not bypass admission
+or merge the unfinished runtime just to enable a diagnostic.
 
-Keep the local delivery monitor running from before CI readiness through export
-settlement. After CI finishes, interrupt it once to join the final status poll,
-download the result artifacts, then run:
+Set `ANTFLY_HTTP_TRIAL_PLAN` to the fresh public plan and install only newly generated
+disposable baseline/candidate/observer API tokens in the named CI secrets. Never
+upload account credentials, Wrangler tokens or a legacy token file. The plan is
+source-pinned, expires after an hour and is claimed in a retained artifact before
+workload I/O. Retries/replays reject the consumed execution ID. Failed/partial runs
+remain artifacts. Local `--local-diagnostic` execution cannot claim independence.
+
+Keep provider delivery monitoring active from before readiness through settlement.
+After execution, join its final poll, download results and run:
 
 ```sh
 node qualification/reconcile-independent-http.mjs DOWNLOADED_RESULT/report.json DELIVERY_HISTORY CLOSURE_JSON
 ```
 
-A monitor budget of 256 observations and 90 minutes bounds this diagnostic;
-window readers retain their original one-hour bounds. This is intentionally
-not presented as a full one-hour-plus gate runner. Preserve failed plans,
-claims, reports and original evidence. Retire only the explicitly authorized
-disposable resources afterward. This implementation/test session created no
-Cloudflare resources, account credentials or hosted measurements.
+Both orders must meet numeric limits and paired non-regression with complete
+observation before scaling duration. Inline profiles are required only on the
+candidate when its sealed config enables them; the historical control remains
+unmodified. Zero/error/drop flags and phase activation must be retained.
+The short runner always reports `qualification_ready:false` and
+`full_gate_passed:false`, even when its own diagnostic checks pass.
 
+## Coverage, memory and final trials
 
-## Validation
+Reconcile source/role versions, physical attempt IDs, HTTP terminals, intermediate
+witnesses, quiet-role boundaries, provider Tail counts, canonical/native windows,
+source rejection prefixes and receiver/export delivery health. ETag-pinned immutable
+windows require stable repeat observation; downloaded paths must remain portable.
+Missing or sampled populations are not complete. Resource errors survive canonical
+compaction and later success. Polling cannot exclude an error cleared entirely
+between observations, so state this limitation rather than claiming absolute absence.
 
-613 Node tests and 210 CI policy tests pass. Eleven focused actual-workerd
-checks pass across the observer, export receiver and HTTP driver files. An
-initial parallel-file run hit an existing Tail burst fixture response-body reuse
-error; its failed log is retained, and the isolated test and full observer file
-subsequently pass. This is not a claim that every actual-workerd suite ran.
-The new workflow passes `actionlint`. Linting the existing orchestrator also
-reports its pre-existing `cache-mode`/`concurrency.queue` syntax unsupported by
-the installed linter; this change does not add those keys. License and diff
-checks pass. Guarded `make gc` skips cleanup while native builds are active or
-process inspection is unavailable.
+Only after short warm prerequisites pass, run the original gate lifecycle and
+three distinct trials. Preserve the 100 fresh single-attempt recovery epochs per
+candidate for valid executions. Finish exact body/receipt, faults, publication/queue,
+ANN and complete independent coverage checks before evaluating the final gate.
+A cold reconstructed actor is not automatically a proven physically cold isolate.
 
-Logs are separate from the previous sealed hosted evidence, under
-`examples/cloudflare-serverless/dist/qualification/independent-http-implementation/`.
-All failed intermediate logs remain there. No latency improvement is inferred
-from these correctness/integration tests.
+Retain report provenance and all failures. Tokens never enter evidence seals.
+Cleanup only the named authorized disposable resources: stop/freeze private actors,
+await physical/maintenance drain, drain the exact bucket with bounded requests,
+remove app/private Workers, queues/DLQs/namespaces/buckets and disposable secrets,
+then verify scoped absence and save receipts. Never use broad account-wide deletion.
+`make gc` is guarded; do not force it past active builds or unknown process state.

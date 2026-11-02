@@ -40,3 +40,24 @@ export function planCorpus(run,configs,report,id){
  if([root,...Object.values(tenants)].some(r=>r.incarnation.length>256||r.storage_id.length>256))throw Error('CorpusIdentityTooLong');
  return{run:{...structuredClone(run),initial_corpus_root:structuredClone(originalRoot),initial_corpus_routes:structuredClone(base),corpus:{id,root,tenants},deployed:false,last_phase:'corpus-prepared'},configs:configs.map(c=>({...structuredClone(c),vars:{...c.vars,ANTFLY_INCARNATION:root.incarnation,COORDINATOR_STORAGE_ID:root.storage_id,ANTFLY_TENANTS:JSON.stringify(tenants)}}))};
 }
+
+// Equal bounded setup for the independent HTTP rehearsal. Never retry a lost write.
+export async function seedIndependentCorpus(documents,call){
+ if(![64,128,512].includes(documents))throw Error('IndependentCorpusSizeInvalid');
+ const receipts={};
+ for(const tenant of ['a','b','c','d']){
+  for(let offset=0;offset<documents;offset+=64){
+   const result=await call({op:'mutate',operation_id:documents===64?'seed':'seed/'+offset,
+    mutations:Array.from({length:64},(_,j)=>{const i=offset+j;return{kind:'upsert',doc_id:'doc/'+i,body:JSON.stringify({tenant,i,payload:'x'.repeat(1024)})};})},'/api',tenant);
+   if(typeof result.value?.visibility!=='string')throw Error('IndependentSeedReceiptMissing');
+   receipts[tenant]=result.value.visibility;
+  }
+  for(let step=0;;step++){
+   if(step>=128)throw Error('IndependentSeedPublicationIncomplete');
+   if(!(await call({op:'publish'},'/api',tenant)).value.has_more)break;
+  }
+  const count=await call({op:'count',required_visibility:receipts[tenant],fresh:true},'/api',tenant);
+  if(count.value.count!==String(documents))throw Error('IndependentSeedCountMismatch');
+ }
+ return receipts;
+}

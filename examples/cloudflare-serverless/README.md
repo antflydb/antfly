@@ -59,7 +59,7 @@ The native profile opens one metadata snapshot per query, reuses durable
 reader pins, executes whole mutations in the writer, coalesces publication
 messages and prioritizes interactive metadata work. Immutable manifests/pages
 and bounded decoded rows remain warm. Recovery overlaps independent reads.
-See [the performance design](../../docs/design/cloudflare-performance.md).
+See [the performance design](../../docs/design/cloudflare-platform-baselines.md).
 
 `PACK_SMALL_BODIES=false` disables creation of new body packs. Facts v10 combines
 body-pack references with media audit and source-provenance fields. Readers and
@@ -229,7 +229,7 @@ encoded inputs. Readers cap native working memory at 8 MiB. Actor queues admit
 at most eight calls / 4 MiB per actor with 30-second admission deadlines;
 `READERS_PER_TENANT` defaults to two (one through four logical slots). Increasing
 logical actors does not increase the physical kernel pool. See the
-[design and rollout contract](../../docs/design/cloudflare-performance.md#bounded-tenant-runtimes-and-prepared-wal-commits)
+[design and rollout contract](../../docs/design/cloudflare-platform-baselines.md)
 for colocation, GC overlap and aggregate-memory limits. New reader/build actors
 use no SQLite or platform storage API.
 
@@ -320,7 +320,7 @@ cancel active jobs and finish collector frontiers before downgrading binaries.
 preparation from fresh execution so waiting for authority holds no query WASM
 slot. A bounded native cache retains authenticated preparations; eviction and
 kernel replacement fall back to fresh reads. It defaults off pending qualification.
-See [the detached native read design](../../docs/design/detached-native-reads.md)
+See [the detached native read design](../../docs/design/cloudflare-serverless.md)
 for resource accounting, rollout and the stalled-tenant regression.
 
 Additional opt-in read controls are `FUSED_READ_ADMISSION`, `NATIVE_READ_STATE`,
@@ -330,7 +330,7 @@ with WAL commits, and protect foreground cache entries from scans. Native WAL
 extensions use HEAD format 4; deploy compatible readers and collectors before
 activation. Disabling activation flags does not downgrade existing HEADs.
 `OPPORTUNISTIC_READ_PREPARE=true` additionally avoids queued or late preparation
-with detached reads. See [shared native read state](../../docs/design/native-read-state.md).
+with detached reads. See [shared native read state](../../docs/design/cloudflare-serverless.md).
 
 Three additional storage experiments default off: `WAL_PACKED_PAGES=true`
 co-locates an unpublished WAL forest in bounded immutable blocks (HEAD format 5),
@@ -341,7 +341,7 @@ indexes (HEAD format 6). Publish compatible native modules to every reader,
 writer, publisher and collector before activation. Existing new-format data
 remains readable when flags are disabled; downgrade requires migration, not
 switching a flag. The resource and acceptance limits remain unchanged.
-See [compact serving blocks and deferred folding](../../docs/design/serverless-compact-serving-blocks.md)
+See [compact serving blocks and deferred folding](../../docs/design/cloudflare-serverless.md)
 for persistence, concurrency, overflow, collection, and measurement contracts.
 
 `DO_LOCATION_HINT` can override compute placement independently of the bucket
@@ -358,7 +358,7 @@ inspect with `publication_action: "status"`, or cancel with
 `PUBLICATION_UNITS` selects 1–256 posting units per slice (default 128);
 `PUBLICATION_CONTINUATION_FORCE=true` is useful for exercising small-record
 checkpoints locally. Existing native document/page limits are unchanged. See the
-[native protocol design](../../docs/design/cloudflare-runtime-target.md#native-publication-continuations-and-readwrite-plans)
+[native protocol design](../../docs/design/cloudflare-serverless.md)
 for ownership, collector and recovery contracts.
 
 In R2 mode, use a stable `operation_id` (at most 256 UTF-8 bytes) when a lost
@@ -366,7 +366,7 @@ response must be recoverable. `compact_status` reports the durable state;
 resubmitting that same identity returns its original result after completion.
 Changing the deployment's compaction limits requires a new identity. Ticketed
 R2 Queue compactions derive a stable identity from their ticket and step.
-See the [receipt protocol](../../docs/design/cloudflare-compaction-receipts.md)
+See the [receipt protocol](../../docs/design/antfly-object-storage-backend.md)
 for atomic publication, recovery and retention semantics.
 
 `compact` calls the existing native `Compactor`, with host I/O, its existing
@@ -385,7 +385,7 @@ incarnation; parallel Queue deliveries otherwise contend for the same lease
 and spend retries without useful work. Interactive requests still use their
 own lane. A multi-incarnation deployment needs a deliberate scheduling profile.
 
-The [native reuse audit](../../docs/design/cloudflare-native-audit.md) identifies
+The [native reuse audit](../../docs/design/cloudflare-serverless.md) identifies
 which parts already exist and the actual remaining execution boundaries.
 
 Publication and immutable content reuse come from the native engine. The
@@ -420,7 +420,7 @@ full-corpus body snapshot. Common-term queries still scan matching postings and
 retain document scores under request budgets; final ranking retains only the
 requested offset plus limit. Paged storage remains subject to request budgets.
 Application joins and production concurrency qualification remain separate work.
-See [capacity observations](../../docs/design/cloudflare-native-audit.md).
+See [capacity observations](../../docs/design/cloudflare-serverless.md).
 
 Set `PAGED_PROJECTIONS="true"` to enable page-based dense and sparse indexes
 and paged text together. Sparse changes replace only touched document/term
@@ -514,13 +514,13 @@ Deploy the new runtime to every client before enabling collection. Collection
 is supported only for this coordinated hosted profile with its 30-second
 request deadline and bounded clock skew; do not mix unbounded native readers
 into the same physical incarnation. The original whole-log native ObjectStore
-format remains unchanged. See the [collection safety argument](../../docs/design/cloudflare-hosted-collection.md).
+format remains unchanged. See the [collection safety argument](../../docs/design/antfly-object-storage-backend.md).
 
 ## Workers AI and AI Gateway
 
 Antfly's regular provider configuration now supports `provider: "cloudflare"`
 and optional `gateway_id` across its qualified model adapters; see
-[Cloudflare models](../../docs/guides/cloudflare-models.md). Native deployments
+[Cloudflare models](../../docs/guides/providers/cloudflare.mdx). Native deployments
 use `account_id`, `model` and a resolved `api_key`. This Worker profile calls
 the Workers AI binding through the typed WASM inference bridge: `AI_GATEWAY`
 selects the gateway, and `EMBEDDING_MODEL` or `AI_MODEL` selects the model.
@@ -586,279 +586,31 @@ Cloudflare provider integration is tracked separately in
 bundled with the database WASM module.
 
 
-## Native metadata scale qualification
+## Qualification and current limits
 
-`node qualification/r2-scale.mjs 100000` checks 100,000 metadata records, cold
-reopen, a wide tree branch, deletion, three metadata collection cycles and every
-surviving value. It reports bounded native memory, object operations, transfers
-and retained storage. This local fixture does not measure R2 latency or cost.
+The current references are [architecture](../../docs/design/cloudflare-serverless.md),
+[durability/recovery](../../docs/design/antfly-object-storage-backend.md),
+[performance findings](../../docs/design/cloudflare-platform-baselines.md),
+[qualification procedure](../../docs/design/cloudflare-independent-http.md) and
+[unresolved memory investigation](../../docs/design/cloudflare-sqlite-memory.md).
+They describe the current implementation; per-commit trials are retained in Git
+history and local reports rather than additional design documents.
 
-## Live qualification
+Use `qualification/read-state-latency.mjs` for local serving comparisons and
+`qualification/r2-scale.mjs` for bounded native/R2 scale fixtures. Use the
+independent HTTP runner and eight-role observer for short hosted comparisons,
+then the original gate runner only after warm prerequisites pass. Full gate
+thresholds and source/control verification remain unchanged. Dedicated-client
+workflow activation requires its reviewed registration to land on main first.
 
-See the [recorded live measurements and limits](../../docs/design/cloudflare-qualification.md).
-
-`qualification/prepare.mjs ACCOUNT_ID` creates an ignored, uniquely named
-configuration and a mode-0600 API token under `dist/qualification/`. Provision
-its R2 bucket and two Queues, install the token with Wrangler, then run
-`qualification/snapshot.mjs RUN_JSON` to seal a self-contained, validated bundle.
-Deploy that configuration and run `qualification/run.mjs RUN_JSON HTTPS_ORIGIN`.
-It exercises real R2/DO/Queue durability, concurrent writers, publication,
-native compaction, collection, and a Workers AI embedding through Gateway, and saves latencies
-and deployment version IDs. It performs real billable service operations.
-
-The qualification wrapper alone has a token-protected drain route, restricted
-to the generated physical incarnation. Disable/remove the Queue consumer
-before `run.mjs ... --drain`; then delete the generated Worker, Queues, and empty
-bucket. Production `worker.mjs` has no drain route. Reports contain no API token.
-A successful fixture and absence of resource-limit errors do not measure total
-isolate memory or establish all-workload production qualification.
-For the Antfly-native coordinator, prepare with `--r2-coordinator`. After the
-ordinary fixture, run `run.mjs RUN_JSON HTTPS_ORIGIN --collect-metadata` to check
-metadata collection, preserved counts and harmless late Queue deliveries.
-
-For live paged text qualification, prepare with `--paged-text` and run
-`run.mjs RUN_JSON HTTPS_ORIGIN --scale --documents=5000`. The runner validates
-edits, deletes, and an old generation cursor against the real services.
-After disabling the consumer, `--collect-only` checks live collection on that
-scale fixture. `--diagnostics` reports only collector counts, frontier size,
-and phase through the authenticated qualification wrapper.
-
-For a fresh incarnation with `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS`
-configured, `run.mjs RUN_JSON HTTPS_ORIGIN --enrichment --windows` validates a
-48-chunk document across provider windows, native compaction, and fenced vector
-search. Use a separate incarnation to avoid embedding the larger durability
-fixture as part of this small model test.
-
-For local capacity characterization after building, run:
-
-```sh
-node qualification/benchmark.mjs --sizes=100,1000,5000
-node qualification/benchmark.mjs --paged-text --sizes=1000,10000,50000 --publication-records=64
-node qualification/benchmark.mjs --paged-text --sizes=1000 --body-bytes=4096
-```
-
-This exercises actual native WASM publication, cold/warm reads, and compaction
-over the in-process R2 contract fixture. It writes memory/object counts and
-explicit admission failures to ignored `dist/qualification/local-capacity.json`.
-It also checks cold point updates, deletion, and replacement compute. It does
-not measure deployed R2 latency or total isolate memory.
-Defaults match the host's 4 MiB upload cap, 16-record publication prefix,
-24 MiB recycling threshold, and 1,000-document compaction preflight. Override
-`--max-put-bytes`, `--publication-records`, `--recycle-at-bytes`, and
-`--compaction-documents` to compare admitted profiles. Corpora of at least 10,000
-documents use a disk-backed local bucket so emulated R2 artifact payloads do not
-accumulate in the test process's RAM; `--file-bucket` selects it for smaller
-fixtures. This storage belongs to the test harness, outside native request
-budgets. See [qualification requirements](../../docs/design/cloudflare-qualification.md).
-For example, the measured
-5,000-document compaction case uses `--compaction-documents=5000`; the default
-host still rejects that compaction unless configured for it.
-
-Set `LOG_METRICS="true"` to emit numeric structured `antfly.operation` logs for
-runtime operations. Samples include outcome, operations, inference calls,
-transferred bytes, elapsed/I/O-wait time, working allocation peak, retained
-cache charge, and per-lane/combined WASM linear-memory size. Linear memory is
-an instance high watermark and may stay large after allocations are freed.
-These logs exclude document bodies, API tokens, and model inputs. Metrics
-observer failures do not change a durable write's outcome.
-
-## SQLite pressure qualification
-
-The earlier live collector `SQLITE_NOMEM` recovered after deployment replacement.
-Cursor draining and retryable HTTP 503 responses remain in place. Coordinator
-failures now emit `antfly.sqlite.pressure` for both journal and object RPCs,
-with the operation, phase and
-best-effort database size; database size is not a memory measurement. Translated native transport errors
-and rate limits also return retryable HTTP 503 responses.
-
-`node qualification/sqlite-soak.mjs --local --rounds=32` compares intentionally
-undrained legacy mutation cursors with drained cursors in a warm SQLite Durable
-Object. The disposable live variant accepts a run manifest and its HTTPS origin.
-A 32-cycle live run executed 1,340,160 statements across both modes without
-reproducing the error. This isolates SQLite journal work from WASM, R2 and model
-heap pressure; the original error's cause remains unconfirmed. See the
-[native audit](../../docs/design/cloudflare-native-audit.md) for the evidence.
-
-For the local dense/sparse capacity, cold-resume and recall fixture:
-
-```sh
-node qualification/benchmark.mjs --paged-projections --dimensions=384 \
-  --sizes=1000,10000 --publication-records=16 --reindex --recall-queries=5 \
-  --output=dist/qualification/projections.json
-```
-
-This fixture reports local memory, object traffic and wall time separately;
-its in-memory object store is outside the native memory budget. Recall is
-measured against brute-force cosine neighbors at eight and 32 requested probes and with `search_effort: 1` (all routing
-clusters, with native quantized candidate selection and exact reranking).
-
-
-For a deployed mixed workload, configure tenants `a,b,c,d` and run
-`node qualification/mixed.mjs RUN_JSON HTTPS_ORIGIN`. It defaults to 512 actual
-documents per tenant and eight rounds of concurrent reads, writes and compaction.
-Run immediately after a fresh deployment to record the first request without
-warmup, then redeploy and use `--verify` to check the original receipts and data.
-Use `qualification/summarize-metrics.mjs TAIL_JSONL OUTPUT_JSON` for observed
-per-operation R2 attempts. These reports distinguish first requests, warm
-traffic, retry-inclusive latency, WASM memory and unavailable billing/isolate
-measurements; see [the performance design](../../docs/design/cloudflare-performance.md).
-
-Repeat just the mixed phase on that corpus with fresh operation IDs using
-`--scenario=mixed-final --reuse=mixed`; recover that run using
-`--scenario=mixed-final --verify`. The recovery check replays both the latest
-write and an original seed receipt, and checks exact payloads and updated text.
-For a separate fresh default namespace with Queue delivery externally paused,
-`node qualification/publication.mjs RUN_JSON HTTPS_ORIGIN` measures one
-64-document publication and verifies all bodies, count and receipt replay.
-
-For cold measurements, rebind to a fresh physical coordinator class while
-preserving storage IDs, pause Queue delivery and disable cron. Pass
-`--expected-version=WORKER_VERSION_UUID`; the version-only readiness probe does
-not warm WASM or a tenant object, and old-version data responses are excluded.
-
-
-For disposable live qualification, `node qualification/analytics.mjs RUN_JSON`
-fetches periodic whole-isolate memory percentiles and scoped R2 analytics from
-Cloudflare. It uses `CLOUDFLARE_API_TOKEN` or the existing local Wrangler OAuth
-credential only as authorization to Cloudflare's API. Reports contain no
-credential. Recent samples can lag; percentiles are not absolute peaks and R2
-adaptive request counts are not a finalized bill. Run it before deleting the
-disposable namespaces/bucket. `qualification/mixed.mjs` keeps workload timings
-separate from these platform measurements.
-
-
-For a fresh split deployment, create the bucket and both Queues named in the
-split configs, then deploy in dependency order:
-
-```sh
-npx wrangler deploy --config wrangler.split-writer.jsonc
-npx wrangler deploy --config wrangler.split-reader.jsonc
-npx wrangler deploy --config wrangler.split-builder.jsonc
-npx wrangler deploy --config wrangler.split-app.jsonc
-npx wrangler secret put API_TOKEN --config wrangler.split-app.jsonc
-```
-
-Set account, tenant/storage identities, model and Gateway policy consistently
-across those configs before deployment. Private writer/reader/builder services
-have no public API endpoint. The builder owns Queue consumption and scheduled
-repair. Split configs use a fresh namespace and bucket; existing R2 authority
-requires a quiescent fenced cutover. Do not reuse an active writer identity
-across old and new services. See the
-[rollout and memory budgets](../../docs/design/cloudflare-performance.md).
-
-For controlled component comparisons and large root-format/GC qualification:
-
-```sh
-node qualification/critical-path.mjs
-node qualification/r2-scale.mjs 100000 --compact --idle-checkpoint --hot-root
-```
-
-These use the actual native kernel with an in-memory R2 fixture; injected delay
-is not live latency. For ANN comparisons add `--coarse-probes=32` to the paged
-projection benchmark and compare recall, physical GETs and bytes to the default
-zero-pruning run. Full effort retains its exact-search control. `LOG_METRICS`
-adds correlated bounded critical-path traces, physical I/O waves and decoded
-manifest-cache metrics. Re-run `npm run test:workerd` for persisted recovery,
-collection and split service admission checks.
-
-
-The [performance acceptance gate](../../docs/design/cloudflare-gates.md) provides
-paired sealed deployments, fixed-arrival soak traffic, fresh physical recovery
-samples, exact body/receipt checks and content-addressed ANN/failure evidence.
-`qualification/evaluate-gate.mjs GATE_JSON` exits with status 2 while any required
-evidence or threshold is missing. A short smoke run cannot pass this gate.
-
-
-### Resumable exact vector search
-
-With the R2 backend and paged projections, vector `search_effort: 1` scans the
-stored FP32 vectors in bounded native steps. A response with `complete: false`
-has no final hits; resubmit the same query with its `cursor` until it completes:
-
-```js
-let cursor;
-let result;
-do {
-  result = await query({op: "search", mode: "vector", vector, limit: 10,
-    search_effort: 1, ...(cursor ? {cursor} : {})});
-  cursor = result.cursor;
-} while (!result.complete);
-console.log(result.hits);
-```
-
-The cursor fixes the original generation and visibility cutoff across publication
-and actor eviction. It has a four-minute idle window and one-hour absolute
-lifetime. Cancellation stops further steps; expired or retired snapshots require
-a new query. The app authenticates cursor state before dispatch and uses
-`EXACT_SCAN_CURSOR_KEY`, falling back to its existing operator `API_TOKEN`.
-Configure signing secrets through Worker secrets. Key rotation invalidates cursors.
-The [exact-scan design](../../docs/design/cloudflare-gates.md#bounded-exhaustive-vector-search)
-details admission limits and the FP32/FP16 comparison caveat.
-
-For a bounded live test of large-record publication across physical actor
-replacement, run `node qualification/native-protocol-live.mjs CANDIDATE_RUN_JSON`
-on a sealed, paused disposable candidate with native write plans and publication
-continuations enabled. Its root namespace must be empty. The driver writes a
-private source snapshot and report, uses root epochs 0–2, and leaves tenants a–d
-untouched. Retire that root identity and purge its pending test notifications
-before measuring the tenant corpus. Clean up the disposable deployment with the
-gate lifecycle tool afterward. Current diagnostic procedures and limits are documented
-in [platform baselines](../../docs/design/cloudflare-platform-baselines.md).
-
-Prepared continuation slices and adaptive posting batches are opt-in through
-`PUBLICATION_PREPARED_SLICES=true` and `PUBLICATION_ADAPTIVE_SLICES=true`, alongside
-`PUBLICATION_CONTINUATIONS=true`. Deploy compatible modules and collectors across
-all roles first, and drain/cancel active adaptive jobs before binary downgrade.
-Current local serving comparisons use `qualification/read-state-latency.mjs`. See
-[the shared engine design](../../docs/design/shared-object-publication.md).
-
+The disk-backed local bucket avoids retaining large emulated R2 payloads in host
+RAM. Use it for large fixture runs; fixture storage is outside WASM memory metrics.
+Local emulator timings, injected storage delay and synthetic retained-byte pressure
+are not hosted qualification or proof that `SQLITE_NOMEM` is fixed. Preserve all
+failed reports, complete physical settlements and recovered resource errors.
 
 ## Authenticated mail application
 
-[Antfly Mail](MAIL.md) is a separate application entry point with Better Auth
-login, per-user mailboxes, Email Worker ingestion, private R2 attachments, Antfly
-search and a durable Cloudflare Email Service outbox. Its configuration and
-local captured-mail tests do not alter these operator or qualification profiles.
-
-### Small cold-bootstrap diagnostic pilot
-
-The [cold serving design](../../docs/design/cold-serving-bootstrap.md) records
-phase attribution, the prepare-once bootstrap implementation, retained negative
-results and the distinction between actor reconstruction and physical cold starts.
-`qualification/cold-pilot.mjs` supports `prepare ACCOUNT_ID`, then `seal`, `deploy`,
-`upload-token`, `seed`, `restart`, `read`, `tail ROLE`, and `cleanup`, each taking
-the generated `run.json` path. Start bounded sanitized tails before seeding. It
-uses four disposable split Workers, three actor namespaces and one R2 bucket,
-with explicit publication and no queues or recurring maintenance. Keep the
-credential file private. Cleanup retains reports and removes the test token.
-
-This is a diagnostic tool, not the full gate: all response versions must match,
-all reconstructed actor identities must change, and bodies/fences must remain
-correct. Tail cannot establish exhaustive resource-error coverage. Run local
-latency comparisons without competing builds, deployments or test suites; retain
-failed/mixed-version populations instead of treating a later retry as a clean run.
-The `--control-report=PATH` local latency option reuses and hash-checks saved
-`serving-durable` bundles and exact bindings; it does not select or alter the
-approved hosted control.
-
-For current external-client comparison requirements, see
-[independent HTTP qualification](../../docs/design/cloudflare-independent-http.md).
-`qualification/paired-http-trial.mjs` coordinates two sealed stacks and a bounded
-HTTP driver. Its timings exclude the local host and external client transit;
-these are separate from the full gate. The driver rejects redirects, pins
-versions, retains every failed member, advances fences only after durable ACKs,
-and runs all rounds remotely. Native serving/control source remains unchanged.
-
-
-For independent offered-load measurements, use the Node runner and eight-service
-canonical export described in [the independent measurement design](../../docs/design/cloudflare-independent-http.md).
-Its GitHub-hosted workflow uses disposable application/observer credentials;
-account authorization remains local. Client success alone cannot close missing
-service/resource or provider delivery windows. Local checks do not establish a
-hosted gate pass.
-
-
-For primitive latency baselines, inline owner/HTTP attribution and bounded storage
-pressure isolation, see [platform baseline diagnostics](../../docs/design/cloudflare-platform-baselines.md).
-The primitive fixture measures provider costs separately from Antfly. Neither
-local emulator results nor a minimum sample is a hosted latency floor.
+See [MAIL.md](MAIL.md) for the mail UI, email transport, authentication and local
+workflow. The mail example has separate deployment configs and does not change the
+database durability or qualification contract.

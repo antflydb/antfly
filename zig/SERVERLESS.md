@@ -1894,7 +1894,7 @@ namespace to an exclusive provider actor and can capture its committed view
 without rediscovering object storage per read. That capability requires a
 persisted authority protocol and cannot be enabled by extending journal proof
 lifetimes or silently changing an existing namespace. See
-[resident serving shards](../docs/design/resident-serving-shards.md) for the
+[resident serving shards](../docs/design/cloudflare-serverless.md) for the
 owner contract, migration restrictions, fixed-budget execution lanes and
 qualification plan. A native point cache does not imply a portable leader lease,
 automatic splitting, strong replica reads or a hosted latency guarantee.

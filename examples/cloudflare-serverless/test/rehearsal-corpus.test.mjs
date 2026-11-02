@@ -30,3 +30,30 @@ test('legacy completed rehearsal adoption is explicit and archives original corp
 test('active or identity-mismatched completed rehearsals cannot claim a corpus',async()=>fixture(async f=>{
  const before=await readFile(f.gate.trials[0].baseline);f.report.stage='workload';await writeFile(f.reportPath,JSON.stringify(f.report));assert.notEqual(f.call(true).status,0);f.report.stage='complete';f.report.sides[0].source_revision='different';await writeFile(f.reportPath,JSON.stringify(f.report));assert.notEqual(f.call(true).status,0);assert.deepEqual(await readFile(f.gate.trials[0].baseline),before);
 }));
+
+
+test('independent rehearsal seeds every supported corpus in bounded keyed batches and verifies counts',async()=>{
+ const {seedIndependentCorpus}=await import('../qualification/corpus.mjs');
+ for(const documents of [64,128,512]){
+  const stores=new Map(),ids=new Map();let publication=0;
+  const receipts=await seedIndependentCorpus(documents,async(input,path,tenant)=>{
+   assert.equal(path,'/api');const store=stores.get(tenant)??new Map();stores.set(tenant,store);
+   if(input.op==='mutate'){
+    assert.equal(input.mutations.length,64);const seen=ids.get(tenant)??new Set();ids.set(tenant,seen);assert.ok(!seen.has(input.operation_id));seen.add(input.operation_id);
+    for(const m of input.mutations){assert.ok(!store.has(m.doc_id));const body=JSON.parse(m.body);assert.equal(body.tenant,tenant);assert.equal(m.doc_id,'doc/'+body.i);assert.equal(body.payload.length,1024);store.set(m.doc_id,m.body);}
+    return{value:{visibility:tenant+'/'+store.size}};
+   }
+   if(input.op==='publish'){publication++;return{value:{has_more:false}};}
+   assert.equal(input.op,'count');assert.equal(input.required_visibility,tenant+'/'+documents);return{value:{count:String(store.size)}};
+  });
+  assert.equal(publication,4);assert.equal(stores.size,4);
+  for(const tenant of ['a','b','c','d']){assert.equal(stores.get(tenant).size,documents);assert.ok(stores.get(tenant).has('doc/'+(documents-1)));assert.equal(receipts[tenant],tenant+'/'+documents);}
+ }
+});
+test('independent setup rejects invalid size, incomplete publication and wrong counts without retrying writes',async()=>{
+ const {seedIndependentCorpus}=await import('../qualification/corpus.mjs');let writes=0;
+ await assert.rejects(seedIndependentCorpus(65,()=>{throw Error('NoDispatch');}),/CorpusSize/);
+ await assert.rejects(seedIndependentCorpus(64,async input=>{if(input.op==='mutate'){writes++;return{value:{visibility:'receipt'}};}return{value:{has_more:true}};}),/PublicationIncomplete/);assert.equal(writes,1);
+ await assert.rejects(seedIndependentCorpus(512,async input=>({value:input.op==='mutate'?{visibility:'receipt'}:input.op==='publish'?{has_more:false}:{count:'64'}})),/CountMismatch/);
+ const failure=Error('AmbiguousWrite');let attempts=0;await assert.rejects(seedIndependentCorpus(512,async()=>{attempts++;throw failure;}),e=>e===failure);assert.equal(attempts,1);
+});
