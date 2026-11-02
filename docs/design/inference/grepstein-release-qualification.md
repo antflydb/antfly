@@ -433,3 +433,20 @@ The explicit `bf16_vision` profile and the cuDNN route still need a complete-pag
 A100 comparison of output, warm throughput, cold load, batch cardinality and peak
 memory. Spark-only fused GEMM results are not A100 results. The admission contract
 and host-side CUDA-enabled tests do not establish those performance measurements.
+
+### Extraction completion and publication ownership
+
+A partial OCR publication withholds request-completion credit. A failed
+publication also carries an explicit pipeline-failure marker through scanner
+and asynchronous lane boundaries; a matching provider error tag cannot reuse
+a document retry identity. Exhausting storage retries must not exhaust OCR
+attempts or acknowledge an incomplete generation.
+
+The raw extraction manifest persists `ocr_retryable_failed_count` across all
+pages, independently of the 32-entry failure diagnostic sample. Artifact PUT
+repairs inline declarations and stores the canonical table-wide declaration,
+which survives removal of its declaring index. Artifact DELETE removes both
+forms and leaves consumers for normal dependency validation to reject.
+
+These storage and catalog regressions are distinct from the outstanding
+complete-page A100 output and memory qualification above.

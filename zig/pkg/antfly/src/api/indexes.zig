@@ -243,7 +243,7 @@ pub fn addEnrichmentToTableIndexesJson(
         else => return error.InvalidTableIndexMetadata,
     };
     if (config.value != .object) return error.InvalidExtensionEnrichment;
-    const replaced_inline = @import("enrichment_catalog_update.zig").replaceInline(root, enrichment_name, config.value);
+    _ = @import("enrichment_catalog_update.zig").replaceInline(root, enrichment_name, config.value);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -269,7 +269,7 @@ pub fn addEnrichmentToTableIndexesJson(
         try appendJsonValue(alloc, &out, entry.value_ptr.*);
     }
 
-    if (!wrote_enrichments and replaced_inline == 0) {
+    if (!wrote_enrichments) {
         if (!first) try out.append(alloc, ',');
         try appendJsonString(alloc, &out, "enrichments");
         try out.appendSlice(alloc, ":[");
@@ -293,12 +293,12 @@ pub fn removeEnrichmentFromTableIndexesJson(
         .object => |object| object,
         else => return error.InvalidTableIndexMetadata,
     };
-    const current_enrichments = root.get("enrichments") orelse return null;
-    if (current_enrichments != .array) return error.InvalidTableIndexMetadata;
+    const current_enrichments = root.get("enrichments");
+    if (current_enrichments != null and current_enrichments.? != .array) return error.InvalidTableIndexMetadata;
 
-    var removed = false;
+    var removed = @import("enrichment_catalog_update.zig").removeInline(root, enrichment_name) != 0;
     var remaining: usize = 0;
-    for (current_enrichments.array.items) |item| {
+    for (if (current_enrichments) |value| value.array.items else &.{}) |item| {
         if (enrichmentValueNameEquals(item, enrichment_name)) {
             removed = true;
         } else {
@@ -8128,6 +8128,21 @@ fn consumerTests() type {
             try std.testing.expect(std.mem.indexOf(u8, repaired, "ocr_fallback") == null);
             try std.testing.expect(std.mem.indexOf(u8, repaired, "chunks") != null);
             try std.testing.expect(std.mem.indexOf(u8, repaired, "document_text") != null);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, repaired, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("enrichments").?.array.items.len);
+            const dropped = (try removeIndexFromTableIndexesJson(alloc, repaired, "document_text")).?;
+            defer alloc.free(dropped);
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, dropped);
+            try std.testing.expect(std.mem.indexOf(u8, dropped, "units") != null);
+            const deleted = (try removeEnrichmentFromTableIndexesJson(alloc, dropped, "units")).?;
+            defer alloc.free(deleted);
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, deleted);
+            try std.testing.expect(std.mem.indexOf(u8, deleted, "units") == null);
+            // Inline copies must not silently resurrect a deleted producer.
+            const dependent = (try removeEnrichmentFromTableIndexesJson(alloc, repaired, "units")).?;
+            defer alloc.free(dependent);
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(alloc, dependent));
         }
 
         test "index metadata validates artifact enrichment graph" {
