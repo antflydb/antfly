@@ -6005,6 +6005,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
     const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    const graph_admission_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = selectTestFilters(b, &.{
+            "graph legacy ordinal batches bound resolver calls and preserve membership",
+            "graph predicate cache clones outside locks and pins evicted membership",
+            "graph predicate cache shares process admission across pinned generations and indexes",
+            "graph predicate cache declines unmanaged and soft-pressure admission",
+            "db graph analyzed admission intersects resolved row permissions",
+            "db graph indexed admission reuses compressed membership and honors cancellation and memory",
+            "db graph search filters result nodes and hidden traversal intermediates",
+            "db graph shortest path searches through admitted alternatives",
+        }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("graph-admission-test", "Verify indexed graph predicates, row permissions and denied intermediates")
+        .dependOn(&addFilteredTestRunArtifact(b, graph_admission_tests).step);
     // Use the local owner constructor and keep ordered application in the
     // server adapter; broad DB fixtures still need the shared storage imports.
     antfly_imports.configureEmbedded(b, db_test_mod, true);
@@ -6068,6 +6084,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     chaos_test_step.dependOn(storage_vopr_step);
 
     const graph_metric_unit_filters = [_][]const u8{
+        "graph predicate cache clones outside locks and pins evicted membership",
+        "graph predicate cache shares process admission across pinned generations and indexes",
+        "graph predicate cache declines unmanaged and soft-pressure admission",
+        "graph legacy ordinal batches bound resolver calls and preserve membership",
+        "db graph analyzed admission intersects resolved row permissions",
+        "db graph indexed admission reuses compressed membership and honors cancellation and memory",
         "graph committed intents survive canceled durability fences",
         "graph.query.",
         "index maintenance VOPR regression exact replay",
@@ -6229,6 +6251,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed graph traverse target nodes filter returned nodes without pruning frontier",
         "distributed graph traverse routes cross-table frontier by table generation",
         "distributed graph path materialization preserves table provenance",
+        "distributed graph root-specific traversal matches independent roots",
+        "distributed graph visited maps charge actual allocations and reject undersized budgets",
+        "distributed graph adjacency cache surrenders optional memory",
+        "distributed graph adjacency cache reclaims backing budgets and declines opaque owners",
+        "distributed graph adjacency cache parent reclamation respects pins and coordinator accounting",
+        "api query contract legacy graph node filters use retrieval validation",
+        "api query contract graph permission filters stop denied roots and intermediates",
         "public graph metric borrowed wire",
         "public index contract exposes runtime status metadata",
         "indexes openapi parses graph metric runtime summary",

@@ -9408,6 +9408,127 @@ fn logBenchSortCollectorProfile(
     }
 }
 
+/// Bound legacy identity lookup by both key count and retained key bytes.
+const GraphOrdinalBatch = struct {
+    keys: [256][]const u8 = undefined,
+    count: usize = 0,
+    bytes: usize = 0,
+    alloc: Allocator,
+
+    fn deinit(self: *@This()) void {
+        for (self.keys[0..self.count]) |key| self.alloc.free(key);
+        self.count = 0;
+        self.bytes = 0;
+    }
+    fn flush(self: *@This(), rows: *roaring.RoaringBitmap, executor: StructuredFilterResolverExecutor, generation: ?u64, control: query_mod.ExecutionControl) !void {
+        if (self.count == 0) return;
+        defer self.deinit();
+        try control.check();
+        const resolve = executor.resolve_doc_ids_to_doc_set orelse return error.UnsupportedQueryRequest;
+        var resolved = try resolve(executor.ctx, self.alloc, self.keys[0..self.count], generation);
+        defer resolved.deinit(self.alloc);
+        try control.check();
+        switch (resolved) {
+            .ordinals => |values| for (values) |value| try rows.add(value),
+            .ordinal_bitmap => |*values| try rows.orWith(values),
+            .none => {},
+            else => return error.UnsupportedQueryRequest,
+        }
+    }
+    fn append(self: *@This(), id: []const u8, rows: *roaring.RoaringBitmap, executor: StructuredFilterResolverExecutor, generation: ?u64, control: query_mod.ExecutionControl) !void {
+        if (self.count == self.keys.len or id.len > 64 * 1024 -| self.bytes) try self.flush(rows, executor, generation, control);
+        self.keys[self.count] = try self.alloc.dupe(u8, id);
+        self.count += 1;
+        self.bytes += id.len;
+    }
+};
+
+/// Compressed, snapshot- and analyzer-bound graph membership. Repeated shard
+/// admission batches reuse the same immutable set instead of executing postings
+/// and expanding matching document-number arrays for every hop.
+pub fn graphIndexedPredicateAlloc(a: Allocator, req: types.SearchRequest, executor: StructuredFilterResolverExecutor, json: []const u8) !doc_set.ResolvedDocSet {
+    const control = query_mod.ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+    try control.check();
+    const entry = (try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name)) orelse return error.UnsupportedQueryRequest;
+    entry.lockAnalysisShared();
+    defer entry.unlockAnalysisShared();
+    const snapshot = entry.persistent.acquireSnapshot();
+    defer snapshot.release();
+    var deletion_hash = std.hash.Wyhash.init(0);
+    for (snapshot.segments) |seg| {
+        const revision = seg.shared.deletion_revision.load(.acquire);
+        deletion_hash.update(std.mem.asBytes(&revision));
+    }
+    const key = try std.fmt.allocPrint(a, "{d}:{d}:{d}:{d}:{s}", .{ entry.instance_id, entry.projection_revision, req.identity_read_generation orelse 0, deletion_hash.final(), json });
+    defer a.free(key);
+    const cache = &snapshot.graph_predicates;
+    if (try cache.get(a, key, control)) |rows| {
+        var owned = rows;
+        errdefer owned.deinit();
+        try control.check();
+        return .{ .ordinal_bitmap = owned };
+    }
+    const flight = try cache.lockFlight(key, control);
+    defer flight.unlock();
+    if (try cache.get(a, key, control)) |rows| {
+        var owned = rows;
+        errdefer owned.deinit();
+        try control.check();
+        return .{ .ordinal_bitmap = owned };
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, json, .{});
+    if (patternFilterValueHasRole(parsed)) return error.UnsupportedQueryRequest;
+    const search_query = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
+    if (!try searchQueryCanUseSnapshot(snapshot, search_query, entry.text_analysis, entry.runtime_schema, false)) return error.UnsupportedQueryRequest;
+    const filter = try search_mod.searchQueryToFilterArena(scratch, search_query);
+    var docs = try snapshot.executeFilterBitmap(a, filter.withControl(control));
+    defer docs.deinit();
+    var rows = roaring.RoaringBitmap.init(a);
+    errdefer rows.deinit();
+    var identities = segment_mod.SegmentReadScratch.init(a, 64 * 1024);
+    defer identities.deinit();
+    var fallback = GraphOrdinalBatch{ .alloc = a };
+    defer fallback.deinit();
+    var it = docs.iterator();
+    var next = it.next();
+    var offset: u32 = 0;
+    for (snapshot.segments, 0..) |seg, segment_index| {
+        try control.check();
+        const upper = try std.math.add(u32, offset, seg.reader.doc_count);
+        if (next == null) break;
+        if (next.? >= upper) {
+            offset = upper;
+            continue;
+        }
+        var lease = try snapshot.leaseSegment(segment_index);
+        defer lease.deinit();
+        var ordinals = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+        while (next) |doc| {
+            if (doc >= upper) break;
+            try control.check();
+            if (try ordinals.get(doc - offset)) |ordinal| {
+                try rows.add(ordinal);
+            } else {
+                // Decode through bounded scratch, then resolve a bounded batch.
+                identities.reset();
+                if (try snapshot.storedIdScoped(identities.allocator(), doc)) |id| {
+                    try fallback.append(id, &rows, executor, req.identity_read_generation, control);
+                }
+            }
+            next = it.next();
+        }
+        offset = upper;
+    }
+    try fallback.flush(&rows, executor, req.identity_read_generation, control);
+    try control.check();
+    cache.put(snapshot.alloc, key, &rows);
+    try control.check();
+    return .{ .ordinal_bitmap = rows };
+}
+
 fn collectStructuredFilterResolvedDocSetAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -10171,7 +10292,7 @@ fn rejectStoredMatchFallback(value: std.json.Value) !void {
     }
 }
 
-fn patternFilterContainsMatch(value: std.json.Value, depth: u8) !bool {
+pub fn patternFilterContainsMatch(value: std.json.Value, depth: u8) !bool {
     if (depth >= 64 or value != .object) return error.InvalidArgument;
     if (value.object.get("match") != null) return true;
 
@@ -38113,4 +38234,50 @@ test "highlight compiled routing preserves document types aliases arrays field o
     try Harness.run(std.testing.allocator);
     var stable = @import("../../lite/test_allocator.zig").NoResizeAllocator{ .backing = std.testing.allocator };
     try std.testing.checkAllAllocationFailures(stable.allocator(), Harness.run, .{});
+}
+
+test "graph legacy ordinal batches bound resolver calls and preserve membership" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        largest: usize = 0,
+        fn text(_: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            return null;
+        }
+        fn resolve(ctx: ?*anyopaque, alloc: Allocator, keys: []const []const u8, generation: ?u64) anyerror!doc_set.ResolvedDocSet {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            try std.testing.expectEqual(@as(?u64, 42), generation);
+            self.calls += 1;
+            self.largest = @max(self.largest, keys.len);
+            const rows = try alloc.alloc(u32, keys.len);
+            errdefer alloc.free(rows);
+            for (keys, rows) |key, *row| row.* = try std.fmt.parseInt(u32, key, 10);
+            return .{ .ordinals = rows };
+        }
+    };
+    var fake = Fake{};
+    const executor = StructuredFilterResolverExecutor{ .ctx = &fake, .text_index_entry = Fake.text, .resolve_doc_ids_to_doc_set = Fake.resolve };
+    var batch = GraphOrdinalBatch{ .alloc = a };
+    defer batch.deinit();
+    var rows = roaring.RoaringBitmap.init(a);
+    defer rows.deinit();
+    for (0..1025) |i| {
+        var buffer: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buffer, "{d}", .{i});
+        try batch.append(key, &rows, executor, 42, .{});
+    }
+    try batch.flush(&rows, executor, 42, .{});
+    try std.testing.expectEqual(@as(usize, 5), fake.calls);
+    try std.testing.expectEqual(@as(usize, 256), fake.largest);
+    try std.testing.expectEqual(@as(usize, 1025), rows.cardinality());
+    for (0..1025) |i| try std.testing.expect(rows.contains(@intCast(i)));
+    // Byte limits flush independently of key count, without losing long IDs.
+    const long = try a.alloc(u8, 40 * 1024);
+    defer a.free(long);
+    @memset(long, '0');
+    try batch.append(long, &rows, executor, 42, .{});
+    try batch.append(long, &rows, executor, 42, .{});
+    try std.testing.expectEqual(@as(usize, 6), fake.calls);
+    try batch.flush(&rows, executor, 42, .{});
+    try std.testing.expectEqual(@as(usize, 7), fake.calls);
 }
