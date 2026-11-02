@@ -5932,6 +5932,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = selectTestFilters(b, &.{
             "graph legacy ordinal batches bound resolver calls and preserve membership",
             "graph predicate cache clones outside locks and pins evicted membership",
+            "graph predicate cache shares process admission across pinned generations and indexes",
+            "graph predicate cache declines unmanaged and soft-pressure admission",
             "db graph analyzed admission intersects resolved row permissions",
             "db graph indexed admission reuses compressed membership and honors cancellation and memory",
             "db graph search filters result nodes and hidden traversal intermediates",
@@ -6005,6 +6007,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const graph_metric_unit_filters = [_][]const u8{
         "graph predicate cache clones outside locks and pins evicted membership",
+        "graph predicate cache shares process admission across pinned generations and indexes",
+        "graph predicate cache declines unmanaged and soft-pressure admission",
         "graph legacy ordinal batches bound resolver calls and preserve membership",
         "db graph analyzed admission intersects resolved row permissions",
         "db graph indexed admission reuses compressed membership and honors cancellation and memory",
