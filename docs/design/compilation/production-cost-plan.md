@@ -1,13 +1,27 @@
 # Production binary size, compilation time and memory plan
 
-Status: proposed implementation plan, based on source and artifact investigation
-on 2026-11-01. No production optimization in this document is enabled by the
-planning change. Baseline source: `9b3fda9f22`; toolchain: Zig 0.17.0.
+Status: implementation in progress. Source/artifact investigation and baseline
+are from 2026-11-01, source `9b3fda9f22`, Zig 0.17.0. The validated first slice
+is recorded in [media session implementation](history/media-session-2026-11-01.md).
+The full production PDF/image migration and subsequent redesigns remain open.
 
 Current architecture and acceptance policy remain in
 [COMPILATION.md](../../../zig/COMPILATION.md). Recent accepted results and the
 rejected mutation outlining experiment are recorded in
 [production retention](history/production-retention-2026-11-01.md).
+
+## Implementation status
+
+| Item | Current state |
+| --- | --- |
+| P0 measurement tools | Both-product CPU profiling, tested Mach-O map reader, pinned compiler time-report collector, scoped Linux memory snapshots implemented; full baseline qualification and server map still pending |
+| P1a opaque PDF session | Retained state, stable allocator/deadline adapters, operation cancellation, directly charged PNG output and compiled source-free tests implemented |
+| Media build isolation | Fixed automatic storage/inference linking into media-only tests; provider/client/contract cache matrix passed |
+| P1b/P1c production migration | Open: bounded batch/raster/analysis contracts, executor and admission borrowing, all existing PDF/image callers and caches |
+| P2–P7 redesigns | Open, apart from the media cache matrix above; acceptance gates remain unchanged |
+
+P1a and the measurement tools do not establish smaller production binaries or
+faster complete builds. No new whole-product size or cold-build claim is made.
 
 ## Decision
 

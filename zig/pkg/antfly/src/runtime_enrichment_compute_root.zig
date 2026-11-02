@@ -32,6 +32,9 @@ const enrichment_compute_exports = @import("antfly_local_sources").storage_enric
 comptime {
     exportInternal(&enrichment_compute_exports.extractStream, "antfly_enrichment_extract_stream");
     exportInternal(&enrichment_compute_exports.renderPdfPagePng, "antfly_enrichment_render_pdf_page_png");
+    exportInternal(&enrichment_compute_exports.pdfSessionOpen, "antfly_enrichment_pdf_session_open");
+    exportInternal(&enrichment_compute_exports.pdfSessionRenderPng, "antfly_enrichment_pdf_session_render_png");
+    exportInternal(&enrichment_compute_exports.pdfSessionClose, "antfly_enrichment_pdf_session_close");
     exportInternal(&enrichment_compute_exports.bufferDestroy, "antfly_enrichment_buffer_destroy");
 }
 

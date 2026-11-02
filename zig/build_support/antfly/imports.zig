@@ -403,6 +403,7 @@ pub const AntflyRootImports = struct {
         // whose caller may carry the default full storage profile. Declare
         // only compute contracts so storage ABI edits cannot invalidate it.
         self.storage_boundary.configureProfile(mod, true, false, .enrichment);
+        @import("../embedded/source_owner.zig").registerStorageIndependent(mod);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_template_content", self.template_content);

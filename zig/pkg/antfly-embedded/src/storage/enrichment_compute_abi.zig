@@ -16,7 +16,7 @@
 //! Media compute has no dependency on the DB owner protocol. Its version and
 //! request layouts evolve independently; only semantic failure identity is shared.
 const failure = @import("runtime_failure_abi");
-pub const abi_version: u32 = 2;
+pub const abi_version: u32 = 3;
 pub const Allocator = @import("runtime_memory_abi").Allocator;
 pub const Status = failure.Status;
 pub const FailureIdentity = failure.FailureIdentity;
@@ -96,11 +96,74 @@ pub const EnrichmentRenderedPdfPage = extern struct {
     _reserved0: u32 = 0,
 };
 
+/// Process-local opaque PDF state. The input bytes and allocator callback
+/// context are borrowed through close; neither may refer to an expired stack
+/// frame. The provider copies the allocator table into stable session storage.
+/// Calls on one session are exclusive; separate sessions can run concurrently.
+pub const PdfSession = opaque {};
+
+/// Borrowed for one synchronous operation, never retained between calls.
+pub const PdfCancellation = extern struct {
+    context: ?*const anyopaque = null,
+    is_cancelled: ?*const fn (?*const anyopaque) callconv(.c) u8 = null,
+};
+
+pub const PdfSessionOpenRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    allocator: ?*const Allocator = null,
+    pdf_bytes: BorrowedBytes = .{},
+    timeout_ms: u64 = 0,
+    cancellation: PdfCancellation = .{},
+    max_decoded_stream_bytes: u64 = 64 * 1024 * 1024,
+    max_working_set_bytes: u64 = 96 * 1024 * 1024,
+};
+
+pub const PdfSessionRenderRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    /// Borrowed only during this render call. When supplied, the PNG is
+    /// allocated from this allocator and the caller must release it there.
+    /// Null preserves the provider buffer/destroy convention for one-shot calls.
+    output_allocator: ?*const Allocator = null,
+    timeout_ms: u64 = 0,
+    cancellation: PdfCancellation = .{},
+    page_number: u64 = 1,
+    dpi: u16 = 150,
+    _reserved1: u16 = 0,
+    max_dimension: u32 = 4096,
+    max_pixels: u64 = 40_000_000,
+};
+
+pub extern fn antfly_enrichment_pdf_session_open(
+    request: *const PdfSessionOpenRequest,
+    out_session: *?*PdfSession,
+    out_page_count: *u64,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+/// The request selects PNG output ownership. Session allocations remain
+/// charged to the open allocator until close; render output is charged to the
+/// supplied output allocator until the caller releases it.
+pub extern fn antfly_enrichment_pdf_session_render_png(
+    session: *PdfSession,
+    request: *const PdfSessionRenderRequest,
+    out_png: *OwnedBytes,
+    out_page: *EnrichmentRenderedPdfPage,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+/// Null is an empty session; close clears the caller's handle before returning.
+pub extern fn antfly_enrichment_pdf_session_close(session: *?*PdfSession) callconv(.c) void;
+
 pub const EnrichmentOperation = enum(u32) {
     extract_stream = 1,
     render_pdf_page = 2,
     validate_extract_response = 3,
     validate_render_response = 4,
+    pdf_session_open = 5,
+    pdf_session_render = 6,
+    validate_pdf_session_response = 7,
 };
 
 pub extern fn antfly_enrichment_extract_stream(

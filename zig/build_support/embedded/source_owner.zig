@@ -32,6 +32,7 @@ pub fn cloneModule(b: *std.Build, original: *std.Build.Module) *std.Build.Module
     copy.frameworks = original.frameworks.clone(b.allocator) catch @panic("OOM");
     copy.link_objects = original.link_objects.clone(b.allocator) catch @panic("OOM");
     copy.cached_graph = .{ .modules = &.{}, .names = &.{} };
+    if (isStorageIndependent(original)) registerStorageIndependent(copy);
     return copy;
 }
 
@@ -42,6 +43,22 @@ var storage_dependencies: []const *std.Build.Step.Compile = &.{};
 const StorageVisit = struct { module: *std.Build.Module, testing: bool };
 const LocalProvider = struct { consumer: *std.Build.Module, provider: *std.Build.Step.Compile };
 var local_providers: std.ArrayList(LocalProvider) = .empty;
+
+// A compute-only root may share source paths and contract construction with
+// storage without consuming an engine. Exclude its complete graph explicitly;
+// deriving this from its directory would link storage and inference into media
+// tests. Any accidental engine call then fails to link instead of being hidden.
+var storage_independent: std.ArrayList(*std.Build.Module) = .empty;
+
+pub fn registerStorageIndependent(module: *std.Build.Module) void {
+    if (isStorageIndependent(module)) return;
+    storage_independent.append(module.owner.allocator, module) catch @panic("OOM");
+}
+
+fn isStorageIndependent(module: *std.Build.Module) bool {
+    for (storage_independent.items) |item| if (item == module) return true;
+    return false;
+}
 
 /// A source-level owner fixture may compile a provider in its final image.
 /// Do not also import that provider's archive through a storage dependency.
@@ -162,6 +179,7 @@ fn attachStorageFinalLinks(b: *std.Build, step: *std.Build.Step, provider: *std.
 }
 
 fn needsStorageProvider(b: *std.Build, module: *std.Build.Module, provider: *std.Build.Step.Compile, testing: bool, seen: *std.AutoHashMap(StorageVisit, void)) bool {
+    if (isStorageIndependent(module)) return false;
     // One module can feed both a test object and a production archive. Its
     // builtin.is_test selection differs, so visit each compilation context.
     if (module == provider.root_module or (seen.getOrPut(.{ .module = module, .testing = testing }) catch @panic("OOM")).found_existing) return false;

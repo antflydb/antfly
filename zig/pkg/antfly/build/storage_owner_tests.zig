@@ -87,6 +87,7 @@ pub fn add(
             tests.executable.root_module.addObject(test_metadata.object);
             runs[index] = tests.run(b);
             if (index == 2) {
+                b.step("enrichment-compute-owner-test", "Run the compiled media owner contract regressions").dependOn(&runs[index].step);
                 tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
             } else {
                 inline for (.{ .storage_kernel, .local_query, .enrichment_compute, .inference }) |unit|
@@ -107,6 +108,30 @@ pub fn add(
                 module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
         }
     }
+    const pdf_client = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/storage/pdf_session_client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pdf_client.addImport("enrichment_compute_abi", imports.storage_boundary.enrichment);
+    pdf_client.addImport("kernel_error_identity", imports.storage_boundary.identity);
+    const pdf_consumer = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/opaque_pdf_session_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    pdf_consumer.addImport("pdf_session_client", pdf_client);
+    pdf_consumer.addImport("enrichment_compute_abi", imports.storage_boundary.enrichment);
+    const pdf_tests = @import("linked_tests.zig").add(b, .{
+        .name = "opaque-pdf-session-tests",
+        .root_module = pdf_consumer,
+        .filters = &.{"opaque PDF session"},
+        .max_rss = 1024 * 1024 * 1024,
+    });
+    pdf_tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
+    b.step("opaque-pdf-session-test", "Test retained PDF state from a source-free client").dependOn(&pdf_tests.run(b).step);
+    b.step("opaque-pdf-consumer-compile", "Compile the PDF client without building its implementation owner").dependOn(&pdf_tests.object.step);
     const opaque_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/opaque_query_owner_test_root.zig"), .target = target, .optimize = optimize });
     opaque_module.link_libc = true;
     opaque_module.addImport("kernel_owner_abi", imports.storage_boundary.owner);

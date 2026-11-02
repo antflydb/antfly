@@ -182,8 +182,89 @@ pub fn extractStream(
     return .ok;
 }
 
-pub fn renderPdfPagePng(
-    request: *const abi.EnrichmentRenderPdfRequest,
+/// Session and allocator adapter have one stable address. A Reader must never
+/// retain an adapter table or deadline living in the open/render call's frame.
+const PdfSessionState = struct {
+    allocator: abi.Allocator,
+    deadline: extraction.PdfRenderDeadline,
+    pdf: extraction.PdfRenderSession,
+    cancellation: abi.PdfCancellation,
+    deadline_enabled: bool,
+
+    fn isCancelled(context: ?*const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(context.?));
+        if (self.cancellation.is_cancelled) |callback| if (callback(self.cancellation.context) != 0) return true;
+        if (self.deadline_enabled) self.deadline.probe().check() catch return true;
+        return false;
+    }
+
+    fn probe(self: *const @This()) extraction.PdfCancellationProbe {
+        return .{ .context = self, .is_cancelled_fn = isCancelled };
+    }
+
+    fn resetDeadline(self: *@This(), timeout_ms: u64, cancellation: abi.PdfCancellation) void {
+        self.deadline = .init(timeout_ms);
+        self.deadline_enabled = timeout_ms != 0;
+        self.cancellation = cancellation;
+        self.pdf.setCancellationProbe(self.probe());
+    }
+};
+
+pub fn pdfSessionOpen(
+    request: *const abi.PdfSessionOpenRequest,
+    out_session: *?*abi.PdfSession,
+    out_page_count: *u64,
+    out_failure: *abi.FailureIdentity,
+) callconv(.c) abi.Status {
+    out_session.* = null;
+    out_page_count.* = 0;
+    out_failure.* = .{};
+    if (request.version != abi.abi_version)
+        return fail(error.InvalidAbiVersion, .pdf_session_open, out_failure);
+    if (request._reserved0 != 0 or (request.pdf_bytes.len != 0 and request.pdf_bytes.ptr == null))
+        return fail(error.InvalidArgument, .pdf_session_open, out_failure);
+    if (request.allocator) |allocator| if (!allocator.valid())
+        return fail(error.InvalidArgument, .pdf_session_open, out_failure);
+    const limits = extraction.PdfDecodeLimits{
+        .max_decoded_stream_bytes = std.math.cast(usize, request.max_decoded_stream_bytes) orelse
+            return fail(error.InvalidPdfDecodeLimits, .pdf_session_open, out_failure),
+        .max_working_set_bytes = std.math.cast(usize, request.max_working_set_bytes) orelse
+            return fail(error.InvalidPdfDecodeLimits, .pdf_session_open, out_failure),
+    };
+    // The default allocator value has process lifetime. Custom contexts must
+    // remain live through close, as required by the private ABI contract.
+    const default_allocator = &std.heap.c_allocator;
+    const allocator = if (request.allocator) |value| value.* else abi.Allocator.fromStd(default_allocator);
+    const state = allocator.asStd().create(PdfSessionState) catch |err|
+        return fail(err, .pdf_session_open, out_failure);
+    state.allocator = allocator;
+    state.deadline = .init(request.timeout_ms);
+    state.deadline_enabled = request.timeout_ms != 0;
+    state.cancellation = request.cancellation;
+    const alloc = state.allocator.asStd();
+    state.pdf = extraction.PdfRenderSession.initWithDecodeLimitsAndCancellation(
+        alloc,
+        request.pdf_bytes.slice(),
+        limits,
+        state.probe(),
+    ) catch |err| {
+        alloc.destroy(state);
+        return fail(err, .pdf_session_open, out_failure);
+    };
+    const count = state.pdf.pageCount() catch |err| {
+        state.pdf.deinit();
+        alloc.destroy(state);
+        return fail(err, .pdf_session_open, out_failure);
+    };
+    state.cancellation = .{};
+    out_page_count.* = @intCast(count);
+    out_session.* = @ptrCast(state);
+    return .ok;
+}
+
+pub fn pdfSessionRenderPng(
+    session: *abi.PdfSession,
+    request: *const abi.PdfSessionRenderRequest,
     out_png: *abi.OwnedBytes,
     out_page: *abi.EnrichmentRenderedPdfPage,
     out_failure: *abi.FailureIdentity,
@@ -192,29 +273,24 @@ pub fn renderPdfPagePng(
     out_page.* = .{};
     out_failure.* = .{};
     if (request.version != abi.abi_version)
-        return fail(error.InvalidAbiVersion, .render_pdf_page, out_failure);
+        return fail(error.InvalidAbiVersion, .pdf_session_render, out_failure);
+    if (request._reserved0 != 0 or request._reserved1 != 0)
+        return fail(error.InvalidArgument, .pdf_session_render, out_failure);
+    if (request.output_allocator) |allocator| if (!allocator.valid())
+        return fail(error.InvalidArgument, .pdf_session_render, out_failure);
+    const output_allocator = if (request.output_allocator) |allocator| allocator.asStd() else std.heap.c_allocator;
     const page_number = std.math.cast(usize, request.page_number) orelse
-        return fail(error.InvalidArgument, .render_pdf_page, out_failure);
-    if (request.allocator) |allocator| if (!allocator.valid()) return fail(error.InvalidArgument, .render_pdf_page, out_failure);
-    const decoder_alloc = if (request.allocator) |allocator| allocator.asStd() else std.heap.c_allocator;
-    var deadline = extraction.PdfRenderDeadline.init(request.render_timeout_ms);
-    var session = extraction.PdfRenderSession.initWithDecodeLimitsAndCancellation(decoder_alloc, request.pdf_bytes.slice(), .{
-        .max_decoded_stream_bytes = std.math.cast(usize, request.max_decoded_stream_bytes) orelse
-            return fail(error.InvalidPdfDecodeLimits, .render_pdf_page, out_failure),
-        .max_working_set_bytes = std.math.cast(usize, request.max_working_set_bytes) orelse
-            return fail(error.InvalidPdfDecodeLimits, .render_pdf_page, out_failure),
-    }, if (request.render_timeout_ms == 0) .{} else deadline.probe()) catch |err| return fail(err, .render_pdf_page, out_failure);
-    defer session.deinit();
-    deadline = extraction.PdfRenderDeadline.init(request.render_timeout_ms);
-    const rendered = session.renderPagePngAdaptiveAlloc(
-        std.heap.c_allocator,
+        return fail(error.InvalidArgument, .pdf_session_render, out_failure);
+    const state: *PdfSessionState = @ptrCast(@alignCast(session));
+    state.resetDeadline(request.timeout_ms, request.cancellation);
+    defer state.cancellation = .{};
+    const rendered = state.pdf.renderPagePngAdaptiveAlloc(
+        output_allocator,
         page_number,
         request.dpi,
         request.max_pixels,
         request.max_dimension,
-    ) catch |err| {
-        return fail(err, .render_pdf_page, out_failure);
-    };
+    ) catch |err| return fail(err, .pdf_session_render, out_failure);
     out_png.* = .{ .ptr = rendered.png.ptr, .len = @intCast(rendered.png.len) };
     out_page.* = .{
         .requested_dpi = rendered.requested_dpi,
@@ -223,6 +299,47 @@ pub fn renderPdfPagePng(
         .height = rendered.height,
     };
     return .ok;
+}
+
+pub fn pdfSessionClose(session: *?*abi.PdfSession) callconv(.c) void {
+    const handle = session.* orelse return;
+    session.* = null;
+    const state: *PdfSessionState = @ptrCast(@alignCast(handle));
+    state.pdf.deinit();
+    const allocator = state.allocator;
+    allocator.asStd().destroy(state);
+}
+
+pub fn renderPdfPagePng(
+    request: *const abi.EnrichmentRenderPdfRequest,
+    out_png: *abi.OwnedBytes,
+    out_page: *abi.EnrichmentRenderedPdfPage,
+    out_failure: *abi.FailureIdentity,
+) callconv(.c) abi.Status {
+    // Preserve the existing one-shot operation identity while sharing its
+    // implementation with retained sessions.
+    var session: ?*abi.PdfSession = null;
+    defer pdfSessionClose(&session);
+    var count: u64 = 0;
+    out_png.* = .{};
+    out_page.* = .{};
+    var status = pdfSessionOpen(&.{
+        .version = request.version,
+        .allocator = request.allocator,
+        .pdf_bytes = request.pdf_bytes,
+        .timeout_ms = request.render_timeout_ms,
+        .max_decoded_stream_bytes = request.max_decoded_stream_bytes,
+        .max_working_set_bytes = request.max_working_set_bytes,
+    }, &session, &count, out_failure);
+    if (status == .ok) status = pdfSessionRenderPng(session.?, &.{
+        .timeout_ms = request.render_timeout_ms,
+        .page_number = request.page_number,
+        .dpi = request.dpi,
+        .max_pixels = request.max_pixels,
+        .max_dimension = request.max_dimension,
+    }, out_png, out_page, out_failure);
+    if (status != .ok) out_failure.operation = @backingInt(abi.EnrichmentOperation.render_pdf_page);
+    return status;
 }
 
 fn fail(
