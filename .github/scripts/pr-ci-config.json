@@ -51,6 +51,11 @@
       "id": "apple-video",
       "workflow": "zig-apple-video.yml",
       "label": "ci:apple-video"
+    },
+    {
+      "id": "cloudflare",
+      "workflow": "cloudflare-qualification.yml",
+      "label": "ci:cloudflare"
     }
   ]
 }

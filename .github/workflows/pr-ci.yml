@@ -168,9 +168,23 @@ jobs:
       base_sha: ${{ needs.approve.outputs.base_sha }}
       check_id: ${{ inputs.check_id }}
       comment_id: ${{ inputs.comment_id }}
+  cloudflare:
+    needs: approve
+    if: contains(fromJSON(needs.approve.outputs.suites), 'cloudflare')
+    uses: ./.github/workflows/cloudflare-qualification.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ needs.approve.outputs.head_sha }}
+      base_sha: ${{ needs.approve.outputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+    secrets:
+      ANTFLY_BASELINE_API_TOKEN: ${{ secrets.ANTFLY_BASELINE_API_TOKEN }}
+      ANTFLY_CANDIDATE_API_TOKEN: ${{ secrets.ANTFLY_CANDIDATE_API_TOKEN }}
+      ANTFLY_OBSERVER_API_TOKEN: ${{ secrets.ANTFLY_OBSERVER_API_TOKEN }}
   result:
     name: PR CI result
-    needs: [approve, policy, zig, sdks, scale, gpu, vopr, darwin, linux-release, apple-video]
+    needs: [approve, policy, zig, sdks, scale, gpu, vopr, darwin, linux-release, apple-video, cloudflare]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
