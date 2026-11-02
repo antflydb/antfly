@@ -5425,6 +5425,8 @@ pub const HBCIndex = struct {
     deferred_node_keys: std.AutoHashMapUnmanaged(u128, DeferredNodeValue),
     deferred_oversized_leaves: std.AutoHashMapUnmanaged(u64, void),
     write_session_depth: usize = 0,
+    /// Bounded commits for bulk builds larger than one storage commit.
+    bulk_commit_rotation: vectorindex_hbc_index.BulkCommitRotation = .{},
     write_session_kind: ?WriteSessionKind = null,
     bulk_publication_may_have_mutated: bool = false,
     hilbert: ?vec.Hilbert,
@@ -6074,6 +6076,17 @@ pub const HBCIndex = struct {
 
     pub fn lsmSessionBatchingActive(self: *const HBCIndex) bool {
         return self.write_session_depth != 0;
+    }
+
+    /// Largest staged size one bulk-build commit should reach, or 0 when the
+    /// backend has no per-commit admission limit. A quarter of the LSM's
+    /// commit backlog leaves room for concurrent writers and metadata.
+    pub fn bulkCommitBudgetBytes(self: *const HBCIndex) u64 {
+        if (self.nativeHbcAuthoritative()) return 0;
+        return switch (self.env_owner) {
+            .lsm => |handle| @max(handle.backend.options.manifest_commit_backlog_bytes / 4, 1 << 20),
+            .native => 0,
+        };
     }
 
     pub fn crossBatchPublicationActive(self: *const HBCIndex) bool {
@@ -17727,6 +17740,20 @@ pub const HBCIndex = struct {
     pub fn bulkBuildPreparedInputsTxn(self: *HBCIndex, txn: anytype, inputs: []const PreparedBulkBuildInput) !void {
         try self.captureExactVectorPreparedBulkBuild(inputs);
         try vectorindex_hbc_index.bulkBuildPreparedInputsTxn(self, txn, inputs);
+    }
+
+    /// Commit budget when a bulk build of `inputs` is too large for one
+    /// storage commit; null when the single-transaction path fits.
+    pub fn preparedBulkBuildCommitBudget(self: *HBCIndex, inputs: []const PreparedBulkBuildInput) ?u64 {
+        return vectorindex_hbc_index.preparedBulkBuildCommitBudget(self, inputs, .{});
+    }
+
+    /// Bulk build too large for one storage commit: owns a bulk-publication
+    /// session and stages the build in bounded commits (see
+    /// `preparedBulkBuildCommitBudget`).
+    pub fn bulkBuildPreparedInputsBounded(self: *HBCIndex, inputs: []const PreparedBulkBuildInput, budget: u64) !void {
+        try self.captureExactVectorPreparedBulkBuild(inputs);
+        try vectorindex_hbc_index.bulkBuildPreparedInputsBounded(self, inputs, .{}, budget, nowNs, elapsedSince);
     }
 
     pub fn bulkBuildPreparedInputsTxnOptions(
@@ -35750,4 +35777,109 @@ test "hbc multi-bit quantization measurement on a dataset" {
             }
         }
     }
+}
+
+test "hbc bulk build larger than one storage commit stages bounded commits" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    const dims = 128;
+    const n = 6000; // ~3 MiB of raw vectors against a 1 MiB commit budget
+    const data = try multiBitTestVectors(alloc, n, dims, 21);
+    defer alloc.free(data);
+    const items = try alloc.alloc(BatchInsertItem, n);
+    defer alloc.free(items);
+    for (items, 0..) |*item, i| item.* = .{ .vector_id = i + 1, .vector = data[i * dims ..][0..dims], .metadata = "doc" };
+    const cfg = HBCConfig{
+        .dims = dims,
+        .leaf_size = 64,
+        .branching_factor = 16,
+        .search_width = 64,
+        .use_quantization = true,
+        .use_random_ortho_trans = true,
+        .quantization_bits = 4,
+    };
+    const lsm: hbc_backend.LsmOptions = .{ .backend_options = .{ .manifest_commit_backlog_bytes = 2 * 1024 * 1024 } };
+    {
+        var idx = try HBCIndex.openWithLsmOptions(alloc, path, cfg, lsm);
+        defer idx.close();
+        try std.testing.expectEqual(@as(u64, 1 << 20), idx.bulkCommitBudgetBytes());
+        try idx.bulkBuildWithMetadata(items);
+        try std.testing.expectEqual(@as(u64, n), idx.stats().active_count);
+        try std.testing.expectEqual(@as(u64, 0), idx.bulk_commit_rotation.budget);
+        try std.testing.expect(idx.bulk_commit_rotation.commits >= 2);
+        // The session is closed and nothing is left staged.
+        try std.testing.expectEqual(@as(usize, 0), idx.write_session_depth);
+        var results = try idx.search(data[17 * dims ..][0..dims], 5);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(u64, 18), results.getHits()[0].vector_id);
+    }
+    // Reopen: the bulk-publish marker is cleared and the tree is complete.
+    var reopened = try HBCIndex.openWithLsmOptions(alloc, path, cfg, lsm);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, n), reopened.stats().active_count);
+    for ([_]usize{ 0, 2999, 5999 }) |i| {
+        var results = try reopened.search(data[i * dims ..][0..dims], 3);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(u64, i + 1), results.getHits()[0].vector_id);
+    }
+}
+
+test "hbc small bulk build keeps the single-commit path" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    const dims = 32;
+    const n = 200;
+    const data = try multiBitTestVectors(alloc, n, dims, 22);
+    defer alloc.free(data);
+    const items = try alloc.alloc(BatchInsertItem, n);
+    defer alloc.free(items);
+    for (items, 0..) |*item, i| item.* = .{ .vector_id = i + 1, .vector = data[i * dims ..][0..dims], .metadata = "" };
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = dims, .leaf_size = 32 });
+    defer idx.close();
+    try idx.bulkBuildWithMetadata(items);
+    try std.testing.expectEqual(@as(u64, 0), idx.bulk_commit_rotation.commits);
+    try std.testing.expectEqual(@as(u64, n), idx.stats().active_count);
+}
+
+test "hbc prepared bulk build chooses bounded commits only when needed" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    const dims = 96;
+    const n = 8000;
+    const data = try multiBitTestVectors(alloc, n, dims, 23);
+    defer alloc.free(data);
+    const cfg = HBCConfig{ .dims = dims, .leaf_size = 64, .branching_factor = 16, .search_width = 64, .use_random_ortho_trans = true };
+    const lsm: hbc_backend.LsmOptions = .{ .backend_options = .{ .manifest_commit_backlog_bytes = 2 * 1024 * 1024 } };
+    var idx = try HBCIndex.openWithLsmOptions(alloc, path, cfg, lsm);
+    defer idx.close();
+    const transformed = try alloc.alloc(f32, n * dims);
+    defer alloc.free(transformed);
+    const inputs = try alloc.alloc(PreparedBulkBuildInput, n);
+    defer alloc.free(inputs);
+    for (inputs, 0..) |*input, i| {
+        const t = idx.transformVector(data[i * dims ..][0..dims], transformed[i * dims ..][0..dims]);
+        input.* = .{ .vector_id = i + 1, .vector = data[i * dims ..][0..dims], .transformed = t, .metadata = "k" };
+    }
+    // A small child fits one commit; the full set does not.
+    try std.testing.expect(idx.preparedBulkBuildCommitBudget(inputs[0..100]) == null);
+    const budget = idx.preparedBulkBuildCommitBudget(inputs) orelse return error.TestExpectedBudget;
+    try idx.bulkBuildPreparedInputsBounded(inputs, budget);
+    try std.testing.expect(idx.bulk_commit_rotation.commits >= 2);
+    try std.testing.expectEqual(@as(usize, 0), idx.write_session_depth);
+    try std.testing.expectEqual(@as(u64, n), idx.stats().active_count);
+    var results = try idx.search(data[4321 * dims ..][0..dims], 3);
+    defer results.deinit();
+    try std.testing.expectEqual(@as(u64, 4322), results.getHits()[0].vector_id);
 }

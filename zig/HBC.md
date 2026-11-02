@@ -114,23 +114,32 @@ default) scans all 100k vectors here:
 
 On real 768-d text embeddings the gap is much smaller.
 [Qdrant/arxiv-abstracts-instructorxl-embeddings](https://huggingface.co/datasets/Qdrant/arxiv-abstracts-instructorxl-embeddings),
-30k vectors, 50 held-out abstracts as queries, same settings, width 1008:
+100k vectors, 200 held-out abstracts as queries, same settings, width 1008:
 
-| Codes | Heap | Recall@10 | Exact reranks/q | ms/query |
-|---|---:|---:|---:|---:|
-| 1-bit | 20 | 0.900 | 19 | 0.53 |
-| 1-bit | 80 | 0.996 | 56 | 0.67 |
-| 2-bit, margin 2 | 80 | 1.000 | 23 | 0.85 |
-| 4-bit, margin 2 | 20 | 0.998 | 6 | 0.81 |
-| 4-bit, margin 2 | 80 | 0.998 | 6 | 0.82 |
-| 8-bit, margin 2 | 80 | 1.000 | 0.6 | 0.77 |
+| Codes | Heap | Recall@10 | Exact reranks/q | ms/query | Build |
+|---|---:|---:|---:|---:|---:|
+| 1-bit | 20 | 0.902 | 19 | 1.84 | 24.0 s |
+| 1-bit | 80 | 0.997 | 64 | 2.20 | |
+| 2-bit, margin 2 | 80 | 0.999 | 25 | 2.53 | 25.5 s |
+| 4-bit, margin 2 | 20 | 1.000 | 7 | 2.42 | 26.6 s |
+| 4-bit, margin 2 | 80 | 1.000 | 7 | 2.19 | |
+| 8-bit, margin 2 | 80 | 0.999 | 0.6 | 2.03 | 28.0 s |
 
 Here 1-bit codes already find nearly every neighbor at the default heap.
-Extended codes mainly cut exact reranks (56 to 6 per query), which matters
+Extended codes mainly cut exact reranks (64 to 7 per query), which matters
 when rerank reads vectors from cold or remote storage rather than the warm
-cache this test uses. NYTimes-256 is a deliberately hard set. A 100k run at
-768-d failed in the 1-bit bulk build with `ResourceBudgetExceeded`, before
-any extended code ran; not yet investigated.
+cache this test uses. NYTimes-256 is a deliberately hard set. These builds
+exceed one LSM commit and use bounded commits (below); the NYTimes ones fit
+in one.
+
+Build cost: extended codes use a golden-section search over the level scale
+(`rabitq_ex.Codec.bestLevels`), about 1.9 us per 256-d and 4.8 us per 768-d
+vector at 4 or 8 bits, against 51 us and 1 ms for the exact sweep it
+replaced. At 100k x 256 a 4-bit build takes 5.1 s against 4.7 s for 1-bit.
+Most bulk-build time at 256-d is Hilbert ordering
+(`vector.Hilbert.encodeVecBytesInto`, about 64% of samples), independent of
+the code width. Leaf scoring prepares the extended query only when a leaf
+first rescores a candidate.
 
 `bench/vectors/rabitq_hbc_sim.zig` reproduces the admission effect outside
 HBC.
@@ -181,6 +190,33 @@ builds parent nodes upward from finished children, and quantizes each final
 node exactly once as it is written. There is no per-item online insert loop in
 the bulk-build path; search works correctly on the built index, and
 `active_count` and metadata are correct after reopen.
+
+### Bounded commits for large bulk builds
+
+A bulk build stages vectors, metadata and the finished tree in one LSM
+transaction, and the LSM admits at most `manifest_commit_backlog_bytes`
+(256 MiB by default) per commit. Builds past that failed with
+`ResourceBudgetExceeded` (for example 100k 768-d vectors, about 307 MB of raw
+vectors).
+
+When a build's conservative size estimate exceeds three quarters of that
+limit, `bulkBuildWithMetadata` and the split child rebuild
+(`preparedBulkBuildCommitBudget` / `bulkBuildPreparedInputsBounded`) run
+inside a bulk-publication session and commit whenever the batch reaches a
+quarter of the limit (`HBCIndex.bulkCommitBudgetBytes`):
+
+- Rotation points are between complete writes: after stored vectors or
+  metadata, and after each finished leaf.
+- The size check asks the batch what commit admission would count
+  (`NamespaceBatch.stagedBytes`, backed by the LSM transaction's logical
+  bytes), sampled at halving checkpoints toward the budget.
+- Searches keep the previous snapshot until the session finish publishes the
+  tree. A crash mid-build leaves the bulk-publish marker, so reopen fails
+  with `IncompleteBulkPublish` and the index manager rebuilds the index, as
+  for any interrupted bulk session.
+- Smaller builds keep the single transaction. Bounded commits cost a
+  read-back of committed nodes while linking parents, and an LSM flush at
+  session finish.
 
 ### Split Child Rebuild
 

@@ -16796,7 +16796,18 @@ pub const IndexManager = struct {
 
             const before_insert = dest_entry.index.getWriteProfile();
             const insert_started = nowNs();
-            try dest_entry.index.bulkBuildPreparedInputsTxn(&dest_txn, ctx.collected[0..ctx.collected_count]);
+            const collected_inputs = ctx.collected[0..ctx.collected_count];
+            // A child too large for one storage commit is built in bounded
+            // commits inside its own bulk-publication session; the session
+            // marker makes an interrupted build rebuild on reopen.
+            const bounded_budget = dest_entry.index.preparedBulkBuildCommitBudget(collected_inputs);
+            if (bounded_budget) |budget| {
+                dest_txn.abort();
+                dest_txn_open = false;
+                try dest_entry.index.bulkBuildPreparedInputsBounded(collected_inputs, budget);
+            } else {
+                try dest_entry.index.bulkBuildPreparedInputsTxn(&dest_txn, collected_inputs);
+            }
             handoffs[i].insert_ns += elapsedSince(insert_started);
             const after_insert = dest_entry.index.getWriteProfile();
             handoffs[i].insert_store_ns += after_insert.bulk_build_store_ns - before_insert.bulk_build_store_ns;
@@ -16808,8 +16819,10 @@ pub const IndexManager = struct {
 
             const before_finalize = dest_entry.index.getWriteProfile();
             const finalize_started = nowNs();
-            try dest_entry.index.finishWriteTxn(&dest_txn);
-            dest_txn_open = false;
+            if (dest_txn_open) {
+                try dest_entry.index.finishWriteTxn(&dest_txn);
+                dest_txn_open = false;
+            }
             handoffs[i].finalize_ns += elapsedSince(finalize_started);
             const after_finalize = dest_entry.index.getWriteProfile();
             handoffs[i].finalize_quantized_ns += after_finalize.refresh_quantized_ns - before_finalize.refresh_quantized_ns;
