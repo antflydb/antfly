@@ -598,6 +598,10 @@ pub const Storage = struct {
         open_leased_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").Source = null,
         acquire_lease: ?*const fn (*anyopaque) anyerror!Lease = null,
         create_dir_path: *const fn (*anyopaque, []const u8) anyerror!void,
+        /// Directories are inferred from child files and have no independent
+        /// entry to publish. Creating one needs no parent durability barrier.
+        /// File publication and deletion still require their normal barriers.
+        virtual_directories: bool = false,
         read_file_alloc: *const fn (*anyopaque, Allocator, []const u8, usize) anyerror![]u8,
         read_file_range_alloc: *const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror![]u8,
         begin_read_file_range_alloc: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror!RangeReadFuture = null,

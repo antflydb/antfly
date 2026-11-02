@@ -17,6 +17,10 @@
 //! instruction: transcription is image-only, and grounding is an exact keyword.
 const std = @import("std");
 
+/// Per-page OCR completion budget when the caller omits max_tokens.
+/// Request and deployment limits remain authoritative.
+pub const default_max_tokens: usize = 4096;
+
 pub const repository = "lightonai/LightOnOCR-3-0.8B";
 pub const revision = "36d8636925327c671bd8e479c517a004f7566bd9";
 pub const pinned_ref = repository ++ ":safetensors@" ++ revision;

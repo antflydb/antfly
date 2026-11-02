@@ -55,13 +55,15 @@ func (c *fixtureConnector) ValidateAbsentSources(context.Context, Request, []str
 }
 
 type publicationFixture struct {
-	mu                sync.Mutex
-	catalogRecords    map[string]map[string]any
-	records           map[string]map[string]any
-	failAfterWrite    bool
-	upserted, skipped int
-	deletes           int
-	selectedHeaders   []string
+	dropContentAck, dropCleanupAck bool
+	mu                             sync.Mutex
+	catalogRecords                 map[string]map[string]any
+	records                        map[string]map[string]any
+	failAfterWrite                 bool
+	upserted, skipped              int
+	deletes                        int
+	contentMerges, cleanupMerges   int
+	selectedHeaders                []string
 }
 
 func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -125,6 +127,11 @@ func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad merge", 400)
 			return
 		}
+		if request.ScopedMerge.DeleteMissing {
+			f.cleanupMerges++
+		} else {
+			f.contentMerges++
+		}
 		result, err := fixtureScopedMerge(records, request.ScopedMerge)
 		if err != nil {
 			http.Error(w, err.Error(), 400)
@@ -133,6 +140,18 @@ func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.deletes += result.Deleted
 		f.upserted += result.Upserted
 		f.skipped += result.Skipped
+		if (!request.ScopedMerge.DeleteMissing && f.dropContentAck) || (request.ScopedMerge.DeleteMissing && f.dropCleanupAck) {
+			if request.ScopedMerge.DeleteMissing {
+				f.dropCleanupAck = false
+			} else {
+				f.dropContentAck = false
+			}
+			connection, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				connection.Close()
+			}
+			return
+		}
 		if f.failAfterWrite {
 			f.failAfterWrite = false
 			http.Error(w, "write ack lost", 500)
@@ -153,7 +172,16 @@ func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				selected = append(selected, term["equals"].(string))
 			}
 		}
-		if ids, ok := q["ids"].([]any); ok {
+		if q["ids"] != nil {
+			http.Error(w, "doc_id query tag required", 400)
+			return
+		}
+		if tag, ok := q["doc_id"].(map[string]any); ok {
+			ids, ok := tag["ids"].([]any)
+			if !ok {
+				http.Error(w, "bounded ids required", 400)
+				return
+			}
 			for _, id := range ids {
 				selected = append(selected, id.(string))
 			}
@@ -183,7 +211,12 @@ func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if clauses, ok := b["must_not"].([]any); ok {
 				for _, clause := range clauses {
 					if c, ok := clause.(map[string]any); ok {
-						if ids, ok := c["ids"].([]any); ok {
+						if c["ids"] != nil {
+							http.Error(w, "doc_id query tag required", 400)
+							return
+						}
+						tag, _ := c["doc_id"].(map[string]any)
+						if ids, ok := tag["ids"].([]any); ok {
 							for _, id := range ids {
 								excluded[id.(string)] = true
 							}

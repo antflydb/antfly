@@ -738,7 +738,7 @@ fn parseChunkResponse(alloc: Allocator, response_body: []const u8) ![]RemoteChun
 fn responsePolicy(raw: @TypeOf(@as(inference_api.ChunkEmbeddingResponse, undefined).policy)) !inference_chunker.planning.Policy {
     var policy = inference_chunker.planning.Policy{};
     inline for (@typeInfo(inference_chunker.planning.Policy).@"struct".field_names) |name| if (@field(raw, name)) |n| {
-        @field(policy, name) = std.math.cast(@TypeOf(@field(policy, name)), n) orelse return error.InvalidChunkerResponse;
+        @field(policy, name) = if (@TypeOf(@field(policy, name)) == bool) n else std.math.cast(@TypeOf(@field(policy, name)), n) orelse return error.InvalidChunkerResponse;
     };
     try policy.validate();
     return policy;
@@ -776,7 +776,7 @@ fn parseModelChunks(a: Allocator, body: []const u8, replay: ?chunking_types.Repl
         if (!std.mem.eql(u8, item.descriptor.id, (inference_chunker.planning.Identity{ .plan = plan, .source = source }).cursor(ordinal, &cursor))) return error.InvalidChunkerResponse;
         const raw = item.descriptor.coordinates;
         var coordinates = inference_chunker.planning.Coordinates{ .kind = std.meta.stringToEnum(inference_chunker.planning.Kind, raw.kind) orelse return error.InvalidChunkerResponse };
-        inline for (.{ "start_byte", "end_byte", "page", "start_ns", "end_ns", "first_picture", "picture_count", "start_sample", "end_sample", "sample_rate", "start_tick", "end_tick", "timescale", "page_rotation", "raster_width", "raster_height" }) |name| {
+        inline for (.{ "start_byte", "end_byte", "page", "start_ns", "end_ns", "first_picture", "picture_count", "start_sample", "end_sample", "sample_rate", "start_tick", "end_tick", "timescale", "page_rotation", "speaker_index", "raster_width", "raster_height" }) |name| {
             if (@field(raw, name)) |number| @field(coordinates, name) = std.math.cast(@typeInfo(@TypeOf(@field(coordinates, name))).optional.child, number) orelse return error.InvalidChunkerResponse;
         }
         var owned_pictures: ?[]u64 = null;
@@ -802,7 +802,7 @@ fn parseModelChunks(a: Allocator, body: []const u8, replay: ?chunking_types.Repl
         try coordinates.validate();
         var policy = inference_chunker.planning.Policy{};
         inline for (@typeInfo(inference_chunker.planning.Policy).@"struct".field_names) |name| if (@field(response.policy, name)) |n| {
-            @field(policy, name) = std.math.cast(@TypeOf(@field(policy, name)), n) orelse return error.InvalidChunkerResponse;
+            @field(policy, name) = if (@TypeOf(@field(policy, name)) == bool) n else std.math.cast(@TypeOf(@field(policy, name)), n) orelse return error.InvalidChunkerResponse;
         };
         try policy.validate();
         if (item.embedding) |vector| {

@@ -132,6 +132,19 @@ zig build test -Dshared-lib-root=../..
 
 ## Tests
 
+Large allocation-heavy lake fixtures use `CheckedTestAllocator`: ownership,
+poisoning, write-after-free and leak checks stay enabled without capturing a
+stack for each successful allocation. Set `ANTFLY_TEST_ALLOCATOR_TRACES=1` to
+rerun with full allocation traces, and `ANTFLY_TEST_TIMINGS=1` to print per-test
+setup, body and cleanup times. For example, from `zig/`:
+
+```sh
+ANTFLY_TEST_ALLOCATOR_TRACES=1 ZIG_GLOBAL_CACHE_DIR=.zig-cache/global \
+  ~/bin/zig build lake-integration-test \
+  -Dtest-filter='external lake native ordered indexes spill real Parquet' -j1
+```
+
+
 The default Zig test target runs unit, simulation, chaos, and checked recall
 coverage:
 
@@ -238,9 +251,10 @@ Run each graph-pattern mode in a fresh process. The JSON output reports p50,
 p95, and p99 latency and query-allocation high-water marks. Process RSS is an
 OS high-water mark; use `--warmup 0 --samples 1` for a cold-query RSS comparison.
 
-The `search-benchmark-game/engines/antfly-zig` directory is an adapter for the
-external `search-benchmark-game` harness. It delegates to the root
-`search-bench` step.
+The [`bench/full_text/search-benchmark-game/engines`](bench/full_text/search-benchmark-game/engines)
+directory holds adapters for the external `search-benchmark-game` harness:
+`antfly-zig` delegates to the root `search-bench` step, and `tantivy-kernel` is
+the Tantivy comparison engine. See [the full-text benchmark](bench/full_text/BENCHMARK.md).
 
 ### PDF-only iteration
 

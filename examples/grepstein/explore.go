@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -130,7 +131,7 @@ func explorerHandlerWithStorage(tableURL string, client *http.Client, bucket str
 		}
 		original, _ := doc["original_url"].(string)
 		u, err := url.Parse(original)
-		if err != nil || bucket == "" || u.Scheme != "s3" || u.Host != bucket || !regexp.MustCompile(`^/objects/sha256/[a-f0-9]{64}\.pdf$`).MatchString(u.Path) || u.RawQuery != "" || u.User != nil {
+		if err != nil || !validOriginalLocator(u, bucket) {
 			http.Error(w, "Source unavailable", 404)
 			return
 		}
@@ -140,7 +141,11 @@ func explorerHandlerWithStorage(tableURL string, client *http.Client, bucket str
 			return
 		}
 		storage.Timeout = time.Minute
-		req, err := http.NewRequestWithContext(r.Context(), "GET", "https://storage.googleapis.com/storage/v1/b/"+url.PathEscape(bucket)+"/o/"+url.PathEscape(strings.TrimPrefix(u.Path, "/"))+"?alt=media", nil)
+		query := url.Values{"alt": {"media"}}
+		if u.Scheme == "gs" {
+			query.Set("generation", u.Query().Get("generation"))
+		}
+		req, err := http.NewRequestWithContext(r.Context(), "GET", "https://storage.googleapis.com/storage/v1/b/"+url.PathEscape(bucket)+"/o/"+url.PathEscape(strings.TrimPrefix(u.Path, "/"))+"?"+query.Encode(), nil)
 		if err != nil {
 			http.Error(w, "Source unavailable", 502)
 			return
@@ -221,4 +226,32 @@ func explorerQuery(q, mode string) (map[string]any, error) {
 // never be forwarded to storage, even when a result contains an external URL.
 func gcsReadClient(ctx context.Context) (*http.Client, error) {
 	return google.DefaultClient(ctx, "https://www.googleapis.com/auth/devstorage.read_only")
+}
+
+// Only immutable original PDFs in the configured private bucket can be served.
+// Page fragments are citations and never become part of the storage request.
+func validOriginalLocator(u *url.URL, bucket string) bool {
+	if u == nil || bucket == "" || u.Host != bucket || u.User != nil || !regexp.MustCompile(`^/objects/sha256/[a-f0-9]{64}\.pdf$`).MatchString(u.Path) {
+		return false
+	}
+	if u.Scheme == "s3" {
+		return u.RawQuery == "" && !u.ForceQuery
+	}
+	if u.Scheme != "gs" {
+		return false
+	}
+	q, err := url.ParseQuery(u.RawQuery)
+	return err == nil && len(q) == 1 && len(q["generation"]) == 1 && validGCSGeneration(q.Get("generation")) && u.RawQuery == "generation="+q.Get("generation")
+}
+func validGCSGeneration(value string) bool {
+	if value == "" || value[0] == '0' {
+		return false
+	}
+	for _, c := range value {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	_, err := strconv.ParseUint(value, 10, 64)
+	return err == nil
 }

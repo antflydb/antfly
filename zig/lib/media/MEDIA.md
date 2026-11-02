@@ -206,7 +206,12 @@ and the existing class/admission limits charge the final allocation.
 
 [mp4.Reader](src/mp4.zig) retains codec/configuration, geometry, display matrix,
 pixel aspect and raw color declarations alongside decode-order packet metadata.
-It supports qualified AVC and complete JPEG visual entries. Indexing reads bounded
+By default it supports qualified AVC and complete JPEG visual entries. Consumers
+can explicitly opt into HEVC (hvc1/hev1) and AV1 (av01) metadata and packet
+indexing through `Limits.codecs`. Their hvcC/av1C configuration is structurally
+validated and borrowed through `Track.codec_config`; this does not add portable
+CPU or Metal decoding. EmbeddingGemma2 CUDA uses that opt-in for NVDEC.
+Indexing reads bounded
 metadata, including tail `moov`, while payloads are independently leased.
 Container sync flags are hints; video validates actual IDR dependencies before
 nonzero AVC starts.

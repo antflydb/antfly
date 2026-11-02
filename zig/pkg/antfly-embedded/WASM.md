@@ -167,7 +167,7 @@ Available building blocks:
     HTTP server
 - [db.zig](src/engine/db.zig)
   - includes `openHosted(...)`
-- [antfly_wasm.zig](../../examples/antfly_wasm.zig)
+- [wasm_root.zig](src/wasm_root.zig)
   - runnable shared embedded WASM example using `Api.openHosted(...)`
   - proves close/reopen persistence over host-provided `Storage`
 
@@ -182,7 +182,7 @@ Typical hosted flow:
 7. app opens with `embedded.db.DB.openHosted(...)` or
    `embedded.api.Api.openHosted(...)`
 8. JS/WASM callers can also use the exported FFI shown in
-   `examples/antfly_wasm.zig`
+   `src/wasm_root.zig`
 9. host drives maintenance with `runUntilIdle()`
 
 ## Why Two Storage Interfaces

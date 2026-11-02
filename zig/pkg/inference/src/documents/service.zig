@@ -255,7 +255,7 @@ pub fn Service(comptime Node: type) type {
             defer arena.deinit();
             const a = arena.allocator();
             const request = try std.json.parseFromSliceLeaky(ReadRequest, a, bytes, .{ .duplicate_field_behavior = .@"error" });
-            if (request.max_tokens) |tokens| if (tokens < 1 or tokens > 1024) return error.InvalidMaxTokens;
+            if (request.max_tokens) |tokens| if (tokens < 1 or tokens > readers.max_output_tokens) return error.InvalidMaxTokens;
             const key = Key{ .name = request.model, .operation = definition_operation };
             const known_definition = if (snapshot) |graph| graph.get(key) else null;
             const definition_bytes = if (known_definition == null) try node.documentDefinition(a, request.model, definition_operation) else null;
@@ -1594,6 +1594,7 @@ fn dataUri(a: A, mime: []const u8, bytes: []const u8) ![]const u8 {
 test "document nested composites share one budget and one rendered view" {
     const Fake = struct {
         reads: usize = 0,
+        last_max_tokens: ?i64 = null,
         structured: bool = false,
         narrow_child: bool = false,
         byte_limited_child: bool = false,
@@ -1635,6 +1636,7 @@ test "document nested composites share one budget and one rendered view" {
             try std.testing.expectEqual(@as(usize, 1), request.images.len);
             try std.testing.expectEqualStrings("image/png", request.images[0].mime_type);
             self.reads += 1;
+            self.last_max_tokens = request.max_tokens;
             const results = try a.alloc(readers.Result, 1);
             results[0] = .{ .text = "Receipt total 12.50", .completion = if (self.incomplete) .length else .complete, .prompt_tokens = if (self.measured) @as(usize, 10) else null, .completion_tokens = if (self.measured) @as(usize, 256) else null };
             if (self.structured) results[0].document_json =
@@ -1734,6 +1736,21 @@ test "document nested composites share one budget and one rendered view" {
     try std.testing.expectEqualStrings("12.50", hosted_page.object.get("tables").?.array.items[0].object.get("cells").?.array.items[0].object.get("text").?.string);
     fake = .{};
     try testDurableReading(Fake, &fake);
+    // Document composition must preserve model defaults and larger explicit
+    // budgets all the way to the selected leaf reader.
+    const omitted = try Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = @import("antfly_documents").fixtures.get("one-pixel.png"), .mime_type = "image/png" }} }, .{});
+    defer a.free(omitted);
+    try std.testing.expectEqual(@as(?i64, null), fake.last_max_tokens);
+    for ([_]i64{ 4096, 8192 }) |tokens| {
+        const manual = try Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = @import("antfly_documents").fixtures.get("one-pixel.png"), .mime_type = "image/png" }}, .max_tokens = tokens }, .{});
+        defer a.free(manual);
+        try std.testing.expectEqual(@as(?i64, tokens), fake.last_max_tokens);
+    }
+    const reads_before_invalid = fake.reads;
+    for ([_]i64{ -1, 0, 8193 }) |tokens| {
+        try std.testing.expectError(error.InvalidMaxTokens, Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = @import("antfly_documents").fixtures.get("one-pixel.png"), .mime_type = "image/png" }}, .max_tokens = tokens }, .{}));
+    }
+    try std.testing.expectEqual(reads_before_invalid, fake.reads);
 }
 
 test "document extraction keeps independent sources atomic and reuses retained readings" {

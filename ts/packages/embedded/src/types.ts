@@ -96,7 +96,7 @@ export interface OpenOptions {
   generatedEnrichmentReplay?: boolean;
   mapSize?: Uint64Like;
   ttlCleanup?: TTLCleanupOptions;
-  /** Milliseconds to retry while another writer holds the writer lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0 (default) fails immediately. */
+  /** Milliseconds to retry Lite admission while another process holds the writer lease or advances the allocator checkpoint (ANTFLY_BUSY), like sqlite3_busy_timeout. Mutation bodies are never replayed by this admission retry. 0 (default) fails immediately. */
   busyTimeoutMs?: Uint64Like;
   inferenceHostBudgetMb?: number;
   inferenceBackendBudgetMb?: number;
@@ -215,6 +215,7 @@ export interface Capabilities {
 }
 
 export interface PendingWorkStatus {
+  background_publications?: unknown;
   derived_target_sequence: number;
   has_async_indexes: boolean;
   portable_import_publication_in_progress: boolean;
@@ -239,7 +240,22 @@ export interface ReplayGeneratedEnrichmentsResult {
   replayed: number;
 }
 
+/** Logical key/value payload, excluding physical headers. */
+export interface LiveByteCategory {
+  records: number;
+  key_bytes: number;
+  value_bytes: number;
+}
+
+export interface LiveByteAccounting {
+  metadata_catalog: LiveByteCategory;
+  index_catalog: LiveByteCategory;
+  control_documents: LiveByteCategory;
+  documents: LiveByteCategory;
+}
+
 export interface CheckReport {
+  live_accounting?: LiveByteAccounting | null;
   valid: boolean;
   file_size: number;
   valid_prefix_size: number;

@@ -8,8 +8,10 @@ import {
   DashboardPageDescription,
   DashboardPageHeader,
   DashboardPageTitle,
+  Field,
+  FieldLabel,
+  HighlightedCodeBlock,
   Input,
-  Label,
   Textarea,
 } from "@antfly/design-system";
 import type { InferenceGatewayModel, InferenceGatewayOperation } from "@antfly/sdk";
@@ -273,9 +275,26 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
           <CardHeader>
             <CardTitle>Public inference is disabled</CardTitle>
           </CardHeader>
-          <CardContent>
-            Ask your deployment administrator to enable the inference gateway. Database indexing and
-            query inference remain available.
+          <CardContent className="space-y-3">
+            <p>
+              Ask your deployment administrator to enable the inference gateway. Database indexing
+              and query inference remain available.
+            </p>
+            {models.length > 0 ? (
+              <div className="space-y-1">
+                <p className="text-sm font-medium">
+                  Installed models (not invocable until enabled)
+                </p>
+                <ul aria-label="Installed models" className="list-disc pl-5 text-sm">
+                  {models.map((entry) => (
+                    <li key={entry.id}>
+                      <code>{entry.id}</code>
+                      {entry.task ? ` (${entry.task})` : null}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
           </CardContent>
         </Card>
       ) : (
@@ -285,10 +304,10 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
               <CardTitle>Request</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="gateway-model">
+              <Field className="gap-2">
+                <FieldLabel htmlFor="gateway-model">
                   {operation === "generate/batch" ? "Default model (optional)" : "Model"}
-                </Label>
+                </FieldLabel>
                 <Input
                   id="gateway-model"
                   list="gateway-models"
@@ -301,7 +320,7 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
                     <option key={entry.id} value={entry.id} />
                   ))}
                 </datalist>
-              </div>
+              </Field>
               {selected && (
                 <p className="text-sm text-muted-foreground">
                   Availability: {selected.availability ?? "unknown"} · Catalog:{" "}
@@ -313,8 +332,8 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
                       .join(", ")}`}
                 </p>
               )}
-              <div className="space-y-2">
-                <Label htmlFor="gateway-operation">Operation</Label>
+              <Field className="gap-2">
+                <FieldLabel htmlFor="gateway-operation">Operation</FieldLabel>
                 <select
                   id="gateway-operation"
                   className="bg-background border rounded-md px-3 py-2 w-full"
@@ -327,7 +346,7 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
                     <option key={value}>{value}</option>
                   ))}
                 </select>
-              </div>
+              </Field>
               {operation === "decisions" &&
                 selected?.task === "decide" &&
                 selected.gateway_capabilities?.images === "supported" && (
@@ -376,23 +395,25 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
                   Use batch example
                 </Button>
               )}
-              <Label htmlFor="gateway-body">JSON request</Label>
-              <Textarea
-                id="gateway-body"
-                className="font-mono min-h-56"
-                value={request}
-                onChange={(event) => {
-                  const value = event.target.value;
-                  setDraft((draft) => ({
-                    ...draft,
-                    request: value,
-                    requestIsSample: false,
-                    // An edited body belongs to the current operation. Discovery
-                    // must not reinterpret it as another task's request.
-                    automaticOperation: false,
-                  }));
-                }}
-              />
+              <Field>
+                <FieldLabel htmlFor="gateway-body">JSON request</FieldLabel>
+                <Textarea
+                  id="gateway-body"
+                  className="font-mono min-h-56"
+                  value={request}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setDraft((draft) => ({
+                      ...draft,
+                      request: value,
+                      requestIsSample: false,
+                      // An edited body belongs to the current operation. Discovery
+                      // must not reinterpret it as another task's request.
+                      automaticOperation: false,
+                    }));
+                  }}
+                />
+              </Field>
               <div className="flex gap-2">
                 <Button
                   disabled={
@@ -433,10 +454,19 @@ function InferenceGatewayPlayground({ initialModel }: { initialModel: string }) 
                   <track kind="captions" />
                 </audio>
               )}
-              <pre aria-live="polite" className="whitespace-pre-wrap break-words text-sm font-mono">
-                {output ||
-                  (running ? "Waiting for response…" : "Run a request to see its response.")}
-              </pre>
+              <div aria-live="polite">
+                {output ? (
+                  <HighlightedCodeBlock
+                    code={output}
+                    language={/^\s*[[{]/.test(output) ? "json" : "text"}
+                    wrap
+                  />
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    {running ? "Waiting for response…" : "Run a request to see its response."}
+                  </p>
+                )}
+              </div>
             </CardContent>
           </Card>
         </>

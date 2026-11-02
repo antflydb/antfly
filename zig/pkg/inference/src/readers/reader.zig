@@ -36,6 +36,7 @@ pub const Field = reader_types.Field;
 pub const Region = reader_types.Region;
 pub const Result = reader_types.Result;
 pub const ReadOptions = reader_types.ReadOptions;
+pub const resolveOutputTokens = reader_types.resolveOutputTokens;
 pub const StructuredValue = reader_types.StructuredValue;
 pub const nativeFlorenceReadBatchSize = @import("../pipelines/reading.zig").nativeFlorenceReadBatchSize;
 
@@ -461,6 +462,26 @@ pub const LoadedReader = union(enum) {
         if (batch.results.len != rasters.len) return error.InvalidReadResultCount;
         for (batch.results) |*result| try sanitizeResultUtf8(result);
         return batch;
+    }
+
+    /// The same completion budget used by each reader when max_tokens is omitted.
+    pub fn defaultMaxTokens(self: *LoadedReader) !?usize {
+        return switch (self.*) {
+            .vision => |*reader| blk: {
+                const prefix: usize = if (reader.core.dec_config.forced_bos_token_id == null) 1 else 2;
+                if (reader.core.dec_config.max_length <= prefix) return error.InvalidMaxTokens;
+                break :blk reader.core.dec_config.max_length - prefix;
+            },
+            .moondream => moondream_reader_mod.default_max_tokens,
+            .multistage => null,
+        };
+    }
+
+    /// Resolve once and pass the same effective options to validation and execution.
+    /// Explicit values remain unchanged so callers can reject values over policy.
+    pub fn resolveMaxTokens(self: *LoadedReader, requested: ?usize, ceiling: ?usize) !?usize {
+        if (requested) |value| return value;
+        return resolveOutputTokens(requested, try self.defaultMaxTokens(), ceiling);
     }
 
     /// Return the exact per-item textual input length produced by this loaded
@@ -1209,4 +1230,29 @@ test "Moondream readers route natively only with native checkpoint artifacts" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "moondream2/tokenizer.json", .data = "{}" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "moondream2/model.safetensors", .data = "" });
     try std.testing.expectEqual(ReaderKind.moondream, (try probeManifest(allocator, model_dir, man)).supported);
+}
+
+test "reader effective output options bound omitted defaults and preserve explicit values" {
+    var reader: LoadedReader = .{ .moondream = undefined };
+    try std.testing.expectEqual(@as(?usize, 64), try reader.resolveMaxTokens(null, 64));
+    try std.testing.expectEqual(@as(?usize, 256), try reader.resolveMaxTokens(null, null));
+    try std.testing.expectEqual(@as(?usize, 65), try reader.resolveMaxTokens(65, 64));
+}
+
+test "OCR reader families retain decoder budgets and manual overrides" {
+    // No inference sessions are needed to resolve immutable decoder metadata.
+    for ([_]ParserKind{ .default, .donut, .florence, .pix2struct }) |kind| {
+        var reader: LoadedReader = .{ .vision = .{ .allocator = std.testing.allocator, .parser_kind = kind, .core = undefined } };
+        reader.vision.core.dec_config = .{ .max_length = 2048 };
+        try std.testing.expectEqual(@as(?usize, 2047), try reader.resolveMaxTokens(null, null));
+        try std.testing.expectEqual(@as(?usize, 1024), try reader.resolveMaxTokens(null, 1024));
+        reader.vision.core.dec_config.forced_bos_token_id = 0;
+        try std.testing.expectEqual(@as(?usize, 2046), try reader.resolveMaxTokens(null, null));
+        try std.testing.expectEqual(@as(?usize, 4096), try reader.resolveMaxTokens(4096, 1024));
+        reader.vision.core.dec_config.max_length = 2;
+        try std.testing.expectError(error.InvalidMaxTokens, reader.resolveMaxTokens(null, null));
+    }
+    var multistage: LoadedReader = .{ .multistage = undefined };
+    try std.testing.expectEqual(@as(?usize, null), try multistage.resolveMaxTokens(null, 4096));
+    try std.testing.expectEqual(@as(?usize, 128), try multistage.resolveMaxTokens(128, 64));
 }

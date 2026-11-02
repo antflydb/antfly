@@ -367,7 +367,7 @@ pub const Runtime = struct {
             }
             const payload = try requestPayload(a, self.runtime.io, cfg, self.request);
             const body = payload.body;
-            const base = if (cfg.provider == .antfly and cfg.url.len == 0) if (self.runtime.antfly_url) |endpoint| try registry_mod.gateway.apiBaseAlloc(a, endpoint) else cfg.baseUrl() else cfg.baseUrl();
+            const base = if (cfg.provider == .antfly and cfg.url.len == 0) if (self.runtime.antfly_url) |endpoint| try @import("../common/inference_gateway.zig").apiBaseAlloc(a, endpoint) else cfg.baseUrl() else cfg.baseUrl();
             const url = if (cfg.provider == .cloudflare) (if (cfg.url.len != 0) cfg.url else try @import("antfly_decisions").cloudflare.endpoint(a, cfg.account_id.?, cfg.modelName())) else try std.fmt.allocPrint(a, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), switch (cfg.provider) {
                 .antfly => "/decisions",
                 .jev => "/v1/systemone",
@@ -2246,7 +2246,7 @@ test "decision provider rewriting requires completion aware local generation wit
     var fake = Fake{};
     var http = httpx.Client.init(a, std.testing.io);
     defer http.deinit();
-    const executor = registry_mod.tasks.Executor{
+    const executor = @import("../common/inference_tasks.zig").Executor{
         .view = .{ .providers = &registry },
         .http = &http,
         .context = .{ .io = std.testing.io, .deadline_ns = null },

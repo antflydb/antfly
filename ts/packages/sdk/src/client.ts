@@ -1045,7 +1045,7 @@ export class AntflyClient {
     path: string,
     request: unknown,
     options?: WriteOptions,
-    method: "POST" | "DELETE" = "POST",
+    method: "POST" | "DELETE" | "GET" = "POST",
     extraHeaders?: Record<string, string>
   ): Promise<T | undefined> {
     const { data } = await this.requestBoundedJSON<T>(
@@ -1182,8 +1182,42 @@ export class AntflyClient {
       options,
       "DELETE"
     );
-    if (!data || Array.isArray(data) || typeof data !== "object" || Object.keys(data).length !== 0)
+    // Older servers serialized the empty acknowledgment as [] rather than {}.
+    // Neither form carries data; reject nonempty or scalar acknowledgments.
+    if (!data || typeof data !== "object" || Object.keys(data).length !== 0)
       throw new Error("Invalid SQL connection close response");
+  }
+
+  /** Read a durable SQL transaction receipt without retrying or replaying its mutation. */
+  async getSQLTransactionOutcome(
+    transactionId: string,
+    options?: WriteOptions
+  ): Promise<{
+    transaction_id: string;
+    disposition: components["schemas"]["TransactionSessionStatus"]["disposition"];
+  }> {
+    if (!/^[0-9a-f]{32}$/.test(transactionId))
+      throw new Error("SQL transaction ID must be 32 lowercase hexadecimal characters");
+    const data = await this.sqlRequest<components["schemas"]["TransactionSessionDetailsResponse"]>(
+      `/db/v1/transactions/${transactionId}`,
+      undefined,
+      options,
+      "GET"
+    );
+    if (
+      !data ||
+      data.transaction_id !== transactionId ||
+      ![
+        "active",
+        "outcome_unknown",
+        "committed",
+        "committed_pending",
+        "committed_repair_required",
+        "aborted",
+      ].includes(data.disposition)
+    )
+      throw new Error("Invalid SQL transaction outcome response");
+    return { transaction_id: data.transaction_id, disposition: data.disposition };
   }
 
   /**
@@ -3963,6 +3997,8 @@ export interface InferenceGatewayModel {
   availability?: string;
   freshness?: string;
   gateway_capabilities?: Record<string, "supported" | "unsupported" | "unknown">;
+  /** False when public inference is disabled: the model is installed, but calls return 403. */
+  invocable?: boolean;
 }
 export interface InferenceGatewayCatalog {
   /** Deployment policy; omitted by servers predating public inference controls. */

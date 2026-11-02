@@ -3,6 +3,7 @@ from enum import StrEnum
 
 class ChunkOutputTargetKind(StrEnum):
     CLASSIFY = "classify"
+    DIARIZE = "diarize"
     EMBEDDING = "embedding"
     TRANSCRIBE = "transcribe"
 

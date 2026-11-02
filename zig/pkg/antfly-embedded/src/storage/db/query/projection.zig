@@ -411,8 +411,13 @@ test "public graph metric borrowed wire special projection sources preserve over
             }
         }
     };
-    try Fixture.run(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    // Keep every allocation-failure case without capturing allocator stacks on
+    // each replay of the fixture. Safety and leak checks remain enabled.
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
+    const alloc = fixture_allocator.allocator();
+    try Fixture.run(alloc);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Fixture.run, .{});
 }
 
 test "public graph metric borrowed wire local search shares plans and bounds synthetic projection scratch" {
@@ -484,8 +489,13 @@ test "public graph metric borrowed wire decoded special fields preserve numeric 
             }
         }
     };
-    try Fixture.run(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    // Keep every allocation-failure case without capturing allocator stacks on
+    // each replay of the fixture. Safety and leak checks remain enabled.
+    var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer fixture_allocator.deinit();
+    const alloc = fixture_allocator.allocator();
+    try Fixture.run(alloc);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Fixture.run, .{});
 }
 
 test "public graph metric borrowed wire decoded embedding projection fits bounded row scratch" {

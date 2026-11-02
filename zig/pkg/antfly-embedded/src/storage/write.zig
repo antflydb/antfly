@@ -17,7 +17,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const storage_engine = @import("engine.zig");
+const storage_engine = @import("engine_dispatch.zig").implementation;
 pub const scraping = if (builtin.os.tag == .freestanding) @import("db/scraping_stub.zig") else @import("antfly_scraping");
 const common_secrets = @import("../common/secrets.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;

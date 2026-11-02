@@ -1,0 +1,1034 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "20ff7b59641e553a13e9edd840f6e1dd2919f473",
+  "scope": "Paired conditional-source delivery and cache planning qualification; local raw artifacts remain ignored and unpublished.",
+  "fixture_limits": [
+    "Five alternating trials; 128 synthetic PNG image units in eight parents, constant model scores and 20 ms artificial HTTP delay.",
+    "Linux ARM64 runs in a two-CPU, 1-GiB container in the existing VM on the same physical Mac; not independent native Linux hardware.",
+    "CLI CPU/RSS excludes the Python index/provider fixture; HTTP wall time includes fixture hashing.",
+    "Both baselines already avoid warm inference. No live provider relevance, model-token or price claim.",
+    "Cold CPU/RSS and first-result latency do not improve uniformly; admission estimates are not RSS caps."
+  ],
+  "fixtures": {
+    "macos": {
+      "raw_artifact": "output/conditional-planned-wide-macos.json",
+      "raw_artifact_sha256": "3455331f53a3cd383b972b1c4e69da4a0466c357a5494e8fd8a34acdbb18e2ea",
+      "raw_artifact_availability": "local, unpublished",
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "machine": "arm64",
+      "binaries": {
+        "baseline": {
+          "sha256": "d43922ab35ed11d34893119d35c815a478b5052ff3b7fc7a52f65b9451d25594",
+          "bytes": 8207208
+        },
+        "candidate": {
+          "sha256": "faafe6832f4c44a74da8d07faf698de36bdf48119fcf898f573317712c9769ad",
+          "bytes": 8207864
+        }
+      },
+      "output_sha256": "5db0a0e8ce7b60c6e6fba878a0e422aa6fc66d653b5cdf8bf22de1e1cf150c02",
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 518625584,
+          "first_stdout_ns": 516307709,
+          "user_cpu_ns": 132224000,
+          "system_cpu_ns": 50940000,
+          "peak_rss_bytes": 57884672,
+          "provider_requests": 20,
+          "index_requests": 17,
+          "index_response_bytes": 44801025,
+          "projected_asset_bytes": 44742400,
+          "logical_provider_json_bytes": 44817660,
+          "evaluated_units": 128,
+          "child_cpu_ns": 183164000,
+          "elapsed_range_ns": [
+            495659208,
+            547210875
+          ]
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 219735625,
+          "first_stdout_ns": 218389000,
+          "user_cpu_ns": 3946000,
+          "system_cpu_ns": 13539000,
+          "peak_rss_bytes": 7421952,
+          "provider_requests": 0,
+          "index_requests": 17,
+          "index_response_bytes": 57073,
+          "projected_asset_bytes": 0,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 128,
+          "child_cpu_ns": 17327000,
+          "elapsed_range_ns": [
+            202975334,
+            224394541
+          ]
+        },
+        {
+          "variant": "baseline",
+          "phase": "question_miss",
+          "elapsed_ns": 693401875,
+          "first_stdout_ns": 691365125,
+          "user_cpu_ns": 136060000,
+          "system_cpu_ns": 54818000,
+          "peak_rss_bytes": 60768256,
+          "provider_requests": 21,
+          "index_requests": 33,
+          "index_response_bytes": 44822369,
+          "projected_asset_bytes": 44742400,
+          "logical_provider_json_bytes": 44818121,
+          "evaluated_units": 128,
+          "child_cpu_ns": 190862000,
+          "elapsed_range_ns": [
+            688480500,
+            700929666
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 511198292,
+          "first_stdout_ns": 508673459,
+          "user_cpu_ns": 136615000,
+          "system_cpu_ns": 50385000,
+          "peak_rss_bytes": 62717952,
+          "provider_requests": 20,
+          "index_requests": 17,
+          "index_response_bytes": 44801025,
+          "projected_asset_bytes": 44742400,
+          "logical_provider_json_bytes": 44817660,
+          "evaluated_units": 128,
+          "child_cpu_ns": 186092000,
+          "elapsed_range_ns": [
+            506542917,
+            528528208
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 213549958,
+          "first_stdout_ns": 212140708,
+          "user_cpu_ns": 3492000,
+          "system_cpu_ns": 8583000,
+          "peak_rss_bytes": 7585792,
+          "provider_requests": 0,
+          "index_requests": 10,
+          "index_response_bytes": 56338,
+          "projected_asset_bytes": 0,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 128,
+          "child_cpu_ns": 12059000,
+          "elapsed_range_ns": [
+            204332834,
+            219339042
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "question_miss",
+          "elapsed_ns": 534498958,
+          "first_stdout_ns": 531735667,
+          "user_cpu_ns": 136369000,
+          "system_cpu_ns": 51567000,
+          "peak_rss_bytes": 60342272,
+          "provider_requests": 20,
+          "index_requests": 17,
+          "index_response_bytes": 44801025,
+          "projected_asset_bytes": 44742400,
+          "logical_provider_json_bytes": 44817820,
+          "evaluated_units": 128,
+          "child_cpu_ns": 188938000,
+          "elapsed_range_ns": [
+            522097875,
+            568247125
+          ]
+        }
+      ]
+    },
+    "linux": {
+      "raw_artifact": "output/conditional-planned-wide-linux.json",
+      "raw_artifact_sha256": "1c125ad98582ef68b9b64b54c66d7c3c33548c827c98a7ac86bc55a4d05bf37d",
+      "raw_artifact_availability": "local, unpublished",
+      "platform": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.41",
+      "machine": "aarch64",
+      "binaries": {
+        "baseline": {
+          "sha256": "453f9606106a16cdce8c188b4f3f081e2d061319d16650a5ad6bf843cc8e8531",
+          "bytes": 31719872
+        },
+        "candidate": {
+          "sha256": "9bfdd5b3cd713fefa56966390286a222d15d5d45cd669957e4f284636dac9c44",
+          "bytes": 31750296
+        }
+      },
+      "output_sha256": "5db0a0e8ce7b60c6e6fba878a0e422aa6fc66d653b5cdf8bf22de1e1cf150c02",
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 530580167,
+          "first_stdout_ns": 513777000,
+          "user_cpu_ns": 216457000,
+          "system_cpu_ns": 50267000,
+          "peak_rss_bytes": 92393472,
+          "provider_requests": 20,
+          "index_requests": 17,
+          "index_response_bytes": 44801025,
+          "projected_asset_bytes": 44742400,
+          "logical_provider_json_bytes": 44817644,
+          "evaluated_units": 128,
+          "child_cpu_ns": 266724000,
+          "elapsed_range_ns": [
+            488673708,
+            569525251
+          ]
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 221996500,
+          "first_stdout_ns": 220992708,
+          "user_cpu_ns": 26407000,
+          "system_cpu_ns": 9338000,
+          "peak_rss_bytes": 17264640,
+          "provider_requests": 0,
+          "index_requests": 18,
+          "index_response_bytes": 5302612,
+          "projected_asset_bytes": 5243250,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 128,
+          "child_cpu_ns": 35592000,
+          "elapsed_range_ns": [
+            190049167,
+            267112250
+          ]
+        },
+        {
+          "variant": "baseline",
+          "phase": "question_miss",
+          "elapsed_ns": 653944250,
+          "first_stdout_ns": 650640375,
+          "user_cpu_ns": 211652000,
+          "system_cpu_ns": 45283000,
+          "peak_rss_bytes": 94695424,
+          "provider_requests": 20,
+          "index_requests": 33,
+          "index_response_bytes": 45171929,
+          "projected_asset_bytes": 45091950,
+          "logical_provider_json_bytes": 44817812,
+          "evaluated_units": 128,
+          "child_cpu_ns": 258872000,
+          "elapsed_range_ns": [
+            639817584,
+            672721042
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 469572625,
+          "first_stdout_ns": 465643750,
+          "user_cpu_ns": 208763000,
+          "system_cpu_ns": 45729000,
+          "peak_rss_bytes": 96391168,
+          "provider_requests": 19,
+          "index_requests": 17,
+          "index_response_bytes": 44801025,
+          "projected_asset_bytes": 44742400,
+          "logical_provider_json_bytes": 44817343,
+          "evaluated_units": 128,
+          "child_cpu_ns": 254492000,
+          "elapsed_range_ns": [
+            453165541,
+            484638751
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 192484292,
+          "first_stdout_ns": 191541917,
+          "user_cpu_ns": 3954000,
+          "system_cpu_ns": 8897000,
+          "peak_rss_bytes": 12808192,
+          "provider_requests": 0,
+          "index_requests": 10,
+          "index_response_bytes": 56338,
+          "projected_asset_bytes": 0,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 128,
+          "child_cpu_ns": 11802000,
+          "elapsed_range_ns": [
+            189270208,
+            207270375
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "question_miss",
+          "elapsed_ns": 472692792,
+          "first_stdout_ns": 469259792,
+          "user_cpu_ns": 213908000,
+          "system_cpu_ns": 35491000,
+          "peak_rss_bytes": 96530432,
+          "provider_requests": 20,
+          "index_requests": 17,
+          "index_response_bytes": 44801025,
+          "projected_asset_bytes": 44742400,
+          "logical_provider_json_bytes": 44817812,
+          "evaluated_units": 128,
+          "child_cpu_ns": 251479000,
+          "elapsed_range_ns": [
+            457669792,
+            498821333
+          ]
+        }
+      ]
+    }
+  },
+  "drivers": {
+    "zig/pkg/antfly-grep/bench/visual_batches.py": "11725a8e4da0c84eeec1dddb0016b18e4aee9101ccf7f252bec6e28e5e1d1c9b",
+    "zig/e2e/antfly/bench_source_projection.py": "4eb0122eb447917d46718b329b9cbd71e7672631ac4c49d9984b65ceb688ef91"
+  },
+  "storage_contract": {
+    "maximum_certificate_bytes": 17519,
+    "covers": "disjoint scalar leaves in current native JSON projection directories",
+    "proof_bindings": [
+      "current mutation/content proof",
+      "original byte length and SHA-256",
+      "source kind",
+      "exact directory SHA-256",
+      "canonicalizer/compiler ABI"
+    ],
+    "publication": "atomic with primary source, directory, content proof and mutation revision",
+    "fallback": "missing/stale certificates, opaque/subtree values, unsupported layouts and source-dependent operators use ordinary source projection/hash",
+    "limits": "Proof hits do not establish zero physical storage I/O. Other fields/layouts can require storage-frame or full source reads. Certificates add bounded metadata and linear write hashing work.",
+    "minimum_source_bytes": 16384,
+    "eligible_filters": "Public ID/filter roots with a synthesized match-all text marker remain source-only. Named or scoring text queries retain full-value execution."
+  },
+  "reproduction": [
+    "python3 zig/pkg/antfly-grep/bench/visual_batches.py CANDIDATE --baseline BASELINE --rounds 5 --parents 8 --units 16 --image-bytes 262144 --fixture-library FIXTURE_LIBRARY --source-projection --question-miss --output output/conditional-planning.json",
+    "uv run --project zig/e2e/antfly python zig/e2e/antfly/bench_source_projection.py CANDIDATE_SERVER --baseline BASELINE_SERVER --rounds 5 --documents 8 --value-bytes 262144 --output output/conditional-owned-native-server.json"
+  ],
+  "validation": {
+    "cli_macos": {
+      "total": 288,
+      "passed": 286,
+      "skipped": 2
+    },
+    "cli_linux_vm": {
+      "total": 288,
+      "passed": 285,
+      "skipped": 3
+    },
+    "query_contracts": {
+      "passed": 149,
+      "leaked": 0
+    },
+    "source_value_identity": {
+      "passed": 15,
+      "leaked": 0
+    },
+    "logical_field_queries": {
+      "passed": 91,
+      "skipped": 1,
+      "leaked": 0
+    },
+    "native_integration": {
+      "passed": 27,
+      "skipped": 7,
+      "covers": [
+        "single/two-shard delivery",
+        "wildcard/exclusion masks",
+        "integer/float/boolean/null/escaped Unicode identity equivalence",
+        "revision and authorization fences",
+        "current-value mutation",
+        "snapshot pagination and expiry"
+      ]
+    },
+    "artifact_cache": {
+      "passed": 4
+    },
+    "windows_cli": "cross-compilation passed; no runtime claim",
+    "storage_shard_audit": "passed",
+    "embedded_source_boundary_regressions": 20,
+    "apache_boundary_sources": 2203,
+    "release_packaging_tests": 4,
+    "main_merge_commit": "9ca2e6e28f",
+    "cli_suite_reuse": "Post-merge rebuilds are byte-identical; see post_main_merge_validation."
+  },
+  "validation_artifacts": {
+    "conditional-main-contracts.log": {
+      "availability": "local, unpublished",
+      "sha256": "b38dcdf9293ef054e7c05dd45887078eff59c6c4effec5f011c8ec652283ca96"
+    },
+    "conditional-main-boundary.log": {
+      "availability": "local, unpublished",
+      "sha256": "d419304086e969f41f709425c365ed1f01eaa5342262b6b6fc9831255afa4529"
+    },
+    "conditional-main-native-final.log": {
+      "availability": "local, unpublished",
+      "sha256": "bd5d12822f9c8184295113d25b9a3835d6344c725fd676f965e5c81275dcb474"
+    },
+    "conditional-main-packaging-final.log": {
+      "availability": "local, unpublished",
+      "sha256": "11f94406f8af58b62708be31dbfde7f39ef601dcf0c32e44dada03cbaa0e3159"
+    },
+    "conditional-main-grep-build.log": {
+      "availability": "local, unpublished",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "conditional-main-grep-linux-build.log": {
+      "availability": "local, unpublished",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "conditional-main-grep-windows-build.log": {
+      "availability": "local, unpublished",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "conditional-main-cli-rebuilds.json": {
+      "availability": "local, unpublished",
+      "sha256": "311fb54eb7106bf3e112fb7a3ddcc4a173f51d8b4d12a27c89be47588868497c"
+    }
+  },
+  "compiler": "0.17.0",
+  "implementation_source_sha256": {
+    "zig/pkg/antfly-embedded/src/api/query_contract.zig": "0486c39232548899e11826a54b6cedebc3ab3cd343c86f57fd8cdcdb2e400a4e",
+    "zig/pkg/antfly-embedded/src/api/query_execution_contract.zig": "8bc7b183db3c2dffad31f06c3d311ec71857c465222593e3babadbcc845cd698",
+    "zig/pkg/antfly-embedded/src/api/source_projection.zig": "6ca620b76b700ae2a20e8ac3512980fb08639a6e052707148465e9cd98aead31",
+    "zig/pkg/antfly-embedded/src/source_catalog.zig": "44ad1cac4772911f7344e500ac3baf635be9d97738df78678510783d90c4110e",
+    "zig/pkg/antfly-embedded/src/source_catalog_control.zig": "d37314465f45784cb0ea73d578feb8763044b56a7c2ec043801dd9fde3f575bf",
+    "zig/pkg/antfly-embedded/src/storage/db/db.zig": "0a9226525d4b8fb39863152bbd3bebca95c4430c0bc5724dbd02dbb69fde7c45",
+    "zig/pkg/antfly-embedded/src/storage/db/types.zig": "90a2fb304c7ace3f49524ba9b2e0df823089d183c9137af37d2c73fa80dac189",
+    "zig/pkg/antfly-embedded/src/storage/document_mutation_revision.zig": "3c6aef137a7e2c51704dfea3378f9c54b07942d9e3f797a04f5bb802fbab80e7",
+    "zig/pkg/antfly-embedded/src/storage/logical_source.zig": "f4d6b646c685c47d5ad45403f0410feb66b54dd18a0f635a450c7e4bc0b53059",
+    "zig/pkg/antfly-grep/src/artifact_cache.zig": "663cfee03c12a4e7e296f5cad5a22c45bd3434e30d3ed53c51cd776b497c46f8",
+    "zig/pkg/antfly-grep/src/decision.zig": "70badf8f982aac3d7d8127c6ddf2697e61a7f310671f72b593bc617e81752384",
+    "zig/pkg/antfly-grep/src/image_descriptor.zig": "3d45b8ffee89fa233c478aaa3f141402e234d9acd8f17df859888702aa44ebd9",
+    "zig/pkg/antfly-grep/src/indexed.zig": "d2f7270555e04bb542cd8c00e54ddf32cefb5ecc966e716f62f0716ca82587c9",
+    "zig/pkg/antfly-grep/src/root.zig": "c68733f3eb873ce2b71f6a5f08e503b7deffd6c03922d472412f7e91a5441403",
+    "zig/pkg/antfly-embedded/src/storage/source_value_identity.zig": "dfc0d66b2f43cb09484c6a4c5cdcdb5fdaa260665ff3b91a1e230bca02052b0b",
+    "zig/pkg/antfly-embedded/src/storage/conditional_source.zig": "80494aec451f061ac2063df06ba24be141d808144f592f5684baa2958a0b938f"
+  },
+  "integration_fixture_sha256": "de1e5f1803e23bd4ff488f1a41ca8d1a6cd985717d4d869d90d22ec1540815a8",
+  "native_source_delivery": {
+    "scope": "Native single-shard JSON tables, synthetic ASCII source values, warm filesystem/storage caches after ingestion; whole server process CPU includes background work; RSS sampled every 5 ms and is not an allocation bound; shared host; no inference",
+    "main_merge_commit": "9ca2e6e28f",
+    "main_commit": "871c14378840c9fb4d2422464d95f35ba51c0814",
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "cpu_count": 14,
+    "rounds": 5,
+    "documents": 8,
+    "value_bytes": 262144,
+    "build": {
+      "optimize": "ReleaseFast",
+      "strip": true,
+      "target": "aarch64-macos",
+      "cpu": "baseline",
+      "version": "antfly dev (zig runtime)"
+    },
+    "binaries": {
+      "baseline": {
+        "sha256": "074dbee368bec483600bb29e65fbcfc915d305974243476bfac9ca58b49c7489",
+        "bytes": 211070856
+      },
+      "candidate": {
+        "sha256": "25bd1ac46d75b0cf34ab184f8a56df307c984f2d25ade5a81eea8a3411d124c9",
+        "bytes": 211836616
+      }
+    },
+    "corpus_sha256": "553c2ce85f669d008a3a8fb798b73166f2c5a6148069ab195026a202bbc625f2",
+    "output_sha256": {
+      "full": "38a348f0497ea0dc4e4e4498d9c633ed2181a29cf13303c7413b2daaca8d20c9",
+      "conditional": "0466105df69a235c4b8f178e00924a7db5a0ce55cb4968cfc45beb2af6b20468"
+    },
+    "certificate_counts": [
+      {
+        "variant": "baseline",
+        "round": 0,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 0,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 1,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "baseline",
+        "round": 1,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "baseline",
+        "round": 2,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 2,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 3,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "baseline",
+        "round": 3,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "baseline",
+        "round": 4,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 4,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      }
+    ],
+    "medians": [
+      {
+        "variant": "baseline",
+        "phase": "ingest",
+        "elapsed_ns": 56354541,
+        "server_cpu_ns": 64687292,
+        "peak_rss_bytes": 155418624,
+        "response_bytes": 63,
+        "elapsed_range_ns": [
+          43434791,
+          85482167
+        ],
+        "server_cpu_range_ns": [
+          58483916,
+          85656125
+        ],
+        "median_peak_footprint_bytes": 121439240
+      },
+      {
+        "variant": "baseline",
+        "phase": "full",
+        "elapsed_ns": 15212709,
+        "server_cpu_ns": 12416792,
+        "peak_rss_bytes": 159825920,
+        "response_bytes": 2099279,
+        "elapsed_range_ns": [
+          10559292,
+          36326333
+        ],
+        "server_cpu_range_ns": [
+          8644209,
+          22000417
+        ],
+        "median_peak_footprint_bytes": 121078816
+      },
+      {
+        "variant": "baseline",
+        "phase": "conditional",
+        "elapsed_ns": 10292458,
+        "server_cpu_ns": 8886542,
+        "peak_rss_bytes": 159858688,
+        "response_bytes": 2071,
+        "elapsed_range_ns": [
+          7450833,
+          12348209
+        ],
+        "server_cpu_range_ns": [
+          6661750,
+          11542084
+        ],
+        "median_peak_footprint_bytes": 121832552
+      },
+      {
+        "variant": "candidate",
+        "phase": "ingest",
+        "elapsed_ns": 66237875,
+        "server_cpu_ns": 80216583,
+        "peak_rss_bytes": 152666112,
+        "response_bytes": 63,
+        "elapsed_range_ns": [
+          52714042,
+          71044500
+        ],
+        "server_cpu_range_ns": [
+          77095125,
+          95017042
+        ],
+        "median_peak_footprint_bytes": 118572040
+      },
+      {
+        "variant": "candidate",
+        "phase": "full",
+        "elapsed_ns": 17358250,
+        "server_cpu_ns": 14834292,
+        "peak_rss_bytes": 156434432,
+        "response_bytes": 2099279,
+        "elapsed_range_ns": [
+          11486459,
+          19978500
+        ],
+        "server_cpu_range_ns": [
+          9700875,
+          17076334
+        ],
+        "median_peak_footprint_bytes": 118359072
+      },
+      {
+        "variant": "candidate",
+        "phase": "conditional",
+        "elapsed_ns": 2165000,
+        "server_cpu_ns": 1089792,
+        "peak_rss_bytes": 156598272,
+        "response_bytes": 2071,
+        "elapsed_range_ns": [
+          1454333,
+          2323000
+        ],
+        "server_cpu_range_ns": [
+          708541,
+          1315083
+        ],
+        "median_peak_footprint_bytes": 118473760
+      }
+    ],
+    "raw_artifact": "output/conditional-main-native-server-final.json",
+    "raw_artifact_sha256": "6858fe35b33e6cb548467ec844d649c00a2af38510b05819e71276588810629e",
+    "raw_artifact_availability": "local, unpublished",
+    "limits": [
+      "Synthetic ASCII values in fresh single-shard native JSON tables; no inference, remote connector or independent host measurement.",
+      "Current certificates are required for omission; unsupported/legacy/stale cases retain full-value reference delivery and bounded repair.",
+      "Whole server process CPU includes background work. RSS is sampled and is not an allocation bound; remaining source fields/layouts can still require physical reads.",
+      "Ingestion and full delivery regress modestly in this corpus; warm read savings do not mean free writes or zero server work.",
+      "Response bytes count decoded HTTP bodies, not physical storage I/O.",
+      "Candidate includes main #1262 CLI/license unification as well as this feature; this pair does not isolate that merge. The separate pre-main run isolates the feature.",
+      "Shared-host timing/CPU and background activity vary between qualifications. No universal speed, memory or write-cost guarantee."
+    ]
+  },
+  "native_source_delivery_pre_main_merge": {
+    "scope": "Native single-shard JSON tables, synthetic ASCII source values, warm filesystem/storage caches after ingestion; whole server process CPU includes background work; RSS sampled every 5 ms and is not an allocation bound; shared host; no inference",
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "cpu_count": 14,
+    "rounds": 5,
+    "documents": 8,
+    "value_bytes": 262144,
+    "build": {
+      "optimize": "ReleaseFast",
+      "strip": true,
+      "target": "aarch64-macos",
+      "cpu": "baseline",
+      "version": "antfly dev (zig runtime)"
+    },
+    "binaries": {
+      "baseline": {
+        "sha256": "074dbee368bec483600bb29e65fbcfc915d305974243476bfac9ca58b49c7489",
+        "bytes": 211070856
+      },
+      "candidate": {
+        "sha256": "5c37eba8cc2462596b05c619816af698f0423f319c2b0941b6edd46b382f022c",
+        "bytes": 211136520
+      }
+    },
+    "corpus_sha256": "553c2ce85f669d008a3a8fb798b73166f2c5a6148069ab195026a202bbc625f2",
+    "output_sha256": {
+      "full": "38a348f0497ea0dc4e4e4498d9c633ed2181a29cf13303c7413b2daaca8d20c9",
+      "conditional": "0466105df69a235c4b8f178e00924a7db5a0ce55cb4968cfc45beb2af6b20468"
+    },
+    "certificate_counts": [
+      {
+        "variant": "baseline",
+        "round": 0,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 0,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 1,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "baseline",
+        "round": 1,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "baseline",
+        "round": 2,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 2,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 3,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "baseline",
+        "round": 3,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "baseline",
+        "round": 4,
+        "certificate_hits": 0,
+        "full_fallbacks": 0
+      },
+      {
+        "variant": "candidate",
+        "round": 4,
+        "certificate_hits": 16,
+        "full_fallbacks": 0
+      }
+    ],
+    "medians": [
+      {
+        "variant": "baseline",
+        "phase": "ingest",
+        "elapsed_ns": 41221917,
+        "server_cpu_ns": 52487708,
+        "peak_rss_bytes": 152977408,
+        "response_bytes": 63,
+        "elapsed_range_ns": [
+          38775291,
+          59561583
+        ],
+        "server_cpu_range_ns": [
+          42634333,
+          57819042
+        ],
+        "median_peak_footprint_bytes": 118981640
+      },
+      {
+        "variant": "baseline",
+        "phase": "full",
+        "elapsed_ns": 10391166,
+        "server_cpu_ns": 8447792,
+        "peak_rss_bytes": 155156480,
+        "response_bytes": 2099279,
+        "elapsed_range_ns": [
+          9861041,
+          28733459
+        ],
+        "server_cpu_range_ns": [
+          8126583,
+          12192375
+        ],
+        "median_peak_footprint_bytes": 117097504
+      },
+      {
+        "variant": "baseline",
+        "phase": "conditional",
+        "elapsed_ns": 7505958,
+        "server_cpu_ns": 6875125,
+        "peak_rss_bytes": 155205632,
+        "response_bytes": 2071,
+        "elapsed_range_ns": [
+          7284584,
+          8905291
+        ],
+        "server_cpu_range_ns": [
+          6692916,
+          8372583
+        ],
+        "median_peak_footprint_bytes": 117113888
+      },
+      {
+        "variant": "candidate",
+        "phase": "ingest",
+        "elapsed_ns": 43325041,
+        "server_cpu_ns": 55391834,
+        "peak_rss_bytes": 152797184,
+        "response_bytes": 63,
+        "elapsed_range_ns": [
+          40967083,
+          44850917
+        ],
+        "server_cpu_range_ns": [
+          47226875,
+          60625834
+        ],
+        "median_peak_footprint_bytes": 118850568
+      },
+      {
+        "variant": "candidate",
+        "phase": "full",
+        "elapsed_ns": 10934625,
+        "server_cpu_ns": 9053875,
+        "peak_rss_bytes": 156614656,
+        "response_bytes": 2099279,
+        "elapsed_range_ns": [
+          10394250,
+          11217083
+        ],
+        "server_cpu_range_ns": [
+          8725750,
+          9421125
+        ],
+        "median_peak_footprint_bytes": 118309944
+      },
+      {
+        "variant": "candidate",
+        "phase": "conditional",
+        "elapsed_ns": 1368375,
+        "server_cpu_ns": 676625,
+        "peak_rss_bytes": 156762112,
+        "response_bytes": 2071,
+        "elapsed_range_ns": [
+          1255875,
+          1378375
+        ],
+        "server_cpu_range_ns": [
+          642000,
+          714208
+        ],
+        "median_peak_footprint_bytes": 118359096
+      }
+    ],
+    "raw_artifact": "output/conditional-owned-native-server-final.json",
+    "raw_artifact_sha256": "e875bed17cb0a528f9b10ac6dce15595aa94bcc2fed2f10ff4edbd25fa2ea8d1",
+    "raw_artifact_availability": "local, unpublished",
+    "limits": [
+      "Synthetic ASCII values in fresh single-shard native JSON tables; no inference, remote connector or independent host measurement.",
+      "Current certificates are required for omission; unsupported/legacy/stale cases retain full-value reference delivery and bounded repair.",
+      "Whole server process CPU includes background work. RSS is sampled and is not an allocation bound; remaining source fields/layouts can still require physical reads.",
+      "Ingestion and full delivery regress modestly in this corpus; warm read savings do not mean free writes or zero server work.",
+      "Response bytes count decoded HTTP bodies, not physical storage I/O."
+    ],
+    "measured_implementation_commit": "95cdf2a20a"
+  },
+  "post_main_merge_validation": {
+    "merge_commit": "9ca2e6e28f",
+    "main_commit": "871c14378840c9fb4d2422464d95f35ba51c0814",
+    "query_contracts": 149,
+    "source_identity_tests": 15,
+    "logical_field_tests": 91,
+    "logical_field_skips": 1,
+    "leaks": 0,
+    "native_integration_passed": 27,
+    "native_integration_skipped": 7,
+    "release_packaging_tests": 4,
+    "apache_source_files": 2203,
+    "cli_rebuilds": {
+      "macos_sha256": "faafe6832f4c44a74da8d07faf698de36bdf48119fcf898f573317712c9769ad",
+      "linux_sha256": "9bfdd5b3cd713fefa56966390286a222d15d5d45cd669957e4f284636dac9c44",
+      "windows": {
+        "sha256": "f9d4900f91439325b805c1fbb7622afeefe4834093bc662fc548a50d7149c5c1",
+        "bytes": 8711680
+      },
+      "windows_unchanged": true
+    },
+    "cli_test_reuse": "macOS/Linux/Windows CLI rebuilds are byte-identical to the fully tested pre-merge binaries; full CLI suites remain applicable.",
+    "driver_sha256": {
+      "zig/pkg/antfly-grep/bench/visual_batches.py": "11725a8e4da0c84eeec1dddb0016b18e4aee9101ccf7f252bec6e28e5e1d1c9b",
+      "zig/e2e/antfly/bench_source_projection.py": "c37345aedea3b65780bb99e11bd419e3ead28345200e3c66895450346fa57c89"
+    },
+    "driver_change": "Native benchmark header changed to Apache-2.0 to match main; benchmark code is unchanged.",
+    "integration_fixture_sha256": "4df875ea2dc8af4b6384ef6a730f1801ba4f19c3f0473f286e106ca8419091c8",
+    "artifacts": {
+      "conditional-main-contracts.log": {
+        "availability": "local, unpublished",
+        "sha256": "b38dcdf9293ef054e7c05dd45887078eff59c6c4effec5f011c8ec652283ca96"
+      },
+      "conditional-main-boundary.log": {
+        "availability": "local, unpublished",
+        "sha256": "d419304086e969f41f709425c365ed1f01eaa5342262b6b6fc9831255afa4529"
+      },
+      "conditional-main-native-final.log": {
+        "availability": "local, unpublished",
+        "sha256": "bd5d12822f9c8184295113d25b9a3835d6344c725fd676f965e5c81275dcb474"
+      },
+      "conditional-main-packaging-final.log": {
+        "availability": "local, unpublished",
+        "sha256": "11f94406f8af58b62708be31dbfde7f39ef601dcf0c32e44dada03cbaa0e3159"
+      },
+      "conditional-main-grep-build.log": {
+        "availability": "local, unpublished",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "conditional-main-grep-linux-build.log": {
+        "availability": "local, unpublished",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "conditional-main-grep-windows-build.log": {
+        "availability": "local, unpublished",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "conditional-main-cli-rebuilds.json": {
+        "availability": "local, unpublished",
+        "sha256": "311fb54eb7106bf3e112fb7a3ddcc4a173f51d8b4d12a27c89be47588868497c"
+      }
+    }
+  },
+  "measured_implementation_commit": "95cdf2a20a",
+  "pre_main_validation": {
+    "cli_macos": {
+      "total": 288,
+      "passed": 286,
+      "skipped": 2
+    },
+    "cli_linux_vm": {
+      "total": 288,
+      "passed": 285,
+      "skipped": 3
+    },
+    "query_contracts": {
+      "passed": 149,
+      "leaked": 0
+    },
+    "source_value_identity": {
+      "passed": 15,
+      "leaked": 0
+    },
+    "logical_field_queries": {
+      "passed": 91,
+      "skipped": 1,
+      "leaked": 0
+    },
+    "native_integration": {
+      "passed": 27,
+      "skipped": 7,
+      "covers": [
+        "single/two-shard delivery",
+        "wildcard/exclusion masks",
+        "integer/float/boolean/null/escaped Unicode identity equivalence",
+        "revision and authorization fences",
+        "current-value mutation",
+        "snapshot pagination and expiry"
+      ]
+    },
+    "artifact_cache": {
+      "passed": 4
+    },
+    "windows_cli": "cross-compilation passed; no runtime claim",
+    "storage_shard_audit": "passed",
+    "embedded_source_boundary_regressions": 20,
+    "apache_boundary_sources": 2432
+  },
+  "pre_main_validation_artifacts": {
+    "conditional-planned-cli-macos-final.log": {
+      "availability": "local, unpublished",
+      "sha256": "1b703774fe9d12d830d55a811246020bc27463255795ec65c949c7d49f8d1162"
+    },
+    "conditional-planned-cli-linux-final.log": {
+      "availability": "local, unpublished",
+      "sha256": "05e91c567f79f8c6e620e26170850058310bfbae31621818581fb7457ddf138a"
+    },
+    "conditional-owned-real-scope-tests.log": {
+      "availability": "local, unpublished",
+      "sha256": "bd53a4a311018992106e6bfb86bb7f8ddc84b7a33e05e902211d9d869ca82569"
+    },
+    "conditional-owned-snapshot-final-tests.log": {
+      "availability": "local, unpublished",
+      "sha256": "67191fb30503a719dde6f02286c75db60f5c17446cbe47f609001fca5297c597"
+    },
+    "conditional-owned-snapshot-native-final.log": {
+      "availability": "local, unpublished",
+      "sha256": "31fa0afcf3d2ab484ad3d5a903c82668e0b42e6adc4f1888cd3c6e28b36a80dd"
+    },
+    "conditional-cache-writers-test.log": {
+      "availability": "local, unpublished",
+      "sha256": "a77972c1cbe3394329424ca4862ea29a43d13ad6636dffb85388b71f53625eb7"
+    },
+    "conditional-planned-windows-build.log": {
+      "availability": "local, unpublished",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "conditional-owned-snapshot-boundary-final.log": {
+      "availability": "local, unpublished",
+      "sha256": "809d64b31ad3c07a6a72de5dc7176917915947bf0dbb0b793eae2e68c6c2bbae"
+    }
+  },
+  "final_main_refresh": {
+    "main_commit": "2aed23bb0e43b51e0a674b6c2f54dd940706d0cb",
+    "merge_commit": "5447f58f3a",
+    "main_changes": "#1264 CI/inference build fixes and #1265 symbolic Type1 PDF Unicode recovery",
+    "merge_resolution": "Regenerated private error-name table with Zig 0.17.0; generator check and both transport tests pass.",
+    "query_contracts": 149,
+    "identity_storage_tests": 15,
+    "logical_field_tests": 91,
+    "logical_field_skips": 1,
+    "leaks": 0,
+    "pdf_tests": "lib-pdf-test passed (shared PDF and mock OCR integration)",
+    "error_transport_tests": 2,
+    "cli_macos_passed": 286,
+    "cli_macos_skipped": 2,
+    "cli_linux_vm_passed": 285,
+    "cli_linux_vm_skipped": 3,
+    "apache_source_files": 2203,
+    "core_source_hashes_unchanged_from_native_qualification": true,
+    "cli_macos_sha256": "faafe6832f4c44a74da8d07faf698de36bdf48119fcf898f573317712c9769ad",
+    "cli_linux_sha256": "9bfdd5b3cd713fefa56966390286a222d15d5d45cd669957e4f284636dac9c44",
+    "windows_cross_compilation": "passed",
+    "windows_cli_sha256": "f9d4900f91439325b805c1fbb7622afeefe4834093bc662fc548a50d7149c5c1",
+    "native_validation_scope": "Native server integration and performance remain pinned to the recorded 9ca2e6e28f build. This final refresh changes PDF/inference/CI paths; relevant query/storage source hashes and macOS/Linux CLI bytes are unchanged.",
+    "artifacts": {
+      "conditional-latest-cli-macos.log": {
+        "availability": "local, unpublished",
+        "sha256": "1ccaece6c979e24e94e4d836d93bb0b7acc60b4f6c35731cb6c5a6701674fdbe"
+      },
+      "conditional-latest-cli-linux.log": {
+        "availability": "local, unpublished",
+        "sha256": "7956c2af78f4d5885b098881e9498cc6cc0ea15bd6d5deb523edbbe692c52c9c"
+      },
+      "conditional-latest-contracts-pdf.log": {
+        "availability": "local, unpublished",
+        "sha256": "1c8b332fe9c59021b46688861d683a0d894498b0c89fcac2737a7c47fc91dea0"
+      },
+      "conditional-latest-error-transport.log": {
+        "availability": "local, unpublished",
+        "sha256": "527eb1106307ccf2f36cac7305730ef2d98e2cd0305758c7642e8fc7529ffd04"
+      },
+      "conditional-latest-boundary.log": {
+        "availability": "local, unpublished",
+        "sha256": "d419304086e969f41f709425c365ed1f01eaa5342262b6b6fc9831255afa4529"
+      },
+      "conditional-latest-compatibility.log": {
+        "availability": "local, unpublished",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "conditional-latest-windows-build.log": {
+        "availability": "local, unpublished",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  }
+}

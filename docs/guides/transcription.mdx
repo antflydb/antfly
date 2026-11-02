@@ -1,7 +1,8 @@
 ---
 title: Index Recorded Calls and Podcasts
-order: 10
 description: A table whose audio recordings are transcribed at write time, chunked with the moment in the recording each chunk came from, and searchable next to your other documents
+sidebar: ingest
+order: 3
 ---
 
 <Questions>
@@ -153,6 +154,8 @@ antfly inference pull csukuangfj/speaker-embedding-models:3dspeaker_speech_campp
 Without it, a diarization request fails with `SPEAKER_MODEL_UNAVAILABLE` rather than silently returning an unlabelled transcript. Diarization adds roughly a tenth of a second per phrase on CPU. A transcript produced as text (rather than JSON) keeps the turns as `SPEAKER_00: ...` lines; the JSON form carries `speaker` on each segment and a `speakers` list. Labels are per recording: `SPEAKER_00` in one file is not the same person as `SPEAKER_00` in another.
 
 As an enrichment, the labels are durable. Each transcript phrase keeps the speaker who said it, and every chunk cut from a phrase carries `_speaker` alongside `_start_time_ms` and `_end_time_ms`, so a search hit says who was talking. A chunk that straddles a turn carries no label rather than crediting the wrong person. Providers that name speakers their own way, such as Vertex, are renumbered into the same `SPEAKER_NN` order.
+
+For audio and video chunking, `/ai/v1/chunk` also supports standalone `diarize` outputs, source-scoped speaker indices across windows, and optional boundaries at detected speaker turns. See [Speaker Diarization and Turn Boundaries](/docs/guides/media-pass#speaker-diarization-and-turn-boundaries).
 
 ## Tradeoffs
 

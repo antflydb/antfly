@@ -199,7 +199,12 @@ test "result collectors release scan rows across every allocation failure" {
             try std.testing.expectEqual(@as(usize, 3), result.documents.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
+    // Allocation-failure enumeration requires the same allocation sequence on
+    // every run. Backing-allocator remaps may succeed depending on neighboring
+    // allocations; force the allocate/copy fallback so every ownership transfer
+    // and growth allocation is tested independently of heap placement.
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), F.run, .{});
 }
 
 test "result collectors adopt enrichment arrays atomically across every allocation failure" {
@@ -227,7 +232,12 @@ test "result collectors adopt enrichment arrays atomically across every allocati
             try std.testing.expectEqual(@as(usize, 1), result.failed_keys.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
+    // Allocation-failure enumeration requires the same allocation sequence on
+    // every run. Backing-allocator remaps may succeed depending on neighboring
+    // allocations; force the allocate/copy fallback so every ownership transfer
+    // and growth allocation is tested independently of heap placement.
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), F.run, .{});
 }
 
 /// Owns every partially constructed extraction and every transferred array.
@@ -319,5 +329,10 @@ test "result collectors release complete graph identity and extraction transfers
             try std.testing.expectEqualStrings("embedding", result.dense_embeddings[0].artifact_ref.?.name);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
+    // Allocation-failure enumeration requires the same allocation sequence on
+    // every run. Backing-allocator remaps may succeed depending on neighboring
+    // allocations; force the allocate/copy fallback so every ownership transfer
+    // and growth allocation is tested independently of heap placement.
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), F.run, .{});
 }

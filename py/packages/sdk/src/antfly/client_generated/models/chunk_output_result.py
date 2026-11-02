@@ -7,11 +7,13 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.chunk_output_result_kind import ChunkOutputResultKind
+from ..models.chunk_output_result_speaker_scope import ChunkOutputResultSpeakerScope
 from ..models.chunk_output_result_status import ChunkOutputResultStatus
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.chunk_output_label import ChunkOutputLabel
+    from ..models.chunk_speaker_span import ChunkSpeakerSpan
     from ..models.chunk_transcript_span import ChunkTranscriptSpan
 
 
@@ -32,6 +34,12 @@ class ChunkOutputResult:
             coverage policy.
         sub_index (int):
         status (ChunkOutputResultStatus):
+        speaker_model_revision (str | Unset): SHA-256 of the speaker ONNX bytes used for this output. Included in recipe
+            identity for diarization and paired transcription or embedding boundaries.
+        speaker_scope (ChunkOutputResultSpeakerScope | Unset): Speaker indices are shared across all windows of this
+            source and diarization recipe.
+        speaker_spans (list[ChunkSpeakerSpan] | Unset): Timed voice annotations for kind=diarize, including unassigned
+            intervals. No transcript is required.
         start_ns (int | Unset):
         end_ns (int | Unset):
         attempts (int | Unset): Durable repair attempts made by the enrichment consumer.
@@ -51,6 +59,9 @@ class ChunkOutputResult:
     recipe_id: str
     sub_index: int
     status: ChunkOutputResultStatus
+    speaker_model_revision: str | Unset = UNSET
+    speaker_scope: ChunkOutputResultSpeakerScope | Unset = UNSET
+    speaker_spans: list[ChunkSpeakerSpan] | Unset = UNSET
     start_ns: int | Unset = UNSET
     end_ns: int | Unset = UNSET
     attempts: int | Unset = UNSET
@@ -79,6 +90,19 @@ class ChunkOutputResult:
         sub_index = self.sub_index
 
         status = self.status.value
+
+        speaker_model_revision = self.speaker_model_revision
+
+        speaker_scope: str | Unset = UNSET
+        if not isinstance(self.speaker_scope, Unset):
+            speaker_scope = self.speaker_scope.value
+
+        speaker_spans: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.speaker_spans, Unset):
+            speaker_spans = []
+            for speaker_spans_item_data in self.speaker_spans:
+                speaker_spans_item = speaker_spans_item_data.to_dict()
+                speaker_spans.append(speaker_spans_item)
 
         start_ns = self.start_ns
 
@@ -123,6 +147,12 @@ class ChunkOutputResult:
                 "status": status,
             }
         )
+        if speaker_model_revision is not UNSET:
+            field_dict["speaker_model_revision"] = speaker_model_revision
+        if speaker_scope is not UNSET:
+            field_dict["speaker_scope"] = speaker_scope
+        if speaker_spans is not UNSET:
+            field_dict["speaker_spans"] = speaker_spans
         if start_ns is not UNSET:
             field_dict["start_ns"] = start_ns
         if end_ns is not UNSET:
@@ -145,6 +175,7 @@ class ChunkOutputResult:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.chunk_output_label import ChunkOutputLabel
+        from ..models.chunk_speaker_span import ChunkSpeakerSpan
         from ..models.chunk_transcript_span import ChunkTranscriptSpan
 
         d = dict(src_dict)
@@ -165,6 +196,24 @@ class ChunkOutputResult:
         sub_index = d.pop("sub_index")
 
         status = ChunkOutputResultStatus(d.pop("status"))
+
+        speaker_model_revision = d.pop("speaker_model_revision", UNSET)
+
+        _speaker_scope = d.pop("speaker_scope", UNSET)
+        speaker_scope: ChunkOutputResultSpeakerScope | Unset
+        if isinstance(_speaker_scope, Unset):
+            speaker_scope = UNSET
+        else:
+            speaker_scope = ChunkOutputResultSpeakerScope(_speaker_scope)
+
+        _speaker_spans = d.pop("speaker_spans", UNSET)
+        speaker_spans: list[ChunkSpeakerSpan] | Unset = UNSET
+        if _speaker_spans is not UNSET:
+            speaker_spans = []
+            for speaker_spans_item_data in _speaker_spans:
+                speaker_spans_item = ChunkSpeakerSpan.from_dict(speaker_spans_item_data)
+
+                speaker_spans.append(speaker_spans_item)
 
         start_ns = d.pop("start_ns", UNSET)
 
@@ -206,6 +255,9 @@ class ChunkOutputResult:
             recipe_id=recipe_id,
             sub_index=sub_index,
             status=status,
+            speaker_model_revision=speaker_model_revision,
+            speaker_scope=speaker_scope,
+            speaker_spans=speaker_spans,
             start_ns=start_ns,
             end_ns=end_ns,
             attempts=attempts,

@@ -527,6 +527,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.WouldBlock,
         error.WriterLocked,
         error.FileBusy,
+        error.TextMergeBackpressureTimeout,
         error.LiteRetirementBacklogExceeded,
         error.SourceFileChanged,
         error.PortableImportPublicationInProgress,
@@ -560,7 +561,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.SqlMutationOutcomeUnknown,
         error.CommitDecisionUnknown,
         => .outcome_unknown,
-        error.RunUntilIdleNoProgress, error.EnrichmentWaitTimeout, error.AsyncWorkerFailed => .stalled,
+        error.RunUntilIdleNoProgress, error.EnrichmentWaitTimeout, error.AsyncWorkerFailed, error.CommitVisibilityNotSatisfied => .stalled,
         // A dimension probe against a live embedder hit an operational
         // (network/transport) failure rather than a malformed request --
         // matches `managed_embedder.isOperationalEmbeddingProbeError`'s
@@ -601,6 +602,9 @@ test "unauthenticated Lite access to an RLS table is a nonretryable capability e
 test "bounded Lite retirement admission is retryable while uncertain publication is not" {
     try std.testing.expectEqual(ErrorCode.busy, mapError(error.LiteRetirementBacklogExceeded));
     try std.testing.expectEqual(ErrorCode.busy, mapError(error.FileBusy));
+    try std.testing.expectEqual(ErrorCode.stalled, mapError(error.CommitVisibilityNotSatisfied));
+    try std.testing.expectEqual(ErrorCode.busy, mapError(error.TextMergeBackpressureTimeout));
+    try std.testing.expectEqualStrings("TextMergeBackpressureTimeout", std.mem.span(lastErrorDetail()));
     inline for (.{ error.DurabilityOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.CommitDecisionUnknown }) |err| {
         try std.testing.expectEqual(ErrorCode.outcome_unknown, mapError(err));
     }

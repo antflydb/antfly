@@ -211,7 +211,8 @@ pub const NativeContext = struct {
         const b = request.sample_index;
         const h: usize = self.config.encoder.hidden_size;
         const q = self.prepared.query_width;
-        const l = self.prepared.word_width;
+        const stride = self.prepared.word_width;
+        const l = self.prepared.samples[b].words.len;
         if (request.query_pairs.len > limits.math.max_queries or request.pairs.len > limits.max_relation_pairs) return error.InvalidBoundaryScorerRouting;
         const query_dim = if (self.config.head.directional_relation_states) 2 * h else h;
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -227,7 +228,7 @@ pub const NativeContext = struct {
                 @memcpy(output[h..], ts);
             } else for (output, hs, ts) |*value, left, right| value.* = (left + right) / 2;
         }
-        const result = try tasks.scoreRelationsNative(self.cb, allocator, self.config, .{ .batch = 1, .sequence_length = l, .relations = request.query_pairs.len, .text_states = self.core.text_states[b * l * h ..][0 .. l * h], .relation_query_states = states, .pairs = request.pairs, .control = control }, limits);
+        const result = try tasks.scoreRelationsNative(self.cb, allocator, self.config, .{ .batch = 1, .sequence_length = l, .relations = request.query_pairs.len, .text_states = self.core.text_states[b * stride * h ..][0 .. l * h], .relation_query_states = states, .pairs = request.pairs, .control = control }, limits);
         return .{ .storage = .{ .allocator = result.storage.allocator, .arena = result.storage.arena }, .logits = result.logits, .valid = result.valid };
     }
     fn recordScores(raw: *anyopaque, allocator: Allocator, request: RecordRequest, limits: tasks.Limits, control: ?Control) !RecordScores {

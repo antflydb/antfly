@@ -71,18 +71,18 @@ inference endpoint is configured.
 
 Serving admission and backend execution are separate concerns:
 
-- `admission.query.max_concurrent_requests` bounds node-local query, search,
+- `resources.query.admission.max_concurrent_requests` bounds node-local query, search,
   and retrieval execution across REST, MCP, A2A, and direct API-kernel calls.
-- `admission.write.max_concurrent_requests` independently bounds foreground
+- `resources.write.admission.max_concurrent_requests` independently bounds foreground
   table mutations, linear merges, and transaction commits. Administrative and
   control-plane routes remain available when either foreground class saturates.
-- `admission.inference.max_concurrent_requests` independently bounds requests
+- `resources.inference.admission.max_concurrent_requests` independently bounds requests
   across every embedded inference execution surface, including direct providers
   and the public inference and traditional-ML prediction routes, as well as
   public connection inference forwarding. Standalone shares one coordinator
-  across those surfaces rather than stacking independent limits. The same value
-  sizes a weighted work budget, so expensive requests can exhaust inference
-  capacity before the request-count ceiling is reached.
+  across those surfaces rather than stacking independent limits. `resources.inference.admission.max_work_units` independently sizes weighted
+  work capacity; when omitted it derives from request concurrency. Expensive
+  requests can exhaust work capacity before the request count is reached.
 - Listener connection limits remain transport safeguards. They do not express
   executing-query capacity because HTTP/2 streams and keep-alive requests can
   multiplex work over a smaller number of sockets.

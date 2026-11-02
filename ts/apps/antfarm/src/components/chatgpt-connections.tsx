@@ -6,7 +6,7 @@ export function ChatGPTConnections() {
   return (
     <section className="border p-5 space-y-4">
       <div>
-        <h2 className="font-aeonik text-lg">Use your ChatGPT plan</h2>
+        <h2 className="text-lg font-medium">Use your ChatGPT plan</h2>
         <p className="text-sm text-muted-foreground">
           Power interactive chat and answers over your Antfly data. Prompts and retrieved context
           are sent to OpenAI. Usage counts toward your existing ChatGPT plan limits.

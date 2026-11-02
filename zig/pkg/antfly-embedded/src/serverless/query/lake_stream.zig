@@ -275,25 +275,29 @@ pub const Stream = struct {
         }
     }
     fn warmBloom(self: *Stream, inventory: external.Inventory, ordinal: u32) anyerror!void {
+        _ = try self.probeGroup(inventory, ordinal);
+    }
+    fn probeGroup(self: *Stream, inventory: external.Inventory, ordinal: u32) anyerror!bool {
         const reader = self.source.scanner.shared_reader.?;
         var worker: @import("lake_serving_cache.zig").Reader = .{ .cache = reader.cache, .base = reader.base, .scope = reader.scope, .context = reader.context };
         const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = lookaheadCanceled };
         worker.context.cancellation = token;
         worker.base.cancellation = token;
         var stats: Stats = .{};
-        _ = try bloomGroupMayMatch(std.heap.page_allocator, worker.reader(), inventory.files[0], inventory.files[0].row_groups[ordinal], self.groupPredicates(), worker.context, &stats);
+        return try bloomGroupMayMatch(std.heap.page_allocator, worker.reader(), inventory.files[0], inventory.files[0].row_groups[ordinal], self.groupPredicates(), worker.context, &stats);
     }
     fn warmGroup(self: *Stream, inventory: external.Inventory, ordinal: u32, names: []const []const u8, required: []const bool) anyerror!void {
         const reader = self.source.scanner.shared_reader.?;
-        var worker_reader: @import("lake_serving_cache.zig").Reader = .{ .cache = reader.cache, .base = reader.base, .scope = reader.scope, .context = reader.context };
+        var worker_reader: @import("lake_serving_cache.zig").Reader = .{ .cache = reader.cache, .base = reader.base, .scope = reader.scope, .context = reader.context, .scheduler = reader.scheduler };
         const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = lookaheadCanceled };
         worker_reader.context.cancellation = token;
         worker_reader.base.cancellation = token;
         // Worker allocations never mutate a statement arena. Decoded buffers
         // belong to the bounded shared cache, and temporary work is admitted
         // by the same scheduler used by kernels, spill writes and prefetch.
-        var bloom_stats: Stats = .{};
-        if (!try bloomGroupMayMatch(std.heap.page_allocator, worker_reader.reader(), inventory.files[0], inventory.files[0].row_groups[ordinal], self.groupPredicates(), worker_reader.context, &bloom_stats)) return;
+        const io = worker_reader.context.io orelse return;
+        var bloom = reader.scheduler.submitIoTransient(io, 64 * 1024, probeGroup, .{ self, inventory, ordinal }) orelse return;
+        if (!try bloom.await(io)) return;
         var budget: @import("../../sql/memory_budget.zig") = .{ .backing = std.heap.page_allocator, .limit = self.lookaheadWorkspace() };
         defer std.debug.assert(budget.live == 0);
         var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(budget.allocator(), worker_reader.reader(), inventory, inventory.files[0].file_id, ordinal, names, .{
@@ -303,9 +307,9 @@ pub const Stream = struct {
             .max_struct_allocation_bytes = @min(self.limits.max_decoded_bytes, 2 * 1024 * 1024),
         });
         defer cursor.deinit();
-        // Avoid recursively reserving scheduler slots from an admitted task.
-        worker_reader.context.io = null;
         cursor.shared_reader = &worker_reader;
+        cursor.scheduler = reader.scheduler;
+        cursor.speculative = true;
         if (self.filter) |filter| {
             if (filter.encoded) cursor.filter = filter;
         }
@@ -354,7 +358,7 @@ pub const Stream = struct {
                     self.lookahead_next_input += 1;
                     continue;
                 }
-                slot.* = reader.scheduler.submitTransient(io, self.lookaheadWorkspace(), warmGroup, .{ self, plan.inventory, input.row_group_ordinal, self.lookahead_names, self.lookahead_required });
+                slot.* = reader.scheduler.submitPullTransient(io, self.lookaheadWorkspace(), warmGroup, .{ self, plan.inventory, input.row_group_ordinal, self.lookahead_names, self.lookahead_required });
                 if (slot.* == null) return; // Retry on the next pull as pressure falls.
                 self.lookahead_next_input += 1;
                 self.lookahead_started += 1;

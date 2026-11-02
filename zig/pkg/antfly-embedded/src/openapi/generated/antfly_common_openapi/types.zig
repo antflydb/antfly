@@ -11,46 +11,8 @@ const antfly_logging_openapi = @import("antfly_logging_openapi");
 const antfly_middleware_openapi = @import("antfly_middleware_openapi");
 const antfly_provider_openapi = @import("antfly_provider_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
+const antfly_resources_openapi = @import("antfly_resources_openapi");
 const antfly_scraping_openapi = @import("antfly_scraping_openapi");
-
-/// Node-local foreground database request admission settings.
-pub const AdmissionConfig = struct {
-    query: ?QueryAdmissionConfig = null,
-    write: ?WriteAdmissionConfig = null,
-    inference: ?InferenceAdmissionConfig = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "query", "query", true },
-        .{ "write", "write", true },
-        .{ "inference", "inference", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.query) |value| {
-            try jw.objectField("query");
-            try jw.write(value);
-        }
-        if (self.write) |value| {
-            try jw.objectField("write");
-            try jw.write(value);
-        }
-        if (self.inference) |value| {
-            try jw.objectField("inference");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
 
 /// Per-connection AWS credential identity. Each named connection owns an independent refresh cache, allowing lanes to use different accounts, profiles, or workload identities.
 pub const AwsCredentialConfig = struct {
@@ -290,8 +252,7 @@ pub const Config = struct {
     health_enabled: ?bool = null,
     /// Port for the health/metrics server. Defaults to 4200.
     health_port: ?i64 = null,
-    admission: ?AdmissionConfig = null,
-    graph_execution: ?GraphExecutionConfig = null,
+    resources: ?antfly_resources_openapi.ResourcesConfig = null,
     mcp: ?McpConfig = null,
     pgwire: ?PgwireConfig = null,
     backup: ?BackupConfig = null,
@@ -366,8 +327,7 @@ pub const Config = struct {
         .{ "log", "log", false },
         .{ "health_enabled", "health_enabled", true },
         .{ "health_port", "health_port", true },
-        .{ "admission", "admission", true },
-        .{ "graph_execution", "graph_execution", true },
+        .{ "resources", "resources", false },
         .{ "mcp", "mcp", true },
         .{ "pgwire", "pgwire", true },
         .{ "backup", "backup", true },
@@ -439,13 +399,12 @@ pub const Config = struct {
             try jw.objectField("health_port");
             try jw.write(value);
         }
-        if (self.admission) |value| {
-            try jw.objectField("admission");
+        if (self.resources) |value| {
+            try jw.objectField("resources");
             try jw.write(value);
-        }
-        if (self.graph_execution) |value| {
-            try jw.objectField("graph_execution");
-            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("resources");
+            try jw.write(@as(?u8, null));
         }
         if (self.mcp) |value| {
             try jw.objectField("mcp");
@@ -1175,83 +1134,6 @@ pub const GcsExternalIoConfig = struct {
     }
 };
 
-/// Operator-owned ceilings shared by all named graph operations in one admitted query. Public requests cannot raise these values. Explored work, scanned anchors, and exact-distinct capacity are request-consumptive; intermediate and retained-state ceilings bound simultaneously live state.
-pub const GraphExecutionConfig = struct {
-    /// Cumulative node expansions across every named operation and path spur in one request.
-    max_explored_nodes: ?i64 = null,
-    /// Cumulative edge expansions across every named operation and path spur in one request.
-    max_explored_edges: ?i64 = null,
-    /// Cumulative owned bytes of materialized edges read while executing one request.
-    max_explored_edge_bytes: ?i64 = null,
-    /// Cumulative source anchors scanned by exact MATCH operations in one request.
-    max_scanned_anchors: ?i64 = null,
-    /// Maximum simultaneously live traversal, pathfinding, or MATCH frontier states.
-    max_intermediate_states: ?i64 = null,
-    /// Maximum simultaneously retained bytes of admitted graph execution state.
-    max_retained_state_bytes: ?i64 = null,
-    /// Cumulative exact-distinct identities admitted across all named aggregates in one request.
-    max_distinct_identities: ?i64 = null,
-    /// Request-consumptive bytes for exact-distinct identities, indexes, and ownership transfer.
-    max_distinct_state_bytes: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "max_explored_nodes", "max_explored_nodes", true },
-        .{ "max_explored_edges", "max_explored_edges", true },
-        .{ "max_explored_edge_bytes", "max_explored_edge_bytes", true },
-        .{ "max_scanned_anchors", "max_scanned_anchors", true },
-        .{ "max_intermediate_states", "max_intermediate_states", true },
-        .{ "max_retained_state_bytes", "max_retained_state_bytes", true },
-        .{ "max_distinct_identities", "max_distinct_identities", true },
-        .{ "max_distinct_state_bytes", "max_distinct_state_bytes", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.max_explored_nodes) |value| {
-            try jw.objectField("max_explored_nodes");
-            try jw.write(value);
-        }
-        if (self.max_explored_edges) |value| {
-            try jw.objectField("max_explored_edges");
-            try jw.write(value);
-        }
-        if (self.max_explored_edge_bytes) |value| {
-            try jw.objectField("max_explored_edge_bytes");
-            try jw.write(value);
-        }
-        if (self.max_scanned_anchors) |value| {
-            try jw.objectField("max_scanned_anchors");
-            try jw.write(value);
-        }
-        if (self.max_intermediate_states) |value| {
-            try jw.objectField("max_intermediate_states");
-            try jw.write(value);
-        }
-        if (self.max_retained_state_bytes) |value| {
-            try jw.objectField("max_retained_state_bytes");
-            try jw.write(value);
-        }
-        if (self.max_distinct_identities) |value| {
-            try jw.objectField("max_distinct_identities");
-            try jw.write(value);
-        }
-        if (self.max_distinct_state_bytes) |value| {
-            try jw.objectField("max_distinct_state_bytes");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 /// How the hot-standby admin API of this node is reached and authenticated.
 pub const HotStandbyAdminConfig = struct {
     /// URL where this node's hot-standby admin API is reachable. Used as the default target by `antfly ha` when no `--admin-url`, `--data-dir`, or local handle flag is given. Not used by the server itself.
@@ -1648,33 +1530,6 @@ pub const HttpExternalIoConfig = struct {
         }
         if (self.headers) |value| {
             try jw.objectField("headers");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const InferenceAdmissionConfig = struct {
-    /// Maximum concurrent inference requests admitted by this process. The budget covers embedded inference routes, direct providers, and public connection inference forwarding. Remote forwarding holds a slot for the full upstream request. The runtime-reserved `local-inference` connection dispatches in process and is admitted once by the destination inference route; configured URLs remain remote boundaries even when they alias the local listener. Embedded standalone uses one shared coordinator for all of those surfaces; API-only runtimes use the same setting as a local forwarding gate. For embedded inference, this value also sizes the weighted work budget: each request consumes one request slot and at least one unit, while request body size, generation workload, and image byte/count reservations can consume more than one unit. The request count can therefore never exceed this value, while expensive requests may exhaust weighted capacity sooner. Read and image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per two images. A positive capacity also clamps each such request's downloaded-image ceiling to 16 MiB times this value. When a request or weighted-work ceiling is exhausted, new HTTP requests are rejected immediately with 503 Service Unavailable and Retry-After: 1; they are not retained in an in-process queue. Set to 0 to disable request admission and, for embedded inference, weighted-unit accounting and the capacity-derived clamp. The default is 32.
-    max_concurrent_requests: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "max_concurrent_requests", "max_concurrent_requests", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.max_concurrent_requests) |value| {
-            try jw.objectField("max_concurrent_requests");
             try jw.write(value);
         }
         try jw.endObject();
@@ -2368,33 +2223,6 @@ pub const PgwireConfig = struct {
     }
 };
 
-pub const QueryAdmissionConfig = struct {
-    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
-    max_concurrent_requests: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "max_concurrent_requests", "max_concurrent_requests", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.max_concurrent_requests) |value| {
-            try jw.objectField("max_concurrent_requests");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 pub const RewriterConfig = std.json.Value;
 
 pub const RuntimeTaskBinding = struct {
@@ -2896,33 +2724,6 @@ pub const WebSearchConnectionVariant = struct {
         try jw.write(self.capabilities);
         try jw.objectField("web_search");
         try jw.write(self.web_search);
-        try jw.endObject();
-    }
-};
-
-pub const WriteAdmissionConfig = struct {
-    /// Maximum concurrent foreground data mutations in this process. The default is 16. Table batch writes, cross-table batches, linear merges, and transaction commits consume this budget. Schema, index, backup, restore, repair, and other administrative operations use dedicated control or background-maintenance paths. Set to 0 to disable write admission. Excess HTTP work in either foreground class is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Both budgets are independent of transport safeguards and admission.inference.max_concurrent_requests.
-    max_concurrent_requests: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "max_concurrent_requests", "max_concurrent_requests", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.max_concurrent_requests) |value| {
-            try jw.objectField("max_concurrent_requests");
-            try jw.write(value);
-        }
         try jw.endObject();
     }
 };

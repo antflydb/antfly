@@ -40,8 +40,9 @@ pub const Response = struct {
 pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, expected_id: ?u64, identity: ?server_api.AuthenticatedIdentity, context: operation.RequestContext, request: Request) !Response {
     const mutation = request.action == .create or request.action == .commit or request.action == .changes or request.action == .maintenance or request.action == .reconcile;
     if (identity) |value| {
-        if (!server_api.permissionsAllow(value.permissions, .table, physical, if (mutation) .admin else .read)) return error.Forbidden;
-        // Catalog writes are table-wide file commits, not row-policy mutations.
+        if (!server_api.permissionsAllow(value.permissions, .table, physical, if (request.action == .changes) .write else if (mutation) .admin else .read)) return error.Forbidden;
+        // CDC accepts row mutations, while catalog/maintenance writes require
+        // table administration. Neither path evaluates per-row write policies.
         if (mutation and server_api.effectiveRowFilterJson(value, physical) != null) return error.Forbidden;
     }
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.ReadUnavailable;

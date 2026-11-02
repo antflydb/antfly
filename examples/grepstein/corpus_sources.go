@@ -18,6 +18,7 @@ package main
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"container/heap"
 	"crypto/hmac"
 	"crypto/rand"
@@ -274,9 +275,16 @@ func readCorpusLine[T any](r *bufio.Reader, v *T) (int64, error) {
 		}
 		break
 	}
-	err := error(nil)
-	if err = json.Unmarshal(line, v); err != nil {
+	// Locators contain nanosecond timestamps, which exceed float64's exact
+	// integer range. Keep numbers lossless even inside document metadata maps.
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	decoder.UseNumber()
+	if err := decoder.Decode(v); err != nil {
 		return 0, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return 0, fmt.Errorf("manifest line contains trailing JSON")
 	}
 	return int64(len(line)), nil
 }

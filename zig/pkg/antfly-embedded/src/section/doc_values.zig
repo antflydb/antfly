@@ -17,7 +17,9 @@
 //!
 //! Doc values provide per-document field values for sorting, faceting, and
 //! highlighting. Values are grouped into chunks (default 1024 docs) and
-//! Snappy-compressed for efficient random access.
+//! Snappy-compressed for efficient random access. Native source streams add
+//! authenticated first/last document IDs to each trailing-directory entry.
+//! A cursor builds record offsets once per decoded chunk, retaining one chunk.
 //!
 //! Wire format:
 //!   [numChunks: u32 LE]
@@ -49,6 +51,8 @@ pub const default_chunk_size: u32 = 1024;
 /// Soft byte bound; a single larger value gets its own chunk.
 pub const chunk_raw_target = 64 * 1024;
 const streamed_flag: u32 = 0x80000000;
+const indexed_flag: u32 = 0x40000000;
+const count_mask: u32 = 0x3fffffff;
 
 const ChunkBuffer = struct {
     raw: std.ArrayListUnmanaged(u8) = .empty,
@@ -116,7 +120,7 @@ pub const DocValuesWriter = struct {
     }
     fn flush(self: *DocValuesWriter) !void {
         if (self.pending.count == 0) return;
-        if (self.offsets.items.len >= streamed_flag - 1) return error.InvalidData;
+        if (self.offsets.items.len >= count_mask) return error.InvalidData;
         try self.offsets.ensureUnusedCapacity(self.alloc, 1);
         const encoded = try self.pending.encode(self.alloc, &self.compressed);
         try self.payload.appendSlice(self.alloc, encoded);
@@ -136,23 +140,32 @@ pub const DocValuesWriter = struct {
 
 /// Stream payload into a private segment sink. The high header bit selects a
 /// trailing offset directory, followed by its payload-relative start (u64 LE).
-/// Both readers continue to accept the historical front-directory format.
+/// Indexed source streams set bit 30 and append first/last doc IDs after every
+/// u64 offset. Readers accept both directory variants and the historical format.
 pub const StreamingWriter = struct {
     alloc: Allocator,
     sink: *@import("../segment.zig").SegmentSink,
     pending: ChunkBuffer,
     compressed: std.ArrayListUnmanaged(u8) = .empty,
     offsets: std.ArrayListUnmanaged(u64) = .empty,
+    bounds: std.ArrayListUnmanaged(struct { first: u32, last: u32 }) = .empty,
+    indexed: bool = false,
     start: ?usize = null,
     finished: bool = false,
 
     pub fn init(alloc: Allocator, sink: *@import("../segment.zig").SegmentSink, chunk_size: u32) StreamingWriter {
         return .{ .alloc = alloc, .sink = sink, .pending = .{ .max_docs = chunk_size } };
     }
+    pub fn initIndexed(alloc: Allocator, sink: *@import("../segment.zig").SegmentSink, chunk_size: u32) StreamingWriter {
+        var self = init(alloc, sink, chunk_size);
+        self.indexed = true;
+        return self;
+    }
     pub fn deinit(self: *StreamingWriter) void {
         self.pending.raw.deinit(self.alloc);
         self.compressed.deinit(self.alloc);
         self.offsets.deinit(self.alloc);
+        self.bounds.deinit(self.alloc);
     }
     pub fn add(self: *StreamingWriter, doc: u32, value: []const u8) !void {
         if (self.finished or self.pending.max_docs == 0 or value.len > std.math.maxInt(u32)) return error.InvalidData;
@@ -162,8 +175,9 @@ pub const StreamingWriter = struct {
     }
     fn flush(self: *StreamingWriter) !void {
         if (self.pending.count == 0) return;
-        if (self.offsets.items.len >= streamed_flag - 1) return error.InvalidData;
+        if (self.offsets.items.len >= count_mask) return error.InvalidData;
         try self.offsets.ensureUnusedCapacity(self.alloc, 1);
+        if (self.indexed) try self.bounds.ensureUnusedCapacity(self.alloc, 1);
         const encoded = try self.pending.encode(self.alloc, &self.compressed);
         if (self.start == null) {
             const start = self.sink.len();
@@ -172,6 +186,7 @@ pub const StreamingWriter = struct {
         }
         try self.sink.appendSlice(encoded);
         self.offsets.appendAssumeCapacity(self.sink.len() - self.start.? - 4);
+        if (self.indexed) self.bounds.appendAssumeCapacity(.{ .first = std.mem.readInt(u32, self.pending.raw.items[4..8], .little), .last = self.pending.last.? });
         self.pending.reset(self.alloc, &self.compressed);
     }
     pub fn finish(self: *StreamingWriter) !bool {
@@ -181,14 +196,19 @@ pub const StreamingWriter = struct {
         const start = self.start orelse return false;
         const directory_start = self.sink.len() - start - 4;
         var bytes: [8]u8 = undefined;
-        for (self.offsets.items) |offset| {
+        for (self.offsets.items, 0..) |offset, i| {
             std.mem.writeInt(u64, &bytes, offset, .little);
             try self.sink.appendSlice(&bytes);
+            if (self.indexed) {
+                std.mem.writeInt(u32, bytes[0..4], self.bounds.items[i].first, .little);
+                std.mem.writeInt(u32, bytes[4..8], self.bounds.items[i].last, .little);
+                try self.sink.appendSlice(&bytes);
+            }
         }
         std.mem.writeInt(u64, &bytes, directory_start, .little);
         try self.sink.appendSlice(&bytes);
         var header: [4]u8 = undefined;
-        std.mem.writeInt(u32, &header, streamed_flag | @as(u32, @intCast(self.offsets.items.len)), .little);
+        std.mem.writeInt(u32, &header, streamed_flag | (if (self.indexed) indexed_flag else @as(u32, 0)) | @as(u32, @intCast(self.offsets.items.len)), .little);
         try self.sink.writeAt(start, &header);
         return true;
     }
@@ -207,14 +227,38 @@ pub const DocValuesReader = struct {
     payload_length: u64,
     range: ?@import("../segment_source.zig").View = null,
     owned_offsets: ?[]u8 = null,
+    indexed: bool = false,
+    fn stride(self: *const DocValuesReader) usize {
+        return if (self.indexed) 16 else 8;
+    }
+    fn endOffset(self: *const DocValuesReader, chunk: u32) u64 {
+        return std.mem.readInt(u64, self.chunk_offsets[@as(usize, chunk) * self.stride() ..][0..8], .little);
+    }
+    fn bounds(self: *const DocValuesReader, chunk: u32) struct { first: u32, last: u32 } {
+        const at = @as(usize, chunk) * self.stride() + 8;
+        return .{ .first = std.mem.readInt(u32, self.chunk_offsets[at..][0..4], .little), .last = std.mem.readInt(u32, self.chunk_offsets[at + 4 ..][0..4], .little) };
+    }
+    fn chunkForDoc(self: *const DocValuesReader, doc: u32) ?u32 {
+        var low: u32 = 0;
+        var high = self.num_chunks;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const range = self.bounds(mid);
+            if (doc < range.first) high = mid else if (doc > range.last) low = mid + 1 else return mid;
+        }
+        return null;
+    }
 
     pub fn init(alloc: Allocator, data: []const u8) !DocValuesReader {
         if (data.len < 4) return error.InvalidData;
         const raw_count = std.mem.readInt(u32, data[0..4], .little);
         const streamed = raw_count & streamed_flag != 0;
-        const count = raw_count & ~streamed_flag;
-        if (count > (data.len - 4) / 8) return error.InvalidData;
-        const bytes = @as(usize, count) * 8;
+        const indexed = raw_count & indexed_flag != 0;
+        if (indexed and !streamed) return error.InvalidData;
+        const count = raw_count & count_mask;
+        const stride_bytes: usize = if (indexed) 16 else 8;
+        if (count > (data.len - 4) / stride_bytes) return error.InvalidData;
+        const bytes = @as(usize, count) * stride_bytes;
         var directory: usize = 4;
         var start: usize = 4 + bytes;
         var length: usize = data.len - start;
@@ -227,15 +271,23 @@ pub const DocValuesReader = struct {
             directory = start + length;
         }
         const offsets = data[directory..][0..bytes];
-        try validateOffsets(offsets, count, length);
-        return .{ .alloc = alloc, .data = data, .num_chunks = count, .chunk_offsets = offsets, .data_start = start, .payload_length = length };
+        try validateOffsets(offsets, count, length, indexed);
+        return .{ .alloc = alloc, .data = data, .num_chunks = count, .chunk_offsets = offsets, .data_start = start, .payload_length = length, .indexed = indexed };
     }
 
-    fn validateOffsets(offsets: []const u8, count: u32, length: u64) !void {
+    fn validateOffsets(offsets: []const u8, count: u32, length: u64, indexed: bool) !void {
+        const step: usize = if (indexed) 16 else 8;
+        var prior_doc: ?u32 = null;
         var previous: u64 = 0;
         for (0..count) |i| {
-            const end = std.mem.readInt(u64, offsets[i * 8 ..][0..8], .little);
+            const end = std.mem.readInt(u64, offsets[i * step ..][0..8], .little);
             if (end <= previous or end > length) return error.InvalidData;
+            if (indexed) {
+                const first = std.mem.readInt(u32, offsets[i * step + 8 ..][0..4], .little);
+                const last = std.mem.readInt(u32, offsets[i * step + 12 ..][0..4], .little);
+                if (first > last or (prior_doc != null and first <= prior_doc.?)) return error.InvalidData;
+                prior_doc = last;
+            }
             previous = end;
         }
         if (previous != length) return error.InvalidData;
@@ -248,8 +300,11 @@ pub const DocValuesReader = struct {
         try view.readInto(0, &header);
         const raw_count = std.mem.readInt(u32, &header, .little);
         const streamed = raw_count & streamed_flag != 0;
-        const count = raw_count & ~streamed_flag;
-        const bytes = std.math.mul(usize, count, 8) catch return error.InvalidData;
+        const indexed = raw_count & indexed_flag != 0;
+        if (indexed and !streamed) return error.InvalidData;
+        const count = raw_count & count_mask;
+        const stride_bytes: usize = if (indexed) 16 else 8;
+        const bytes = std.math.mul(usize, count, stride_bytes) catch return error.InvalidData;
         if (bytes > view.length - 4) return error.InvalidData;
         var directory: u64 = 4;
         var start: usize = 4 + bytes;
@@ -267,8 +322,8 @@ pub const DocValuesReader = struct {
         const offsets = try alloc.alloc(u8, bytes);
         errdefer alloc.free(offsets);
         try view.readInto(directory, offsets);
-        try validateOffsets(offsets, count, length);
-        return .{ .alloc = alloc, .data = &.{}, .num_chunks = count, .chunk_offsets = offsets, .data_start = start, .payload_length = length, .range = view, .owned_offsets = offsets };
+        try validateOffsets(offsets, count, length, indexed);
+        return .{ .alloc = alloc, .data = &.{}, .num_chunks = count, .chunk_offsets = offsets, .data_start = start, .payload_length = length, .range = view, .owned_offsets = offsets, .indexed = indexed };
     }
     pub fn deinit(self: *DocValuesReader) void {
         if (self.owned_offsets) |offsets| self.alloc.free(offsets);
@@ -317,10 +372,10 @@ pub const DocValuesReader = struct {
         if (chunk_idx >= self.num_chunks) return error.InvalidChunk;
         // Get chunk byte range
         const chunk_start: u64 = if (chunk_idx > 0)
-            @intCast(std.mem.readInt(u64, self.chunk_offsets[(@as(usize, chunk_idx) - 1) * 8 ..][0..8], .little))
+            self.endOffset(chunk_idx - 1)
         else
             0;
-        const chunk_end: u64 = @intCast(std.mem.readInt(u64, self.chunk_offsets[@as(usize, chunk_idx) * 8 ..][0..8], .little));
+        const chunk_end = self.endOffset(chunk_idx);
 
         if (chunk_start > chunk_end or chunk_end > self.payload_length) return error.InvalidData;
         return if (self.range) |view| blk: {
@@ -340,7 +395,7 @@ pub const DocValuesReader = struct {
         // Preserve one-chunk access for dense historical columns. The hint is
         // accepted only after inspecting actual IDs, so sparse columns remain
         // correct and callers need not know the writer's chunk size.
-        var hint: ?u32 = if (chunk_size != 0 and doc_id / chunk_size < high) doc_id / chunk_size else null;
+        var hint: ?u32 = if (self.indexed) (self.chunkForDoc(doc_id) orelse return null) else if (chunk_size != 0 and doc_id / chunk_size < high) doc_id / chunk_size else null;
         while (low < high) {
             const mid = hint orelse (low + (high - low) / 2);
             hint = null;
@@ -365,8 +420,173 @@ pub const DocValuesReader = struct {
                 pos += len;
             }
             if (pos != bytes.len) return error.InvalidData;
+            if (self.indexed) {
+                const range = self.bounds(mid);
+                if (first != range.first or last != range.last) return error.InvalidData;
+            }
             if (selected) |value| return try self.alloc.dupe(u8, value);
+            if (self.indexed) return null;
             if (doc_id < first) high = mid else if (doc_id > last) low = mid + 1 else return null;
+        }
+        return null;
+    }
+};
+
+/// Caller-owned navigation plus one decoded chunk. Borrowed values expire on
+/// the next get; no field payload is retained in the shared segment cache.
+pub const Cursor = struct {
+    const Record = struct { doc: u32, offset: usize, len: u32 };
+    /// A cursor and result pages may share one immutable decoded chunk. Moving
+    /// the cursor drops its reference; outstanding rows keep payloads valid.
+    const Shared = struct {
+        a: Allocator,
+        refs: std.atomic.Value(usize) = .init(1),
+        bytes: []u8,
+        records: std.ArrayListUnmanaged(Record),
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            const a = self.a;
+            a.free(self.bytes);
+            self.records.deinit(a);
+            a.destroy(self);
+        }
+    };
+    pub fn retainChunk(self: *Cursor) !@import("../storage/rowsource/types.zig").ColumnOwner {
+        if (self.chunk == null) return error.InvalidData;
+        const shared = self.shared orelse create: {
+            const value = try self.reader.alloc.create(Shared);
+            value.* = .{ .a = self.reader.alloc, .bytes = self.bytes, .records = self.records };
+            self.shared = value;
+            break :create value;
+        };
+        _ = shared.refs.fetchAdd(1, .monotonic);
+        return .{ .ptr = shared, .release_fn = Shared.release, .retained_bytes = @sizeOf(Shared) + shared.bytes.len + shared.records.capacity * @sizeOf(Record) };
+    }
+    fn retireChunk(self: *Cursor) void {
+        if (self.shared) |shared| {
+            Shared.release(shared);
+            self.records = .empty;
+            self.shared = null;
+        } else self.reader.alloc.free(self.bytes);
+        self.bytes = &.{};
+        self.chunk = null;
+        self.records.clearRetainingCapacity();
+    }
+    reader: DocValuesReader,
+    chunk: ?u32 = null,
+    bytes: []u8 = &.{},
+    records: std.ArrayListUnmanaged(Record) = .empty,
+    first: u32 = 0,
+    last: u32 = 0,
+    decode_count: usize = 0,
+    shared: ?*Shared = null,
+    pub fn init(reader: DocValuesReader) Cursor {
+        return .{ .reader = reader };
+    }
+    pub fn deinit(self: *Cursor) void {
+        self.retireChunk();
+        self.records.deinit(self.reader.alloc);
+        self.reader.deinit();
+    }
+    pub const Prefetch = struct { ranges: usize = 0, bytes: u64 = 0, examined: usize = 0 };
+    /// Hints for the next selected chunks, never intervening archive rows.
+    /// The enclosing segment authenticates this directory; required get still
+    /// validates decoded IDs. The source owns admission, cancellation and joins.
+    /// `docs` is sorted global ordinals within [base, end); no pointers escape.
+    pub fn prefetchSelected(self: *const Cursor, docs: []const u32, base: u32, end: u32) Prefetch {
+        var result: Prefetch = .{};
+        if (!self.reader.indexed) return result;
+        const view = self.reader.range orelse return result;
+        if (view.source != .ranges or view.source.ranges.prefetch == null) return result;
+        var position: usize = 0;
+        while (position < docs.len and result.ranges < 4 and result.examined < 64) {
+            result.examined += 1;
+            const doc = docs[position];
+            if (doc < base or doc >= end) break;
+            const chunk = self.reader.chunkForDoc(doc - base) orelse {
+                position += 1;
+                continue;
+            };
+            const last = @as(u64, base) + self.reader.bounds(chunk).last;
+            // Skip a dense selected chunk without scanning its rows or
+            // issuing duplicate hints for each winner.
+            var low = position + 1;
+            var high = docs.len;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                if (docs[mid] <= last) low = mid + 1 else high = mid;
+            }
+            position = low;
+            if (self.chunk == chunk) continue;
+            const start = if (chunk == 0) 0 else self.reader.endOffset(chunk - 1);
+            const length = self.reader.endOffset(chunk) - start;
+            // Oversized required values remain demand reads. Speculation has
+            // a byte cap as well as the existing four-task source queue.
+            if (length > 1024 * 1024 - result.bytes) break;
+            view.source.prefetch(view.offset + self.reader.data_start + start, length);
+            result.ranges += 1;
+            result.bytes += length;
+        }
+        return result;
+    }
+    pub fn get(self: *Cursor, doc: u32) !?[]const u8 {
+        if (self.chunk != null and doc >= self.first and doc <= self.last) return self.find(doc);
+        if (self.reader.indexed) {
+            const selected = self.reader.chunkForDoc(doc) orelse return null;
+            try self.load(selected);
+            return self.find(doc);
+        }
+        // Legacy columns still advance sequentially before falling back to a
+        // payload-bound search; new source columns seek in navigation alone.
+        var low: u32 = 0;
+        var high = self.reader.num_chunks;
+        var adjacent: ?u32 = if (self.chunk) |at| (if (doc > self.last and at + 1 < high) at + 1 else if (doc < self.first and at != 0) at - 1 else null) else null;
+        while (low < high) {
+            const mid = adjacent orelse (low + (high - low) / 2);
+            adjacent = null;
+            try self.load(mid);
+            if (doc < self.first) high = mid else if (doc > self.last) low = mid + 1 else return self.find(doc);
+        }
+        return null;
+    }
+    fn load(self: *Cursor, index: u32) !void {
+        if (self.chunk == index) return;
+        self.retireChunk();
+        self.bytes = try self.reader.decodeChunk(index);
+        self.decode_count += 1;
+        if (self.bytes.len < 4) return error.InvalidData;
+        const count = std.mem.readInt(u32, self.bytes[0..4], .little);
+        if (count == 0 or count > (self.bytes.len - 4) / 8) return error.InvalidData;
+        try self.records.ensureTotalCapacity(self.reader.alloc, count);
+        var at: usize = 4;
+        var last: ?u32 = null;
+        for (0..count) |_| {
+            if (self.bytes.len - at < 8) return error.InvalidData;
+            const id = std.mem.readInt(u32, self.bytes[at..][0..4], .little);
+            const len = std.mem.readInt(u32, self.bytes[at + 4 ..][0..4], .little);
+            at += 8;
+            if (len > self.bytes.len - at or (last != null and id <= last.?)) return error.InvalidData;
+            self.records.appendAssumeCapacity(.{ .doc = id, .offset = at, .len = len });
+            last = id;
+            at += len;
+        }
+        if (at != self.bytes.len) return error.InvalidData;
+        self.first = self.records.items[0].doc;
+        self.last = last.?;
+        if (self.reader.indexed) {
+            const range = self.reader.bounds(index);
+            if (range.first != self.first or range.last != self.last) return error.InvalidData;
+        }
+        self.chunk = index;
+    }
+    fn find(self: *const Cursor, doc: u32) ?[]const u8 {
+        var low: usize = 0;
+        var high = self.records.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const record = self.records.items[mid];
+            if (doc < record.doc) high = mid else if (doc > record.doc) low = mid + 1 else return self.bytes[record.offset..][0..record.len];
         }
         return null;
     }
@@ -602,4 +822,110 @@ test "empty stored values respect the byte limit with large document chunk caps"
     const got = (try reader.get(16383, 100000)).?;
     defer a.free(got);
     try std.testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "external lake bounded window profiles indexed source navigation decodes only selected chunks and unwinds faults" {
+    const Run = struct {
+        fn run(a: Allocator) !void {
+            var memory = @import("../segment.zig").MemorySegmentSink.init(a);
+            defer memory.deinit();
+            var sink = memory.sink();
+            var writer = StreamingWriter.initIndexed(a, &sink, 1);
+            defer writer.deinit();
+            for (0..32) |i| try writer.add(@intCast(i * 2), "value");
+            try std.testing.expect(try writer.finish());
+            const view = try @import("../segment_source.zig").View.init(.{ .contiguous = memory.out.items }, 0, memory.out.items.len);
+            var cursor = Cursor.init(try DocValuesReader.initRanges(a, view));
+            defer cursor.deinit();
+            try std.testing.expectEqualStrings("value", (try cursor.get(62)).?);
+            try std.testing.expectEqual(@as(usize, 1), cursor.decode_count);
+            try std.testing.expect((try cursor.get(61)) == null);
+            try std.testing.expectEqual(@as(usize, 1), cursor.decode_count);
+            for (0..32) |i| try std.testing.expectEqualStrings("value", (try cursor.get(@intCast(i * 2))).?);
+            try std.testing.expectEqual(@as(usize, 33), cursor.decode_count);
+            const directory = 4 + cursor.reader.payload_length;
+            // Reject an overlapping row-range directory before opening payloads.
+            try sink.writeAt(@intCast(directory + 16 + 8), &(@as([4]u8, @splat(0))));
+            try std.testing.expectError(error.InvalidData, DocValuesReader.init(a, memory.out.items));
+        }
+    };
+    try Run.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+}
+
+test "external lake bounded window profiles source chunk prefetch selects exact ranges bounds bytes and preserves demand ownership" {
+    const Run = struct {
+        fn run(a: Allocator, large: bool) !void {
+            const segment = @import("../segment.zig");
+            var memory = segment.MemorySegmentSink.init(a);
+            defer memory.deinit();
+            var sink = memory.sink();
+            try sink.appendSlice("padding");
+            var writer = StreamingWriter.initIndexed(a, &sink, 1);
+            defer writer.deinit();
+            const payload = try a.alloc(u8, if (large) 700 * 1024 else 8);
+            defer a.free(payload);
+            var random = std.Random.DefaultPrng.init(17);
+            random.random().bytes(payload);
+            for (0..8) |i| try writer.add(@intCast(i * 2), payload);
+            try std.testing.expect(try writer.finish());
+            const State = struct {
+                bytes: []const u8,
+                reads: usize = 0,
+                hints: [4]struct { offset: u64, length: u64 } = undefined,
+                count: usize = 0,
+                fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (offset > self.bytes.len or out.len > self.bytes.len - offset) return error.EndOfStream;
+                    self.reads += 1;
+                    @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+                }
+                fn prefetch(raw: *anyopaque, offset: u64, length: u64) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    std.debug.assert(self.count < self.hints.len);
+                    self.hints[self.count] = .{ .offset = offset, .length = length };
+                    self.count += 1;
+                }
+                fn close(_: *anyopaque) void {}
+            };
+            var state: State = .{ .bytes = memory.out.items };
+            const source: @import("../segment_source.zig").Source = .{ .ranges = .{ .ptr = &state, .length = state.bytes.len, .read_into = State.read, .prefetch = State.prefetch, .close = State.close } };
+            const view = try @import("../segment_source.zig").View.init(source, 7, state.bytes.len - 7);
+            var cursor = Cursor.init(try DocValuesReader.initRanges(a, view));
+            defer cursor.deinit();
+            try std.testing.expectEqualSlices(u8, payload, (try cursor.get(0)).?);
+            const reads = state.reads;
+            const hint = cursor.prefetchSelected(&.{ 100, 100, 102, 102, 106, 108, 110, 114, 116 }, 100, 116);
+            try std.testing.expectEqual(reads, state.reads);
+            try std.testing.expectEqual(@as(usize, if (large) 1 else 4), hint.ranges);
+            try std.testing.expectEqual(hint.ranges, state.count);
+            try std.testing.expect(hint.bytes <= 1024 * 1024);
+            const selected = [_]u32{ 1, 3, 4, 5 };
+            for (state.hints[0..state.count], selected[0..state.count]) |range, chunk| {
+                const start = cursor.reader.endOffset(chunk - 1);
+                try std.testing.expectEqual(view.offset + cursor.reader.data_start + start, range.offset);
+                try std.testing.expectEqual(cursor.reader.endOffset(chunk) - start, range.length);
+            }
+            // Prefetch neither changes the live decoded chunk nor transfers
+            // value ownership; missing and out-of-segment IDs stay harmless.
+            try std.testing.expectEqual(@as(?u32, 0), cursor.chunk);
+            try std.testing.expectEqual(@as(usize, 1), cursor.decode_count);
+            try std.testing.expectEqual(@as(usize, 0), cursor.prefetchSelected(&.{116}, 100, 116).ranges);
+            // Sparse absent rows cannot make each chunk transition scan the
+            // entire remaining selection. Bound metadata work independently.
+            var missing: [256]u32 = undefined;
+            for (&missing, 0..) |*doc, i| doc.* = @intCast(1000 + i);
+            const sparse_hint = cursor.prefetchSelected(&missing, 0, 2000);
+            try std.testing.expectEqual(@as(usize, 0), sparse_hint.ranges);
+            try std.testing.expectEqual(@as(usize, 64), sparse_hint.examined);
+            try std.testing.expectEqualSlices(u8, payload, (try cursor.get(14)).?);
+            std.debug.print("SOURCE_PREFETCH large={} ranges={} bytes={} sparse_probes={} demand_reads_during_hint=0\n", .{ large, hint.ranges, hint.bytes, sparse_hint.examined });
+        }
+        fn faults(a: Allocator) !void {
+            try run(a, false);
+        }
+    };
+    try Run.run(std.testing.allocator, false);
+    try Run.run(std.testing.allocator, true);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.faults, .{});
 }

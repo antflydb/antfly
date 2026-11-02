@@ -6,8 +6,8 @@ import { cn } from "@/lib/utils";
 
 /**
  * Buttons in the Antfly design language:
- *   - Mono "instrument" voice (Roboto Mono, 13px, weight 500, 0.03em tracking)
- *   - Square corners (rounded-none)
+ *   - Sans (Inter) at 14px, weight 500, sentence case
+ *   - Small radius (rounded-md): things you click are rounded, the page is square
  *   - token-width (--border-width) borders on outlined variants — the visual language is borders, not shadows
  *   - Ink fill is the everyday primary; the amber `brand` fill is reserved
  *     for special, infrequent actions (create a table — not apply a filter)
@@ -16,10 +16,9 @@ import { cn } from "@/lib/utils";
  */
 const buttonVariants = cva(
   cn(
-    // mono "instrument readout" voice
-    "font-mono text-[13px] font-medium",
+    "font-sans text-sm font-medium",
     // structure
-    "inline-flex shrink-0 items-center justify-center gap-2 rounded-none whitespace-nowrap",
+    "inline-flex shrink-0 items-center justify-center gap-2 rounded-md whitespace-nowrap",
     // motion (linear, no spring)
     "transition-colors",
     // focus + invalid + disabled
@@ -53,7 +52,7 @@ const buttonVariants = cva(
       },
       size: {
         default: "h-9 px-4 has-[>svg]:px-3",
-        xs: "h-6 gap-1 px-2 text-[11px] has-[>svg]:px-1.5 [&_svg:not([class*='size-'])]:size-3",
+        xs: "h-6 gap-1 px-2 text-xs has-[>svg]:px-1.5 [&_svg:not([class*='size-'])]:size-3",
         sm: "h-8 gap-1.5 px-3 has-[>svg]:px-2.5",
         lg: "h-10 px-6 has-[>svg]:px-4",
         icon: "size-9",

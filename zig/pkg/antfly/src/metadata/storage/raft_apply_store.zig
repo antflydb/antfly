@@ -46305,6 +46305,7 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
     var reader_requirements: ?@import("antfly_local_sources").common_schema_readers.ReaderRequirements = null;
     var full_text_read_index: ?[]const u8 = null;
     var materialized_view_id: ?u64 = null;
+    var object_storage_generation: u64 = 0;
     var lake_index_catalog_json: []const u8 = "";
     var sql_native_indexes_json: []const u8 = "";
     while (pos < encoded.len and count < fields.len) : (count += 1) {
@@ -46327,6 +46328,7 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
         reader_requirements = extension.schema_reader_requirements;
         full_text_read_index = extension.full_text_read_index;
         materialized_view_id = extension.sql_materialized_view_id;
+        object_storage_generation = extension.object_storage_generation;
     }
     // Legacy, read-schema, and restore-intent records respectively. Borrow all
     // framed fields to validate the encoding, but copy only query-owned data.
@@ -46336,6 +46338,7 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
         .full_text_read_index = if (mode == .query) full_text_read_index else null,
         .table_id = table_id,
         .storage_engine = storage.engine,
+        .object_storage_generation = object_storage_generation,
         .schema_json = fields[1],
         .read_schema_json = if (mode == .schema or count == 5) "" else fields[2],
         .indexes_json = if (mode == .schema) "" else fields[if (count == 5) 2 else 3],
@@ -61211,6 +61214,11 @@ test "metadata.lake index object table engine framing preserves empty topology a
     const projection = try decodeTableQueryProjection(a, table_bytes, true);
     defer projection.deinit(a);
     try std.testing.expectEqual(.object, projection.query_definition.?.storage_engine);
+    try std.testing.expectEqual(table.object_storage_generation, projection.query_definition.?.object_storage_generation);
+    for ([_]TableProjectionMode{ .schema, .query }) |mode| {
+        const borrowed = try borrowTableProjection(table_bytes, mode);
+        try std.testing.expectEqual(table.object_storage_generation, borrowed.query_definition.?.object_storage_generation);
+    }
     var roundtrip = (try decodeTransitionCommand(a, wire)).?;
     defer roundtrip.deinit(a);
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, roundtrip.apply_table_topology.create.table));
@@ -67323,7 +67331,19 @@ test "SQL native index namespace source digest tracks selected incarnations only
     try std.testing.expectEqualSlices(u8, &digest, &try RaftApplyStore.relationNativeTableSourceDigest(a, 17, "items", "{}", selected, second));
     try std.testing.expect(!std.mem.eql(u8, &digest, &try RaftApplyStore.relationNativeTableSourceDigest(a, 17, "items", "{}", selected, replaced)));
     try std.testing.expectEqualSlices(u8, &RaftApplyStore.relationTableSourceDigest(17, "items", "{}"), &try RaftApplyStore.relationNativeTableSourceDigest(a, 17, "items", "{}", "", first));
-    const record: metadata.TableRecord = .{ .table_id = 17, .name = "items", .schema_json = "{}", .indexes_json = first, .sql_native_indexes_json = selected };
+    const record: metadata.TableRecord = .{
+        .table_id = 17,
+        .name = "items",
+        .schema_json = "{}",
+        .indexes_json = first,
+        .sql_native_indexes_json = selected,
+        .schema_reader_requirements = .{ .semantic_version = 42, .encoding_version = 42 },
+        .full_text_read_index = "status_fts",
+        .sql_materialized_view_id = 23,
+        .storage = .{ .engine = .object },
+        .object_storage_generation = 37,
+        .object_storage_identity = @splat(9),
+    };
     const bytes = try encodeTableRecord(a, record);
     defer a.free(bytes);
     const decoded = try decodeTableRecord(a, bytes);
@@ -67332,4 +67352,9 @@ test "SQL native index namespace source digest tracks selected incarnations only
     const borrowed = try borrowTableProjection(bytes, .schema);
     try std.testing.expectEqualStrings(selected, borrowed.sql_native_indexes_json);
     try std.testing.expectEqualStrings(first, borrowed.raw_indexes_json);
+    try std.testing.expectEqualDeep(record.schema_reader_requirements, borrowed.schema_reader_requirements);
+    try std.testing.expectEqualStrings(record.full_text_read_index.?, borrowed.full_text_read_index.?);
+    try std.testing.expectEqual(record.sql_materialized_view_id, borrowed.sql_materialized_view_id);
+    try std.testing.expectEqual(.object, borrowed.query_definition.?.storage_engine);
+    try std.testing.expectEqual(record.object_storage_generation, borrowed.query_definition.?.object_storage_generation);
 }

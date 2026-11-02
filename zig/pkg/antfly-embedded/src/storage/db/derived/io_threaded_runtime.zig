@@ -1659,6 +1659,7 @@ const TestThreadedRuntimeCapture = struct {
     fail_next_forced_persist: std.atomic.Value(bool) = .init(false),
     fail_next_dense_apply_not_found: std.atomic.Value(bool) = .init(false),
     fail_next_apply_resource_budget: std.atomic.Value(bool) = .init(false),
+    apply_admission_error: anyerror = error.ResourceBudgetExceeded,
     fail_next_apply_would_block: std.atomic.Value(bool) = .init(false),
     would_block_failures: std.atomic.Value(u64) = .init(0),
     fail_next_publish: std.atomic.Value(bool) = .init(false),
@@ -1691,7 +1692,7 @@ fn testThreadedRuntimeApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, 
     }
     if (capture.fail_next_apply_resource_budget.swap(false, .monotonic)) {
         _ = capture.resource_budget_failures.fetchAdd(1, .monotonic);
-        return error.ResourceBudgetExceeded;
+        return capture.apply_admission_error;
     }
     if (index_ref.kind == .dense_vector and capture.fail_next_dense_apply_not_found.swap(false, .monotonic)) {
         _ = capture.apply_not_found_failures.fetchAdd(1, .monotonic);
@@ -2422,6 +2423,16 @@ test "io threaded dense publish NotFound retries with a fresh session" {
 }
 
 test "io threaded full-text resource pressure retries without poisoning runtime" {
+    try testFullTextAdmissionRetry(error.ResourceBudgetExceeded);
+}
+
+test "issue1015 issue1431 full-text capacity pressure retries and persists progress" {
+    for ([_]anyerror{ error.CapacityUnavailable, error.CapacityObservationStale }) |err| {
+        try testFullTextAdmissionRetry(err);
+    }
+}
+
+fn testFullTextAdmissionRetry(admission_error: anyerror) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2439,7 +2450,7 @@ test "io threaded full-text resource pressure retries without poisoning runtime"
         .target_hints = &.{.full_text},
     });
 
-    var capture = TestThreadedRuntimeCapture{};
+    var capture = TestThreadedRuntimeCapture{ .apply_admission_error = admission_error };
     capture.fail_next_apply_resource_budget.store(true, .monotonic);
     var runtime = try DerivedRuntime.init(
         alloc,

@@ -53,6 +53,13 @@ test "metadata head races remain retryable across runtime callbacks" {
     try std.testing.expect(errorHasStableDetail(error.MetadataSnapshotHeadMismatch));
 }
 
+test "hierarchy cursor conflicts retain identity across runtime callbacks" {
+    const transported = statusFromError(error.HierarchyCursorStale);
+    try std.testing.expectEqual(@backingInt(Code.conflict), transported.code);
+    try std.testing.expectEqual(error.HierarchyCursorStale, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.HierarchyCursorStale));
+}
+
 pub const Code = enum(c_int) {
     ok = 0,
     out_of_memory,
@@ -886,59 +893,6 @@ pub const Detail = enum(c_int) {
     graph_start_identity_required,
     metadata_snapshot_head_mismatch,
     inference_endpoint_access_denied,
-    sql_index_already_exists,
-    sql_constraint_already_exists,
-    program_limit_exceeded,
-    catalog_occupancy_not_ready,
-    unsupported_native_index_owner,
-    invalid_private_index_claim_inventory,
-    invalid_private_index_claim_receipt,
-    private_index_owner_job_changed,
-    private_index_publication_canceled,
-    private_index_job_required,
-    private_index_publication_required,
-    invalid_private_index_owner_job,
-    invalid_private_index_inputs,
-    relational_index_catalog_schema_mismatch,
-    invalid_index_publication_candidate,
-    immutable_relational_index_definition_conflict,
-    private_index_cancellation_pending,
-    private_index_cancellation_required,
-    invalid_private_index_cancellation,
-    invalid_private_index_native_receipt,
-    invalid_relational_index_progress,
-    missing_relational_index_definitions,
-    index_owner_receipt_changed,
-    invalid_index_owner_receipt,
-    sql_invalid_power_argument,
-    invalid_schema_reader_requirements,
-    private_index_root_recovery_required,
-    invalid_relational_index_budget,
-    private_index_claim_backlog_full,
-    partial_index_predicate_not_implied,
-    // Append only: existing detail integers are a released runtime contract.
-    relational_check_violation,
-    row_policy_denied,
-    row_policy_authentication_required,
-    check_constraint_validation_required,
-    foreign_key_match_full_violation,
-    invalid_schema_validation_job,
-    invalid_schema_validation_page_command,
-    invalid_schema_validation_token,
-    schema_validation_canceled,
-    schema_validation_cancellation_required,
-    schema_validation_command_rejected,
-    schema_validation_inputs_required,
-    schema_validation_job_changed,
-    schema_validation_job_required,
-    schema_validation_not_ready,
-    schema_validation_preparation_changed,
-    schema_validation_publication_required,
-    schema_validation_runtime_recovery_required,
-    store_registration_required,
-    catalog_publication_fence_unavailable,
-    undefined_column,
-    foreign_key_validation_required,
     document_storage_not_configured,
     document_run_busy,
     document_run_exists,
@@ -984,8 +938,74 @@ pub const Detail = enum(c_int) {
     cloudflare_inference_failed,
     invalid_cloudflare_response,
     document_token_limit_exceeded,
-    // Append only: immutable materialized generations reject primary mutation.
-    materialized_view_read_only,
+    hierarchy_cursor_stale,
+    read_transient_failure,
+    read_request_failed,
+    invalid_gcs_url,
+    gcs_connection_not_found_or_out_of_scope,
+    ambiguous_gcs_connection,
+    invalid_connection_credentials,
+    pioneer_credential_missing,
+    unsupported_pioneer_schema,
+    unsupported_pioneer_input,
+    standalone_replication_sources_unsupported,
+    ha_catalog_replication_sources_unsupported,
+    // Append-only: numeric Detail values are part of the stable C ABI.
+    embed_admission_refused,
+    // Append-only SQL additions follow every published main Detail identity.
+    sql_index_already_exists = 839,
+    sql_constraint_already_exists = 840,
+    program_limit_exceeded = 841,
+    catalog_occupancy_not_ready = 842,
+    unsupported_native_index_owner = 843,
+    invalid_private_index_claim_inventory = 844,
+    invalid_private_index_claim_receipt = 845,
+    private_index_owner_job_changed = 846,
+    private_index_publication_canceled = 847,
+    private_index_job_required = 848,
+    private_index_publication_required = 849,
+    invalid_private_index_owner_job = 850,
+    invalid_private_index_inputs = 851,
+    relational_index_catalog_schema_mismatch = 852,
+    invalid_index_publication_candidate = 853,
+    immutable_relational_index_definition_conflict = 854,
+    private_index_cancellation_pending = 855,
+    private_index_cancellation_required = 856,
+    invalid_private_index_cancellation = 857,
+    invalid_private_index_native_receipt = 858,
+    invalid_relational_index_progress = 859,
+    missing_relational_index_definitions = 860,
+    index_owner_receipt_changed = 861,
+    invalid_index_owner_receipt = 862,
+    sql_invalid_power_argument = 863,
+    invalid_schema_reader_requirements = 864,
+    private_index_root_recovery_required = 865,
+    invalid_relational_index_budget = 866,
+    private_index_claim_backlog_full = 867,
+    partial_index_predicate_not_implied = 868,
+    relational_check_violation = 869,
+    row_policy_denied = 870,
+    row_policy_authentication_required = 871,
+    check_constraint_validation_required = 872,
+    foreign_key_match_full_violation = 873,
+    invalid_schema_validation_job = 874,
+    invalid_schema_validation_page_command = 875,
+    invalid_schema_validation_token = 876,
+    schema_validation_canceled = 877,
+    schema_validation_cancellation_required = 878,
+    schema_validation_command_rejected = 879,
+    schema_validation_inputs_required = 880,
+    schema_validation_job_changed = 881,
+    schema_validation_job_required = 882,
+    schema_validation_not_ready = 883,
+    schema_validation_preparation_changed = 884,
+    schema_validation_publication_required = 885,
+    schema_validation_runtime_recovery_required = 886,
+    store_registration_required = 887,
+    catalog_publication_fence_unavailable = 888,
+    undefined_column = 889,
+    foreign_key_validation_required = 890,
+    materialized_view_read_only = 891,
 };
 
 test "partial index proof rejection preserves exact callback error identity" {
@@ -1048,6 +1068,12 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.ReadTransientFailure => status(.retryable, .read_transient_failure),
+        error.ReadRequestFailed => status(.invalid_argument, .read_request_failed),
+        error.InvalidGcsUrl => status(.invalid_argument, .invalid_gcs_url),
+        error.GcsConnectionNotFoundOrOutOfScope => status(.forbidden, .gcs_connection_not_found_or_out_of_scope),
+        error.AmbiguousGcsConnection => status(.invalid_argument, .ambiguous_gcs_connection),
+        error.InvalidConnectionCredentials => status(.invalid_argument, .invalid_connection_credentials),
         error.InvalidDocumentSource => status(.invalid_argument, .invalid_document_source),
         error.UnsupportedDocumentFormat => status(.invalid_argument, .unsupported_document_format),
         error.DocumentSourceLimitExceeded => status(.invalid_argument, .document_source_limit_exceeded),
@@ -1065,6 +1091,11 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidCloudflareConfig => status(.invalid_argument, .invalid_cloudflare_config),
         error.UnsupportedCloudflareModel => status(.invalid_argument, .unsupported_cloudflare_model),
         error.UnsupportedCloudflareSchema => status(.invalid_argument, .unsupported_cloudflare_schema),
+        error.PioneerCredentialMissing => status(.invalid_argument, .pioneer_credential_missing),
+        error.UnsupportedPioneerSchema => status(.invalid_argument, .unsupported_pioneer_schema),
+        error.UnsupportedPioneerInput => status(.invalid_argument, .unsupported_pioneer_input),
+        error.StandaloneReplicationSourcesUnsupported => status(.invalid_argument, .standalone_replication_sources_unsupported),
+        error.HACatalogReplicationSourcesUnsupported => status(.invalid_argument, .ha_catalog_replication_sources_unsupported),
         error.CloudflareAuthenticationFailed => status(.unauthorized, .cloudflare_authentication_failed),
         error.InvalidExtractorResponse => status(.invalid_argument, .invalid_extractor_response),
         error.UnsupportedExtractionSchemaVersion => status(.invalid_argument, .unsupported_extraction_schema_version),
@@ -1919,6 +1950,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RuntimeAlreadyReady => status(.conflict, .runtime_already_ready),
         error.DocumentExtractionWorkingSetTooLarge => status(.invalid_argument, .document_extraction_working_set_too_large),
         error.DocumentArtifactPublicationFailed => status(.conflict, .document_artifact_publication_failed),
+        error.HierarchyCursorStale => status(.conflict, .hierarchy_cursor_stale),
         error.CrcMismatch => status(.corrupt, .crc_mismatch),
         error.InvalidData => status(.corrupt, .invalid_data),
         error.MappedArtifactUnsupported => status(.unsupported, .mapped_artifact_unsupported),
@@ -1942,6 +1974,13 @@ pub fn statusFromError(err: anyerror) Status {
         error.ReadScopeResetUnsupported => status(.unsupported, .read_scope_reset_unsupported),
         error.ReadSnapshotForkUnsupported => status(.unsupported, .read_snapshot_fork_unsupported),
         error.SourceVisitorFailed => status(.internal, .source_visitor_failed),
+        // A local provider's admission refusal (the request never ran)
+        // distinct from a real provider transient failure. Keep this
+        // retryable like EmbedTransientFailure so callers that only check
+        // the Code still back off, while callers that need the distinct
+        // identity (the enrichment retry-budget exemption) can tell them
+        // apart by name.
+        error.EmbedAdmissionRefused => status(.retryable, .embed_admission_refused),
         else => status(.internal, .none),
     };
 }
@@ -2006,6 +2045,11 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_cloudflare_config => "InvalidCloudflareConfig",
         .unsupported_cloudflare_model => "UnsupportedCloudflareModel",
         .unsupported_cloudflare_schema => "UnsupportedCloudflareSchema",
+        .pioneer_credential_missing => "PioneerCredentialMissing",
+        .unsupported_pioneer_schema => "UnsupportedPioneerSchema",
+        .unsupported_pioneer_input => "UnsupportedPioneerInput",
+        .standalone_replication_sources_unsupported => "StandaloneReplicationSourcesUnsupported",
+        .ha_catalog_replication_sources_unsupported => "HACatalogReplicationSourcesUnsupported",
         .cloudflare_authentication_failed => "CloudflareAuthenticationFailed",
         .invalid_extractor_response => "InvalidExtractorResponse",
         .unsupported_extraction_schema_version => "UnsupportedExtractionSchemaVersion",
@@ -2138,6 +2182,14 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
 
         .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
         .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
+        .hierarchy_cursor_stale => "HierarchyCursorStale",
+        .read_transient_failure => "ReadTransientFailure",
+        .read_request_failed => "ReadRequestFailed",
+        .invalid_gcs_url => "InvalidGcsUrl",
+        .gcs_connection_not_found_or_out_of_scope => "GcsConnectionNotFoundOrOutOfScope",
+        .ambiguous_gcs_connection => "AmbiguousGcsConnection",
+        .invalid_connection_credentials => "InvalidConnectionCredentials",
+
         .crc_mismatch => "CrcMismatch",
         .invalid_data => "InvalidData",
         .mapped_artifact_unsupported => "MappedArtifactUnsupported",
@@ -2872,6 +2924,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .runtime_failed => "RuntimeFailed",
         .runtime_stopping => "RuntimeStopping",
         .runtime_already_ready => "RuntimeAlreadyReady",
+        .embed_admission_refused => "EmbedAdmissionRefused",
     };
 }
 
@@ -3343,6 +3396,70 @@ test "grouped and constrained producer failures preserve callback identity and b
     try std.testing.expectEqual(@backingInt(Code.unsupported), statusFromError(error.UnsupportedGeneratedExtractionSchema).code);
 }
 
+test "released document reader and inference Detail identifiers retain main wire numbers" {
+    const published = .{
+        .{ Detail.document_storage_not_configured, @as(c_int, 782) },
+        .{ Detail.document_run_busy, @as(c_int, 783) },
+        .{ Detail.document_run_exists, @as(c_int, 784) },
+        .{ Detail.document_run_expired, @as(c_int, 785) },
+        .{ Detail.document_run_lease_lost, @as(c_int, 786) },
+        .{ Detail.document_run_not_found, @as(c_int, 787) },
+        .{ Detail.document_run_retention_active, @as(c_int, 788) },
+        .{ Detail.document_run_terminal, @as(c_int, 789) },
+        .{ Detail.document_run_store_needs_recovery, @as(c_int, 790) },
+        .{ Detail.document_model_revision_mismatch, @as(c_int, 791) },
+        .{ Detail.document_budget_exhausted, @as(c_int, 792) },
+        .{ Detail.document_output_too_large, @as(c_int, 793) },
+        .{ Detail.document_stage_in_flight, @as(c_int, 794) },
+        .{ Detail.invalid_document_checkpoint, @as(c_int, 795) },
+        .{ Detail.too_many_active_jobs, @as(c_int, 796) },
+        .{ Detail.invalid_document_source, @as(c_int, 797) },
+        .{ Detail.unsupported_document_format, @as(c_int, 798) },
+        .{ Detail.document_source_limit_exceeded, @as(c_int, 799) },
+        .{ Detail.document_page_limit_exceeded, @as(c_int, 800) },
+        .{ Detail.document_pixel_limit_exceeded, @as(c_int, 801) },
+        .{ Detail.document_media_type_mismatch, @as(c_int, 802) },
+        .{ Detail.invalid_document_selection, @as(c_int, 803) },
+        .{ Detail.duplicate_document_source, @as(c_int, 804) },
+        .{ Detail.document_unresolved, @as(c_int, 805) },
+        .{ Detail.document_capability_mismatch, @as(c_int, 806) },
+        .{ Detail.unsupported_document_request_field, @as(c_int, 807) },
+        .{ Detail.remote_document_model_denied, @as(c_int, 808) },
+        .{ Detail.cloudflare_credential_missing, @as(c_int, 809) },
+        .{ Detail.invalid_cloudflare_config, @as(c_int, 810) },
+        .{ Detail.unsupported_cloudflare_model, @as(c_int, 811) },
+        .{ Detail.unsupported_cloudflare_schema, @as(c_int, 812) },
+        .{ Detail.cloudflare_authentication_failed, @as(c_int, 813) },
+        .{ Detail.invalid_extractor_response, @as(c_int, 814) },
+        .{ Detail.unsupported_extraction_schema_version, @as(c_int, 815) },
+        .{ Detail.invalid_inference_request, @as(c_int, 816) },
+        .{ Detail.document_artifact_not_found, @as(c_int, 817) },
+        .{ Detail.document_artifact_expired, @as(c_int, 818) },
+        .{ Detail.cloudflare_rate_limited, @as(c_int, 819) },
+        .{ Detail.inference_upstream_rate_limited, @as(c_int, 820) },
+        .{ Detail.inference_capacity_unavailable, @as(c_int, 821) },
+        .{ Detail.inference_transport_unavailable, @as(c_int, 822) },
+        .{ Detail.cloudflare_inference_failed, @as(c_int, 823) },
+        .{ Detail.invalid_cloudflare_response, @as(c_int, 824) },
+        .{ Detail.document_token_limit_exceeded, @as(c_int, 825) },
+        .{ Detail.hierarchy_cursor_stale, @as(c_int, 826) },
+        .{ Detail.read_transient_failure, @as(c_int, 827) },
+        .{ Detail.read_request_failed, @as(c_int, 828) },
+        .{ Detail.invalid_gcs_url, @as(c_int, 829) },
+        .{ Detail.gcs_connection_not_found_or_out_of_scope, @as(c_int, 830) },
+        .{ Detail.ambiguous_gcs_connection, @as(c_int, 831) },
+        .{ Detail.invalid_connection_credentials, @as(c_int, 832) },
+        .{ Detail.pioneer_credential_missing, @as(c_int, 833) },
+        .{ Detail.unsupported_pioneer_schema, @as(c_int, 834) },
+        .{ Detail.unsupported_pioneer_input, @as(c_int, 835) },
+        .{ Detail.standalone_replication_sources_unsupported, @as(c_int, 836) },
+        .{ Detail.ha_catalog_replication_sources_unsupported, @as(c_int, 837) },
+        .{ Detail.embed_admission_refused, @as(c_int, 838) },
+    };
+    inline for (published) |entry| try std.testing.expectEqual(entry[1], @backingInt(entry[0]));
+    try std.testing.expect(@backingInt(Detail.sql_index_already_exists) > 838);
+}
+
 test "merged runtime error details preserve main wire identifiers" {
     try std.testing.expectEqual(@as(c_int, 674), @backingInt(Detail.inference_worker_executable_not_configured));
     try std.testing.expectEqual(@as(c_int, 675), @backingInt(Detail.inference_worker_unavailable));
@@ -3394,6 +3511,11 @@ test "durable document policy errors retain identity across native runtime bound
         error.InvalidCloudflareConfig,
         error.UnsupportedCloudflareModel,
         error.UnsupportedCloudflareSchema,
+        error.PioneerCredentialMissing,
+        error.UnsupportedPioneerSchema,
+        error.UnsupportedPioneerInput,
+        error.StandaloneReplicationSourcesUnsupported,
+        error.HACatalogReplicationSourcesUnsupported,
         error.CloudflareAuthenticationFailed,
         error.InvalidExtractorResponse,
         error.UnsupportedExtractionSchemaVersion,
@@ -3424,4 +3546,13 @@ test "materialized view mutation rejection retains exact runtime boundary identi
     try std.testing.expectEqual(@backingInt(Code.forbidden), result.code);
     try std.testing.expectEqual(error.MaterializedViewReadOnly, errorFromStatus(result));
     try std.testing.expectEqual(error.MaterializedViewReadOnly, errorFromStableName("MaterializedViewReadOnly").?);
+}
+
+test "reader failures preserve retry semantics and GCS failures preserve scope semantics" {
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.ReadTransientFailure).code);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.ReadRequestFailed).code);
+    try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.GcsConnectionNotFoundOrOutOfScope).code);
+    inline for (.{ error.ReadTransientFailure, error.ReadRequestFailed, error.InvalidGcsUrl, error.GcsConnectionNotFoundOrOutOfScope, error.AmbiguousGcsConnection, error.InvalidConnectionCredentials }) |expected| {
+        try std.testing.expectEqual(expected, errorFromStatus(statusFromError(expected)));
+    }
 }

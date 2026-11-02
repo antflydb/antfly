@@ -10,17 +10,20 @@ import {
   DashboardPageHeader,
   DashboardPageTitle,
   DashboardToolbar,
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldLabel,
   FormActions,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
+  Spinner,
   Switch,
 } from "@antfly/design-system";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import {
   AudioLines,
   Check,
@@ -607,7 +610,7 @@ const TranscribePlaygroundPage: React.FC = () => {
     <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Transcribe Playground</DashboardPageTitle>
+          <DashboardPageTitle>Transcribe Playground</DashboardPageTitle>
           <DashboardPageDescription>
             Record or upload audio, transcribe with Whisper, optionally chunk with VAD and clean up
             with an LLM
@@ -635,8 +638,8 @@ const TranscribePlaygroundPage: React.FC = () => {
           <CardContent className="space-y-4">
             {/* Row 1: Core config */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="space-y-2">
-                <Label htmlFor="transcriber-model">Transcriber Model</Label>
+              <Field className="gap-2">
+                <FieldLabel htmlFor="transcriber-model">Transcriber Model</FieldLabel>
                 <Select
                   value={selectedTranscriberModel}
                   onValueChange={setSelectedTranscriberModel}
@@ -659,21 +662,21 @@ const TranscribePlaygroundPage: React.FC = () => {
                     ))}
                   </SelectContent>
                 </Select>
-              </div>
+              </Field>
 
-              <div className="space-y-2">
-                <Label htmlFor="language">Language</Label>
+              <Field className="gap-2">
+                <FieldLabel htmlFor="language">Language</FieldLabel>
                 <Input
                   id="language"
                   placeholder="Auto-detect (or e.g. en, es)"
                   value={language}
                   onChange={(e) => setLanguage(e.target.value)}
                 />
-              </div>
+              </Field>
 
-              <div className="space-y-2">
-                <Label>Input Source</Label>
-                <div className="flex rounded-none border overflow-hidden h-9">
+              <Field className="gap-2">
+                <FieldLabel>Input Source</FieldLabel>
+                <div className="flex rounded-lg border overflow-hidden h-9">
                   <button
                     type="button"
                     className={`flex-1 flex items-center justify-center gap-1.5 text-sm transition-colors ${
@@ -695,26 +698,26 @@ const TranscribePlaygroundPage: React.FC = () => {
                     File
                   </button>
                 </div>
-              </div>
+              </Field>
             </div>
 
             {/* Pipeline options */}
             <div className="space-y-4 pt-2 border-t">
-              <div className="flex items-start gap-3">
+              <Field orientation="horizontal" className="gap-3">
                 <Switch id="use-vad" checked={useVAD} onCheckedChange={setUseVAD} />
-                <div className="grid gap-1">
-                  <Label htmlFor="use-vad" className="text-sm font-normal cursor-pointer">
+                <FieldContent>
+                  <FieldLabel htmlFor="use-vad" className="text-sm font-normal cursor-pointer">
                     VAD chunking
-                  </Label>
-                  <p className="text-xs text-muted-foreground">
+                  </FieldLabel>
+                  <FieldDescription className="text-xs">
                     Split long recordings into speech segments using Silero VAD
-                  </p>
-                </div>
-              </div>
+                  </FieldDescription>
+                </FieldContent>
+              </Field>
               {useVAD && (
                 <div className="space-y-4 pl-12">
-                  <div className="space-y-2">
-                    <Label>VAD Model</Label>
+                  <Field className="gap-2">
+                    <FieldLabel>VAD Model</FieldLabel>
                     <Select
                       value={selectedChunkerModel}
                       onValueChange={setSelectedChunkerModel}
@@ -737,16 +740,16 @@ const TranscribePlaygroundPage: React.FC = () => {
                         ))}
                       </SelectContent>
                     </Select>
-                  </div>
+                  </Field>
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                    <div className="space-y-1">
-                      <Label
+                    <Field className="gap-1">
+                      <FieldLabel
                         htmlFor="vad-threshold"
                         className="text-xs"
                         title="Speech probability threshold (0-1). Higher values require stronger speech signals."
                       >
                         Threshold
-                      </Label>
+                      </FieldLabel>
                       <Input
                         id="vad-threshold"
                         type="number"
@@ -762,15 +765,15 @@ const TranscribePlaygroundPage: React.FC = () => {
                           }
                         }}
                       />
-                    </div>
-                    <div className="space-y-1">
-                      <Label
+                    </Field>
+                    <Field className="gap-1">
+                      <FieldLabel
                         htmlFor="vad-min-silence"
                         className="text-xs"
                         title="Minimum silence duration (ms) to split segments. Longer values produce fewer, larger segments."
                       >
                         Min Silence (ms)
-                      </Label>
+                      </FieldLabel>
                       <Input
                         id="vad-min-silence"
                         type="number"
@@ -786,15 +789,15 @@ const TranscribePlaygroundPage: React.FC = () => {
                           })
                         }
                       />
-                    </div>
-                    <div className="space-y-1">
-                      <Label
+                    </Field>
+                    <Field className="gap-1">
+                      <FieldLabel
                         htmlFor="vad-min-speech"
                         className="text-xs"
                         title="Minimum speech duration (ms). Segments shorter than this are discarded."
                       >
                         Min Speech (ms)
-                      </Label>
+                      </FieldLabel>
                       <Input
                         id="vad-min-speech"
                         type="number"
@@ -810,15 +813,15 @@ const TranscribePlaygroundPage: React.FC = () => {
                           })
                         }
                       />
-                    </div>
-                    <div className="space-y-1">
-                      <Label
+                    </Field>
+                    <Field className="gap-1">
+                      <FieldLabel
                         htmlFor="vad-speech-pad"
                         className="text-xs"
                         title="Padding (ms) added before and after each speech segment."
                       >
                         Speech Pad (ms)
-                      </Label>
+                      </FieldLabel>
                       <Input
                         id="vad-speech-pad"
                         type="number"
@@ -834,27 +837,27 @@ const TranscribePlaygroundPage: React.FC = () => {
                           })
                         }
                       />
-                    </div>
+                    </Field>
                   </div>
                 </div>
               )}
 
-              <div className="flex items-start gap-3">
+              <Field orientation="horizontal" className="gap-3">
                 <Switch id="use-llm" checked={useLLMCleanup} onCheckedChange={setUseLLMCleanup} />
-                <div className="grid gap-1">
-                  <Label htmlFor="use-llm" className="text-sm font-normal cursor-pointer">
+                <FieldContent>
+                  <FieldLabel htmlFor="use-llm" className="text-sm font-normal cursor-pointer">
                     LLM cleanup
-                  </Label>
-                  <p className="text-xs text-muted-foreground">
+                  </FieldLabel>
+                  <FieldDescription className="text-xs">
                     Post-process transcripts to remove filler words, fix grammar, and handle
                     self-corrections
-                  </p>
-                </div>
-              </div>
+                  </FieldDescription>
+                </FieldContent>
+              </Field>
               {useLLMCleanup && (
                 <div className="pl-12">
-                  <div className="space-y-2">
-                    <Label>Generator Model</Label>
+                  <Field className="gap-2">
+                    <FieldLabel>Generator Model</FieldLabel>
                     <Select
                       value={selectedGeneratorModel}
                       onValueChange={setSelectedGeneratorModel}
@@ -877,7 +880,7 @@ const TranscribePlaygroundPage: React.FC = () => {
                         ))}
                       </SelectContent>
                     </Select>
-                  </div>
+                  </Field>
                 </div>
               )}
             </div>
@@ -902,7 +905,7 @@ const TranscribePlaygroundPage: React.FC = () => {
         </Card>
         {/* Error */}
         {error && (
-          <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
+          <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-lg text-destructive text-sm">
             {error}
           </div>
         )}
@@ -945,7 +948,7 @@ const TranscribePlaygroundPage: React.FC = () => {
                 <>
                   {/* Drop zone */}
                   <div
-                    className={`border-2 border-dashed rounded-none p-8 text-center cursor-pointer transition-colors ${
+                    className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors ${
                       isDraggingAudio
                         ? "border-primary bg-primary/5"
                         : "border-muted-foreground/25 hover:border-primary/50"
@@ -984,7 +987,7 @@ const TranscribePlaygroundPage: React.FC = () => {
                 </>
               ) : (
                 /* Mic recording */
-                <div className="border-2 border-dashed rounded-none p-8 text-center transition-colors border-muted-foreground/25">
+                <div className="border-2 border-dashed rounded-lg p-8 text-center transition-colors border-muted-foreground/25">
                   {isRecording ? (
                     <div className="space-y-4">
                       <div className="flex items-center justify-center gap-2">
@@ -1021,7 +1024,7 @@ const TranscribePlaygroundPage: React.FC = () => {
 
               {/* Audio file info & player */}
               {audioFile && !isRecording && (
-                <div className="p-4 bg-muted/30 rounded-none border space-y-3">
+                <div className="p-4 bg-muted/30 rounded-lg border space-y-3">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2 min-w-0">
                       <Mic className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -1094,7 +1097,7 @@ const TranscribePlaygroundPage: React.FC = () => {
                   {segments.map((seg, i) => (
                     <div
                       key={`seg-${seg.startMs}-${seg.endMs}`}
-                      className="p-3 bg-muted/30 rounded-none border space-y-2"
+                      className="p-3 bg-muted/30 rounded-lg border space-y-2"
                     >
                       {/* Timestamp + copy */}
                       <div className="flex items-center justify-between">
@@ -1130,7 +1133,7 @@ const TranscribePlaygroundPage: React.FC = () => {
                       )}
                       {seg.status === "transcribing" && (
                         <p className="text-sm text-muted-foreground italic flex items-center gap-2">
-                          <ReloadIcon className="h-3 w-3 animate-spin" />
+                          <Spinner className="h-3 w-3" />
                           Transcribing...
                         </p>
                       )}

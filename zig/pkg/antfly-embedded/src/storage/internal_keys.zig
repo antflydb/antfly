@@ -262,6 +262,16 @@ pub fn isInternalMetadataKey(key: []const u8) bool {
     return key[0] == replay_namespace or key[0] == identity_namespace;
 }
 
+/// Physical DB records other than authored primary/relational rows. This also
+/// recognizes the reserved textual families used by transaction receipts,
+/// columnar state and older metadata protocols.
+pub fn isControlRecordKey(key: []const u8) bool {
+    return isInternalMetadataKey(key) or
+        (isInternalUserKey(key) and !isStoredDocumentRowKey(key)) or
+        std.mem.startsWith(u8, key, "\x00\x00__") or
+        std.mem.startsWith(u8, key, "\x00antfly/");
+}
+
 pub fn isInternalUserKey(key: []const u8) bool {
     return key.len > 0 and key[0] == user_namespace;
 }
@@ -1288,6 +1298,16 @@ pub fn artifactRepairIssueIndexPrefixAlloc(alloc: Allocator, index_name: []const
     try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind });
     try appendEncodedComponent(&list, alloc, index_name);
     return try list.toOwnedSlice(alloc);
+}
+
+/// Reserved selector in the secondary issue namespace; it cannot alias an
+/// ArtifactRepairKind. The primary key keeps different kinds disjoint.
+pub fn artifactRepairEnrichmentFailurePrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    return artifactRepairIssueKindIndexPrefixAlloc(alloc, "enrichment_failed", index_name);
+}
+
+pub fn artifactRepairEnrichmentFailureKeyAlloc(alloc: Allocator, index_name: []const u8, primary_key: []const u8) ![]u8 {
+    return artifactRepairIssueKindKeyAlloc(alloc, "enrichment_failed", index_name, primary_key);
 }
 
 pub fn artifactRepairIssueKeyAlloc(

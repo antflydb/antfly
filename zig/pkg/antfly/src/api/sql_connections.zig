@@ -194,6 +194,8 @@ pub const Action = union(enum) {
 };
 
 pub fn mutate(store: *transactions.DurableSessionStore, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64) !usize {
+    @import("antfly_platform").sync.lockYielding(&store.sql_connection_mutex);
+    defer store.sql_connection_mutex.unlock();
     if (store.fail_writes_for_test) return error.InjectedSessionStoreFailure;
     return switch (store.backend) {
         .docstore => |backend| blk: {
@@ -676,4 +678,50 @@ test "HTTP sequence sessions persist issued values and fence discarded cache epo
     try std.testing.expectEqual(@as(usize, 0), current.value.sequence_state.values.len);
     try std.testing.expect(current.value.sequence_state.last == null);
     try std.testing.expectError(error.SqlConnectionNotFound, mutate(&store, .{ .discard_sequences = id }, "bob", 7, 2));
+}
+
+test "HTTP connection directory preserves concurrent creates and closes" {
+    const alloc = std.testing.allocator;
+    var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var native = try backend.runtimeStore(alloc, .{ .name = "sql-connection-race-test" });
+    defer native.deinit();
+    var store = transactions.DurableSessionStore.initRuntime(alloc, &native);
+    const Worker = struct {
+        fn run(shared: *transactions.DurableSessionStore, id: [32]u8, closing: bool, failure: *?anyerror) void {
+            const action: Action = if (closing) .{ .close = id } else .{ .create = .{
+                .id = id,
+                .principal = "alice",
+                .owner_node_id = 7,
+                .expires_at_ms = 1000,
+                .database = "main",
+                .namespace = "public",
+            } };
+            _ = mutate(shared, action, "alice", 7, 1) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    var ids: [16][32]u8 = undefined;
+    for (&ids, 0..) |*id, index| _ = try std.fmt.bufPrint(id, "{x:0>32}", .{index + 1});
+    for (0..8) |_| {
+        for ([_]bool{ false, true }) |closing| {
+            var failures: [16]?anyerror = @splat(null);
+            var group: std.Io.Group = .init;
+            defer group.cancel(std.testing.io);
+            for (ids, 0..) |id, index| try group.concurrent(std.testing.io, Worker.run, .{ &store, id, closing, &failures[index] });
+            try group.await(std.testing.io);
+            for (failures) |failure| if (failure) |err| return err;
+            var txn = try native.beginRead();
+            defer txn.abort();
+            const entries = try copyDirectoryTxn(&txn, alloc);
+            defer alloc.free(entries);
+            try std.testing.expectEqual(@as(usize, if (closing) 0 else ids.len), entries.len);
+            if (!closing) for (ids) |id| {
+                var connection = try load(&store, alloc, id, "alice", 7, 1);
+                connection.deinit();
+            };
+        }
+    }
 }

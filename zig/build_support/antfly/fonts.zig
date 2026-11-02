@@ -15,6 +15,17 @@
 
 const std = @import("std");
 
+/// Inline variant of the `pdf_standard_fonts` module, for targets without a
+/// native immutable-data archive (for example WASM). Paths resolve inside the
+/// generated write-files directory populated by `create`. The inference
+/// package build (pkg/inference/build/runtime.zig) carries the same source.
+pub const inline_source =
+    \\pub const regular = @embedFile("lib/pdf/fonts/roboto/Roboto-Regular.ttf");
+    \\pub const bold = @embedFile("lib/pdf/fonts/roboto/Roboto-Bold.ttf");
+    \\pub const glyphCodepoints = @import("lib/pdf/src/agl_lookup.zig").codepoints;
+    \\
+;
+
 /// PDF products embed reviewed Apache-2.0 Roboto fonts, independently of server UI assets.
 pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
     const files = b.addWriteFiles();
@@ -23,7 +34,7 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lan
     _ = files.addCopyFile(b.path("lib/pdf/src/agl_data.zig"), "lib/pdf/src/agl_data.zig");
     _ = files.addCopyFile(b.path("lib/pdf/src/agl_lookup.zig"), "lib/pdf/src/agl_lookup.zig");
     const module = b.createModule(.{
-        .root_source_file = files.add("pdf_standard_fonts.zig", @embedFile("../../pdf_standard_fonts.zig")),
+        .root_source_file = files.add("pdf_standard_fonts.zig", inline_source),
         .target = target,
         .optimize = optimize,
     });

@@ -88,9 +88,10 @@ const (
 
 // OpenOptions configures OpenWithOptions and CreateWithOptions.
 //
-// BusyTimeout, like sqlite3_busy_timeout, keeps retrying a native operation while
-// another process holds the database's writer lease. Zero fails
-// immediately with Busy. The C ABI takes whole milliseconds.
+// BusyTimeout, like sqlite3_busy_timeout, retries Lite admission while another
+// process holds the writer lease or advances the allocator checkpoint. Mutation
+// bodies are never replayed by this admission retry. Zero fails immediately with
+// Busy. The C ABI takes whole milliseconds.
 //
 // HostBudgetMB, BackendBudgetMB, CombinedBudgetMB, KVBudgetMB,
 // ScratchBudgetMB, and ProcessMemoryBudgetMB are explicit resource-budget

@@ -38,6 +38,7 @@ typedef struct {
     unsigned width, height, matrix, full_range, coded_width, coded_height;
     int failed, sequence_seen;
     unsigned surfaces, expected_width, expected_height;
+    cudaVideoCodec codec, expected_codec;
     int display_left, display_top, matrix_override, range_override;
     tcuvidCreateVideoParser *create_parser;
     tcuvidDestroyVideoParser *destroy_parser;
@@ -73,7 +74,7 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
     if (d->range_override >= 0 && matrix != 2 && full_range != (unsigned)d->range_override) { d->failed = 2; return 0; }
     if (d->matrix_override >= 0) matrix = d->matrix_override;
     if (d->range_override >= 0) full_range = d->range_override;
-    if (f->codec != cudaVideoCodec_H264 || !f->progressive_sequence ||
+    if (f->codec != d->expected_codec || !f->progressive_sequence ||
         f->chroma_format != cudaVideoChromaFormat_420 || w != d->expected_width || h != d->expected_height || f->bit_depth_luma_minus8 ||
         f->bit_depth_chroma_minus8 || !w || !h || (w&1) || (h&1) ||
         f->coded_width > 4096 || f->coded_height > 4096 ||
@@ -86,7 +87,7 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
         (transfer != 1 && transfer != 2 && transfer != 6 && transfer != 13) ||
         !f->min_num_decode_surfaces || f->min_num_decode_surfaces > 32) { d->failed = 2; return 0; }
     // Never silently reinterpret a stream whose geometry or color changes.
-    int compatible = d->width == w && d->height == h && d->coded_width == f->coded_width &&
+    int compatible = d->codec == f->codec && d->width == w && d->height == h && d->coded_width == f->coded_width &&
         d->coded_height == f->coded_height && d->surfaces >= f->min_num_decode_surfaces &&
         d->display_left == f->display_area.left && d->display_top == f->display_area.top;
     if (d->sequence_seen) {
@@ -129,6 +130,7 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
     d->matrix = matrix; d->full_range = full_range;
     d->display_left = f->display_area.left; d->display_top = f->display_area.top;
     d->surfaces = c.ulNumDecodeSurfaces;
+    d->codec = f->codec;
     return d->surfaces;
 }
 static int decode(void *opaque, CUVIDPICPARAMS *picture) {
@@ -187,13 +189,15 @@ int antfly_nvdec_open(Decoder **out, void *stream, void *user, frame_callback ca
 }
 // The previous request must have drained EOS before reuse. A new parser owns
 // the new stream's reference-picture state; compatible decoder surfaces persist.
-int antfly_nvdec_begin(Decoder *d, void *stream, void *user, frame_callback callback, unsigned width, unsigned height, int matrix, int range) {
+int antfly_nvdec_begin(Decoder *d, void *stream, void *user, frame_callback callback, unsigned width, unsigned height, int codec, int matrix, int range) {
     if (d->parser) return 3;
+    if (codec != cudaVideoCodec_H264 && codec != cudaVideoCodec_HEVC && codec != cudaVideoCodec_AV1) return 2;
     d->stream = stream; d->user = user; d->frame = callback;
     d->failed = 0; d->sequence_seen = 0;
     d->expected_width = width; d->expected_height = height; d->matrix_override = matrix; d->range_override = range;
+    d->expected_codec = codec;
     CUVIDPARSERPARAMS p = {0};
-    p.CodecType = cudaVideoCodec_H264; p.ulMaxNumDecodeSurfaces = 1;
+    p.CodecType = codec; p.ulMaxNumDecodeSurfaces = 1;
     p.ulClockRate = 1000000; p.ulMaxDisplayDelay = 4;
     p.pUserData = d; p.pfnSequenceCallback = sequence; p.pfnDecodePicture = decode; p.pfnDisplayPicture = display;
     return d->create_parser(&d->parser, &p) ? 3 : 0;

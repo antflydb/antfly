@@ -86,11 +86,20 @@ fn discoverSelected(a: A, io: std.Io, endpoint: []const u8, catalog_table: []con
     var wire_bytes: usize = 0;
     var policy: ?[]const u8 = null;
     const query = if (source_id) |id|
-        try std.json.Stringify.valueAlloc(state, .{ .conjuncts = .{ .{ .equals = "source_catalog", .field = "doc_type" }, .{ .equals = id, .field = "source.id" } } }, .{})
+        try std.json.Stringify.valueAlloc(state, .{ .doc_id = .{ .ids = [_][]const u8{id} } }, .{})
     else
         try state.dupe(u8, "{\"equals\":\"source_catalog\",\"field\":\"doc_type\"}");
+    // Ordinary catalog tables need no secondary indexes. Discovery explicitly
+    // admits bounded value verification; selected publication checks use the
+    // primary document ID. Existing page, wire and memory bounds still apply.
+    const execution: indexed.Execution = .{ .value_verification = .{
+        .allow_scan = source_id == null,
+        .max_documents = 10_000,
+        .max_bytes = 32 * 1024 * 1024,
+        .max_regex_work = 1_000_000,
+    } };
     for (0..1024) |_| {
-        const body = try std.json.Stringify.valueAlloc(state, .{ .query = try std.json.parseFromSliceLeaky(std.json.Value, state, query, .{}), .fields = [_][]const u8{ "version", "doc_type", "source", "document_version", "published_revision" }, .limit = @as(u32, 64), .order_by = [_]struct { field: []const u8, desc: bool }{.{ .field = "_id", .desc = false }}, .remote_snapshot = snapshot, .search_after = if (previous) |id| @as(?[1][]const u8, .{id}) else null }, .{ .emit_null_optional_fields = false });
+        const body = try std.json.Stringify.valueAlloc(state, .{ .query = try std.json.parseFromSliceLeaky(std.json.Value, state, query, .{}), .execution = execution, .fields = [_][]const u8{ "version", "doc_type", "source", "document_version", "published_revision" }, .limit = @as(u32, 64), .order_by = [_]struct { field: []const u8, desc: bool }{.{ .field = "_id", .desc = false }}, .remote_snapshot = snapshot, .search_after = if (previous) |id| @as(?[1][]const u8, .{id}) else null }, .{ .emit_null_optional_fields = false });
         var response = response: {
             for (0..2) |attempt| {
                 const token = if (session) |cloud| cloud.token() else credential;
@@ -135,6 +144,7 @@ fn discoverSelected(a: A, io: std.Io, endpoint: []const u8, catalog_table: []con
         } else snapshot = result.remote_snapshot;
         if (result.hits.hits.len > 64) return error.InvalidSourceCatalog;
         for (result.hits.hits) |hit| {
+            if (source_id) |id| if (!std.mem.eql(u8, id, hit._id)) return error.InvalidSourceCatalog;
             if (hit._source.version != 1 or hit._source.document_version != 1 or !std.mem.eql(u8, hit._source.doc_type, "source_catalog") or !std.mem.eql(u8, hit._id, hit._source.source.id)) return error.InvalidSourceCatalog;
             if (previous) |id| if (std.mem.order(u8, id, hit._id) != .lt) return error.InvalidSourceCatalog;
             if (std.mem.eql(u8, hit._source.source.status, "searchable") and (hit._source.source.valid_until == null or hit._source.published_revision.len == 0)) return error.InvalidSourceCatalog;

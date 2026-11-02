@@ -1064,7 +1064,9 @@ class SchedulingAndParsingTests(unittest.TestCase):
             config = json.loads((root / "antfly-server.json").read_text())
             self.assertEqual(
                 512,
-                config["generation_batching"]["max_idle_prefill_chunk_size"],
+                config["inference"]["generation_batching"][
+                    "max_idle_prefill_chunk_size"
+                ],
             )
             for name, value in benchmark.CUDA_SERVER_BUDGET_MB.items():
                 flag = f"--{name}-budget-mb"

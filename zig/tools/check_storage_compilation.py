@@ -24,7 +24,9 @@ Every mutation lives in an isolated source overlay; the checkout is read only.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
+import errno
 import json
 import os
 import platform
@@ -34,6 +36,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import sys
 from pathlib import Path
@@ -478,7 +481,13 @@ def measured_build(
 def link_children(source: Path, destination: Path) -> None:
     destination.mkdir()
     for child in source.iterdir():
-        if child.name in {".git", ".worktrees", ".zig-cache", "zig-out"}:
+        if child.name in {
+            ".git",
+            ".worktrees",
+            ".zig-cache",
+            ".zig-global-cache",
+            "zig-out",
+        }:
             continue
         (destination / child.name).symlink_to(child, target_is_directory=child.is_dir())
 
@@ -529,11 +538,108 @@ def seed_global_cache(destination: Path) -> None:
             shutil.copyfile(archive, destination / "p" / name)
 
 
+class AuditWorkspace:
+    def __init__(self, root: Path, jobs: int):
+        self.root = root
+        self.cwd = root / "zig"
+        self.local_cache = self.cwd / ".zig-cache"
+        self.global_cache = self.cwd / ".zig-global-cache"
+        self.jobs = jobs
+
+
+def clone_audit_cache(
+    source: Path, destination: Path, *, rebase_from=None, rebase_to=None
+) -> None:
+    """Share immutable bytes; each worker owns manifests, locks and new output."""
+
+    def copy(source_file, destination_file):
+        relative = Path(source_file).relative_to(source)
+        if relative.parts[0] in {"o", "p"} and not relative.name.endswith(".lock"):
+            try:
+                os.link(source_file, destination_file)
+            except OSError as err:
+                if err.errno != errno.EXDEV:
+                    raise
+                # CI phase caches can live on a PVC while fixture temporary
+                # directories live on the runner filesystem. Copy immutable
+                # bytes once across that boundary instead of bootstrapping the
+                # compiler again. Same-volume worker snapshots still hard-link.
+                return shutil.copy2(source_file, destination_file)
+            return str(destination_file)
+        return shutil.copy2(source_file, destination_file)
+
+    shutil.copytree(source, destination, copy_function=copy, symlinks=True)
+    rebase_overlay_links(destination, rebase_from or source, rebase_to or destination)
+
+
+def rebase_overlay_links(destination: Path, old_root: Path, new_root: Path) -> None:
+    # Relative links already retain their meaning. Absolute links into either
+    # baseline cache/source overlay must not survive deletion of that baseline.
+    for directory, names, files in os.walk(destination, followlinks=False):
+        for name in names + files:
+            link = Path(directory) / name
+            if not link.is_symlink():
+                continue
+            target = Path(os.readlink(link))
+            if target.is_absolute() and target.is_relative_to(old_root):
+                replacement = new_root / target.relative_to(old_root)
+                link.unlink()
+                link.symlink_to(replacement)
+
+
+def clone_audit_workspace(source: AuditWorkspace, destination: AuditWorkspace) -> None:
+    # Snapshot the warmed source overlay, rather than reconstructing it from
+    # the checkout. Preserve metadata used by compiler manifests and keep all
+    # mutable source bytes private; only immutable cache objects are hard links.
+    shutil.copytree(
+        source.root,
+        destination.root,
+        symlinks=True,
+        ignore=shutil.ignore_patterns(".zig-cache", ".zig-global-cache", "zig-out"),
+    )
+    rebase_overlay_links(destination.root, source.root, destination.root)
+    for original, cloned in (
+        (source.local_cache, destination.local_cache),
+        (source.global_cache, destination.global_cache),
+    ):
+        clone_audit_cache(
+            original, cloned, rebase_from=source.root, rebase_to=destination.root
+        )
+
+
+def partition_cases(cases):
+    # Run 40738032138: independent probes need ~53 minutes after the baseline.
+    # Balance those probes across the same two compiler slots, rather than
+    # duplicating the cold build or increasing the runner's CPU/memory budget.
+    weights = {
+        "storage contract": 873,
+        "read coordination": 838,
+        "write coordination": 507,
+        "physical DB": 421,
+        "physical local query": 411,
+        "consumer test root": 78,
+        "owner integration test": 51,
+    }
+    groups = [[], []]
+    loads = [0, 0]
+    for case in sorted(cases, key=lambda case: weights.get(case[0], 900), reverse=True):
+        worker = min(range(2), key=loads.__getitem__)
+        groups[worker].append(case)
+        loads[worker] += weights.get(case[0], 900)
+    return groups
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zig", default="zig")
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--report", type=Path)
+    parser.add_argument(
+        "--case-workers",
+        type=int,
+        choices=(1, 2),
+        help="Parallel mutation workers; two requires the measured Linux profile",
+    )
     catalog_mode = parser.add_mutually_exclusive_group()
     catalog_mode.add_argument("--write-control-catalog", action="store_true")
     catalog_mode.add_argument("--check-control-catalog", action="store_true")
@@ -552,23 +658,27 @@ def main() -> None:
             )
         return
     records = []
+    report_lock = threading.RLock()
+    abort = threading.Event()
     measured_memory = qualified_audit_memory(args.zig, args.jobs)
     if args.jobs <= 0:
         parser.error("--jobs must be positive")
 
+    case_workers = args.case_workers or (2 if measured_memory else 1)
+    if case_workers == 2 and not measured_memory:
+        parser.error(
+            "two mutation workers require the qualified two-slot Linux memory profile"
+        )
+
     def publish():
-        if args.report:
-            write_report(args.report, records)
+        with report_lock:
+            if args.report:
+                write_report(args.report, records)
 
     publish()
     with tempfile.TemporaryDirectory(prefix="antfly-storage-compilation-") as temporary:
         work = Path(temporary)
         root = work / "repo"
-        link_children(ZIG_ROOT.parent, root)
-        build_file = own(root, "zig/build.zig")
-        shutil.copyfile(build_file, build_file.with_name("project_build.zig"))
-        shutil.copyfile(ZIG_ROOT / "tools/fixtures/storage_compilation.zig", build_file)
-
         cases = (
             (
                 "read coordination",
@@ -639,18 +749,34 @@ def main() -> None:
                 },
             ),
         )
-        # Establish the overlay layout before the baseline. A mutation changes
-        # file contents only, not symlink resolution or compiler source paths.
-        for _, relative, _, _ in cases:
-            own(root, source_owner_path(relative))
-        local_cache = work / "cache"
-        global_cache = work / "global-cache"
-        seed_global_cache(global_cache)
 
-        def build(label: str) -> dict[str, str]:
+        def prepare_overlay(root):
+            link_children(ZIG_ROOT.parent, root)
+            build_file = own(root, "zig/build.zig")
+            shutil.copyfile(build_file, build_file.with_name("project_build.zig"))
+            shutil.copyfile(
+                ZIG_ROOT / "tools/fixtures/storage_compilation.zig", build_file
+            )
+            # File contents may change; compiler-relative paths never do.
+            for _, relative, _, _ in cases:
+                own(root, source_owner_path(relative))
+
+        prepare_overlay(root)
+        baseline = AuditWorkspace(root, args.jobs)
+        seed_global_cache(baseline.global_cache)
+
+        def build(label: str, workspace=baseline) -> dict[str, str]:
+            if abort.is_set():
+                raise RuntimeError("another storage audit worker failed")
             print(f"{label}: compiling production artifacts", flush=True)
             arguments = [
                 "build",
+                # In Zig 0.17 an implicit current-directory build root has no
+                # cache prefix. Authored inputs then hash as absolute paths,
+                # making a relocated warm cache cold. An explicit relative
+                # build file registers a relocatable build-root prefix.
+                "--build-file",
+                "./build.zig",
                 "check-storage-compilation",
                 "-Doptimize=debug",
                 # Ownership and cache invalidation depend on Debug code and
@@ -660,13 +786,13 @@ def main() -> None:
                 "-Dmetal=false",
                 "-Dsystem-blas=false",
                 "-Dantfly-version=compilation-check",
-                f"-j{args.jobs}",
+                f"-j{workspace.jobs}",
                 "--summary",
                 "all",
                 "--color",
                 "off",
                 "--cache-dir",
-                str(local_cache),
+                ".zig-cache",
             ]
             if measured_memory:
                 # Keep every qualified axis explicit; other compiler/profile
@@ -689,19 +815,28 @@ def main() -> None:
                 "command": command,
                 "disk_free_before_bytes": shutil.disk_usage(work).free,
             }
-            records.append(record)
-            publish()
+            record["workspace"] = workspace.root.name
+            with report_lock:
+                records.append(record)
+                publish()
 
             def progress(current):
-                record.update(current)
-                publish()
+                if abort.is_set():
+                    raise RuntimeError("another storage audit worker failed")
+                with report_lock:
+                    record.update(current)
+                    publish()
 
             try:
                 returncode, output, measurements = measured_build(
                     command,
-                    root / "zig",
+                    workspace.cwd,
                     progress=progress,
-                    env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(global_cache)},
+                    env={
+                        **os.environ,
+                        "ZIG_LOCAL_CACHE_DIR": ".zig-cache",
+                        "ZIG_GLOBAL_CACHE_DIR": ".zig-global-cache",
+                    },
                     # The cold graph has several independent archives and
                     # owner/consumer executables. A newly started compiler is
                     # not stalled because earlier units consumed 30 minutes.
@@ -711,24 +846,26 @@ def main() -> None:
                     compiler_timeout_seconds=1800,
                 )
             except BaseException as err:
-                record.update(status="interrupted", error=type(err).__name__)
-                publish()
+                with report_lock:
+                    record.update(status="interrupted", error=type(err).__name__)
+                    publish()
                 raise
             states = {
                 ("link:" + name if kind == "exe" else name): state
                 for kind, name, state in COMPILES.findall(output)
             }
             elapsed = measurements["wall_seconds"]
-            record.update(
-                {
-                    **measurements,
-                    "disk_free_after_bytes": shutil.disk_usage(work).free,
-                    "status": "failed" if returncode else "completed",
-                    "returncode": returncode,
-                    "artifacts": states,
-                }
-            )
-            publish()
+            with report_lock:
+                record.update(
+                    {
+                        **measurements,
+                        "disk_free_after_bytes": shutil.disk_usage(work).free,
+                        "status": "failed" if returncode else "completed",
+                        "returncode": returncode,
+                        "artifacts": states,
+                    }
+                )
+                publish()
             if returncode:
                 if measurements["timed_out"]:
                     print(
@@ -740,6 +877,25 @@ def main() -> None:
                     "\n".join(line for line in output.splitlines() if len(line) < 1000)
                 )
                 raise RuntimeError(f"{label}: build failed ({returncode})")
+            if label.endswith("warm"):
+                rebuilt = sorted(
+                    {
+                        name
+                        for _, name, status in COMPILES.findall(output)
+                        if status == "success"
+                    }
+                )
+                if rebuilt:
+                    with report_lock:
+                        record.update(
+                            status="failed",
+                            error="UnexpectedWarmRebuild",
+                            rebuilt_artifacts=rebuilt,
+                        )
+                        publish()
+                    raise AssertionError(
+                        f"{label}: cache relocation rebuilt production artifacts: {rebuilt}"
+                    )
             missing = (ARCHIVES | CONSUMERS) - states.keys()
             if missing:
                 raise AssertionError(
@@ -760,45 +916,80 @@ def main() -> None:
         warm = build("warm")
         assert all(warm[name] == "cached" for name in ARCHIVES | CONSUMERS), warm
 
-        def restart_cache(reason: str) -> None:
+        def restart_cache(workspace, reason: str) -> None:
             # Remove Zig's objects and manifests together. A manifest retained
             # without its output can produce a false cache hit. The source
             # overlay stays at the same path with earlier edits still applied.
-            for directory in (local_cache, global_cache):
+            for directory in (workspace.local_cache, workspace.global_cache):
                 if directory.exists():
                     shutil.rmtree(directory)
-            seed_global_cache(global_cache)
-            build(f"{reason} cold")
-            warmed = build(f"{reason} warm")
+            seed_global_cache(workspace.global_cache)
+            build(f"{reason} cold", workspace)
+            warmed = build(f"{reason} warm", workspace)
             assert all(warmed[name] == "cached" for name in ARCHIVES | CONSUMERS), (
                 warmed
             )
 
-        for label, relative, rebuilt, cached in cases:
-            # Keep the measured warm cache across mutations. A second cold
-            # build adds a full production compile without testing another
-            # ownership property. Roll over only under real disk pressure.
-            if shutil.disk_usage(work).free < 12 * (1 << 30):
-                restart_cache(label)
-            path = own(root, source_owner_path(relative))
-            # Keep earlier edits in this private overlay. Restoring one would
-            # itself invalidate Zig's most recent manifest and confound the
-            # next case, even if it restores bytes from the cold build.
-            path.write_bytes(
-                path.read_bytes() + b"\n// storage compilation ownership regression\n"
-            )
-            states = build(label)
-            for name in rebuilt:
-                assert states.get(name) == "success", (label, name, states)
-            for name in cached:
-                assert states.get(name) == "cached", (label, name, states)
-            if label in {"physical DB", "physical local query"}:
-                for name in CONSUMERS:
-                    assert states.get("link:" + name) == "success", (
-                        label,
-                        name,
-                        states,
+        def run_cases(workspace, selected):
+            try:
+                for label, relative, rebuilt, cached in selected:
+                    # Each worker retains earlier edits and owns both caches.
+                    # A low-disk rollover cannot delete another worker's input.
+                    if shutil.disk_usage(work).free < 12 * (1 << 30):
+                        restart_cache(workspace, label)
+                    path = own(workspace.root, source_owner_path(relative))
+                    path.write_bytes(
+                        path.read_bytes()
+                        + b"\n// storage compilation ownership regression\n"
                     )
+                    states = build(label, workspace)
+                    for name in rebuilt:
+                        assert states.get(name) == "success", (label, name, states)
+                    for name in cached:
+                        assert states.get(name) == "cached", (label, name, states)
+                    if label in {"physical DB", "physical local query"}:
+                        for name in CONSUMERS:
+                            assert states.get("link:" + name) == "success", (
+                                label,
+                                name,
+                                states,
+                            )
+            except BaseException:
+                abort.set()
+                raise
+
+        if case_workers == 1:
+            run_cases(baseline, cases)
+            return
+
+        workers = []
+        for index in range(case_workers):
+            workspace = AuditWorkspace(work / f"worker-{index}", 1)
+            clone_audit_workspace(baseline, workspace)
+            # Require real compiler cache hits before accepting relocation.
+            # This fails closed if a future build starts embedding root paths.
+            states = build(f"worker {index} warm", workspace)
+            assert all(states[name] == "cached" for name in ARCHIVES | CONSUMERS), (
+                states
+            )
+            workers.append(workspace)
+        # Only hard-linked immutable objects remain shared. Drop the baseline
+        # references so a worker's disk-pressure rollover can reclaim its work.
+        shutil.rmtree(baseline.local_cache)
+        shutil.rmtree(baseline.global_cache)
+        executor = ThreadPoolExecutor(max_workers=case_workers)
+        try:
+            pending = [
+                executor.submit(run_cases, workspace, group)
+                for workspace, group in zip(
+                    workers, partition_cases(cases), strict=True
+                )
+            ]
+            for future in as_completed(pending):
+                future.result()
+        finally:
+            abort.set()
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 if __name__ == "__main__":

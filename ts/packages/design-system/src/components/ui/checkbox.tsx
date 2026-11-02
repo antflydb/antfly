@@ -1,7 +1,7 @@
 "use client";
 
-import * as CheckboxPrimitive from "@radix-ui/react-checkbox";
 import { Check } from "lucide-react";
+import { Checkbox as CheckboxPrimitive } from "radix-ui";
 import type * as React from "react";
 
 import { cn } from "@/lib/utils";
@@ -13,7 +13,7 @@ function Checkbox({ className, ...props }: React.ComponentProps<typeof CheckboxP
       className={cn(
         "peer shrink-0 self-start mt-0.5",
         // 16px square, deliberate token-width (--border-width) border, no radius, no shadow
-        "size-4 rounded-none border-(length:--border-width) border-input bg-transparent",
+        "size-4 rounded-sm border-(length:--border-width) border-input bg-transparent",
         // checked state: ink fill — amber is reserved for the primary action
         "data-[state=checked]:bg-foreground data-[state=checked]:text-background data-[state=checked]:border-foreground",
         "dark:data-[state=checked]:bg-foreground",

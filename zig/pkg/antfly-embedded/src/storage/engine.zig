@@ -36,11 +36,7 @@ pub const ReplayBoundary = @import("named_callback.zig").Boundary(ReplayCallback
 pub const BackupPlan = struct { value: @import("../api/backup_contract.zig").TableBackupPlan, io: ?native.IoBorrow };
 /// Restore owns a disposable generation; keep its record loops and errors in
 /// the physical storage unit. Callbacks here return no Zig error values.
-pub const PortableRestoreImportOptions = struct {
-    identity_namespace: ?@import("db/doc_identity.zig").Namespace = null,
-    embedding_source_fields: []const @import("portable_backup.zig").ImportOptions.EmbeddingSourceField = &.{},
-    cancellation: types.CancellationToken = .none,
-};
+pub const PortableRestoreImportOptions = @import("portable_backup.zig").RestoreImportOptions;
 pub const WriterBorrow = @import("native_writer.zig").Borrow;
 pub const PortableExportOptions = struct {
     value: @import("portable_backup.zig").ExportOptions,

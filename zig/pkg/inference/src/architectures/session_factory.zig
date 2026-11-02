@@ -33,6 +33,7 @@ const InferenceExecutionControl = @import("../execution_control.zig").InferenceE
 const bert = @import("../models/bert.zig");
 const t5_mod = @import("../models/t5.zig");
 const gpt_mod = @import("../models/gpt.zig");
+const qwen35_execution = @import("qwen35_execution.zig");
 const embedding_gemma2_model = @import("../models/embedding_gemma2.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const whisper_mod = @import("../models/whisper.zig");
@@ -364,7 +365,7 @@ fn captureBoundaryIdentity(mf: *const manifest_mod.ModelManifest, store: tensor_
         return .{ .backbone = config.backbone, .precision = receipt.value.precision, .weight = digest, .sidecars = sidecars };
     }
     const reader = store.singleSafetensorsReader() orelse return error.UnsupportedGlinerBoundaryBundle;
-    return .{ .backbone = config.backbone, .precision = .fp32, .weight = boundary_bundle.Digest.of(reader.file_bytes), .sidecars = sidecars };
+    return .{ .backbone = config.backbone, .precision = .fp32, .weight = boundary_bundle.Digest.ofMapped(reader.file_bytes), .sidecars = sidecars };
 }
 
 fn sameDigest(left: gliner_decide_qualification.Digest, right: gliner_decide_qualification.Digest) bool {
@@ -398,7 +399,7 @@ fn captureGlinerDecisionIdentity(mf: *const manifest_mod.ModelManifest, store: t
             inventory.all_f32 = false;
             break;
         };
-        weight = gliner_decide_qualification.Digest.of(reader.file_bytes);
+        weight = gliner_decide_qualification.Digest.ofMapped(reader.file_bytes);
     } else if (store.glinerGgufSnapshot()) |snapshot| {
         inventory = .{ .count = snapshot.tensor_count, .all_f32 = snapshot.all_f32 };
         // GGUF stores start with random-access advice for sparse tensor loads.
@@ -1831,6 +1832,8 @@ fn createCudaSessionWithRequiredProfile(
     gliner_precision: GlinerCudaPrecision,
 ) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+    const load_started_ns = platform.time.monotonicNs();
+    defer std.log.info("inference_model_load backend=cuda phase=total elapsed_ms={d}", .{(platform.time.monotonicNs() -| load_started_ns) / std.time.ns_per_ms});
     try config.validate();
     if (config.mode.failClosed() and !load_context.allowsQualification()) {
         return error.KernelJitRequiredDynamicLoad;
@@ -1904,8 +1907,10 @@ fn createCudaSessionWithRequiredProfile(
 
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     if (debug_cuda_session) std.log.info("cuda-session: create native session start path={s}", .{model_path});
+    const host_prepare_started_ns = platform.time.monotonicNs();
     var native_session = try createNativeSessionForCudaUpload(allocator, model_path, override, true);
     defer native_session.close();
+    std.log.info("inference_model_load backend=cuda phase=host_prepare elapsed_ms={d}", .{(platform.time.monotonicNs() -| host_prepare_started_ns) / std.time.ns_per_ms});
     if (debug_cuda_session) std.log.info("cuda-session: create native session done path={s}", .{model_path});
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
     if (native_impl.backend_type != .native) return error.InvalidBackend;
@@ -1940,6 +1945,7 @@ fn createCudaSessionWithRequiredProfile(
     );
 
     if (debug_cuda_session) std.log.info("cuda-session: init cuda compute start path={s}", .{model_path});
+    const device_init_started_ns = platform.time.monotonicNs();
     var cuda_compute = try cuda_compute_mod.CudaCompute.initWithKernelJitForScopeAndLoadContext(
         allocator,
         config,
@@ -1948,6 +1954,7 @@ fn createCudaSessionWithRequiredProfile(
         load_context,
     );
     errdefer cuda_compute.deinit();
+    std.log.info("inference_model_load backend=cuda phase=device_init elapsed_ms={d}", .{(platform.time.monotonicNs() -| device_init_started_ns) / std.time.ns_per_ms});
     if (debug_cuda_session) std.log.info("cuda-session: init cuda compute done path={s}", .{model_path});
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
@@ -1963,10 +1970,8 @@ fn createCudaSessionWithRequiredProfile(
         platform.env.getenvBoolDefault("ANTFLY_CUDA_GLINER_1B_Q8_F16_ATTENTION", true);
     cuda_compute.laya_optimizations = (cuda_profile == .laya or cuda_profile == .gliner25_modern_bert) and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_OPTIMIZATIONS", true);
     cuda_compute.laya_fusion = cuda_compute.laya_optimizations and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_FUSION", true);
-    if (a4b_inference != null and
-        (cuda_compute.ctx.info.compute_major != 8 or cuda_compute.ctx.info.compute_minor != 9))
-    {
-        return error.A4bCudaUnsupportedDevice;
+    if (a4b_inference != null and !cuda_compute.kernels.hasGemma4A4BResidentQ4_0Primitives()) {
+        return error.A4bCudaKernelUnavailable;
     }
     cuda_compute.a4b_inference = a4b_inference;
     var resident_uploads: std.ArrayListUnmanaged(CudaResidentUpload) = .empty;
@@ -2007,6 +2012,7 @@ fn createCudaSessionWithRequiredProfile(
             return err;
         };
     }
+    std.log.info("inference_model_load backend=cuda phase=weight_upload weights={d} elapsed_ms={d}", .{ resident_uploads.items.len, (platform.time.monotonicNs() -| dense_upload_start_ns) / std.time.ns_per_ms });
     if (a4b_inference != null) {
         cuda_compute.noteA4bDenseUpload(
             platform.time.monotonicNs() -| dense_upload_start_ns,
@@ -2052,10 +2058,28 @@ fn createCudaSessionWithRequiredProfile(
     else
         runtime.tier.memory.Limits{};
     const decision_identity_handoff = unsealedGlinerDecisionIdentityHandoff(native_impl);
+    var resolved_arch_config = native_impl.arch_config;
+    const recurrent_execution: ?qwen35_execution.Decision = if (resolved_arch_config == .gpt and
+        resolved_arch_config.gpt.isQwen35() and resolved_arch_config.gpt.qwen35_has_linear_attention)
+    blk: {
+        const decision = qwen35_execution.apply(&resolved_arch_config.gpt, cuda_compute.ctx.info.compute_major, qwen35_execution.cudaCoreEnabled());
+        const placement_format = "inference recurrent placement backend=cuda placement={s} reason={s} compute={d}.{d}";
+        const placement_args = .{
+            @tagName(decision.placement), @tagName(decision.reason), cuda_compute.ctx.info.compute_major, cuda_compute.ctx.info.compute_minor,
+        };
+        // The native benchmark runner suppresses info logs. Keep its placement
+        // evidence explicit instead of inferring execution from a backend name.
+        if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print(placement_format ++ "\n", placement_args)
+        else
+            std.log.info(placement_format, placement_args);
+        break :blk decision;
+    } else null;
     const impl = try allocator.create(ArchSession);
     impl.* = .{
         .allocator = allocator,
-        .arch_config = native_impl.arch_config,
+        .arch_config = resolved_arch_config,
+        .recurrent_execution = recurrent_execution,
         .task = native_impl.task,
         .gliner_span_encoder_family = native_impl.gliner_span_encoder_family,
         .gliner_decision_identity = decision_identity_handoff.identity,
@@ -7623,6 +7647,7 @@ const ArchSession = struct {
     video_coefficient_suspended: bool = false,
     allocator: std.mem.Allocator,
     arch_config: ArchConfig,
+    recurrent_execution: ?qwen35_execution.Decision = null,
     boundary_identity: ?boundary_bundle.Identity = null,
     gliner_decision_identity: ?gliner_decide_qualification.Identity = null,
     gliner_decision_identity_sealed: bool = false,
@@ -8313,6 +8338,14 @@ fn makeComputeBackend(
         } else return error.CudaNotEnabled,
         .wasm => return error.WasmNotSupportedHere,
     };
+}
+
+/// The placement resolved at model load; read-only diagnostics never re-resolve
+/// mutable environment flags or alter an existing recurrent history.
+pub fn getRecurrentExecution(session: Session) ?qwen35_execution.Decision {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return self.recurrent_execution;
 }
 
 /// Get GPT config from a session, if it's a GPT model. Returns null for non-GPT architectures.

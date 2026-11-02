@@ -91,6 +91,22 @@ pub const Image = struct {
     width: u32,
     height: u32,
     bytes: usize,
+    // Borrowed immutable slice proven JSON-safe by the image constructors.
+    // Bind the proof to the original extent so replacing data_url fails closed.
+    json_safe_url: ?[]const u8 = null,
+    table_source: ?input.TableSourceReference = null,
+    pub fn hasJsonSafeUrl(self: Image) bool {
+        const safe = self.json_safe_url orelse return false;
+        return safe.ptr == self.data_url.ptr and safe.len == self.data_url.len;
+    }
+    pub fn writeDataUrl(self: Image, json: *std.json.Stringify) !void {
+        if (!self.hasJsonSafeUrl() or json.options.emit_strings_as_arrays) return json.write(self.data_url);
+        try json.beginWriteRaw();
+        try json.writer.writeByte('"');
+        try json.writer.writeAll(self.data_url);
+        try json.writer.writeByte('"');
+        json.endWriteRaw();
+    }
     pub fn fromBytes(a: A, bytes: []const u8, max_bytes: usize, max_pixels: u64) !Image {
         if (bytes.len > max_bytes) return error.ImageByteBudgetExceeded;
         const mime = imageMime(bytes) orelse return error.UnsupportedEvidenceMedia;
@@ -103,7 +119,7 @@ pub const Image = struct {
         _ = std.base64.standard.Encoder.encode(url[prefix.len..], bytes);
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-        return .{ .data_url = url, .sha256 = digest, .mime_type = mime, .width = info.width, .height = info.height, .bytes = bytes.len };
+        return .{ .data_url = url, .sha256 = digest, .mime_type = mime, .width = info.width, .height = info.height, .bytes = bytes.len, .json_safe_url = url };
     }
     /// Every caller validates before cache access. Decoded bytes are temporary;
     /// no raster is allocated, retained, or written to the decision cache.
@@ -127,7 +143,7 @@ pub const Image = struct {
         if (!std.mem.eql(u8, mime, inline_image.mime)) return error.EvidenceMimeMismatch;
         const info = try images.inspectEncoded(bytes);
         if (try info.pixels() > max_pixels) return error.ImagePixelBudgetExceeded;
-        return .{ .data_url = url, .sha256 = digest, .mime_type = mime, .width = info.width, .height = info.height, .bytes = size };
+        return .{ .data_url = url, .sha256 = digest, .mime_type = mime, .width = info.width, .height = info.height, .bytes = size, .json_safe_url = url };
     }
 };
 
@@ -149,8 +165,16 @@ pub const Loader = struct {
     ctx: *anyopaque,
     load: *const fn (*anyopaque, A, Unit) anyerror!Image,
     load_many: ?*const fn (*anyopaque, A, []const Unit, []Loaded) anyerror!void = null,
+    /// Re-materialize a conditionally omitted wave after score eviction/expiry.
+    /// The caller no longer uses earlier wave images when invoking this.
+    materialize_many: ?*const fn (*anyopaque, A, []const Unit, []Loaded) anyerror!void = null,
     /// Retire borrowed wave backing only after its last score/output user.
     release_wave: ?*const fn (*anyopaque) void = null,
+    pub fn materialize(self: Loader, a: A, units: []const Unit, output: []Loaded) !void {
+        self.releaseWave();
+        if (self.materialize_many) |many| return many(self.ctx, a, units, output);
+        return self.batch(a, units, output);
+    }
     pub fn releaseWave(self: Loader) void {
         if (self.release_wave) |release| release(self.ctx);
     }

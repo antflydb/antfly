@@ -17,7 +17,12 @@ const std = @import("std");
 const httpx = @import("httpx");
 const objectstore = @import("objectstore");
 
-pub const data_uri = @import("data_uri.zig");
+pub const data_uri = @import("antfly_data_uri");
+
+// Public connection-input contracts. Configuration consumers already depend on
+// scraping; they do not need a direct dependency on the concrete object store.
+pub const GcsCredentialSource = objectstore.Gcs.CredentialSource;
+pub const GcsCredentialConfig = objectstore.Gcs.Credentials;
 
 const Allocator = std.mem.Allocator;
 const default_max_download_size_bytes: u64 = 100 * 1024 * 1024;
@@ -30,7 +35,7 @@ pub const CancellationToken = objectstore.CancellationToken;
 
 /// Supported media transports. Shared with offline dependency inspection so
 /// destination evidence cannot enable a protocol this runtime cannot execute.
-pub const ContentScheme = enum { http, https, file, s3, data };
+pub const ContentScheme = enum { http, https, file, s3, gs, data };
 
 pub fn contentScheme(scheme: []const u8) error{UnsupportedUrlScheme}!ContentScheme {
     inline for (@typeInfo(ContentScheme).@"enum".field_names) |name| {
@@ -145,6 +150,81 @@ pub const S3CredentialConfig = struct {
     }
 };
 
+/// Borrowed view of an explicitly configured external-I/O connection. The
+/// owning configuration snapshot outlives every fetch; no credentials are
+/// inferred from a gs:// URI or from an unscoped process identity.
+pub const GcsContentConnection = struct {
+    buckets: []const []u8 = &.{},
+    prefix: ?[]u8 = null,
+    project_id: ?[]u8 = null,
+    endpoint: ?[]u8 = null,
+    credentials: objectstore.Gcs.Credentials = .{},
+
+    pub fn allows(self: *const GcsContentConnection, location: *const GcsLocation) bool {
+        var allowed = false;
+        for (self.buckets) |bucket| if (std.mem.eql(u8, bucket, location.bucket)) {
+            allowed = true;
+            break;
+        };
+        if (!allowed) return false;
+        const prefix = self.prefix orelse return true;
+        return prefix.len == 0 or hasComponentPrefix(location.key, std.mem.trimEnd(u8, prefix, "/"), '/');
+    }
+};
+
+pub const GcsLocation = struct {
+    bucket: []u8,
+    key: []u8,
+    generation: ?[]u8,
+
+    pub fn deinit(self: *GcsLocation, alloc: Allocator) void {
+        alloc.free(self.bucket);
+        alloc.free(self.key);
+        if (self.generation) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub fn parseGcsLocationAlloc(alloc: Allocator, uri: []const u8) !GcsLocation {
+    const parsed = std.Uri.parse(uri) catch return error.InvalidGcsUrl;
+    if (!std.ascii.eqlIgnoreCase(parsed.scheme, "gs") or parsed.user != null or
+        parsed.password != null or parsed.port != null or parsed.fragment != null) return error.InvalidGcsUrl;
+    const bucket = (parsed.host orelse return error.InvalidGcsUrl).percent_encoded;
+    if (bucket.len < 3 or bucket.len > 222) return error.InvalidGcsUrl;
+    for (bucket) |c| if (!std.ascii.isLower(c) and !std.ascii.isDigit(c) and c != '-' and c != '_' and c != '.') return error.InvalidGcsUrl;
+    if (!std.ascii.isAlphanumeric(bucket[0]) or !std.ascii.isAlphanumeric(bucket[bucket.len - 1])) return error.InvalidGcsUrl;
+    if (!std.mem.startsWith(u8, parsed.path.percent_encoded, "/")) return error.InvalidGcsUrl;
+    const encoded_key = parsed.path.percent_encoded[1..];
+    if (encoded_key.len == 0) return error.InvalidGcsUrl;
+    var encoded_index: usize = 0;
+    while (encoded_index < encoded_key.len) : (encoded_index += 1) {
+        const c = encoded_key[encoded_index];
+        if (c <= 0x20 or c == 0x7f) return error.InvalidGcsUrl;
+        if (c == '%') {
+            if (encoded_index + 2 >= encoded_key.len or !std.ascii.isHex(encoded_key[encoded_index + 1]) or !std.ascii.isHex(encoded_key[encoded_index + 2])) return error.InvalidGcsUrl;
+            encoded_index += 2;
+        }
+    }
+    const key = try alloc.dupe(u8, encoded_key);
+    defer alloc.free(key);
+    const decoded = std.Uri.percentDecodeInPlace(key);
+    for (decoded) |c| if (c < 0x20 or c == 0x7f) return error.InvalidGcsUrl;
+    const owned_key = try alloc.dupe(u8, decoded);
+    errdefer alloc.free(owned_key);
+    var generation: ?[]u8 = null;
+    if (parsed.query) |query| {
+        const value = query.percent_encoded;
+        if (!std.mem.startsWith(u8, value, "generation=")) return error.InvalidGcsUrl;
+        const digits = value["generation=".len..];
+        if (digits.len == 0 or digits.len > 20 or digits[0] == '0') return error.InvalidGcsUrl;
+        for (digits) |c| if (!std.ascii.isDigit(c)) return error.InvalidGcsUrl;
+        _ = std.fmt.parseUnsigned(u64, digits, 10) catch return error.InvalidGcsUrl;
+        generation = try alloc.dupe(u8, digits);
+    }
+    errdefer if (generation) |value| alloc.free(value);
+    return .{ .bucket = try alloc.dupe(u8, bucket), .key = owned_key, .generation = generation };
+}
+
 pub const HTTPCredentialConfig = struct {
     base_url: ?[]u8 = null,
     headers: std.StringArrayHashMapUnmanaged([]u8) = .{},
@@ -168,6 +248,8 @@ pub const RemoteContentConfig = struct {
     default_s3: ?[]u8 = null,
     s3: std.StringArrayHashMapUnmanaged(S3CredentialConfig) = .{},
     http: std.StringArrayHashMapUnmanaged(HTTPCredentialConfig) = .{},
+    /// Derived only from canonical connections with content.fetch capability.
+    gcs_connections: std.StringArrayHashMapUnmanaged(GcsContentConnection) = .{},
     /// Optional process-owned publisher for hot-reloadable configuration. The
     /// publisher is borrowed and must outlive every use of this facade.
     runtime: ?RemoteContentRuntime = null,
@@ -251,7 +333,33 @@ pub const RemoteContentConfig = struct {
             entry.value_ptr.deinit(alloc);
         }
         self.http.deinit(alloc);
+        // Keys and connection values are borrowed from the owning Config.
+        self.gcs_connections.deinit(alloc);
         self.* = undefined;
+    }
+};
+
+/// JSON payload for the compiled storage owner. The derived facade borrows
+/// policy and connection values from this payload; only its GCS map is owned.
+/// Release that map before destroying the parsed payload.
+pub const RemoteContentSnapshotData = struct {
+    security: ContentSecurityConfig = .{},
+    gcs_connections: []const NamedGcsConnection = &.{},
+
+    pub const NamedGcsConnection = struct {
+        name: []const u8,
+        connection: GcsContentConnection,
+    };
+
+    pub fn configAlloc(self: *const @This(), alloc: Allocator) !RemoteContentConfig {
+        var config = RemoteContentConfig{ .security = self.security };
+        errdefer config.gcs_connections.deinit(alloc);
+        for (self.gcs_connections) |entry| {
+            const result = try config.gcs_connections.getOrPut(alloc, entry.name);
+            if (result.found_existing) return error.InvalidRemoteContentConfig;
+            result.value_ptr.* = entry.connection;
+        }
+        return config;
     }
 };
 
@@ -366,6 +474,7 @@ fn downloadContentOutcomeAllocImpl(
         .s3 => {
             return .{ .ok = try downloadS3Alloc(alloc, maybe_context, parsed, security, s3_credentials) };
         },
+        .gs => return error.GcsConnectionNotFoundOrOutOfScope,
         .data => unreachable, // Handled before URI parsing.
     }
 }
@@ -917,6 +1026,65 @@ pub fn validateS3Uri(uri: std.Uri, options: struct { complete: bool = true }) !v
     const host = uri.host orelse return error.InvalidS3Url;
     if (host.percent_encoded.len == 0) return error.InvalidS3Url;
     if (options.complete and trimLeftSlash(uri.path.percent_encoded).len == 0) return error.InvalidS3Url;
+}
+
+/// Fetch through an explicitly authorized GCS connection. A bare gs:// URL
+/// never opts into ambient credentials. Generation-qualified reads use the
+/// existing JSON API client's immutable-version validation.
+pub fn downloadGcsContentAlloc(
+    alloc: Allocator,
+    maybe_context: ?DownloadContext,
+    uri: []const u8,
+    security: ?*const ContentSecurityConfig,
+    connection: *const GcsContentConnection,
+) !DownloadedContent {
+    var location = try parseGcsLocationAlloc(alloc, uri);
+    defer location.deinit(alloc);
+    if (!connection.allows(&location)) return error.GcsConnectionNotFoundOrOutOfScope;
+    const joined = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ location.bucket, location.key });
+    defer alloc.free(joined);
+    try validateS3PathSecurity(joined, security);
+    var local_io: ?std.Io.Threaded = if (maybe_context == null) std.Io.Threaded.init(alloc, .{}) else null;
+    defer if (local_io) |*owned| owned.deinit();
+    const context = maybe_context orelse DownloadContext{ .io = local_io.?.io() };
+    const ceiling = try DownloadCeiling.init(context, security);
+    try ceiling.check();
+    var cfg = try objectstore.Gcs.clientConfigForCredentialsAlloc(
+        alloc,
+        connection.credentials,
+        connection.project_id,
+        connection.endpoint,
+        null,
+        context.io,
+        context.io,
+    );
+    var config_owned = true;
+    errdefer if (config_owned) cfg.deinit(alloc);
+    try validateUrlSecurity(try std.Uri.parse(cfg.endpoint), security);
+    cfg.http_client_config = httpClientConfig(security);
+    const remaining = try ceiling.remainingTimeoutMs();
+    cfg.request_timeout_ms = remaining;
+    cfg.request_deadline_ns = if (remaining == 0) null else @import("antfly_platform").time.monotonicNs() +| (remaining *| std.time.ns_per_ms);
+    var client = try objectstore.Gcs.JsonApiClient.init(alloc, cfg);
+    config_owned = false;
+    defer client.deinit();
+    var store = client.client();
+    const max_bytes = maxDownloadSizeBytes(security);
+    const response_ceiling = std.math.add(u64, max_bytes, 1) catch max_bytes;
+    var result = store.getObject(location.bucket, location.key, .{
+        .version_id = location.generation,
+        .skip_metadata_probe = location.generation != null,
+        .max_response_bytes = std.math.cast(usize, response_ceiling) orelse std.math.maxInt(usize),
+        .cancellation = context.cancellation,
+    }) catch |err| return normalizeS3DownloadError(err);
+    defer result.deinit(alloc);
+    if (result.body.len > max_bytes) return error.StreamTooLong;
+    const content_type = try alloc.dupe(u8, result.metadata.content_type orelse guessMimeType(location.key));
+    errdefer alloc.free(content_type);
+    const data = try alloc.dupe(u8, result.body);
+    errdefer alloc.free(data);
+    try ceiling.check();
+    return .{ .content_type = content_type, .data = data };
 }
 
 fn downloadS3Alloc(
@@ -2026,6 +2194,8 @@ const TestHttpResponseServer = struct {
     content_encoding: ?[]const u8,
     status_code: u16 = 200,
     extra_headers: []const u8 = "",
+    expected_request_line: ?[]const u8 = null,
+    expected_authorization: ?[]const u8 = null,
     failure: ?anyerror = null,
 
     fn serve(self: *@This()) void {
@@ -2039,12 +2209,28 @@ const TestHttpResponseServer = struct {
         // bytes can otherwise turn this response into a TCP reset.
         var read_buffer: [4096]u8 = undefined;
         var reader = stream.reader(self.io, &read_buffer);
+        var first = true;
+        var authorized = self.expected_authorization == null;
         while (true) {
             const line = reader.interface.takeDelimiterInclusive('\n') catch |err| {
                 self.failure = err;
                 return;
             };
+            if (first) {
+                if (self.expected_request_line) |expected| if (!std.mem.eql(u8, line, expected)) {
+                    self.failure = error.UnexpectedTestRequest;
+                    return;
+                };
+                first = false;
+            }
+            if (line.len >= 14 and std.ascii.eqlIgnoreCase(line[0..14], "Authorization:")) {
+                if (self.expected_authorization) |expected| authorized = std.mem.eql(u8, std.mem.trim(u8, line[14..], " \r\n"), expected);
+            }
             if (std.mem.eql(u8, line, "\r\n")) break;
+        }
+        if (!authorized) {
+            self.failure = error.MissingTestAuthorization;
+            return;
         }
 
         var write_buffer: [1024]u8 = undefined;
@@ -2250,4 +2436,97 @@ test "S3 URI structure is checked before allocation credentials or transport" {
         defer a.free(bucket);
         try std.testing.expectEqualStrings("bucket", bucket);
     }
+}
+
+test "GCS locators retain encoded names and immutable generation selectors" {
+    const a = std.testing.allocator;
+    var location = try parseGcsLocationAlloc(a, "gs://bucket/objects/a%20b%2Fc.pdf?generation=1793305553268935");
+    defer location.deinit(a);
+    try std.testing.expectEqualStrings("bucket", location.bucket);
+    try std.testing.expectEqualStrings("objects/a b/c.pdf", location.key);
+    try std.testing.expectEqualStrings("1793305553268935", location.generation.?);
+    for ([_][]const u8{
+        "gs://bucket/objects/doc?generation=0",              "gs://bucket/objects/doc?generation=01",
+        "gs://bucket/objects/doc?generation=1&generation=2", "gs://bucket/objects/doc?token=secret",
+        "gs://user@bucket/objects/doc",                      "gs://bucket:443/objects/doc",
+        "gs://bucket/objects/doc#fragment",                  "gs://bucket/objects/doc?generation=18446744073709551616",
+        "gs://bucket/",                                      "gs://bucket/objects/%ZZ",
+        "gs://bucket/objects/%0",                            "gs://bucket/objects/%00",
+        "gs://bucket/objects/raw space",
+    }) |uri| try std.testing.expectError(error.InvalidGcsUrl, parseGcsLocationAlloc(a, uri));
+}
+
+test "GCS scopes reject requests before identity or credentials are loaded" {
+    const a = std.testing.allocator;
+    const buckets = [_][]u8{@constCast("bucket")};
+    const connection = GcsContentConnection{ .buckets = &buckets, .prefix = @constCast("objects/approved"), .credentials = .{ .source = .service_account, .credentials_path = @constCast("__missing_google_credentials__.json") } };
+    for ([_][]const u8{ "gs://other-bucket/objects/approved/doc", "gs://bucket/objects/approved-elsewhere/doc", "gs://bucket/objects/unapproved/doc" }) |uri|
+        try std.testing.expectError(error.GcsConnectionNotFoundOrOutOfScope, downloadGcsContentAlloc(a, null, uri, null, &connection));
+    try std.testing.expectError(error.GcsConnectionNotFoundOrOutOfScope, downloadContentAlloc(a, "gs://bucket/objects/approved/doc", null, null));
+}
+
+test "GCS transport authenticates and verifies generation and byte bounds" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const cases = [_]struct { max_bytes: u64, generation: []const u8, expected: ?anyerror }{
+        .{ .max_bytes = 4, .generation = "123", .expected = null },
+        .{ .max_bytes = 3, .generation = "123", .expected = error.StreamTooLong },
+        .{ .max_bytes = 2, .generation = "123", .expected = error.StreamTooLong },
+        .{ .max_bytes = 4, .generation = "124", .expected = error.PreconditionFailed },
+    };
+    for (cases) |case| {
+        var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
+        var server_open = true;
+        defer if (server_open) server.deinit(io);
+        const headers = try std.fmt.allocPrint(a, "x-goog-generation: {s}\r\n", .{case.generation});
+        defer a.free(headers);
+        var fixture = TestHttpResponseServer{ .io = io, .server = &server, .body = "PDF!", .content_encoding = null, .extra_headers = headers, .expected_request_line = "GET /storage/v1/b/bucket/o/objects%2Fdoc.pdf?generation=123&alt=media HTTP/1.1\r\n", .expected_authorization = "Bearer scoped-fixture-token" };
+        const endpoint = try std.fmt.allocPrint(a, "http://{f}/storage/v1", .{server.socket.address});
+        defer a.free(endpoint);
+        const buckets = [_][]u8{@constCast("bucket")};
+        const connection = GcsContentConnection{ .buckets = &buckets, .prefix = @constCast("objects"), .endpoint = endpoint, .credentials = .{ .source = .bearer_token, .bearer_token = @constCast("scoped-fixture-token") } };
+        const security = ContentSecurityConfig{ .block_private_ips = false, .max_download_size_bytes = case.max_bytes };
+        var thread = try std.testing.io.concurrent(TestHttpResponseServer.serve, .{&fixture});
+        const result = downloadGcsContentAlloc(a, .{ .io = io }, "gs://bucket/objects/doc.pdf?generation=123", &security, &connection);
+        server.deinit(io);
+        server_open = false;
+        thread.await(std.testing.io);
+        if (fixture.failure) |err| return err;
+        if (case.expected) |err| try std.testing.expectError(err, result) else {
+            var downloaded = try result;
+            defer downloaded.deinit(a);
+            try std.testing.expectEqualStrings("PDF!", downloaded.data);
+        }
+    }
+}
+
+test "GCS canceled requests fail before credential discovery" {
+    const a = std.testing.allocator;
+    var canceled = std.atomic.Value(bool).init(true);
+    const buckets = [_][]u8{@constCast("bucket")};
+    const connection = GcsContentConnection{ .buckets = &buckets, .credentials = .{ .source = .service_account, .credentials_path = @constCast("__missing_google_credentials__.json") } };
+    try std.testing.expectError(error.Canceled, downloadGcsContentAlloc(a, .{ .io = std.testing.io, .cancellation = CancellationToken.fromAtomic(&canceled) }, "gs://bucket/doc.pdf", null, &connection));
+}
+
+test "remote content snapshot owns borrowed GCS views and rolls back allocation failures" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const raw =
+                \\{"security":{"max_download_size_bytes":1024},"gcs_connections":[{"name":"archive","connection":{"buckets":["originals"],"prefix":"objects/sha256","credentials":{"source":"bearer_token","bearer_token":"${secret:reader}"}}}]}
+            ;
+            var parsed = try std.json.parseFromSlice(RemoteContentSnapshotData, alloc, raw, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            var config = try parsed.value.configAlloc(alloc);
+            defer config.gcs_connections.deinit(alloc);
+            try std.testing.expectEqual(@as(?u64, 1024), config.security.?.max_download_size_bytes);
+            const connection = config.gcs_connections.get("archive").?;
+            try std.testing.expectEqualStrings("${secret:reader}", connection.credentials.bearer_token.?);
+            var location = try parseGcsLocationAlloc(alloc, "gs://originals/objects/sha256/doc.pdf?generation=123");
+            defer location.deinit(alloc);
+            try std.testing.expect(connection.allows(&location));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

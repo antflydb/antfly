@@ -24,6 +24,17 @@
 const std = @import("std");
 const abi = @import("runtime_failure_abi");
 
+test "merged runtime failure ABI preserves published reader and GCS status numbers" {
+    try std.testing.expectEqual(@as(u32, 841), @backingInt(abi.Status.hierarchy_cursor_stale));
+    try std.testing.expectEqual(@as(u32, 842), @backingInt(abi.Status.read_transient_failure));
+    try std.testing.expectEqual(@as(u32, 843), @backingInt(abi.Status.read_request_failed));
+    try std.testing.expectEqual(@as(u32, 844), @backingInt(abi.Status.invalid_gcs_url));
+    try std.testing.expectEqual(@as(u32, 845), @backingInt(abi.Status.gcs_connection_not_found_or_out_of_scope));
+    try std.testing.expectEqual(@as(u32, 846), @backingInt(abi.Status.ambiguous_gcs_connection));
+    try std.testing.expectEqual(@as(u32, 847), @backingInt(abi.Status.invalid_connection_credentials));
+    try std.testing.expect(@backingInt(abi.Status.catalog_occupancy_not_ready) > 847);
+}
+
 const Mapping = struct {
     status: abi.Status,
     err: anyerror,
@@ -106,6 +117,15 @@ const mappings = [_]Mapping{
     .{ .status = .relational_index_catalog_schema_mismatch, .err = error.RelationalIndexCatalogSchemaMismatch },
     .{ .status = .catalog_occupancy_not_ready, .err = error.CatalogOccupancyNotReady },
     .{ .status = .sequence_catalog_state_required, .err = error.SequenceCatalogStateRequired },
+    .{ .status = .read_transient_failure, .err = error.ReadTransientFailure },
+    .{ .status = .read_request_failed, .err = error.ReadRequestFailed },
+    .{ .status = .invalid_gcs_url, .err = error.InvalidGcsUrl },
+    .{ .status = .gcs_connection_not_found_or_out_of_scope, .err = error.GcsConnectionNotFoundOrOutOfScope },
+    .{ .status = .ambiguous_gcs_connection, .err = error.AmbiguousGcsConnection },
+    .{ .status = .invalid_connection_credentials, .err = error.InvalidConnectionCredentials },
+    .{ .status = .hierarchy_cursor_stale, .err = error.HierarchyCursorStale },
+    .{ .status = .invalid_document_checkpoint, .err = error.InvalidDocumentCheckpoint },
+    .{ .status = .too_many_active_jobs, .err = error.TooManyActiveJobs },
     .{ .status = .grouped_source_owner_changed, .err = error.GroupedSourceOwnerChanged },
     .{ .status = .grouped_source_topology_unavailable, .err = error.GroupedSourceTopologyUnavailable },
     .{ .status = .apple_intelligence_provider_unavailable, .err = error.AppleIntelligenceProviderUnavailable },
@@ -388,8 +408,6 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_relational_rows_request, .err = error.InvalidRelationalRowsRequest },
     .{ .status = .constraint_retirement_required, .err = error.ConstraintRetirementRequired },
     .{ .status = .table_transition_active, .err = error.TableTransitionActive },
-    .{ .status = .invalid_document_checkpoint, .err = error.InvalidDocumentCheckpoint },
-    .{ .status = .too_many_active_jobs, .err = error.TooManyActiveJobs },
     .{ .status = .invalid_integrity_key, .err = error.InvalidIntegrityKey },
     .{ .status = .integrity_record_too_large, .err = error.IntegrityRecordTooLarge },
     .{ .status = .invalid_range, .err = error.InvalidRange },
@@ -1250,6 +1268,15 @@ test "index readiness survives the local query and storage owner boundary" {
     }
 }
 
+test "hierarchy cursor conflicts survive local query and storage owner boundaries" {
+    for ([_]abi.FailureBoundary{ .local_query, .storage_owner }) |boundary| {
+        const failure = failureFromError(error.HierarchyCursorStale, boundary, abi.abi_version, 4);
+        try std.testing.expectEqual(abi.Status.hierarchy_cursor_stale, failure.status);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(error.HierarchyCursorStale, statusToError(failure.status));
+    }
+}
+
 test "committed visibility outcomes survive the storage owner boundary" {
     for ([_]anyerror{
         error.EnrichmentRetryInProgress,
@@ -1336,5 +1363,14 @@ test "catalog object annotation namespace diagnostics retain exact identity acro
         try std.testing.expect(failure.status != .internal);
         try std.testing.expectError(err, statusToError(failure.status));
         try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
+}
+
+test "reader failures and scoped GCS failures retain exact storage boundary identity" {
+    inline for (.{ error.ReadTransientFailure, error.ReadRequestFailed, error.InvalidGcsUrl, error.GcsConnectionNotFoundOrOutOfScope, error.AmbiguousGcsConnection, error.InvalidConnectionCredentials }) |expected| {
+        const failure = failureFromError(expected, .storage_owner, abi.abi_version, 4);
+        try std.testing.expect(failure.status != .internal);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(expected, statusToError(failure.status));
     }
 }

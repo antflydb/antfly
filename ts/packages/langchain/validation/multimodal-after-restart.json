@@ -1,0 +1,24 @@
+{
+  "mode": "retrieval-and-media-integrity",
+  "generation": false,
+  "report": [
+    {
+      "question": "Who owns orchard operations?",
+      "source": "page-1",
+      "mediaVerified": true,
+      "contentParts": 2
+    },
+    {
+      "question": "quarterly shipment bar chart",
+      "source": "figure-1",
+      "mediaVerified": true,
+      "contentParts": 3
+    },
+    {
+      "question": "sensor controller pager diagram",
+      "source": "figure-2",
+      "mediaVerified": true,
+      "contentParts": 3
+    }
+  ]
+}

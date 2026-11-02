@@ -2,7 +2,7 @@
 
 ## Context
 
-The epstein example (`examples/epstein/main.go`) implements OCR support ad-hoc using Termite's `/read` and `/generate` endpoints. This works but isn't reusable — every application that needs OCR (docsaf PDF processing, Google Drive image files, S3 scanned documents) would need to reimplement the same integration. We need a `Reader` interface in `libaf/reading/` following the same pattern as `libaf/embeddings/`, `libaf/chunking/`, and `libaf/reranking/`.
+The epstein example ([`examples/epstein/main.go`](https://github.com/antflydb/antfly/blob/207cd9ca3ba6a5fb2c7db72c11b8a0e4f7479563/examples/epstein/main.go)) implements OCR support ad-hoc using Termite's `/read` and `/generate` endpoints. This works but isn't reusable — every application that needs OCR (docsaf PDF processing, Google Drive image files, S3 scanned documents) would need to reimplement the same integration. We need a `Reader` interface in `libaf/reading/` following the same pattern as `libaf/embeddings/`, `libaf/chunking/`, and `libaf/reranking/`.
 
 ## Design Summary
 
@@ -67,7 +67,7 @@ Location TBD — either `libaf/reading/termite/` or alongside Termite client. Tw
 
 Key files to reference:
 - Termite client: `termite/pkg/client/` — `ReadImagesWithResponse()`, `GenerateContentWithResponse()`
-- Epstein OCR impl: `examples/epstein/main.go:92-242` — `ProcessPage()`, `ReadPageWithPrompt()`, `GeneratePageWithPrompt()`
+- Epstein OCR impl: [`examples/epstein/main.go:92-242`](https://github.com/antflydb/antfly/blob/207cd9ca3ba6a5fb2c7db72c11b8a0e4f7479563/examples/epstein/main.go#L92-L242) — `ProcessPage()`, `ReadPageWithPrompt()`, `GeneratePageWithPrompt()`
 - Content parts: `go/pkg/docsaf/reading/content.go` — `BinaryContent`, `TextContent`
 
 ### Step 4: Create `docsaf/ocr_quality.go`
@@ -79,7 +79,7 @@ Extract quality detection from epstein into docsaf utilities:
 - `HasFontEncodingCorruption(repair *TextRepair, text string) bool`
 - `CountReplacementChars(text string) int`
 
-Reference: `examples/epstein/main.go:245-270` (needsOCRFallback), `main.go:2282-2402` (detection functions)
+Reference: [`examples/epstein/main.go:245-270`](https://github.com/antflydb/antfly/blob/207cd9ca3ba6a5fb2c7db72c11b8a0e4f7479563/examples/epstein/main.go#L245-L270) (needsOCRFallback), `main.go:2282-2402` (detection functions)
 
 Reuse: `docsaf/text_repair.go` already has `TextRepair` with `IsFontEncodingCorrupted()` — integrate with that.
 

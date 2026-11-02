@@ -68,7 +68,20 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
+
+      - name: Fetch validation diff base
+        env:
+          BASE_SHA: ${{ inputs.base_sha || github.event.merge_group.base_sha || github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ -f scripts/ci/fetch_validation_base.py ]]; then
+            python3 scripts/ci/fetch_validation_base.py "$BASE_SHA"
+          else
+            # Older approved PR heads predate this helper. Keep their complete
+            # coverage until they merge main rather than failing or skipping.
+            echo "VALIDATION_FORCE_ALL=true" >> "$GITHUB_ENV"
+          fi
 
       - name: Prepare SDK build caches
         run: |
@@ -95,7 +108,7 @@ jobs:
         env:
           BASE_SHA: ${{ inputs.base_sha || github.event.merge_group.base_sha || github.event.before }}
         run: |
-          if [[ "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "workflow_dispatch" ]]; then
+          if [[ "${VALIDATION_FORCE_ALL:-false}" == "true" || "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "workflow_dispatch" ]]; then
             python3 scripts/ci/classify_validation.py --all --github-output "$GITHUB_OUTPUT"
           else
             python3 scripts/ci/classify_validation.py \
@@ -261,7 +274,8 @@ jobs:
       - name: Upload canonical Antfarm bundle
         # Preserve the Linux build when the checked-in bundle is stale, so it
         # can be inspected and updated without reproducing CI on another OS.
-        if: always() && steps.scopes.outputs.antfarm_e2e == 'true' && hashFiles('ts/apps/antfarm/dist/index.html') != ''
+        # SDK-only scopes also build it; retain any produced bundle on failure.
+        if: always() && hashFiles('ts/apps/antfarm/dist/index.html') != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfarm-linux-node-${{ inputs.head_sha || github.sha }}

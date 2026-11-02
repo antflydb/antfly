@@ -123,3 +123,5 @@ zig-pkg/
 /qualification-linux/
 /qualification-darwin/
 /qualification-server/
+# Local LangChain integration validation state
+/.state/

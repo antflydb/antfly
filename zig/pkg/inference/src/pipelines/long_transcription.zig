@@ -245,6 +245,7 @@ pub fn joinSegments(allocator: std.mem.Allocator, segments: []const Segment) ![]
 const FakeTranscriber = struct {
     allocator: std.mem.Allocator,
     calls: usize = 0,
+    output_budget: @import("transcription_budget.zig").OutputTokenBudget = .{},
     text: []const u8 = "hello",
     language: ?[]const u8 = "en",
     /// Prefix length observed on each call, for conditioning assertions.
@@ -275,6 +276,8 @@ const FakeTranscriber = struct {
     pub fn transcribePcmConditioned(self: *FakeTranscriber, samples: []const f32, sample_rate: u32, prefix: []const i32) !transcription.TranscribeResult {
         if (self.calls < self.prefix_lens.len) self.prefix_lens[self.calls] = prefix.len;
         self.calls += 1;
+        // Three text tokens and EOS, just as the real pipeline charges output.
+        for (0..4) |_| try self.output_budget.consume();
         const seconds = samples.len / sample_rate;
         const text = try std.fmt.allocPrint(self.allocator, "{s}{d}({d}s)", .{ self.text, self.calls, seconds });
         errdefer self.allocator.free(text);
@@ -462,4 +465,19 @@ test "long transcription drops empty window text" {
     try std.testing.expectEqual(@as(usize, 1), result.segments.len);
     try std.testing.expectEqualStrings(result.segments[0].text, result.text);
     try std.testing.expect(result.language == null);
+}
+
+test "long transcription shares output ceiling across windows and rejects partial success" {
+    const a = std.testing.allocator;
+    const samples = try a.alloc(f32, 16000 * 40);
+    defer a.free(samples);
+    @memset(samples, 0.1);
+    var limited = FakeTranscriber{ .allocator = a, .output_budget = .{ .remaining = 6 } };
+    try std.testing.expectError(error.InferenceOutputTokensExceeded, transcribeLong(a, &limited, samples, 16000, .{ .skip_silent_windows = false }));
+    try std.testing.expectEqual(@as(usize, 2), limited.calls);
+    var exact = FakeTranscriber{ .allocator = a, .output_budget = .{ .remaining = 8 } };
+    var result = try transcribeLong(a, &exact, samples, 16000, .{ .skip_silent_windows = false });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), exact.calls);
+    try std.testing.expectEqual(@as(?usize, 0), exact.output_budget.remaining);
 }

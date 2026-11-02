@@ -350,6 +350,7 @@ components:
           description: "Supported Speech locale; Apple transcription does not infer a language."
         timestamps:
           type: boolean
+          x-go-type-skip-optional-pointer: false
           default: true
         download_assets:
           type: boolean

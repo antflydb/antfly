@@ -27,7 +27,7 @@ const relational_native = @import("../storage/relational_index.zig");
 
 fn validateIndexPredicate(condition: relational_wire.RelationalIndexPredicate) !void {
     if (condition.constant != null) {
-        if (condition.column != null or condition.op != null or condition.value != null or condition.collation != null)
+        if (condition.column != null or condition.op != null or condition.value != .absent or condition.collation != null)
             return error.InvalidSchemaUpdateRequest;
     } else {
         const column = condition.column orelse return error.InvalidSchemaUpdateRequest;
@@ -42,7 +42,7 @@ fn indexPredicate(alloc: std.mem.Allocator, condition: relational_wire.Relationa
         .constant = condition.constant,
         .field = condition.column orelse "",
         .op = TableSchema.nativeEnum(relational_native.RelationalCheckOp, condition.op orelse .eq),
-        .value_json = if (condition.value) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
+        .value_json = if (condition.value.valueOrNull()) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
         .collation = condition.collation,
     };
 }
@@ -3142,7 +3142,7 @@ fn parseTableSchemaValueMode(alloc: std.mem.Allocator, value: std.json.Value, un
                 (try names.getOrPut(alloc, check.name)).found_existing)
                 return error.InvalidSchemaUpdateRequest;
             if (check.expression != null) {
-                if (check.column != null or check.op != null or check.value != null or check.collation != null) return error.InvalidSchemaUpdateRequest;
+                if (check.column != null or check.op != null or check.value.isPresent() or check.collation != null) return error.InvalidSchemaUpdateRequest;
             } else {
                 const column_name: []const u8 = check.column orelse "";
                 if (check.op == null or column_name.len == 0) return error.InvalidSchemaUpdateRequest;

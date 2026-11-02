@@ -709,7 +709,7 @@ pub const RelationalCheckConstraint = struct {
     column: ?[]const u8 = null,
     op: ?RelationalComparisonOp = null,
     /// Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// String comparison collation; uses the same rules as ordered indexes.
     collation: ?[]const u8 = null,
     expression: ?RelationalScalarExpression = null,
@@ -720,7 +720,7 @@ pub const RelationalCheckConstraint = struct {
         .{ "name", "name", false },
         .{ "column", "column", true },
         .{ "op", "op", true },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "collation", "collation", true },
         .{ "expression", "expression", true },
     };
@@ -749,9 +749,16 @@ pub const RelationalCheckConstraint = struct {
             try jw.objectField("op");
             try jw.write(value);
         }
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.collation) |value| {
             try jw.objectField("collation");
@@ -1501,7 +1508,7 @@ pub const RelationalIndexPredicate = struct {
     column: ?[]const u8 = null,
     op: ?RelationalComparisonOp = null,
     /// Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// String comparison collation with the same semantics as ordered keys.
     collation: ?[]const u8 = null,
     /// Constant membership truth. SQL UNKNOWN is normalized to false for index membership. Requires reader capability version 26.
@@ -1511,7 +1518,7 @@ pub const RelationalIndexPredicate = struct {
     pub const openApiFieldMetadata = .{
         .{ "column", "column", true },
         .{ "op", "op", true },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "collation", "collation", true },
         .{ "constant", "constant", true },
     };
@@ -1534,9 +1541,16 @@ pub const RelationalIndexPredicate = struct {
             try jw.objectField("op");
             try jw.write(value);
         }
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.collation) |value| {
             try jw.objectField("collation");

@@ -3288,9 +3288,40 @@ pub fn encodeQueryRequestWithGraphWireMode(
     // Canonical hierarchy requests require an explicit projection at both
     // ingress and storage. Their parser reconstructs deferred projection from
     // these fields, so retain them rather than emitting an invalid envelope.
+    const conditional_delivery = @import("field_projection.zig").storageEligible(req) or @import("field_projection.zig").hydrationEligible(req);
+    if (conditional_delivery) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const projection = try std.json.parseFromSliceLeaky(@import("field_projection.zig").Request, a, req.field_projection_json, .{});
+        const selected = try @import("field_projection.zig").selection(a, projection);
+        if (selected.object.count() != 0) {
+            try appendJsonFieldName(alloc, &out, &first, "select");
+            try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(a, selected, .{}));
+            try appendJsonFieldName(alloc, &out, &first, "params");
+            try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(a, projection.params, .{}));
+        }
+        if (!req.include_all_fields) {
+            var plan = try @import("field_projection.zig").decode(a, req.field_projection_json);
+            defer plan.deinit();
+            var required: std.ArrayList([]const u8) = .empty;
+            try required.appendSlice(a, req.fields);
+            var it = plan.required_fields.keyIterator();
+            while (it.next()) |field| {
+                if (std.mem.eql(u8, field.*, "_id")) continue;
+                const exists = for (required.items) |prior| {
+                    if (std.mem.eql(u8, prior, field.*)) break true;
+                } else false;
+                if (!exists) try required.append(a, field.*);
+            }
+            try appendJsonFieldNames(alloc, &out, &first, "fields", required.items);
+        }
+        try appendJsonFieldName(alloc, &out, &first, "_projection_source_fields");
+        try out.appendSlice(alloc, try std.json.Stringify.valueAlloc(a, .{ .fields = req.fields, .include_all = req.include_all_fields }, .{}));
+    }
     const requires_hierarchy_fields = req.hierarchy_children != null or
         req.hierarchy_grouped_matches or req.hierarchy_group_level == .unit;
-    if (!req.include_all_fields and (preserve_projection or requires_hierarchy_fields or !(req.include_stored and req.defer_stored_projection))) {
+    if (!conditional_delivery and !req.include_all_fields and (preserve_projection or requires_hierarchy_fields or !(req.include_stored and req.defer_stored_projection))) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
     }
     if (req.highlight) |highlight| {
@@ -4888,6 +4919,8 @@ const RemoteSearchParser = struct {
         try self.expect(.object_begin);
         var wire: metadata_openapi.QueryHit = .{ ._id = "", ._score = 0 };
         var stored: ?[]u8 = null;
+        var computed: ?[]u8 = null;
+        errdefer if (computed) |value| self.alloc.free(value);
         var pending: ?db_mod.types.document_authority.Pending = null;
         errdefer if (stored) |value| self.alloc.free(value);
         var seen: u64 = 0;
@@ -4898,6 +4931,11 @@ const RemoteSearchParser = struct {
                     var captured: db_mod.types.document_authority.Pending = .{};
                     if (try rawObjectSourceRange(&self.source_workspace, &self.scanner, self.options, .{ .ctx = &captured, .member_fn = db_mod.types.document_authority.Pending.observe }) != null) pending = captured;
                 } else stored = try self.source();
+            } else if (std.mem.eql(u8, name, "_computed")) {
+                // Retain validated lexical spans directly, including exact
+                // numbers and escaped payloads, just like stored source.
+                computed = try self.source();
+                if (computed) |value| _ = try @import("antfly-json").RawObject.init(value);
             } else try self.member(metadata_openapi.QueryHit, &wire, i, a);
         }
         if (!required(metadata_openapi.QueryHit, "_id", seen) or !required(metadata_openapi.QueryHit, "_score", seen)) return error.MissingField;
@@ -4916,6 +4954,9 @@ const RemoteSearchParser = struct {
         if (self.authority_group != null) try self.pending_sources.append(self.alloc, pending);
         hit.stored_data = stored;
         stored = null;
+        hit.computed_json = computed;
+        hit.computed_receipt = null;
+        computed = null;
         return hit;
     }
     fn rows(self: *@This()) !void {
@@ -7453,4 +7494,17 @@ test "public graph metric borrowed wire source scan rejects invalid authority en
         defer a.free(wire);
         try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResultWithAuthority(a, a, wire, 7, null));
     }
+}
+
+test "api query contract worker computed spans preserve numbers and reject malformed objects" {
+    const a = std.testing.allocator;
+    const prefix = "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"a\",\"_score\":1,\"_computed\":";
+    const suffix = "}]},\"status\":200,\"table\":\"docs\",\"took\":0}]}";
+    const body = prefix ++ "{\"integer\":9007199254740993,\"decimal\":1e0,\"text\":\"\\u03bb\\n\"}" ++ suffix;
+    var result = try parseRemoteSearchResult(a, body);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("{\"integer\":9007199254740993,\"decimal\":1e0,\"text\":\"\\u03bb\\n\"}", result.hits[0].computed_json.?);
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, prefix ++ "[]" ++ suffix));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, prefix ++ "{\"x\":1,\"x\":2}" ++ suffix));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(a, prefix ++ "{\"x\":NaN}" ++ suffix));
 }

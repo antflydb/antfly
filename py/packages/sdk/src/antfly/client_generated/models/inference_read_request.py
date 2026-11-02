@@ -21,7 +21,7 @@ class InferenceReadRequest:
     """Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
 
     Attributes:
-        model (str): Name of reader model from models_dir/readers/ Example: microsoft/trocr-base-printed.
+        model (str): Name of reader model from models_dir/readers/ Example: lightonai/LightOnOCR-3-0.8B.
         retain_artifact (bool | Unset): Request an opaque, process-local reading handle for extraction reuse. Retention
             is best effort; inspect document.artifact_id and artifact_ttl_ms. Default: False.
         documents (list[DocumentSource] | Unset): Complete documents, mutually exclusive with images. Each source is
@@ -31,14 +31,16 @@ class InferenceReadRequest:
             - URLs (if content_security allows)
              Example: [{'url': 'data:image/png;base64,iVBORw0KGgo...'}].
         prompt (str | Unset): Optional task prompt for document understanding models.
-            - TrOCR: Not used (pure OCR)
             - Donut CORD: "<s_cord-v2>" for receipt parsing
             - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>"
             - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
             - Pix2Struct: "What type of document is this?"
             - Moondream: "Describe this image."
              Example: What type of document is this?.
-        max_tokens (int | Unset): Maximum tokens to generate Default: 256. Example: 256.
+        max_tokens (int | Unset): Maximum output tokens per page. When omitted, the selected reader
+            model supplies its default, bounded by deployment limits. Explicit
+            values override the model default and must fit model and server limits.
+             Example: 256.
     """
 
     model: str
@@ -46,7 +48,7 @@ class InferenceReadRequest:
     documents: list[DocumentSource] | Unset = UNSET
     images: list[InferenceImageURL] | Unset = UNSET
     prompt: str | Unset = UNSET
-    max_tokens: int | Unset = 256
+    max_tokens: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

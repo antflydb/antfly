@@ -75,6 +75,7 @@ pub fn add(ctx: Context, wasm_jinja: *std.Build.Module, wasm_platform: *std.Buil
     const bge_tests = bge.tests;
     const bge_install = ctx.b.addInstallArtifact(bge.bge_m3_e2e_bench_exe, .{});
     ctx.step("build-bge-m3-benchmark", "Build the managed BGE-M3 format qualification probe").dependOn(&bge_install.step);
+    ctx.step("test-cli", "Run standalone inference CLI and configuration tests").dependOn(&suite.run_cli_tests.step);
     const test_step = tests.addDefault(ctx, suite, .{
         .codegen = checks.createCodegen(ctx).quant_kernel_codegen_test_check,
         .cuda_source = checks.createCudaSourceCheck(ctx).cuda_artifact_source_policy_check,

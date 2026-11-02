@@ -981,3 +981,79 @@ the execution job logs its cgroup baseline before starting inference.
 - A future ABI version may expose node-owned device capacity domains. Until the
   node owner has reliable per-device capacity information, inference's
   backend-aware limits remain authoritative for accelerator memory.
+
+### CUDA capacity and standalone policy
+
+CUDA admission discovers total memory on the same device selected by the CUDA
+context. This probe does not create or replace a thread's current context. For
+discrete GPUs the default device ceiling reserves ten percent (at least 512 MiB,
+never more than half on very small devices) for the driver and other overhead.
+The host ceiling still follows the finite process/cgroup envelope. On integrated
+CUDA devices, host and device memory share the physical combined ceiling.
+Unknown capacity retains conservative defaults; it never means unlimited VRAM.
+Model tuning floors and explicit overrides cannot exceed discovered physical
+capacity. Explicit lower limits remain authoritative.
+
+Database configuration and `antfly inference run --config` share a canonical
+`resources` policy. Workload budgets are distinct from model execution settings:
+
+```json
+{
+  "resources": {
+    "memory": {"max_bytes": 34359738368},
+    "query": {
+      "admission": {"max_concurrent_requests": 32},
+      "request_limits": {"graph": {"max_explored_nodes": 100000}}
+    },
+    "write": {"admission": {"max_concurrent_requests": 16}},
+    "inference": {
+      "memory": {
+        "max_host_bytes": 21474836480,
+        "max_device_bytes": 22548578304,
+        "max_kv_bytes": 1073741824,
+        "max_scratch_bytes": 2147483648
+      },
+      "admission": {"max_concurrent_requests": 1, "max_work_units": 8},
+      "request_limits": {
+        "max_items_per_request": 1,
+        "max_input_tokens_per_item": 8192,
+        "max_output_tokens_per_item": 512,
+        "max_decoded_pixels_per_batch": 4000000
+      }
+    }
+  },
+  "inference": {"max_loaded_models": 1}
+}
+```
+
+All resource memory values are bytes. Omitted/zero memory fields select
+automatic policy. CLI MiB budget flags override their corresponding field,
+including explicit zero. The whole-process envelope and physical capacity
+remain authoritative. Integrated CUDA enforces a lower combined override
+across simultaneous CPU/GPU leases. Model-load logs expose requested and
+resolved limits, CUDA capacity, unified-memory status, and automatic fallback.
+
+Admission limits count simultaneous requests and weighted work independently.
+Omitted `max_work_units` derives capacity from request concurrency; explicit zero
+disables weighted accounting. Neither setting changes model residency limits.
+Request ceilings must be positive and narrow model capabilities in discovery
+and execution. Input/output token limits are per item; decoded pixels are
+aggregate across a batch and also bound execution microbatches. Public item
+limits are checked before splitting a caller batch into tickets; independent
+callers may still combine into a larger native microbatch. Omitted reader
+output lengths resolve to a model default narrowed by policy before execution.
+LightOn continuous and cohort readers validate the expanded prompt token count
+before reserving page execution resources.
+
+There are no configuration aliases for the old top-level `admission`,
+`graph_execution`, `memory`, or `request_limits` locations. Model execution
+settings belong under `inference`; transport/download and storage-cache
+safeguards retain their own explicitly named settings.
+
+`zig/tools/qualify_reader_generator_pools.py` is a bounded native probe, not a
+deployment tool. Use candidate policies with output=512 (below /read's hard
+1024-token limit), input=8192, decoded pixels=4,000,000, and dimension=2048.
+It checks exact policy error codes and the exact concurrency-rejection reason,
+validates the winning response during overload, and verifies discovery remains
+available. GPU model fit and peak memory still require exact-release hardware
+qualification; unit tests do not establish that a 4B reader fits an L4.

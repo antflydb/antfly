@@ -132,7 +132,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                   </Tooltip>
                 </TooltipProvider>
               ) : (
-                <SidebarMenuButton size="lg" className="cursor-default">
+                <div className="flex h-12 w-full min-w-0 items-center gap-3 p-2 text-foreground">
                   <div className="flex h-8 min-w-8 items-center justify-center">
                     <Anty
                       size={24}
@@ -146,7 +146,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                   <div className="flex min-w-0 flex-1 items-center text-left text-sm leading-tight">
                     <span className="truncate font-semibold">Antfarm</span>
                   </div>
-                </SidebarMenuButton>
+                </div>
               )}
               {isMounted && (isMobile || sidebarState !== "collapsed") && (
                 <TooltipProvider delayDuration={0}>
@@ -184,7 +184,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
         {isProductEnabled("antfly") && (
           <>
             <SidebarGroup>
-              <SidebarGroupLabel className="mono-label">Data</SidebarGroupLabel>
+              <SidebarGroupLabel>Data</SidebarGroupLabel>
               <SidebarGroupContent>
                 <SidebarMenu>
                   <SidebarMenuItem>
@@ -255,7 +255,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
             </SidebarGroup>
 
             <SidebarGroup>
-              <SidebarGroupLabel className="mono-label">Retrieval</SidebarGroupLabel>
+              <SidebarGroupLabel>Retrieval</SidebarGroupLabel>
               <SidebarGroupContent>
                 <SidebarMenu>
                   <SidebarMenuItem>
@@ -311,7 +311,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
             </SidebarGroup>
 
             <SidebarGroup>
-              <SidebarGroupLabel className="mono-label">Ingest</SidebarGroupLabel>
+              <SidebarGroupLabel>Ingest</SidebarGroupLabel>
               <SidebarGroupContent>
                 <SidebarMenu>
                   <SidebarMenuItem>
@@ -370,7 +370,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
 
         {isProductEnabled("inference") && (
           <SidebarGroup>
-            <SidebarGroupLabel className="mono-label">AI workspace</SidebarGroupLabel>
+            <SidebarGroupLabel>AI workspace</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
                 <SidebarMenuItem>
@@ -410,7 +410,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                     </a>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
-                <div className="px-2 py-1.5 mono-label text-sidebar-foreground/50 group-data-[collapsible=icon]:hidden">
+                <div className="px-2 py-1.5 text-xs font-medium text-muted-foreground group-data-[collapsible=icon]:hidden">
                   Tools
                 </div>
 
@@ -547,7 +547,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
 
         {isProductEnabled("antfly") && (
           <SidebarGroup>
-            <SidebarGroupLabel className="mono-label">Operations</SidebarGroupLabel>
+            <SidebarGroupLabel>Operations</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
                 <SidebarMenuItem>

@@ -1209,33 +1209,33 @@ test "gliner boundary qualification measures pinned base checkpoint production g
             ,
         },
         .{
-            .name = "examples/dogfood real production schema (11 entities, 6 relations) on the repro text",
+            .name = "examples/antfly-docs-knowledge-base real production schema (11 entities, 6 relations) on the repro text",
             .text = "The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection.",
             .body =
             \\{"schema_version":2,"model":"boundary","schema":{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]},"options":{"include_confidence":true,"include_spans":true},"inputs":[{"content":"The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection."}]}
             ,
         },
         .{
-            // examples/dogfood's smallest real section: zig/SCHEMA.md's
+            // examples/antfly-docs-knowledge-base's smallest real section: zig/SCHEMA.md's
             // "Related Docs" list, which docsaf reduces to the link targets
             // with no whitespace between them -- one 20-byte "word". The
             // ingest embeds and full-text indexes it, so extraction must
             // admit it too rather than fail the whole drain.
-            .name = "examples/dogfood real production schema on the smallest real corpus section (SCHEMA.md Related Docs, 20 bytes/1 word)",
+            .name = "examples/antfly-docs-knowledge-base real production schema on the smallest real corpus section (SCHEMA.md Related Docs, 20 bytes/1 word)",
             .text = "TODO.mdSERVERLESS.md",
             .body =
             \\{"schema_version":2,"model":"boundary","schema":{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]},"options":{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}},"inputs":[{"content":"TODO.mdSERVERLESS.md"}]}
             ,
         },
         .{
-            .name = "examples/dogfood real production schema on a one-character document",
+            .name = "examples/antfly-docs-knowledge-base real production schema on a one-character document",
             .text = "a",
             .body =
             \\{"schema_version":2,"model":"boundary","schema":{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]},"options":{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}},"inputs":[{"content":"a"}]}
             ,
         },
         .{
-            .name = "examples/dogfood real production schema on a realistic corpus paragraph (ENRICHMENTS.md, 734 bytes/107 words)",
+            .name = "examples/antfly-docs-knowledge-base real production schema on a realistic corpus paragraph (ENRICHMENTS.md, 734 bytes/107 words)",
             .text = "Both lanes are handed the same document group's classified work and, when both have real work for the quantum, are scheduled with `Io.concurrent` so their provider round trips overlap; the calling task runs the dense lane inline while awaiting the concurrently spawned asset lane. If the `Io` backend does not support concurrency (for example a deterministic single-flow VOPR/simulation harness), both lanes still run, just sequentially, with identical outcomes -- concurrency is a scheduling optimization, not a correctness requirement. In-flight work is bounded to exactly one preparation quantum per stream.",
             .body =
             \\{"schema_version":2,"model":"boundary","schema":{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]},"options":{"include_confidence":true,"include_spans":true},"inputs":[{"content":"Both lanes are handed the same document group's classified work and, when both have real work for the quantum, are scheduled with `Io.concurrent` so their provider round trips overlap; the calling task runs the dense lane inline while awaiting the concurrently spawned asset lane. If the `Io` backend does not support concurrency (for example a deterministic single-flow VOPR/simulation harness), both lanes still run, just sequentially, with identical outcomes -- concurrency is a scheduling optimization, not a correctness requirement. In-flight work is bounded to exactly one preparation quantum per stream."}]}
@@ -1328,7 +1328,7 @@ test "gliner boundary qualification measures pinned base checkpoint production g
 /// Slices out the section beginning at the first occurrence of `heading`
 /// (a full Markdown heading line, e.g. "### Some Title") and running up to
 /// (but excluding) the next line that starts a new Markdown heading, or to
-/// the end of the file. Mirrors the section boundaries examples/dogfood's
+/// the end of the file. Mirrors the section boundaries examples/antfly-docs-knowledge-base's
 /// docsaf.MarkdownProcessor produces (a new section at every heading line),
 /// so the measured document is the same shape a real ingest would extract.
 fn extractHeadingSection(full: []const u8, heading: []const u8) ![]const u8 {
@@ -1347,13 +1347,13 @@ fn extractHeadingSection(full: []const u8, heading: []const u8) ![]const u8 {
 const LongDocumentCase = struct { name: []const u8, path: ?[]const u8 = null, heading: []const u8 = "", text: ?[]const u8 = null };
 
 // Paths are relative to the inference-test binary's working directory
-// (zig/pkg/inference, per zig/TESTING.md's build steps). examples/dogfood
+// (zig/pkg/inference, per zig/TESTING.md's build steps). examples/antfly-docs-knowledge-base
 // requests long_document.mode=window unconditionally for every section (see
 // index_config.go's knowledgeGraphIndexJSON), so the qualified row must also
 // cover the small end of the real corpus, not just the sections that
 // actually require more than one window.
 const long_document_geometry_cases = [_]LongDocumentCase{
-    // The two smallest documents the row must admit: examples/dogfood's
+    // The two smallest documents the row must admit: examples/antfly-docs-knowledge-base's
     // smallest real section (zig/SCHEMA.md's "Related Docs" list, which
     // docsaf reduces to the two link targets with no whitespace between
     // them) and a one-character document. Both are embedded and full-text
@@ -1484,7 +1484,7 @@ fn measureLongDocumentGeometry(
 // Evidence for long-document windowing qualification: real repository
 // sections at representative sizes (see GLINER25.md's long-document
 // qualification section for the corpus-wide percentile/max survey that
-// picked these), against the real examples/dogfood production schema (11
+// picked these), against the real examples/antfly-docs-knowledge-base production schema (11
 // entities, 6 relations). Sweeps the wire's window_words options actually
 // under consideration for the default (see GLINER25.md's throughput section
 // for why 1024 was chosen over the original 4096 default: attention cost is

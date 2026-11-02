@@ -39,6 +39,9 @@ export interface SqlResult<Row = Record<string, unknown>> {
   rows: Row[];
   rowsAffected: bigint;
   commandTag: string;
+  /** Native write disposition; callers must not retry an uncertain write. */
+  mutationOutcome?: string | null;
+  ddlReceipt?: Readonly<Record<string, unknown>> | null;
 }
 export interface WireResult {
   columns: SqlColumn[];
@@ -46,4 +49,6 @@ export interface WireResult {
   sql_nulls: boolean[][] | null;
   rows_affected: number;
   command_tag: string;
+  mutation_outcome?: string | null;
+  ddl_receipt?: Readonly<Record<string, unknown>> | null;
 }

@@ -169,7 +169,10 @@ pub const Image = struct {
         self.* = .{ .a = a };
         errdefer self.release();
         const keys = if (delta.key_fields.len != 0) delta.key_fields else if (previous) |old| old.key_fields else &.{};
-        if (previous) |old| if (delta.key_fields.len != 0) {
+        // An empty suffix cached before the first accepted transaction has no
+        // key definition yet. Bind it once; populated or already-bound images
+        // must keep their original identity even when every row was deleted.
+        if (previous) |old| if (delta.key_fields.len != 0 and (old.key_fields.len != 0 or old.change_count != 0)) {
             if (old.key_fields.len != keys.len) return error.LakeSourceConflict;
             for (keys, old.key_fields) |l, r| if (!std.mem.eql(u8, l, r)) return error.LakeSourceConflict;
         };
@@ -359,6 +362,33 @@ test "external lake bounded WAL images share unchanged rows without ancestor own
         }
     };
     try std.testing.checkAllAllocationFailures(a, Failure.run, .{ image, ingestion.Pending{ .lsn = 100, .key_fields = keys, .changes = &.{.{ .op = .upsert, .row = first }} } });
+}
+
+test "external lake bounded WAL empty image binds first key definition and then fences changes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const row = try std.json.parseFromSliceLeaky(V, arena.allocator(), "{\"id\":7,\"other\":9,\"body\":\"first accepted row\"}", .{});
+    // A warm query can cache an empty accepted suffix before a writer submits
+    // the first new transaction against the same published archive cut.
+    const empty = try Image.update(a, null, .{ .lsn = 1, .key_fields = &.{} });
+    defer empty.release();
+    const first = try Image.update(a, empty, .{ .lsn = 2, .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = row }} });
+    defer first.release();
+    try std.testing.expectEqual(@as(usize, 0), empty.key_fields.len);
+    try std.testing.expectEqual(@as(usize, 1), first.key_fields.len);
+    try std.testing.expectEqualStrings("id", first.key_fields[0]);
+    try std.testing.expectEqual(@as(usize, 1), first.row_count);
+    const retained = try Image.update(a, first, .{ .lsn = 2, .key_fields = &.{} });
+    defer retained.release();
+    try std.testing.expectEqualStrings("id", retained.key_fields[0]);
+    try std.testing.expectEqual(@as(usize, 1), retained.row_count);
+    const changed_keys: ingestion.Pending = .{ .lsn = 3, .key_fields = &.{"other"}, .changes = &.{.{ .op = .upsert, .row = row }} };
+    try std.testing.expectError(error.LakeSourceConflict, Image.update(a, first, changed_keys));
+    // An empty image with an established key definition is not unbound.
+    const bound_empty = try Image.update(a, null, .{ .lsn = 1, .key_fields = &.{"id"} });
+    defer bound_empty.release();
+    try std.testing.expectError(error.LakeSourceConflict, Image.update(a, bound_empty, changed_keys));
 }
 
 test "external lake bounded WAL equivalent numeric keys replace" {
