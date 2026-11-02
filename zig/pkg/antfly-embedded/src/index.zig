@@ -226,6 +226,7 @@ pub const SegmentShared = struct {
     /// generation sharing this segment observes the same live count without
     /// reading roaring containers or taking the deletion lock.
     deleted_count: std.atomic.Value(u32) = .init(0),
+    deletion_revision: std.atomic.Value(u64) = .init(0),
     deletion_lock: std.atomic.Value(u32) = .init(0),
     /// Lazily populated physical column summaries plus an atomically
     /// maintained count of missing values that still belong to live
@@ -279,6 +280,7 @@ pub const SegmentShared = struct {
         const previous = self.deletion_lock.fetchOr(deletion_writer_bit, .acq_rel);
         std.debug.assert((previous & deletion_writer_bit) == 0);
         while (self.deletion_lock.load(.acquire) != deletion_writer_bit) spinOrYield();
+        _ = self.deletion_revision.fetchAdd(1, .acq_rel);
     }
 
     fn unlockDeletionExclusive(self: *SegmentShared) void {
@@ -939,6 +941,77 @@ const BM25BoundTableKey = struct {
 const BM25BoundTableCache = std.AutoHashMapUnmanaged(BM25BoundTableKey, *inverted.BM25BoundTable);
 const max_bm25_bound_tables_per_snapshot: usize = 4;
 
+/// Snapshot-owned scalar membership only; no query reader or capability is
+/// retained. Both entry count and cloned physical storage have hard ceilings.
+pub const GraphPredicateCache = struct {
+    pub const max_bytes: usize = 64 * 1024 * 1024;
+    const Entry = struct { key: []u8, rows: roaring.RoaringBitmap, bytes: usize };
+    entries: [16]?Entry = @splat(null),
+    bytes: usize = 0,
+    cursor: usize = 0,
+    hits: usize = 0,
+    misses: usize = 0,
+    mutex: std.atomic.Mutex = .unlocked,
+    flights: [8]std.atomic.Mutex = @splat(.unlocked),
+
+    pub fn lockFlight(self: *@This(), key: []const u8, control: query_mod.ExecutionControl) !*std.atomic.Mutex {
+        const lock = &self.flights[std.hash.Wyhash.hash(0, key) % self.flights.len];
+        while (!lock.tryLock()) {
+            try control.check();
+            spinOrYield();
+        }
+        errdefer lock.unlock();
+        try control.check();
+        return lock;
+    }
+    pub fn get(self: *@This(), a: Allocator, key: []const u8, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
+        while (!self.mutex.tryLock()) {
+            try control.check();
+            spinOrYield();
+        }
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| if (entry.*) |*value| {
+            if (std.mem.eql(u8, value.key, key)) {
+                self.hits += 1;
+                return try value.rows.cloneExact(a);
+            }
+        };
+        self.misses += 1;
+        return null;
+    }
+    fn evict(self: *@This(), a: Allocator, index: usize) void {
+        if (self.entries[index]) |*entry| {
+            a.free(entry.key);
+            entry.rows.deinit();
+            self.bytes -= entry.bytes;
+            self.entries[index] = null;
+        }
+    }
+    pub fn put(self: *@This(), a: Allocator, key: []const u8, rows: *const roaring.RoaringBitmap) void {
+        const bytes = std.math.add(usize, key.len, rows.cloneStorageBound()) catch return;
+        if (bytes > max_bytes) return;
+        while (!self.mutex.tryLock()) spinOrYield();
+        defer self.mutex.unlock();
+        for (self.entries) |entry| if (entry) |value| if (std.mem.eql(u8, value.key, key)) return;
+        while (self.bytes > max_bytes - bytes) {
+            self.evict(a, self.cursor);
+            self.cursor = (self.cursor + 1) % self.entries.len;
+        }
+        self.evict(a, self.cursor);
+        const owned_key = a.dupe(u8, key) catch return;
+        const owned_rows = rows.cloneExact(a) catch {
+            a.free(owned_key);
+            return;
+        };
+        self.entries[self.cursor] = .{ .key = owned_key, .rows = owned_rows, .bytes = bytes };
+        self.bytes += bytes;
+        self.cursor = (self.cursor + 1) % self.entries.len;
+    }
+    pub fn deinit(self: *@This(), a: Allocator) void {
+        for (0..self.entries.len) |i| self.evict(a, i);
+    }
+};
+
 /// Immutable, ref-counted snapshot of the index state.
 ///
 /// Snapshots obtained via `acquireSnapshot()` must be released via `release()`.
@@ -948,6 +1021,7 @@ pub const IndexSnapshot = struct {
     alloc: Allocator,
     ref_count: u32,
     epoch: u64,
+    graph_predicates: GraphPredicateCache = .{},
     segments: []SegmentEntry,
     global_total_field_len: std.StringHashMapUnmanaged(u64),
     collection_doc_count: ?u32 = null,
@@ -1339,6 +1413,7 @@ pub const IndexSnapshot = struct {
     fn freeFinal(self: *IndexSnapshot) void {
         self.quiesceOwnedSources();
         const alloc = self.alloc;
+        self.graph_predicates.deinit(alloc);
         self.binding_flights.deinit(alloc);
         var entries = self.bound_segments.valueIterator();
         while (entries.next()) |entry| {

@@ -4381,7 +4381,10 @@ components:
     NodeFilter:
       x-go-type-skip-optional-pointer: true
       type: object
-      description: "Filter nodes during graph traversal using existing query primitives"
+      description: >-
+        Admission predicate applied to every start, target and intermediate node
+        before returning or expanding it, for all graph operations. Denied nodes
+        cannot occur in result paths or expose descendants through traversal.
       properties:
         filter_query:
           x-go-type-skip-optional-pointer: true
@@ -4522,12 +4525,15 @@ components:
           type: integer
           minimum: 1
           maximum: 10000
+          description: Global result-entry limit shared by all starts; root-specific path entries each consume one slot.
         deduplicate_nodes:
           x-go-type-skip-optional-pointer: true
           type: boolean
+          description: Deduplicate nodes per root when include_paths is true, otherwise across all starts.
         include_paths:
           x-go-type-skip-optional-pointer: true
           type: boolean
+          description: Preserve independent paths per start; the first path node identifies the root. max_depth is measured from each root.
         weight_mode: { $ref: "#/components/schemas/PathWeightMode" }
         k:
           x-go-type-skip-optional-pointer: true
@@ -5021,8 +5027,11 @@ components:
       additionalProperties: false
       required: [start]
       description: >-
-        Breadth-first traversal with request-wide deduplication by exact
-        table-qualified node identity. Direction defaults to `out`; use `both`
+        Breadth-first traversal by exact table-qualified node identity. With
+        include_paths, visited state and deduplication are independent per start
+        node, preserving paths between roots and overlapping root provenance.
+        The first node in each path identifies its root. Without include_paths,
+        result nodes are deduplicated across starts. Direction defaults to `out`; use `both`
         to traverse a relationship as undirected without storing a reciprocal
         edge.
       properties:
@@ -5044,7 +5053,7 @@ components:
           minimum: 1
           maximum: 64
           default: 1
-          description: Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
+          description: Maximum hop depth measured independently from each start. Defaults to one hop to keep fan-out explicit.
         edge_weight:
           x-go-type-skip-optional-pointer: false
           $ref: '#/components/schemas/GraphEdgeWeightRange'
@@ -5058,9 +5067,11 @@ components:
           type: boolean
           default: true
           description: >-
-            Return each node once across all starts. Set false with include_paths
-            to return each reaching path, including its start node. Depth, result,
-            and work limits still bound path enumeration.
+            With include_paths, return each node once per start, preserving a
+            separate path for every reaching root. Without include_paths, return
+            each node once across all starts. Set false with include_paths to
+            enumerate reaching paths within a root. Depth, result, and shared
+            request work limits still bound enumeration.
         include_paths: { type: boolean, default: false }
         include_documents:
           type: boolean

@@ -9408,6 +9408,98 @@ fn logBenchSortCollectorProfile(
     }
 }
 
+/// Compressed, snapshot- and analyzer-bound graph membership. Repeated shard
+/// admission batches reuse the same immutable set instead of executing postings
+/// and expanding matching document-number arrays for every hop.
+pub fn graphIndexedPredicateAlloc(a: Allocator, req: types.SearchRequest, executor: StructuredFilterResolverExecutor, json: []const u8) !doc_set.ResolvedDocSet {
+    const control = query_mod.ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+    try control.check();
+    const entry = (try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name)) orelse return error.UnsupportedQueryRequest;
+    entry.lockAnalysisShared();
+    defer entry.unlockAnalysisShared();
+    const snapshot = entry.persistent.acquireSnapshot();
+    defer snapshot.release();
+    var deletion_hash = std.hash.Wyhash.init(0);
+    for (snapshot.segments) |seg| {
+        const revision = seg.shared.deletion_revision.load(.acquire);
+        deletion_hash.update(std.mem.asBytes(&revision));
+    }
+    const key = try std.fmt.allocPrint(a, "{d}:{d}:{d}:{d}:{s}", .{ entry.instance_id, entry.projection_revision, req.identity_read_generation orelse 0, deletion_hash.final(), json });
+    defer a.free(key);
+    const cache = &snapshot.graph_predicates;
+    if (try cache.get(a, key, control)) |rows| {
+        var owned = rows;
+        errdefer owned.deinit();
+        try control.check();
+        return .{ .ordinal_bitmap = owned };
+    }
+    const flight = try cache.lockFlight(key, control);
+    defer flight.unlock();
+    if (try cache.get(a, key, control)) |rows| {
+        var owned = rows;
+        errdefer owned.deinit();
+        try control.check();
+        return .{ .ordinal_bitmap = owned };
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, json, .{});
+    if (patternFilterValueHasRole(parsed)) return error.UnsupportedQueryRequest;
+    const search_query = try patternFilterValueToSearchQuery(scratch, parsed, entry.text_analysis, entry.runtime_schema);
+    if (!try searchQueryCanUseSnapshot(snapshot, search_query, entry.text_analysis, entry.runtime_schema, false)) return error.UnsupportedQueryRequest;
+    const filter = try search_mod.searchQueryToFilterArena(scratch, search_query);
+    var docs = try snapshot.executeFilterBitmap(a, filter.withControl(control));
+    defer docs.deinit();
+    var rows = roaring.RoaringBitmap.init(a);
+    errdefer rows.deinit();
+    var identities = segment_mod.SegmentReadScratch.init(a, 64 * 1024);
+    defer identities.deinit();
+    var it = docs.iterator();
+    var next = it.next();
+    var offset: u32 = 0;
+    for (snapshot.segments, 0..) |seg, segment_index| {
+        try control.check();
+        const upper = try std.math.add(u32, offset, seg.reader.doc_count);
+        if (next == null) break;
+        if (next.? >= upper) {
+            offset = upper;
+            continue;
+        }
+        var lease = try snapshot.leaseSegment(segment_index);
+        defer lease.deinit();
+        var ordinals = try segment_mod.DocOrdinalCursor.init(&lease.entry.reader);
+        while (next) |doc| {
+            if (doc >= upper) break;
+            try control.check();
+            if (try ordinals.get(doc - offset)) |ordinal| {
+                try rows.add(ordinal);
+            } else {
+                // Older segments may predate ordinal sidecars. Resolve only
+                // this identity without retaining a table-sized ID array.
+                identities.reset();
+                if (try snapshot.storedIdScoped(identities.allocator(), doc)) |id| {
+                    const resolve = executor.resolve_doc_ids_to_doc_set orelse return error.UnsupportedQueryRequest;
+                    var resolved = try resolve(executor.ctx, a, &.{id}, req.identity_read_generation);
+                    defer resolved.deinit(a);
+                    switch (resolved) {
+                        .ordinals => |values| for (values) |value| try rows.add(value),
+                        .ordinal_bitmap => |*values| try rows.orWith(values),
+                        .none => {},
+                        else => return error.UnsupportedQueryRequest,
+                    }
+                }
+            }
+            next = it.next();
+        }
+        offset = upper;
+    }
+    try control.check();
+    cache.put(snapshot.alloc, key, &rows);
+    try control.check();
+    return .{ .ordinal_bitmap = rows };
+}
+
 fn collectStructuredFilterResolvedDocSetAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -10171,7 +10263,7 @@ fn rejectStoredMatchFallback(value: std.json.Value) !void {
     }
 }
 
-fn patternFilterContainsMatch(value: std.json.Value, depth: u8) !bool {
+pub fn patternFilterContainsMatch(value: std.json.Value, depth: u8) !bool {
     if (depth >= 64 or value != .object) return error.InvalidArgument;
     if (value.object.get("match") != null) return true;
 
