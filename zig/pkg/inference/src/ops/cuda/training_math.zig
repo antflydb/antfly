@@ -30,35 +30,38 @@ pub fn artifactHash() [32]u8 {
     return hash;
 }
 
+const Program = @import("embedded_module.zig").EmbeddedModule(ptx, .{
+    .gelu = "termite_gliner25_gelu_f32_cuda128",
+    .silu = "termite_gliner25_silu_f32_cuda128",
+    .norm_chunks = "termite_gliner25_norm_chunks_v1",
+    .norm_finish = "termite_gliner25_norm_finish_v1",
+    .norm_total = "termite_gliner25_norm_total_v1",
+    .consistency_prepare = "termite_gliner25_consistency_prepare_v1",
+    .consistency_boundary = "termite_gliner25_consistency_boundary_v1",
+    .consistency_pair = "termite_gliner25_consistency_pair_v1",
+    .adamw = "termite_gliner25_adamw_pytorch_v1",
+    .log_softmax_warp = "termite_gliner25_log_softmax_warp_f32",
+    .log_softmax_block = "termite_gliner25_log_softmax_block_f32",
+    .record_prepare = "termite_gliner25_record_target_exp_v1",
+    .record_vjp = "termite_gliner25_record_logp_vjp_v1",
+    .record_mask = "termite_gliner25_record_mask_vjp_v1",
+    .sigmoid = "termite_gliner25_sigmoid_f32_cuda128",
+    .scan_outer = "termite_gliner25_scan_outer_v1",
+    .scan_inner = "termite_gliner25_scan_inner_v1",
+    .scan_vector = "termite_gliner25_scan_vector_v1",
+    .scan_vector_sums = "termite_gliner25_scan_vector_sums_v1",
+    .reduce_part = "termite_gliner25_reduce_part_v1",
+    .reduce_finish = "termite_gliner25_reduce_finish_v1",
+    .span_features = "termite_gliner25_frozen_span_features_v1",
+    .scatter = "termite_gliner25_scatter_gather_v1",
+    .embedding_scatter = "termite_gliner25_scatter_embedding_v1",
+    .elementwise_vjp = "termite_gliner25_elementwise_vjp_v1",
+    .listwise_prepare = "termite_gliner25_listwise_prepare_v1",
+    .listwise_vjp = "termite_gliner25_listwise_vjp_v1",
+});
+
 pub const Module = struct {
-    module: driver.CUmodule,
-    gelu: driver.CUfunction,
-    silu: driver.CUfunction,
-    sigmoid: driver.CUfunction,
-    scan_outer: driver.CUfunction,
-    scan_inner: driver.CUfunction,
-    scan_vector: driver.CUfunction,
-    scan_vector_sums: driver.CUfunction,
-    reduce_part: driver.CUfunction,
-    reduce_finish: driver.CUfunction,
-    span_features: driver.CUfunction,
-    scatter: driver.CUfunction,
-    embedding_scatter: driver.CUfunction,
-    adamw: driver.CUfunction,
-    norm_chunks: driver.CUfunction,
-    norm_finish: driver.CUfunction,
-    norm_total: driver.CUfunction,
-    consistency_prepare: driver.CUfunction,
-    consistency_boundary: driver.CUfunction,
-    consistency_pair: driver.CUfunction,
-    elementwise_vjp: driver.CUfunction,
-    listwise_prepare: driver.CUfunction,
-    listwise_vjp: driver.CUfunction,
-    log_softmax_warp: driver.CUfunction,
-    log_softmax_block: driver.CUfunction,
-    record_prepare: driver.CUfunction,
-    record_vjp: driver.CUfunction,
-    record_mask: driver.CUfunction,
+    program: Program,
     shared_memory_per_block: u32,
     multiprocessors: u32,
     max_threads_per_multiprocessor: u32,
@@ -66,13 +69,9 @@ pub const Module = struct {
     pub fn init(ctx: *Context) !Module {
         try ctx.makeCurrent();
         if (try ctx.streamCaptureActive()) return error.ResidentTrainingExternalFrame;
-        var module: driver.CUmodule = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&module, ptx.ptr, 0, null, null));
-        errdefer _ = ctx.driver.fns.cuModuleUnload(module);
-        var gelu: driver.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&gelu, module, "termite_gliner25_gelu_f32_cuda128"));
-        var silu: driver.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&silu, module, "termite_gliner25_silu_f32_cuda128"));
+        var program: Program = .{};
+        try program.initCurrent(&ctx.driver);
+        errdefer program.deinitCurrent(&ctx.driver) catch {};
         const get_attribute = ctx.driver.fns.cuDeviceGetAttribute orelse return error.CudaSymbolMissing;
         var multiprocessors: c_int = 0;
         try ctx.driver.check(get_attribute(&multiprocessors, 16, ctx.device)); // MULTIPROCESSOR_COUNT
@@ -83,40 +82,11 @@ pub const Module = struct {
         var shared_memory: c_int = 0;
         try ctx.driver.check(get_attribute(&shared_memory, 8, ctx.device));
         if (shared_memory < 4096) return error.CudaKernelUnavailable;
-        return .{ .norm_chunks = try function(ctx, module, "termite_gliner25_norm_chunks_v1"), .norm_finish = try function(ctx, module, "termite_gliner25_norm_finish_v1"), .norm_total = try function(ctx, module, "termite_gliner25_norm_total_v1"), .consistency_prepare = try function(ctx, module, "termite_gliner25_consistency_prepare_v1"), .consistency_boundary = try function(ctx, module, "termite_gliner25_consistency_boundary_v1"), .consistency_pair = try function(ctx, module, "termite_gliner25_consistency_pair_v1"), .adamw = try function(ctx, module, "termite_gliner25_adamw_pytorch_v1"), .log_softmax_warp = try function(ctx, module, "termite_gliner25_log_softmax_warp_f32"), .log_softmax_block = try function(ctx, module, "termite_gliner25_log_softmax_block_f32"), .record_prepare = try function(ctx, module, "termite_gliner25_record_target_exp_v1"), .record_vjp = try function(ctx, module, "termite_gliner25_record_logp_vjp_v1"), .record_mask = try function(ctx, module, "termite_gliner25_record_mask_vjp_v1"), .shared_memory_per_block = @intCast(shared_memory), .module = module, .gelu = gelu, .silu = silu, .sigmoid = try function(ctx, module, "termite_gliner25_sigmoid_f32_cuda128"), .scan_outer = try function(ctx, module, "termite_gliner25_scan_outer_v1"), .scan_inner = try function(ctx, module, "termite_gliner25_scan_inner_v1"), .scan_vector = try function(ctx, module, "termite_gliner25_scan_vector_v1"), .scan_vector_sums = try function(ctx, module, "termite_gliner25_scan_vector_sums_v1"), .reduce_part = try function(ctx, module, "termite_gliner25_reduce_part_v1"), .reduce_finish = try function(ctx, module, "termite_gliner25_reduce_finish_v1"), .span_features = try function(ctx, module, "termite_gliner25_frozen_span_features_v1"), .scatter = try function(ctx, module, "termite_gliner25_scatter_gather_v1"), .embedding_scatter = try function(ctx, module, "termite_gliner25_scatter_embedding_v1"), .elementwise_vjp = try function(ctx, module, "termite_gliner25_elementwise_vjp_v1"), .listwise_prepare = try function(ctx, module, "termite_gliner25_listwise_prepare_v1"), .listwise_vjp = try function(ctx, module, "termite_gliner25_listwise_vjp_v1"), .multiprocessors = @intCast(multiprocessors), .max_threads_per_multiprocessor = @intCast(max_threads) };
+        return .{ .program = program, .shared_memory_per_block = @intCast(shared_memory), .multiprocessors = @intCast(multiprocessors), .max_threads_per_multiprocessor = @intCast(max_threads) };
     }
 
     pub fn deinit(self: *Module, ctx: *Context) void {
-        ctx.makeCurrent() catch {};
-        if (self.module != null) _ = ctx.driver.fns.cuModuleUnload(self.module);
-        self.module = null;
-        self.gelu = null;
-        self.silu = null;
-        self.sigmoid = null;
-        self.scan_outer = null;
-        self.scan_inner = null;
-        self.scan_vector = null;
-        self.scan_vector_sums = null;
-        self.reduce_part = null;
-        self.reduce_finish = null;
-        self.span_features = null;
-        self.scatter = null;
-        self.embedding_scatter = null;
-        self.adamw = null;
-        self.norm_chunks = null;
-        self.norm_finish = null;
-        self.norm_total = null;
-        self.consistency_prepare = null;
-        self.consistency_boundary = null;
-        self.consistency_pair = null;
-        self.elementwise_vjp = null;
-        self.listwise_prepare = null;
-        self.listwise_vjp = null;
-        self.log_softmax_warp = null;
-        self.log_softmax_block = null;
-        self.record_prepare = null;
-        self.record_vjp = null;
-        self.record_mask = null;
+        self.program.deinit(ctx);
     }
 
     pub fn reductionDevice(self: *const Module) reduction.Device {
@@ -134,17 +104,17 @@ pub const Module = struct {
         var staging = scratch.ptr;
         var params = [_]?*anyopaque{ @ptrCast(&out), @ptrCast(&in), @ptrCast(&staging), @ptrCast(&config) };
         try ctx.makeCurrent();
-        const part = self.reduce_part orelse return error.CudaKernelUnavailable;
+        const part = self.program.function(.reduce_part) orelse return error.CudaKernelUnavailable;
         try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(part, plan.grid, config.ctas, 1, plan.block[0], plan.block[1], 1, 0, ctx.stream, &params, null));
         ctx.noteKernelLaunch();
         if (config.ctas > 1) {
             var finish = [_]?*anyopaque{ @ptrCast(&out), @ptrCast(&staging), @ptrCast(&config) };
-            try launch(ctx, self.reduce_finish, plan.grid, plan.block, &finish);
+            try launch(ctx, self.program.function(.reduce_finish), plan.grid, plan.block, &finish);
         }
     }
 
     pub fn launchGelu(self: *const Module, ctx: *Context, output: Buffer, input: Buffer, upstream: Buffer, count: usize, backward: bool) !void {
-        return launchActivation(self.gelu, ctx, output, input, upstream, count, backward);
+        return launchActivation(self.program.function(.gelu), ctx, output, input, upstream, count, backward);
     }
 
     pub fn launchSpanFeatures(self: *const Module, ctx: *Context, attrs: SpanFeatures, output: Buffer, lengths: Buffer, counts: Buffer) !void {
@@ -159,16 +129,16 @@ pub const Module = struct {
         var ns = counts.ptr;
         var params = [_]?*anyopaque{ @ptrCast(&out), @ptrCast(&lens), @ptrCast(&ns), @ptrCast(&rows), @ptrCast(&capacity) };
         try ctx.makeCurrent();
-        try launch(ctx, self.span_features, (rows + 255) / 256, .{ 256, 1 }, &params);
+        try launch(ctx, self.program.function(.span_features), (rows + 255) / 256, .{ 256, 1 }, &params);
     }
 
     /// Backward consumes the saved forward output, not the original logits.
     pub fn launchSigmoid(self: *const Module, ctx: *Context, output: Buffer, input: Buffer, upstream: Buffer, count: usize, backward: bool) !void {
-        return launchActivation(self.sigmoid, ctx, output, input, upstream, count, backward);
+        return launchActivation(self.program.function(.sigmoid), ctx, output, input, upstream, count, backward);
     }
 
     pub fn launchSilu(self: *const Module, ctx: *Context, output: Buffer, input: Buffer, upstream: Buffer, count: usize, backward: bool) !void {
-        return launchActivation(self.silu, ctx, output, input, upstream, count, backward);
+        return launchActivation(self.program.function(.silu), ctx, output, input, upstream, count, backward);
     }
 
     pub fn launchAdamW(self: *const Module, ctx: *Context, buffers: [4]Buffer, count: usize, step: u32, rate: f64, config: @import("ml").graph.optimizers.AdamWConfig64) !void {
@@ -186,7 +156,7 @@ pub const Module = struct {
         for (&scalars, 0..) |*value, i| params[5 + i] = @ptrCast(value);
         params[10] = @ptrCast(&adam_step);
         try ctx.makeCurrent();
-        try launch(ctx, self.adamw, @intCast((@as(u64, n) + 255) / 256), .{ 256, 1 }, &params);
+        try launch(ctx, self.program.function(.adamw), @intCast((@as(u64, n) + 255) / 256), .{ 256, 1 }, &params);
     }
 
     pub fn launchScatter(self: *const Module, ctx: *Context, output: Buffer, values: Buffer, rows: Buffer, offsets: Buffer, order: Buffer, group_count: usize, width: usize, value_rows: usize, output_rows: usize, reduction_profile: @import("ml").graph.node.ScatterReduction, padding_index: ?u32) !void {
@@ -214,7 +184,7 @@ pub const Module = struct {
         params[8] = @ptrCast(&padding_i32);
         try ctx.makeCurrent();
         const per_block: u32 = if (embedding) 256 else 8;
-        try launch(ctx, if (embedding) self.embedding_scatter else self.scatter, @intCast((@as(u64, elements) + per_block - 1) / per_block), .{ 256, 1 }, &params);
+        try launch(ctx, if (embedding) self.program.function(.embedding_scatter) else self.program.function(.scatter), @intCast((@as(u64, elements) + per_block - 1) / per_block), .{ 256, 1 }, &params);
     }
 
     pub const NormPart = enum { chunks, finish, total };
@@ -233,9 +203,9 @@ pub const Module = struct {
             break :blk @min(512, @as(u32, 1) << @intCast(31 - @clz(width)));
         } else 512;
         const func = switch (part) {
-            .chunks => self.norm_chunks,
-            .finish => self.norm_finish,
-            .total => self.norm_total,
+            .chunks => self.program.function(.norm_chunks),
+            .finish => self.program.function(.norm_finish),
+            .total => self.program.function(.norm_total),
         };
         try ctx.makeCurrent();
         try launch(ctx, func, @intCast(out_count), .{ block, 1 }, &params);
@@ -253,7 +223,7 @@ pub const Module = struct {
         var count: u32 = @intCast(n);
         params[4] = @ptrCast(&count);
         try ctx.makeCurrent();
-        try launch(ctx, self.consistency_prepare, @intCast((n + 255) / 256), .{ 256, 1 }, &params);
+        try launch(ctx, self.program.function(.consistency_prepare), @intCast((n + 255) / 256), .{ 256, 1 }, &params);
     }
 
     pub fn launchConsistencyBoundary(self: *const Module, ctx: *Context, buffers: [5]Buffer, m: usize, kept: usize, weight: f32) !void {
@@ -272,7 +242,7 @@ pub const Module = struct {
         params[6] = @ptrCast(&valid_count);
         params[7] = @ptrCast(&seed);
         try ctx.makeCurrent();
-        try launch(ctx, self.consistency_boundary, @intCast((m + 255) / 256), .{ 256, 1 }, &params);
+        try launch(ctx, self.program.function(.consistency_boundary), @intCast((m + 255) / 256), .{ 256, 1 }, &params);
     }
 
     pub fn launchConsistencyPair(self: *const Module, ctx: *Context, buffers: [7]Buffer, n: usize, m: usize) !void {
@@ -288,7 +258,7 @@ pub const Module = struct {
         var count: u32 = @intCast(n);
         params[7] = @ptrCast(&count);
         try ctx.makeCurrent();
-        try launch(ctx, self.consistency_pair, @intCast((n + 255) / 256), .{ 256, 1 }, &params);
+        try launch(ctx, self.program.function(.consistency_pair), @intCast((n + 255) / 256), .{ 256, 1 }, &params);
     }
 
     pub fn launchListwisePrepare(self: *const Module, ctx: *Context, buffers: [6]Buffer, rows: usize, cols: usize, queries: usize, candidate_major: bool) !void {
@@ -305,7 +275,7 @@ pub const Module = struct {
         var scalars = [_]u32{ @intCast(rows), @intCast(cols), @intCast(queries), @intFromBool(candidate_major) };
         for (&scalars, 0..) |*value, i| params[6 + i] = @ptrCast(value);
         try ctx.makeCurrent();
-        try launch(ctx, self.listwise_prepare, @intCast((n + 255) / 256), .{ 256, 1 }, &params);
+        try launch(ctx, self.program.function(.listwise_prepare), @intCast((n + 255) / 256), .{ 256, 1 }, &params);
     }
 
     pub fn launchListwiseVjp(self: *const Module, ctx: *Context, buffers: [7]Buffer, rows: usize, cols: usize, queries: usize, candidate_major: bool, canonical_output: bool) !void {
@@ -322,7 +292,7 @@ pub const Module = struct {
         var scalars = [_]u32{ @intCast(rows), @intCast(cols), @intCast(queries), @intFromBool(candidate_major), @intFromBool(canonical_output) };
         for (&scalars, 0..) |*value, i| params[7 + i] = @ptrCast(value);
         try ctx.makeCurrent();
-        try launch(ctx, self.listwise_vjp, @intCast((n + 255) / 256), .{ 256, 1 }, &params);
+        try launch(ctx, self.program.function(.listwise_vjp), @intCast((n + 255) / 256), .{ 256, 1 }, &params);
     }
 
     pub fn launchLogSoftmax(self: *const Module, ctx: *Context, output: Buffer, input: Buffer, logp: Buffer, rows: usize, width: usize, backward: bool) !void {
@@ -342,14 +312,14 @@ pub const Module = struct {
             block = .{ lanes, 128 / lanes };
             grid = @intCast((rows + block[1] * batches - 1) / (block[1] * batches));
             scalars = .{ @intCast(rows), @intCast(width), @intFromBool(backward) };
-            kernel = self.log_softmax_warp;
+            kernel = self.program.function(.log_softmax_warp);
         } else {
             block = .{ if (backward) @max(32, try std.math.ceilPowerOfTwo(u32, @intCast(@min(width / 4, 1024) / 2))) else 1024, 1 };
             grid = @intCast(rows);
             const shared_rows = (self.shared_memory_per_block - block[0] / 32 * 4) / 4;
             const warp_reduce = width % 4 == 0 and width < shared_rows and output.ptr % 16 == 0 and input.ptr % 16 == 0 and logp.ptr % 16 == 0;
             scalars = .{ @intCast(width), @intFromBool(backward), @intFromBool(warp_reduce) };
-            kernel = self.log_softmax_block;
+            kernel = self.program.function(.log_softmax_block);
         }
         var params: [6]?*anyopaque = undefined;
         for (&pointers, 0..) |*value, i| params[i] = @ptrCast(value);
@@ -384,9 +354,9 @@ pub const Module = struct {
         for (&scalars, counts.len..) |*value, i| params[i] = @ptrCast(value);
         try ctx.makeCurrent();
         try launch(ctx, switch (part) {
-            .prepare => self.record_prepare,
-            .vjp => self.record_vjp,
-            .mask => self.record_mask,
+            .prepare => self.program.function(.record_prepare),
+            .vjp => self.program.function(.record_vjp),
+            .mask => self.program.function(.record_mask),
         }, @intCast((n + 255) / 256), .{ 256, 1 }, &params);
     }
 
@@ -404,13 +374,7 @@ pub const Module = struct {
         params[5] = @ptrCast(&kind);
         for (&scalars, 6..) |*scalar, i| params[i] = @ptrCast(scalar);
         try ctx.makeCurrent();
-        try launch(ctx, self.elementwise_vjp, (n + 255) / 256, .{ 256, 1 }, &params);
-    }
-
-    fn function(ctx: *Context, module: driver.CUmodule, name: [:0]const u8) !driver.CUfunction {
-        var result: driver.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&result, module, name.ptr));
-        return result;
+        try launch(ctx, self.program.function(.elementwise_vjp), (n + 255) / 256, .{ 256, 1 }, &params);
     }
 
     fn launch(ctx: *Context, kernel: driver.CUfunction, grid: u32, block: [2]u32, params: []?*anyopaque) !void {
@@ -439,9 +403,9 @@ pub const Module = struct {
             var iterations = (tiles + self.multiprocessors - 1) / self.multiprocessors;
             var sums = scratch.ptr;
             var sum_params = [_]?*anyopaque{ @ptrCast(&sums), @ptrCast(&in), @ptrCast(&width), @ptrCast(&iterations), @ptrCast(&reverse) };
-            try launch(ctx, self.scan_vector_sums, grid, .{ 512, 1 }, &sum_params);
+            try launch(ctx, self.program.function(.scan_vector_sums), grid, .{ 512, 1 }, &sum_params);
             var params = [_]?*anyopaque{ @ptrCast(&out), @ptrCast(&in), @ptrCast(&sums), @ptrCast(&width), @ptrCast(&iterations), @ptrCast(&reverse) };
-            try launch(ctx, self.scan_vector, grid, .{ 512, 1 }, &params);
+            try launch(ctx, self.program.function(.scan_vector), grid, .{ 512, 1 }, &params);
         } else if (attrs.reference == .inner) {
             const log_width: i32 = @intCast(std.math.log2_int_ceil(u32, width));
             const log_rows: i32 = @intCast(std.math.log2_int_ceil(u32, b));
@@ -449,10 +413,10 @@ pub const Module = struct {
             const tx: u32 = @as(u32, 1) << @intCast(log_x);
             const ty = 512 / tx;
             var params = [_]?*anyopaque{ @ptrCast(&out), @ptrCast(&in), @ptrCast(&b), @ptrCast(&width), @ptrCast(&log_x), @ptrCast(&reverse) };
-            try launch(ctx, self.scan_inner, (b + ty - 1) / ty, .{ tx, ty }, &params);
+            try launch(ctx, self.program.function(.scan_inner), (b + ty - 1) / ty, .{ tx, ty }, &params);
         } else {
             var params = [_]?*anyopaque{ @ptrCast(&out), @ptrCast(&in), @ptrCast(&b), @ptrCast(&width), @ptrCast(&channels), @ptrCast(&reverse) };
-            try launch(ctx, self.scan_outer, (b * channels + 255) / 256, .{ 256, 1 }, &params);
+            try launch(ctx, self.program.function(.scan_outer), (b * channels + 255) / 256, .{ 256, 1 }, &params);
         }
     }
 

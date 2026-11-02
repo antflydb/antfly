@@ -1434,8 +1434,8 @@ fn writeResultsJson(
     var pass = true;
     for (results) |result| pass = pass and result.passes(cfg);
     try writer.print(
-        "{{\"schema\":\"antfly.cuda_flash_prefill_prototype.v4\",\"runtime_integrated\":false,\"architecture\":\"sm_89\",\"compute_capability\":\"{d}.{d}\",\"artifacts\":{{\"candidate_sha256\":\"{s}\",\"baseline_sha256\":\"{s}\"}},\"candidate\":\"wmma-f16-kv-f32-q\",\"baseline\":\"{s}\",\"candidate_query_tile\":{d},\"candidate_key_tile\":{d},\"candidate_head_group\":{d},\"scalar_reference\":\"standalone-f16-kv-f32-q\",\"pass\":{s},",
-        .{ compute_major, compute_minor, candidate_artifact_sha, baseline_artifact_sha, cfg.baseline_route.label(), cfg.candidate_query_tile, cfg.candidate_key_tile, cfg.candidate_head_group, if (pass) "true" else "false" },
+        "{{\"schema\":\"antfly.cuda_flash_prefill_prototype.v4\",\"runtime_integrated\":false,\"architecture\":\"sm_{d}{d}\",\"compute_capability\":\"{d}.{d}\",\"artifacts\":{{\"candidate_sha256\":\"{s}\",\"baseline_sha256\":\"{s}\"}},\"candidate\":\"wmma-f16-kv-f32-q\",\"baseline\":\"{s}\",\"candidate_query_tile\":{d},\"candidate_key_tile\":{d},\"candidate_head_group\":{d},\"scalar_reference\":\"standalone-f16-kv-f32-q\",\"pass\":{s},",
+        .{ compute_major, compute_minor, compute_major, compute_minor, candidate_artifact_sha, baseline_artifact_sha, cfg.baseline_route.label(), cfg.candidate_query_tile, cfg.candidate_key_tile, cfg.candidate_head_group, if (pass) "true" else "false" },
     );
     try writer.print(
         "\"gates\":{{\"require_bitwise_candidate\":{s},\"max_abs\":{e:.12},\"max_rms_normalized\":{e:.12},\"cpu_sample_max_abs\":{e:.12},\"max_timing_cv\":{e:.12}}},\"results\":[",
@@ -1587,7 +1587,8 @@ pub fn main(init: std.process.Init) !void {
 
     var ctx = try cuda_context.CudaContext.initDefault();
     defer ctx.deinit();
-    if (ctx.info.compute_major != 8 or ctx.info.compute_minor != 9) return error.UnsupportedCudaArchitecture;
+    // CudaContext owns device/profile admission; module loading checks native
+    // image compatibility. Record the actual GPU rather than assuming SM89.
     var candidate_module = try Module.load(&ctx, candidate_image);
     defer candidate_module.deinit(&ctx);
     var baseline_module = try Module.load(&ctx, baseline_image);

@@ -104,21 +104,10 @@ pub const MemoryStats = struct {
 /// Request-thread transfer audit. GPU execution is asynchronous, but all
 /// host copies/accesses enter these synchronous APIs on the dispatch thread.
 /// Independent sessions on other threads cannot contaminate these counters.
-pub const TransferAudit = struct {
-    upload_bytes: u64 = 0,
-    download_bytes: u64 = 0,
-    host_accesses: u64 = 0,
-    upload_calls: u64 = 0,
-    download_calls: u64 = 0,
-};
-threadlocal var transfer_audit: ?*TransferAudit = null;
-pub fn beginTransferAudit(audit: *TransferAudit) !void {
-    if (transfer_audit != null) return error.MetalTransferAuditAlreadyActive;
-    transfer_audit = audit;
-}
-pub fn endTransferAudit() void {
-    transfer_audit = null;
-}
+const transfer_audit = @import("../execution/transfer_audit.zig");
+pub const TransferAudit = transfer_audit.Audit;
+pub const beginTransferAudit = transfer_audit.begin;
+pub const endTransferAudit = transfer_audit.end;
 
 var memory_stats = MemoryStats{};
 var to_host_trace_count: usize = 0;
@@ -448,6 +437,11 @@ extern fn termite_metal_buffer_download(
     dst: *anyopaque,
     length: usize,
 ) c_int;
+fn downloadBuffer(runtime: *anyopaque, handle: *anyopaque, offset: usize, output: *anyopaque, bytes: usize) !void {
+    try transfer_audit.checkDeviceHostAccess();
+    if (termite_metal_buffer_download(runtime, handle, offset, output, bytes) != 0) return error.MetalBufferDownloadFailed;
+    transfer_audit.download(bytes);
+}
 extern fn termite_metal_decode_runtime_flush_active_frame(runtime: *anyopaque) c_int;
 extern fn termite_metal_decode_runtime_has_active_frame(runtime: *anyopaque) c_int;
 extern fn termite_metal_decode_runtime_retain_active_frame_buffer(runtime: *anyopaque, handle: *anyopaque) c_int;
@@ -484,6 +478,14 @@ pub const MetalTensor = struct {
     /// alias the Shared-storage contents pointer (zero-copy) or be a cached
     /// host mirror (populated by `toHostSlice`).
     device: ?DeviceStorage = null,
+
+    /// Empty owner used when a multi-stage operation may decline before all
+    /// of its intermediates are initialized. Always safe to deinit.
+    pub const empty: MetalTensor = .{
+        .data = @ptrFromInt(@alignOf(f32)),
+        .len = 0,
+        .owned_by_c_allocator = false,
+    };
 
     pub fn borrowed(data: [*]f32, len: usize, dims: []const i32) MetalTensor {
         std.debug.assert(dims.len <= max_dims);
@@ -750,6 +752,26 @@ pub const MetalTensor = struct {
         return tensor;
     }
 
+    /// Read within the source's scope without copying host payloads. Device
+    /// views retain storage and own any mirror they later materialize; callers
+    /// must deinit the view. Host views borrow their source's lifetime.
+    pub fn readView(self: *const MetalTensor) !MetalTensor {
+        if (self.device) |d| {
+            var view = deviceView(try retainDeviceBuffer(d.ref), d.byte_offset, d.byte_len, self.shape(), self.dtype);
+            // Reuse an existing cache while its source is alive. Private
+            // caches still refresh after a frame flush, but the view never
+            // frees the source's allocation.
+            if (self.len != 0) {
+                view.data = self.data;
+                view.len = self.len;
+                view.device.?.mirror_owned = d.mirror_owned;
+            }
+            return view;
+        }
+        if (self.dtype != .f32) return error.UnsupportedTensorType;
+        return borrowed(self.data, self.len, self.shape());
+    }
+
     pub fn retainedCopy(self: *const MetalTensor) !MetalTensor {
         if (self.device) |d| {
             return deviceView(try retainDeviceBuffer(d.ref), d.byte_offset, d.byte_len, self.shape(), self.dtype);
@@ -963,10 +985,7 @@ pub const MetalTensor = struct {
             byte_len,
         );
         if (rc != 0) return error.MetalBufferUploadFailed;
-        if (transfer_audit) |audit| {
-            audit.upload_bytes += byte_len;
-            audit.upload_calls += 1;
-        }
+        transfer_audit.upload(byte_len);
     }
 
     /// Explicit bounded readback into caller-owned memory. No persistent host
@@ -983,12 +1002,7 @@ pub const MetalTensor = struct {
         if (dev.ref.released or dev.ref.ref_count == 0) return error.ReleasedDeviceBuffer;
         if (output.len != dev.byte_len) return error.InvalidTensorShape;
         if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) return error.MetalFrameSyncFailed;
-        if (termite_metal_buffer_download(dev.ref.runtime, dev.ref.handle, dev.byte_offset, @ptrCast(output.ptr), dev.byte_len) != 0)
-            return error.MetalBufferDownloadFailed;
-        if (transfer_audit) |audit| {
-            audit.download_bytes += output.len;
-            audit.download_calls += 1;
-        }
+        try downloadBuffer(dev.ref.runtime, dev.ref.handle, dev.byte_offset, @ptrCast(output.ptr), dev.byte_len);
     }
 
     pub fn uploadBytes(self: *MetalTensor, input: []const u8) !void {
@@ -998,10 +1012,7 @@ pub const MetalTensor = struct {
         self.invalidateHostMirror();
         if (termite_metal_buffer_upload(dev.ref.runtime, dev.ref.handle, dev.byte_offset, input.ptr, input.len) != 0)
             return error.MetalBufferUploadFailed;
-        if (transfer_audit) |audit| {
-            audit.upload_bytes += input.len;
-            audit.upload_calls += 1;
-        }
+        transfer_audit.upload(input.len);
     }
 
     /// Return a host-backed `[]f32` view. For pure host tensors this is
@@ -1009,9 +1020,7 @@ pub const MetalTensor = struct {
     /// if present, otherwise aliases the Shared-storage contents pointer
     /// when available, or allocates + downloads from Private storage.
     pub fn toHostSlice(self: *MetalTensor) ![]f32 {
-        if (self.isDevice()) if (transfer_audit) |audit| {
-            audit.host_accesses += 1;
-        };
+        if (self.device) |device| try transfer_audit.hostAccess(device.byte_len);
         if (self.dtype != .f32) return error.UnsupportedTensorType;
         memory_stats.to_host_calls += 1;
         if (self.device == null) return self.data[0..self.len];
@@ -1052,14 +1061,13 @@ pub const MetalTensor = struct {
                 // mirrors alias device memory and are coherent after the
                 // flush). Refresh the snapshot so writes queued since it was
                 // taken become visible.
-                const rc = termite_metal_buffer_download(
+                try downloadBuffer(
                     dev.ref.runtime,
                     dev.ref.handle,
                     dev.byte_offset,
                     @ptrCast(self.data),
                     dev.byte_len,
                 );
-                if (rc != 0) return error.MetalBufferDownloadFailed;
             }
             return self.data[0..self.len];
         }
@@ -1087,14 +1095,13 @@ pub const MetalTensor = struct {
         // Fallback: allocate a c_allocator mirror and download Private bytes.
         const buf = try std.heap.c_allocator.alloc(f32, count);
         errdefer std.heap.c_allocator.free(buf);
-        const rc = termite_metal_buffer_download(
+        try downloadBuffer(
             dev.ref.runtime,
             dev.ref.handle,
             dev.byte_offset,
             @ptrCast(buf.ptr),
             dev.byte_len,
         );
-        if (rc != 0) return error.MetalBufferDownloadFailed;
         self.data = buf.ptr;
         self.len = buf.len;
         self.owned_by_c_allocator = true;
@@ -1120,14 +1127,13 @@ pub const MetalTensor = struct {
             }
             const count = dev.byte_len / @sizeOf(f32);
             if (self.len == count and dev.mirror_owned) {
-                const rc = termite_metal_buffer_download(
+                try downloadBuffer(
                     dev.ref.runtime,
                     dev.ref.handle,
                     dev.byte_offset,
                     @ptrCast(self.data),
                     dev.byte_len,
                 );
-                if (rc != 0) return error.MetalBufferDownloadFailed;
             }
         }
     }
@@ -1148,14 +1154,13 @@ pub const MetalTensor = struct {
         const count = dev.byte_len / @sizeOf(f32);
         const buf = try std.heap.c_allocator.alloc(f32, count);
         defer std.heap.c_allocator.free(buf);
-        const rc = termite_metal_buffer_download(
+        try downloadBuffer(
             dev.ref.runtime,
             dev.ref.handle,
             dev.byte_offset,
             @ptrCast(buf.ptr),
             dev.byte_len,
         );
-        if (rc != 0) return error.MetalBufferDownloadFailed;
         var acc: f64 = 0;
         for (buf) |v| acc += @abs(v);
         return acc;
@@ -1175,14 +1180,13 @@ pub const MetalTensor = struct {
         if (row_count * row_width > count) return error.InvalidTensorShape;
         const buf = try std.heap.c_allocator.alloc(f32, count);
         defer std.heap.c_allocator.free(buf);
-        const rc = termite_metal_buffer_download(
+        try downloadBuffer(
             dev.ref.runtime,
             dev.ref.handle,
             dev.byte_offset,
             @ptrCast(buf.ptr),
             dev.byte_len,
         );
-        if (rc != 0) return error.MetalBufferDownloadFailed;
         var acc: f64 = 0;
         for (0..row_count) |r| {
             var row_sum: f64 = 0;

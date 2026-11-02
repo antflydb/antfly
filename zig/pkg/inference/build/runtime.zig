@@ -54,6 +54,7 @@ pub const Paths = struct {
 };
 
 pub const SharedModules = struct {
+    tile: ?*std.Build.Module = null,
     build_info_mod: *std.Build.Module,
     build_info_object: *std.Build.Step.Compile,
     tokenizer_mod: *std.Build.Module,
@@ -145,6 +146,7 @@ pub const Graph = struct {
     inference_tokenizer_mod: *std.Build.Module,
     inference_hf_tokenizer_mod: *std.Build.Module,
     inference_linalg_mod: *std.Build.Module,
+    tile_mod: *std.Build.Module,
     inference_fixed_tokenizer_data_mod: *std.Build.Module,
     inference_audio_mod: *std.Build.Module,
     inference_chunker_mod: *std.Build.Module,
@@ -240,6 +242,7 @@ pub fn create(config: Config) Graph {
     const hash_mod = shared.hash orelse createSharedModule(config, "lib/hash/src/mod.zig");
     const image_mod = shared.image orelse createSharedModule(config, "lib/image/src/mod.zig");
     if (shared.image == null) image_mod.addImport("antfly_hash", hash_mod);
+    structured_mod.addImport("antfly_image", image_mod);
     const prometheus_mod = shared.prometheus;
     const structlog_mod = shared.structlog;
     const jinja_mod = shared.jinja orelse b.dependency("jinja", .{
@@ -295,9 +298,19 @@ pub fn create(config: Config) Graph {
         break :blk mod;
     };
     const reader_config_mod = shared.reader_config orelse createSharedModule(config, "lib/readers/src/config.zig");
+
     const s3_openapi_mod = shared.s3_openapi orelse createSharedModule(config, "pkg/antfly-embedded/src/openapi/generated/antfly_s3_openapi/root.zig");
     shared_with_generating.s3_openapi = s3_openapi_mod;
     const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared_with_generating);
+    const document_runs_mod = b.modules.get("antfly_document_runs") orelse createSharedModule(config, "lib/readers/src/document_runs.zig");
+    const readers_mod = b.modules.get("antfly_readers") orelse createSharedModule(config, "lib/readers/src/mod.zig");
+    readers_mod.addImport("antfly_document_runs", document_runs_mod);
+    readers_mod.addImport("httpx", httpx_mod);
+    readers_mod.addImport("inference_api", inference_api_mod);
+    readers_mod.addImport("antfly_google", google_mod);
+    readers_mod.addImport("antfly_reader_config", reader_config_mod);
+    readers_mod.addImport("antfly_scraping", scraping_mod);
+    readers_mod.addImport("antfly_image", image_mod);
     const audio_openapi_mod = shared.audio_openapi orelse blk: {
         const mod = createSharedModule(config, "pkg/antfly-embedded/src/openapi/generated/antfly_audio_openapi/root.zig");
         mod.addImport("antfly_s3_openapi", s3_openapi_mod);
@@ -328,23 +341,21 @@ pub fn create(config: Config) Graph {
     const apple_native_options = b.addOptions();
     apple_native_options.addOption(bool, "enabled", false);
     const apple_native_mod = createSharedModule(config, "lib/apple_native/src/mod.zig");
-    apple_native_mod.addImport("apple_native_options", apple_native_options.createModule());
+    const apple_options_mod = apple_native_options.createModule();
+    apple_native_mod.addImport("apple_native_options", apple_options_mod);
+    if (!readers_mod.import_table.contains("apple_reader_options")) readers_mod.addImport("apple_reader_options", apple_options_mod);
+    if (!readers_mod.import_table.contains("antfly_inference_work")) {
+        const work_mod = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/host/work.zig")), .target = target, .optimize = optimize });
+        work_mod.addImport("antfly_scraping", scraping_mod);
+        work_mod.addImport("antfly_image", image_mod);
+        readers_mod.addImport("antfly_inference_work", work_mod);
+    }
+    readers_mod.addImport("antfly_platform", platform_mod);
+    readers_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     apple_native_mod.addImport("antfly_platform", platform_mod);
     apple_native_mod.addImport("httpx", httpx_mod);
     transcribing_mod.addImport("antfly_apple_native", apple_native_mod);
     if (shared.generating == null) generating_mod.addImport("antfly_apple_native", apple_native_mod);
-    const document_runs_mod = createSharedModule(config, "lib/readers/src/document_runs.zig");
-    const readers_mod = createSharedModule(config, "lib/readers/src/mod.zig");
-    readers_mod.addImport("antfly_document_runs", document_runs_mod);
-    readers_mod.addImport("httpx", httpx_mod);
-    readers_mod.addImport("inference_api", inference_api_mod);
-    readers_mod.addImport("antfly_google", google_mod);
-    readers_mod.addImport("antfly_reader_config", reader_config_mod);
-    readers_mod.addImport("antfly_scraping", scraping_mod);
-    readers_mod.addImport("antfly_image", image_mod);
-    readers_mod.addImport("antfly_platform", platform_mod);
-    readers_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
-    readers_mod.addImport("apple_reader_options", apple_native_mod.import_table.get("apple_native_options").?);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
             .root_source_file = b.path(pathJoin(b, paths.inference_root, "../inference-client/src/root.zig")),
@@ -366,12 +377,19 @@ pub fn create(config: Config) Graph {
         b.modules.put(b.allocator, "sentencepiece_proto", sentencepiece_proto_mod) catch @panic("OOM");
     }
 
+    const tile_mod = shared.tile orelse b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/tile/src/mod.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const inference_linalg_mod = addOrCreateModule(b, config.register_public_modules, "inference_linalg", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/linalg/src/mod.zig")),
         .target = target,
         .optimize = optimize,
     });
 
+    inference_linalg_mod.addImport("antfly_tile", tile_mod);
     addX86Kernels(
         b,
         inference_linalg_mod,
@@ -444,6 +462,7 @@ pub fn create(config: Config) Graph {
         .inference_tokenizer_mod = inference_tokenizer_mod,
         .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,
         .inference_linalg_mod = inference_linalg_mod,
+        .tile_mod = tile_mod,
         .inference_fixed_tokenizer_data_mod = inference_fixed_tokenizer_data_mod,
         .jsonschema_mod = jsonschema_mod,
         .scraping_mod = scraping_mod,
@@ -507,6 +526,8 @@ pub fn create(config: Config) Graph {
         .target = target,
         .optimize = optimize,
     });
+    inference_internal_mod.addImport("antfly_readers", readers_mod);
+    inference_internal_mod.addImport("antfly_document_runs", document_runs_mod);
     inference_internal_mod.addImport("antfly_decisions", decisions_mod);
     inference_internal_mod.addImport("antfly_structured", structured_mod);
     inference_internal_mod.addImport("antfly_extracting", extracting_mod);
@@ -528,6 +549,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("ml_tabular", ml_tabular_mod);
     if (pjrt_mod) |pjrt| inference_internal_mod.addImport("pjrt", pjrt);
     inference_internal_mod.addImport("inference_linalg", inference_linalg_mod);
+    inference_internal_mod.addImport("antfly_tile", tile_mod);
     inference_internal_mod.addImport("protobuf", protobuf_mod);
     inference_internal_mod.addImport("antfly_platform", platform_mod);
     inference_internal_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
@@ -581,6 +603,7 @@ pub fn create(config: Config) Graph {
         .inference_tokenizer_mod = inference_tokenizer_mod,
         .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,
         .inference_linalg_mod = inference_linalg_mod,
+        .tile_mod = tile_mod,
         .inference_fixed_tokenizer_data_mod = inference_fixed_tokenizer_data_mod,
         .inference_audio_mod = inference_audio_mod,
         .inference_chunker_mod = inference_chunker_mod,
@@ -654,6 +677,7 @@ const InferenceRootImports = struct {
     inference_tokenizer_mod: *std.Build.Module,
     inference_hf_tokenizer_mod: *std.Build.Module,
     inference_linalg_mod: *std.Build.Module,
+    tile_mod: *std.Build.Module,
     inference_fixed_tokenizer_data_mod: *std.Build.Module,
     jsonschema_mod: *std.Build.Module,
     scraping_mod: *std.Build.Module,
@@ -683,6 +707,7 @@ pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRoot
     module.addImport("inference_tokenizer", imports.inference_tokenizer_mod);
     module.addImport("inference_hf_tokenizer", imports.inference_hf_tokenizer_mod);
     module.addImport("inference_linalg", imports.inference_linalg_mod);
+    module.addImport("antfly_tile", imports.tile_mod);
     module.addImport("inference_fixed_tokenizer_data", imports.inference_fixed_tokenizer_data_mod);
     module.addImport("antfly_jsonschema", imports.jsonschema_mod);
     module.addImport("antfly_scraping", imports.scraping_mod);

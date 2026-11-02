@@ -203,9 +203,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var graph_cache = graph_mod.cache.GraphCache.init(allocator);
     defer graph_cache.deinit();
 
-    const pipeline_stub = .{
+    const pipeline_stub = graph_mod.execution.Context{
         .allocator = allocator,
-        .gpt_config = gpt_config,
+        .gpt_config = &gpt_config,
         .cb = &cb,
     };
     const entry = try graph_mod.execution.ensureGraphEntry(
@@ -690,9 +690,9 @@ fn writeWholeModelPjrtArtifactForShape(
     defer graph_cache.deinit();
 
     const graph_input_ids = [_]i64{token_id};
-    const pipeline_stub = .{
+    const pipeline_stub = graph_mod.execution.Context{
         .allocator = allocator,
-        .gpt_config = gpt_config,
+        .gpt_config = &gpt_config,
         .cb = cb,
     };
     const entry = try graph_mod.execution.ensureGraphEntry(
@@ -1302,9 +1302,9 @@ fn buildWholeModelSelectionForShape(
     defer allocator.free(graph_input_ids);
     @memset(graph_input_ids, 0);
 
-    const pipeline_stub = .{
+    const pipeline_stub = graph_mod.execution.Context{
         .allocator = allocator,
-        .gpt_config = gpt_config,
+        .gpt_config = &gpt_config,
         .cb = cb,
     };
     const entry = try graph_mod.execution.ensureGraphEntry(

@@ -3124,13 +3124,13 @@ test "Qwen3-VL vision pipeline drains both tensor banks on completion cancellati
         var fake = Fake{ .mode = mode };
         var table = native_compute.vtable_impl;
         table.freeTensor = Fake.free;
-        table.decoderRuntimeBeginFrame = Fake.begin;
-        table.decoderRuntimeHasActiveFrame = Fake.hasActive;
-        table.decoderRuntimeHasSubmittedFrame = Fake.hasSubmitted;
-        table.decoderRuntimeSubmitFrame = Fake.submit;
-        table.decoderRuntimeWaitSubmittedFrame = Fake.wait;
-        table.decoderRuntimeSubmitAndWaitFrame = Fake.submitWait;
-        table.decoderRuntimeCancelFrame = Fake.cancel;
+        table.regions.decoder.beginFrame = Fake.begin;
+        table.regions.decoder.hasActiveFrame = Fake.hasActive;
+        table.regions.decoder.hasSubmittedFrame = Fake.hasSubmitted;
+        table.regions.decoder.submitFrame = Fake.submit;
+        table.regions.decoder.waitSubmittedFrame = Fake.wait;
+        table.regions.decoder.submitAndWaitFrame = Fake.submitWait;
+        table.regions.decoder.cancelFrame = Fake.cancel;
         const cb = ComputeBackend{ .ptr = &fake, .vtable = &table };
         var group = VisionFrameGroup{ .cb = &cb, .blocks = 2, .streamed = mode != 5 };
         var encoded: usize = 0;
@@ -3189,7 +3189,7 @@ test "LightOnOCR3 CUDA resident vision batch width preserves other backend ceili
 }
 
 test "LightOnOCR3 full page vision batching fits the CUDA kernel contract and preserves Metal bounds" {
-    const cuda_geometry = @import("../ops/cuda/lighton_vision_bf16.zig");
+    const cuda_geometry = @import("../ops/cuda/encoder_block_bf16.zig");
     for ([_]usize{ 1, 4096, 7600, 8192, 16_384 }) |patches| {
         const count = residentVisionBatchItemLimit(.cuda, patches);
         try std.testing.expect(count >= 2);
@@ -3278,7 +3278,7 @@ test "LightOnOCR3 CUDA learned positions preserve host interpolation merge order
     for ([_]usize{ 768, 1024 }) |dim| for ([_]bool{ false, true }) |bf16| {
         var compute = try CudaCompute.init(a);
         defer compute.deinit();
-        if (!@import("../ops/cuda/lighton_attention.zig").packetSupported(compute.ctx.info.compute_major, compute.ctx.info.driver_version)) return error.SkipZigTest;
+        if (!@import("../ops/cuda/paged_attention_bf16.zig").packetSupported(compute.ctx.info.compute_major, compute.ctx.info.driver_version)) return error.SkipZigTest;
         compute.capability_profile = .lightonocr3;
         const cb = compute.computeBackend();
         const values = try a.alloc(f32, 48 * 48 * dim);

@@ -211,7 +211,7 @@ pub fn run(compute: *CudaCompute, request: Request) !Result {
     const objective_weight = 1.0 / @as(f32, @floatFromInt(request.dimensions.len));
     for (request.dimensions, 0..) |dimension, dimension_index| {
         const width: usize = dimension;
-        try module.launchMrlNormalize(compute.embeddingGemma2TrainingContext(), normalized, request.embeddings, @intCast(rows), dimension);
+        try module.launchPrefixNormalize(compute.embeddingGemma2TrainingContext(), normalized, request.embeddings, .{ .rows = @intCast(rows), .width = dimension, .input_stride = 768 });
         const query_bytes = try mul(try mul(request.query_count, width), @sizeOf(f32));
         const candidate_elements = try mul(request.candidate_count, width);
         const candidate_bytes = try mul(candidate_elements, @sizeOf(f32));
@@ -241,7 +241,7 @@ pub fn run(compute: *CudaCompute, request: Request) !Result {
         module.noteCublasF32Matmul();
         try cublas.matrix(ctx.stream, @ptrFromInt(candidate_gradient.ptr), @ptrFromInt(coefficients.ptr), @ptrFromInt(query_normalized.ptr), request.candidate_count, request.query_count, width, true, false, false);
         module.noteCublasF32Matmul();
-        try module.launchMrlNormalizeVjp(compute.embeddingGemma2TrainingContext(), result.embedding_gradients, normalized_gradients, request.embeddings, @intCast(rows), dimension, 1);
+        try module.launchPrefixNormalizeVjp(compute.embeddingGemma2TrainingContext(), result.embedding_gradients, normalized_gradients, request.embeddings, .{ .rows = @intCast(rows), .width = dimension, .input_stride = 768 }, 1);
     }
     return result;
 }

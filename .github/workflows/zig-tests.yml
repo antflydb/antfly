@@ -783,6 +783,10 @@ jobs:
         run: |
           PYTHONPATH=scripts/laya python3 -m unittest discover -s scripts/laya -p 'test_*.py'
 
+      - name: Check generated kernel ownership and canonical source closure
+        working-directory: zig/pkg/inference
+        run: zig build check-kernel-ownership
+
       - name: Check inference kernels through the root build graph
         working-directory: zig
         run: >-
@@ -807,6 +811,7 @@ jobs:
             scripts.gemma4.test_run_gemma4_cuda_preference_smoke \
             scripts.gemma4.test_run_gemma4_unsloth_preference_benchmark \
             scripts.test_paired_benchmark \
+            scripts.test_kernel_ownership_inventory \
             scripts.test_regen_cuda_artifacts \
             scripts.test_regen_cuda_training_math \
             scripts.test_regen_cuda_boundary_attention \

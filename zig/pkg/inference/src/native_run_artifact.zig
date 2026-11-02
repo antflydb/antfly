@@ -1171,9 +1171,9 @@ fn runPjrtHloArtifactFull(
         graph_cache.deinit();
         if (pjrtExecDebugEnabled()) std.log.info("PJRT run-artifact graph cache deinit complete", .{});
     }
-    const pipeline_stub = .{
+    const pipeline_stub = graph_mod.execution.Context{
         .allocator = allocator,
-        .gpt_config = gpt_config,
+        .gpt_config = &gpt_config,
         .cb = &cb,
     };
     const entry = try graph_mod.execution.ensureGraphEntry(
@@ -1525,9 +1525,9 @@ fn materializePartitionInputs(
     var graph_cache = graph_mod.cache.GraphCache.init(allocator);
     defer graph_cache.deinit();
 
-    const pipeline_stub = .{
+    const pipeline_stub = graph_mod.execution.Context{
         .allocator = allocator,
-        .gpt_config = gpt_config,
+        .gpt_config = &gpt_config,
         .cb = &cb,
     };
     const entry = try graph_mod.execution.ensureGraphEntry(

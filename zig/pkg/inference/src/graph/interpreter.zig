@@ -61,6 +61,9 @@ pub const InterpreterError = error{
 pub const RuntimeInput = struct {
     node_id: NodeId,
     value: CT,
+    /// Current storage owner, independent of the proposed node placement.
+    /// Null preserves the default execution backend contract.
+    source_backend: ?*const ComputeBackend = null,
 };
 
 /// Pre-computed graph analysis that can be cached across executions.
@@ -140,7 +143,22 @@ pub const CachedAnalysis = struct {
 /// Side channels and runtime data for graph execution. Stateful ops
 /// (paged attention, embedding lookup, MoE routing) pull from these
 /// rather than from the graph, since their data varies per invocation.
+pub const OutputPlacement = enum {
+    /// Compatibility for consumers expecting one backend for every output.
+    default_backend,
+    /// Keep each result on its producer. Use Runtime.Result.backendFor before
+    /// materializing it; the prepared runtime must outlive resident results.
+    producer,
+};
+
 pub const ExecuteOptions = struct {
+    /// Borrowed semantic-role mask, prepared once from ModelProgram bindings.
+    /// Input/state values can change each invocation even at a stable address.
+    mutable_parameters: ?[]const bool = null,
+    output_placement: OutputPlacement = .default_backend,
+    /// Enforce actual device/host access at transfer boundaries. Final output
+    /// materialization happens after submission and outside this scope.
+    activation_readbacks: enum { allowed, forbidden } = .allowed,
     /// Request lifetime checked before graph setup and at every reachable node.
     /// A backend operation that is already executing still owns its buffers and
     /// must return before cleanup, but graph-scale work can no longer ignore a
@@ -192,11 +210,17 @@ pub const ExecuteOptions = struct {
     /// provided, execute() skips recomputing these per-call — a win
     /// for the decode loop where the graph never changes.
     cached_analysis: ?CachedAnalysis = null,
+    /// Submission-order last uses, prepared for this exact partition plan.
+    cached_partition_last_use: ?[]const u32 = null,
 
     /// Pre-computed graph buffer/lifetime plan. This is invariant for a fixed
     /// graph and partition plan, so compiled training sessions can borrow it
     /// across repeated steps.
     cached_buffer_plan: ?*const buffer_plan_mod.BufferPlan = null,
+    /// The immutable plan was validated against this graph/placement at prepare.
+    /// External/debug plans retain validation unless their owner proves this.
+    cached_buffer_plan_validated: bool = false,
+    physical_frame: ?*@import("../execution/physical_buffers.zig").Frame = null,
 
     /// Skip Metal graph-fusion probes for graphs whose hot path is already
     /// covered by backend primitive/runtime commands.
@@ -672,6 +696,19 @@ pub fn execute(
 ) !ExecutionResult {
     if (options.execution_control) |control| try control.check();
     const count = graph.nodeCount();
+    if (options.runtime_inputs) |inputs| for (inputs) |input| {
+        if (input.node_id >= count) return error.InvalidRuntimeInputNode;
+        if (input.source_backend) |source| {
+            if (source.ptr != cb.ptr or source.vtable != cb.vtable) return error.RuntimeInputBackendMismatch;
+        }
+    };
+    const transfer_audit = @import("../execution/transfer_audit.zig");
+    var audit = transfer_audit.Audit{ .forbid_device_host_access = options.activation_readbacks == .forbidden };
+    if (audit.forbid_device_host_access) {
+        try transfer_audit.validateBackend(cb.kind());
+        try transfer_audit.begin(&audit);
+    }
+    defer if (audit.forbid_device_host_access) transfer_audit.end();
     const trace_nodes = graphExecTraceEnabled();
     const profile_ops = graphOpProfileEnabled();
     const finite_trace = graphFiniteTraceEnabled();
@@ -757,6 +794,7 @@ pub fn execute(
 
     // 5. Mutable execution state
     var exec_state = ExecState{
+        .allocator = allocator,
         .attention_layer = 0,
         .options = options,
         .last_use = donation_last_use,
@@ -1089,6 +1127,7 @@ pub fn captureNodeValues(
     }
 
     var exec_state = ExecState{
+        .allocator = allocator,
         .attention_layer = 0,
         .options = options,
         .last_use = donation_last_use,
@@ -1413,6 +1452,8 @@ const MoeGroupedState = struct {
 /// Mutable state carried across node executions within a single
 /// execute() call. Tracks counters for side-channel consumption.
 pub const ExecState = struct {
+    /// Borrowed invocation allocator for shared temporary materialization.
+    allocator: ?std.mem.Allocator = null,
     /// Auto-incremented for each attention node, so each layer gets
     /// the correct layer_index in its AttentionContext.
     attention_layer: usize,
@@ -1920,7 +1961,7 @@ fn executeGeluBackwardFallback(
         }
         const t = std.math.tanh(inner);
         const sech2 = 1.0 - t * t;
-        const derivative = 0.5 * (1.0 + t) + 0.5 * x * sech2 * 0.7978845608028654 * (1.0 + 0.134145 * x2);
+        const derivative = (comptime @import("antfly_tile").native_math.geluDerivative(@import("antfly_tile").fexpr.operand("sech2"))).evaluate(struct {}, .{ .value = x, .t = t, .x2 = x2, .sech2 = sech2 });
         dst.* = if (std.math.isFinite(derivative)) upstream * derivative else 0.0;
     }
 
@@ -2516,6 +2557,9 @@ pub fn executeNode(
     node_id: NodeId,
     state: *ExecState,
 ) !CT {
+    if (state.options.physical_frame) |frame| {
+        if (try frame.execute(cb, values, node_id, if (graph.node(node_id).op == .fused_rope) (try ropePositionOverride(state.options.attention)) else null)) |output| return output;
+    }
     const n = graph.node(node_id);
     const ins = n.getInputs();
 
@@ -2603,23 +2647,11 @@ pub fn executeNode(
         },
 
         .fused_embedding_lookup => |attrs| {
-            if (try cb.embeddingLookupTensor(V.get(ins[0]), V.get(ins[1]), attrs.total, attrs.dim)) |device_result| {
-                return device_result;
-            }
-            var owned_ids: ?[]i64 = null;
-            defer if (owned_ids) |buf| std.heap.page_allocator.free(buf);
-            const ids = blk: {
-                if (graph.node(ins[1]).op == .fused_from_float32) {
-                    break :blk state.options.embedding_ids orelse return error.MissingRuntimeInput;
-                }
-                const raw = try cb.toFloat32(V.get(ins[1]), std.heap.page_allocator);
-                defer std.heap.page_allocator.free(raw);
-                const converted = try std.heap.page_allocator.alloc(i64, raw.len);
-                for (converted, raw) |*dst, value| dst.* = @intFromFloat(@round(value));
-                owned_ids = converted;
-                break :blk converted;
-            };
-            return cb.embeddingLookup(V.get(ins[0]), ids, attrs.total, attrs.dim);
+            const indices: EmbeddingIndices = if (graph.node(ins[1]).op == .fused_from_float32)
+                .{ .host = state.options.embedding_ids orelse return error.MissingRuntimeInput }
+            else
+                .{ .tensor = values[ins[1]] orelse return error.MissingRuntimeInput };
+            return executeEmbeddingLookup(state.allocator orelse graph.allocator, cb, V.get(ins[0]), indices, attrs.total, attrs.dim);
         },
 
         .fused_layer_norm => |attrs| {
@@ -3065,10 +3097,7 @@ pub fn executeNode(
 
         .fused_rope => |attrs| {
             const rope_dim: usize = if (attrs.rope_dim > 0) attrs.rope_dim else attrs.head_dim;
-            const position_offset = if (state.options.attention) |attn|
-                attn.total_sequence_len - attn.query_sequence_len
-            else
-                attrs.position_offset;
+            const position_offset = (try ropePositionOverride(state.options.attention)) orelse attrs.position_offset;
             return cb.rope(
                 V.get(ins[0]),
                 attrs.seq_len,
@@ -5168,9 +5197,6 @@ const TestCompute = struct {
     }
 
     fn stubSdpa(_: *anyopaque, _: CT, _: CT, _: CT, _: []const i64, _: ?CT, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
-        return error.UnsupportedPrimitiveOp;
-    }
-    fn stubCausalAttn(_: *anyopaque, _: CT, _: CT, _: CT, _: ?CT, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
         return error.UnsupportedPrimitiveOp;
     }
     fn stubCrossAttn(_: *anyopaque, _: CT, _: CT, _: CT, _: []const i64, _: usize, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
@@ -8755,4 +8781,56 @@ test "native GatherND widens floating weight slices when exact import is unavail
         defer a.free(empty_shape);
         try std.testing.expectEqualSlices(i64, &.{ 0, 3 }, empty_shape);
     }
+}
+
+/// Shared resident-first embedding dispatch. Legacy host ID tensors use exact
+/// integer export when a resident implementation is unavailable.
+/// Traced host IDs have no materialized placeholder tensor. Imported tensor
+/// IDs keep the resident fast path and exact integer fallback.
+pub const EmbeddingIndices = union(enum) { host: []const i64, tensor: CT };
+
+pub fn executeEmbeddingLookup(allocator: std.mem.Allocator, cb: *const ComputeBackend, weight: CT, source: EmbeddingIndices, total: usize, dim: usize) !CT {
+    const indices = switch (source) {
+        .host => |ids| return cb.embeddingLookup(weight, ids, total, dim),
+        .tensor => |tensor| tensor,
+    };
+    if (try cb.embeddingLookupTensor(weight, indices, total, dim)) |device_result| {
+        return device_result;
+    }
+    var owned_ids: ?[]i64 = null;
+    defer if (owned_ids) |buf| allocator.free(buf);
+    const ids = blk: {
+        const dtype = try cb.tensorDType(indices);
+        if (dtype == .i64 or dtype == .i32) {
+            const exported = (try cb.exportTensorData(indices, allocator)) orelse return error.UnsupportedIntegerTensor;
+            const bytes = switch (exported.payload) {
+                .bytes => |bytes| bytes,
+                .quantized_f32 => |quantized| {
+                    allocator.free(quantized.raw_bytes);
+                    allocator.free(quantized.shape);
+                    return error.UnsupportedIntegerTensor;
+                },
+            };
+            defer allocator.free(bytes);
+            if (exported.dtype != dtype or bytes.len != try std.math.mul(usize, total, dtype.byteSize())) return error.InvalidTensorShape;
+            const converted = try allocator.alloc(i64, total);
+            for (converted, 0..) |*id, i| id.* = if (dtype == .i64) std.mem.readInt(i64, bytes[i * 8 ..][0..8], .little) else std.mem.readInt(i32, bytes[i * 4 ..][0..4], .little);
+            owned_ids = converted;
+            break :blk converted;
+        }
+        const raw = try cb.toFloat32(indices, allocator);
+        defer allocator.free(raw);
+        const converted = try allocator.alloc(i64, raw.len);
+        for (converted, raw) |*dst, value| dst.* = @intFromFloat(@round(value));
+        owned_ids = converted;
+        break :blk converted;
+    };
+    return cb.embeddingLookup(weight, ids, total, dim);
+}
+
+/// Preserve the ordinary interpreter's per-invocation attention position when
+/// binding a frozen logical RoPE descriptor to assigned storage.
+pub fn ropePositionOverride(attention: ?contracts.AttentionContext) error{InvalidRoPEInput}!?usize {
+    if (attention) |value| return std.math.sub(usize, value.total_sequence_len, value.query_sequence_len) catch return error.InvalidRoPEInput;
+    return null;
 }

@@ -125,14 +125,14 @@ test "gliner boundary device request rejects external frames and unwinds failed 
     var cb = backend.computeBackend();
     var vtable = cb.vtable.*;
     vtable.backendKind = MissingDevice.kind;
-    vtable.glinerBoundaryDevice = MissingDevice.execute;
-    vtable.glinerBoundaryDownload = MissingDevice.download;
-    vtable.decoderRuntimeHasActiveFrame = MissingDevice.active;
+    vtable.regions.relative_boundary.device = MissingDevice.execute;
+    vtable.regions.relative_boundary.download = MissingDevice.download;
+    vtable.regions.decoder.hasActiveFrame = MissingDevice.active;
     cb.vtable = &vtable;
     try std.testing.expectError(error.GlinerBoundaryExternalFrame, request.run(&cb, a, &config, &prepared, &schemas, .{}));
     try std.testing.expectError(error.GlinerBoundaryExternalFrame, request.runWindows(&cb, a, &config, &prepared, &schemas, .{}));
     try std.testing.expectError(error.GlinerBoundaryExternalFrame, math.Context.create(a, &cb, .{}, null));
-    vtable.decoderRuntimeHasActiveFrame = null;
+    vtable.regions.decoder.hasActiveFrame = null;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, MissingDevice.allocationFailure, .{ &cb, &config, &prepared, &schemas });
     const Cancel = struct {
         fn check(_: ?*anyopaque) anyerror!void {
@@ -302,9 +302,9 @@ const ContextScopeFixture = struct {
         var vtable = backend.computeBackend().vtable.*;
         vtable.backendKind = kind;
         vtable.freeTensor = free;
-        vtable.glinerBoundaryDevice = execute;
-        vtable.glinerBoundaryScope = scopeOperation;
-        vtable.decoderRuntimeHasActiveFrame = active;
+        vtable.regions.relative_boundary.device = execute;
+        vtable.regions.relative_boundary.scope = scopeOperation;
+        vtable.regions.decoder.hasActiveFrame = active;
         var fixture = ContextScopeFixture{ .allocator = a };
         const model_bytes = 65 * 4096; // 64 distinct weights and one shared derived table.
         fixture.accounting.stats.resident_model_live_bytes = model_bytes;

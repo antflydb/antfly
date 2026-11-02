@@ -36,6 +36,9 @@ const ml = @import("ml");
 /// (native CPU uses f32 slices, device backends use opaque handles). Tensors are always
 /// freed via the ComputeBackend that created them.
 pub const CT = backend_contracts.CT;
+pub const kernel_descriptor = @import("kernel_descriptor.zig");
+pub const physical_storage = @import("physical_storage.zig");
+pub const KernelBackend = @import("kernel_backend.zig").VTable;
 
 /// Result of an optional backend lookup for immutable scalar model metadata.
 /// `unsupported` lets callers retain their existing weight-loading path;
@@ -613,6 +616,83 @@ pub const Gemma4MtpVerifyCommitRequest = struct {
     eos_token_ids: []const i32,
     accept_bonus: bool,
     allocator: std.mem.Allocator,
+    /// No allocation or backend state changes. Empty drafts retain optional
+    /// decline; overflowing row counts have the ordinary shape error.
+    pub fn verifyLength(self: *const @This()) error{InvalidTensorShape}!?usize {
+        if (self.draft_tokens.len == 0) return null;
+        const length = std.math.add(usize, self.draft_tokens.len, 1) catch return error.InvalidTensorShape;
+        if (self.rows < length) return error.InvalidTensorShape;
+        return length;
+    }
+
+    fn isEos(self: *const @This(), token: usize) bool {
+        for (self.eos_token_ids) |eos| {
+            if (eos >= 0 and token == @as(usize, @intCast(eos))) return true;
+        }
+        return false;
+    }
+
+    /// Borrow choices. The backend transfers its allocation only after this
+    /// succeeds; errors preserve its existing cleanup responsibility.
+    pub fn classifyTargetChoices(self: *const @This(), target_choices: []u32) error{ InvalidTensorShape, InvalidModelOutput }!Gemma4MtpVerifyCommitResult {
+        const length = (try self.verifyLength()) orelse return error.InvalidTensorShape;
+        if (target_choices.len < length) return error.InvalidTensorShape;
+        var matched_drafts: usize = 0;
+        var accepted: usize = 0;
+        var correction_added = false;
+        var hit_eos = false;
+
+        for (self.draft_tokens, 0..) |draft_token_raw, i| {
+            if (draft_token_raw < 0) return error.InvalidModelOutput;
+            const draft_token: usize = @intCast(draft_token_raw);
+            const target_choice: usize = @intCast(target_choices[i]);
+            if (target_choice == draft_token) {
+                matched_drafts += 1;
+                accepted += 1;
+                if (self.isEos(target_choice)) {
+                    hit_eos = true;
+                    break;
+                }
+            } else {
+                correction_added = true;
+                accepted = matched_drafts + 1;
+                if (self.isEos(target_choice)) {
+                    hit_eos = true;
+                }
+                break;
+            }
+        }
+
+        const can_bonus = matched_drafts == self.draft_tokens.len and !hit_eos;
+        const had_bonus = can_bonus and self.accept_bonus;
+        const bonus_skipped = can_bonus and !self.accept_bonus;
+        if (had_bonus) {
+            const bonus_token: usize = @intCast(target_choices[self.draft_tokens.len]);
+            accepted += 1;
+            if (self.isEos(bonus_token)) {
+                hit_eos = true;
+            }
+        }
+
+        const commit_forward_required = correction_added or had_bonus;
+        const accepted_hidden_row: ?usize = if (accepted != 0 and !commit_forward_required)
+            accepted - 1
+        else
+            null;
+
+        return .{
+            .target_choices = target_choices,
+            .target_choices_owned = false,
+            .matched_drafts = matched_drafts,
+            .accepted = accepted,
+            .correction_added = correction_added,
+            .had_bonus = had_bonus,
+            .bonus_skipped = bonus_skipped,
+            .hit_eos = hit_eos,
+            .commit_forward_required = commit_forward_required,
+            .accepted_hidden_row = accepted_hidden_row,
+        };
+    }
 };
 
 pub const TakeRowsRequest = struct {
@@ -1561,7 +1641,10 @@ pub const QuantExecutionTimingStats = struct {
     gated_qkv_ffn_failures: u64 = 0,
 };
 
+pub const RuntimeTelemetry = @import("../execution/runtime_telemetry.zig").Snapshot;
+
 pub const BackendDebugTimingSnapshot = struct {
+    runtime: RuntimeTelemetry = .{},
     native_quant_null: bool = true,
     provider: NativeQuantTimingStats = .{},
     quant: QuantExecutionTimingStats = .{},
@@ -1692,7 +1775,7 @@ pub const ComputeBackend = struct {
     pub fn glinerBoundaryDevice(self: *const ComputeBackend, request: *const gliner_boundary_device.Request) !CT {
         errdefer self.cancelGlinerBoundaryOwnedScope();
         try self.checkExecutionControl();
-        const op = self.vtable.glinerBoundaryDevice orelse return error.UnsupportedGlinerBoundaryDevice;
+        const op = self.vtable.regions.relative_boundary.device orelse return error.UnsupportedGlinerBoundaryDevice;
         const output = try op(self.ptr, request);
         errdefer self.free(output);
         try self.checkExecutionControl();
@@ -1705,7 +1788,7 @@ pub const ComputeBackend = struct {
     pub fn glinerBoundaryPackedQkv(self: *const ComputeBackend, request: *const gliner_boundary_device.PackedQkvRequest) !gliner_boundary_device.PackedQkvResult {
         errdefer self.cancelGlinerBoundaryOwnedScope();
         try self.checkExecutionControl();
-        const op = self.vtable.glinerBoundaryPackedQkv orelse return error.UnsupportedGlinerBoundaryPackedQkv;
+        const op = self.vtable.regions.relative_boundary.packedQkv orelse return error.UnsupportedGlinerBoundaryPackedQkv;
         const output = try op(self.ptr, request);
         errdefer {
             self.free(output.query);
@@ -1719,7 +1802,7 @@ pub const ComputeBackend = struct {
     pub fn glinerBoundaryFusedFfn(self: *const ComputeBackend, request: *const gliner_boundary_device.FusedFfnRequest) !CT {
         errdefer self.cancelGlinerBoundaryOwnedScope();
         try self.checkExecutionControl();
-        const op = self.vtable.glinerBoundaryFusedFfn orelse return error.UnsupportedGlinerBoundaryFusedFfn;
+        const op = self.vtable.regions.relative_boundary.fusedFfn orelse return error.UnsupportedGlinerBoundaryFusedFfn;
         const output = try op(self.ptr, request);
         errdefer self.free(output);
         try self.checkExecutionControl();
@@ -1727,20 +1810,20 @@ pub const ComputeBackend = struct {
     }
 
     pub fn glinerBoundaryFusedFfnAvailable(self: *const ComputeBackend) bool {
-        const op = self.vtable.glinerBoundaryFusedFfnAvailable orelse return false;
+        const op = self.vtable.regions.relative_boundary.fusedFfnAvailable orelse return false;
         return op(self.ptr);
     }
 
     pub fn glinerBoundaryDownload(self: *const ComputeBackend, tensor: CT, output: []f32) !void {
         errdefer self.cancelGlinerBoundaryOwnedScope();
         try self.checkExecutionControl();
-        const op = self.vtable.glinerBoundaryDownload orelse return error.UnsupportedGlinerBoundaryDevice;
+        const op = self.vtable.regions.relative_boundary.download orelse return error.UnsupportedGlinerBoundaryDevice;
         try op(self.ptr, tensor, output);
         try self.checkExecutionControl();
     }
 
     fn cancelGlinerBoundaryOwnedScope(self: *const ComputeBackend) void {
-        const op = self.vtable.glinerBoundaryScope orelse return;
+        const op = self.vtable.regions.relative_boundary.scope orelse return;
         const state = op(self.ptr, &.{ .snapshot = {} }) catch return;
         if (state.active) _ = op(self.ptr, &.{ .cancel = .{ .generation = state.generation } }) catch {};
     }
@@ -1748,7 +1831,7 @@ pub const ComputeBackend = struct {
     /// Explicit ownership of the existing serial Metal frame. Cleanup and
     /// snapshots must remain available after a request's control is cancelled.
     pub fn glinerBoundaryScope(self: *const ComputeBackend, request: *const gliner_boundary_device.ScopeRequest) !gliner_boundary_device.ScopeStats {
-        const op = self.vtable.glinerBoundaryScope orelse return error.UnsupportedGlinerBoundaryScope;
+        const op = self.vtable.regions.relative_boundary.scope orelse return error.UnsupportedGlinerBoundaryScope;
         switch (request.*) {
             .snapshot, .cancel => return op(self.ptr, request),
             .begin => {
@@ -1773,7 +1856,7 @@ pub const ComputeBackend = struct {
     /// Private session preparation grant on a freshly leased request wrapper.
     /// It never persists request controls or CT handles in the physical owner.
     pub fn glinerBoundaryResidentPreparation(self: *const ComputeBackend, enabled: bool) !void {
-        const op = self.vtable.glinerBoundaryResidentPreparation orelse return error.UnsupportedGlinerBoundaryResidentWeights;
+        const op = self.vtable.regions.relative_boundary.residentPreparation orelse return error.UnsupportedGlinerBoundaryResidentWeights;
         if (!enabled) return op(self.ptr, false);
         try self.checkExecutionControl();
         try op(self.ptr, true);
@@ -1831,12 +1914,12 @@ pub const ComputeBackend = struct {
     }
 
     pub fn decoderRuntimePushPlannedComputeBarrierSuppression(self: *const ComputeBackend) !bool {
-        const op = self.vtable.decoderRuntimePushPlannedComputeBarrierSuppression orelse return false;
+        const op = self.vtable.regions.decoder.pushPlannedComputeBarrierSuppression orelse return false;
         return op(self.ptr);
     }
 
     pub fn decoderRuntimePopPlannedComputeBarrierSuppression(self: *const ComputeBackend) !void {
-        const op = self.vtable.decoderRuntimePopPlannedComputeBarrierSuppression orelse return;
+        const op = self.vtable.regions.decoder.popPlannedComputeBarrierSuppression orelse return;
         return op(self.ptr);
     }
 
@@ -1851,72 +1934,432 @@ pub const ComputeBackend = struct {
     }
 
     pub fn debugCudaGraphCaptureBegin(self: *const ComputeBackend, label: []const u8) !bool {
-        const op = self.vtable.debugCudaGraphCaptureBegin orelse return false;
+        const op = self.vtable.regions.replay.captureBegin orelse return false;
         return op(self.ptr, label);
     }
 
     pub fn debugCudaGraphPrepareDecodeScalars(self: *const ComputeBackend, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize, kv_position_offset: usize) !bool {
-        const op = self.vtable.debugCudaGraphPrepareDecodeScalars orelse return false;
+        const op = self.vtable.regions.replay.prepareDecodeScalars orelse return false;
         return op(self.ptr, position_offset, query_position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
     }
 
     pub fn debugCudaTraceTensor(self: *const ComputeBackend, label: []const u8, tensor: CT) !void {
-        const op = self.vtable.debugCudaTraceTensor orelse return;
+        const op = self.vtable.regions.replay.traceTensor orelse return;
         return op(self.ptr, label, tensor);
     }
 
     pub fn debugCudaGraphRegisterFinalHiddenReplayBoundary(self: *const ComputeBackend, input: CT, output: CT) !void {
-        const op = self.vtable.debugCudaGraphRegisterFinalHiddenReplayBoundary orelse return;
+        const op = self.vtable.regions.replay.registerFinalHiddenReplayBoundary orelse return;
         return op(self.ptr, input, output);
     }
 
     pub fn debugCudaGraphRegisterFinalHiddenReplayInput(self: *const ComputeBackend, input: CT) !void {
-        const op = self.vtable.debugCudaGraphRegisterFinalHiddenReplayInput orelse return;
+        const op = self.vtable.regions.replay.registerFinalHiddenReplayInput orelse return;
         return op(self.ptr, input);
     }
 
     pub fn debugCudaGraphRegisterFinalHiddenReplayAuxInput(self: *const ComputeBackend, input: CT) !void {
-        const op = self.vtable.debugCudaGraphRegisterFinalHiddenReplayAuxInput orelse return;
+        const op = self.vtable.regions.replay.registerFinalHiddenReplayAuxInput orelse return;
         return op(self.ptr, input);
     }
 
     pub fn debugCudaGraphPrepareFinalHiddenReplayInput(self: *const ComputeBackend, label: []const u8, input: CT, kv_seq_len: usize) !?CT {
-        const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayInput orelse return null;
+        const op = self.vtable.regions.replay.prepareFinalHiddenReplayInput orelse return null;
         return op(self.ptr, label, input, kv_seq_len);
     }
 
     pub fn debugCudaGraphPrepareGreedyTokenReplayInput(self: *const ComputeBackend, label: []const u8, input: CT, kv_seq_len: usize) !?CT {
-        const op = self.vtable.debugCudaGraphPrepareGreedyTokenReplayInput orelse return null;
+        const op = self.vtable.regions.replay.prepareGreedyTokenReplayInput orelse return null;
         return op(self.ptr, label, input, kv_seq_len);
     }
 
     pub fn debugCudaGraphPrepareFinalHiddenReplayAuxInput(self: *const ComputeBackend, input: CT) !?CT {
-        const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayAuxInput orelse return null;
+        const op = self.vtable.regions.replay.prepareFinalHiddenReplayAuxInput orelse return null;
         return op(self.ptr, input);
     }
 
     pub fn debugCudaGraphReplayFinalHidden(self: *const ComputeBackend, input: CT) !?CT {
-        const op = self.vtable.debugCudaGraphReplayFinalHidden orelse return null;
+        const op = self.vtable.regions.replay.replayFinalHidden orelse return null;
         return op(self.ptr, input);
     }
 
     pub fn debugCudaGraphReplayFinalHiddenDiscard(self: *const ComputeBackend, input: CT) !bool {
-        const op = self.vtable.debugCudaGraphReplayFinalHiddenDiscard orelse return false;
+        const op = self.vtable.regions.replay.replayFinalHiddenDiscard orelse return false;
         return op(self.ptr, input);
     }
 
     pub fn debugCudaGraphCaptureEnd(self: *const ComputeBackend, replay: bool) !void {
-        const op = self.vtable.debugCudaGraphCaptureEnd orelse return;
+        const op = self.vtable.regions.replay.captureEnd orelse return;
         return op(self.ptr, replay);
     }
 
     pub fn debugCudaDeviceWarmup(self: *const ComputeBackend, bytes: usize, iterations: usize) !bool {
-        const op = self.vtable.debugCudaDeviceWarmup orelse return false;
+        const op = self.vtable.regions.replay.deviceWarmup orelse return false;
         return op(self.ptr, bytes, iterations);
     }
 
+    /// Optional operation regions. Stored inline: dispatch retains one function
+    /// pointer load and unsupported regions cost no allocations. Historical
+    /// ComputeBackend methods below are compatibility adapters into these tables.
+    pub const Regions = struct {
+        window_attention: WindowAttentionRegion = .{},
+        action_scoring: ActionScoringRegion = .{},
+        sequence_encoder: SequenceEncoderRegion = .{},
+        speculative: SpeculativeRegion = .{},
+        vision: VisionRegion = .{},
+        token_selection: TokenSelectionRegion = .{},
+        audio_attention: AudioAttentionRegion = .{},
+        sequence_projection: SequenceProjectionRegion = .{},
+        relative_encoder: RelativeEncoderRegion = .{},
+        decoder: DecoderRegion = .{},
+        relative_boundary: RelativeBoundaryRegion = .{},
+        replay: ReplayRegion = .{},
+    };
+
+    pub const DecoderRegion = struct {
+        /// Temporarily suppress planned compute barriers for a backend-owned
+        /// frame whose caller has stronger model-specific ordering knowledge.
+        pushPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        popPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        setPipelinedFrames: ?*const fn (ctx: *anyopaque, enabled: bool) bool = null,
+        submitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        waitSubmittedFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        /// Consume an active decoder-runtime frame with a batched masked
+        /// argmax. Backends return null when there is no compatible frame.
+        argmaxRowsSuppress: ?*const fn (ctx: *anyopaque, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
+        /// Prepare a backend-owned whole-token greedy decode runtime for a
+        /// decoder-only model. Backends return false when unsupported so the
+        /// caller can fall back to the existing decode path.
+        prepareGreedy: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeGreedyRequest) anyerror!bool = null,
+        /// Reset runtime-owned mutable state for the backend whole-token
+        /// decode path while keeping resident model weights/slots intact.
+        resetState: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        /// Backend-owned greedy decode entry point. The request describes
+        /// a batch of qLen=1 decode items plus the decoder contract without
+        /// exposing model-specific frontend types. Backends return false
+        /// when unsupported so callers can fall back.
+        decode: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeDecodeRequest) anyerror!bool = null,
+        /// Build and reserve a backend-owned qLen>1 prefill frame plan before
+        /// frontend layer orchestration starts encoding runtime operations.
+        /// Backends return false when the model/shape cannot use the planned
+        /// frame path.
+        planPrefillFrame: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrefillFramePlanRequest) anyerror!bool = null,
+        /// Execute a backend-owned graph command plan frame as one planned
+        /// sequence. Backends return false before encoding when unsupported;
+        /// after accepting, errors should abort the active frame.
+        executeGraphCommandPlanFrame: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeGraphCommandPlanFrameRequest) anyerror!bool = null,
+        /// Begin a backend-owned decoder frame. Backends that support this
+        /// encode subsequent runtime operations into one command submission
+        /// until `decoderRuntimeSubmitAndWaitFrame` is called.
+        beginFrame: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        /// Tag the active frame for backend-owned diagnostic attribution.
+        /// This must not alter dispatch or command-buffer topology.
+        setActiveFrameRegime: ?*const fn (ctx: *anyopaque, regime: DecoderRuntimeFrameRegime) anyerror!void = null,
+        /// Push/pop a semantic region for work encoded into an active decoder
+        /// frame. The returned token restores the prior nested region.
+        pushComputeRegion: ?*const fn (ctx: *anyopaque, region: DecoderRuntimeComputeRegion) anyerror!?usize = null,
+        popComputeRegion: ?*const fn (ctx: *anyopaque, previous: usize) anyerror!void = null,
+        /// Return true when a backend-owned decoder frame is already active.
+        hasActiveFrame: ?*const fn (ctx: *anyopaque) bool = null,
+        /// Submitted frames remain owned by the caller until explicitly waited.
+        hasSubmittedFrame: ?*const fn (ctx: *anyopaque) bool = null,
+        /// Arm a per-layer MoE miss ledger for an optimistic decode frame.
+        /// Returns false before encoding when the arena is not fully warm.
+        beginMoeCheckpoint: ?*const fn (ctx: *anyopaque, layer_count: usize, top_k: usize) anyerror!bool = null,
+        /// Inspect the armed ledger after the frame's terminal wait. Returns
+        /// true when the token must be replayed through synchronized repair.
+        finishMoeCheckpoint: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        /// Force the bounded replay through the synchronized route/repair
+        /// path. Backends without optimistic MoE routing ignore this.
+        setMoeReplayMode: ?*const fn (ctx: *anyopaque, enabled: bool) anyerror!void = null,
+        /// Submit and wait for the active backend-owned decoder frame.
+        submitAndWaitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        /// Submit and wait for the active backend-owned decoder frame, then
+        /// reopen a frame for subsequent runtime operations.
+        flushActiveFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        /// Drop the active backend-owned decoder frame without submitting it.
+        cancelFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        /// Reuse or prepare decoder-runtime family state for the current
+        /// sequence shape. Backends that do not support this can leave it
+        /// null and the caller will see a zero-valued result.
+        prepareOrReuseFamily: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, gpt_config: gpt_model.Config, current_kv_tokens: usize, configured_layer_count: usize) anyerror!DecoderRuntimePrepareReuseResult = null,
+        /// Hidden-state-only dense Qwen3 prefill omits the vocabulary head.
+        prepareOrReuseTextPrefill: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, gpt_config: gpt_model.Config, configured_layer_count: usize, execution_control: ?InferenceExecutionControl) anyerror!DecoderRuntimePrepareReuseResult = null,
+        /// Report whether the backend-owned decoder runtime exists and is
+        /// currently available.
+        ready: ?*const fn (ctx: *anyopaque) bool = null,
+        /// Report whether absolute embedding tables are resident in the
+        /// backend-owned decoder runtime.
+        absoluteEmbeddingsPrepared: ?*const fn (ctx: *anyopaque) bool = null,
+        /// Upload absolute token/position embedding tables into a backend-
+        /// owned whole-token decode runtime. Backends return false when the
+        /// model or runtime is unsupported.
+        prepareAbsoluteEmbeddings: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrepareAbsoluteEmbeddingsRequest) anyerror!bool = null,
+        /// Execute the decoder input embedding step for absolute-position
+        /// models from backend-owned embedding tables: gather token and
+        /// position rows by id and return their sum as a backend tensor with
+        /// shape [1, hidden_size].
+        embedAbsolutePosition: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeEmbedAbsolutePositionRequest) anyerror!?CT = null,
+        /// Upload layer-norm parameters into a backend-owned whole-token
+        /// decode runtime. `slot` is backend-defined but stable for the life
+        /// of the prepared runtime.
+        prepareLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrepareLayerNormRequest) anyerror!bool = null,
+        /// Report whether a layer-norm slot with the requested shape is
+        /// already resident. This lets architecture warmup paths avoid
+        /// reloading model weights merely to rediscover prepared state.
+        layerNormSlotPrepared: ?*const fn (ctx: *anyopaque, slot: usize, hidden_size: usize) bool = null,
+        /// Reuse or prepare a backend-owned graph/runtime layer-norm slot
+        /// without exposing backend slot allocation policy to graph executors.
+        ensureLayerNormSlot: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeEnsureLayerNormSlotRequest) anyerror!?usize = null,
+        /// Apply a previously prepared layer norm from the backend-owned
+        /// whole-token runtime and return a [1, hidden_size] tensor.
+        applyLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLayerNormRequest) anyerror!?CT = null,
+        /// Upload RMS-norm parameters into a backend-owned whole-token
+        /// decode runtime. `slot` is backend-defined but stable for the life
+        /// of the prepared runtime.
+        prepareRmsNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrepareRmsNormRequest) anyerror!bool = null,
+        /// Reuse or prepare a backend-owned graph/runtime RMS-norm slot
+        /// without exposing backend slot allocation policy to graph executors.
+        ensureRmsNormSlot: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeEnsureRmsNormSlotRequest) anyerror!?usize = null,
+        /// Apply a previously prepared RMS norm from the backend-owned
+        /// whole-token runtime and return a [1, hidden_size] tensor.
+        applyRmsNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyRmsNormRequest) anyerror!?CT = null,
+        /// Apply a prepared layer norm slot followed by a prepared linear
+        /// slot inside one backend-owned whole-token submission and return a
+        /// [1, out_dim] tensor.
+        applyLayerNormLinear: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLayerNormLinearRequest) anyerror!?CT = null,
+        /// Apply a prepared layer norm slot followed by a prepared linear
+        /// argmax slot inside one backend-owned whole-token submission.
+        applyLayerNormLinearArgmax: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLayerNormLinearArgmaxRequest) anyerror!?usize = null,
+        /// Apply a prepared layer norm slot followed by a prepared linear
+        /// slot inside one backend-owned whole-token submission and sample a
+        /// token from the resulting last-row logits using a penalty-free
+        /// sampling config.
+        applyLayerNormLinearSample: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLayerNormLinearSampleRequest) anyerror!?usize = null,
+        /// Apply a prepared RMS norm slot followed by a prepared linear
+        /// slot inside one backend-owned whole-token submission and return a
+        /// [1, out_dim] tensor.
+        applyRmsNormLinear: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyRmsNormLinearRequest) anyerror!?CT = null,
+        /// Apply a prepared RMS norm slot followed by a prepared linear
+        /// argmax slot inside one backend-owned whole-token submission.
+        applyRmsNormLinearArgmax: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyRmsNormLinearArgmaxRequest) anyerror!?usize = null,
+        /// Apply a prepared RMS norm slot followed by a prepared linear
+        /// slot inside one backend-owned whole-token submission and sample a
+        /// token from the resulting last-row logits using a penalty-free
+        /// sampling config.
+        applyRmsNormLinearSample: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyRmsNormLinearSampleRequest) anyerror!?usize = null,
+        /// Sample a token from the full logits left resident in the backend's
+        /// sample-logits buffer by the most recent decode frame's fused
+        /// lm-head tail.
+        sampleResidentLogits: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeSampleResidentLogitsRequest) anyerror!?usize = null,
+        /// Preflight the exact resident-logits sampling contract. Backends
+        /// must return false before a decode frame is submitted when any
+        /// requested transform cannot be honored exactly.
+        residentLogitsSamplingSupported: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeSampleResidentLogitsRequest) bool = null,
+        /// Upload dense linear parameters into a backend-owned whole-token
+        /// runtime slot. Weight shape is [out_dim, in_dim], bias shape is
+        /// [out_dim].
+        prepareLinear: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrepareLinearRequest) anyerror!bool = null,
+        /// Report whether a linear slot with the requested shape is already
+        /// resident. Backends that do not expose resident slots leave this
+        /// null and callers perform ordinary preparation.
+        linearSlotPrepared: ?*const fn (ctx: *anyopaque, slot: usize, in_dim: usize, out_dim: usize) bool = null,
+        /// Reuse or prepare a backend-owned graph/runtime dense linear slot
+        /// without exposing backend slot allocation policy to graph executors.
+        ensureLinearSlot: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeEnsureLinearSlotRequest) anyerror!?usize = null,
+        /// Apply a previously prepared dense linear slot to a [1, in_dim]
+        /// input and return a [1, out_dim] tensor.
+        applyLinear: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearRequest) anyerror!?CT = null,
+        /// Apply a prepared linear slot, residual add, and prepared layer norm.
+        applyLinearLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearLayerNormRequest) anyerror!?CT = null,
+        /// Apply a prepared two-linear FFN, residual add, and prepared layer norm.
+        applyFfnLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyFfnLayerNormRequest) anyerror!?CT = null,
+        /// Apply a previously prepared dense linear slot to a [1, in_dim]
+        /// input and return the argmax token id without materializing full
+        /// logits back through the generic path.
+        applyLinearArgmax: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearArgmaxRequest) anyerror!?usize = null,
+        /// Apply two previously prepared linear slots to the same [1, in_dim]
+        /// input and return both [1, out_dim] outputs.
+        applyLinearPair: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearPairRequest) anyerror!?LinearNoBiasPairResult = null,
+        /// Apply three previously prepared q/k/v linear slots to the same
+        /// input and return all projected outputs.
+        applyLinearQkv: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest) anyerror!?LinearNoBiasTripleResult = null,
+        applyLinearQkvInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) anyerror!?CT = null,
+        applyLinearInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearRequest, out: CT) anyerror!bool = null,
+        beginPlannedComputeScope: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        endPlannedComputeScope: ?*const fn (ctx: *anyopaque) void = null,
+        /// Apply an activation inside the backend-owned decoder runtime.
+        applyActivation: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyActivationRequest) anyerror!?CT = null,
+        /// Apply tanh-approx GELU backward inside the backend runtime:
+        /// output = upstream_grad * d/dx(gelu(input)).
+        applyGeluBackward: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyGeluBackwardRequest) anyerror!?CT = null,
+        /// Execute the hot DeBERTa FFN backward strip as one backend runtime
+        /// unit while returning each graph-visible intermediate.
+        ffnGeluBackwardChain: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) anyerror!?DecoderRuntimeFfnGeluBackwardChainResult = null,
+        /// Execute the rank-1 DeBERTa FFN backward strip while returning only
+        /// the first branch and final output nodes that remain graph-visible.
+        ffnGeluBackwardOutput: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) anyerror!?DecoderRuntimeFfnGeluBackwardOutputResult = null,
+        /// Apply elementwise add inside the backend-owned decoder runtime.
+        applyAdd: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyAddRequest) anyerror!?CT = null,
+        /// Apply scaled elementwise add inside the backend-owned decoder runtime.
+        applyAddScale: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyAddScaleRequest) anyerror!?CT = null,
+        /// Apply `(lhs * lhs_scale + rhs) * output_scale` inside the backend runtime.
+        applyScaledAddScale: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyScaledAddScaleRequest) anyerror!?CT = null,
+        /// Apply `lhs * rhs + addend` inside the backend runtime.
+        applyMultiplyAdd: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyMultiplyAddRequest) anyerror!?CT = null,
+        /// Apply `lhs0 * rhs0 + lhs1 * rhs1` inside the backend runtime.
+        applyMultiplyAdd2: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyMultiplyAdd2Request) anyerror!?CT = null,
+    };
+
+    pub const RelativeBoundaryRegion = struct {
+        device: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.Request) anyerror!CT = null,
+        packedQkv: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.PackedQkvRequest) anyerror!gliner_boundary_device.PackedQkvResult = null,
+        fusedFfnAvailable: ?*const fn (ctx: *anyopaque) bool = null,
+        fusedFfn: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.FusedFfnRequest) anyerror!CT = null,
+        scope: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.ScopeRequest) anyerror!gliner_boundary_device.ScopeStats = null,
+        residentPreparation: ?*const fn (ctx: *anyopaque, enabled: bool) anyerror!void = null,
+        download: ?*const fn (ctx: *anyopaque, tensor: CT, output: []f32) anyerror!void = null,
+    };
+
+    pub const ReplayRegion = struct {
+        captureBegin: ?*const fn (ctx: *anyopaque, label: []const u8) anyerror!bool = null,
+        prepareDecodeScalars: ?*const fn (ctx: *anyopaque, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize, kv_position_offset: usize) anyerror!bool = null,
+        traceTensor: ?*const fn (ctx: *anyopaque, label: []const u8, tensor: CT) anyerror!void = null,
+        registerFinalHiddenReplayBoundary: ?*const fn (ctx: *anyopaque, input: CT, output: CT) anyerror!void = null,
+        registerFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
+        registerFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
+        prepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT, kv_seq_len: usize) anyerror!?CT = null,
+        prepareGreedyTokenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT, kv_seq_len: usize) anyerror!?CT = null,
+        prepareFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
+        replayFinalHidden: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
+        replayFinalHiddenDiscard: ?*const fn (ctx: *anyopaque, input: CT) anyerror!bool = null,
+        captureEnd: ?*const fn (ctx: *anyopaque, replay: bool) anyerror!void = null,
+        deviceWarmup: ?*const fn (ctx: *anyopaque, bytes: usize, iterations: usize) anyerror!bool = null,
+    };
+
+    pub const RelativeEncoderRegion = struct {
+        /// DeBERTa-v3 embedding block: word lookup + row LayerNorm + attention-mask multiply.
+        /// Backends may return null to use the generic embedding/layernorm/multiply path.
+        embeddings: ?*const fn (ctx: *anyopaque, request: *const DebertaEmbeddingsRequest) anyerror!?CT = null,
+        /// Versioned training attention with source query-and-key masking,
+        /// compact relative buckets, and counter-based probability dropout.
+        /// The integer control tensor is a physical i32 leaf. These operations
+        /// must not fall back to the inference attention mask or host execution.
+        trainingAttention: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+        trainingAttentionBackward: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, dO: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+        /// Build/cache a backend-owned GLiNER DeBERTa encoder frame plan.
+        /// This prepares model-specific encoder block metadata without
+        /// executing the frame.
+        planFrame: ?*const fn (ctx: *anyopaque, request: *const DebertaEncoderFramePlanRequest) anyerror!bool = null,
+        /// Normalize and gather the model-scoped DeBERTa relative embedding
+        /// table. Backends may retain this immutable result across requests.
+        relativeEmbeddings: ?*const fn (ctx: *anyopaque, request: *const DebertaRelativeEmbeddingRequest) anyerror!?CT = null,
+        /// Execute one GLiNER DeBERTa encoder layer from a previously
+        /// prepared backend-owned slot layout. Backends return null when the
+        /// shape/path should use the ordinary eager ops.
+        layer: ?*const fn (ctx: *anyopaque, request: *const DebertaEncoderLayerRequest) anyerror!?CT = null,
+    };
+
+    pub const SequenceProjectionRegion = struct {
+        /// GLiNER-specific word embedding aggregation:
+        /// takes the first encoder hidden row by a host words_mask into
+        /// [batch * num_words, hidden_size].
+        firstWordRows: ?*const fn (ctx: *anyopaque, request: *const GlinerWordEmbeddingsRequest) anyerror!?CT = null,
+        /// GLiNER-specific CountLSTM GRU step plus skip connection:
+        /// returns `gru(label_embeddings, pos0) + label_embeddings` as
+        /// [num_labels, hidden_size].
+        gruSummary: ?*const fn (ctx: *anyopaque, request: *const GlinerLabelGruCombinedRequest) anyerror!?CT = null,
+        /// GLiNER span-head gather of start/end projected word rows, concat on
+        /// the last dimension, and ReLU. Backends may fuse the full strip.
+        gatherConcatRelu: ?*const fn (ctx: *anyopaque, request: *const GlinerGatherConcatReluRequest) anyerror!?CT = null,
+        /// Florence-2 vision tail for spatial_avg_pool + temporal_avg_pool:
+        /// apply final 2D/temporal embeddings on device and emit
+        /// [batch * (height * width + 1), dim].
+        spatialTemporalSources: ?*const fn (ctx: *anyopaque, tokens: CT, row_embed: CT, col_embed: CT, temporal_embed: ?CT, batch: usize, height: usize, width: usize, dim: usize) anyerror!?CT = null,
+        /// Florence-2 image projection with backend-owned cached projection
+        /// weight layout when the stored GGUF tensor is quantized.
+        projectImageFeatures: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, vision_dim: usize, projection_dim: usize) anyerror!?CT = null,
+    };
+
+    pub const AudioAttentionRegion = struct {
+        localRelative: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
+        packedLocalRelative: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
+    };
+
+    pub const TokenSelectionRegion = struct {
+        encodeLogitsStats: ?*const fn (ctx: *anyopaque, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool = null,
+        readLogitsStats: ?*const fn (ctx: *anyopaque, slot: usize, out: *WhisperLogitsStatsRaw) bool = null,
+        writeGrammar: ?*const fn (ctx: *anyopaque, state: *const WhisperGrammarState) bool = null,
+    };
+
+    pub const VisionRegion = struct {
+        /// Optional model-scoped vision-attention routes. They have the same unmasked,
+        /// unbiased semantics as scaledDotProductAttention with an empty mask,
+        /// but lets a backend select a model-scoped kernel without changing
+        /// unrelated vision encoders that happen to share a tensor shape.
+        unmaskedWarpReduced: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
+        unmaskedRetrieval: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
+        unmaskedTensorCore: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
+        tryUnmaskedRetrieval: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT = null,
+        /// Complete official EmbeddingGemma2 HF vision encoder. The input and
+        /// output are token-major F32 `[sequence, 768]`. A backend may decline
+        /// before queueing work; errors after submission must propagate.
+        encoderTower: ?*const fn (ctx: *anyopaque, input: CT, sequence: usize, grid_x: usize, grid_y: usize, batch: usize, control: ?InferenceExecutionControl) anyerror!?CT = null,
+        /// Exact Pillow RGB8 resize and official 16x16 patch packing. Returns
+        /// F32 `[patch_count, 768]` scaled pixels; decline before queueing work.
+        imagePatches: ?*const fn (ctx: *anyopaque, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) anyerror!?CT = null,
+        /// Same preparation, written into caller-owned F32 patch rows. A
+        /// decline occurs before any write to the destination.
+        imagePatchesInto: ?*const fn (ctx: *anyopaque, destination: CT, row_offset: usize, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) anyerror!bool = null,
+    };
+
+    pub const SpeculativeRegion = struct {
+        /// Gemma4 MTP masked embedding selection. Backends may keep centroid
+        /// top-k and restricted-token argmax on device; callers fall back to
+        /// the portable host implementation when unsupported.
+        maskedArgmax: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpMaskedArgmaxRequest) anyerror!?u32 = null,
+        /// Gemma4 MTP masked embedding selection fused with the assistant
+        /// hidden-to-centroid projection. Backends return null when unsupported
+        /// so callers can use centroid linear + masked argmax.
+        maskedSelect: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpMaskedSelectRequest) anyerror!?u32 = null,
+        /// Gemma4 MTP masked embedding selection fused all the way from
+        /// assistant hidden state to the restricted LM-head argmax. Backends
+        /// return null when unsupported so callers can compute full logits.
+        maskedSelectFromHidden: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpMaskedSelectFromHiddenRequest) anyerror!?u32 = null,
+        /// Gemma4 MTP preprojection helper. Backends may fuse the target
+        /// embedding/activation concat with pre_projection.weight; callers
+        /// fall back to concat + linear when unsupported.
+        preproject: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpPreprojectRequest) anyerror!?CT = null,
+        /// Gemma4 pure-greedy MTP verification helper. Backends may combine
+        /// hidden-to-LM-head argmax with draft comparison and commit metadata;
+        /// callers fall back to the portable verifier when unsupported.
+        verifyCommit: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpVerifyCommitRequest) anyerror!?Gemma4MtpVerifyCommitResult = null,
+    };
+
+    pub const SequenceEncoderRegion = struct {
+        /// Execute one NomicBERT encoder layer from a previously prepared
+        /// backend-owned slot layout. Backends return null when the shape/path
+        /// should use the ordinary eager attention + SwiGLU sequence.
+        rotaryLayer: ?*const fn (ctx: *anyopaque, request: *const NomicBertEncoderLayerRequest) anyerror!?CT = null,
+        poolNormalize: ?*const fn (ctx: *anyopaque, request: *const NomicBertPoolNormalizeRequest) anyerror!?CT = null,
+    };
+
+    pub const ActionScoringRegion = struct {
+        features: ?*const fn (ctx: *anyopaque, request: *const LayaActionFeaturesRequest) anyerror!CT = null,
+    };
+
+    pub const WindowAttentionRegion = struct {
+        /// ModernBERT training attention over packed [Q;K;V] with an i32
+        /// range/position control; linear storage, replayed backward
+        /// returning packed [dQ;dK;dV]. See ops/range_attention_reference.zig.
+        trainingForward: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+        trainingBackward: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+    };
+
     pub const VTable = struct {
+        regions: Regions = .{},
         backendKind: *const fn (ctx: *anyopaque) BackendKind,
+        kernels: ?*const KernelBackend = null,
         deinitBackend: *const fn (ctx: *anyopaque) void,
         freeTensor: *const fn (ctx: *anyopaque, tensor: CT) void,
         /// Optional backend-provided device-write hook installer. CUDA and
@@ -1948,38 +2391,12 @@ pub const ComputeBackend = struct {
         /// partition executes. Metal maps these to persistent MTLBuffer slots.
         reserveGraphPlanSlots: ?*const fn (ctx: *anyopaque, slots: []const GraphPlanSlot) anyerror!bool = null,
 
-        /// Temporarily suppress planned compute barriers for a backend-owned
-        /// frame whose caller has stronger model-specific ordering knowledge.
-        decoderRuntimePushPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
-        decoderRuntimePopPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
-
         cumulativeSum: ?*const fn (ctx: *anyopaque, tensor: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT = null,
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
-        glinerBoundaryDevice: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.Request) anyerror!CT = null,
-        glinerBoundaryPackedQkv: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.PackedQkvRequest) anyerror!gliner_boundary_device.PackedQkvResult = null,
-        glinerBoundaryFusedFfnAvailable: ?*const fn (ctx: *anyopaque) bool = null,
-        glinerBoundaryFusedFfn: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.FusedFfnRequest) anyerror!CT = null,
-        glinerBoundaryScope: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.ScopeRequest) anyerror!gliner_boundary_device.ScopeStats = null,
-        glinerBoundaryResidentPreparation: ?*const fn (ctx: *anyopaque, enabled: bool) anyerror!void = null,
         recordLossGradient: ?*const fn (ctx: *anyopaque, request: *const record_loss_math.Request) anyerror!void = null,
         listwiseLossGradient: ?*const fn (ctx: *anyopaque, request: *const listwise_loss_math.Request) anyerror!void = null,
         consistencyLossGradient: ?*const fn (ctx: *anyopaque, request: *const consistency_loss_math.Request) anyerror!void = null,
         elementwiseLossGradient: ?*const fn (ctx: *anyopaque, request: *const elementwise_loss_math.Request) anyerror!void = null,
-        glinerBoundaryDownload: ?*const fn (ctx: *anyopaque, tensor: CT, output: []f32) anyerror!void = null,
-
-        debugCudaGraphCaptureBegin: ?*const fn (ctx: *anyopaque, label: []const u8) anyerror!bool = null,
-        debugCudaGraphPrepareDecodeScalars: ?*const fn (ctx: *anyopaque, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize, kv_position_offset: usize) anyerror!bool = null,
-        debugCudaTraceTensor: ?*const fn (ctx: *anyopaque, label: []const u8, tensor: CT) anyerror!void = null,
-        debugCudaGraphRegisterFinalHiddenReplayBoundary: ?*const fn (ctx: *anyopaque, input: CT, output: CT) anyerror!void = null,
-        debugCudaGraphRegisterFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
-        debugCudaGraphRegisterFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
-        debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT, kv_seq_len: usize) anyerror!?CT = null,
-        debugCudaGraphPrepareGreedyTokenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT, kv_seq_len: usize) anyerror!?CT = null,
-        debugCudaGraphPrepareFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
-        debugCudaGraphReplayFinalHidden: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
-        debugCudaGraphReplayFinalHiddenDiscard: ?*const fn (ctx: *anyopaque, input: CT) anyerror!bool = null,
-        debugCudaGraphCaptureEnd: ?*const fn (ctx: *anyopaque, replay: bool) anyerror!void = null,
-        debugCudaDeviceWarmup: ?*const fn (ctx: *anyopaque, bytes: usize, iterations: usize) anyerror!bool = null,
 
         /// Look up an immutable, backend-owned weight tensor. Repeated lookups
         /// share a handle; unreleased handles are reclaimed at backend teardown.
@@ -2024,30 +2441,13 @@ pub const ComputeBackend = struct {
         /// `input` is [total, num_groups * group_dim], and `norm_weight` is [group_dim].
         rmsNormAddWeightedEmbeddingTensor: ?*const fn (ctx: *anyopaque, input: CT, norm_weight: CT, embedding_weight: CT, ids: CT, total: usize, num_groups: usize, group_dim: usize, eps: f32, lhs_scale: f32, rhs_scale: f32) anyerror!?CT = null,
 
-        /// DeBERTa-v3 embedding block: word lookup + row LayerNorm + attention-mask multiply.
-        /// Backends may return null to use the generic embedding/layernorm/multiply path.
-        debertaEmbeddings: ?*const fn (ctx: *anyopaque, request: *const DebertaEmbeddingsRequest) anyerror!?CT = null,
-
         /// Gather rows from a [total, dim] tensor along axis 0.
         takeRows: ?*const fn (ctx: *anyopaque, request: *const TakeRowsRequest) anyerror!?CT = null,
 
-        /// GLiNER-specific word embedding aggregation:
-        /// takes the first encoder hidden row by a host words_mask into
-        /// [batch * num_words, hidden_size].
-        glinerWordEmbeddings: ?*const fn (ctx: *anyopaque, request: *const GlinerWordEmbeddingsRequest) anyerror!?CT = null,
         // Optional backend hint: prefer dense mirrors for eager-path quantized
         // linears (set by architectures whose eager weights are hot GEMMs, e.g.
         // the GLiNER span head). No-op on backends without the concept.
         preferEagerQuantMirrors: ?*const fn (ctx: *anyopaque, enabled: bool) void = null,
-
-        /// GLiNER-specific CountLSTM GRU step plus skip connection:
-        /// returns `gru(label_embeddings, pos0) + label_embeddings` as
-        /// [num_labels, hidden_size].
-        glinerLabelGruCombined: ?*const fn (ctx: *anyopaque, request: *const GlinerLabelGruCombinedRequest) anyerror!?CT = null,
-
-        /// GLiNER span-head gather of start/end projected word rows, concat on
-        /// the last dimension, and ReLU. Backends may fuse the full strip.
-        glinerGatherConcatRelu: ?*const fn (ctx: *anyopaque, request: *const GlinerGatherConcatReluRequest) anyerror!?CT = null,
 
         /// Y = X @ W^T + bias. X:[rows, in_dim], W:[out_dim, in_dim], bias:[out_dim] → Y:[rows, out_dim]
         linear: *const fn (ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT,
@@ -2145,8 +2545,6 @@ pub const ComputeBackend = struct {
         flattenChannelsTimeFreqBatch: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, time: usize, freq: usize, channels: usize) anyerror!?CT = null,
         audioFrontend: ?*const fn (ctx: *anyopaque, input: CT, auxiliary: ?CT, params: AudioFrontendParams) anyerror!?CT = null,
         supportsLinearPackedNamed: ?*const fn (ctx: *anyopaque) bool = null,
-        gemma4AudioLocalAttention: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
-        gemma4AudioPackedAttention: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
 
         /// Y = X + value. Backends may keep scalar adds on device; callers
         /// fall back to host materialization or a broadcast scalar tensor.
@@ -2226,13 +2624,7 @@ pub const ComputeBackend = struct {
         packedQkvRope: ?*const fn (ctx: *anyopaque, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) anyerror!?SplitLastDim3Result = null,
         ensureDeviceResident: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
         conv1dIm2col: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, in_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize, time_major: bool) anyerror!?CT = null,
-        whisperLogitsStatsEncode: ?*const fn (ctx: *anyopaque, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool = null,
-        whisperLogitsStatsRead: ?*const fn (ctx: *anyopaque, slot: usize, out: *WhisperLogitsStatsRaw) bool = null,
-        whisperGrammarWrite: ?*const fn (ctx: *anyopaque, state: *const WhisperGrammarState) bool = null,
         embeddingLookupDeviceToken: ?*const fn (ctx: *anyopaque, weight: CT, token_slot: usize, dim: usize) anyerror!?CT = null,
-        decoderRuntimeSetWhisperPipelinedFrames: ?*const fn (ctx: *anyopaque, enabled: bool) bool = null,
-        decoderRuntimeSubmitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
-        decoderRuntimeWaitSubmittedFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
         /// Planned variant for graph executors that already selected a
         /// backend-specific operator. Backends that leave this null use
@@ -2365,15 +2757,6 @@ pub const ComputeBackend = struct {
         /// Slice contiguous rows from a rank-2 tensor:
         /// input:[rows, cols] -> [row_count, cols]
         sliceRows2D: ?*const fn (ctx: *anyopaque, input: CT, start_row: usize, row_count: usize, cols: usize) anyerror!CT = null,
-
-        /// Florence-2 vision tail for spatial_avg_pool + temporal_avg_pool:
-        /// apply final 2D/temporal embeddings on device and emit
-        /// [batch * (height * width + 1), dim].
-        florenceVisionTailSources: ?*const fn (ctx: *anyopaque, tokens: CT, row_embed: CT, col_embed: CT, temporal_embed: ?CT, batch: usize, height: usize, width: usize, dim: usize) anyerror!?CT = null,
-
-        /// Florence-2 image projection with backend-owned cached projection
-        /// weight layout when the stored GGUF tensor is quantized.
-        florenceProjectImageFeatures: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, vision_dim: usize, projection_dim: usize) anyerror!?CT = null,
 
         /// ggml_mul_mat_id-style routed matrix multiply. `input` is already
         /// grouped row-wise, `weight` is the full packed expert tensor or an
@@ -2567,31 +2950,11 @@ pub const ComputeBackend = struct {
         /// Inclusive symmetric window; padding masks keys, never introduces causality.
         /// Token-major Q/K/V and output: [batch*seq_len, num_heads*head_dim].
         encoderLocalAttention: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, radius: usize) anyerror!CT = null,
-        layaActionFeatures: ?*const fn (ctx: *anyopaque, request: *const LayaActionFeaturesRequest) anyerror!CT = null,
         packedGegluExact: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT = null,
         splitQkvRope: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, seq: usize, heads: usize, dim: usize, theta: f32) anyerror!?SplitLastDim3Result = null,
 
-        /// Optional model-scoped vision-attention routes. They have the same unmasked,
-        /// unbiased semantics as scaledDotProductAttention with an empty mask,
-        /// but lets a backend select a model-scoped kernel without changing
-        /// unrelated vision encoders that happen to share a tensor shape.
-        scaledDotProductAttentionGemma4Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
-        scaledDotProductAttentionEmbeddingGemma2Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
-        scaledDotProductAttentionQwen3VlVision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
-        tryScaledDotProductAttentionEmbeddingGemma2Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT = null,
         /// Direct spatial merge and optional channel standardization.
         spatialPoolPrepare: ?*const fn (ctx: *anyopaque, input: CT, bias: ?CT, scale: ?CT, params: SpatialPoolParams) anyerror!?CT = null,
-
-        /// Complete official EmbeddingGemma2 HF vision encoder. The input and
-        /// output are token-major F32 `[sequence, 768]`. A backend may decline
-        /// before queueing work; errors after submission must propagate.
-        runEmbeddingGemma2VisionTower: ?*const fn (ctx: *anyopaque, input: CT, sequence: usize, grid_x: usize, grid_y: usize, batch: usize, control: ?InferenceExecutionControl) anyerror!?CT = null,
-        /// Exact Pillow RGB8 resize and official 16x16 patch packing. Returns
-        /// F32 `[patch_count, 768]` scaled pixels; decline before queueing work.
-        preprocessEmbeddingGemma2ImagePatches: ?*const fn (ctx: *anyopaque, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) anyerror!?CT = null,
-        /// Same preparation, written into caller-owned F32 patch rows. A
-        /// decline occurs before any write to the destination.
-        preprocessEmbeddingGemma2ImagePatchesInto: ?*const fn (ctx: *anyopaque, destination: CT, row_offset: usize, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) anyerror!bool = null,
 
         /// Optional bidirectional attention with no mask. This is equivalent
         /// to scaledDotProductAttention with an all-ones mask, but lets
@@ -2656,24 +3019,12 @@ pub const ComputeBackend = struct {
         /// attn_bias has the same mask-only threshold contract as the forward op.
         disentangledRelativeAttentionBackwardPacked: ?*const fn (ctx: *anyopaque, qkv: CT, qr_kr: CT, attn_bias: CT, dO: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
 
-        /// Versioned training attention with source query-and-key masking,
-        /// compact relative buckets, and counter-based probability dropout.
-        /// The integer control tensor is a physical i32 leaf. These operations
-        /// must not fall back to the inference attention mask or host execution.
-        debertaTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
-        debertaTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, dO: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
         /// CPU only today (no device kernel): the encoder's global and
         /// local-window layers and packed rows' tree segments all lower to
         /// this. `null` means the training graph must fall back to the
         /// dense-bias attention path (see `finetune/laya/graph.zig`).
         segmentTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
         segmentTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
-
-        /// ModernBERT training attention over packed [Q;K;V] with an i32
-        /// range/position control; linear storage, replayed backward
-        /// returning packed [dQ;dK;dV]. See ops/modernbert_training_attention.zig.
-        modernBertTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
-        modernBertTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
 
         /// Optional destructive softmax over the last dimension. When this
         /// returns a tensor, the backend may have reused `input`'s storage, so
@@ -2910,10 +3261,6 @@ pub const ComputeBackend = struct {
         /// small list of suppressed token ids.
         argmaxRowsSuppress: ?*const fn (ctx: *anyopaque, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
 
-        /// Consume an active decoder-runtime frame with a batched masked
-        /// argmax. Backends return null when there is no compatible frame.
-        decoderRuntimeArgmaxRowsSuppress: ?*const fn (ctx: *anyopaque, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
-
         /// Return the argmax token id as a backend tensor while masking a small
         /// list of suppressed token ids. Used by pure-greedy decode paths that
         /// must avoid full-logit host transfers.
@@ -2944,118 +3291,6 @@ pub const ComputeBackend = struct {
         /// compare them against draft tokens on the CPU control path.
         linearNoBiasArgmaxRowsSuppress: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) anyerror!?[]u32 = null,
 
-        /// Gemma4 MTP masked embedding selection. Backends may keep centroid
-        /// top-k and restricted-token argmax on device; callers fall back to
-        /// the portable host implementation when unsupported.
-        gemma4MtpMaskedArgmax: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpMaskedArgmaxRequest) anyerror!?u32 = null,
-
-        /// Gemma4 MTP masked embedding selection fused with the assistant
-        /// hidden-to-centroid projection. Backends return null when unsupported
-        /// so callers can use centroid linear + masked argmax.
-        gemma4MtpMaskedSelect: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpMaskedSelectRequest) anyerror!?u32 = null,
-
-        /// Gemma4 MTP masked embedding selection fused all the way from
-        /// assistant hidden state to the restricted LM-head argmax. Backends
-        /// return null when unsupported so callers can compute full logits.
-        gemma4MtpMaskedSelectFromHidden: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpMaskedSelectFromHiddenRequest) anyerror!?u32 = null,
-
-        /// Gemma4 MTP preprojection helper. Backends may fuse the target
-        /// embedding/activation concat with pre_projection.weight; callers
-        /// fall back to concat + linear when unsupported.
-        gemma4MtpPreproject: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpPreprojectRequest) anyerror!?CT = null,
-
-        /// Gemma4 pure-greedy MTP verification helper. Backends may combine
-        /// hidden-to-LM-head argmax with draft comparison and commit metadata;
-        /// callers fall back to the portable verifier when unsupported.
-        gemma4MtpVerifyCommit: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpVerifyCommitRequest) anyerror!?Gemma4MtpVerifyCommitResult = null,
-
-        /// Prepare a backend-owned whole-token greedy decode runtime for a
-        /// decoder-only model. Backends return false when unsupported so the
-        /// caller can fall back to the existing decode path.
-        decoderRuntimePrepareGreedy: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeGreedyRequest) anyerror!bool = null,
-
-        /// Reset runtime-owned mutable state for the backend whole-token
-        /// decode path while keeping resident model weights/slots intact.
-        decoderRuntimeResetState: ?*const fn (ctx: *anyopaque) anyerror!void = null,
-
-        /// Backend-owned greedy decode entry point. The request describes
-        /// a batch of qLen=1 decode items plus the decoder contract without
-        /// exposing model-specific frontend types. Backends return false
-        /// when unsupported so callers can fall back.
-        decoderRuntimeDecode: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeDecodeRequest) anyerror!bool = null,
-
-        /// Build and reserve a backend-owned qLen>1 prefill frame plan before
-        /// frontend layer orchestration starts encoding runtime operations.
-        /// Backends return false when the model/shape cannot use the planned
-        /// frame path.
-        decoderRuntimePlanPrefillFrame: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrefillFramePlanRequest) anyerror!bool = null,
-
-        /// Execute a backend-owned graph command plan frame as one planned
-        /// sequence. Backends return false before encoding when unsupported;
-        /// after accepting, errors should abort the active frame.
-        decoderRuntimeExecuteGraphCommandPlanFrame: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeGraphCommandPlanFrameRequest) anyerror!bool = null,
-
-        /// Build/cache a backend-owned GLiNER DeBERTa encoder frame plan.
-        /// This prepares model-specific encoder block metadata without
-        /// executing the frame.
-        debertaEncoderPlanFrame: ?*const fn (ctx: *anyopaque, request: *const DebertaEncoderFramePlanRequest) anyerror!bool = null,
-
-        /// Normalize and gather the model-scoped DeBERTa relative embedding
-        /// table. Backends may retain this immutable result across requests.
-        debertaRelativeEmbeddings: ?*const fn (ctx: *anyopaque, request: *const DebertaRelativeEmbeddingRequest) anyerror!?CT = null,
-
-        /// Execute one GLiNER DeBERTa encoder layer from a previously
-        /// prepared backend-owned slot layout. Backends return null when the
-        /// shape/path should use the ordinary eager ops.
-        debertaEncoderLayer: ?*const fn (ctx: *anyopaque, request: *const DebertaEncoderLayerRequest) anyerror!?CT = null,
-
-        /// Execute one NomicBERT encoder layer from a previously prepared
-        /// backend-owned slot layout. Backends return null when the shape/path
-        /// should use the ordinary eager attention + SwiGLU sequence.
-        nomicBertEncoderLayer: ?*const fn (ctx: *anyopaque, request: *const NomicBertEncoderLayerRequest) anyerror!?CT = null,
-        nomicBertPoolNormalize: ?*const fn (ctx: *anyopaque, request: *const NomicBertPoolNormalizeRequest) anyerror!?CT = null,
-
-        /// Begin a backend-owned decoder frame. Backends that support this
-        /// encode subsequent runtime operations into one command submission
-        /// until `decoderRuntimeSubmitAndWaitFrame` is called.
-        decoderRuntimeBeginFrame: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
-
-        /// Tag the active frame for backend-owned diagnostic attribution.
-        /// This must not alter dispatch or command-buffer topology.
-        decoderRuntimeSetActiveFrameRegime: ?*const fn (ctx: *anyopaque, regime: DecoderRuntimeFrameRegime) anyerror!void = null,
-
-        /// Push/pop a semantic region for work encoded into an active decoder
-        /// frame. The returned token restores the prior nested region.
-        decoderRuntimePushComputeRegion: ?*const fn (ctx: *anyopaque, region: DecoderRuntimeComputeRegion) anyerror!?usize = null,
-        decoderRuntimePopComputeRegion: ?*const fn (ctx: *anyopaque, previous: usize) anyerror!void = null,
-
-        /// Return true when a backend-owned decoder frame is already active.
-        decoderRuntimeHasActiveFrame: ?*const fn (ctx: *anyopaque) bool = null,
-        /// Submitted frames remain owned by the caller until explicitly waited.
-        decoderRuntimeHasSubmittedFrame: ?*const fn (ctx: *anyopaque) bool = null,
-
-        /// Arm a per-layer MoE miss ledger for an optimistic decode frame.
-        /// Returns false before encoding when the arena is not fully warm.
-        decoderRuntimeBeginMoeCheckpoint: ?*const fn (ctx: *anyopaque, layer_count: usize, top_k: usize) anyerror!bool = null,
-
-        /// Inspect the armed ledger after the frame's terminal wait. Returns
-        /// true when the token must be replayed through synchronized repair.
-        decoderRuntimeFinishMoeCheckpoint: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
-
-        /// Force the bounded replay through the synchronized route/repair
-        /// path. Backends without optimistic MoE routing ignore this.
-        decoderRuntimeSetMoeReplayMode: ?*const fn (ctx: *anyopaque, enabled: bool) anyerror!void = null,
-
-        /// Submit and wait for the active backend-owned decoder frame.
-        decoderRuntimeSubmitAndWaitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
-
-        /// Submit and wait for the active backend-owned decoder frame, then
-        /// reopen a frame for subsequent runtime operations.
-        decoderRuntimeFlushActiveFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
-
-        /// Drop the active backend-owned decoder frame without submitting it.
-        decoderRuntimeCancelFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
-
         /// Gather one paged-KV layer from backend-owned cache state into
         /// host-owned row-major `f32` buffers. Returns null when unsupported.
         gatherPagedKvLayerCache: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, kv: KvCacheView, token_count: usize, layer_index: usize) anyerror!?PagedKvLayerCacheRows = null,
@@ -3076,174 +3311,6 @@ pub const ComputeBackend = struct {
         /// Reset backend-owned debug timing counters for diagnostic
         /// printing. Backends that do not support this can leave it null.
         resetDebugTimingStats: ?*const fn (ctx: *anyopaque) void = null,
-
-        /// Reuse or prepare decoder-runtime family state for the current
-        /// sequence shape. Backends that do not support this can leave it
-        /// null and the caller will see a zero-valued result.
-        decoderRuntimePrepareOrReuseFamily: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, gpt_config: gpt_model.Config, current_kv_tokens: usize, configured_layer_count: usize) anyerror!DecoderRuntimePrepareReuseResult = null,
-        /// Hidden-state-only dense Qwen3 prefill omits the vocabulary head.
-        decoderRuntimePrepareOrReuseTextPrefill: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, gpt_config: gpt_model.Config, configured_layer_count: usize, execution_control: ?InferenceExecutionControl) anyerror!DecoderRuntimePrepareReuseResult = null,
-
-        /// Report whether the backend-owned decoder runtime exists and is
-        /// currently available.
-        decoderRuntimeReady: ?*const fn (ctx: *anyopaque) bool = null,
-
-        /// Report whether absolute embedding tables are resident in the
-        /// backend-owned decoder runtime.
-        decoderRuntimeAbsoluteEmbeddingsPrepared: ?*const fn (ctx: *anyopaque) bool = null,
-
-        /// Upload absolute token/position embedding tables into a backend-
-        /// owned whole-token decode runtime. Backends return false when the
-        /// model or runtime is unsupported.
-        decoderRuntimePrepareAbsoluteEmbeddings: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrepareAbsoluteEmbeddingsRequest) anyerror!bool = null,
-
-        /// Execute the decoder input embedding step for absolute-position
-        /// models from backend-owned embedding tables: gather token and
-        /// position rows by id and return their sum as a backend tensor with
-        /// shape [1, hidden_size].
-        decoderRuntimeEmbedAbsolutePosition: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeEmbedAbsolutePositionRequest) anyerror!?CT = null,
-
-        /// Upload layer-norm parameters into a backend-owned whole-token
-        /// decode runtime. `slot` is backend-defined but stable for the life
-        /// of the prepared runtime.
-        decoderRuntimePrepareLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrepareLayerNormRequest) anyerror!bool = null,
-
-        /// Report whether a layer-norm slot with the requested shape is
-        /// already resident. This lets architecture warmup paths avoid
-        /// reloading model weights merely to rediscover prepared state.
-        decoderRuntimeLayerNormSlotPrepared: ?*const fn (ctx: *anyopaque, slot: usize, hidden_size: usize) bool = null,
-
-        /// Reuse or prepare a backend-owned graph/runtime layer-norm slot
-        /// without exposing backend slot allocation policy to graph executors.
-        decoderRuntimeEnsureLayerNormSlot: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeEnsureLayerNormSlotRequest) anyerror!?usize = null,
-
-        /// Apply a previously prepared layer norm from the backend-owned
-        /// whole-token runtime and return a [1, hidden_size] tensor.
-        decoderRuntimeApplyLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLayerNormRequest) anyerror!?CT = null,
-
-        /// Upload RMS-norm parameters into a backend-owned whole-token
-        /// decode runtime. `slot` is backend-defined but stable for the life
-        /// of the prepared runtime.
-        decoderRuntimePrepareRmsNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrepareRmsNormRequest) anyerror!bool = null,
-
-        /// Reuse or prepare a backend-owned graph/runtime RMS-norm slot
-        /// without exposing backend slot allocation policy to graph executors.
-        decoderRuntimeEnsureRmsNormSlot: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeEnsureRmsNormSlotRequest) anyerror!?usize = null,
-
-        /// Apply a previously prepared RMS norm from the backend-owned
-        /// whole-token runtime and return a [1, hidden_size] tensor.
-        decoderRuntimeApplyRmsNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyRmsNormRequest) anyerror!?CT = null,
-
-        /// Apply a prepared layer norm slot followed by a prepared linear
-        /// slot inside one backend-owned whole-token submission and return a
-        /// [1, out_dim] tensor.
-        decoderRuntimeApplyLayerNormLinear: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLayerNormLinearRequest) anyerror!?CT = null,
-
-        /// Apply a prepared layer norm slot followed by a prepared linear
-        /// argmax slot inside one backend-owned whole-token submission.
-        decoderRuntimeApplyLayerNormLinearArgmax: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLayerNormLinearArgmaxRequest) anyerror!?usize = null,
-
-        /// Apply a prepared layer norm slot followed by a prepared linear
-        /// slot inside one backend-owned whole-token submission and sample a
-        /// token from the resulting last-row logits using a penalty-free
-        /// sampling config.
-        decoderRuntimeApplyLayerNormLinearSample: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLayerNormLinearSampleRequest) anyerror!?usize = null,
-
-        /// Apply a prepared RMS norm slot followed by a prepared linear
-        /// slot inside one backend-owned whole-token submission and return a
-        /// [1, out_dim] tensor.
-        decoderRuntimeApplyRmsNormLinear: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyRmsNormLinearRequest) anyerror!?CT = null,
-
-        /// Apply a prepared RMS norm slot followed by a prepared linear
-        /// argmax slot inside one backend-owned whole-token submission.
-        decoderRuntimeApplyRmsNormLinearArgmax: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyRmsNormLinearArgmaxRequest) anyerror!?usize = null,
-
-        /// Apply a prepared RMS norm slot followed by a prepared linear
-        /// slot inside one backend-owned whole-token submission and sample a
-        /// token from the resulting last-row logits using a penalty-free
-        /// sampling config.
-        decoderRuntimeApplyRmsNormLinearSample: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyRmsNormLinearSampleRequest) anyerror!?usize = null,
-
-        /// Sample a token from the full logits left resident in the backend's
-        /// sample-logits buffer by the most recent decode frame's fused
-        /// lm-head tail.
-        decoderRuntimeSampleResidentLogits: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeSampleResidentLogitsRequest) anyerror!?usize = null,
-
-        /// Preflight the exact resident-logits sampling contract. Backends
-        /// must return false before a decode frame is submitted when any
-        /// requested transform cannot be honored exactly.
-        decoderRuntimeResidentLogitsSamplingSupported: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeSampleResidentLogitsRequest) bool = null,
-
-        /// Upload dense linear parameters into a backend-owned whole-token
-        /// runtime slot. Weight shape is [out_dim, in_dim], bias shape is
-        /// [out_dim].
-        decoderRuntimePrepareLinear: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimePrepareLinearRequest) anyerror!bool = null,
-
-        /// Report whether a linear slot with the requested shape is already
-        /// resident. Backends that do not expose resident slots leave this
-        /// null and callers perform ordinary preparation.
-        decoderRuntimeLinearSlotPrepared: ?*const fn (ctx: *anyopaque, slot: usize, in_dim: usize, out_dim: usize) bool = null,
-
-        /// Reuse or prepare a backend-owned graph/runtime dense linear slot
-        /// without exposing backend slot allocation policy to graph executors.
-        decoderRuntimeEnsureLinearSlot: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeEnsureLinearSlotRequest) anyerror!?usize = null,
-
-        /// Apply a previously prepared dense linear slot to a [1, in_dim]
-        /// input and return a [1, out_dim] tensor.
-        decoderRuntimeApplyLinear: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearRequest) anyerror!?CT = null,
-
-        /// Apply a prepared linear slot, residual add, and prepared layer norm.
-        decoderRuntimeApplyLinearLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearLayerNormRequest) anyerror!?CT = null,
-
-        /// Apply a prepared two-linear FFN, residual add, and prepared layer norm.
-        decoderRuntimeApplyFfnLayerNorm: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyFfnLayerNormRequest) anyerror!?CT = null,
-
-        /// Apply a previously prepared dense linear slot to a [1, in_dim]
-        /// input and return the argmax token id without materializing full
-        /// logits back through the generic path.
-        decoderRuntimeApplyLinearArgmax: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearArgmaxRequest) anyerror!?usize = null,
-
-        /// Apply two previously prepared linear slots to the same [1, in_dim]
-        /// input and return both [1, out_dim] outputs.
-        decoderRuntimeApplyLinearPair: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearPairRequest) anyerror!?LinearNoBiasPairResult = null,
-
-        /// Apply three previously prepared q/k/v linear slots to the same
-        /// input and return all projected outputs.
-        decoderRuntimeApplyLinearQkv: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest) anyerror!?LinearNoBiasTripleResult = null,
-        decoderRuntimeApplyLinearQkvInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) anyerror!?CT = null,
-        decoderRuntimeApplyLinearInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearRequest, out: CT) anyerror!bool = null,
-        decoderRuntimeBeginPlannedComputeScope: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
-        decoderRuntimeEndPlannedComputeScope: ?*const fn (ctx: *anyopaque) void = null,
-
-        /// Apply an activation inside the backend-owned decoder runtime.
-        decoderRuntimeApplyActivation: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyActivationRequest) anyerror!?CT = null,
-
-        /// Apply tanh-approx GELU backward inside the backend runtime:
-        /// output = upstream_grad * d/dx(gelu(input)).
-        decoderRuntimeApplyGeluBackward: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyGeluBackwardRequest) anyerror!?CT = null,
-
-        /// Execute the hot DeBERTa FFN backward strip as one backend runtime
-        /// unit while returning each graph-visible intermediate.
-        decoderRuntimeFfnGeluBackwardChain: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) anyerror!?DecoderRuntimeFfnGeluBackwardChainResult = null,
-
-        /// Execute the rank-1 DeBERTa FFN backward strip while returning only
-        /// the first branch and final output nodes that remain graph-visible.
-        decoderRuntimeFfnGeluBackwardOutput: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) anyerror!?DecoderRuntimeFfnGeluBackwardOutputResult = null,
-
-        /// Apply elementwise add inside the backend-owned decoder runtime.
-        decoderRuntimeApplyAdd: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyAddRequest) anyerror!?CT = null,
-
-        /// Apply scaled elementwise add inside the backend-owned decoder runtime.
-        decoderRuntimeApplyAddScale: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyAddScaleRequest) anyerror!?CT = null,
-
-        /// Apply `(lhs * lhs_scale + rhs) * output_scale` inside the backend runtime.
-        decoderRuntimeApplyScaledAddScale: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyScaledAddScaleRequest) anyerror!?CT = null,
-
-        /// Apply `lhs * rhs + addend` inside the backend runtime.
-        decoderRuntimeApplyMultiplyAdd: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyMultiplyAddRequest) anyerror!?CT = null,
-
-        /// Apply `lhs0 * rhs0 + lhs1 * rhs1` inside the backend runtime.
-        decoderRuntimeApplyMultiplyAdd2: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyMultiplyAdd2Request) anyerror!?CT = null,
 
         /// Apply a two-linear FFN strip (`linear -> activation -> linear ->
         /// residual add`) inside one backend-owned whole-token submission and
@@ -3507,7 +3574,7 @@ pub const ComputeBackend = struct {
         var controlled = request;
         controlled.control = self.execution_control orelse request.control;
         if (controlled.control) |active| try active.check();
-        if (self.vtable.debertaEmbeddings) |op| {
+        if (self.vtable.regions.relative_encoder.embeddings) |op| {
             const output = try op(self.ptr, &controlled);
             errdefer if (output) |tensor| self.free(tensor);
             if (controlled.control) |active| try active.check();
@@ -3529,7 +3596,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn glinerWordEmbeddings(self: *const ComputeBackend, hidden: CT, words_mask: []const i64, batch: usize, seq_len: usize, hidden_size: usize, num_words: usize) !?CT {
-        if (self.vtable.glinerWordEmbeddings) |op| {
+        if (self.vtable.regions.sequence_projection.firstWordRows) |op| {
             return op(self.ptr, &.{
                 .hidden = hidden,
                 .words_mask = words_mask,
@@ -3549,7 +3616,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn glinerLabelGruCombined(self: *const ComputeBackend, label_embeddings: CT, num_labels: usize, hidden_size: usize) !?CT {
-        if (self.vtable.glinerLabelGruCombined) |op| {
+        if (self.vtable.regions.sequence_projection.gruSummary) |op| {
             return op(self.ptr, &.{
                 .label_embeddings = label_embeddings,
                 .num_labels = num_labels,
@@ -3961,6 +4028,30 @@ pub const ComputeBackend = struct {
         return false;
     }
 
+    /// Publish F32 rows independently of mutable decoder/arena storage. This
+    /// copies on the selected backend; it never stages activations through host.
+    pub fn snapshotRows2D(self: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, start_row: usize, rows: usize, cols: usize) !CT {
+        if (rows == 0 or cols == 0 or rows > std.math.maxInt(i32) or cols > std.math.maxInt(i32)) return error.InvalidShape;
+        if (try self.tensorDType(input) != .f32) return error.UnsupportedTensorType;
+        const count = try std.math.mul(usize, rows, cols);
+        if (count > std.math.maxInt(i32)) return error.InvalidShape;
+        const shape = [_]i32{ @intCast(rows), @intCast(cols) };
+        const output = stable_storage: {
+            // Stable target storage bypasses temporary arena slots. The owned
+            // reshape retains the flat allocation through the published value.
+            if (self.vtable.kernels) |functions| if (functions.allocatePhysicalStorage) |allocate| {
+                const storage = (try allocate(self.ptr, try std.math.mul(usize, count, @sizeOf(f32)))) orelse return error.UnsupportedBackendOp;
+                defer self.free(storage);
+                const dimensions = [_]i64{ @intCast(rows), @intCast(cols) };
+                break :stable_storage try self.primReshape(storage, &dimensions);
+            };
+            break :stable_storage (try self.allocUninitF32Shape(&shape)) orelse return error.UnsupportedBackendOp;
+        };
+        errdefer self.free(output);
+        if (!try self.copyRows2D(allocator, output, 0, input, start_row, rows, cols)) return error.UnsupportedBackendOp;
+        return output;
+    }
+
     /// Whether this backend exposes the device-to-device row-copy primitive.
     /// Callers may use this to choose an in-place layout-preserving algorithm
     /// without probing by partially mutating a destination tensor.
@@ -4025,7 +4116,7 @@ pub const ComputeBackend = struct {
         width: usize,
         dim: usize,
     ) !?CT {
-        if (self.vtable.florenceVisionTailSources) |vision_tail| {
+        if (self.vtable.regions.sequence_projection.spatialTemporalSources) |vision_tail| {
             return vision_tail(self.ptr, tokens, row_embed, col_embed, temporal_embed, batch, height, width, dim);
         }
         return null;
@@ -4039,7 +4130,7 @@ pub const ComputeBackend = struct {
         vision_dim: usize,
         projection_dim: usize,
     ) !?CT {
-        if (self.vtable.florenceProjectImageFeatures) |project| {
+        if (self.vtable.regions.sequence_projection.projectImageFeatures) |project| {
             return project(self.ptr, input, weight, rows, vision_dim, projection_dim);
         }
         return null;
@@ -4246,19 +4337,19 @@ pub const ComputeBackend = struct {
     /// immediately when no frame is active). False means the caller must
     /// fall back to reading the logits row.
     pub fn whisperLogitsStatsEncode(self: *const ComputeBackend, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) !bool {
-        if (self.vtable.whisperLogitsStatsEncode) |f| return f(self.ptr, logits, params, suppress_ids);
+        if (self.vtable.regions.token_selection.encodeLogitsStats) |f| return f(self.ptr, logits, params, suppress_ids);
         return false;
     }
 
     pub fn whisperLogitsStatsRead(self: *const ComputeBackend, slot: usize, out: *WhisperLogitsStatsRaw) bool {
-        if (self.vtable.whisperLogitsStatsRead) |f| return f(self.ptr, slot, out);
+        if (self.vtable.regions.token_selection.readLogitsStats) |f| return f(self.ptr, slot, out);
         return false;
     }
 
     /// Seed the device timestamp-grammar state read by `whisperLogitsStatsEncode`
     /// in device-window mode. Only valid while no frame is in flight.
     pub fn whisperGrammarWrite(self: *const ComputeBackend, state: *const WhisperGrammarState) bool {
-        if (self.vtable.whisperGrammarWrite) |f| return f(self.ptr, state);
+        if (self.vtable.regions.token_selection.writeGrammar) |f| return f(self.ptr, state);
         return false;
     }
 
@@ -4274,21 +4365,21 @@ pub const ComputeBackend = struct {
     /// running, so the caller can keep one frame in flight behind the one
     /// it encodes. Returns false when the backend cannot pipeline.
     pub fn decoderRuntimeSetWhisperPipelinedFrames(self: *const ComputeBackend, enabled: bool) bool {
-        if (self.vtable.decoderRuntimeSetWhisperPipelinedFrames) |f| return f(self.ptr, enabled);
+        if (self.vtable.regions.decoder.setPipelinedFrames) |f| return f(self.ptr, enabled);
         return false;
     }
 
     /// Submit the active frame without waiting; pair with
     /// `decoderRuntimeWaitSubmittedFrame`.
     pub fn decoderRuntimeSubmitFrame(self: *const ComputeBackend) !void {
-        if (self.vtable.decoderRuntimeSubmitFrame) |op| return op(self.ptr);
+        if (self.vtable.regions.decoder.submitFrame) |op| return op(self.ptr);
         return error.UnsupportedOperation;
     }
 
     /// Wait for the frame submitted by `decoderRuntimeSubmitFrame`; a no-op
     /// when none is in flight.
     pub fn decoderRuntimeWaitSubmittedFrame(self: *const ComputeBackend) !void {
-        if (self.vtable.decoderRuntimeWaitSubmittedFrame) |op| return op(self.ptr);
+        if (self.vtable.regions.decoder.waitSubmittedFrame) |op| return op(self.ptr);
     }
 
     pub fn addLayerNorm(self: *const ComputeBackend, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
@@ -4380,7 +4471,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn glinerGatherConcatRelu(self: *const ComputeBackend, request: *const GlinerGatherConcatReluRequest) !?CT {
-        if (self.vtable.glinerGatherConcatRelu) |f| return f(self.ptr, request);
+        if (self.vtable.regions.sequence_projection.gatherConcatRelu) |f| return f(self.ptr, request);
         return null;
     }
 
@@ -4512,10 +4603,14 @@ pub const ComputeBackend = struct {
     }
 
     pub fn layaActionFeatures(self: *const ComputeBackend, request: *const LayaActionFeaturesRequest) !?CT {
-        if (self.vtable.layaActionFeatures) |f| return try f(self.ptr, request);
+        if (self.vtable.regions.action_scoring.features) |f| return try f(self.ptr, request);
         return null;
     }
 
+    /// Dense attention uses token-major [batch*seq, heads*dim] tensors.
+    /// Native, Metal and CUDA also honor explicit head-major 3D/4D storage;
+    /// output retains the input's physical layout. Model adapters can keep QKV
+    /// linear outputs token-major instead of inserting layout conversions.
     pub fn scaledDotProductAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
         return self.vtable.scaledDotProductAttention(self.ptr, Q, K, V, mask, attn_bias, batch, seq_len, num_heads, head_dim);
     }
@@ -4523,7 +4618,7 @@ pub const ComputeBackend = struct {
     /// Unmasked, token-major Gemma4 vision attention. Providers without the
     /// qualified model-specific kernel retain portable unmasked attention.
     pub fn scaledDotProductAttentionGemma4Vision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
-        if (self.vtable.scaledDotProductAttentionGemma4Vision) |f| {
+        if (self.vtable.regions.vision.unmaskedWarpReduced) |f| {
             return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
         }
         return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
@@ -4532,7 +4627,7 @@ pub const ComputeBackend = struct {
     /// EmbeddingGemma 2's Gemma4-shaped vision tower requires F32 inputs and
     /// probabilities throughout attention to preserve pretrained retrieval.
     pub fn scaledDotProductAttentionEmbeddingGemma2Vision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
-        if (self.vtable.scaledDotProductAttentionEmbeddingGemma2Vision) |f| {
+        if (self.vtable.regions.vision.unmaskedRetrieval) |f| {
             return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
         }
         return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
@@ -4541,14 +4636,14 @@ pub const ComputeBackend = struct {
     /// Runs Qwen3-VL's unmasked vision attention. Backends that do not expose
     /// a model-scoped route retain the regular portable implementation.
     pub fn scaledDotProductAttentionQwen3VlVision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
-        if (self.vtable.scaledDotProductAttentionQwen3VlVision) |f| {
+        if (self.vtable.regions.vision.unmaskedTensorCore) |f| {
             return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
         }
         return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
     }
 
     pub fn tryScaledDotProductAttentionEmbeddingGemma2Vision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
-        if (self.vtable.tryScaledDotProductAttentionEmbeddingGemma2Vision) |f| {
+        if (self.vtable.regions.vision.tryUnmaskedRetrieval) |f| {
             return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
         }
         return null;
@@ -4562,12 +4657,12 @@ pub const ComputeBackend = struct {
     }
 
     pub fn runEmbeddingGemma2VisionTower(self: *const ComputeBackend, input: CT, sequence: usize, grid_x: usize, grid_y: usize, batch: usize) !?CT {
-        const op = self.vtable.runEmbeddingGemma2VisionTower orelse return null;
+        const op = self.vtable.regions.vision.encoderTower orelse return null;
         return op(self.ptr, input, sequence, grid_x, grid_y, batch, self.execution_control);
     }
 
     pub fn preprocessEmbeddingGemma2ImagePatchesInto(self: *const ComputeBackend, destination: CT, row_offset: usize, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) !bool {
-        const op = self.vtable.preprocessEmbeddingGemma2ImagePatchesInto orelse return false;
+        const op = self.vtable.regions.vision.imagePatchesInto orelse return false;
         try self.checkExecutionControl();
         const result = try op(self.ptr, destination, row_offset, rgb, width, height, stride, target_width, target_height);
         try self.checkExecutionControl();
@@ -4575,7 +4670,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn preprocessEmbeddingGemma2ImagePatches(self: *const ComputeBackend, rgb: []const u8, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32) !?CT {
-        const op = self.vtable.preprocessEmbeddingGemma2ImagePatches orelse return null;
+        const op = self.vtable.regions.vision.imagePatches orelse return null;
         return op(self.ptr, rgb, width, height, stride, target_width, target_height);
     }
 
@@ -4642,7 +4737,7 @@ pub const ComputeBackend = struct {
     pub fn debertaTrainingAttentionV1(self: *const ComputeBackend, qkv: CT, relative: CT, control_i32: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs) !CT {
         _ = try attrs.layout();
         try self.checkExecutionControl();
-        const op = self.vtable.debertaTrainingAttentionV1 orelse return error.DebertaTrainingAttentionProfileUnavailable;
+        const op = self.vtable.regions.relative_encoder.trainingAttention orelse return error.DebertaTrainingAttentionProfileUnavailable;
         const output = try op(self.ptr, qkv, relative, control_i32, attrs, self.execution_control);
         errdefer self.free(output);
         try self.checkExecutionControl();
@@ -4652,7 +4747,7 @@ pub const ComputeBackend = struct {
     pub fn debertaTrainingAttentionBackwardV1(self: *const ComputeBackend, qkv: CT, relative: CT, control_i32: CT, dO: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs) !CT {
         _ = try attrs.layout();
         try self.checkExecutionControl();
-        const op = self.vtable.debertaTrainingAttentionBackwardV1 orelse return error.DebertaTrainingAttentionProfileUnavailable;
+        const op = self.vtable.regions.relative_encoder.trainingAttentionBackward orelse return error.DebertaTrainingAttentionProfileUnavailable;
         const output = try op(self.ptr, qkv, relative, control_i32, dO, attrs, self.execution_control);
         errdefer self.free(output);
         try self.checkExecutionControl();
@@ -4682,7 +4777,7 @@ pub const ComputeBackend = struct {
     pub fn modernBertTrainingAttentionV1(self: *const ComputeBackend, qkv: CT, control_i32: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs) !CT {
         _ = try attrs.layout();
         try self.checkExecutionControl();
-        const op = self.vtable.modernBertTrainingAttentionV1 orelse return error.ModernBertTrainingAttentionProfileUnavailable;
+        const op = self.vtable.regions.window_attention.trainingForward orelse return error.ModernBertTrainingAttentionProfileUnavailable;
         const output = try op(self.ptr, qkv, control_i32, attrs, self.execution_control);
         errdefer self.free(output);
         try self.checkExecutionControl();
@@ -4692,7 +4787,7 @@ pub const ComputeBackend = struct {
     pub fn modernBertTrainingAttentionBackwardV1(self: *const ComputeBackend, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs) !CT {
         _ = try attrs.layout();
         try self.checkExecutionControl();
-        const op = self.vtable.modernBertTrainingAttentionBackwardV1 orelse return error.ModernBertTrainingAttentionProfileUnavailable;
+        const op = self.vtable.regions.window_attention.trainingBackward orelse return error.ModernBertTrainingAttentionProfileUnavailable;
         const output = try op(self.ptr, qkv, control_i32, dO, attrs, self.execution_control);
         errdefer self.free(output);
         try self.checkExecutionControl();
@@ -4988,7 +5083,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn gemma4AudioLocalAttention(self: *const ComputeBackend, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) !?CT {
-        const op = self.vtable.gemma4AudioLocalAttention orelse return null;
+        const op = self.vtable.regions.audio_attention.localRelative orelse return null;
         return op(self.ptr, q, k, v, rel, q_dim_scales, valid, params);
     }
 
@@ -5314,6 +5409,23 @@ pub const ComputeBackend = struct {
         }
     }
 
+    pub fn readFloat32Into(self: *const ComputeBackend, tensor: CT, output: []f32) !bool {
+        try self.checkExecutionControl();
+        const functions = self.vtable.kernels orelse return false;
+        const read = functions.readFloat32Into orelse return false;
+        return read(self.ptr, tensor, output);
+    }
+
+    pub fn retainImmutableTensor(self: *const ComputeBackend, tensor: CT, allocator: std.mem.Allocator) !?CT {
+        if (self.vtable.kernels) |functions| if (functions.retainImmutableTensor) |retain| return retain(self.ptr, tensor);
+        const dims = try self.tensorShape(tensor, allocator);
+        defer allocator.free(dims);
+        if (dims.len > 8) return error.UnsupportedShape;
+        var shape: [8]i32 = undefined;
+        for (dims, 0..) |dim, axis| shape[axis] = std.math.cast(i32, dim) orelse return error.UnsupportedShape;
+        return self.cloneTensorShape(tensor, shape[0..dims.len]);
+    }
+
     pub fn cloneTensorShape(self: *const ComputeBackend, tensor: CT, shape: []const i32) !?CT {
         if (self.vtable.cloneTensorShape) |clone_tensor_shape| {
             return clone_tensor_shape(self.ptr, tensor, shape);
@@ -5465,7 +5577,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn decoderRuntimeArgmaxRowsSuppress(self: *const ComputeBackend, tensor: CT, row_start: usize, row_count: usize, dim: usize, suppress_token_ids: []const i32, allocator: std.mem.Allocator) !?[]u32 {
-        if (self.vtable.decoderRuntimeArgmaxRowsSuppress) |argmax_rows_suppress| {
+        if (self.vtable.regions.decoder.argmaxRowsSuppress) |argmax_rows_suppress| {
             return argmax_rows_suppress(self.ptr, tensor, row_start, row_count, dim, suppress_token_ids, allocator);
         }
         return null;
@@ -5514,55 +5626,55 @@ pub const ComputeBackend = struct {
     }
 
     pub fn gemma4MtpMaskedArgmax(self: *const ComputeBackend, request: *const Gemma4MtpMaskedArgmaxRequest) !?u32 {
-        if (self.vtable.gemma4MtpMaskedArgmax) |op| {
+        if (self.vtable.regions.speculative.maskedArgmax) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn gemma4MtpMaskedSelect(self: *const ComputeBackend, request: *const Gemma4MtpMaskedSelectRequest) !?u32 {
-        if (self.vtable.gemma4MtpMaskedSelect) |op| {
+        if (self.vtable.regions.speculative.maskedSelect) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn gemma4MtpMaskedSelectFromHidden(self: *const ComputeBackend, request: *const Gemma4MtpMaskedSelectFromHiddenRequest) !?u32 {
-        if (self.vtable.gemma4MtpMaskedSelectFromHidden) |op| {
+        if (self.vtable.regions.speculative.maskedSelectFromHidden) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn gemma4MtpPreproject(self: *const ComputeBackend, request: *const Gemma4MtpPreprojectRequest) !?CT {
-        if (self.vtable.gemma4MtpPreproject) |op| {
+        if (self.vtable.regions.speculative.preproject) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn gemma4MtpVerifyCommit(self: *const ComputeBackend, request: *const Gemma4MtpVerifyCommitRequest) !?Gemma4MtpVerifyCommitResult {
-        if (self.vtable.gemma4MtpVerifyCommit) |op| {
+        if (self.vtable.regions.speculative.verifyCommit) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimePrepareGreedy(self: *const ComputeBackend, request: *const DecoderRuntimeGreedyRequest) !bool {
-        if (self.vtable.decoderRuntimePrepareGreedy) |op| {
+        if (self.vtable.regions.decoder.prepareGreedy) |op| {
             return op(self.ptr, request);
         }
         return false;
     }
 
     pub fn decoderRuntimeResetState(self: *const ComputeBackend) !void {
-        if (self.vtable.decoderRuntimeResetState) |op| {
+        if (self.vtable.regions.decoder.resetState) |op| {
             return op(self.ptr);
         }
     }
 
     pub fn decoderRuntimeDecode(self: *const ComputeBackend, request: *const DecoderRuntimeDecodeRequest) !bool {
-        if (self.vtable.decoderRuntimeDecode) |op| {
+        if (self.vtable.regions.decoder.decode) |op| {
             return op(self.ptr, request);
         }
         return false;
@@ -5573,61 +5685,61 @@ pub const ComputeBackend = struct {
     }
 
     pub fn decoderRuntimePlanPrefillFrame(self: *const ComputeBackend, request: *const DecoderRuntimePrefillFramePlanRequest) !bool {
-        if (self.vtable.decoderRuntimePlanPrefillFrame) |op| {
+        if (self.vtable.regions.decoder.planPrefillFrame) |op| {
             return op(self.ptr, request);
         }
         return false;
     }
 
     pub fn decoderRuntimeExecuteGraphCommandPlanFrame(self: *const ComputeBackend, request: *const DecoderRuntimeGraphCommandPlanFrameRequest) !bool {
-        if (self.vtable.decoderRuntimeExecuteGraphCommandPlanFrame) |op| {
+        if (self.vtable.regions.decoder.executeGraphCommandPlanFrame) |op| {
             return op(self.ptr, request);
         }
         return false;
     }
 
     pub fn debertaEncoderPlanFrame(self: *const ComputeBackend, request: *const DebertaEncoderFramePlanRequest) !bool {
-        if (self.vtable.debertaEncoderPlanFrame) |op| {
+        if (self.vtable.regions.relative_encoder.planFrame) |op| {
             return op(self.ptr, request);
         }
         return false;
     }
 
     pub fn debertaRelativeEmbeddings(self: *const ComputeBackend, request: *const DebertaRelativeEmbeddingRequest) !?CT {
-        const op = self.vtable.debertaRelativeEmbeddings orelse return null;
+        const op = self.vtable.regions.relative_encoder.relativeEmbeddings orelse return null;
         return op(self.ptr, request);
     }
 
     pub fn debertaEncoderLayer(self: *const ComputeBackend, request: *const DebertaEncoderLayerRequest) !?CT {
-        if (self.vtable.debertaEncoderLayer) |op| {
+        if (self.vtable.regions.relative_encoder.layer) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn nomicBertEncoderLayer(self: *const ComputeBackend, request: *const NomicBertEncoderLayerRequest) !?CT {
-        if (self.vtable.nomicBertEncoderLayer) |op| {
+        if (self.vtable.regions.sequence_encoder.rotaryLayer) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn nomicBertPoolNormalize(self: *const ComputeBackend, request: *const NomicBertPoolNormalizeRequest) !?CT {
-        if (self.vtable.nomicBertPoolNormalize) |op| {
+        if (self.vtable.regions.sequence_encoder.poolNormalize) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeBeginFrame(self: *const ComputeBackend) !bool {
-        if (self.vtable.decoderRuntimeBeginFrame) |op| {
+        if (self.vtable.regions.decoder.beginFrame) |op| {
             return op(self.ptr);
         }
         return false;
     }
 
     pub fn decoderRuntimeSetActiveFrameRegime(self: *const ComputeBackend, regime: DecoderRuntimeFrameRegime) !void {
-        if (self.vtable.decoderRuntimeSetActiveFrameRegime) |op| {
+        if (self.vtable.regions.decoder.setActiveFrameRegime) |op| {
             return op(self.ptr, regime);
         }
     }
@@ -5636,63 +5748,63 @@ pub const ComputeBackend = struct {
         self: *const ComputeBackend,
         region: DecoderRuntimeComputeRegion,
     ) !DecoderRuntimeComputeRegionScope {
-        const op = self.vtable.decoderRuntimePushComputeRegion orelse return .{};
+        const op = self.vtable.regions.decoder.pushComputeRegion orelse return .{};
         const previous = (try op(self.ptr, region)) orelse return .{};
         return .{ .backend = self, .previous = previous, .active = true };
     }
 
     pub fn decoderRuntimePopComputeRegion(self: *const ComputeBackend, previous: usize) !void {
-        if (self.vtable.decoderRuntimePopComputeRegion) |op| {
+        if (self.vtable.regions.decoder.popComputeRegion) |op| {
             try op(self.ptr, previous);
         }
     }
 
     pub fn decoderRuntimeHasActiveFrame(self: *const ComputeBackend) bool {
-        if (self.vtable.decoderRuntimeHasActiveFrame) |op| {
+        if (self.vtable.regions.decoder.hasActiveFrame) |op| {
             return op(self.ptr);
         }
         return false;
     }
 
     pub fn decoderRuntimeHasSubmittedFrame(self: *const ComputeBackend) bool {
-        if (self.vtable.decoderRuntimeHasSubmittedFrame) |op| return op(self.ptr);
+        if (self.vtable.regions.decoder.hasSubmittedFrame) |op| return op(self.ptr);
         return false;
     }
 
     pub fn decoderRuntimeBeginMoeCheckpoint(self: *const ComputeBackend, layer_count: usize, top_k: usize) !bool {
-        if (self.vtable.decoderRuntimeBeginMoeCheckpoint) |op| {
+        if (self.vtable.regions.decoder.beginMoeCheckpoint) |op| {
             return op(self.ptr, layer_count, top_k);
         }
         return false;
     }
 
     pub fn decoderRuntimeFinishMoeCheckpoint(self: *const ComputeBackend) !bool {
-        if (self.vtable.decoderRuntimeFinishMoeCheckpoint) |op| {
+        if (self.vtable.regions.decoder.finishMoeCheckpoint) |op| {
             return op(self.ptr);
         }
         return false;
     }
 
     pub fn decoderRuntimeSetMoeReplayMode(self: *const ComputeBackend, enabled: bool) !void {
-        if (self.vtable.decoderRuntimeSetMoeReplayMode) |op| {
+        if (self.vtable.regions.decoder.setMoeReplayMode) |op| {
             try op(self.ptr, enabled);
         }
     }
 
     pub fn decoderRuntimeSubmitAndWaitFrame(self: *const ComputeBackend) !void {
-        if (self.vtable.decoderRuntimeSubmitAndWaitFrame) |op| {
+        if (self.vtable.regions.decoder.submitAndWaitFrame) |op| {
             return op(self.ptr);
         }
     }
 
     pub fn decoderRuntimeFlushActiveFrame(self: *const ComputeBackend) !void {
-        if (self.vtable.decoderRuntimeFlushActiveFrame) |op| {
+        if (self.vtable.regions.decoder.flushActiveFrame) |op| {
             return op(self.ptr);
         }
     }
 
     pub fn decoderRuntimeCancelFrame(self: *const ComputeBackend) !void {
-        if (self.vtable.decoderRuntimeCancelFrame) |op| {
+        if (self.vtable.regions.decoder.cancelFrame) |op| {
             return op(self.ptr);
         }
     }
@@ -5738,7 +5850,7 @@ pub const ComputeBackend = struct {
         current_kv_tokens: usize,
         configured_layer_count: usize,
     ) !DecoderRuntimePrepareReuseResult {
-        if (self.vtable.decoderRuntimePrepareOrReuseFamily) |op| {
+        if (self.vtable.regions.decoder.prepareOrReuseFamily) |op| {
             return op(self.ptr, allocator, gpt_config, current_kv_tokens, configured_layer_count);
         }
         return .{};
@@ -5750,7 +5862,7 @@ pub const ComputeBackend = struct {
         gpt_config: gpt_model.Config,
         configured_layer_count: usize,
     ) !DecoderRuntimePrepareReuseResult {
-        if (self.vtable.decoderRuntimePrepareOrReuseTextPrefill) |op| {
+        if (self.vtable.regions.decoder.prepareOrReuseTextPrefill) |op| {
             return op(self.ptr, allocator, gpt_config, configured_layer_count, self.execution_control);
         }
         return .{};
@@ -5760,6 +5872,7 @@ pub const ComputeBackend = struct {
         if (self.vtable.debugTimingSnapshot) |op| {
             return op(self.ptr);
         }
+        if (self.kind() == .native) return .{ .runtime = .{ .counters = .{ .kernel_dispatches = 0, .graph_submissions = 0, .frame_submissions = 0, .synchronizations = 0, .physical_allocations = 0, .physical_frees = 0 }, .memory = .{ .scope = .backend_device_buffers, .live_bytes = 0, .lifetime_peak_bytes = 0 } } };
         return .{};
     }
 
@@ -5775,189 +5888,189 @@ pub const ComputeBackend = struct {
     }
 
     pub fn decoderRuntimeReady(self: *const ComputeBackend) bool {
-        if (self.vtable.decoderRuntimeReady) |op| {
+        if (self.vtable.regions.decoder.ready) |op| {
             return op(self.ptr);
         }
         return false;
     }
 
     pub fn decoderRuntimeAbsoluteEmbeddingsPrepared(self: *const ComputeBackend) bool {
-        if (self.vtable.decoderRuntimeAbsoluteEmbeddingsPrepared) |op| {
+        if (self.vtable.regions.decoder.absoluteEmbeddingsPrepared) |op| {
             return op(self.ptr);
         }
         return false;
     }
 
     pub fn decoderRuntimePrepareAbsoluteEmbeddings(self: *const ComputeBackend, request: *const DecoderRuntimePrepareAbsoluteEmbeddingsRequest) !bool {
-        if (self.vtable.decoderRuntimePrepareAbsoluteEmbeddings) |op| {
+        if (self.vtable.regions.decoder.prepareAbsoluteEmbeddings) |op| {
             return op(self.ptr, request);
         }
         return false;
     }
 
     pub fn decoderRuntimeEmbedAbsolutePosition(self: *const ComputeBackend, request: *const DecoderRuntimeEmbedAbsolutePositionRequest) !?CT {
-        if (self.vtable.decoderRuntimeEmbedAbsolutePosition) |op| {
+        if (self.vtable.regions.decoder.embedAbsolutePosition) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimePrepareLayerNorm(self: *const ComputeBackend, request: *const DecoderRuntimePrepareLayerNormRequest) !bool {
-        if (self.vtable.decoderRuntimePrepareLayerNorm) |op| {
+        if (self.vtable.regions.decoder.prepareLayerNorm) |op| {
             return op(self.ptr, request);
         }
         return false;
     }
 
     pub fn decoderRuntimeLayerNormSlotPrepared(self: *const ComputeBackend, slot: usize, hidden_size: usize) bool {
-        if (self.vtable.decoderRuntimeLayerNormSlotPrepared) |op| {
+        if (self.vtable.regions.decoder.layerNormSlotPrepared) |op| {
             return op(self.ptr, slot, hidden_size);
         }
         return false;
     }
 
     pub fn decoderRuntimeEnsureLayerNormSlot(self: *const ComputeBackend, request: *const DecoderRuntimeEnsureLayerNormSlotRequest) !?usize {
-        if (self.vtable.decoderRuntimeEnsureLayerNormSlot) |op| {
+        if (self.vtable.regions.decoder.ensureLayerNormSlot) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyLayerNorm(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLayerNormRequest) !?CT {
-        if (self.vtable.decoderRuntimeApplyLayerNorm) |op| {
+        if (self.vtable.regions.decoder.applyLayerNorm) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimePrepareRmsNorm(self: *const ComputeBackend, request: *const DecoderRuntimePrepareRmsNormRequest) !bool {
-        if (self.vtable.decoderRuntimePrepareRmsNorm) |op| {
+        if (self.vtable.regions.decoder.prepareRmsNorm) |op| {
             return op(self.ptr, request);
         }
         return false;
     }
 
     pub fn decoderRuntimeEnsureRmsNormSlot(self: *const ComputeBackend, request: *const DecoderRuntimeEnsureRmsNormSlotRequest) !?usize {
-        if (self.vtable.decoderRuntimeEnsureRmsNormSlot) |op| {
+        if (self.vtable.regions.decoder.ensureRmsNormSlot) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyRmsNorm(self: *const ComputeBackend, request: *const DecoderRuntimeApplyRmsNormRequest) !?CT {
-        if (self.vtable.decoderRuntimeApplyRmsNorm) |op| {
+        if (self.vtable.regions.decoder.applyRmsNorm) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyLayerNormLinearArgmax(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLayerNormLinearArgmaxRequest) !?usize {
-        if (self.vtable.decoderRuntimeApplyLayerNormLinearArgmax) |op| {
+        if (self.vtable.regions.decoder.applyLayerNormLinearArgmax) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyLayerNormLinear(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLayerNormLinearRequest) !?CT {
-        if (self.vtable.decoderRuntimeApplyLayerNormLinear) |op| {
+        if (self.vtable.regions.decoder.applyLayerNormLinear) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyLayerNormLinearSample(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLayerNormLinearSampleRequest) !?usize {
-        if (self.vtable.decoderRuntimeApplyLayerNormLinearSample) |op| {
+        if (self.vtable.regions.decoder.applyLayerNormLinearSample) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyRmsNormLinearArgmax(self: *const ComputeBackend, request: *const DecoderRuntimeApplyRmsNormLinearArgmaxRequest) !?usize {
-        if (self.vtable.decoderRuntimeApplyRmsNormLinearArgmax) |op| {
+        if (self.vtable.regions.decoder.applyRmsNormLinearArgmax) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyRmsNormLinear(self: *const ComputeBackend, request: *const DecoderRuntimeApplyRmsNormLinearRequest) !?CT {
-        if (self.vtable.decoderRuntimeApplyRmsNormLinear) |op| {
+        if (self.vtable.regions.decoder.applyRmsNormLinear) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyRmsNormLinearSample(self: *const ComputeBackend, request: *const DecoderRuntimeApplyRmsNormLinearSampleRequest) !?usize {
-        if (self.vtable.decoderRuntimeApplyRmsNormLinearSample) |op| {
+        if (self.vtable.regions.decoder.applyRmsNormLinearSample) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeSampleResidentLogits(self: *const ComputeBackend, request: *const DecoderRuntimeSampleResidentLogitsRequest) !?usize {
-        if (self.vtable.decoderRuntimeSampleResidentLogits) |op| {
+        if (self.vtable.regions.decoder.sampleResidentLogits) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeResidentLogitsSamplingSupported(self: *const ComputeBackend, request: *const DecoderRuntimeSampleResidentLogitsRequest) bool {
-        if (self.vtable.decoderRuntimeResidentLogitsSamplingSupported) |op| {
+        if (self.vtable.regions.decoder.residentLogitsSamplingSupported) |op| {
             return op(self.ptr, request);
         }
         return false;
     }
 
     pub fn decoderRuntimePrepareLinear(self: *const ComputeBackend, request: *const DecoderRuntimePrepareLinearRequest) !bool {
-        if (self.vtable.decoderRuntimePrepareLinear) |op| {
+        if (self.vtable.regions.decoder.prepareLinear) |op| {
             return op(self.ptr, request);
         }
         return false;
     }
 
     pub fn decoderRuntimeLinearSlotPrepared(self: *const ComputeBackend, slot: usize, in_dim: usize, out_dim: usize) bool {
-        if (self.vtable.decoderRuntimeLinearSlotPrepared) |op| {
+        if (self.vtable.regions.decoder.linearSlotPrepared) |op| {
             return op(self.ptr, slot, in_dim, out_dim);
         }
         return false;
     }
 
     pub fn decoderRuntimeEnsureLinearSlot(self: *const ComputeBackend, request: *const DecoderRuntimeEnsureLinearSlotRequest) !?usize {
-        if (self.vtable.decoderRuntimeEnsureLinearSlot) |op| {
+        if (self.vtable.regions.decoder.ensureLinearSlot) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyLinear(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearRequest) !?CT {
-        if (self.vtable.decoderRuntimeApplyLinear) |op| {
+        if (self.vtable.regions.decoder.applyLinear) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyLinearLayerNorm(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearLayerNormRequest) !?CT {
-        if (self.vtable.decoderRuntimeApplyLinearLayerNorm) |op| {
+        if (self.vtable.regions.decoder.applyLinearLayerNorm) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyFfnLayerNorm(self: *const ComputeBackend, request: *const DecoderRuntimeApplyFfnLayerNormRequest) !?CT {
-        if (self.vtable.decoderRuntimeApplyFfnLayerNorm) |op| {
+        if (self.vtable.regions.decoder.applyFfnLayerNorm) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyLinearArgmax(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearArgmaxRequest) !?usize {
-        if (self.vtable.decoderRuntimeApplyLinearArgmax) |op| {
+        if (self.vtable.regions.decoder.applyLinearArgmax) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyLinearPair(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearPairRequest) !?LinearNoBiasPairResult {
-        if (self.vtable.decoderRuntimeApplyLinearPair) |op| {
+        if (self.vtable.regions.decoder.applyLinearPair) |op| {
             return op(self.ptr, request);
         }
         return null;
@@ -5967,7 +6080,7 @@ pub const ComputeBackend = struct {
     /// such as rows of a resident cache. False (nothing written) when the
     /// backend cannot place the output.
     pub fn decoderRuntimeApplyLinearInto(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearRequest, out: CT) !bool {
-        if (self.vtable.decoderRuntimeApplyLinearInto) |op| return op(self.ptr, request, out);
+        if (self.vtable.regions.decoder.applyLinearInto) |op| return op(self.ptr, request, out);
         return false;
     }
 
@@ -5975,7 +6088,7 @@ pub const ComputeBackend = struct {
     /// `v_out` (device row views, e.g. rows of a resident cache) and Q is
     /// returned. Null when the backend cannot place the outputs.
     pub fn decoderRuntimeApplyLinearQkvInto(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) !?CT {
-        if (self.vtable.decoderRuntimeApplyLinearQkvInto) |op| return op(self.ptr, request, k_out, v_out);
+        if (self.vtable.regions.decoder.applyLinearQkvInto) |op| return op(self.ptr, request, k_out, v_out);
         return null;
     }
 
@@ -5984,79 +6097,79 @@ pub const ComputeBackend = struct {
     /// instead of one encoder per op. Requires an active frame; returns
     /// false when unsupported.
     pub fn decoderRuntimeBeginPlannedComputeScope(self: *const ComputeBackend) !bool {
-        if (self.vtable.decoderRuntimeBeginPlannedComputeScope) |op| return op(self.ptr);
+        if (self.vtable.regions.decoder.beginPlannedComputeScope) |op| return op(self.ptr);
         return false;
     }
 
     pub fn decoderRuntimeEndPlannedComputeScope(self: *const ComputeBackend) void {
-        if (self.vtable.decoderRuntimeEndPlannedComputeScope) |op| op(self.ptr);
+        if (self.vtable.regions.decoder.endPlannedComputeScope) |op| op(self.ptr);
     }
 
     pub fn decoderRuntimeApplyLinearQkv(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearQkvRequest) !?LinearNoBiasTripleResult {
-        if (self.vtable.decoderRuntimeApplyLinearQkv) |op| {
+        if (self.vtable.regions.decoder.applyLinearQkv) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyActivation(self: *const ComputeBackend, request: *const DecoderRuntimeApplyActivationRequest) !?CT {
-        if (self.vtable.decoderRuntimeApplyActivation) |op| {
+        if (self.vtable.regions.decoder.applyActivation) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyGeluBackward(self: *const ComputeBackend, request: *const DecoderRuntimeApplyGeluBackwardRequest) !?CT {
-        if (self.vtable.decoderRuntimeApplyGeluBackward) |op| {
+        if (self.vtable.regions.decoder.applyGeluBackward) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeFfnGeluBackwardChain(self: *const ComputeBackend, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) !?DecoderRuntimeFfnGeluBackwardChainResult {
-        if (self.vtable.decoderRuntimeFfnGeluBackwardChain) |op| {
+        if (self.vtable.regions.decoder.ffnGeluBackwardChain) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeFfnGeluBackwardOutput(self: *const ComputeBackend, request: *const DecoderRuntimeFfnGeluBackwardChainRequest) !?DecoderRuntimeFfnGeluBackwardOutputResult {
-        if (self.vtable.decoderRuntimeFfnGeluBackwardOutput) |op| {
+        if (self.vtable.regions.decoder.ffnGeluBackwardOutput) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyAdd(self: *const ComputeBackend, request: *const DecoderRuntimeApplyAddRequest) !?CT {
-        if (self.vtable.decoderRuntimeApplyAdd) |op| {
+        if (self.vtable.regions.decoder.applyAdd) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyAddScale(self: *const ComputeBackend, request: *const DecoderRuntimeApplyAddScaleRequest) !?CT {
-        if (self.vtable.decoderRuntimeApplyAddScale) |op| {
+        if (self.vtable.regions.decoder.applyAddScale) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyScaledAddScale(self: *const ComputeBackend, request: *const DecoderRuntimeApplyScaledAddScaleRequest) !?CT {
-        if (self.vtable.decoderRuntimeApplyScaledAddScale) |op| {
+        if (self.vtable.regions.decoder.applyScaledAddScale) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyMultiplyAdd(self: *const ComputeBackend, request: *const DecoderRuntimeApplyMultiplyAddRequest) !?CT {
-        if (self.vtable.decoderRuntimeApplyMultiplyAdd) |op| {
+        if (self.vtable.regions.decoder.applyMultiplyAdd) |op| {
             return op(self.ptr, request);
         }
         return null;
     }
 
     pub fn decoderRuntimeApplyMultiplyAdd2(self: *const ComputeBackend, request: *const DecoderRuntimeApplyMultiplyAdd2Request) !?CT {
-        if (self.vtable.decoderRuntimeApplyMultiplyAdd2) |op| {
+        if (self.vtable.regions.decoder.applyMultiplyAdd2) |op| {
             return op(self.ptr, request);
         }
         return null;
@@ -6413,7 +6526,7 @@ test "DeBERTa embeddings forward controls and release cancelled backend outputs"
                 .return_null = case == .null_output or case == .cancelled_null,
             };
             var vtable: ComputeBackend.VTable = undefined;
-            vtable.debertaEmbeddings = Fake.embeddings;
+            vtable.regions.relative_encoder.embeddings = Fake.embeddings;
             vtable.freeTensor = Fake.free;
             const cb = ComputeBackend{
                 .ptr = &fake,
@@ -6504,8 +6617,8 @@ test "packed boundary QKV releases all outputs and cancels its owned scope on re
         var probe = Probe{ .cancelled = case == .pre_cancel };
         var fake = Fake{ .probe = &probe, .cancel_during = case == .post_cancel };
         var vtable: ComputeBackend.VTable = undefined;
-        vtable.glinerBoundaryPackedQkv = Fake.packedOp;
-        vtable.glinerBoundaryScope = Fake.scope;
+        vtable.regions.relative_boundary.packedQkv = Fake.packedOp;
+        vtable.regions.relative_boundary.scope = Fake.scope;
         vtable.freeTensor = Fake.free;
         const cb = ComputeBackend{ .ptr = &fake, .vtable = &vtable, .execution_control = probe.control() };
         const marker: CT = @ptrCast(&fake.outputs[0]);
@@ -6752,5 +6865,47 @@ test "embeddinggemma2 streamed FFN restores controls and releases post-cancel ou
 }
 
 test {
+    _ = kernel_descriptor;
     _ = @import("embedding_vision_plan.zig");
+}
+
+test "MTP shared verify decision covers correction bonus EOS and checked geometry" {
+    var choices = [_]u32{ 3, 5, 7, 11 };
+    const drafts = [_]i64{ 3, 5, 7 };
+    var request = Gemma4MtpVerifyCommitRequest{ .input = @ptrFromInt(8), .weight = @ptrFromInt(16), .rows = 4, .in_dim = 1, .out_dim = 12, .suppress_token_ids = &.{}, .draft_tokens = &drafts, .eos_token_ids = &.{ -1, 11 }, .accept_bonus = true, .allocator = std.testing.allocator };
+    const all = try request.classifyTargetChoices(&choices);
+    try std.testing.expectEqual(@as(usize, 3), all.matched_drafts);
+    try std.testing.expectEqual(@as(usize, 4), all.accepted);
+    try std.testing.expect(all.had_bonus and all.hit_eos and all.commit_forward_required);
+    try std.testing.expect(!all.target_choices_owned and all.accepted_hidden_row == null);
+    request.accept_bonus = false;
+    const skipped = try request.classifyTargetChoices(&choices);
+    try std.testing.expect(skipped.bonus_skipped and !skipped.commit_forward_required and !skipped.hit_eos);
+    try std.testing.expectEqual(@as(?usize, 2), skipped.accepted_hidden_row);
+    for (0..drafts.len) |mismatch| {
+        choices = .{ 3, 5, 7, 11 };
+        choices[mismatch] = 11;
+        const result = try request.classifyTargetChoices(&choices);
+        try std.testing.expectEqual(mismatch, result.matched_drafts);
+        try std.testing.expectEqual(mismatch + 1, result.accepted);
+        try std.testing.expect(result.correction_added and result.hit_eos and result.commit_forward_required);
+    }
+    choices = .{ 3, 5, 7, 11 };
+    request.eos_token_ids = &.{ -1, 5 };
+    const eos = try request.classifyTargetChoices(&choices);
+    try std.testing.expectEqual(@as(usize, 2), eos.accepted);
+    try std.testing.expect(eos.hit_eos and !eos.correction_added and !eos.had_bonus);
+    request.rows = 3;
+    try std.testing.expectError(error.InvalidTensorShape, request.verifyLength());
+    request.rows = 4;
+    try std.testing.expectError(error.InvalidTensorShape, request.classifyTargetChoices(choices[0..3]));
+    request.draft_tokens = &.{ 3, -1, 7 };
+    try std.testing.expectError(error.InvalidModelOutput, request.classifyTargetChoices(&choices));
+    request.draft_tokens = &.{};
+    try std.testing.expectEqual(@as(?usize, null), try request.verifyLength());
+    try std.testing.expectError(error.InvalidTensorShape, request.classifyTargetChoices(&choices));
+    const fake: [*]const i64 = @ptrFromInt(8);
+    request.draft_tokens = fake[0..std.math.maxInt(usize)];
+    request.rows = std.math.maxInt(usize);
+    try std.testing.expectError(error.InvalidTensorShape, request.verifyLength());
 }

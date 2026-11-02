@@ -23,51 +23,70 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-struct antfly_q4_k_block_view {
-    const uint8_t *d;
-    const uint8_t *dmin;
-    const uint8_t *scales;
-    const uint8_t *qs;
-};
-
 static __device__ __forceinline__ float antfly_half_le_to_float(const uint8_t *p) {
     const uint16_t bits = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
     return __half2float(__ushort_as_half(bits));
 }
 
-static __device__ __forceinline__ void antfly_q4_k_unpack_scale_min(
-    const uint8_t *scales,
-    int sub,
-    float *scale,
-    float *min_v
-) {
-    if (sub < 4) {
-        *scale = (float)(scales[sub] & 63u);
-        *min_v = (float)(scales[sub + 4] & 63u);
-        return;
-    }
-
-    *scale = (float)((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4));
-    *min_v = (float)((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-}
-
-static __device__ __forceinline__ float antfly_q4_k_dequant_lane(const uint8_t *block, int lane) {
-    antfly_q4_k_block_view view = {
-        block,
-        block + 2,
-        block + 4,
-        block + 16,
-    };
-    const int sub = lane >> 5;
-    const int q_index = (sub >> 1) * 32 + (lane & 31);
-    const uint8_t packed = view.qs[q_index];
-    const uint8_t q = (sub & 1) == 0 ? (packed & 0x0fu) : (packed >> 4);
-    const float d = antfly_half_le_to_float(view.d);
-    const float dmin = antfly_half_le_to_float(view.dmin);
-    float raw_scale = 0.0f;
-    float raw_min = 0.0f;
-    antfly_q4_k_unpack_scale_min(view.scales, sub, &raw_scale, &raw_min);
-    return d * raw_scale * (float)q - dmin * raw_min;
+__device__ __forceinline__ float antfly_q4_k_dequant_lane(const unsigned char *block, int lane) {
+    int v0 = lane;
+    int v1 = 5;
+    int v2 = int(unsigned(v0) >> v1);
+    int v3 = 31;
+    int v4 = v0 & v3;
+    int v5 = 1;
+    int v6 = int(unsigned(v2) >> v5);
+    int v7 = 32;
+    int v8 = v6 * v7;
+    int v9 = v8 + v4;
+    int v10 = 16;
+    int v11 = v10 + v9;
+    int v12 = int(block[v11]);
+    int v13 = v2 & v5;
+    int v14 = 4;
+    int v15 = int(unsigned(v12) >> v14);
+    int v16 = 15;
+    int v17 = v12 & v16;
+    int v18 = v13 ? v15 : v17;
+    int v19 = 0;
+    float v20 = antfly_half_le_to_float(block + v19);
+    int v21 = v2 < v14;
+    int v22 = v2 + v14;
+    int v23 = 8;
+    int v24 = v2 + v23;
+    int v25 = v21 ? v22 : v24;
+    int v26 = int(block[v25]);
+    int v27 = v26 & v16;
+    int v28 = v2 + v19;
+    int v29 = v21 ? v14 : v28;
+    int v30 = int(block[v29]);
+    int v31 = 6;
+    int v32 = int(unsigned(v30) >> v31);
+    int v33 = int(unsigned(v32) << v14);
+    int v34 = v27 | v33;
+    int v35 = 63;
+    int v36 = v26 & v35;
+    int v37 = v21 ? v36 : v34;
+    float v38 = float(v37);
+    float v39 = v20 * v38;
+    float v40 = float(v18);
+    float v41 = v39 * v40;
+    int v42 = 2;
+    float v43 = antfly_half_le_to_float(block + v42);
+    int v44 = v21 ? v24 : v24;
+    int v45 = int(block[v44]);
+    int v46 = int(unsigned(v45) >> v14);
+    int v47 = v21 ? v14 : v22;
+    int v48 = int(block[v47]);
+    int v49 = int(unsigned(v48) >> v31);
+    int v50 = int(unsigned(v49) << v14);
+    int v51 = v46 | v50;
+    int v52 = v45 & v35;
+    int v53 = v21 ? v52 : v51;
+    float v54 = float(v53);
+    float v55 = v43 * v54;
+    float v56 = v41 - v55;
+    return v56;
 }
 
 extern "C" __global__ void antfly_q4_k_mmv_f32_v1(

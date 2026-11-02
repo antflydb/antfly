@@ -409,20 +409,26 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
 
         pub fn runExecutor(ctx: *LightOnStreamContext) void {
             const io = ctx.worker_io.?.io();
-            // This pipeline borrows only epoch-owned objects. Request-local
-            // pipelines may disappear immediately after result publication.
-            var pipeline = generation.NativeGenerationPipeline{
-                .allocator = ctx.allocator,
-                .io = io,
-                .cb = ctx.cb.?,
-                .session = ctx.model.session,
-                .gpt_config = ctx.cfg,
-                .kv_dtype = ctx.worker_kv_dtype,
-                .tokenizer = ctx.model.getTokenizer(),
-                .execution_lock = &ctx.step_mutex,
-                .execution_gate = if (ctx.gate_events) &ctx.step_gate else null,
-                .execution_contention_wait_ns = ctx.execution_gate_wait_ns,
-                .execution_control = ctx.worker_control,
+            // Physical execution borrows the epoch's backend/state. Task
+            // publication is a separate adapter and retains no request pipeline.
+            var executor = @import("../graph/decoder_step_executor.zig").Executor{
+                .context = .{
+                    .allocator = ctx.allocator,
+                    .cb = &ctx.cb.?,
+                    .gpt_config = &ctx.cfg,
+                    .session = ctx.model.session,
+                    .kv_dtype = ctx.worker_kv_dtype,
+                    .execution_control = ctx.worker_control,
+                },
+                .pad_token = ctx.model.getTokenizer().specialTokens().pad_id,
+                .continuation = ctx.worker_control,
+                .access = .{
+                    .mutex = &ctx.step_mutex,
+                    .gate = if (ctx.gate_events) &ctx.step_gate else null,
+                    .io = io,
+                    .control = ctx.worker_control,
+                    .contention_wait_ns = ctx.execution_gate_wait_ns,
+                },
                 .prepared_lighton_decode = ctx.features.prepared,
                 .packed_prefill_items = ctx.features.packed_prefill_items,
                 .prepared_qwen_prefill_chunk_rows = ctx.features.prepared_prefill_chunk_rows,
@@ -433,7 +439,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 .gpu_greedy_stream_lighton_decode = ctx.features.gpu_greedy_stream,
                 .lighton_cuda_execution_id = ctx.execution_id,
             };
-            defer pipeline.deinit();
+            defer executor.endEpoch();
             var storage: [reader_execution_pool.Pool.max_capacity]runtime.scheduler.native_generate.StepItem = undefined;
             var step = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
             while (!ctx.worker_stop.load(.acquire)) {
@@ -464,13 +470,14 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 ctx.kv_mutex.unlock();
                 if (ctx.coordinator.claimNextStep(budget, &storage, &step)) |claimed_lease| {
                     var lease = claimed_lease;
-                    pipeline.executeClaimedStep(&ctx.coordinator, &lease, step.items);
+                    var publication = generation.DecoderStepPublication{ .scheduler = &ctx.coordinator, .lease = &lease, .vocab_size = ctx.cfg.vocab_size };
+                    executor.execute(step.items, ctx.coordinator.usesStepEvents(), publication.interface());
                     ctx.worker_steps += 1;
                     continue;
                 }
                 if (!ctx.worker_stop.load(.acquire)) ctx.worker_wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMicroseconds(ctx.coordinator.eventWaitUs()), .clock = .awake } }) catch {};
             }
-            ctx.worker_tail_steps = pipeline.executor_tail_steps;
+            ctx.worker_tail_steps = executor.tail_steps;
         }
 
         pub fn prepare(ctx: *LightOnStreamContext, kv_dtype: runtime.kv.pool.KvDType) !void {

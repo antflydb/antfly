@@ -68,6 +68,7 @@ pub fn eliminate(allocator: std.mem.Allocator, graph: *const Graph) !EliminateRe
 
     // Build old→new ID mapping
     const id_map = try allocator.alloc(NodeId, count);
+    errdefer allocator.free(id_map);
     @memset(id_map, null_node);
 
     var new_count: u32 = 0;

@@ -27,8 +27,6 @@ const compiled_registry = @import("compiled_registry.zig");
 const interpreter = @import("interpreter.zig");
 const model_runtime = @import("model_runtime.zig");
 const partition_mod = @import("partition.zig");
-const metal_capabilities = @import("metal_capabilities.zig");
-const webgpu_capabilities = @import("webgpu_capabilities.zig");
 const device_mesh = @import("device_mesh.zig");
 const multi_executor = @import("multi_executor.zig");
 const parallel_strategy = @import("parallel_strategy.zig");
@@ -36,6 +34,40 @@ const graph_passes = @import("ml").graph.passes;
 const native_compute = @import("../ops/native_compute.zig");
 const executor_stats = @import("executor_stats.zig");
 const metal_compute = if (build_options.enable_metal) @import("../ops/metal_compute.zig") else struct {};
+
+/// Synchronous model-weight adapter. Returned handles transfer to execution;
+/// checkpoint naming stays with the adapter, never with generic scheduling.
+pub const Weights = struct {
+    ptr: *anyopaque,
+    get_fn: *const fn (*anyopaque, []const u8) anyerror!ops.CT,
+};
+
+/// Explicit borrowed execution dependencies shared by serving and offline
+/// compilation. Backend/weight adapters are explicit borrows; task publication
+/// is outside this interface. The backend owner must outlive cache bindings
+/// and resident outputs.
+pub const Context = struct {
+    allocator: std.mem.Allocator,
+    cb: *const ops.ComputeBackend,
+    gpt_config: *const @import("../models/gpt.zig").Config,
+    weights: ?Weights = null,
+    execution_control: ?InferenceExecutionControl = null,
+    model_dir: ?[]const u8 = null,
+    artifact_dir: ?[]const u8 = null,
+    pjrt_client: ?*anyopaque = null,
+    session: ?@import("../backends/session.zig").Session = null,
+    kv_dtype: ?@import("../runtime/root.zig").kv.pool.KvDType = null,
+    shared_moe_cache: ?*@import("../runtime/root.zig").moe.shared.SharedExpertCache = null,
+    device_mesh: ?*device_mesh.DeviceMesh = null,
+    parallel_config: ?parallel_strategy.ParallelConfig = null,
+    compiled_partition_backend: ?contracts.BackendKind = null,
+    compiled_attachment_target: compiled_backend.AttachmentTarget = .partitioned,
+
+    pub fn graphWeight(self: *const Context, name: []const u8) !ops.CT {
+        if (self.weights) |source| return source.get_fn(source.ptr, name);
+        return self.cb.getWeight(name);
+    }
+};
 
 fn compiledBackendDefinition(kind: contracts.BackendKind) ?compiled_backend.Definition {
     return compiled_registry.find(kind);
@@ -109,18 +141,18 @@ test "compiled model request preserves execution control" {
 }
 
 fn compiledBackendAttachContext(
-    pipeline: anytype,
+    pipeline: *const Context,
     requested_backend: ?contracts.BackendKind,
     attention_mode: ?cache_mod.AttentionMode,
 ) compiled_backend.AttachContext {
     return .{
-        .cb = &pipeline.cb,
+        .cb = pipeline.cb,
         .requested_backend = requested_backend,
         .model_dir = pipeline.model_dir,
         .artifact_dir = pipeline.artifact_dir,
         .pjrt_client = pipeline.pjrt_client,
         .session = pipeline.session,
-        .gpt_config = pipeline.gpt_config,
+        .gpt_config = pipeline.gpt_config.*,
         .kv_dtype = pipeline.kv_dtype,
         .shared_moe_cache = pipeline.shared_moe_cache,
         .attention_mode = attention_mode,
@@ -153,7 +185,7 @@ pub fn shouldUsePartitionedGraphExecution(
 }
 
 pub fn graphForwardAll(
-    pipeline: anytype,
+    pipeline: *const Context,
     cache: *cache_mod.GraphCache,
     input_ids: []const i64,
     batch: usize,
@@ -162,12 +194,19 @@ pub fn graphForwardAll(
 ) ![]f32 {
     const allocator = pipeline.allocator;
     const attn_mode = cacheAttentionMode(decode_context);
+    const cache_before = cache.specializations.stats;
     const entry = try ensureGraphEntry(pipeline, cache, input_ids, batch, seq_len, decode_context);
     const graph = &entry.graph;
 
     if (entry.weight_inputs == null) {
         const params = graph.parameters.items;
-        const wc = try allocator.alloc(interpreter.RuntimeInput, params.len);
+        const wc = try entry.resourceAllocator().alloc(interpreter.RuntimeInput, params.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (wc[0..initialized]) |input| pipeline.cb.free(input.value);
+            entry.resourceAllocator().free(wc);
+        }
+
         for (params, 0..) |param_id, idx| {
             const name = graph.parameterName(graph.node(param_id));
             const value = pipeline.graphWeight(name) catch |err| {
@@ -178,14 +217,16 @@ pub fn graphForwardAll(
                 .node_id = param_id,
                 .value = value,
             };
+            initialized += 1;
         }
         entry.weight_inputs = wc;
     }
     if (entry.cached_analysis == null) {
-        entry.cached_analysis = try interpreter.CachedAnalysis.compute(allocator, graph);
+        entry.cached_analysis = try interpreter.CachedAnalysis.compute(entry.resourceAllocator(), graph);
     }
 
     const exec_options = interpreter.ExecuteOptions{
+        .execution_control = pipeline.execution_control,
         .attention = gpt_arch.attentionContextFromDecode(decode_context),
         .embedding_ids = input_ids,
         .runtime_inputs = entry.weight_inputs,
@@ -224,127 +265,45 @@ pub fn graphForwardAll(
         }
     }
 
-    return try executeSingleDeviceGraphExecutor(pipeline, allocator, graph, exec_options);
+    const output = try executeSingleDeviceGraphExecutor(pipeline, allocator, entry, graph, exec_options);
+    if (entry.single_device_executable) |prepared| prepared.diagnostics.recordSpecializations(cache.specializations.stats.since(cache_before));
+    return output;
 }
 
 fn executeSingleDeviceGraphExecutor(
-    pipeline: anytype,
+    pipeline: *const Context,
     allocator: std.mem.Allocator,
+    entry: *cache_mod.CacheEntry,
     graph: *const @import("ml").graph.Graph,
     exec_options: interpreter.ExecuteOptions,
 ) ![]f32 {
-    const target_kind = backendKindForGraphPartition(pipeline.cb.kind());
-    const use_native_fallback = target_kind != .native and @import("build_options").enable_native;
-
-    var fallback_storage: ?FallbackNativeBackend = null;
-    if (use_native_fallback) {
-        fallback_storage = try FallbackNativeBackend.init(allocator);
+    const executable = @import("../execution/executable.zig");
+    if (entry.single_device_executable != null and
+        (entry.single_device_backend.ptr != pipeline.cb.ptr or entry.single_device_backend.vtable != pipeline.cb.vtable)) entry.resetSingleDeviceExecutable();
+    // The cache entry is heap-stable across insertion, LRU eviction and array
+    // growth. Executors borrow this backend copy rather than a pipeline stack.
+    entry.single_device_backend = pipeline.cb.*;
+    if (entry.single_device_executable == null) {
+        const target_kind = pipeline.cb.kind();
+        const seeds = try partition_mod.allocTensorDescriptorSeeds(allocator, graph);
+        defer allocator.free(seeds);
+        try partition_mod.seedAllUploadableResidency(seeds, graph, target_kind, 0);
+        try seedRuntimeQuantizedInputDescriptors(seeds, graph, exec_options.runtime_inputs, pipeline.cb, target_kind);
+        _ = try partition_mod.seedAttentionKvDescriptorsFromContext(seeds, graph, exec_options.attention, target_kind, 0);
+        const prepared = try allocator.create(executable.Executable);
+        errdefer allocator.destroy(prepared);
+        prepared.* = try executable.prepareAnalyzedGraph(allocator, graph, entry.cached_analysis.?, &entry.single_device_backend, .partitioned, .{ .tensor_descs = seeds, .input_bindings = exec_options.runtime_inputs });
+        entry.resource_allocator = allocator;
+        entry.single_device_executable = prepared;
     }
-    defer {
-        if (traceGraphExecutorOutputs()) std.debug.print("graph_executor_output_trace: cleanup_fallback_begin\n", .{});
-        if (fallback_storage) |*fallback| fallback.deinit(allocator);
-        if (traceGraphExecutorOutputs()) std.debug.print("graph_executor_output_trace: cleanup_fallback_end\n", .{});
-    }
-
-    var devices_buf: [2]device_mesh.DeviceEntry = undefined;
-    devices_buf[0] = .{
-        .id = 0,
-        .backend = &pipeline.cb,
-        .kind = target_kind,
-    };
-    const device_count: usize = if (use_native_fallback) blk: {
-        const fallback = &fallback_storage.?;
-        devices_buf[1] = .{
-            .id = 1,
-            .backend = &fallback.backend,
-            .kind = .native,
-        };
-        break :blk 2;
-    } else 1;
-
-    var mesh = try device_mesh.DeviceMesh.init(allocator, devices_buf[0..device_count]);
-    defer {
-        if (traceGraphExecutorOutputs()) std.debug.print("graph_executor_output_trace: cleanup_mesh_begin\n", .{});
-        mesh.deinit();
-        if (traceGraphExecutorOutputs()) std.debug.print("graph_executor_output_trace: cleanup_mesh_end\n", .{});
-    }
-
-    var capabilities_buf: [2]partition_mod.Capability = undefined;
-    capabilities_buf[0] = .{
-        .backend = target_kind,
-        .priority = 10,
-        .supports = supportsForGraphBackend(target_kind),
-        .decide = decisionForGraphBackend(target_kind),
-    };
-    const capability_count: usize = if (use_native_fallback) blk: {
-        capabilities_buf[1] = .{
-            .backend = .native,
-            .priority = 0,
-            .supports = &partition_mod.supportsAll,
-            .decide = &partition_mod.decideNative,
-        };
-        break :blk 2;
-    } else 1;
-
-    const descriptor_seeds = try partition_mod.allocTensorDescriptorSeeds(allocator, graph);
-    defer allocator.free(descriptor_seeds);
-    try partition_mod.seedAllUploadableResidency(descriptor_seeds, graph, target_kind, 0);
-    try seedRuntimeQuantizedInputDescriptors(descriptor_seeds, graph, exec_options.runtime_inputs, &pipeline.cb, target_kind);
-    _ = try partition_mod.seedAttentionKvDescriptorsFromContext(descriptor_seeds, graph, exec_options.attention, target_kind, 0);
-
-    var diagnostics = partition_mod.CapabilityDiagnostics{};
-    var base_plan = try partition_mod.partitionWithOptions(allocator, graph, capabilities_buf[0..capability_count], .{
-        .tensor_descs = descriptor_seeds,
-        .diagnostics = &diagnostics,
-    });
-    var owns_base_plan = true;
-    errdefer if (owns_base_plan) base_plan.deinit();
-    executor_stats.printPartitionFallbackOps(graph, &base_plan, target_kind);
-
-    const assignments = try allocator.alloc(device_mesh.DeviceId, base_plan.partitions.len);
-    var owns_assignments = true;
-    errdefer if (owns_assignments) allocator.free(assignments);
-    for (base_plan.partitions, 0..) |part, idx| {
-        assignments[idx] = if (use_native_fallback and part.backend == .native) 1 else 0;
-    }
-
-    var dpp = multi_executor.DevicePartitionPlan{
-        .base = base_plan,
-        .device_assignment = assignments,
-        .allocator = allocator,
-    };
-    owns_base_plan = false;
-    owns_assignments = false;
-    defer {
-        if (traceGraphExecutorOutputs()) std.debug.print("graph_executor_output_trace: cleanup_dpp_begin\n", .{});
-        dpp.deinit();
-        if (traceGraphExecutorOutputs()) std.debug.print("graph_executor_output_trace: cleanup_dpp_end\n", .{});
-    }
-
-    var multi_result = try multi_executor.executeMultiDevice(allocator, graph, &dpp, &mesh, exec_options);
-    defer {
-        if (traceGraphExecutorOutputs()) std.debug.print("graph_executor_output_trace: cleanup_multi_result_begin\n", .{});
-        multi_result.deinit(&mesh);
-        if (traceGraphExecutorOutputs()) std.debug.print("graph_executor_output_trace: cleanup_multi_result_end\n", .{});
-    }
-
-    if (traceGraphExecutorOutputs()) std.debug.print(
-        "graph_executor_output_trace: single_device outputs={d} output_devices={d}\n",
-        .{ multi_result.outputs.len, multi_result.output_devices.len },
-    );
-    if (multi_result.outputs.len == 0 or multi_result.output_devices.len != multi_result.outputs.len) return error.MissingValue;
-    const output_index = multi_result.outputs.len - 1;
-    const output_device = mesh.device(multi_result.output_devices[output_index]) orelse return error.DeviceNotFound;
-    if (traceGraphExecutorOutputs()) std.debug.print(
-        "graph_executor_output_trace: single_device output_index={d} output_device={d} backend={s}\n",
-        .{ output_index, multi_result.output_devices[output_index], @tagName(output_device.backend.kind()) },
-    );
-    const logits = try output_device.backend.toFloat32(multi_result.outputs[output_index], allocator);
-    if (traceGraphExecutorOutputs()) std.debug.print(
-        "graph_executor_output_trace: single_device to_float32_done len={d}\n",
-        .{logits.len},
-    );
-    return logits;
+    const prepared = entry.single_device_executable.?;
+    var options = exec_options;
+    options.output_placement = .producer;
+    var result = try prepared.run(allocator, options);
+    defer result.deinit(&prepared.runtime);
+    if (result.outputs.len == 0) return error.MissingValue;
+    const index = result.outputs.len - 1;
+    return result.backendFor(&prepared.runtime, index).toFloat32(result.outputs[index], allocator);
 }
 
 fn multiResultLastOutputToFloat32(
@@ -356,10 +315,6 @@ fn multiResultLastOutputToFloat32(
     const output_index = multi_result.outputs.len - 1;
     const output_device = mesh.device(multi_result.output_devices[output_index]) orelse return error.DeviceNotFound;
     return try output_device.backend.toFloat32(multi_result.outputs[output_index], allocator);
-}
-
-fn traceGraphExecutorOutputs() bool {
-    return platform.env.getenvBoolDefault("TERMITE_GRAPH_EXECUTOR_TRACE_OUTPUTS", false);
 }
 
 const FallbackNativeBackend = struct {
@@ -395,33 +350,6 @@ const FallbackNativeBackend = struct {
         allocator.destroy(self.weight_store);
     }
 };
-
-fn backendKindForGraphPartition(kind: contracts.BackendKind) contracts.BackendKind {
-    return switch (kind) {
-        .metal => .metal,
-        .pjrt => .pjrt,
-        .wasm => .wasm,
-        .webgpu => .webgpu,
-        else => .native,
-    };
-}
-
-fn supportsForGraphBackend(kind: contracts.BackendKind) *const fn (@import("ml").graph.OpCode) bool {
-    return switch (kind) {
-        .metal => &metal_capabilities.supportsMetalEagerGraph,
-        .webgpu => &webgpu_capabilities.supportsWebGpuGraph,
-        else => &partition_mod.supportsAll,
-    };
-}
-
-fn decisionForGraphBackend(kind: contracts.BackendKind) ?*const fn (partition_mod.CapabilityQuery) partition_mod.CapabilityDecision {
-    return switch (kind) {
-        .metal => &metal_capabilities.decideMetalEagerGraph,
-        .webgpu => &webgpu_capabilities.decideWebGpuGraph,
-        .native => &partition_mod.decideNative,
-        else => null,
-    };
-}
 
 fn cacheAttentionMode(decode_context: *const gpt_arch.DecodeContext) cache_mod.AttentionMode {
     return switch (decode_context.attention_mode) {
@@ -469,44 +397,40 @@ fn backendTensorDTypeToGraphDType(dtype: @import("../backends/tensor.zig").DType
 }
 
 fn graphCacheKey(
-    pipeline: anytype,
+    pipeline: *const Context,
     batch: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) cache_mod.CacheKey {
     const attn_mode = cacheAttentionMode(decode_context);
-    const query_seq_len = decode_context.query_sequence_len;
     return .{
-        .config_hash = cache_mod.hashConfigBytes(std.mem.asBytes(&pipeline.gpt_config)),
+        .config_hash = cache_mod.hashConfigBytes(std.mem.asBytes(pipeline.gpt_config)),
         .batch = @intCast(batch),
-        .seq_len = if (attn_mode == .paged_prefill) cache_mod.bucketSeqLen(@intCast(query_seq_len)) else @intCast(query_seq_len),
+        // Key the shape actually traced. Bucketing is safe only when the
+        // caller has padded the physical inputs to that bucket first.
+        .seq_len = @intCast(decode_context.query_sequence_len),
         .attention_mode = attn_mode,
     };
 }
 
 pub fn ensureGraphEntry(
-    pipeline: anytype,
+    pipeline: *const Context,
     cache: *cache_mod.GraphCache,
     input_ids: []const i64,
     batch: usize,
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) !*cache_mod.CacheEntry {
-    const allocator = pipeline.allocator;
+    const allocator = cache.allocator;
+    cache.selectBackend(pipeline.cb);
     const key = graphCacheKey(pipeline, batch, decode_context);
 
     if (cache.get(key) == null) {
-        const PipelineType = @TypeOf(pipeline.*);
         const Resolver = struct {
             fn resolve(raw_context: ?*anyopaque, resolve_allocator: std.mem.Allocator, name: []const u8) anyerror!?@import("ml").graph.Shape {
                 const context = raw_context orelse return null;
-                const typed_pipeline: *PipelineType = @ptrCast(@alignCast(context));
-                const backend = if (@hasField(PipelineType, "cb")) typed_pipeline.cb else return null;
-                const resolved_weight = if (@hasDecl(PipelineType, "graphWeight"))
-                    typed_pipeline.graphWeight(name)
-                else if (@hasField(PipelineType, "cb"))
-                    backend.getWeight(name)
-                else
-                    return null;
+                const typed_context: *const Context = @ptrCast(@alignCast(context));
+                const backend = typed_context.cb;
+                const resolved_weight = typed_context.graphWeight(name);
                 const weight = resolved_weight catch |err| switch (err) {
                     error.MissingWeight, error.WeightNotFound => return null,
                     else => return err,
@@ -524,23 +448,31 @@ pub fn ensureGraphEntry(
             }
         };
 
-        var tc = tracing_compute.TracingCompute.initWithWeightResolver(allocator, .{
-            .context = @ptrCast(@constCast(pipeline)),
-            .resolve = &Resolver.resolve,
-        });
-        tc.setRuntimeEmbeddingIds(input_ids);
-        var tc_cb = tc.backend();
+        var raw_graph = trace: {
+            var tc = tracing_compute.TracingCompute.initWithWeightResolver(allocator, .{
+                .context = @ptrCast(@constCast(pipeline)),
+                .resolve = &Resolver.resolve,
+            });
+            defer tc.deinit();
+            tc.setRuntimeEmbeddingIds(input_ids);
+            var tc_cb = tc.backend();
+            var trace_dc = decode_context.*;
+            trace_dc.moe_runtime = null;
+            const dummy_logits = try gpt_arch.forward(&tc_cb, allocator, pipeline.gpt_config.*, input_ids, batch, seq_len, &trace_dc);
+            defer allocator.free(dummy_logits);
+            break :trace tc.extractGraph();
+        };
 
-        var trace_dc = decode_context.*;
-        trace_dc.moe_runtime = null;
-        const dummy_logits = try gpt_arch.forward(&tc_cb, allocator, pipeline.gpt_config, input_ids, batch, seq_len, &trace_dc);
-        allocator.free(dummy_logits);
-
-        var raw_graph = tc.extractGraph();
-        tc.deinit();
-
-        const optimized = try graph_passes.pipeline.Pipeline.default.run(allocator, &raw_graph);
+        const optimized = graph_passes.pipeline.Pipeline.default.run(allocator, &raw_graph) catch |err| {
+            raw_graph.deinit();
+            return err;
+        };
+        defer allocator.free(optimized.id_map);
         raw_graph.deinit();
+        errdefer {
+            var graph = optimized.graph;
+            graph.deinit();
+        }
         try cache.put(key, optimized.graph);
     }
 
@@ -548,7 +480,7 @@ pub fn ensureGraphEntry(
 }
 
 pub fn executeExplicitCompiledPartitionBackend(
-    pipeline: anytype,
+    pipeline: *const Context,
     allocator: std.mem.Allocator,
     entry: *cache_mod.CacheEntry,
     graph: *const @import("ml").graph.Graph,
@@ -576,7 +508,7 @@ pub fn executeExplicitCompiledPartitionBackend(
     const descriptor_seeds = try partition_mod.allocTensorDescriptorSeeds(allocator, graph);
     defer allocator.free(descriptor_seeds);
     try partition_mod.seedAllUploadableResidency(descriptor_seeds, graph, backend, 0);
-    try seedRuntimeQuantizedInputDescriptors(descriptor_seeds, graph, exec_options.runtime_inputs, &pipeline.cb, backend);
+    try seedRuntimeQuantizedInputDescriptors(descriptor_seeds, graph, exec_options.runtime_inputs, pipeline.cb, backend);
     _ = try partition_mod.seedAttentionKvDescriptorsFromContext(descriptor_seeds, graph, exec_options.attention, backend, 0);
 
     const plan = try partition_mod.partitionWithOptions(allocator, graph, &capabilities, .{
@@ -607,7 +539,7 @@ pub fn executeExplicitCompiledPartitionBackend(
     );
 
     var devices_buf: [2]device_mesh.DeviceEntry = undefined;
-    devices_buf[0] = .{ .id = 0, .backend = &pipeline.cb, .kind = host_kind };
+    devices_buf[0] = .{ .id = 0, .backend = pipeline.cb, .kind = host_kind };
     const device_count: usize = if (use_native_fallback) blk: {
         const fallback = &fallback_storage.?;
         devices_buf[1] = .{ .id = 1, .backend = &fallback.backend, .kind = .native };
@@ -624,7 +556,7 @@ pub fn executeExplicitCompiledPartitionBackend(
 }
 
 pub fn graphForwardCompiledModelLast(
-    pipeline: anytype,
+    pipeline: *const Context,
     cache: *cache_mod.GraphCache,
     input_ids: []const i64,
     batch: usize,
@@ -651,14 +583,8 @@ pub fn graphForwardCompiledModelLast(
     const attention_mode = cacheAttentionMode(decode_context);
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);
     const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
-    if (backend_def.execute_model_forward_direct) |execute_direct| {
-        if (try execute_direct(
-            allocator,
-            cache,
-            attach_context,
-            .single_device,
-            request,
-        )) |last_logits| return last_logits;
+    if (try backend_def.candidate(allocator, cache, attach_context, .single_device)) |candidate| {
+        if (try candidate.forward(allocator, request)) |last_logits| return last_logits;
     }
 
     const execute_model_forward = backend_def.execute_model_forward orelse {
@@ -736,7 +662,7 @@ pub fn graphForwardCompiledModelLast(
 }
 
 pub fn prepareCompiledModelRuntime(
-    pipeline: anytype,
+    pipeline: *const Context,
     cache: *cache_mod.GraphCache,
     kv_tokens_hint: usize,
 ) !bool {
@@ -744,23 +670,14 @@ pub fn prepareCompiledModelRuntime(
     if (pipeline.compiled_attachment_target != .whole_model) return false;
     const backend_def = compiledBackendDefinition(backend) orelse return false;
     if (backend_def.model_runtime_strategy == .none) return false;
-    const prepare_direct = backend_def.prepare_model_runtime_direct orelse return false;
 
     const attach_context = compiledBackendAttachContext(pipeline, backend, null);
-    return try prepare_direct(
-        pipeline.allocator,
-        cache,
-        attach_context,
-        .single_device,
-        .{
-            .execution_control = pipeline.execution_control,
-            .kv_tokens_hint = kv_tokens_hint,
-        },
-    );
+    const candidate = (try backend_def.candidate(pipeline.allocator, cache, attach_context, .single_device)) orelse return false;
+    return candidate.prepare(pipeline.allocator, .{ .execution_control = pipeline.execution_control, .kv_tokens_hint = kv_tokens_hint });
 }
 
 pub fn graphForwardCompiledModelOutput(
-    pipeline: anytype,
+    pipeline: *const Context,
     cache: *cache_mod.GraphCache,
     input_ids: []const i64,
     batch: usize,
@@ -772,22 +689,16 @@ pub fn graphForwardCompiledModelOutput(
     if (pipeline.compiled_attachment_target != .whole_model) return null;
     const backend_def = compiledBackendDefinition(backend) orelse return null;
     if (backend_def.model_runtime_strategy == .none) return null;
-    const execute_direct = backend_def.execute_model_forward_output_direct orelse return null;
 
     const attention_mode = cacheAttentionMode(decode_context);
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);
     const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
-    return try execute_direct(
-        pipeline.allocator,
-        cache,
-        attach_context,
-        .single_device,
-        request,
-    );
+    const candidate = (try backend_def.candidate(pipeline.allocator, cache, attach_context, .single_device)) orelse return null;
+    return candidate.output(pipeline.allocator, request);
 }
 
 pub fn graphForwardCompiledModelGreedyToken(
-    pipeline: anytype,
+    pipeline: *const Context,
     cache: *cache_mod.GraphCache,
     input_ids: []const i64,
     batch: usize,
@@ -800,19 +711,12 @@ pub fn graphForwardCompiledModelGreedyToken(
     if (pipeline.compiled_attachment_target != .whole_model) return null;
     const backend_def = compiledBackendDefinition(backend) orelse return null;
     if (backend_def.model_runtime_strategy == .none) return null;
-    const execute_direct = backend_def.execute_model_greedy_direct orelse return null;
 
     const attention_mode = cacheAttentionMode(decode_context);
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);
     const request = try compiledModelForwardRequest(input_ids, seq_len, decode_context, attention_mode, pipeline.execution_control);
-    return try execute_direct(
-        pipeline.allocator,
-        cache,
-        attach_context,
-        .single_device,
-        request,
-        vocab_size,
-    );
+    const candidate = (try backend_def.candidate(pipeline.allocator, cache, attach_context, .single_device)) orelse return null;
+    return candidate.greedy(pipeline.allocator, request, vocab_size);
 }
 
 /// Executes a capability-qualified sampled decode through the compiled
@@ -820,7 +724,7 @@ pub fn graphForwardCompiledModelGreedyToken(
 /// any model frame was submitted. Errors after submission propagate to the
 /// caller; this function never replays the forward through another path.
 pub fn graphForwardCompiledModelSampledToken(
-    pipeline: anytype,
+    pipeline: *const Context,
     cache: *cache_mod.GraphCache,
     request: model_runtime.SampledDecodeRequest,
 ) !?i64 {
@@ -828,20 +732,14 @@ pub fn graphForwardCompiledModelSampledToken(
     if (pipeline.compiled_attachment_target != .whole_model) return null;
     const backend_def = compiledBackendDefinition(backend) orelse return null;
     if (backend_def.model_runtime_strategy == .none) return null;
-    const execute_direct = backend_def.execute_model_sample_direct orelse return null;
 
     const attach_context = compiledBackendAttachContext(
         pipeline,
         backend,
         request.decode.attention_mode,
     );
-    return try execute_direct(
-        pipeline.allocator,
-        cache,
-        attach_context,
-        .single_device,
-        request,
-    );
+    const candidate = (try backend_def.candidate(pipeline.allocator, cache, attach_context, .single_device)) orelse return null;
+    return candidate.sample(pipeline.allocator, request);
 }
 
 test "shouldUsePartitionedGraphExecution requires explicit sharding config" {
@@ -923,4 +821,147 @@ test "multiResultLastOutputToFloat32 reads from output owning device" {
     const host = try multiResultLastOutputToFloat32(allocator, &mesh, &result);
     defer allocator.free(host);
     try std.testing.expectEqualSlices(f32, &.{ 3.0, 4.0 }, host);
+}
+
+test "cached decoder graph preparation reuses native and Metal executables across cache growth" {
+    const a = std.testing.allocator;
+    const contexts = @import("../backends/compute_context.zig");
+    const Backend = @import("../backends/backends.zig").BackendType;
+    for ([_]Backend{ .native, .metal }) |kind| {
+        if (kind == .metal) {
+            if (comptime !build_options.enable_metal) continue;
+            if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) continue;
+        }
+        var context = try contexts.BackendContext.init(a, kind, null);
+        defer context.deinit(a);
+        const cb = context.computeBackend();
+        const config: @import("../models/gpt.zig").Config = .{};
+        const pipeline = Context{ .allocator = a, .cb = &cb, .gpt_config = &config };
+        var cache = cache_mod.GraphCache.init(a);
+        defer cache.deinitWithBackend(pipeline.cb);
+        var graph = @import("ml").graph.Graph.init(a);
+        var owned = true;
+        defer if (owned) graph.deinit();
+        var b = @import("ml").graph.Builder.init(&graph);
+        const x = try b.parameter("x", @import("ml").graph.Shape.init(.f32, &.{ 2, 4 }));
+        const output = try b.neg(try b.relu(x));
+        try graph.markOutput(output);
+        const key = cache_mod.CacheKey{ .config_hash = 0, .batch = 2, .seq_len = 1, .attention_mode = .full_recompute };
+        try cache.put(key, graph);
+        owned = false;
+        const entry = cache.getEntry(key).?;
+        entry.cached_analysis = try interpreter.CachedAnalysis.compute(a, &entry.graph);
+        const bindings = try a.alloc(interpreter.RuntimeInput, 1);
+        var bound = false;
+        defer if (!bound) a.free(bindings);
+        bindings[0] = .{ .node_id = x, .value = try pipeline.cb.fromFloat32Shape(&.{ -4, -3, -2, -1, 0, 1, 2, 3 }, &.{ 2, 4 }) };
+        entry.weight_inputs = bindings;
+        bound = true;
+        var identity: ?*@import("../execution/executable.zig").Executable = null;
+        for (0..3) |iteration| {
+            const values = try executeSingleDeviceGraphExecutor(&pipeline, a, entry, &entry.graph, .{ .runtime_inputs = bindings });
+            defer a.free(values);
+            try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0, 0, -1, -2, -3 }, values);
+            const prepared = entry.single_device_executable.?;
+            if (identity) |prior| try std.testing.expectEqual(prior, prepared) else identity = prepared;
+            if (iteration == 0) {
+                // Keep this entry hot while the pointer array grows and other
+                // entries are evicted. Prepared graph/backend pointers survive.
+                for (1..cache_mod.max_entries + 8) |index| {
+                    _ = cache.getEntry(key);
+                    var other_key = key;
+                    other_key.config_hash = index;
+                    try cache.put(other_key, @import("ml").graph.Graph.init(a));
+                }
+                prepared.diagnostics.configure(true);
+            } else if (kind == .native) {
+                const stats = prepared.diagnostics.snapshot().?.execution;
+                try std.testing.expectEqual(@as(u64, 0), stats.physical_storage_allocations);
+                try std.testing.expect(stats.physical_storage_reuses > 0);
+            }
+        }
+    }
+}
+
+test "decoder graph cache owns tracing allocations and failed traces remain retryable" {
+    const a = std.testing.allocator;
+    const Backend = @import("../backends/backends.zig").BackendType;
+    for ([_]Backend{ .native, .metal, .cuda }) |kind| {
+        if (kind == .metal and !build_options.enable_metal) continue;
+        if (kind == .cuda and !build_options.enable_cuda) continue;
+        var context = try @import("../backends/compute_context.zig").BackendContext.init(a, kind, null);
+        defer context.deinit(a);
+        const cb = context.computeBackend();
+        var request = std.heap.FixedBufferAllocator.init(&.{});
+        const Fixture = struct {
+            cb: *const ops.ComputeBackend,
+            missing_norm: bool = true,
+            fn get(raw: *anyopaque, name: []const u8) !ops.CT {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (std.mem.endsWith(u8, name, "norm.weight")) {
+                    if (self.missing_norm) return error.MissingWeight;
+                    return self.cb.fromFloat32Shape(&.{ 1, 1, 1, 1 }, &.{4});
+                }
+                if (std.mem.endsWith(u8, name, "embed_tokens.weight")) {
+                    var values: [32]f32 = @splat(1);
+                    @memset(values[5..8], 0);
+                    return self.cb.fromFloat32Shape(&values, &.{ 8, 4 });
+                }
+                if (std.mem.eql(u8, name, "lm_head.weight"))
+                    return self.cb.fromFloat32Shape(&@as([32]f32, @splat(1)), &.{ 8, 4 });
+                return error.MissingWeight;
+            }
+        };
+        var fixture = Fixture{ .cb = &cb };
+        const config: @import("../models/gpt.zig").Config = .{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .num_key_value_heads = 1, .intermediate_size = 8, .vocab_size = 8, .position_encoding = .rope, .norm_type = .rms_norm, .activation = .silu };
+        const pipeline = Context{ .allocator = request.allocator(), .cb = &cb, .weights = .{ .ptr = &fixture, .get_fn = Fixture.get }, .gpt_config = &config };
+        var cache = cache_mod.GraphCache.init(a);
+        defer cache.deinit();
+        const decode_context = gpt_arch.DecodeContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 };
+        try std.testing.expectError(error.MissingWeight, ensureGraphEntry(&pipeline, &cache, &.{0}, 1, 1, &decode_context));
+        try std.testing.expectEqual(@as(usize, 0), cache.count());
+        fixture.missing_norm = false;
+        // Serving and offline preparation share this exact typed context. Execute
+        // through it too, so backend-pointer contracts cannot hide in uninstantiated
+        // generic branches. The adapter supplies all-one embeddings/head weights.
+        var execution = pipeline;
+        execution.allocator = a;
+        const logits = try graphForwardAll(&execution, &cache, &.{0}, 1, 1, &decode_context);
+        defer a.free(logits);
+        try std.testing.expectEqual(@as(usize, 8), logits.len);
+        for (logits) |value| try std.testing.expectApproxEqAbs(@as(f32, 4) / @sqrt(1 + execution.gpt_config.norm_eps), value, 0.00001);
+        const changed = try graphForwardAll(&execution, &cache, &.{1}, 1, 1, &decode_context);
+        defer a.free(changed);
+        for (changed) |value| try std.testing.expectApproxEqAbs(@as(f32, 1) / @sqrt(0.25 + execution.gpt_config.norm_eps), value, 0.00001);
+        const entry = try ensureGraphEntry(&pipeline, &cache, &.{0}, 1, 1, &decode_context);
+        // The request allocator has zero capacity; persistent graph creation and
+        // a subsequent cache hit must use the cache's owner and remain usable.
+        try std.testing.expect(entry.graph.nodeCount() > 0);
+        try std.testing.expect(entry == try ensureGraphEntry(&pipeline, &cache, &.{0}, 1, 1, &decode_context));
+        try std.testing.expectEqual(@as(usize, 1), cache.count());
+        // A borrowed configuration's address is not its semantic cache key.
+        var equivalent_config = config;
+        var equivalent = pipeline;
+        equivalent.gpt_config = &equivalent_config;
+        try std.testing.expect(entry == try ensureGraphEntry(&equivalent, &cache, &.{0}, 1, 1, &decode_context));
+        equivalent_config.norm_eps *= 2;
+        try std.testing.expect(entry != try ensureGraphEntry(&equivalent, &cache, &.{0}, 1, 1, &decode_context));
+        const first_ids: [12]i64 = @splat(0);
+        const second_ids: [13]i64 = @splat(0);
+        var prefill = gpt_arch.DecodeContext{ .attention_mode = .paged_prefill, .total_sequence_len = 12, .query_sequence_len = 12, .kv_sequence_len = 12 };
+        const first = try ensureGraphEntry(&pipeline, &cache, &first_ids, 1, 12, &prefill);
+        prefill.total_sequence_len = 13;
+        prefill.query_sequence_len = 13;
+        prefill.kv_sequence_len = 13;
+        const second = try ensureGraphEntry(&pipeline, &cache, &second_ids, 1, 13, &prefill);
+        const last = second.graph.outputs.items[second.graph.outputs.items.len - 1];
+        try std.testing.expectEqual(@as(i64, 13 * 8), second.graph.node(last).output_shape.numElements().?);
+        try std.testing.expect(first != second);
+        var decode = gpt_arch.DecodeContext{ .attention_mode = .paged_decode, .total_sequence_len = 14, .query_sequence_len = 1, .kv_sequence_len = 14 };
+        const decode_entry = try ensureGraphEntry(&pipeline, &cache, &.{0}, 1, 14, &decode);
+        decode.total_sequence_len = 15;
+        decode.kv_sequence_len = 15;
+        // Total KV length changes each step; the physical query remains one row.
+        try std.testing.expect(decode_entry == try ensureGraphEntry(&pipeline, &cache, &.{0}, 1, 15, &decode));
+    }
 }

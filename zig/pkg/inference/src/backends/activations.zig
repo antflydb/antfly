@@ -17,6 +17,7 @@
 // Uses Zig's @Vector for vectorized operations on supported platforms.
 
 const std = @import("std");
+const kernel_math = @import("antfly_tile").native_math;
 const linalg_primitives = @import("inference_linalg").primitives;
 
 // Comptime-selected SIMD width and vectorized exp helper, sourced from
@@ -42,23 +43,30 @@ inline fn tanhVec(x: F32xN) F32xN {
 
 /// GELU activation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 pub fn gelu(data: []f32) void {
-    const sqrt_2_over_pi_s: f32 = 0.7978845608028654;
-    const sqrt_2_over_pi: F32xN = @splat(sqrt_2_over_pi_s);
-    const c044715: F32xN = @splat(0.044715);
-    const half: F32xN = @splat(0.5);
-    const one: F32xN = @splat(1.0);
+    applyActivation(.gelu, data);
+}
+
+const VectorMath = struct {
+    pub inline fn exp(x: F32xN) F32xN {
+        return expVec(x);
+    }
+    pub inline fn tanh(x: F32xN) F32xN {
+        return tanhVec(x);
+    }
+};
+
+/// Scheduling and transcendental approximations stay native-owned; the scalar
+/// expression is shared with generated GPU kernels. Preserve the existing
+/// cube-first SIMD GELU and left-associated scalar tail independently.
+fn applyActivation(comptime kind: kernel_math.Activation, data: []f32) void {
+    const vector_recipe = comptime kernel_math.activation(kind, .cube_first);
+    const scalar_recipe = comptime kernel_math.activation(kind, .left_associated);
     var i: usize = 0;
     while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
         const v: F32xN = data[i..][0..VEC_LEN].*;
-        const v3 = v * v * v;
-        const inner = sqrt_2_over_pi * (v + c044715 * v3);
-        data[i..][0..VEC_LEN].* = half * v * (one + tanhVec(inner));
+        data[i..][0..VEC_LEN].* = kernel_math.evaluate(vector_recipe, VectorMath, v);
     }
-    while (i < data.len) : (i += 1) {
-        const val = data[i];
-        const inner = sqrt_2_over_pi_s * (val + 0.044715 * val * val * val);
-        data[i] = 0.5 * val * (1.0 + std.math.tanh(inner));
-    }
+    while (i < data.len) : (i += 1) data[i] = kernel_math.evaluate(scalar_recipe, kernel_math.ScalarMath, data[i]);
 }
 
 /// GELU and gate multiplication stream through cache-sized tiles. Workers
@@ -296,29 +304,22 @@ pub fn relu(data: []f32) void {
 
 /// Sigmoid activation: 1 / (1 + exp(-x))
 pub fn sigmoid(data: []f32) void {
-    const one: F32xN = @splat(1.0);
-    var i: usize = 0;
-    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
-        const v: F32xN = data[i..][0..VEC_LEN].*;
-        data[i..][0..VEC_LEN].* = one / (one + expVec(-v));
-    }
-    while (i < data.len) : (i += 1) {
-        data[i] = 1.0 / (1.0 + @exp(-data[i]));
-    }
+    applyActivation(.sigmoid, data);
 }
 
 /// SiLU/Swish activation: x * sigmoid(x) = x / (1 + exp(-x))
 pub fn silu(data: []f32) void {
-    const one: F32xN = @splat(1.0);
+    const expression = comptime @import("antfly_tile").fexpr.acc.siluOf();
+    const Math = struct {
+        pub fn exp(comptime _: comptime_int, x: F32xN) F32xN {
+            return expVec(x);
+        }
+    };
     var i: usize = 0;
     while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
-        const v: F32xN = data[i..][0..VEC_LEN].*;
-        data[i..][0..VEC_LEN].* = v / (one + expVec(-v));
+        data[i..][0..VEC_LEN].* = expression.evalVecWith(VEC_LEN, Math, data[i..][0..VEC_LEN].*, @splat(0), @splat(0));
     }
-    while (i < data.len) : (i += 1) {
-        const val = data[i];
-        data[i] = val / (1.0 + @exp(-val));
-    }
+    while (i < data.len) : (i += 1) data[i] = kernel_math.evaluate(comptime kernel_math.activation(.silu, .left_associated), kernel_math.ScalarMath, data[i]);
 }
 
 pub fn clampSilu(output: []f32, input: []const f32, min_value: ?f32, max_value: ?f32) void {
@@ -342,60 +343,17 @@ pub fn clampSilu(output: []f32, input: []const f32, min_value: ?f32, max_value: 
 /// Quick GELU activation: x * sigmoid(1.702 * x)
 /// Faster approximation used by CLIP and some other models.
 pub fn quickGelu(data: []f32) void {
-    const neg1702: F32xN = @splat(-1.702);
-    const one: F32xN = @splat(1.0);
-    var i: usize = 0;
-    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
-        const v: F32xN = data[i..][0..VEC_LEN].*;
-        data[i..][0..VEC_LEN].* = v / (one + expVec(neg1702 * v));
-    }
-    while (i < data.len) : (i += 1) {
-        const val = data[i];
-        data[i] = val / (1.0 + @exp(-1.702 * val));
-    }
+    applyActivation(.quick_gelu, data);
 }
 
 /// RMS normalization: x * rsqrt(mean(x^2) + eps) * weight. No bias, no mean subtraction.
 pub fn rmsNorm(data: []f32, weight: []const f32, dim: usize, eps: f32) void {
-    const batch = data.len / dim;
-    for (0..batch) |b| {
-        const row = data[b * dim .. (b + 1) * dim];
-
-        const sum_sq = vectorDotSelf(row);
-        const rms = @sqrt(sum_sq / @as(f32, @floatFromInt(dim)) + eps);
-        const inv_rms = 1.0 / rms;
-
-        const scale: F32xN = @splat(inv_rms);
-        var i: usize = 0;
-        while (i + VEC_LEN <= dim) : (i += VEC_LEN) {
-            const v: F32xN = row[i..][0..VEC_LEN].*;
-            const w: F32xN = weight[i..][0..VEC_LEN].*;
-            row[i..][0..VEC_LEN].* = v * scale * w;
-        }
-        while (i < dim) : (i += 1) {
-            row[i] = row[i] * inv_rms * weight[i];
-        }
-    }
+    @import("antfly_tile").norm.runRms(VEC_LEN, false, .{ .x = data, .gamma = weight, .out = data, .dim = dim, .eps = eps });
 }
 
-/// Fused post-norm residual epilogue. Keep the reduction and multiplication
-/// order identical to rmsNorm, followed by separate scale/add/scale passes.
+/// Fused post-norm residual with the same strict arithmetic and reduction order.
 pub fn rmsNormResidual(output: []f32, input: []const f32, weight: []const f32, residual: []const f32, dim: usize, eps: f32, norm_scale: f32, output_scale: f32) void {
-    @setFloatMode(.strict);
-    for (0..input.len / dim) |r| {
-        const row = input[r * dim ..][0..dim];
-        const inv: F32xN = @splat(1.0 / @sqrt(vectorDotSelf(row) / @as(f32, @floatFromInt(dim)) + eps));
-        const ns: F32xN = @splat(norm_scale);
-        const os: F32xN = @splat(output_scale);
-        var i: usize = 0;
-        while (i + VEC_LEN <= dim) : (i += VEC_LEN) {
-            const v: F32xN = row[i..][0..VEC_LEN].*;
-            const w: F32xN = weight[i..][0..VEC_LEN].*;
-            const res: F32xN = residual[r * dim + i ..][0..VEC_LEN].*;
-            output[r * dim + i ..][0..VEC_LEN].* = (res + ((v * inv) * w) * ns) * os;
-        }
-        while (i < dim) : (i += 1) output[r * dim + i] = (residual[r * dim + i] + ((row[i] * inv[0]) * weight[i]) * norm_scale) * output_scale;
-    }
+    @import("antfly_tile").norm.runRms(VEC_LEN, true, .{ .x = input, .gamma = weight, .out = output, .residual = residual, .dim = dim, .eps = eps, .norm_scale = norm_scale, .output_scale = output_scale });
 }
 
 /// Softmax over the last dimension. data is [batch, dim], applied per row.
@@ -555,34 +513,6 @@ pub fn logSoftmaxInPlace(data: []f32, dim: usize) void {
 }
 
 // --- Vectorized helpers ---
-
-fn vectorSum(data: []const f32) f32 {
-    var acc: F32xN = @splat(0.0);
-    var i: usize = 0;
-    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
-        const v: F32xN = data[i..][0..VEC_LEN].*;
-        acc += v;
-    }
-    var sum = @reduce(.Add, acc);
-    while (i < data.len) : (i += 1) {
-        sum += data[i];
-    }
-    return sum;
-}
-
-fn vectorDotSelf(data: []const f32) f32 {
-    var acc: F32xN = @splat(0.0);
-    var i: usize = 0;
-    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
-        const v: F32xN = data[i..][0..VEC_LEN].*;
-        acc += v * v;
-    }
-    var sum = @reduce(.Add, acc);
-    while (i < data.len) : (i += 1) {
-        sum += data[i] * data[i];
-    }
-    return sum;
-}
 
 fn vectorMax(data: []const f32) f32 {
     if (data.len == 0) return -std.math.inf(f32);

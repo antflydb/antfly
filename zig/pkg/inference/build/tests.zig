@@ -37,16 +37,17 @@ pub fn create(ctx: Context) Suite {
     // Native CPU Debug peaked at 12,070,764,544 bytes with cold compiler
     // caches. 12,672 MiB retains 10% headroom rounded up to 128 MiB.
     // Accelerator and other-host reservations retain their existing profiles.
-    const native_cpu = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+    const native_cpu_macos = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
         ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and
         !ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
+    // The optimized native CPU closeout scope peaked at 11,435,048,960
+    // bytes. 12,032 MiB retains 10% headroom rounded up to 128 MiB.
+    // CUDA serving reached 19.57 GB on Linux; dual-backend macOS reached
+    // 20.66 GB. Reserve 24 GiB for CUDA and 20 GiB for the measured 17.56 GB
+    // single-Metal suite. These are compiler scheduler reservations only.
     const tests = b.addTest(.{
-        // Zig 0.17's focused CUDA serving suite reached 19.57 GB on aarch64
-        // Linux. Reserve 24 GiB so the scheduler admits its measured compiler
-        // footprint and leaves room for the socket/reference coverage.
-        // The focused native CPU ReleaseFast suite peaked at 10,032,644,096
-        // bytes. Its old 9 GiB declaration rejected a successful compilation.
-        .max_rss = if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
+        .max_rss = if (native_cpu_macos) @as(usize, if (ctx.optimize == .debug) 12_672 else 12_032) * 1024 * 1024 else @as(usize, if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 20 else 9) * 1024 * 1024 * 1024,
+
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
@@ -72,21 +73,7 @@ pub fn create(ctx: Context) Suite {
     // Direct reader API tests share the runtime's request and result types.
     // Reuse the root owner so native reader options, imports, and framework
     // linkage stay consistent with the runtime under test.
-    const readers_mod = ctx.graph.inference_mod.import_table.get("antfly_readers") orelse blk: {
-        const standalone_readers_mod = b.createModule(.{
-            .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/readers/src/mod.zig" })),
-            .target = ctx.target,
-            .optimize = ctx.optimize,
-        });
-        standalone_readers_mod.addImport("antfly_document_runs", ctx.graph.document_runs_mod);
-        standalone_readers_mod.addImport("httpx", ctx.graph.httpx_mod);
-        standalone_readers_mod.addImport("inference_api", ctx.graph.inference_api_mod);
-        standalone_readers_mod.addImport("antfly_google", ctx.graph.google_mod);
-        standalone_readers_mod.addImport("antfly_reader_config", ctx.graph.reader_config_mod);
-        standalone_readers_mod.addImport("antfly_scraping", ctx.graph.scraping_mod);
-        standalone_readers_mod.addImport("antfly_image", ctx.graph.image_mod);
-        break :blk standalone_readers_mod;
-    };
+    const readers_mod = ctx.graph.inference_mod.import_table.get("antfly_readers").?;
     tests.root_module.addImport("antfly_readers", readers_mod);
     tests.root_module.addImport("antfly_document_runs", ctx.graph.document_runs_mod);
     tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);
@@ -102,6 +89,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
     tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
     tests.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    tests.root_module.addImport("antfly_tile", ctx.graph.tile_mod);
     tests.root_module.addImport("inference_fixed_tokenizer_data", ctx.graph.inference_fixed_tokenizer_data_mod);
     tests.root_module.addImport("antfly_jsonschema", ctx.graph.jsonschema_mod);
     tests.root_module.addImport("antfly_scraping", ctx.graph.scraping_mod);
@@ -405,6 +393,7 @@ fn addGliner25Fuzz(ctx: Context) *std.Build.Step.Run {
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
     tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
     tests.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    tests.root_module.addImport("antfly_tile", ctx.graph.tile_mod);
     tests.root_module.addImport("ml", ml);
     const run = ctx.addRunArtifact(tests);
     ctx.step("test-gliner25-fuzz", "Run bounded GLiNER2.5 parser, schema and document property tests").dependOn(&run.step);

@@ -337,6 +337,8 @@ const RuntimeRegionPlan = struct {
     // exact same node ordering. Length + endpoints alone can collide across two
     // structurally-different graphs with equal counts and equal first/last ids.
     node_ids_hash: u64 = 0,
+    descriptor_indices: []u32 = &.{},
+    descriptors: []ops_mod.kernel_descriptor.Descriptor = &.{},
     regions_by_pos: []RuntimeRegion = &.{},
     prepared_by_pos: []PreparedRuntimeRegion = &.{},
     attention_input_max_first_node: []NodeId = &.{},
@@ -349,6 +351,8 @@ const RuntimeRegionPlan = struct {
     pre_skip_declined_external_consumer_count: usize = 0,
 
     pub fn deinit(self: *RuntimeRegionPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.descriptor_indices);
+        allocator.free(self.descriptors);
         allocator.free(self.regions_by_pos);
         allocator.free(self.prepared_by_pos);
         allocator.free(self.attention_input_max_first_node);
@@ -365,6 +369,12 @@ const RuntimeRegionPlan = struct {
         if (node_ids.len == 0) return self.first_node == null_node and self.last_node == null_node;
         if (self.first_node != node_ids[0] or self.last_node != node_ids[node_ids.len - 1]) return false;
         return self.node_ids_hash == hashNodeIds(node_ids);
+    }
+
+    fn descriptorAt(self: RuntimeRegionPlan, position: usize) ?*const ops_mod.kernel_descriptor.Descriptor {
+        if (position >= self.descriptor_indices.len) return null;
+        const index = self.descriptor_indices[position];
+        return if (index < self.descriptors.len) &self.descriptors[index] else null;
     }
 
     fn regionAt(self: RuntimeRegionPlan, node_pos: usize, node_id: NodeId, node_ids: []const NodeId) RuntimeRegion {
@@ -1189,7 +1199,7 @@ const ChunkLocalOutputPool = struct {
         if (slot.backend != .metal or slot.storage != .metal_buffer) return null;
         if (slot.allocation == buffer_plan_mod.invalid_allocation) return null;
         const boundary_node_id = node_ids[chunk_boundary_pos];
-        if (slot.last_use > @as(u32, @intCast(boundary_node_id))) return null;
+        if (slot.last_use > buffer_plan.positionForNode(boundary_node_id)) return null;
         if (valueReferencedAfterBoundary(graph, node_ids, chunk_boundary_pos, node_id)) return null;
         const allocation = buffer_plan.allocationForSlot(slot.id) orelse return null;
         if (!allocation.reusable or allocation.kind != .tensor) return null;
@@ -1721,6 +1731,7 @@ pub const MetalPartitionExecutor = struct {
         var chunk_executed: usize = 0;
 
         var exec_state = interpreter.ExecState{
+            .allocator = allocator,
             .attention_layer = if (exec_ctx.attention_layer) |layer| layer.* else 0,
             .options = options,
             .last_use = last_use,
@@ -2097,10 +2108,17 @@ pub const MetalPartitionExecutor = struct {
                         }
                         break :blk null;
                     };
-                    const command_output_opt = if (!metalPartitionRuntimeCommandsDisabled())
-                        try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state, output_hint, &attn_mask_cache, exec_ctx.stats, resident_input_cache_ptr)
-                    else
-                        null;
+                    const command_output_opt = command: {
+                        if (metalPartitionRuntimeCommandsDisabled()) break :command null;
+                        errdefer if (output_hint) |hint| cb.free(hint);
+                        if (runtime_region_plan.descriptorAt(node_pos)) |descriptor| {
+                            if (try tryExecuteAssignedMetal(cb, descriptor, graph.node(node_id).getInputs(), values, output_hint, if (descriptor.operation == .rope) (try interpreter.ropePositionOverride(exec_state.options.attention)) else null)) |output| {
+                                if (exec_ctx.stats) |stats| stats.assigned_kernel_dispatches += 1;
+                                break :command output;
+                            }
+                        }
+                        break :command try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state, output_hint, &attn_mask_cache, exec_ctx.stats, resident_input_cache_ptr);
+                    };
                     // Free an unconsumed pooled-output view (op didn't take the hint).
                     if (output_hint) |hint| {
                         const consumed = if (command_output_opt) |co| co == hint else false;
@@ -3586,7 +3604,7 @@ fn arenaAliasStillLive(
     if (alias_index >= last_use.len) return true;
     if (last_use[alias_index] == std.math.maxInt(u32)) return true;
     const slot = buffer_plan.slotForNode(alias_node) orelse return true;
-    if (slot.last_use >= @as(u32, @intCast(node_pos))) return true;
+    if (slot.last_use >= buffer_plan.positionForNode(current_node)) return true;
     if (last_use[alias_index] >= @as(u32, @intCast(current_node))) return true;
     if (valueReferencedAtOrAfterPosition(graph, node_ids, node_pos, alias_node)) return true;
     if (slot.roles.graph_output or slot.roles.partition_output or slot.roles.transfer_source) return true;
@@ -4076,6 +4094,17 @@ fn buildRuntimeRegionPlan(
     reachable: []const bool,
     last_use: []const u32,
 ) !RuntimeRegionPlan {
+    const descriptor_indices = try allocator.alloc(u32, node_ids.len);
+    errdefer allocator.free(descriptor_indices);
+    @memset(descriptor_indices, std.math.maxInt(u32));
+    var descriptors = std.ArrayListUnmanaged(ops_mod.kernel_descriptor.Descriptor).empty;
+    errdefer descriptors.deinit(allocator);
+    for (node_ids, 0..) |node_id, position| {
+        const descriptor = ops_mod.kernel_descriptor.lower(graph, node_id) orelse continue;
+        if (!metal_compute_mod.supportsAssignedDescriptor(&descriptor)) continue;
+        descriptor_indices[position] = @intCast(descriptors.items.len);
+        try descriptors.append(allocator, descriptor);
+    }
     const regions = try allocator.alloc(RuntimeRegion, node_ids.len);
     errdefer allocator.free(regions);
     @memset(regions, .{ .none = {} });
@@ -4292,6 +4321,8 @@ fn buildRuntimeRegionPlan(
         .first_node = if (node_ids.len == 0) null_node else node_ids[0],
         .last_node = if (node_ids.len == 0) null_node else node_ids[node_ids.len - 1],
         .node_ids_hash = hashNodeIds(node_ids),
+        .descriptor_indices = descriptor_indices,
+        .descriptors = try descriptors.toOwnedSlice(allocator),
         .regions_by_pos = regions,
         .prepared_by_pos = prepared,
         .attention_input_max_first_node = attention_input_max_first_node,
@@ -13732,18 +13763,7 @@ fn validatePartitionView(
     }
 }
 
-const RuntimeUnaryOp = enum {
-    negate,
-    sqrt,
-    rsqrt,
-    exp,
-    log,
-    sin,
-    cos,
-    tanh,
-    erf,
-    abs,
-};
+const RuntimeUnaryOp = ops_mod.kernel_descriptor.Unary;
 
 fn runtimeUnaryActivationKind(op: RuntimeUnaryOp) u32 {
     return switch (op) {
@@ -13757,6 +13777,7 @@ fn runtimeUnaryActivationKind(op: RuntimeUnaryOp) u32 {
         .tanh => 13,
         .erf => 14,
         .abs => 15,
+        .gelu, .gelu_exact, .relu, .silu => unreachable,
     };
 }
 
@@ -13785,10 +13806,39 @@ fn executeRuntimeUnary(
         .tanh => cb.primTanh(input),
         .erf => cb.primErf(input),
         .abs => cb.primAbs(input),
+        .gelu, .gelu_exact, .relu, .silu => unreachable,
     } catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
+}
+
+fn tryExecuteAssignedMetal(cb: *const ComputeBackend, frozen: *const ops_mod.kernel_descriptor.Descriptor, input_ids: []const NodeId, values: []?CT, output_hint: ?CT, rope_position: ?usize) !?CT {
+    // The arena binding belongs to Metal. Reference/simulation executions may
+    // run this executor with a native provider whose hooks require physical leases.
+    if (cb.kind() != .metal) return null;
+    const functions = cb.vtable.kernels orelse return null;
+    const run = functions.runAssignedKernel orelse return null;
+    var inputs: [3]CT = undefined;
+    for (input_ids, 0..) |id, index| inputs[index] = valueFor(values, id) orelse return null;
+    var positioned: ops_mod.kernel_descriptor.Descriptor = undefined;
+    const descriptor = if (frozen.operation == .rope and rope_position != null) blk: {
+        positioned = frozen.*;
+        positioned.operation.rope = try positioned.operation.rope.withPosition(rope_position.?);
+        break :blk &positioned;
+    } else frozen;
+    var request = ops_mod.kernel_descriptor.Invocation{ .descriptor = descriptor, .inputs = inputs[0..input_ids.len] };
+    if (!try run(cb.ptr, request)) return null;
+    var shape: [ml.graph.shape.max_rank]i32 = undefined;
+    const rank = descriptor.output_shape.rank();
+    for (descriptor.output_shape.dims[0..rank], 0..) |dimension, axis| shape[axis] = @intCast(dimension);
+    // The backend allocator participates in the current Metal command/arena
+    // plan. An existing pooled output binds directly without another allocation.
+    const output = output_hint orelse (try cb.allocUninitF32Shape(shape[0..rank])) orelse return null;
+    errdefer if (output_hint == null) cb.free(output);
+    request.output = output;
+    if (!try run(cb.ptr, request)) return error.AssignedKernelDeclinedAfterBinding;
+    return output;
 }
 
 fn tryExecuteMetalCommand(
@@ -13923,16 +13973,7 @@ fn tryExecuteMetalCommand(
             break :blk transposed;
         },
         .broadcast_in_dim => |attrs| try executeRuntimeBroadcast(cb, values, inputs, graph.node(inputs[0]).output_shape, attrs, output_hint),
-        .neg => try executeRuntimeUnary(cb, values, inputs, .negate, output_hint),
-        .sqrt => try executeRuntimeUnary(cb, values, inputs, .sqrt, output_hint),
-        .rsqrt => try executeRuntimeUnary(cb, values, inputs, .rsqrt, output_hint),
-        .exp => try executeRuntimeUnary(cb, values, inputs, .exp, output_hint),
-        .log => try executeRuntimeUnary(cb, values, inputs, .log, output_hint),
-        .sin => try executeRuntimeUnary(cb, values, inputs, .sin, output_hint),
-        .cos => try executeRuntimeUnary(cb, values, inputs, .cos, output_hint),
-        .tanh => try executeRuntimeUnary(cb, values, inputs, .tanh, output_hint),
-        .erf => try executeRuntimeUnary(cb, values, inputs, .erf, output_hint),
-        .abs => try executeRuntimeUnary(cb, values, inputs, .abs, output_hint),
+        .neg, .sqrt, .rsqrt, .exp, .log, .sin, .cos, .tanh, .erf, .abs => try executeRuntimeUnary(cb, values, inputs, ops_mod.kernel_descriptor.unary(n.op).?, output_hint),
         .slice => |attrs| try executeRuntimeSlice(graph, cb, values, inputs, attrs),
         .concat_prim => |attrs| try executeRuntimeConcatPrim(graph, cb, values, inputs, attrs),
         .gather => |attrs| try executeRuntimeGather(graph, cb, values, node_id, inputs, attrs, stats, resident_input_cache),
@@ -14007,12 +14048,12 @@ fn tryExecuteMetalCommand(
         .conv_general => |attrs| try executeRuntimeConvGeneral(graph, cb, values, inputs, attrs),
         .fused_conv1d => |attrs| try executeRuntimeConv1d(graph, cb, values, inputs, attrs),
         .fused_conv2d => |attrs| try executeRuntimeConv2d(graph, cb, values, inputs, attrs),
-        .fused_linear => |attrs| try executeRuntimeLinear(cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, true, op_plan),
+        .fused_linear => |attrs| try executeRuntimeLinear(graph, cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, true, op_plan, exec_state.options.mutable_parameters),
         .fused_linear_no_bias => |attrs| blk: {
             if (attrs.num_projections != 0) {
                 break :blk try executeRuntimeLinearNoBiasGrouped(cb, values, inputs, attrs);
             }
-            break :blk try executeRuntimeLinear(cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, false, op_plan);
+            break :blk try executeRuntimeLinear(graph, cb, values, inputs, attrs.rows, attrs.in_dim, attrs.out_dim, false, op_plan, exec_state.options.mutable_parameters);
         },
         .fused_linear_no_bias_pair => |attrs| try executeRuntimeLinearNoBiasPair(cb, values, inputs, attrs, exec_state),
         .fused_to_float32 => blk: {
@@ -14022,7 +14063,7 @@ fn tryExecuteMetalCommand(
             }
             break :blk valueFor(values, inputs[0]);
         },
-        .fused_embedding_lookup => |attrs| try executeRuntimeEmbeddingLookup(graph, cb, values, inputs, attrs, exec_state),
+        .fused_embedding_lookup => |attrs| try executeRuntimeEmbeddingLookup(allocator, graph, cb, values, inputs, attrs, exec_state),
         .fused_take_rows => |attrs| try executeRuntimeTakeRows(cb, values, inputs, attrs.rows, attrs.dim, op_plan, exec_state),
         .fused_zero_tensor => |attrs| try executeRuntimeZeroTensor(cb, attrs.rows, attrs.out_dim),
         .fused_rope => |attrs| try executeRuntimeRope(cb, values, inputs, attrs, exec_state),
@@ -14345,6 +14386,7 @@ fn executeRuntimeConvertDType(
 }
 
 fn executeRuntimeEmbeddingLookup(
+    allocator: std.mem.Allocator,
     graph: *const Graph,
     cb: *const ComputeBackend,
     values: []?CT,
@@ -14353,21 +14395,11 @@ fn executeRuntimeEmbeddingLookup(
     exec_state: *interpreter.ExecState,
 ) !?CT {
     const weight = valueFor(values, inputs[0]) orelse return null;
-    var owned_ids: ?[]i64 = null;
-    defer if (owned_ids) |buf| std.heap.page_allocator.free(buf);
-    const ids = blk: {
-        if (graph.node(inputs[1]).op == .fused_from_float32) {
-            break :blk exec_state.options.embedding_ids orelse return error.MissingRuntimeInput;
-        }
-        const ids_ct = valueFor(values, inputs[1]) orelse return null;
-        const raw = try cb.toFloat32(ids_ct, std.heap.page_allocator);
-        defer std.heap.page_allocator.free(raw);
-        const converted = try std.heap.page_allocator.alloc(i64, raw.len);
-        for (converted, raw) |*dst, value| dst.* = @intFromFloat(@round(value));
-        owned_ids = converted;
-        break :blk converted;
-    };
-    return cb.embeddingLookup(weight, ids, attrs.total, attrs.dim) catch |err| switch (err) {
+    const indices: interpreter.EmbeddingIndices = if (graph.node(inputs[1]).op == .fused_from_float32)
+        .{ .host = exec_state.options.embedding_ids orelse return error.MissingRuntimeInput }
+    else
+        .{ .tensor = valueFor(values, inputs[1]) orelse return null };
+    return interpreter.executeEmbeddingLookup(allocator, cb, weight, indices, attrs.total, attrs.dim) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
@@ -14617,7 +14649,26 @@ fn executeRuntimeSlice(
     };
 }
 
+fn parameterBackedMatrix(graph: *const Graph, node_id: NodeId, mutable_parameters: ?[]const bool) bool {
+    var id = node_id;
+    var remaining = graph.nodeCount();
+    while (remaining != 0) : (remaining -= 1) {
+        const node = graph.node(id);
+        switch (node.op) {
+            .constant => return true,
+            .parameter => {
+                if (mutable_parameters) |flags| if (id < flags.len and flags[id]) return false;
+                return true;
+            },
+            .reshape, .transpose => id = node.inputs[0],
+            else => return false,
+        }
+    }
+    return false;
+}
+
 fn executeRuntimeLinear(
+    graph: *const Graph,
     cb: *const ComputeBackend,
     values: []?CT,
     inputs: []const NodeId,
@@ -14626,9 +14677,30 @@ fn executeRuntimeLinear(
     out_dim: usize,
     comptime has_bias: bool,
     op_plan: ?OperatorPlan,
+    mutable_parameters: ?[]const bool,
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
     const weight = valueFor(values, inputs[1]) orelse return null;
+    // A fused linear is algebraically a matrix product; its RHS need not be
+    // an immutable checkpoint. Computed operands (notably K/V) must remain live
+    // device operands, never private packed weights keyed by buffer identity.
+    if (!parameterBackedMatrix(graph, inputs[1], mutable_parameters) and !weightRequiresPlannedLinear(cb, weight)) {
+        const lhs_shape = [_]i64{ @intCast(rows), @intCast(in_dim) };
+        const rhs_shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
+        const output = try cb.primDotGeneral(input, weight, &lhs_shape, &rhs_shape, &.{1}, &.{1}, &.{}, &.{});
+        if (!has_bias) {
+            errdefer cb.free(output);
+            return try promoteMetalOutputIfNeeded(cb, output);
+        }
+        defer cb.free(output);
+        const bias = valueFor(values, inputs[2]) orelse return null;
+        const shape = [_]i64{ @intCast(rows), @intCast(out_dim) };
+        const expanded = try cb.primBroadcastInDim(bias, &shape, &.{1}, &.{@intCast(out_dim)});
+        defer cb.free(expanded);
+        const biased = try cb.add(output, expanded);
+        errdefer cb.free(biased);
+        return try promoteMetalOutputIfNeeded(cb, biased);
+    }
     try validatePlannedLinearOp(cb, weight, rows, in_dim, out_dim, op_plan);
     if (has_bias) {
         const bias = valueFor(values, inputs[2]) orelse return null;
@@ -14728,7 +14800,7 @@ fn executeRuntimeDotGeneral(
         const in_dim = positiveI64ToUsize(lhs_shape[1]) orelse return null;
         const out_dim = positiveI64ToUsize(rhs_shape[0]) orelse return null;
         if (rhs_shape[1] == lhs_shape[1]) {
-            return executeRuntimeLinear(cb, values, inputs, rows, in_dim, out_dim, false, op_plan);
+            return executeRuntimeLinear(graph, cb, values, inputs, rows, in_dim, out_dim, false, op_plan, null);
         }
     }
     const output = cb.primDotGeneral(lhs, rhs, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch) catch |err| switch (err) {
@@ -15214,10 +15286,7 @@ fn executeRuntimeRope(
 ) !?CT {
     const input = valueFor(values, inputs[0]) orelse return null;
     const rope_dim: usize = if (attrs.rope_dim > 0) attrs.rope_dim else attrs.head_dim;
-    const position_offset = if (exec_state.options.attention) |attn|
-        attn.total_sequence_len - attn.query_sequence_len
-    else
-        attrs.position_offset;
+    const position_offset = (try interpreter.ropePositionOverride(exec_state.options.attention)) orelse attrs.position_offset;
     return cb.rope(
         input,
         attrs.seq_len,

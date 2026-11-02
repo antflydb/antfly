@@ -65,7 +65,7 @@ test "gliner boundary device encoder admission and failed allocation cleanup" {
     };
     var vt = cb.vtable.*;
     vt.backendKind = MissingDevice.kind;
-    vt.glinerBoundaryDevice = MissingDevice.execute;
+    vt.regions.relative_boundary.device = MissingDevice.execute;
     cb.vtable = &vt;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, MissingDevice.check, .{ &cb, &config, &prepared });
     const Cancel = struct {

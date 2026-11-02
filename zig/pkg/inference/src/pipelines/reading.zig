@@ -2886,7 +2886,7 @@ test "Florence step frame drains unsupported consumers and cancels failed token 
                 }
             };
             var fallback_table = cb.vtable.*;
-            fallback_table.decoderRuntimeArgmaxRowsSuppress = null;
+            fallback_table.regions.decoder.argmaxRowsSuppress = null;
             var fallback_cb = cb;
             fallback_cb.vtable = &fallback_table;
             var owns = try beginFlorenceStepFrame(&fallback_cb, true);
@@ -2912,9 +2912,9 @@ test "Florence step frame drains unsupported consumers and cancels failed token 
             try std.testing.expect(!cb.decoderRuntimeHasActiveFrame());
             var lost_context = LostResult{ .base = cb };
             var lost_table = cb.vtable.*;
-            lost_table.decoderRuntimeArgmaxRowsSuppress = LostResult.consume;
-            lost_table.decoderRuntimeHasActiveFrame = LostResult.active;
-            lost_table.decoderRuntimeBeginPlannedComputeScope = LostResult.scope;
+            lost_table.regions.decoder.argmaxRowsSuppress = LostResult.consume;
+            lost_table.regions.decoder.hasActiveFrame = LostResult.active;
+            lost_table.regions.decoder.beginPlannedComputeScope = LostResult.scope;
             const lost_cb = ComputeBackend{ .ptr = &lost_context, .vtable = &lost_table };
             var lost_frame = try beginFlorenceStepFrame(&cb, true);
             defer if (lost_frame) cb.decoderRuntimeCancelFrame() catch {};

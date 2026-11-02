@@ -35,6 +35,8 @@ pub const ModelRuntime = struct {
 
     pub const VTable = struct {
         capabilities: ?*const fn (ctx: *anyopaque) RuntimeCapabilities = null,
+        /// Side-effect-free decline before any state reset or submission.
+        supports_forward_request: ?*const fn (ctx: *anyopaque, request: ForwardRequest, operation: ForwardOperation) bool = null,
         prepare: ?*const fn (
             ctx: *anyopaque,
             allocator: std.mem.Allocator,
@@ -67,6 +69,9 @@ pub const ModelRuntime = struct {
             allocator: std.mem.Allocator,
             request: DecodeRequest,
         ) anyerror!GreedyDecodeOutput = null,
+        /// Retain resources needed by resident outputs independently of cache
+        /// ownership. Host-only outputs do not pin the runtime.
+        retain_output_owner: ?*const fn (ctx: *anyopaque) OutputOwner = null,
         deinit: *const fn (ctx: *anyopaque) void,
         reset: ?*const fn (ctx: *anyopaque) anyerror!void = null,
         debug_timing_stats: ?*const fn (ctx: *anyopaque) RuntimeDebugTimingStats = null,
@@ -85,6 +90,27 @@ pub const ModelRuntime = struct {
         caps.supports_sample_decode = caps.supports_sample_decode and self.vtable.decode_sample != null;
         caps.supports_greedy_decode = caps.supports_greedy_decode and self.vtable.decode_greedy != null;
         return caps;
+    }
+
+    pub fn supportsForwardRequest(self: *const ModelRuntime, request: ForwardRequest, operation: ForwardOperation) bool {
+        switch (request) {
+            .prefill => |prefill_request| {
+                if (prefill_request.query_seq_len == 0 or prefill_request.input_ids.len != prefill_request.query_seq_len or prefill_request.query_seq_len > prefill_request.seq_len) return false;
+            },
+            .decode => {
+                const caps = self.capabilities();
+                if (operation == .greedy and !caps.supports_greedy_decode) return false;
+                if (operation == .logits and !caps.supports_decode) return false;
+            },
+        }
+        if (self.vtable.supports_forward_request) |supports| return supports(self.ptr, request, operation);
+        return true;
+    }
+
+    fn retainOutputOwner(self: *const ModelRuntime, output: *ModelOutput) void {
+        if (output.owner == null and (output.device_logits != null or output.prepared_tail != null)) {
+            if (self.vtable.retain_output_owner) |retain| output.owner = retain(self.ptr);
+        }
     }
 
     pub fn reset(self: *ModelRuntime) !void {
@@ -139,6 +165,7 @@ pub const ModelRuntime = struct {
             UninterruptibleGuard{};
         defer hard_cancellation.deinit();
         var output = try self.vtable.prefill(self.ptr, allocator, request);
+        self.retainOutputOwner(&output);
         errdefer output.deinit(allocator);
         try request.check();
         return output;
@@ -157,6 +184,7 @@ pub const ModelRuntime = struct {
             UninterruptibleGuard{};
         defer hard_cancellation.deinit();
         var output = try decode_fn(self.ptr, allocator, request);
+        self.retainOutputOwner(&output);
         errdefer output.deinit(allocator);
         try request.check();
         return output;
@@ -175,6 +203,9 @@ pub const ModelRuntime = struct {
             UninterruptibleGuard{};
         defer hard_cancellation.deinit();
         var output = try decode_greedy_fn(self.ptr, allocator, request);
+        if (output.token_tensor != null and output.owner == null) {
+            if (self.vtable.retain_output_owner) |retain| output.owner = retain(self.ptr);
+        }
         errdefer output.deinit();
         try request.check();
         return output;
@@ -223,6 +254,8 @@ pub const RuntimeStateOwnership = enum {
     /// Runtime execution owns persistent backend-side model/KV/cache state.
     backend_owned,
 };
+
+pub const ForwardOperation = enum { logits, greedy };
 
 pub const RuntimeCapabilities = struct {
     supports_decode: bool = false,
@@ -286,6 +319,14 @@ pub const SamplingConfig = struct {
             self.frequency_penalty == 0 and
             self.presence_penalty == 0;
     }
+};
+
+/// One retained dependency of a resident result. The result releases it after
+/// its tensors, or as soon as explicit materialization leaves only host values.
+/// The provider supplies the reference; retaining requires no wrapper allocation.
+pub const OutputOwner = struct {
+    ptr: *anyopaque,
+    release: *const fn (*anyopaque) void,
 };
 
 pub const ModelOutput = struct {
@@ -369,18 +410,29 @@ pub const ModelOutput = struct {
     device_logits_backend: ?ops.ComputeBackend = null,
     prepared_tail: ?PreparedTail = null,
     final_logit_softcap: f32 = 0.0,
+    owner: ?OutputOwner = null,
+
+    fn releaseOwner(self: *ModelOutput) void {
+        if (self.owner) |owner| {
+            self.owner = null;
+            owner.release(owner.ptr);
+        }
+    }
 
     pub fn hostLogits(self: *ModelOutput, allocator: std.mem.Allocator) ![]const f32 {
         if (self.logits) |logits| return logits;
         if (self.prepared_tail) |*tail| {
             const device_logits = (try tail.logits()) orelse return error.InvalidModelOutput;
             const backend = tail.backend;
-            const logits = try backend.toFloat32(device_logits, allocator);
-            backend.free(device_logits);
+            const logits = materialized: {
+                defer backend.free(device_logits);
+                break :materialized try backend.toFloat32(device_logits, allocator);
+            };
             applyFinalLogitSoftcapInPlace(logits, tail.final_logit_softcap);
             tail.deinit();
             self.prepared_tail = null;
             self.logits = logits;
+            self.releaseOwner();
             return logits;
         }
         if (self.device_logits) |device_logits| {
@@ -391,6 +443,7 @@ pub const ModelOutput = struct {
             self.device_logits_backend = null;
             applyFinalLogitSoftcapInPlace(logits, self.final_logit_softcap);
             self.logits = logits;
+            self.releaseOwner();
             return logits;
         }
         return error.InvalidModelOutput;
@@ -432,6 +485,7 @@ pub const ModelOutput = struct {
             if (self.device_logits_backend) |backend| backend.free(device_logits);
         }
         if (self.prepared_tail) |*tail| tail.deinit();
+        self.releaseOwner();
         self.* = undefined;
     }
 };
@@ -498,11 +552,13 @@ pub const GreedyDecodeOutput = struct {
     /// transfer it again or call deinit.
     token_tensor: ?ops.CT = null,
     token_tensor_backend: ?*const ops.ComputeBackend = null,
+    owner: ?OutputOwner = null,
 
     pub fn deinit(self: *GreedyDecodeOutput) void {
         if (self.token_tensor) |tensor| {
             if (self.token_tensor_backend) |backend| backend.free(tensor);
         }
+        if (self.owner) |owner| owner.release(owner.ptr);
         self.* = undefined;
     }
 };
@@ -869,4 +925,63 @@ test "ModelExecutor reports unsupported decode when backend has no decode path" 
         .sampling = .{},
         .token_history = &.{},
     }));
+}
+
+test "resident model outputs survive runtime eviction and release owners after materialization or failure" {
+    const a = std.testing.allocator;
+    var weights = @import("../ops/native_compute.zig").WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.resident_weights.deinit(a);
+    defer weights.lazy_weights.deinit(a);
+    var compute = @import("../ops/native_compute.zig").NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const Probe = struct {
+        backend: ops.ComputeBackend,
+        references: usize = 1,
+        closed: bool = false,
+        host_only: bool = false,
+        fn retain(ctx: *anyopaque) OutputOwner {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.references += 1;
+            return .{ .ptr = ctx, .release = release };
+        }
+        fn release(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(!self.closed);
+            self.references -= 1;
+            if (self.references == 0) self.closed = true;
+        }
+        fn prefill(ctx: *anyopaque, allocator: std.mem.Allocator, _: PrefillRequest) !ModelOutput {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.host_only) return .{ .logits = try allocator.dupe(f32, &.{ 3, 5 }) };
+            return .{ .device_logits = try self.backend.fromFloat32Shape(&.{ 3, 5 }, &.{ 1, 2 }), .device_logits_backend = self.backend };
+        }
+        const vtable = ModelRuntime.VTable{ .prefill = prefill, .deinit = release, .retain_output_owner = retain };
+    };
+    for ([_]enum { materialize, fail_materialization, discard, host }{ .materialize, .fail_materialization, .discard, .host }) |mode| {
+        var probe = Probe{ .backend = compute.computeBackend(), .host_only = mode == .host };
+        var runtime_instance = ModelRuntime{ .ptr = &probe, .vtable = &Probe.vtable };
+        var output = try runtime_instance.prefill(a, .{ .input_ids = &.{1}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
+        runtime_instance.deinit();
+        var output_live = true;
+        defer if (output_live) output.deinit(a);
+        try std.testing.expectEqual(mode == .host, probe.closed);
+        switch (mode) {
+            .materialize, .host => {
+                try std.testing.expectEqualSlices(f32, &.{ 3, 5 }, try output.hostLogits(a));
+                try std.testing.expect(probe.closed);
+                try std.testing.expectEqualSlices(f32, &.{ 3, 5 }, try output.hostLogits(a));
+            },
+            .fail_materialization => {
+                var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                try std.testing.expectError(error.OutOfMemory, output.hostLogits(failing.allocator()));
+                try std.testing.expect(!probe.closed);
+                try std.testing.expect(output.owner != null);
+            },
+            .discard => {},
+        }
+        output.deinit(a);
+        output_live = false;
+        try std.testing.expect(probe.closed);
+        try std.testing.expectEqual(@as(usize, 0), probe.references);
+    }
 }

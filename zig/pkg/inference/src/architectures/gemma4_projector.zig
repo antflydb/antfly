@@ -3228,24 +3228,6 @@ fn layerNormRowsInPlace(
     }
 }
 
-fn addBiasFromTensor(
-    allocator: std.mem.Allocator,
-    store: *ProjectorWeights,
-    data: []f32,
-    rows: usize,
-    dim: usize,
-    name: []const u8,
-) !void {
-    _ = allocator;
-    var bias = try store.tensorF32(name);
-    defer bias.deinit();
-    if (data.len != rows * dim or bias.data.len != dim) return error.InvalidTensorShape;
-    for (0..rows) |row| {
-        const base = row * dim;
-        for (0..dim) |i| data[base + i] += bias.data[i];
-    }
-}
-
 fn parseConfig(file: *const gguf_format.File) !Config {
     const view = gguf_metadata.View.init(file);
     const arch = view.getString("general.architecture") orelse return error.InvalidGgufProjector;
@@ -3758,7 +3740,7 @@ fn packedAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Proje
     const clipped = if (specs[0].clipsInput()) try clampScalarCt(cb, a, input, rows, width, specs[0].input_min, specs[0].input_max) else input;
     defer if (clipped != input) cb.free(clipped);
     const packed_rows = (try cb.linearPackedNamed(clipped, &.{ names[0], names[1], names[2] }, &.{ width, width, width }, rows, width)) orelse return null;
-    if (cb.vtable.gemma4AudioPackedAttention != null and !audioHostOps().attention and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV")) return .{ .interleaved = .{ .tensor = packed_rows, .specs = specs } };
+    if (cb.vtable.regions.audio_attention.packedLocalRelative != null and !audioHostOps().attention and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV")) return .{ .interleaved = .{ .tensor = packed_rows, .specs = specs } };
     defer cb.free(packed_rows);
     return .{ .separate = try splitAudioQkv(cb, a, packed_rows, rows, width, specs) };
 }
@@ -3818,7 +3800,7 @@ fn audioSelfAttention(
                     }
                 }
                 const validity = if (params.segmented) inputs.segment_valid.? else inputs.valid_ct;
-                if (try cb.vtable.gemma4AudioPackedAttention.?(cb.ptr, interleaved.tensor, interleaved.tensor, interleaved.tensor, rel, inputs.scales[layer], validity, params)) |result| {
+                if (try cb.vtable.regions.audio_attention.packedLocalRelative.?(cb.ptr, interleaved.tensor, interleaved.tensor, interleaved.tensor, rel, inputs.scales[layer], validity, params)) |result| {
                     defer cb.free(result);
                     audioProfileMark(.attn_kernel);
                     return linearNoBiasMaybeClipped(cb, allocator, store, result, try fmt(&buf, "a.blk.{d}.attn_out", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
@@ -4946,50 +4928,6 @@ fn patchEmbedBatchTensor(
     return cb.primReshape(transposed, &.{ @intCast(batch * patch_count), @intCast(cfg.vision_hidden) });
 }
 
-fn patchEmbedHuggingFaceCt(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, pixel_values: []const f32, geometry: Geometry) !CT {
-    const scaled = try allocator.dupe(f32, pixel_values);
-    defer allocator.free(scaled);
-    for (scaled) |*value| value.* = 2.0 * (value.* - 0.5);
-    return patchEmbedHuggingFaceScaledCt(cb, allocator, store, cfg, scaled, geometry);
-}
-
-fn patchEmbedHuggingFaceScaledCt(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, scaled_pixels: []const f32, geometry: Geometry) !CT {
-    const patch_count = geometry.grid_x * geometry.grid_y;
-    const patch_dim = cfg.patch_size * cfg.patch_size * 3;
-    const pixels = try allocator.alloc(f32, patch_count * patch_dim);
-    defer allocator.free(pixels);
-    for (0..geometry.grid_y) |gy| for (0..geometry.grid_x) |gx| {
-        const base = (gy * geometry.grid_x + gx) * patch_dim;
-        for (0..cfg.patch_size) |py| for (0..cfg.patch_size) |px| for (0..3) |channel| {
-            pixels[base + (py * cfg.patch_size + px) * 3 + channel] = scaled_pixels[channel * geometry.width * geometry.height + (gy * cfg.patch_size + py) * geometry.width + gx * cfg.patch_size + px];
-        };
-    };
-    const input = try cb.fromFloat32Shape(pixels, &.{ @intCast(patch_count), @intCast(patch_dim) });
-    defer cb.free(input);
-    const weight = try projectorLinearWeightCt(cb, allocator, store, "v.patch_embd.weight", patch_dim, cfg.vision_hidden);
-    return cb.linearNoBias(input, weight, patch_count, patch_dim, cfg.vision_hidden);
-}
-
-fn addHuggingFacePositionEmbeddingsCt(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, patches: CT, geometry: Geometry) !CT {
-    const table = try store.residentWeight("v.position_embd.weight");
-    defer cb.free(table);
-    const expected = [_]i64{ 2, @intCast(cfg.position_embeddings_per_axis), @intCast(cfg.vision_hidden) };
-    if (!((try cb.tensorShapeMatches(table, &expected)) orelse false)) return error.InvalidPositionEmbeddingShape;
-    const total = geometry.grid_x * geometry.grid_y;
-    const x_ids = try allocator.alloc(i64, total);
-    defer allocator.free(x_ids);
-    const y_ids = try allocator.alloc(i64, total);
-    defer allocator.free(y_ids);
-    fillHfPositionRowIds(x_ids, y_ids, geometry, cfg.position_embeddings_per_axis);
-    const x_pos = try cb.embeddingLookup(table, x_ids, total, cfg.vision_hidden);
-    defer cb.free(x_pos);
-    const y_pos = try cb.embeddingLookup(table, y_ids, total, cfg.vision_hidden);
-    defer cb.free(y_pos);
-    const position = try cb.add(x_pos, y_pos);
-    defer cb.free(position);
-    return cb.add(patches, position);
-}
-
 fn fillHfPositionRowIds(x_ids: []i64, y_ids: []i64, geometry: Geometry, positions_per_axis: usize) void {
     std.debug.assert(x_ids.len == geometry.grid_x * geometry.grid_y and y_ids.len == x_ids.len);
     for (0..geometry.grid_y) |y| for (0..geometry.grid_x) |x| {
@@ -5501,15 +5439,6 @@ fn rmsNormHeadChunksNoScale(
     return cb.fromFloat32Shape(input_data, &shape);
 }
 
-fn swapRopeQuarters(cb: *const ComputeBackend, input: CT, chunks: usize, head_dim: usize) !CT {
-    const shape = [_]i64{ @intCast(chunks), 2, 2, @intCast(head_dim / 4) };
-    const view = try cb.primReshape(input, &shape);
-    defer cb.free(view);
-    const swapped = try cb.primTranspose(view, &.{ 0, 2, 1, 3 }, &shape);
-    defer cb.free(swapped);
-    return cb.primReshape(swapped, &.{ @intCast(chunks), @intCast(head_dim) });
-}
-
 fn apply2dRope(
     data: []f32,
     rows: usize,
@@ -5916,37 +5845,6 @@ fn rmsNormNoScaleCt(
     };
     defer cb.free(weight);
     return cb.rmsNorm(input, weight, dim, eps);
-}
-
-fn applyOptionalStandardization(
-    allocator: std.mem.Allocator,
-    store: anytype,
-    pooled: []f32,
-    cfg: Config,
-) !void {
-    var scale = loadTensorF32(store, "v.std_scale") catch |err| switch (err) {
-        error.TensorNotFound => null,
-        else => return err,
-    };
-    var bias = loadTensorF32(store, "v.std_bias") catch |err| switch (err) {
-        error.TensorNotFound => null,
-        else => return err,
-    };
-    _ = allocator;
-    defer if (scale) |*s| s.deinit();
-    defer if (bias) |*b| b.deinit();
-    if (scale == null and bias == null) return;
-    if (scale == null or bias == null) return error.InvalidStandardizationTensorShape;
-    if (scale.?.data.len != cfg.vision_hidden or bias.?.data.len != cfg.vision_hidden) {
-        return error.InvalidStandardizationTensorShape;
-    }
-    const rows = pooled.len / cfg.vision_hidden;
-    for (0..rows) |row| {
-        const base = row * cfg.vision_hidden;
-        for (0..cfg.vision_hidden) |h| {
-            pooled[base + h] = (pooled[base + h] - bias.?.data[h]) * scale.?.data[h];
-        }
-    }
 }
 
 /// A 1-D projector tensor (norm weight, bias, scale) of `len` elements: the

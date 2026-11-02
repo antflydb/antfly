@@ -1485,7 +1485,7 @@ test "GLiNER contextual batch projections match distinct ragged samples and perm
         var cb = compute.computeBackend();
         var vtable = cb.vtable.*;
         if (optional_gathers) {
-            vtable.glinerWordEmbeddings = ContextualHeadFixture.gatherWords;
+            vtable.regions.sequence_projection.firstWordRows = ContextualHeadFixture.gatherWords;
             vtable.takeRows = ContextualHeadFixture.gatherRows;
         }
         cb.vtable = &vtable;

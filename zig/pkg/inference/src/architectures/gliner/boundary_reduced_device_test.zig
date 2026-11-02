@@ -55,7 +55,7 @@ test "gliner boundary device reduced weight ownership survives failed preparatio
         }
     };
     var vt = cb.vtable.*;
-    vt.glinerBoundaryDevice = Fake.execute;
+    vt.regions.relative_boundary.device = Fake.execute;
     cb.vtable = &vt;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fake.check, .{&cb});
 }

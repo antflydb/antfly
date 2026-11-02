@@ -115,13 +115,6 @@ pub const TracingCompute = struct {
         return tc;
     }
 
-    /// Get a Builder that operates on this TracingCompute's graph.
-    /// The returned Builder borrows the graph pointer and must not
-    /// outlive the TracingCompute.
-    fn getBuilder(self: *TracingCompute) Builder {
-        return Builder.init(&self.graph);
-    }
-
     fn putWeightShape(self: *TracingCompute, name: []const u8, shape: Shape) !void {
         const owned_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned_name);

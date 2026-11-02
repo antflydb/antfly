@@ -347,6 +347,84 @@ pub fn build(b: *std.Build) void {
     const quant_kernel_codegen_step = b.step("quant-kernel-codegen", "Verify dev-generated quant kernel sources are fresh");
     quant_kernel_codegen_step.dependOn(&quant_kernel_codegen_check.step);
 
+    // Shared Tile kernels (lib/tile), with inference adapters in src/tile:
+    // one Zig description lowered to
+    // CPU @Vector code, Metal and CUDA. Host-only; no GPU needed.
+    const host_tile_mod = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ shared_lib_root, "lib/tile/src/mod.zig" })),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const tile_kernel_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = workflow_ctx.path("src/tile/tests.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    const shared_tile_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ shared_lib_root, "lib/tile/src/tests.zig" })),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    const shared_tile_tests_run = b.addRunArtifact(shared_tile_tests);
+    tile_kernel_tests.root_module.addImport("antfly_tile", host_tile_mod);
+    const tile_tests_step = b.step("test-tile-kernels", "Check tile kernel lowerings against the scalar reference");
+    tile_tests_step.dependOn(&b.addRunArtifact(tile_kernel_tests).step);
+    tile_tests_step.dependOn(&shared_tile_tests_run.step);
+    const tile_kernel_codegen_exe = b.addExecutable(.{
+        .name = "antfly-tile-kernel-codegen",
+        .root_module = b.createModule(.{
+            .root_source_file = workflow_ctx.path("src/tile/codegen_main.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    tile_kernel_codegen_exe.root_module.addImport("antfly_tile", host_tile_mod);
+    const tile_kernel_codegen_run = workflow_ctx.addRunArtifact(tile_kernel_codegen_exe);
+    tile_kernel_codegen_run.addPassthruArgs();
+    b.step("tile-kernel-codegen", "Verify (or --write) sources rendered from tile kernels").dependOn(&tile_kernel_codegen_run.step);
+    // Keep ownership reporting a consumed contract, using the same registries
+    // and the source freshness checks rather than another dispatch list.
+    const ownership_inventory = workflow_ctx.addRunArtifact(quant_kernel_codegen_exe);
+    ownership_inventory.addArg("--inventory");
+    const ownership_input = ownership_inventory.addOutputFileArg("kernel-ownership-inputs.json");
+    ownership_inventory.step.dependOn(&quant_kernel_codegen_test_check.step);
+    const ownership_tile_check = workflow_ctx.addRunArtifact(tile_kernel_codegen_exe);
+    ownership_tile_check.addArg("--check");
+    ownership_inventory.step.dependOn(&ownership_tile_check.step);
+    const ownership_verify = b.addSystemCommand(&.{ "python3", "-B" });
+    ownership_verify.addFileArg(workflow_ctx.path("scripts/kernel_ownership_inventory.py"));
+    ownership_verify.addArgs(&.{ "--root", "../../..", "--inventory" });
+    ownership_verify.setCwd(workflow_ctx.path("."));
+    ownership_verify.addFileArg(ownership_input);
+    ownership_verify.addArg("--output");
+    _ = ownership_verify.addOutputFileArg("kernel-ownership.json");
+    b.step("check-kernel-ownership", "Verify the consumed native ownership inventory and canonical source closure").dependOn(&ownership_verify.step);
+    // The CPU lowering is @Vector code: without -Dcpu it targets the build
+    // host's CPU rather than the baseline (no AVX/FMA) the default implies.
+    const tile_whisper_target = if (target.query.cpu_model == .determined_by_arch_os and
+        target.result.cpu.arch == b.graph.host.result.cpu.arch and target.result.os.tag == b.graph.host.result.os.tag)
+        b.graph.host
+    else
+        target;
+    const tile_whisper_exe = b.addExecutable(.{
+        .name = "antfly-tile-whisper",
+        .root_module = b.createModule(.{
+            .root_source_file = workflow_ctx.path("src/tile/whisper_main.zig"),
+            .target = tile_whisper_target,
+            .optimize = if (optimize == .debug) .fast else optimize,
+        }),
+    });
+    tile_whisper_exe.root_module.addImport("antfly_tile", b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ shared_lib_root, "lib/tile/src/mod.zig" })),
+        .target = tile_whisper_target,
+        .optimize = if (optimize == .debug) .fast else optimize,
+    }));
+    tile_whisper_exe.root_module.addImport("inference_audio", runtime_graph.inference_audio_mod);
+    b.step("check-tile-whisper", "Compile the prototype CPU Whisper CLI without model fixtures").dependOn(&tile_whisper_exe.step);
+    const tile_whisper_run = b.addRunArtifact(tile_whisper_exe);
+    tile_whisper_run.addPassthruArgs();
+    b.step("tile-whisper", "Transcribe with Whisper on tile kernels: -- <hf-model-dir> <audio.wav|mel.f32> [--reference <dir>]").dependOn(&tile_whisper_run.step);
+
     const metal_unavailable_message = "Metal quant kernel evidence targets require a macOS target with xcrun/Metal; no Metal runtime evidence was run.";
     const quant_kernel_metal_check_step = b.step("quant-kernel-metal-check", "Compile generated and promoted Metal quant kernels");
     var quant_kernel_metal_artifact_check_step: ?*std.Build.Step = null;
@@ -363,7 +441,80 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_check_step.dependOn(&quant_kernel_metal_unavailable.step);
     }
 
+    const host_ffn_check_step = b.step("test-metal-host-ffn", "Check quantized host FFN outputs, command traces and failure ownership");
+    if (target.result.os.tag == .macos and b.graph.host.result.os.tag == .macos) {
+        const host_ffn = b.addExecutable(.{ .name = "metal-host-ffn-check", .max_rss = 2 * 1024 * 1024 * 1024, .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .fast,
+            .link_libc = true,
+        }) });
+        addMacosSdkPaths(b, host_ffn.root_module, b.graph.host);
+        host_ffn.root_module.linkFramework("Foundation", .{});
+        host_ffn.root_module.linkFramework("Metal", .{});
+        host_ffn.root_module.linkFramework("MetalPerformanceShaders", .{});
+        host_ffn.root_module.linkFramework("Accelerate", .{});
+        host_ffn.root_module.addCSourceFile(.{ .file = b.path("scripts/check_metal_host_ffn.m"), .flags = &.{"-fobjc-arc"} });
+        const run_host_ffn = b.addRunArtifact(host_ffn);
+        host_ffn_check_step.dependOn(&run_host_ffn.step);
+        const ternary_attention = b.addExecutable(.{ .name = "metal-ternary-attention-check", .max_rss = 2 * 1024 * 1024 * 1024, .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .fast,
+            .link_libc = true,
+        }) });
+        addMacosSdkPaths(b, ternary_attention.root_module, b.graph.host);
+        ternary_attention.root_module.linkFramework("Foundation", .{});
+        ternary_attention.root_module.linkFramework("Metal", .{});
+        ternary_attention.root_module.linkFramework("MetalPerformanceShaders", .{});
+        ternary_attention.root_module.linkFramework("Accelerate", .{});
+        ternary_attention.root_module.addCSourceFile(.{ .file = b.path("scripts/check_metal_ternary_attention.m"), .flags = &.{"-fobjc-arc"} });
+        const run_ternary_attention = b.addRunArtifact(ternary_attention);
+        run_ternary_attention.step.dependOn(&run_host_ffn.step);
+        host_ffn_check_step.dependOn(&run_ternary_attention.step);
+    } else {
+        host_ffn_check_step.dependOn(&b.addFail("Metal host FFN checks require a macOS host and target.").step);
+    }
+
+    const row_families_step = b.step("test-metal-row-families", "Qualify native row, audio and rotary families against independent references");
+    if (target.result.os.tag == .macos and b.graph.host.result.os.tag == .macos) {
+        const rows = b.addExecutable(.{ .name = "metal-row-families-check", .max_rss = 2 * 1024 * 1024 * 1024, .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .fast,
+            .link_libc = true,
+        }) });
+        addMacosSdkPaths(b, rows.root_module, b.graph.host);
+        rows.root_module.linkFramework("Foundation", .{});
+        rows.root_module.linkFramework("Metal", .{});
+        rows.root_module.linkFramework("MetalPerformanceShaders", .{});
+        rows.root_module.linkFramework("Accelerate", .{});
+        var flags = std.ArrayListUnmanaged([]const u8).empty;
+        flags.append(b.allocator, "-fobjc-arc") catch @panic("OOM");
+        if (b.option([]const u8, "metal-row-baseline", "Frozen shader factory header for native row qualification")) |path|
+            flags.append(b.allocator, b.fmt("-DANTFLY_METAL_ROW_BASELINE_HEADER=\"{s}\"", .{path})) catch @panic("OOM");
+        rows.root_module.addCSourceFile(.{ .file = b.path("scripts/check_metal_row_families.m"), .flags = flags.items });
+        const run_rows = b.addRunArtifact(rows);
+        run_rows.has_side_effects = true;
+        run_rows.addPassthruArgs();
+        row_families_step.dependOn(&run_rows.step);
+    } else {
+        row_families_step.dependOn(&b.addFail("Metal row family checks require a macOS host and target.").step);
+    }
+
     const quant_kernel_metal_runtime_check_step = b.step("quant-kernel-metal-runtime-check", "Run dev-only generated Metal quant kernel correctness check");
+    quant_kernel_metal_runtime_check_step.dependOn(host_ffn_check_step);
+    if (target.result.os.tag == .macos and b.graph.host.result.os.tag == .macos) {
+        const math_options = b.addExecutable(.{ .name = "metal-math-options-check", .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .fast,
+            .link_libc = true,
+        }) });
+        addMacosSdkPaths(b, math_options.root_module, b.graph.host);
+        math_options.root_module.linkFramework("Foundation", .{});
+        math_options.root_module.linkFramework("Metal", .{});
+        math_options.root_module.addCSourceFile(.{ .file = b.path("scripts/metal_math_options_check.m"), .flags = &.{ "-fobjc-arc", "-Wall", "-Wextra", "-Werror" } });
+        const run_math_options = b.addRunArtifact(math_options);
+        quant_kernel_metal_check_step.dependOn(&run_math_options.step);
+        quant_kernel_metal_runtime_check_step.dependOn(&run_math_options.step);
+    }
     const a4b_metal_id_replay_step = b.step("a4b-metal-id-replay", "Replay exact Gemma4 26B-A4B Q4_0 MUL_MV_ID decode shapes on Metal");
     const a4b_metal_common_q4_replay_step = b.step("a4b-metal-common-q4-replay", "Replay packed-layout candidates for Gemma4 26B-A4B common Q4_0 decode shapes on Metal");
     const a4b_metal_route_select_replay_step = b.step("a4b-metal-route-select-replay", "Replay exact Gemma4 26B-A4B serial and SIMD-group route selection on Metal");
@@ -479,6 +630,14 @@ pub fn build(b: *std.Build) void {
             run_quant_kernel_metal_v2_conformance.step.dependOn(metal_artifact_check_step);
         }
         quant_kernel_metal_v2_conformance_step.dependOn(&run_quant_kernel_metal_v2_conformance.step);
+
+        // Runtime compilation is available with Command Line Tools alone.
+        // Keep the offline SDK gate above for artifact qualification, while
+        // exposing an independently reproducible device conformance target.
+        const run_quant_recipe_runtime = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        run_quant_recipe_runtime.addArg("--v2-conformance");
+        run_quant_recipe_runtime.step.dependOn(&quant_kernel_codegen_test_check.step);
+        b.step("quant-kernel-metal-runtime-conformance", "Run generated Metal device conformance using runtime compilation").dependOn(&run_quant_recipe_runtime.step);
 
         const run_quant_kernel_metal_sweep = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
         run_quant_kernel_metal_sweep.addArg("--sweep");
@@ -598,6 +757,10 @@ pub fn build(b: *std.Build) void {
         "--check",
         "--all",
     });
+    const cuda_standalone_check = b.addSystemCommand(&.{ "python3", "-B" });
+    cuda_standalone_check.addFileArg(b.path("scripts/regen_cuda_standalone.py"));
+    cuda_standalone_check.addPassthruArgs();
+    b.step("cuda-standalone-check", "Regenerate and verify standalone CUDA programs with pinned NVCC/Triton").dependOn(&cuda_standalone_check.step);
     const cuda_artifacts_check_step = b.step("cuda-artifacts-check", "Verify checked-in CUDA artifacts with CUDA 13.2");
     cuda_artifacts_check_step.dependOn(&cuda_artifacts_freshness_check.step);
 
@@ -1384,6 +1547,7 @@ pub fn build(b: *std.Build) void {
     );
     e2b_prefill_route_check_step.dependOn(e2b_prefill_route_tail.?);
 
+    workflows_benches.addCudaFlashPrefill(workflow_ctx);
     workflows_benches.addPagedAttention(workflow_ctx);
 
     const turboquant_distortion_bench_exe = b.addExecutable(.{
@@ -1410,7 +1574,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     clipclap_bench_exe.root_module.addImport("build_options", build_options_mod);
+    clipclap_bench_exe.root_module.addImport("antfly_platform", configured_platform_mod);
     clipclap_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    clipclap_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     if (enable_system_blas) {
         configureSystemBlas(b, clipclap_bench_exe.root_module, target, blas_root);
     }
@@ -1436,6 +1602,7 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| gliner2_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     gliner2_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    gliner2_e2e_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     gliner2_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     gliner2_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     gliner2_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1463,6 +1630,7 @@ pub fn build(b: *std.Build) void {
     clipclap_native_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| clipclap_native_bench_exe.root_module.addImport("pjrt", pjrt);
     clipclap_native_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    clipclap_native_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     clipclap_native_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     clipclap_native_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     clipclap_native_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1490,6 +1658,7 @@ pub fn build(b: *std.Build) void {
     clipclap_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| clipclap_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     clipclap_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    clipclap_e2e_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     clipclap_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     clipclap_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     clipclap_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1525,6 +1694,7 @@ pub fn build(b: *std.Build) void {
     qwen3_embedding_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| qwen3_embedding_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    qwen3_embedding_e2e_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1552,6 +1722,7 @@ pub fn build(b: *std.Build) void {
     nomic_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| nomic_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     nomic_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    nomic_e2e_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     nomic_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     nomic_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     nomic_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1579,6 +1750,7 @@ pub fn build(b: *std.Build) void {
     reranker_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     if (pjrt_mod) |pjrt| reranker_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     reranker_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    reranker_e2e_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     reranker_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     reranker_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
     reranker_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
@@ -1592,6 +1764,106 @@ pub fn build(b: *std.Build) void {
     run_reranker_e2e_bench.addPassthruArgs();
     const reranker_e2e_bench_step = b.step("bench-reranker-e2e", "Run real-bundle text reranker E2E benchmarks");
     reranker_e2e_bench_step.dependOn(&run_reranker_e2e_bench.step);
+
+    const unified_execution_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-unified-execution-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/unified_execution.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    unified_execution_bench_exe.root_module.addImport("build_options", build_options_mod);
+    unified_execution_bench_exe.root_module.addImport("ml", ml_mod);
+    if (pjrt_mod) |pjrt| unified_execution_bench_exe.root_module.addImport("pjrt", pjrt);
+    unified_execution_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    unified_execution_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
+    unified_execution_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    unified_execution_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
+    unified_execution_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
+    unified_execution_bench_exe.root_module.addImport("protobuf", protobuf_mod);
+    unified_execution_bench_exe.root_module.addImport("onnx_graph", onnx.graph);
+    unified_execution_bench_exe.root_module.addImport("onnx_data", onnx.data);
+    unified_execution_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(unified_execution_bench_exe.root_module);
+    unified_execution_bench_exe.root_module.link_libc = true;
+    b.step("build-unified-execution-bench", "Install the reproducible inference acceptance benchmark").dependOn(&b.addInstallArtifact(unified_execution_bench_exe, .{}).step);
+    const run_unified_execution_bench = b.addRunArtifact(unified_execution_bench_exe);
+    run_unified_execution_bench.addPassthruArgs();
+    const unified_execution_bench_step = b.step("bench-unified-execution", "Run pretokenized encoder correctness and performance acceptance workloads");
+    unified_execution_bench_step.dependOn(&run_unified_execution_bench.step);
+
+    const quant_recipe_bench = b.addExecutable(.{
+        .name = "antfly-quant-recipe-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/bench_quant_recipe.zig"), .target = target, .optimize = .ReleaseFast }),
+    });
+    b.step("bench-quant-recipes", "Compare shared SIMD decoding with the frozen scalar decoder").dependOn(&b.addRunArtifact(quant_recipe_bench).step);
+    const quant_recipe_fixtures = b.addExecutable(.{
+        .name = "antfly-quant-recipe-fixtures",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/quant_recipe_conformance.zig"), .target = b.graph.host, .optimize = .ReleaseFast }),
+    });
+    quant_recipe_fixtures.root_module.addImport("antfly_tile", host_tile_mod);
+    const emit_quant_recipe_fixtures = b.addRunArtifact(quant_recipe_fixtures);
+    const quant_recipe_cpp = emit_quant_recipe_fixtures.addOutputFileArg("quant_recipes.cpp");
+    const quant_recipe_host_check = b.addExecutable(.{
+        .name = "antfly-quant-recipe-host-check",
+        .root_module = b.createModule(.{ .target = b.graph.host, .optimize = .ReleaseFast, .link_libc = true }),
+    });
+    quant_recipe_host_check.root_module.addCSourceFile(.{ .file = quant_recipe_cpp, .flags = &.{ "-std=c++17", "-ffp-contract=off" } });
+    b.step("quant-recipe-cuda-host-conformance", "Compile CUDA recipe syntax and compare all formats with the independent GGUF oracle on the host").dependOn(&b.addRunArtifact(quant_recipe_host_check).step);
+
+    const recipe_cuda_fixtures = b.addExecutable(.{
+        .name = "antfly-kernel-recipe-cuda-fixtures",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/kernel_recipe_cuda_conformance.zig"), .target = b.graph.host, .optimize = .ReleaseFast }),
+    });
+    recipe_cuda_fixtures.root_module.addImport("antfly_tile", host_tile_mod);
+    const emit_recipe_cuda = b.addRunArtifact(recipe_cuda_fixtures);
+    const recipe_cuda_source = emit_recipe_cuda.addOutputFileArg("kernel_recipes.cu");
+    const recipe_cuda_source_step = b.step("kernel-recipe-cuda-source", "Generate model-free NVIDIA device conformance source");
+    recipe_cuda_source_step.dependOn(&emit_recipe_cuda.step);
+    const recipe_cuda_device_step = b.step("kernel-recipe-cuda-conformance", "Compile with nvcc and validate recipes and warp reductions on an NVIDIA device");
+    // Resolve nvcc only when this developer target runs, preserving configure
+    // caching and allowing source generation on machines without the toolkit.
+    const compile_recipe_cuda = std.Build.Step.Run.create(b, "compile CUDA recipe conformance");
+    compile_recipe_cuda.has_side_effects = true; // -arch=native observes the installed GPU.
+    compile_recipe_cuda.addFileArg(b.findProgramLazy(.{ .names = &.{"nvcc"} }));
+    // Scalar operation-tree conformance deliberately disables contraction;
+    // production kernel timing retains its normal flags.
+    compile_recipe_cuda.addArgs(&.{ "-x", "cu", "-std=c++17", "-arch=native", "--fmad=false", "-ftz=false" });
+    compile_recipe_cuda.addFileArg(recipe_cuda_source);
+    compile_recipe_cuda.addArg("-o");
+    const recipe_cuda_binary = compile_recipe_cuda.addOutputFileArg("kernel-recipe-cuda-conformance");
+    const run_recipe_cuda = std.Build.Step.Run.create(b, "run CUDA recipe conformance");
+    run_recipe_cuda.addFileArg(recipe_cuda_binary);
+    run_recipe_cuda.has_side_effects = true;
+    recipe_cuda_device_step.dependOn(&run_recipe_cuda.step);
+
+    const unified_fixtures_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-unified-fixtures-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/unified_fixtures.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    unified_fixtures_bench_exe.root_module.addImport("build_options", build_options_mod);
+    unified_fixtures_bench_exe.root_module.addImport("ml", ml_mod);
+    if (pjrt_mod) |pjrt| unified_fixtures_bench_exe.root_module.addImport("pjrt", pjrt);
+    unified_fixtures_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    unified_fixtures_bench_exe.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
+    unified_fixtures_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    unified_fixtures_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
+    unified_fixtures_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
+    unified_fixtures_bench_exe.root_module.addImport("protobuf", protobuf_mod);
+    unified_fixtures_bench_exe.root_module.addImport("onnx_graph", onnx.graph);
+    unified_fixtures_bench_exe.root_module.addImport("onnx_data", onnx.data);
+    unified_fixtures_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(unified_fixtures_bench_exe.root_module);
+    unified_fixtures_bench_exe.root_module.link_libc = true;
+    const run_unified_fixtures_bench = b.addRunArtifact(unified_fixtures_bench_exe);
+    run_unified_fixtures_bench.addPassthruArgs();
+    const unified_fixtures_bench_step = b.step("bench-unified-fixtures", "Export equivalent BERT ONNX and GGUF acceptance fixtures");
+    unified_fixtures_bench_step.dependOn(&run_unified_fixtures_bench.step);
 
     workflows_benches.addAudio(workflow_ctx);
 
@@ -1700,6 +1972,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{"wasm_compute:"},
     });
+    wasm_compute_tests.root_module.addImport("antfly_document_runs", runtime_graph.document_runs_mod);
     wasm_compute_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
     wasm_compute_tests.root_module.addImport("httpx", httpx_mod);
     wasm_compute_tests.root_module.addImport("inference_api", inference_api_mod);
@@ -1709,6 +1982,7 @@ pub fn build(b: *std.Build) void {
     wasm_compute_tests.root_module.addImport("inference_tokenizer", inference_tokenizer_mod);
     wasm_compute_tests.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     wasm_compute_tests.root_module.addImport("inference_linalg", inference_linalg_mod);
+    wasm_compute_tests.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     wasm_compute_tests.root_module.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     wasm_compute_tests.root_module.addImport("antfly_jsonschema", antfly_jsonschema_mod);
     wasm_compute_tests.root_module.addImport("antfly_scraping", antfly_scraping_mod);
@@ -1765,6 +2039,7 @@ pub fn build(b: *std.Build) void {
     web_projector_tests.root_module.addImport("inference_tokenizer", inference_tokenizer_mod);
     web_projector_tests.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     web_projector_tests.root_module.addImport("inference_linalg", inference_linalg_mod);
+    web_projector_tests.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     web_projector_tests.root_module.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     web_projector_tests.root_module.addImport("antfly_jsonschema", antfly_jsonschema_mod);
     web_projector_tests.root_module.addImport("antfly_scraping", antfly_scraping_mod);
@@ -1810,6 +2085,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    linalg_tests.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
     runtime_build.addX86Kernels(
         b,
         linalg_tests.root_module,

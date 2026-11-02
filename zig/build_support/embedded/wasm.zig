@@ -93,6 +93,11 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    const wasm_tile_mod = b.createModule(.{
+        .root_source_file = b.path("lib/tile/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
     const wasm_vector_mod = b.createModule(.{
         .root_source_file = b.path("lib/vector/src/mod.zig"),
         .target = wasm_target,
@@ -129,6 +134,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_objectstore_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_objectstore_mod.addImport("antfly_google", wasm_google_mod);
     wasm_vector_mod.addImport("protobuf", wasm_protobuf_mod);
+    wasm_vector_mod.addImport("antfly_tile", wasm_tile_mod);
     wasm_vectorindex_mod.addImport("antfly_vector", wasm_vector_mod);
     wasm_vectorindex_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_vectorindex_mod.addImport("antfly_hash", wasm_hash_mod);
@@ -444,6 +450,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    wasm_inference_linalg_mod.addImport("antfly_tile", wasm_tile_mod);
     const wasm_inference_ml_mod = b.createModule(.{
         .root_source_file = b.path("lib/ml/src/root.zig"),
         .target = wasm_target,
@@ -536,6 +543,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     inference_wasm_inference_mod.addImport("build_options", inference_wasm_build_options_mod);
     inference_wasm_inference_mod.addImport("inference_audio", wasm_inference_audio_mod);
     inference_wasm_inference_mod.addImport("antfly_media", wasm_inference_audio_mod.import_table.get("antfly_media").?);
+    inference_wasm_inference_mod.addImport("antfly_tile", wasm_tile_mod);
     inference_wasm_inference_mod.addImport("inference_linalg", wasm_inference_linalg_mod);
     inference_wasm_inference_mod.addImport("inference_tokenizer", wasm_inference_tokenizer_mod);
     inference_wasm_inference_mod.addImport("inference_hf_tokenizer", wasm_inference_hf_tokenizer_mod);
@@ -643,6 +651,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
                 .optimize = optimize,
             }) }, .{ .name = "vector", .module = b.createModule(.{
                 .root_source_file = b.path("lib/vector/src/vector.zig"),
+                .imports = &.{.{ .name = "antfly_tile", .module = wasm_tile_mod }},
                 .target = wasm_target,
                 .optimize = optimize,
             }) }, .{ .name = "platform_atomic", .module = b.createModule(.{

@@ -17,31 +17,17 @@ const std = @import("std");
 const context = @import("context.zig");
 const driver = @import("driver.zig");
 
+const Program = @import("embedded_module.zig").EmbeddedModule(@embedFile("scalar_clamp.ptx"), .{ .clamp = "scalar_clamp", .widen = "widen_16bit" });
+
 pub const Kernel = struct {
-    module: driver.CUmodule = null,
-    function: driver.CUfunction = null,
-    widen: driver.CUfunction = null,
+    program: Program = .{},
 
     pub fn deinit(self: *Kernel, ctx: *context.CudaContext) void {
-        if (self.module != null) {
-            ctx.makeCurrent() catch {};
-            _ = ctx.driver.fns.cuModuleUnload(self.module);
-            self.* = .{};
-        }
+        self.program.deinit(ctx);
     }
 
     fn init(self: *Kernel, ctx: *context.CudaContext) !void {
-        try ctx.makeCurrent();
-        if (self.module == null) {
-            var module: driver.CUmodule = null;
-            try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&module, @embedFile("scalar_clamp.ptx").ptr, 0, null, null));
-            errdefer _ = ctx.driver.fns.cuModuleUnload(module);
-            var function: driver.CUfunction = null;
-            try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, "scalar_clamp"));
-            var widen: driver.CUfunction = null;
-            try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&widen, module, "widen_16bit"));
-            self.* = .{ .module = module, .function = function, .widen = widen };
-        }
+        try self.program.init(ctx);
     }
 
     pub fn widen16Bit(self: *Kernel, ctx: *context.CudaContext, input: driver.CUdeviceptr, output: driver.CUdeviceptr, count: usize, bf16: bool) !void {
@@ -53,7 +39,7 @@ pub const Kernel = struct {
         var n: u32 = @intCast(count);
         var bf: u32 = @intFromBool(bf16);
         var args = [_]?*anyopaque{ &src, &dst, &n, &bf };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.widen, @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.program.function(.widen), @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
         ctx.noteKernelLaunch();
     }
 
@@ -68,7 +54,7 @@ pub const Kernel = struct {
         var hi = upper orelse std.math.inf(f32);
         var flags: u32 = @as(u32, @intFromBool(lower != null)) | (@as(u32, @intFromBool(upper != null)) << 1);
         var args = [_]?*anyopaque{ &src, &dst, &n, &lo, &hi, &flags };
-        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.function, @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.program.function(.clamp), @intCast((count + 255) / 256), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
         ctx.noteKernelLaunch();
     }
 };

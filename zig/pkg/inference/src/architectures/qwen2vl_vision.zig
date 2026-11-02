@@ -632,10 +632,6 @@ fn quickGelu(x: f32) f32 {
     return x / (1.0 + @exp(-1.702 * x));
 }
 
-fn geluApprox(x: f32) f32 {
-    return 0.5 * x * (1.0 + std.math.tanh(@sqrt(2.0 / std.math.pi) * (x + 0.044715 * x * x * x)));
-}
-
 fn dot(a: []const f32, b: []const f32) f32 {
     var total: f32 = 0.0;
     for (a, b) |av, bv| total += av * bv;

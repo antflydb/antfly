@@ -1059,6 +1059,8 @@ const ReservedHiddenCarrier = struct {
     ) !?ReservedHiddenCarrier {
         if (comptime !build_options.enable_metal) return null;
         const pair = (try metal_compute_mod.MetalCompute.reserveHiddenStatePair(cb, rows, hidden_size)) orelse return null;
+        errdefer cb.free(pair.front);
+        errdefer cb.free(pair.back);
         if (!(try metal_compute_mod.MetalCompute.copyTensorInto(cb, hidden_input, pair.front))) {
             cb.free(pair.front);
             cb.free(pair.back);
@@ -1083,10 +1085,10 @@ const ReservedHiddenCarrier = struct {
     }
 
     fn replaceActive(self: *ReservedHiddenCarrier, cb: *const ops.ComputeBackend, next_hidden: ops.CT) !void {
+        defer if (!self.ownsSlot(next_hidden)) cb.free(next_hidden);
         if (!(try metal_compute_mod.MetalCompute.copyTensorInto(cb, next_hidden, self.inactive()))) {
             return error.UnsupportedTensorType;
         }
-        if (!self.ownsSlot(next_hidden)) cb.free(next_hidden);
         self.active_front = !self.active_front;
     }
 
@@ -2483,7 +2485,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             decode_context.query_sequence_len,
             gpt_config.hidden_size,
         );
-    errdefer if (reserved_hidden) |*carrier| carrier.deinit(cb, false);
+    defer if (reserved_hidden) |*carrier| carrier.deinit(cb, false);
 
     var hidden = if (reserved_hidden) |*carrier| carrier.active() else hidden_input;
     var owns_hidden = false;
@@ -5059,7 +5061,7 @@ fn forwardFinalHiddenTensorDirect(
         )
     else
         null;
-    errdefer if (reserved_hidden) |*carrier| carrier.deinit(cb, false);
+    defer if (reserved_hidden) |*carrier| carrier.deinit(cb, false);
 
     var hidden = if (reserved_hidden) |*carrier| carrier.active() else hidden_input;
     var owns_hidden = false;
@@ -6696,19 +6698,14 @@ pub fn forwardPrefillLastPreparedTail(
         if (sync_finished_at > sync_started_at) timing_stats.prefill_sync_nanos += sync_finished_at - sync_started_at;
     }
     const slice_started_at = monotonicNowNs();
-    const last_hidden = if (total_rows == 1)
-        final_hidden
-    else
-        try cb.sliceRows2D(allocator, final_hidden, total_rows - 1, 1, gpt_config.hidden_size);
+    // The final row can alias reserved/planned decoder scratch. A deferred
+    // public tail must preserve its value when another prompt reuses that arena.
+    const last_hidden = try cb.snapshotRows2D(allocator, final_hidden, total_rows - 1, 1, gpt_config.hidden_size);
     const slice_finished_at = monotonicNowNs();
     if (slice_finished_at > slice_started_at) timing_stats.prefill_last_hidden_slice_nanos += slice_finished_at - slice_started_at;
-    errdefer if (last_hidden != final_hidden) cb.free(last_hidden);
-    if (last_hidden != final_hidden) {
-        cb.free(final_hidden);
-        owns_final_hidden = false;
-    } else {
-        owns_final_hidden = false;
-    }
+    errdefer cb.free(last_hidden);
+    cb.free(final_hidden);
+    owns_final_hidden = false;
     const frame_finish_started_at = monotonicNowNs();
     finishDecoderRuntimeFrame(cb, &decoder_frame_active);
     const frame_finish_finished_at = monotonicNowNs();
@@ -7451,10 +7448,10 @@ test "Gemma4 MTP input frame transfers and cancels only owned frames" {
         }
     };
     var table = @import("../ops/native_compute.zig").vtable_impl;
-    table.decoderRuntimeBeginFrame = Probe.begin;
-    table.decoderRuntimeHasActiveFrame = Probe.hasActive;
-    table.decoderRuntimeSetActiveFrameRegime = Probe.regime;
-    table.decoderRuntimeCancelFrame = Probe.cancel;
+    table.regions.decoder.beginFrame = Probe.begin;
+    table.regions.decoder.hasActiveFrame = Probe.hasActive;
+    table.regions.decoder.setActiveFrameRegime = Probe.regime;
+    table.regions.decoder.cancelFrame = Probe.cancel;
     var probe = Probe{};
     const cb: ops.ComputeBackend = .{ .ptr = &probe, .vtable = &table };
     var frame = try MtpVerifyInputFrame.begin(&cb);

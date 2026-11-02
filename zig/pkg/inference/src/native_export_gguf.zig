@@ -1314,6 +1314,7 @@ fn buildBertPlannedExport(
     }
 
     for (names) |name| {
+        if (bert_mod.isDerivedBufferName(name)) continue;
         var record = try access.getRecord(allocator, name);
         defer record.deinit();
 
@@ -6420,6 +6421,8 @@ test "dense bert export writes bert metadata and tensors" {
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
     try writeSafetensorsFixture(allocator, st_path, &.{
+        .{ .name = "bert.embeddings.position_ids", .shape = &.{ 1, 32 }, .data = &.{}, .dtype = "I64", .raw_data = std.mem.asBytes(&@as([32]i64, @splat(0))) },
+        .{ .name = "bert.embeddings.token_type_ids", .shape = &.{ 1, 32 }, .data = &.{}, .dtype = "I64", .raw_data = std.mem.asBytes(&@as([32]i64, @splat(0))) },
         .{ .name = "bert.embeddings.word_embeddings.weight", .shape = &.{ 16, 4 }, .data = &(@as([(16 * 4)]f32, @splat(0.0))) },
         .{ .name = "bert.embeddings.position_embeddings.weight", .shape = &.{ 32, 4 }, .data = &(@as([(32 * 4)]f32, @splat(0.0))) },
         .{ .name = "bert.embeddings.token_type_embeddings.weight", .shape = &.{ 2, 4 }, .data = &(@as([8]f32, @splat(0.0))) },
@@ -6462,6 +6465,8 @@ test "dense bert export writes bert metadata and tensors" {
     try std.testing.expectEqual(@as(u64, 3), view.getU64("bert.label_count").?);
     const catalog = gguf_mod.tensor_catalog.Catalog.init(&parsed);
     try std.testing.expect(catalog.find("embeddings.word_embeddings.weight") != null);
+    try std.testing.expect(catalog.find("embeddings.position_ids") == null);
+    try std.testing.expect(catalog.find("embeddings.token_type_ids") == null);
     try std.testing.expect(catalog.find("encoder.layer.0.attention.self.query.weight") != null);
     try std.testing.expect(catalog.find("pooler.dense.weight") != null);
     try std.testing.expect(catalog.find("classifier.weight") != null);
@@ -8603,6 +8608,12 @@ const SafetensorsFixture = struct {
     name: []const u8,
     shape: []const usize,
     data: []const f32,
+    dtype: []const u8 = "F32",
+    raw_data: ?[]const u8 = null,
+
+    fn bytes(self: @This()) []const u8 {
+        return self.raw_data orelse std.mem.sliceAsBytes(self.data);
+    }
 };
 
 fn writeSafetensorsFixture(allocator: std.mem.Allocator, path: []const u8, tensors: []const SafetensorsFixture) !void {
@@ -8610,7 +8621,7 @@ fn writeSafetensorsFixture(allocator: std.mem.Allocator, path: []const u8, tenso
     defer allocator.free(offsets);
     offsets[0] = 0;
     for (tensors, 0..) |tensor, i| {
-        offsets[i + 1] = offsets[i] + @as(u64, tensor.data.len) * 4;
+        offsets[i + 1] = offsets[i] + @as(u64, tensor.bytes().len);
     }
 
     var json: std.Io.Writer.Allocating = .init(allocator);
@@ -8618,7 +8629,7 @@ fn writeSafetensorsFixture(allocator: std.mem.Allocator, path: []const u8, tenso
     const writer = &json.writer;
     try writer.writeAll("{\"__metadata__\":{\"format\":\"pt\"}");
     for (tensors, 0..) |tensor, i| {
-        try writer.print(",\"{s}\":{{\"dtype\":\"F32\",\"shape\":[", .{tensor.name});
+        try writer.print(",\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[", .{ tensor.name, tensor.dtype });
         for (tensor.shape, 0..) |dim, dim_idx| {
             if (dim_idx > 0) try writer.writeByte(',');
             try writer.print("{d}", .{dim});
@@ -8635,7 +8646,7 @@ fn writeSafetensorsFixture(allocator: std.mem.Allocator, path: []const u8, tenso
     try file.writeStreamingAll(io, &header_size);
     try file.writeStreamingAll(io, json.written());
     for (tensors) |tensor| {
-        try file.writeStreamingAll(io, std.mem.sliceAsBytes(tensor.data));
+        try file.writeStreamingAll(io, tensor.bytes());
     }
 }
 

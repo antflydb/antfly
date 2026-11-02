@@ -23,16 +23,122 @@
 #include <metal_stdlib>
 using namespace metal;
 
+inline float antfly_qk_gelu(float x) { if (!isfinite(x)) return 0.0f; float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); if (inner > 10.0f) return x; if (inner < -10.0f) return 0.0f; float y = 0.5f * x * (1.0f + tanh(inner)); return isfinite(y) ? y : 0.0f; }
 inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-inline float antfly_q6_k_dequant_lane_v2(device const uchar *block, int lane) {
-    device const uchar *ql = block; device const uchar *qh = block + 128; device const uchar *scales = block + 192; int sub = lane >> 4; int i = lane & 15; int half_idx = sub >> 3; int group = (sub & 7) >> 1; int l = ((sub & 1) << 4) + i;
-    int ql_off = half_idx * 64 + (group & 1) * 32; int qh_off = half_idx * 32; int qh_shift = group * 2; int nibble_shift = (group >> 1) * 4; int low4 = int((ql[ql_off + l] >> nibble_shift) & 0x0fu); int high2 = int((qh[qh_off + l] >> qh_shift) & 0x03u);
-    int scale_u = int(scales[sub]); int scale = scale_u >= 128 ? scale_u - 256 : scale_u; return antfly_qk_half_le_to_float(block + 208) * float(scale) * float((low4 | (high2 << 4)) - 32);
+inline float antfly_qk_q6_k_scale(device const uchar *block, int lane) {
+    int v0 = lane;
+    int v1 = 4;
+    int v2 = int(uint(v0) >> v1);
+    int v3 = 208;
+    float v4 = antfly_qk_half_le_to_float(block + v3);
+    int v5 = 192;
+    int v6 = v5 + v2;
+    int v7 = int(((device const char *)block)[v6]);
+    float v8 = float(v7);
+    float v9 = v4 * v8;
+    return v9;
 }
+inline float antfly_qk_q6_k_value(device const uchar *block, int lane) {
+    int v0 = lane;
+    int v1 = 4;
+    int v2 = int(uint(v0) >> v1);
+    int v3 = 3;
+    int v4 = int(uint(v2) >> v3);
+    int v5 = 7;
+    int v6 = v2 & v5;
+    int v7 = 1;
+    int v8 = int(uint(v6) >> v7);
+    int v9 = v2 & v7;
+    int v10 = int(uint(v9) << v1);
+    int v11 = 15;
+    int v12 = v0 & v11;
+    int v13 = v10 + v12;
+    int v14 = 64;
+    int v15 = v4 * v14;
+    int v16 = v8 & v7;
+    int v17 = 32;
+    int v18 = v16 * v17;
+    int v19 = v15 + v18;
+    int v20 = v19 + v13;
+    int v21 = 128;
+    int v22 = v4 * v17;
+    int v23 = v21 + v22;
+    int v24 = v23 + v13;
+    int v25 = int(block[v20]);
+    int v26 = int(uint(v8) >> v7);
+    int v27 = v26 * v1;
+    int v28 = int(uint(v25) >> v27);
+    int v29 = v28 & v11;
+    int v30 = int(block[v24]);
+    int v31 = 2;
+    int v32 = v8 * v31;
+    int v33 = int(uint(v30) >> v32);
+    int v34 = v33 & v3;
+    int v35 = int(uint(v34) << v1);
+    int v36 = v29 | v35;
+    int v37 = v36 - v17;
+    float v38 = float(v37);
+    return v38;
+}
+inline float antfly_q6_k_dequant_lane_v2(device const uchar *block, int lane) {
+    int v0 = lane;
+    int v1 = 4;
+    int v2 = int(uint(v0) >> v1);
+    int v3 = 3;
+    int v4 = int(uint(v2) >> v3);
+    int v5 = 7;
+    int v6 = v2 & v5;
+    int v7 = 1;
+    int v8 = int(uint(v6) >> v7);
+    int v9 = v2 & v7;
+    int v10 = int(uint(v9) << v1);
+    int v11 = 15;
+    int v12 = v0 & v11;
+    int v13 = v10 + v12;
+    int v14 = 64;
+    int v15 = v4 * v14;
+    int v16 = v8 & v7;
+    int v17 = 32;
+    int v18 = v16 * v17;
+    int v19 = v15 + v18;
+    int v20 = v19 + v13;
+    int v21 = 128;
+    int v22 = v4 * v17;
+    int v23 = v21 + v22;
+    int v24 = v23 + v13;
+    int v25 = int(block[v20]);
+    int v26 = int(uint(v8) >> v7);
+    int v27 = v26 * v1;
+    int v28 = int(uint(v25) >> v27);
+    int v29 = v28 & v11;
+    int v30 = int(block[v24]);
+    int v31 = 2;
+    int v32 = v8 * v31;
+    int v33 = int(uint(v30) >> v32);
+    int v34 = v33 & v3;
+    int v35 = int(uint(v34) << v1);
+    int v36 = v29 | v35;
+    int v37 = v36 - v17;
+    int v38 = 208;
+    float v39 = antfly_qk_half_le_to_float(block + v38);
+    int v40 = 192;
+    int v41 = v40 + v2;
+    int v42 = int(((device const char *)block)[v41]);
+    float v43 = float(v42);
+    float v44 = v39 * v43;
+    float v45 = float(v37);
+    float v46 = v44 * v45;
+    return v46;
+}
+struct antfly_projection_decode_q6_k {
+    enum : int { values = 256, bytes = 210, shift = 8 };
+    __attribute__((always_inline)) static float decode(device const uchar* block, int lane) { return antfly_q6_k_dequant_lane_v2(block, lane); }
+    using Scalar = float; using Matrix = simdgroup_float8x8; using Scale = float;
+    enum : uint { sub_shift = 1u, sub_mask = 1u, sub_values = 16u };
+    static Scale scale(device const uchar* block, uint sub) { return antfly_qk_q6_k_scale(block, int(sub * 16u)); }
+    static float value(device const uchar* block, Scale scale, uint sub, uint j0, uint i) { return scale * antfly_qk_q6_k_value(block, int(sub * 16u + j0 + i)); }
+};
+#include "../../../graph/templates/metal_projection_native.metal"
 kernel void antfly_q6_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q6_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]], ushort lane_id [[thread_index_in_simdgroup]], ushort simdgroup_id [[simdgroup_index_in_threadgroup]]) {
-    const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u; const uint first_o = (group_pos.x * NSG + uint(simdgroup_id)) * NC; const uint first_r = group_pos.y * NR;
-    if (rows < 2 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return; const uint block_count = uint(in_dim) >> 8; const uint sub = uint(lane_id) >> 1; const uint j0 = (uint(lane_id) & 1u) << 3; const uint half_idx = sub >> 3; const uint group = (sub & 7u) >> 1; const uint l0 = ((sub & 1u) << 4) + j0; const uint ql_off = half_idx * 64u + (group & 1u) * 32u; const uint qh_off = half_idx * 32u; const uint qh_shift = group * 2u; const uint nibble_shift = (group >> 1) * 4u; float acc[4][2]; for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] = 0.0f;
-    for (uint b = 0u; b < block_count; ++b) { uint input_off = first_r * uint(in_dim) + b * 256u + sub * 16u + j0; float x[2][8]; for (uint rr = 0u; rr < NR; ++rr) for (uint i = 0u; i < 8u; ++i) x[rr][i] = first_r + rr < uint(rows) ? input[input_off + rr * uint(in_dim) + i] : 0.0f;
-        for (uint c = 0u; c < NC; ++c) { uint col = first_o + c; if (col >= uint(out_dim)) continue; device const uchar *block = weight_q6_k + (col * block_count + b) * 210u; device const uchar *ql = block; device const uchar *qh = block + 128u; int scale_u = int(block[192u + sub]); int scale = scale_u >= 128 ? scale_u - 256 : scale_u; float dscale = antfly_qk_half_le_to_float(block + 208u) * float(scale); for (uint i = 0u; i < 8u; ++i) { uint l = l0 + i; int low4 = int((ql[ql_off + l] >> nibble_shift) & 0x0fu); int high2 = int((qh[qh_off + l] >> qh_shift) & 0x03u); float w = dscale * float((low4 | (high2 << 4)) - 32); for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] += x[rr][i] * w; } } }
-    for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) { float total = simd_sum(acc[c][rr]); uint col = first_o + c; uint row = first_r + rr; if (lane_id == 0u && col < uint(out_dim) && row < uint(rows)) output[row * uint(out_dim) + col] = total + bias[col]; }
+    antfly_projection_k_tile<antfly_projection_decode_q6_k, antfly_projection_bias, 4u, 4u, 2u>(input, weight_q6_k, bias, output, rows, in_dim, out_dim, lane_id, simdgroup_id, group_pos);
 }

@@ -137,6 +137,7 @@ pub const NativePartitionExecutor = struct {
         }
 
         var exec_state = interpreter.ExecState{
+            .allocator = allocator,
             .attention_layer = if (exec_ctx.attention_layer) |layer| layer.* else 0,
             .options = options,
             .last_use = last_use,
@@ -250,6 +251,9 @@ fn executeNativePlannedNode(
     exec_state: *interpreter.ExecState,
 ) !?CT {
     if (cb.kind() != .native) return null;
+    if (exec_state.options.physical_frame) |frame| {
+        if (try frame.execute(cb, values, node_id, if (graph.node(node_id).op == .fused_rope) (try interpreter.ropePositionOverride(exec_state.options.attention)) else null)) |output| return output;
+    }
     const n = graph.node(node_id);
     const inputs = n.getInputs();
     // Planned native kernels currently derive several operand layouts from
@@ -327,20 +331,11 @@ fn executeNativePlannedNode(
             break :blk result.first;
         },
         .fused_embedding_lookup => |attrs| blk: {
-            var owned_ids: ?[]i64 = null;
-            defer if (owned_ids) |buf| allocator.free(buf);
-            const ids = ids_blk: {
-                if (graph.node(inputs[1]).op == .fused_from_float32) {
-                    break :ids_blk exec_state.options.embedding_ids orelse return error.MissingRuntimeInput;
-                }
-                const raw = try cb.toFloat32(valueAt(values, inputs[1]), allocator);
-                defer allocator.free(raw);
-                const converted = try allocator.alloc(i64, raw.len);
-                for (converted, raw) |*dst, value| dst.* = @intFromFloat(@round(value));
-                owned_ids = converted;
-                break :ids_blk converted;
-            };
-            break :blk try cb.embeddingLookup(valueAt(values, inputs[0]), ids, attrs.total, attrs.dim);
+            const indices: interpreter.EmbeddingIndices = if (graph.node(inputs[1]).op == .fused_from_float32)
+                .{ .host = exec_state.options.embedding_ids orelse return error.MissingRuntimeInput }
+            else
+                .{ .tensor = optionalValueAt(values, inputs[1]) orelse return error.MissingRuntimeInput };
+            break :blk try interpreter.executeEmbeddingLookup(allocator, cb, valueAt(values, inputs[0]), indices, attrs.total, attrs.dim);
         },
         .fused_layer_norm => |attrs| blk: {
             break :blk try cb.layerNorm(
@@ -1107,4 +1102,52 @@ test "native planned constants honor strict integer policy" {
     defer allocator.free(exported.payload.bytes);
     try std.testing.expectEqual(.i32, exported.dtype);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i32{16777217}), exported.payload.bytes);
+}
+
+test "native planned embeddings share exact integer binding semantics with interpretation" {
+    const Spy = struct {
+        calls: usize = 0,
+        fn dtype(_: *anyopaque, _: CT) anyerror!@import("../backends/tensor.zig").DType {
+            return .i64;
+        }
+        fn exportIds(_: *anyopaque, _: CT, a: std.mem.Allocator) anyerror!?ops_mod.ExportTensorData {
+            const bytes = try a.alloc(u8, 8);
+            std.mem.writeInt(i64, bytes[0..8], 16777217, .little);
+            return .{ .dtype = .i64, .payload = .{ .bytes = bytes } };
+        }
+        fn forbiddenFloatExport(_: *anyopaque, _: CT, _: std.mem.Allocator) anyerror![]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn gather(raw: *anyopaque, _: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualSlices(i64, &.{16777217}, ids);
+            try std.testing.expectEqual(@as(usize, 1), total);
+            try std.testing.expectEqual(@as(usize, 1), dim);
+            self.calls += 1;
+            return self;
+        }
+    };
+    var table = native_compute.vtable_impl;
+    table.tensorDType = Spy.dtype;
+    table.exportTensorData = Spy.exportIds;
+    table.toFloat32 = Spy.forbiddenFloatExport;
+    table.embeddingLookup = Spy.gather;
+    table.embeddingLookupTensor = null;
+    var spy = Spy{};
+    const cb = ComputeBackend{ .ptr = &spy, .vtable = &table };
+    var graph = Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const weight = try b.parameter("weight", ml.graph.Shape.init(.f32, &.{ 16777218, 1 }));
+    const ids = try b.parameter("ids", ml.graph.Shape.init(.i64, &.{1}));
+    const output = try b.embeddingLookup(weight, ids, 1, 1);
+    const values = try std.testing.allocator.alloc(?CT, graph.nodeCount());
+    defer std.testing.allocator.free(values);
+    @memset(values, null);
+    values[weight] = &spy;
+    values[ids] = &spy;
+    var state = interpreter.ExecState{ .attention_layer = 0, .options = .{} };
+    const actual = (try executeNativePlannedNode(std.testing.allocator, &graph, &cb, values, output, null, &state)).?;
+    try std.testing.expect(actual == @as(CT, &spy));
+    try std.testing.expectEqual(@as(usize, 1), spy.calls);
 }

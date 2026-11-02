@@ -27,6 +27,10 @@ const TensorDesc = contracts.TensorDesc;
 const TensorStorageClass = contracts.TensorStorageClass;
 const PartitionPlan = partition_mod.PartitionPlan;
 
+pub fn transferKey(node: NodeId, partition: u32) u64 {
+    return (@as(u64, node) << 32) | partition;
+}
+
 pub const SlotId = u32;
 pub const AllocationId = u32;
 pub const invalid_slot: SlotId = std.math.maxInt(SlotId);
@@ -81,8 +85,12 @@ pub const PartitionSlotView = struct {
 };
 
 pub const AllocationKind = enum {
+    input_binding,
+    constant_binding,
     tensor,
     transfer,
+    workspace,
+    auxiliary,
 };
 
 pub const PhysicalAllocation = struct {
@@ -132,15 +140,83 @@ pub const BuildOptions = struct {
 pub const BufferPlan = struct {
     slots: []LogicalSlot,
     node_slots: []SlotId,
+    /// Submission order can differ from graph IDs when partitions group
+    /// independent branches. All physical lifetimes use these positions.
+    node_positions: []u32,
     allocations: []PhysicalAllocation,
     transfers: []TransferEdge,
+    transfer_index: std.AutoHashMapUnmanaged(u64, usize),
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *BufferPlan) void {
         self.allocator.free(self.slots);
         self.allocator.free(self.node_slots);
+        self.allocator.free(self.node_positions);
         self.allocator.free(self.allocations);
         self.allocator.free(self.transfers);
+        self.transfer_index.deinit(self.allocator);
+    }
+
+    /// One scratch region per backend/frame is sufficient for sequential
+    /// command submission. Its lifetime spans the executable's entire graph.
+    pub fn addWorkspace(self: *BufferPlan, backend: BackendKind, bytes: usize, alignment: u32) !AllocationId {
+        if (bytes == 0 or bytes % @sizeOf(f32) != 0) return error.InvalidWorkspaceSize;
+        if (alignment == 0 or !std.math.isPowerOfTwo(alignment) or alignment > @alignOf(f32)) return error.UnsupportedPhysicalWorkspaceAlignment;
+        if (self.allocations.len >= invalid_allocation) return error.TooManyPhysicalAllocations;
+        const storage: TensorStorageClass = switch (backend) {
+            .native => .host_f32,
+            .cuda => .cuda_buffer,
+            else => return error.UnsupportedWorkspaceBackend,
+        };
+        const id: AllocationId = @intCast(self.allocations.len);
+        self.allocations = try self.allocator.realloc(self.allocations, self.allocations.len + 1);
+        self.allocations[id] = .{ .id = id, .kind = .workspace, .backend = backend, .storage = storage, .byte_size = bytes, .first_use = 0, .last_use = @intCast(self.node_slots.len), .reusable = true };
+        return id;
+    }
+
+    /// A stable mutable input bank for captured submission. External inputs
+    /// remain external logical slots; this allocation records the explicit
+    /// device copy which binds their current values to the captured addresses.
+    pub fn addInputBinding(self: *BufferPlan, backend: BackendKind, bytes: usize) !AllocationId {
+        const id = try self.addWorkspace(backend, bytes, @alignOf(f32));
+        self.allocations[id].kind = .input_binding;
+        self.allocations[id].reusable = false;
+        return id;
+    }
+
+    pub fn addConstantBinding(self: *BufferPlan, backend: BackendKind, bytes: usize) !AllocationId {
+        const id = try self.addInputBinding(backend, bytes);
+        self.allocations[id].kind = .constant_binding;
+        return id;
+    }
+
+    /// One representation plane per primary allocation and role. Since the
+    /// primary's aliases/outputs already determine reuse, the plane follows
+    /// that same lifetime and can be reused across all nodes sharing it.
+    pub fn addAuxiliaryPlane(self: *BufferPlan, primary_id: AllocationId, bytes: usize) !AllocationId {
+        if (primary_id >= self.allocations.len or bytes == 0) return error.InvalidBufferPlan;
+        const primary = self.allocations[primary_id];
+        if (primary.kind != .tensor) return error.InvalidBufferPlan;
+        const rounded = try std.math.add(usize, bytes, @sizeOf(f32) - 1);
+        if (self.allocations.len >= invalid_allocation) return error.TooManyPhysicalAllocations;
+        const id: AllocationId = @intCast(self.allocations.len);
+        self.allocations = try self.allocator.realloc(self.allocations, self.allocations.len + 1);
+        self.allocations[id] = primary;
+        self.allocations[id].id = id;
+        self.allocations[id].kind = .auxiliary;
+        self.allocations[id].byte_size = rounded / @sizeOf(f32) * @sizeOf(f32);
+        return id;
+    }
+
+    fn viewAllocation(self: *const BufferPlan, slot: LogicalSlot) !AllocationId {
+        const source = self.slots[slot.source_slot orelse return error.InvalidBufferPlan];
+        if (source.backend == slot.backend) return source.allocation;
+        const index = self.transfer_index.get(transferKey(source.node_id, slot.partition_index)) orelse return error.MissingViewTransfer;
+        return self.transfers[index].allocation;
+    }
+
+    pub fn positionForNode(self: *const BufferPlan, node: NodeId) u32 {
+        return self.node_positions[node];
     }
 
     pub fn slotForNode(self: *const BufferPlan, node_id: NodeId) ?*const LogicalSlot {
@@ -275,7 +351,7 @@ pub const BufferPlan = struct {
                 const source_slot_id = slot.source_slot orelse return error.InvalidBufferPlan;
                 const source_index: usize = @intCast(source_slot_id);
                 if (source_index >= self.slots.len) return error.InvalidBufferPlan;
-                if (slot.allocation != self.slots[source_index].allocation) return error.InvalidBufferPlan;
+                if (slot.allocation != try self.viewAllocation(slot)) return error.InvalidBufferPlan;
             } else if (slot.kind == .allocation) {
                 const allocation = self.allocationForSlot(slot.id) orelse return error.InvalidBufferPlan;
                 if (allocation.kind != .tensor) return error.InvalidBufferPlan;
@@ -331,10 +407,21 @@ pub fn build(
         null;
     defer if (owned_descs) |descs| allocator.free(descs);
     const tensor_descs = options.tensor_descs orelse owned_descs.?;
-
     const output_nodes = options.output_nodes orelse graph.outputs.items;
 
-    const last_use = try computeLastUse(allocator, graph, output_nodes);
+    const positions = try allocator.alloc(u32, node_count);
+    errdefer allocator.free(positions);
+    @memset(positions, std.math.maxInt(u32));
+    var ordinal: u32 = 0;
+    for (partition_plan.partitions, 0..) |part, partition_index| {
+        for (part.node_ids) |id| {
+            if (id >= node_count or positions[id] != std.math.maxInt(u32) or partition_plan.node_assignment[id] != partition_index) return error.InvalidPartitionPlan;
+            positions[id] = ordinal;
+            ordinal += 1;
+        }
+    }
+    if (ordinal != node_count) return error.InvalidPartitionPlan;
+    const last_use = try computeLastUse(allocator, graph, output_nodes, positions);
     defer allocator.free(last_use);
 
     const is_output = try markOutputs(allocator, node_count, output_nodes);
@@ -351,11 +438,24 @@ pub fn build(
         const partition_index = partition_plan.node_assignment[i];
         if (partition_index >= partition_plan.partitions.len) return error.InvalidPartitionPlan;
         const part = partition_plan.partitions[partition_index];
-        const desc = tensor_descs[i] orelse TensorDesc.init(
+        var desc = tensor_descs[i] orelse TensorDesc.init(
             graph.node(node_id).output_shape,
             partition_mod.tensorStorageForBackend(part.backend),
         );
         if (!desc.shape.eq(graph.node(node_id).output_shape)) return error.TensorDescriptorShapeMismatch;
+        // These CUDA kernels materialize dense buffers. Resolve this before
+        // assigning allocation IDs so downstream views retain the right source.
+        if (part.backend == .cuda) {
+            const node = graph.node(node_id);
+            switch (node.op) {
+                .transpose, .broadcast_in_dim => {
+                    desc = TensorDesc.init(node.output_shape, .cuda_buffer);
+                    desc.resident_backend = .cuda;
+                },
+                .reshape => desc = TensorDesc.view(node.output_shape, node.inputs[0], contracts.TensorStrides.dense(node.output_shape), .cuda, 0),
+                else => {},
+            }
+        }
 
         const slot_id: SlotId = @intCast(i);
         node_slots[i] = slot_id;
@@ -369,7 +469,7 @@ pub fn build(
             .kind = kind,
             .storage = materializedStorage(desc, part.backend),
             .desc = desc,
-            .first_use = @intCast(i),
+            .first_use = positions[i],
             .last_use = last_use[i],
             .source_slot = source_slot,
             .reusable = kind == .allocation and !is_output[i] and desc.storage != .runtime_input and desc.storage != .constant,
@@ -377,14 +477,30 @@ pub fn build(
         };
     }
 
+    // A metadata view keeps its source allocation live through every view
+    // consumer and published output. Propagate before assigning/reusing IDs;
+    // retaining a tensor wrapper alone cannot prevent an overlapping write.
+    var view_index = slots.len;
+    while (view_index != 0) {
+        view_index -= 1;
+        const view = slots[view_index];
+        if (view.kind != .view) continue;
+        const source = view.source_slot orelse continue;
+        if (source >= view_index) return error.InvalidViewSource;
+        slots[source].last_use = @max(slots[source].last_use, view.last_use);
+    }
+
     var allocations = std.ArrayListUnmanaged(PhysicalAllocation).empty;
     errdefer allocations.deinit(allocator);
-    for (slots) |*slot| {
-        try assignSlotAllocation(allocator, &allocations, slot, slots);
+    for (partition_plan.partitions) |part| {
+        for (part.node_ids) |node| try assignSlotAllocation(allocator, &allocations, &slots[node], slots);
     }
 
     var transfers = std.ArrayListUnmanaged(TransferEdge).empty;
     errdefer transfers.deinit(allocator);
+    var transfer_index = std.AutoHashMapUnmanaged(u64, usize).empty;
+    errdefer transfer_index.deinit(allocator);
+
     for (partition_plan.partitions, 0..) |part, target_partition| {
         for (part.external_inputs) |ext| {
             const source_index: usize = @intCast(ext.node_id);
@@ -402,10 +518,11 @@ pub fn build(
                 .backend = part.backend,
                 .storage = target_storage,
                 .byte_size = byte_size,
-                .first_use = partitionFirstUse(part),
-                .last_use = partitionLastUse(part),
+                .first_use = if (part.node_ids.len != 0) positions[part.node_ids[0]] else 0,
+                .last_use = if (part.node_ids.len != 0) positions[part.node_ids[part.node_ids.len - 1]] else 0,
                 .reusable = false,
             });
+            try transfer_index.put(allocator, transferKey(ext.node_id, @intCast(target_partition)), transfers.items.len);
             try transfers.append(allocator, .{
                 .source_node = ext.node_id,
                 .source_slot = source_slot,
@@ -421,11 +538,29 @@ pub fn build(
         }
     }
 
+    // A view across a backend boundary aliases the transferred allocation,
+    // not the source device address. Resolve chains after transfer IDs exist.
+    for (slots) |*slot| {
+        if (slot.kind != .view) continue;
+        const source = slots[slot.source_slot orelse return error.InvalidViewSource];
+        slot.allocation = if (source.backend == slot.backend) source.allocation else blk: {
+            const index = transfer_index.get(transferKey(source.node_id, slot.partition_index)) orelse return error.MissingViewTransfer;
+            break :blk transfers.items[index].allocation;
+        };
+        if (slot.allocation != invalid_allocation) allocations.items[slot.allocation].last_use = @max(allocations.items[slot.allocation].last_use, slot.last_use);
+    }
+
+    const owned_allocations = try allocations.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_allocations);
+    const owned_transfers = try transfers.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_transfers);
     return .{
         .slots = slots,
         .node_slots = node_slots,
-        .allocations = try allocations.toOwnedSlice(allocator),
-        .transfers = try transfers.toOwnedSlice(allocator),
+        .node_positions = positions,
+        .allocations = owned_allocations,
+        .transfers = owned_transfers,
+        .transfer_index = transfer_index,
         .allocator = allocator,
     };
 }
@@ -472,45 +607,6 @@ fn assignSlotAllocation(
     });
 }
 
-fn slotReferencedByPartition(
-    plan: *const BufferPlan,
-    slot_id: SlotId,
-    partition_index: u32,
-) bool {
-    for (plan.transfers) |transfer| {
-        if (transfer.source_slot == slot_id and
-            (transfer.source_partition == partition_index or transfer.target_partition == partition_index))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn partitionSlotRoles(
-    plan: *const BufferPlan,
-    slot: LogicalSlot,
-    partition_index: u32,
-) PartitionSlotRoles {
-    var roles = PartitionSlotRoles{
-        .local = slot.partition_index == partition_index,
-        .graph_output = slot.roles.graph_output and slot.partition_index == partition_index,
-    };
-    if (roles.graph_output) roles.output = true;
-    for (plan.transfers) |transfer| {
-        if (transfer.source_slot != slot.id) continue;
-        if (transfer.source_partition == partition_index) {
-            roles.output = true;
-            roles.transfer_source = true;
-        }
-        if (transfer.target_partition == partition_index) {
-            roles.input = true;
-            roles.transfer_target = true;
-        }
-    }
-    return roles;
-}
-
 const AllocationInit = struct {
     kind: AllocationKind,
     backend: BackendKind,
@@ -545,25 +641,16 @@ fn lifetimesOverlap(a_first: u32, a_last: u32, b_first: u32, b_last: u32) bool {
     return a_first <= b_last and b_first <= a_last;
 }
 
-fn partitionFirstUse(part: partition_mod.Partition) u32 {
-    if (part.node_ids.len == 0) return 0;
-    return @intCast(part.node_ids[0]);
-}
-
-fn partitionLastUse(part: partition_mod.Partition) u32 {
-    if (part.node_ids.len == 0) return 0;
-    return @intCast(part.node_ids[part.node_ids.len - 1]);
-}
-
 fn computeLastUse(
     allocator: std.mem.Allocator,
     graph: *const Graph,
     output_nodes: []const NodeId,
+    positions: []const u32,
 ) ![]u32 {
     const node_count: usize = @intCast(graph.nodeCount());
     const last_use = try allocator.alloc(u32, node_count);
     errdefer allocator.free(last_use);
-    for (last_use, 0..) |*value, i| value.* = @intCast(i);
+    @memcpy(last_use, positions);
 
     for (0..node_count) |i| {
         const node_id: NodeId = @intCast(i);
@@ -572,7 +659,8 @@ fn computeLastUse(
             if (input_id == null_node) continue;
             const input_index: usize = @intCast(input_id);
             if (input_index >= node_count) return error.InvalidGraphInput;
-            last_use[input_index] = @max(last_use[input_index], @as(u32, @intCast(i)));
+            if (positions[input_index] >= positions[i]) return error.InvalidPartitionSchedule;
+            last_use[input_index] = @max(last_use[input_index], positions[i]);
         }
     }
 
@@ -831,4 +919,101 @@ test "buffer plan reports total allocation bytes by backend and storage" {
 
     try std.testing.expect(plan.totalAllocationBytes(.native, .host_dense) >= 16);
     try std.testing.expectEqual(plan.totalAllocationBytes(null, null), plan.totalAllocationBytes(.native, null));
+}
+
+test "buffer plan CUDA materialized layouts own storage and reshapes retain that allocation" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const input = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+    const transpose = try b.transpose(input, &.{ 1, 0 });
+    const reshape = try b.reshape(transpose, ml.graph.Shape.init(.f32, &.{6}));
+    const output_shape = ml.graph.Shape.init(.f32, &.{ 2, 6 });
+    var attrs = ml.graph.node.BroadcastAttrs{ .target_shape = output_shape, .num_axes = 1 };
+    attrs.broadcast_axes[0] = 1;
+    const broadcast = try graph.addNode(.{ .op = .{ .broadcast_in_dim = attrs }, .output_shape = output_shape, .inputs = .{ reshape, null_node, null_node, null_node }, .num_inputs = 1 });
+    try graph.markOutput(reshape);
+    try graph.markOutput(broadcast);
+    const cuda = @import("cuda_capabilities.zig");
+    const caps = [_]partition_mod.Capability{
+        .{ .backend = .cuda, .priority = 10, .supports = &cuda.supports, .decide = &cuda.decide },
+        .{ .backend = .native, .priority = 0, .supports = &partition_mod.supportsAll },
+    };
+    var placement = try partition_mod.partition(a, &graph, &caps);
+    defer placement.deinit();
+    var plan = try build(a, &graph, &placement, .{});
+    defer plan.deinit();
+    try plan.validate(&graph, &placement);
+    const transposed = plan.slotForNode(transpose).?;
+    const reshaped = plan.slotForNode(reshape).?;
+    const broadcasted = plan.slotForNode(broadcast).?;
+    try std.testing.expectEqual(BackendKind.cuda, transposed.backend);
+    try std.testing.expectEqual(BackendKind.cuda, broadcasted.backend);
+    try std.testing.expectEqual(SlotKind.allocation, transposed.kind);
+    try std.testing.expectEqual(SlotKind.allocation, broadcasted.kind);
+    try std.testing.expectEqual(SlotKind.view, reshaped.kind);
+    try std.testing.expectEqual(transposed.id, reshaped.source_slot.?);
+    try std.testing.expectEqual(transposed.allocation, reshaped.allocation);
+    try std.testing.expect(transposed.allocation != broadcasted.allocation);
+    try std.testing.expectEqual(@as(u32, graph.nodeCount()), transposed.last_use);
+    try std.testing.expectEqual(@as(u64, 24), plan.allocations[transposed.allocation].byte_size);
+    try std.testing.expectEqual(@as(u64, 48), plan.allocations[broadcasted.allocation].byte_size);
+}
+
+test "buffer plan reuse follows partition submission order across independent branches" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{4}));
+    const left = try b.neg(x);
+    const left_output = try b.neg(left);
+    const right = try graph.addNode(.{ .op = .{ .exp = {} }, .output_shape = graph.node(x).output_shape, .inputs = .{ x, null_node, null_node, null_node }, .num_inputs = 1 });
+    const right_output = try b.neg(right);
+    try graph.markOutput(left_output);
+    try graph.markOutput(right_output);
+    var parts = [_]partition_mod.Partition{
+        .{ .backend = .native, .node_ids = &.{ x, left }, .external_inputs = &.{} },
+        .{ .backend = .native, .node_ids = &.{ right, right_output }, .external_inputs = &.{.{ .node_id = x, .source_partition = 0 }} },
+        .{ .backend = .native, .node_ids = &.{left_output}, .external_inputs = &.{.{ .node_id = left, .source_partition = 0 }} },
+    };
+    const operator_plans: [5]?@import("operator_plan.zig").OperatorPlan = @splat(null);
+    const placement = PartitionPlan{ .partitions = &parts, .node_assignment = &.{ 0, 0, 2, 1, 1 }, .node_operator_plans = &operator_plans, .allocator = a };
+    var plan = try build(a, &graph, &placement, .{});
+    defer plan.deinit();
+    try plan.validate(&graph, &placement);
+    const lhs = plan.slotForNode(left).?;
+    const rhs = plan.slotForNode(right).?;
+    try std.testing.expectEqual(@as(u32, 4), lhs.last_use);
+    try std.testing.expectEqual(@as(u32, 2), rhs.first_use);
+    try std.testing.expect(lhs.allocation != rhs.allocation);
+    try std.testing.expectEqual(@as(u32, 4), plan.positionForNode(left_output));
+}
+
+test "buffer plan cross-backend reshape aliases its transfer allocation through publication" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
+    const dense = try b.neg(x);
+    const view = try b.reshape(dense, ml.graph.Shape.init(.f32, &.{6}));
+    try graph.markOutput(view);
+    var parts = [_]partition_mod.Partition{
+        .{ .backend = .native, .node_ids = &.{ x, dense }, .external_inputs = &.{} },
+        .{ .backend = .cuda, .node_ids = &.{view}, .external_inputs = &.{.{ .node_id = dense, .source_partition = 0 }} },
+    };
+    const operator_plans: [3]?@import("operator_plan.zig").OperatorPlan = @splat(null);
+    const placement = PartitionPlan{ .partitions = &parts, .node_assignment = &.{ 0, 0, 1 }, .node_operator_plans = &operator_plans, .allocator = a };
+    var plan = try build(a, &graph, &placement, .{});
+    defer plan.deinit();
+    try plan.validate(&graph, &placement);
+    const source_slot = plan.slotForNode(dense).?;
+    const view_slot = plan.slotForNode(view).?;
+    try std.testing.expectEqual(SlotKind.view, view_slot.kind);
+    const transfer = plan.transfers[plan.transfer_index.get(transferKey(dense, 1)).?];
+    try std.testing.expectEqual(transfer.allocation, view_slot.allocation);
+    try std.testing.expect(source_slot.allocation != view_slot.allocation);
+    try std.testing.expectEqual(@as(u32, graph.nodeCount()), plan.allocations[view_slot.allocation].last_use);
 }

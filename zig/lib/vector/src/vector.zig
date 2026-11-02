@@ -272,57 +272,11 @@ pub fn norm(v: []const f32) f32 {
 /// Compute the dot product of two vectors.
 pub fn dot(a: []const f32, b: []const f32) f32 {
     std.debug.assert(a.len == b.len);
-    return dotGeneric(a, b);
-}
-
-fn dotGeneric(a: []const f32, b: []const f32) f32 {
-    const n = a.len;
-    const simd_width = 8;
-    const SimdF32 = @Vector(simd_width, f32);
-
-    var sum0: SimdF32 = @splat(0.0);
-    var sum1: SimdF32 = @splat(0.0);
-    var sum2: SimdF32 = @splat(0.0);
-    var sum3: SimdF32 = @splat(0.0);
-    var i: usize = 0;
-
-    while (i + simd_width * 4 <= n) : (i += simd_width * 4) {
-        const av: SimdF32 = a[i..][0..simd_width].*;
-        const bv: SimdF32 = b[i..][0..simd_width].*;
-        const av1: SimdF32 = a[i + simd_width ..][0..simd_width].*;
-        const bv1: SimdF32 = b[i + simd_width ..][0..simd_width].*;
-        const av2: SimdF32 = a[i + simd_width * 2 ..][0..simd_width].*;
-        const bv2: SimdF32 = b[i + simd_width * 2 ..][0..simd_width].*;
-        const av3: SimdF32 = a[i + simd_width * 3 ..][0..simd_width].*;
-        const bv3: SimdF32 = b[i + simd_width * 3 ..][0..simd_width].*;
-        sum0 += av * bv;
-        sum1 += av1 * bv1;
-        sum2 += av2 * bv2;
-        sum3 += av3 * bv3;
-    }
-
-    var sum = sum0 + sum1 + sum2 + sum3;
-    while (i + simd_width <= n) : (i += simd_width) {
-        const av: SimdF32 = a[i..][0..simd_width].*;
-        const bv: SimdF32 = b[i..][0..simd_width].*;
-        sum += av * bv;
-    }
-
-    var result: f32 = @reduce(.Add, sum);
-
-    // Scalar tail.
-    while (i < n) : (i += 1) {
-        result += a[i] * b[i];
-    }
-
-    return result;
+    return @import("antfly_tile").scoring.dot(a, b);
 }
 
 pub fn batchDot(query: []const f32, candidates: []const []const f32, dots: []f32) void {
-    std.debug.assert(candidates.len <= dots.len);
-    for (candidates, 0..) |candidate, i| {
-        dots[i] = dot(query, candidate);
-    }
+    @import("antfly_tile").scoring.batchDot(query, candidates, dots);
 }
 
 /// Compute dst = a - b.

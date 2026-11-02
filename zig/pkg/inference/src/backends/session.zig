@@ -637,9 +637,50 @@ pub const OutputCredits = struct {
     }
 };
 
-/// Session represents a loaded model that can run forward passes.
-/// This is the core abstraction all backends implement.
+/// Resolved semantic/execution metadata, copied with session handles. Optional
+/// wrappers preserve this value rather than rediscovering concrete vtables.
+pub const ModelContract = struct {
+    pub const Task = enum { generic, classifier, extractor };
+    pub const Embedding = struct {
+        family: enum { encoder, last_token_decoder, gemma2 } = .encoder,
+        max_length: usize,
+        reject_truncation: bool,
+        normalize: bool,
+        pooling: ResidentTextPooling,
+        /// Borrowed from the model owner, like public tensor-info names.
+        document_prefix: []const u8,
+        image: bool,
+        audio: bool,
+        video: bool,
+    };
+    task: ?Task = null,
+    /// Borrowed architecture semantics, preserved by session wrappers.
+    decoder_config: ?*const @import("../models/gpt.zig").Config = null,
+    embedding: ?Embedding = null,
+    resolved: bool = false,
+    padding: enum { declared, batch_max } = .declared,
+    resident_text_embeddings: bool = false,
+};
+
+pub const ComputeBackendOptions = struct {
+    run_budget: ?*memory.RunBudget = null,
+    borrow_shared_provider: bool = false,
+};
+
+/// Typed acquisition operation published by the loaded model owner. Wrappers
+/// retain this binding even when their public implementation pointer changes.
+pub const ComputeBackendProvider = struct {
+    ptr: *anyopaque,
+    acquire: *const fn (ctx: *anyopaque, session: Session, allocator: std.mem.Allocator, options: ComputeBackendOptions) anyerror!ops.ComputeBackend,
+};
+
+/// Loaded model execution handle. Copies preserve the resolved model contract.
 pub const Session = struct {
+    model_contract: ModelContract = .{},
+    compute_backend_provider: ?ComputeBackendProvider = null,
+    /// Borrowed common preparation owner. Staged models retain it when loaded;
+    /// resident outputs retain it independently of the publishing session.
+    shared_compute_context: ?*@import("compute_context.zig").SharedBackendContext = null,
     ptr: *anyopaque,
     vtable: *const VTable,
     close_protection: ?CloseProtection = null,
@@ -673,7 +714,19 @@ pub const Session = struct {
         return if (self.generation_workspace) |workspace| workspace.capacity else null;
     }
 
+    pub fn configureExecutionDiagnostics(self: Session, enabled: bool) bool {
+        const configure = self.vtable.configureExecutionDiagnostics orelse return false;
+        configure(self.ptr, enabled);
+        return true;
+    }
+    pub fn executionDiagnostics(self: Session) ?@import("../execution/diagnostics.zig").Snapshot {
+        const snapshot = self.vtable.executionDiagnostics orelse return null;
+        return snapshot(self.ptr);
+    }
+
     pub const VTable = struct {
+        configureExecutionDiagnostics: ?*const fn (ptr: *anyopaque, enabled: bool) void = null,
+        executionDiagnostics: ?*const fn (ptr: *anyopaque) ?@import("../execution/diagnostics.zig").Snapshot = null,
         hasLayaDecisions: ?*const fn (ptr: *anyopaque) bool = null,
         runLayaDecisions: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) anyerror!?[]Tensor = null,
         run: *const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor,
@@ -701,6 +754,11 @@ pub const Session = struct {
         runResidentInputsWithControl: ?*const fn (ptr: *anyopaque, inputs: []const ResidentInput, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
         runResidentTextEmbeddingWithControl: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, request: ResidentTextEmbeddingRequest, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
     };
+
+    pub fn acquireComputeBackend(self: Session, allocator: std.mem.Allocator, options: ComputeBackendOptions) !ops.ComputeBackend {
+        const provider = self.compute_backend_provider orelse return error.UnsupportedSessionComputeBackend;
+        return provider.acquire(provider.ptr, self, allocator, options);
+    }
 
     /// Run a forward pass with the given input tensors.
     pub fn run(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {

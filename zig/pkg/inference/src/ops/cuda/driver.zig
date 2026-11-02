@@ -21,7 +21,10 @@ pub const CUdeviceptr = u64;
 pub const CUcontext = ?*anyopaque;
 pub const CUstream = ?*anyopaque;
 pub const CUmodule = ?*anyopaque;
-pub const CUfunction = ?*anyopaque;
+// CUDA exposes an opaque pointer, but its function identity is distinct from
+// modules and request contexts. Preserve the C pointer ABI without erasing the
+// type used by the bundled-function registry.
+pub const CUfunction = ?*opaque {};
 pub const CUgraph = ?*anyopaque;
 pub const CUgraphExec = ?*anyopaque;
 pub const CUgraphNode = ?*anyopaque;
@@ -85,7 +88,7 @@ pub const CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES: CUjit_option = 4;
 pub const CU_JIT_ERROR_LOG_BUFFER: CUjit_option = 5;
 pub const CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES: CUjit_option = 6;
 
-pub const Error = error{
+pub const Error = @import("driver_contract.zig").Error || error{
     CudaUnavailable,
     CudaSymbolMissing,
     CudaDriverError,
@@ -282,4 +285,11 @@ test "cuda driver unavailable probe does not crash" {
         return;
     };
     defer driver.deinit();
+}
+
+test "CUDA driver function handles preserve pointer ABI without erasing identity" {
+    try std.testing.expectEqual(@sizeOf(?*anyopaque), @sizeOf(CUfunction));
+    try std.testing.expectEqual(@alignOf(?*anyopaque), @alignOf(CUfunction));
+    try std.testing.expect(CUfunction != CUmodule);
+    try std.testing.expect(CUfunction != ?*anyopaque);
 }

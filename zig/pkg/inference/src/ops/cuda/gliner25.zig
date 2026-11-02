@@ -866,14 +866,14 @@ pub fn residentTrainingInstruction(ctx: *anyopaque, instruction: *const program.
                 defer api.freeTensor(ctx, stats);
                 buffers[4] = tensor(inputs[3]).buffer;
                 buffers[5] = tensor(stats).buffer;
-                try self.kernels.launchGliner25LayerNorm(&self.ctx, buffers, rows, attrs.dim, attrs.eps, 1);
+                try self.kernels.launchTrainingWelfordLayerNormF32(&self.ctx, buffers, rows, attrs.dim, attrs.eps, .input_gradient);
                 if (control) |c| try c.check();
-                try self.kernels.launchGliner25LayerNorm(&self.ctx, buffers, rows, attrs.dim, attrs.eps, 2);
+                try self.kernels.launchTrainingWelfordLayerNormF32(&self.ctx, buffers, rows, attrs.dim, attrs.eps, .parameter_gradients);
                 self.stats.launch_other += 2;
                 if (self.layer_norm_backward_observer) |observer|
                     try observer.observe(observer.context, .{ inputs[0], inputs[1], inputs[2], inputs[3] }, output, rows, attrs.dim, attrs.eps);
             } else {
-                try self.kernels.launchGliner25LayerNorm(&self.ctx, buffers, rows, attrs.dim, attrs.eps, 0);
+                try self.kernels.launchTrainingWelfordLayerNormF32(&self.ctx, buffers, rows, attrs.dim, attrs.eps, .forward);
                 self.stats.launch_other += 1;
             }
             break :blk output;
@@ -883,10 +883,11 @@ pub fn residentTrainingInstruction(ctx: *anyopaque, instruction: *const program.
             const backward = instruction.op == .fused_boundary_training_attention_backward_v1;
             const output = try allocate(self, shape, .f32, limits.primitive);
             errdefer api.freeTensor(ctx, output);
-            const scratch = try allocate(self, &.{@intCast(geometry.scratch_bytes / 4)}, .f32, limits.primitive);
+            const scratch_bytes = try module.scratchBytes(attrs, backward);
+            const scratch = try allocate(self, &.{@intCast(scratch_bytes / 4)}, .f32, limits.primitive);
             defer api.freeTensor(ctx, scratch);
             try module.execute(&self.ctx, attrs, backward, tensor(output).buffer, tensor(inputs[0]).buffer, tensor(inputs[1]).buffer, if (backward) tensor(inputs[2]).buffer else .{}, if (backward) tensor(inputs[3]).buffer else .{}, tensor(scratch).buffer);
-            self.stats.launch_other += if (backward) @as(usize, 3) else 2;
+            self.stats.launch_other += if (backward) (if (module.deterministic_gradients) @as(usize, 3) else 4) else 2;
             break :blk output;
         },
         .fused_deberta_training_attention_v1, .fused_deberta_training_attention_backward_v1 => |attrs| try trainingAttention(self, inputs, attrs, instruction.op == .fused_deberta_training_attention_backward_v1, limits, control),
@@ -962,7 +963,7 @@ pub fn residentTrainingInstruction(ctx: *anyopaque, instruction: *const program.
             if (!backward and !r.fuse_backward) break :blk try api.primSoftmaxOp(ctx, inputs[0], r.dim);
             const output = try allocate(self, shape, .f32, limits.primitive);
             errdefer api.freeTensor(self, output);
-            try self.kernels.launchGliner25Softmax(&self.ctx, .{
+            try self.kernels.launchTrainingPersistentSoftmaxF32(&self.ctx, .{
                 tensor(output).buffer,
                 tensor(inputs[0]).buffer,
                 tensor(inputs[if (backward) 1 else 0]).buffer,
@@ -1041,7 +1042,8 @@ test "CUDA boundary physical budget charges retained cache and evicts before new
     defer cb.free(larger);
     try std.testing.expectEqual(initial + 32, budget.snapshot().live);
     try std.testing.expect(device.backend.stats.temp_buffer_evictions > 0);
-    try std.testing.expectError(error.CudaMemoryLimitExceeded, cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = &.{9}, .shape = &.{1} } }, .{}));
+    // Public operation admission normalizes the exhausted physical quota.
+    try std.testing.expectError(error.ResourceLimitExceeded, cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = &.{9}, .shape = &.{1} } }, .{}));
     try std.testing.expectEqual(initial + 32, budget.snapshot().live);
     var actual: [8]f32 = undefined;
     try cb.glinerBoundaryDownload(larger, &actual);
@@ -1456,9 +1458,10 @@ fn checkPinnedTrainingActivation(comptime kind: enum { gelu, silu, sigmoid }, ex
     defer device.deinit();
     try std.testing.expect(device.backend.training_math == null);
     try device.backend.enableResidentTrainingMath();
-    const loaded = device.backend.training_math.?.module;
+    const loaded = device.backend.training_math.?.program.module;
+    try std.testing.expect(loaded != null);
     try device.backend.enableResidentTrainingMath();
-    try std.testing.expectEqual(loaded, device.backend.training_math.?.module);
+    try std.testing.expectEqual(loaded, device.backend.training_math.?.program.module);
     const cb = device.backend.computeBackend();
     const count = if (kind == .gelu) 1025 else 2049; // Partial block and both activation tails.
     var values: [count]f32 = undefined;
@@ -1666,9 +1669,69 @@ test "CUDA boundary retained batched gradients match pinned Python across layout
     try std.testing.expectEqualStrings("3098047a7fcfe93c95bf2849b0ecc7e65ae329f752dfbe6362ad96977b579faa", &std.fmt.bytesToHex(digest, .lower));
 }
 
-test "CUDA boundary fused attention matches pinned Python forward and strict gradients" {
+test "CUDA boundary fused attention preserves qualified forward gradients and exact replay" {
     const ml = @import("ml").graph;
     const execution = @import("../../graph/resident_training_program.zig");
+    const Reference = struct {
+        output: []f64,
+        gradient: []f64,
+
+        fn run(allocator: std.mem.Allocator, attrs: ml.node.BoundaryTrainingAttentionAttrs, packed_values: []const f32, mask: []const f32, upstream: []const f32) !@This() {
+            const batch: usize = attrs.batch;
+            const sequence: usize = attrs.seq_len;
+            const heads: usize = attrs.num_heads;
+            const hidden = heads * 32;
+            const output = try allocator.alloc(f64, batch * sequence * hidden);
+            errdefer allocator.free(output);
+            const gradient = try allocator.alloc(f64, packed_values.len);
+            errdefer allocator.free(gradient);
+            @memset(output, 0);
+            @memset(gradient, 0);
+            const probabilities = try allocator.alloc(f64, sequence);
+            defer allocator.free(probabilities);
+            const scale = 1.0 / @sqrt(@as(f64, 32));
+            for (0..batch) |b| for (0..heads) |h| {
+                for (0..sequence) |q| {
+                    const qi = (b * sequence + q) * 3 * hidden + h * 32;
+                    const yi = (b * sequence + q) * hidden + h * 32;
+                    var maximum = -std.math.inf(f64);
+                    for (0..sequence) |k| {
+                        const distance = if (q > k) q - k else k - q;
+                        const allowed = q == k or (mask[b * sequence + k] != 0 and (attrs.window == 0 or distance <= attrs.window));
+                        var dot: f64 = 0;
+                        const ki = (b * sequence + k) * 3 * hidden + hidden + h * 32;
+                        for (0..32) |d| dot += @as(f64, packed_values[qi + d]) * @as(f64, packed_values[ki + d]);
+                        probabilities[k] = if (allowed) dot * scale else -std.math.inf(f64);
+                        maximum = @max(maximum, probabilities[k]);
+                    }
+                    var denominator: f64 = 0;
+                    for (probabilities) |*probability| {
+                        probability.* = @exp(probability.* - maximum);
+                        denominator += probability.*;
+                    }
+                    for (probabilities, 0..) |*probability, k| {
+                        probability.* /= denominator;
+                        const vi = (b * sequence + k) * 3 * hidden + 2 * hidden + h * 32;
+                        for (0..32) |d| output[yi + d] += probability.* * @as(f64, packed_values[vi + d]);
+                    }
+                    var delta: f64 = 0;
+                    for (0..32) |d| delta += @as(f64, upstream[yi + d]) * output[yi + d];
+                    for (probabilities, 0..) |probability, k| {
+                        const ki = (b * sequence + k) * 3 * hidden + hidden + h * 32;
+                        var dyv: f64 = 0;
+                        for (0..32) |d| dyv += @as(f64, upstream[yi + d]) * @as(f64, packed_values[ki + hidden + d]);
+                        const ds = probability * (dyv - delta) * scale;
+                        for (0..32) |d| {
+                            gradient[qi + d] += ds * @as(f64, packed_values[ki + d]);
+                            gradient[ki + d] += ds * @as(f64, packed_values[qi + d]);
+                            gradient[ki + hidden + d] += probability * @as(f64, upstream[yi + d]);
+                        }
+                    }
+                }
+            };
+            return .{ .output = output, .gradient = gradient };
+        }
+    };
     const a = std.testing.allocator;
     var device = try @import("../../graph/resident_training_fixture.zig").CudaDevice.init(a);
     defer device.deinit();
@@ -1700,6 +1763,14 @@ test "CUDA boundary fused attention matches pinned Python forward and strict gra
         for (xv, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i * 17 % 97)) - 48)) / 29.0;
         for (sv, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i * 19 % 89)) - 44)) / 37.0;
         for (mv, 0..) |*value, i| value.* = if (i % attrs.seq_len < attrs.seq_len -| (i / attrs.seq_len * 3 + 1)) 1 else 0;
+        // SM8 retains the original L4 bitwise reference below. The SM120
+        // warp profile has its own reduction tree, independently checked in
+        // F64 here and required to repeat every output/gradient bit exactly.
+        const reference = if (device.backend.ctx.info.compute_major == 12) try Reference.run(a, attrs, xv, mv, sv) else null;
+        defer if (reference) |ref| {
+            a.free(ref.output);
+            a.free(ref.gradient);
+        };
         const input = try upload(device.backend, f32, xv, &.{ @intCast(layout.rows), @intCast(3 * layout.hidden) }, .{});
         defer cb.free(input);
         const valid = try upload(device.backend, f32, mv, &.{ @intCast(attrs.batch), @intCast(attrs.seq_len) }, .{});
@@ -1708,15 +1779,35 @@ test "CUDA boundary fused attention matches pinned Python forward and strict gra
         defer cb.free(upstream);
         var result = try compiled.execute(a, &cb, &.{ .{ .node_id = ad.id_map[x], .value = input }, .{ .node_id = ad.id_map[mask], .value = valid }, .{ .node_id = ad.id_map[seed], .value = upstream } }, null);
         defer result.deinit(&cb);
-        for (result.outputs, [_][]f32{ sv, xv }) |output, values| {
+        var case_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        for (result.outputs, [_][]f32{ sv, xv }, 0..) |output, values, index| {
             try cb.glinerBoundaryDownload(output, values);
             hash.update(std.mem.sliceAsBytes(values));
+            case_hash.update(std.mem.sliceAsBytes(values));
+            if (reference) |ref| {
+                const expected = if (index == 0) ref.output else ref.gradient;
+                for (expected, values) |want, got| try std.testing.expectApproxEqAbs(want, @as(f64, got), 0.000003);
+            }
+        }
+        if (reference != null) {
+            const expected_bits = case_hash.finalResult();
+            for (0..3) |_| {
+                var replay = try compiled.execute(a, &cb, &.{ .{ .node_id = ad.id_map[x], .value = input }, .{ .node_id = ad.id_map[mask], .value = valid }, .{ .node_id = ad.id_map[seed], .value = upstream } }, null);
+                defer replay.deinit(&cb);
+                var replay_hash = std.crypto.hash.sha2.Sha256.init(.{});
+                for (replay.outputs, [_][]f32{ sv, xv }) |output, values| {
+                    try cb.glinerBoundaryDownload(output, values);
+                    replay_hash.update(std.mem.sliceAsBytes(values));
+                }
+                try std.testing.expectEqual(expected_bits, replay_hash.finalResult());
+            }
         }
     }
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     // All forward/packed-gradient bits, including window and all-masked cases.
-    try std.testing.expectEqualStrings("0da0df5697bf7070bbf20286f50a597f838546a7dad87dba8b513fa18633004e", &std.fmt.bytesToHex(digest, .lower));
+    if (device.backend.ctx.info.compute_major != 12)
+        try std.testing.expectEqualStrings("0da0df5697bf7070bbf20286f50a597f838546a7dad87dba8b513fa18633004e", &std.fmt.bytesToHex(digest, .lower));
 }
 
 test "CUDA boundary prefix scans match pinned forward and strict gradient bits" {
@@ -1971,8 +2062,18 @@ test "CUDA boundary retained forward transposes match pinned head dots and gradi
     }
     var digest: [32]u8 = undefined;
     hash.final(&digest);
-    // Pinned Torch 2.9.1+cu128 / L4, 20 layout/geometry combinations.
-    try std.testing.expectEqualStrings("493ecb9fe8ba5af61a55eabb753ce5858b96c34507a248a30233d30099008251", &std.fmt.bytesToHex(digest, .lower));
+    // scripts/gliner25/cublas_reference.py independently reproduces all 20
+    // physical layouts and seeded gradients. Preserve the original L4 bits;
+    // qualify GB10 per vendor version, already bound into checkpoint identity.
+    const expected = if (device.backend.ctx.info.compute_major == 12 and device.backend.ctx.info.compute_minor == 1)
+        switch (device.backend.training_blas.?.version) {
+            120804 => "37705bbe694699b897492817adce54dc380c2d1d6d508df43bcc43b20d49abc7",
+            130101 => "92c2c0eb8434b3e68cf0da2e376f41ee853ab66b4a66c5a54b8025c28c64ac78",
+            else => return error.UnqualifiedCublasReference,
+        }
+    else
+        "493ecb9fe8ba5af61a55eabb753ce5858b96c34507a248a30233d30099008251";
+    try std.testing.expectEqualStrings(expected, &std.fmt.bytesToHex(digest, .lower));
 }
 
 test "CUDA boundary frozen span features match pinned feature bits" {

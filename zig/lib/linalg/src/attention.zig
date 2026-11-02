@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const kernel_math = @import("antfly_tile").native_math;
 const primitives = @import("primitives.zig");
 const gemm = @import("gemm_dispatch.zig");
 const pool = @import("pool.zig");
@@ -23,6 +24,81 @@ const vec_len = primitives.vec_len;
 const F32xN = @Vector(vec_len, f32);
 const BLOCK_Q: usize = 64;
 const BLOCK_KV: usize = 256;
+
+/// One aligned owner for the score tile and two disjoint row-stat planes.
+/// Both flash schedules retain their arithmetic and per-lane slice extents.
+const FlashScratch = struct {
+    storage: []align(64) f32,
+    scores: []f32,
+    row_max: []f32,
+    row_sum: []f32,
+
+    inline fn init(allocator: std.mem.Allocator, score_count: usize, row_count: usize) !FlashScratch {
+        const mask: usize = 64 / @sizeOf(f32) - 1;
+        const row_max_offset = (std.math.add(usize, score_count, mask) catch return error.InvalidAttentionShape) & ~mask;
+        const row_stride = (std.math.add(usize, row_count, mask) catch return error.InvalidAttentionShape) & ~mask;
+        const row_sum_offset = std.math.add(usize, row_max_offset, row_stride) catch return error.InvalidAttentionShape;
+        const count = std.math.add(usize, row_sum_offset, row_count) catch return error.InvalidAttentionShape;
+        const storage = try allocator.alignedAlloc(f32, .@"64", count);
+        return .{ .storage = storage, .scores = storage[0..score_count], .row_max = storage[row_max_offset..][0..row_count], .row_sum = storage[row_sum_offset..][0..row_count] };
+    }
+};
+
+/// Admitted online-softmax row schedules. Maximum reduction, empty-tile handling,
+/// output scaling and store order are numerical/performance policies, not models.
+pub const OnlineRowSchedule = enum { flash, segment, dense };
+
+/// In-place probability tile and running output/statistics update. Callers own
+/// disjoint score/output/stat planes, GEMM boundaries, cancellation and scratch.
+pub inline fn updateOnlineRow(comptime schedule: OnlineRowSchedule, scores: []f32, output: []f32, maximum: *f32, sum: *f32) void {
+    // Dense evaluates the prior maximum before its SIMD tile reduction.
+    const prior_max = if (schedule == .dense) maximum.* else 0;
+    var block_max: f32 = -std.math.inf(f32);
+    switch (schedule) {
+        .flash => for (scores) |score| {
+            if (score > block_max) block_max = score;
+        },
+        .segment => for (scores) |score| {
+            block_max = @max(block_max, score);
+        },
+        .dense => block_max = denseRowMax(scores),
+    }
+    const old_max = if (schedule == .dense) prior_max else maximum.*;
+    const new_max = @max(old_max, block_max);
+    if (schedule != .dense and new_max == -std.math.inf(f32)) {
+        @memset(scores, 0);
+        return;
+    }
+    if (sum.* != 0 and (schedule != .dense or new_max != old_max)) {
+        const rescale = @exp(old_max - new_max);
+        if (schedule == .dense or rescale != 1.0) {
+            switch (schedule) {
+                .flash => {
+                    const r_splat: F32xN = @splat(rescale);
+                    var d: usize = 0;
+                    while (d + vec_len <= output.len) : (d += vec_len) {
+                        const ov: F32xN = output[d..][0..vec_len].*;
+                        output[d..][0..vec_len].* = ov * r_splat;
+                    }
+                    while (d < output.len) : (d += 1) output[d] *= rescale;
+                },
+                .segment => for (output) |*value| {
+                    value.* *= rescale;
+                },
+                .dense => denseScaleRow(output, rescale),
+            }
+            sum.* *= rescale;
+        }
+    }
+    if (schedule == .flash) {
+        const block_sum = primitives.expSubtractAndSum(scores, new_max);
+        maximum.* = new_max;
+        sum.* += block_sum;
+    } else {
+        sum.* += primitives.expSubtractAndSum(scores, new_max);
+        maximum.* = new_max;
+    }
+}
 
 /// T5 relative position bucket computation.
 /// Maps a relative position (key_pos - query_pos) to a bucket index.
@@ -96,8 +172,9 @@ pub fn ropeCore(output: []f32, positions: []const usize, head_dim: usize, rope_d
             const idx1 = if (consecutive_pairs) 2 * j + 1 else j + head_half;
             const x0 = output[base + idx0];
             const x1 = output[base + idx1];
-            output[base + idx0] = x0 * cos_val - x1 * sin_val;
-            output[base + idx1] = x0 * sin_val + x1 * cos_val;
+            const operands = .{ .value = x0, .other = x1, .cosine = cos_val, .sine = sin_val };
+            output[base + idx0] = (comptime kernel_math.rotary(false)).evaluate(struct {}, operands);
+            output[base + idx1] = (comptime kernel_math.rotary(true)).evaluate(struct {}, operands);
         }
     }
 }
@@ -140,12 +217,11 @@ pub fn flashCausalAttentionHost(
 
     const bq = @min(BLOCK_Q, q_seq_len);
     const bkv = @min(BLOCK_KV, kv_seq_len);
-    const score_tile = try allocator.alloc(f32, std.math.mul(usize, bq, bkv) catch return error.InvalidAttentionShape);
-    defer allocator.free(score_tile);
-    const row_max = try allocator.alloc(f32, bq);
-    defer allocator.free(row_max);
-    const row_sum = try allocator.alloc(f32, bq);
-    defer allocator.free(row_sum);
+    const scratch = try FlashScratch.init(allocator, std.math.mul(usize, bq, bkv) catch return error.InvalidAttentionShape, bq);
+    defer allocator.free(scratch.storage);
+    const score_tile = scratch.scores;
+    const row_max = scratch.row_max;
+    const row_sum = scratch.row_sum;
 
     // Q/K/V are token-major here (each token packs all heads contiguously),
     // so the per-head rows are strided by H_q/H_kv.  The register-tiled SGEMM
@@ -241,39 +317,7 @@ pub fn flashCausalAttentionHost(
                     for (0..cur_bq) |qi_local| {
                         const out_row = out_pack[qi_local * head_dim ..][0..head_dim];
 
-                        var block_max: f32 = -std.math.inf(f32);
-                        for (0..cur_bkv) |ki_local| {
-                            const s = score_tile[qi_local * cur_bkv + ki_local];
-                            if (s > block_max) block_max = s;
-                        }
-
-                        const old_max = row_max[qi_local];
-                        const new_max = @max(old_max, block_max);
-                        if (new_max == -std.math.inf(f32)) {
-                            @memset(score_tile[qi_local * cur_bkv ..][0..cur_bkv], 0.0);
-                            continue;
-                        }
-
-                        if (row_sum[qi_local] != 0.0) {
-                            const rescale = @exp(old_max - new_max);
-                            if (rescale != 1.0) {
-                                const r_splat: F32xN = @splat(rescale);
-                                var d: usize = 0;
-                                while (d + vec_len <= head_dim) : (d += vec_len) {
-                                    const ov: F32xN = out_row[d..][0..vec_len].*;
-                                    out_row[d..][0..vec_len].* = ov * r_splat;
-                                }
-                                while (d < head_dim) : (d += 1) {
-                                    out_row[d] *= rescale;
-                                }
-                                row_sum[qi_local] *= rescale;
-                            }
-                        }
-
-                        const score_row = score_tile[qi_local * cur_bkv ..][0..cur_bkv];
-                        const block_sum = primitives.expSubtractAndSum(score_row, new_max);
-                        row_max[qi_local] = new_max;
-                        row_sum[qi_local] += block_sum;
+                        updateOnlineRow(.flash, score_tile[qi_local * cur_bkv ..][0..cur_bkv], out_row, &row_max[qi_local], &row_sum[qi_local]);
                     }
 
                     // Batched V projection: out_pack[bq, hd] += score_tile[bq, bkv] @ V_pack[bkv, hd].
@@ -446,12 +490,11 @@ pub fn flashAttentionHostWithIo(
     const lanes = if (io != null and seq_len >= 256) @min(head_count, @min(pool.max_workers, @max(1, pool.cachedCpuCount()))) else 1;
     const bq: usize = @min(BLOCK_Q, seq_len);
     const bkv: usize = @min(BLOCK_KV, seq_len);
-    const score_tile = try allocator.alloc(f32, std.math.mul(usize, try std.math.mul(usize, bq, bkv), lanes) catch return error.InvalidAttentionShape);
-    defer allocator.free(score_tile);
-    const row_max = try allocator.alloc(f32, bq * lanes);
-    defer allocator.free(row_max);
-    const row_sum = try allocator.alloc(f32, bq * lanes);
-    defer allocator.free(row_sum);
+    const scratch = try FlashScratch.init(allocator, std.math.mul(usize, try std.math.mul(usize, bq, bkv), lanes) catch return error.InvalidAttentionShape, try std.math.mul(usize, bq, lanes));
+    defer allocator.free(scratch.storage);
+    const score_tile = scratch.scores;
+    const row_max = scratch.row_max;
+    const row_sum = scratch.row_sum;
 
     var contexts: [pool.max_workers]FlashHeadWork = undefined;
     var jobs: [pool.max_workers]pool.Job = undefined;
@@ -493,7 +536,17 @@ const FlashHeadWork = struct {
     row_max: []f32,
     row_sum: []f32,
     cancelled: bool = false,
-    fn run(raw: *anyopaque) void {
+    const run = if (builtin.cpu.arch.isWasm()) runUnaligned else runAligned;
+
+    fn runUnaligned(raw: *anyopaque) void {
+        runBody(raw);
+    }
+
+    fn runAligned(raw: *anyopaque) align(64) void {
+        runBody(raw);
+    }
+
+    inline fn runBody(raw: *anyopaque) void {
         const self: *FlashHeadWork = @ptrCast(@alignCast(raw));
         const Q = self.Q;
         const K = self.K;
@@ -602,41 +655,7 @@ const FlashHeadWork = struct {
                         const qi = q_start + qi_local;
                         const out_ptr = output[bh_offset + qi * head_dim ..][0..head_dim];
 
-                        var block_max: f32 = -std.math.inf(f32);
-                        for (0..cur_bkv) |ki_local| {
-                            const s = score_tile[qi_local * cur_bkv + ki_local];
-                            if (s > block_max) block_max = s;
-                        }
-
-                        const old_max = row_max[qi_local];
-                        const new_max = @max(old_max, block_max);
-                        if (new_max == -std.math.inf(f32)) {
-                            // All scores -inf for this row → zero its score_row
-                            // so the deferred GEMM contributes nothing.
-                            @memset(score_tile[qi_local * cur_bkv ..][0..cur_bkv], 0.0);
-                            continue;
-                        }
-
-                        if (row_sum[qi_local] != 0.0) {
-                            const rescale = @exp(old_max - new_max);
-                            if (rescale != 1.0) {
-                                const r_splat: F32xN = @splat(rescale);
-                                var d: usize = 0;
-                                while (d + vec_len <= head_dim) : (d += vec_len) {
-                                    const ov: F32xN = out_ptr[d..][0..vec_len].*;
-                                    out_ptr[d..][0..vec_len].* = ov * r_splat;
-                                }
-                                while (d < head_dim) : (d += 1) {
-                                    out_ptr[d] *= rescale;
-                                }
-                                row_sum[qi_local] *= rescale;
-                            }
-                        }
-
-                        const score_row = score_tile[qi_local * cur_bkv ..][0..cur_bkv];
-                        const block_sum = primitives.expSubtractAndSum(score_row, new_max);
-                        row_max[qi_local] = new_max;
-                        row_sum[qi_local] += block_sum;
+                        updateOnlineRow(.flash, score_tile[qi_local * cur_bkv ..][0..cur_bkv], out_ptr, &row_max[qi_local], &row_sum[qi_local]);
                     }
 
                     // V projection: out[bq, hd] += score_tile[bq, bkv] @
@@ -965,22 +984,7 @@ fn SegmentHeadWork(comptime Gemm: type) type {
                                     if (!in_range or !near) score.* = -std.math.inf(f32);
                                 }
                             }
-                            var block_max: f32 = -std.math.inf(f32);
-                            for (row) |score| block_max = @max(block_max, score);
-                            const new_max = @max(row_max[r], block_max);
-                            if (new_max == -std.math.inf(f32)) {
-                                @memset(row, 0);
-                                continue;
-                            }
-                            if (row_sum[r] != 0) {
-                                const rescale = @exp(row_max[r] - new_max);
-                                if (rescale != 1.0) {
-                                    for (out_block[r * head_dim ..][0..head_dim]) |*o| o.* *= rescale;
-                                    row_sum[r] *= rescale;
-                                }
-                            }
-                            row_sum[r] += primitives.expSubtractAndSum(row, new_max);
-                            row_max[r] = new_max;
+                            updateOnlineRow(.segment, row, out_block[r * head_dim ..][0..head_dim], &row_max[r], &row_sum[r]);
                         }
                         Gemm.sgemmSync(cur_bq, head_dim, cur_bkv, 1.0, tile, vh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 1.0, out_block);
                         kv_start = kv_end;
@@ -2601,11 +2605,13 @@ test "segmentAttentionHost cancellation drains running parallel heads before scr
         io: std.Io,
         entered: std.Io.Event = .unset,
         release: std.Io.Event = .unset,
+        started: std.atomic.Value(usize) = .init(0),
         finished: std.atomic.Value(usize) = .init(0),
     };
     const BlockingGemm = struct {
         var lifecycle: *Lifecycle = undefined;
         pub fn sgemmTransBSync(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c: []f32) void {
+            _ = lifecycle.started.fetchAdd(1, .acq_rel);
             lifecycle.entered.set(lifecycle.io);
             // Model an already-running BLAS call, which cannot be interrupted.
             lifecycle.release.waitUncancelable(lifecycle.io);
@@ -2647,9 +2653,14 @@ test "segmentAttentionHost cancellation drains running parallel heads before scr
     const result = request.cancel(io);
     pending = false;
     try std.testing.expectError(error.Canceled, result);
-    try std.testing.expectEqual(@as(usize, 4), lifecycle.finished.load(.acquire));
+    // Cancellation may prevent queued heads from starting. The lifecycle
+    // contract is that every already-running BLAS call has finished before
+    // scratch is released, independent of the executor's available slots.
+    const started = lifecycle.started.load(.acquire);
+    try std.testing.expect(started > 0 and started <= 4);
+    try std.testing.expectEqual(started, lifecycle.finished.load(.acquire));
     try Case.run(io);
-    try std.testing.expectEqual(@as(usize, 8), lifecycle.finished.load(.acquire));
+    try std.testing.expectEqual(started + 4, lifecycle.finished.load(.acquire));
 }
 
 test "segmentAttentionHost matches dense masked softmax with ranges, window, and fewer queries" {
@@ -3131,14 +3142,7 @@ const DenseTileRows = struct {
         for (self.first..self.last) |r| {
             if (self.io) |runtime| try runtime.checkCancel();
             const row = self.tile[r * self.keys ..][0..self.keys];
-            const next = @max(self.maxima[r], denseRowMax(row));
-            if (self.sums[r] != 0 and next != self.maxima[r]) {
-                const rescale = @exp(self.maxima[r] - next);
-                denseScaleRow(self.output[r * self.dim ..][0..self.dim], rescale);
-                self.sums[r] *= rescale;
-            }
-            self.sums[r] += primitives.expSubtractAndSum(row, next);
-            self.maxima[r] = next;
+            updateOnlineRow(.dense, row, self.output[r * self.dim ..][0..self.dim], &self.maxima[r], &self.sums[r]);
         }
     }
 };

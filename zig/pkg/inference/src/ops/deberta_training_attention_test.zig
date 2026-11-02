@@ -474,8 +474,8 @@ test "replay DeBERTa training attention native hooks reject unsupported types an
     defer cb.free(wrong_shape);
     try std.testing.expectError(error.InvalidDebertaTrainingAttentionShape, cb.debertaTrainingAttentionV1(wrong_shape, r, words, fixture.attrs));
     var absent_vtable = native_compute.vtable_impl;
-    absent_vtable.debertaTrainingAttentionV1 = null;
-    absent_vtable.debertaTrainingAttentionBackwardV1 = null;
+    absent_vtable.regions.relative_encoder.trainingAttention = null;
+    absent_vtable.regions.relative_encoder.trainingAttentionBackward = null;
     var unavailable = cb;
     unavailable.vtable = &absent_vtable;
     try std.testing.expectError(error.DebertaTrainingAttentionProfileUnavailable, unavailable.debertaTrainingAttentionV1(qkv, r, words, fixture.attrs));

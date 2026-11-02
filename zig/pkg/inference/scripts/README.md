@@ -52,6 +52,117 @@ CUDA artifact generation, paired benchmarking, Metal debugging, and OpenAPI or
 descriptor regeneration remain in this directory because multiple model
 families consume them.
 
+## Shared kernel recipes
+
+Run from `zig/pkg/inference` with the repository-pinned Zig:
+
+```sh
+zig build quant-recipe-cuda-host-conformance
+zig build quant-kernel-metal-runtime-conformance -Dmetal=true
+zig build kernel-recipe-cuda-source
+```
+
+The host check compiles the generated expressions as C++ and checks packed
+values, Q6 integer/scale components, activation policies and shuffle trees.
+The Metal check runs the existing 50 device cases. The CUDA source target only
+generates a model-free device test; it can run on a machine without CUDA.
+
+On an NVIDIA host with `nvcc` in `PATH`:
+
+```sh
+zig build kernel-recipe-cuda-conformance
+```
+
+That target compiles for the installed GPU (`-arch=native`) and runs real
+packed-value, activation and full-warp reduction kernels. Its scalar arithmetic
+conformance disables contraction and flushing subnormals. This is a numerical
+check; it does not qualify production matmul scheduling, CUDA capture or model
+latency. The target always recompiles for the current GPU and reruns the device
+checks, even if earlier build outputs are cached.
+
+The shared descriptor fixture also runs through each target's existing tensor
+setup and checks strict transfer admission, legality queries, output reuse and
+input preservation. For example, on a CUDA host:
+
+```sh
+zig build test-inference-unit -Dcuda=true -Dcuda-artifacts=fatbin \
+  -Dtest-filter='CUDA shared descriptors'
+```
+
+The matching CPU and Metal filters are `CPU shared descriptors` and
+`Metal shared descriptors`; enable Metal with `-Dmetal=true` on a Mac.
+
+After changing production CUDA source, rebuild its artifacts with the pinned
+CUDA toolkit contract in `regen-cuda-artifacts.sh`, then run the affected device,
+capture and model performance gates on the same host for baseline and candidate.
+Host conformance and portable product compilation do not replace those gates.
+
+## Kernel family consolidation qualification
+
+`qualify_kernel_families.py` retains baseline/candidate model and operator receipts. `models` takes a JSON config with `arm_order` and
+`cases: [{"name": "case", "args": ["--model-dir", "...", "--backend", "native",
+"--warmup-iters", "25", "--measure-iters", "201"]}]`, plus optional
+`environment` and Linux `cpu_affinity`. Supply `--config`, `--baseline`,
+`--candidate` and `--results`. It records every arm, requires finite,
+byte-identical output, and applies the 5% median / 10% p95 model budgets.
+
+Use `check_cuda_native_programs.py --help` for instruction/resource comparison
+across native architectures, including explicit export-retirement allowlists.
+Run `test_qualify_kernel_families.py` and `test_check_cuda_native_programs.py`
+for the comparison failure gates. Source accounting uses the dedicated
+`kernel_source_accounting.py` command below.
+
+`kernel_family_metal.mm` consumes a JSON manifest describing full baseline/current
+shader files, buffer fixture files, constant-byte bindings, output extents, grid,
+threads, dynamic scratch, math mode and balanced timing protocol. Build it with
+`clang++ -std=c++17 -O2 -fobjc-arc -framework Foundation -framework Metal`.
+`kernel_family_cuda.cu` uses the corresponding CUDA manifest packed by
+`qualify_kernel_families.py pack-cuda --config MANIFEST --results DIR`; build with
+pinned `nvcc -O3 -arch=native -lcuda`. The Metal executable takes
+`MANIFEST RECEIPT`; CUDA takes `BASELINE_IMAGE CANDIDATE_IMAGE CASES_BIN RECEIPT`.
+Both compare every declared output and guard byte, then time fixed addresses
+with balanced arms. Metal output bindings may additionally specify a
+`reference_file` of independent F32 values, `output_dtype: f32|f16`, and
+nonnegative `absolute_tolerance` / `relative_tolerance` (default zero). Both
+versions must match the reference before timing. Receipts distinguish outputs
+with references from ordinary differential-only outputs.
+ CUDA also checks outputs, guards and persistent workspaces
+after captured replay against separate correctness buffers. Optional `--long`
+after `RECEIPT` selects 32 balanced arms with 4,000 kernels per arm; the default
+uses 16 arms with 1,000 kernels per arm. Event time is divided by the actual
+kernel count in either protocol.
+
+CUDA arguments use `kind: value`, `buffer`, `output`, or `reference_output`, plus
+`file` and an output `written_bytes` extent. A reference-output fixture contains
+CPU-expected bytes followed by guards. The runner poisons the writable prefix,
+requires both versions to reproduce the independent reference exactly, and
+checks guards before and after replay. `pack-cuda` selects protocol v2 when a
+reference output is present; older runners reject it. Ordinary manifests retain
+v1 compatibility. These byte-level references also support exact integer and
+packed-header contracts. Keep independent operator references and model/lifetime
+gates alongside direct baseline comparisons.
+
+The CUDA family runner also accepts `--stable`: it alternates both captured
+versions for at least 500 ms, then measures 32 balanced arms with 20,000 kernel
+dispatches per arm. Receipts record the additional GPU warmup duration and
+dispatch count. Use this protocol when fixed-count warmup exposes clock
+transitions in tiny kernels; retain the original receipts and unchanged timing
+budgets. Reverse-image and identical-image controls help investigate effects
+that are absent from native instruction/resource comparisons.
+
+For a net source ledger that separates inline Zig tests, generated regions,
+kernel bodies, host glue and binary images, run:
+
+```sh
+python3 zig/pkg/inference/scripts/kernel_source_accounting.py \
+  --revision <frozen-baseline-commit> --output /tmp/kernel-source-ledger.json
+```
+
+The ledger includes replacement owners and metadata, staged/unstaged changes
+and untracked files outside ignored fixture directories. Metal shader bytes
+measure the maintained Objective-C string representation; generated copies and
+compiled images remain separate from authored production savings.
+
 ## LightOnOCR-3 Metal throughput
 
 The native reader has an opt-in preset for qualified Apple M4 devices:
