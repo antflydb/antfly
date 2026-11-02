@@ -46796,6 +46796,7 @@ pub const DB = struct {
         node_filter: graph_pattern_mod.NodeFilter,
         prepared_filters: db_query_graph.PreparedPatternFilterCache,
         indexed_node_filter: ?AlgebraicDocFilterRequest = null,
+        indexed_request_filter: ?AlgebraicDocFilterRequest = null,
         decisions: std.StringHashMapUnmanaged(bool) = .empty,
 
         fn init(
@@ -46824,6 +46825,7 @@ pub const DB = struct {
             self.decisions.deinit(self.alloc);
             self.prepared_filters.deinit();
             if (self.indexed_node_filter) |*filter| filter.deinit();
+            if (self.indexed_request_filter) |*filter| filter.deinit();
             self.* = undefined;
         }
 
@@ -46841,6 +46843,8 @@ pub const DB = struct {
             nodes: []const GraphNodeRef,
         ) anyerror![]bool {
             const self: *GraphNodeAdmissionCache = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const control = @import("../../search/query.zig").ExecutionControl{ .cancellation = self.req.cancellation, .deadline_ns = self.req.execution_deadline_ns };
+            try control.check();
             const result = try result_alloc.alloc(bool, nodes.len);
             errdefer result_alloc.free(result);
 
@@ -46866,9 +46870,10 @@ pub const DB = struct {
             }
 
             if (missing_keys.items.len > 0) {
+                if (self.indexed_request_filter == null) self.indexed_request_filter = try self.db.graphRequestWithIndexedFilterAlloc(self.req);
                 const missing_mask = try self.db.filterGraphKeysAlloc(
                     result_alloc,
-                    self.req,
+                    self.indexed_request_filter.?.req,
                     missing_keys.items,
                 );
                 defer result_alloc.free(missing_mask);
@@ -116136,6 +116141,27 @@ test "db graph indexed admission reuses compressed membership and honors cancell
     try std.testing.expect(second[0]);
     try std.testing.expectEqual(misses, snapshot.graph_predicates.misses);
     try std.testing.expect(snapshot.graph_predicates.hits > 0);
+    // A graph request retains the prepared top-level predicate across hops.
+    {
+        var stop = std.atomic.Value(bool).init(false);
+        var gate_req = req;
+        gate_req.cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&stop);
+        var gate = DB.GraphNodeAdmissionCache.init(&db, a, gate_req, "unused", .{});
+        defer gate.deinit();
+        const one = try gate.iface().filterKeysAlloc(a, &.{"a"}, false);
+        defer a.free(one);
+        const warm_hits = snapshot.graph_predicates.hits;
+        const memory = gate.indexed_request_filter.?.graph_memory.?;
+        const retained = memory.tracked.live_bytes;
+        const two = try gate.iface().filterKeysAlloc(a, &.{"b"}, false);
+        defer a.free(two);
+        try std.testing.expect(one[0] and two[0]);
+        try std.testing.expectEqual(warm_hits, snapshot.graph_predicates.hits);
+        try std.testing.expectEqual(retained, memory.tracked.live_bytes);
+        stop.store(true, .release);
+        try std.testing.expectError(error.Canceled, gate.iface().filterKeysAlloc(a, &.{"b"}, false));
+        try std.testing.expectError(error.Canceled, gate.iface().filterKeysAlloc(a, &.{"row-3"}, false));
+    }
     // Broad membership remains compressed; the old document-number array
     // alone used four bytes per match before ordinal conversion and copies.
     try std.testing.expect(snapshot.graph_predicates.bytes < writes.len * @sizeOf(u32));

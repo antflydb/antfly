@@ -102,6 +102,9 @@ pub const WorkBudget = struct {
     remaining_anchors: usize,
     retained_state_bytes: usize = 0,
     last_exhaustion: ?Exhaustion = null,
+    /// Optional request-local storage can surrender memory before required
+    /// graph state is denied. The callback must only free existing ownership.
+    state_reclaimer: ?struct { ctx: *anyopaque, reclaim: *const fn (*anyopaque, usize) void } = null,
 
     pub fn init(max_nodes: usize, max_edges: usize) WorkBudget {
         return initWithLimits(.{
@@ -184,11 +187,13 @@ pub const WorkBudget = struct {
     }
 
     pub fn retainStateBytes(self: *WorkBudget, bytes: usize) !void {
-        const retained = std.math.add(usize, self.retained_state_bytes, bytes) catch
+        if (bytes > self.max_retained_state_bytes -| self.retained_state_bytes) {
+            if (self.state_reclaimer) |optional| optional.reclaim(optional.ctx, bytes);
+        }
+        if (bytes > self.max_retained_state_bytes -| self.retained_state_bytes)
             return self.exhaust(.retained_state_bytes, self.max_retained_state_bytes);
-        if (retained > self.max_retained_state_bytes)
+        self.retained_state_bytes = std.math.add(usize, self.retained_state_bytes, bytes) catch
             return self.exhaust(.retained_state_bytes, self.max_retained_state_bytes);
-        self.retained_state_bytes = retained;
     }
 
     pub fn releaseStateBytes(self: *WorkBudget, bytes: usize) void {

@@ -5170,9 +5170,8 @@ fn clonePatternPathEdge(
     });
 }
 
-/// Optional request-local adjacency reuse across roots and BFS depths. Reserve
-/// a small fraction of the shared budget before cloning, so cache misses and
-/// eviction can never allocate beyond admission or change query correctness.
+/// Optional request-local adjacency reuse across roots and BFS depths. Charge
+/// actual storage and surrender unpinned entries before denying required work.
 const TraversalReadCache = struct {
     const Entry = struct {
         table: []u8,
@@ -5186,6 +5185,29 @@ const TraversalReadCache = struct {
     local_budget: graph_work_budget.WorkBudget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 0 }),
     tracked: ?graph_work_budget.RetainedAllocator = null,
     reservation: graph_work_budget.RetainedLease = .{},
+    active: ?*const Entry = null,
+    capacity: usize = 0,
+
+    fn pin(self: *@This(), table: []const u8, group: ?u64, node: FrontierState) ?*const Entry {
+        std.debug.assert(self.active == null);
+        self.active = self.get(table, group, node);
+        return self.active;
+    }
+    fn unpin(self: *@This()) void {
+        self.active = null;
+    }
+    fn reclaim(ctx: *anyopaque, needed: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const budget = self.reservation.budget orelse return;
+        for (&self.entries, 0..) |*entry, i| {
+            if (needed <= budget.max_retained_state_bytes -| budget.retained_state_bytes) break;
+            if (entry.*) |*value| {
+                if (self.active == value) continue;
+                self.evict(i);
+                self.reservation.resize(self.tracked.?.live_bytes) catch unreachable;
+            }
+        }
+    }
 
     fn get(self: *@This(), table: []const u8, group: ?u64, node: FrontierState) ?*const Entry {
         for (&self.entries) |*maybe| if (maybe.*) |*entry| {
@@ -5208,13 +5230,22 @@ const TraversalReadCache = struct {
         if (self.tracked == null) {
             const allowance = @min(@as(usize, 8 * 1024 * 1024), (budget.max_retained_state_bytes -| budget.retained_state_bytes) / 8);
             if (allowance < 4096) return;
-            self.reservation = graph_work_budget.RetainedLease.init(budget, allowance) catch return;
+            // One synchronous traversal owns this optional memory provider.
+            if (budget.state_reclaimer != null) return;
+            self.reservation = .{ .budget = budget };
+            self.capacity = allowance;
             self.local_budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = allowance });
             self.tracked = .{ .backing = backing, .budget = &self.local_budget };
+            budget.state_reclaimer = .{ .ctx = self, .reclaim = reclaim };
         }
-        // Free a complete entry before replacing it. Cache allocation failures
-        // decline admission; the live step still supplies the requested result.
+        std.debug.assert(self.active == null);
         self.evict(self.cursor);
+        // Reserve only available construction headroom, and return all unused
+        // bytes immediately, including when an oversized entry is declined.
+        const ceiling = @min(self.capacity, self.reservation.bytes + (budget.max_retained_state_bytes -| budget.retained_state_bytes));
+        self.reservation.resize(ceiling) catch return;
+        self.local_budget.max_retained_state_bytes = ceiling;
+        defer self.reservation.resize(self.tracked.?.live_bytes) catch unreachable;
         self.putOwned(table, group, node, result, groups) catch return;
         self.cursor = (self.cursor + 1) % self.entries.len;
     }
@@ -5232,6 +5263,7 @@ const TraversalReadCache = struct {
     fn deinit(self: *@This()) void {
         for (0..self.entries.len) |i| self.evict(i);
         if (self.tracked) |tracked| std.debug.assert(tracked.live_bytes == 0);
+        if (self.reservation.budget) |budget| budget.state_reclaimer = null;
         self.reservation.deinit();
     }
 };
@@ -5390,15 +5422,16 @@ fn executeDistributedTraverse(
                 .reuse_cache = if (reuse_reads) &read_cache else null,
             };
             for (frontier, 0..) |item, frontier_index| {
-                if (root_groups.representative(frontier_index) != frontier_index) continue;
                 if (batch_edges and frontier_index % 64 == 0) try edge_batch.prepare(reader, frontier[frontier_index..@min(frontier.len, frontier_index + 64)], max_depth, graph_query.query.params);
+                if (root_groups.representative(frontier_index) != frontier_index) continue;
                 if (max_depth != 0 and item.depth >= max_depth) continue;
                 const tagged_table = item.table orelse table_name;
                 const tables = [_][]const u8{ tagged_table, table_name };
                 const table_count: usize = if (std.mem.eql(u8, tagged_table, table_name)) 1 else 2;
                 for (tables[0..table_count]) |expansion_table| {
                     try metric_batch.prepareTable(expansion_table);
-                    const cached = if (reuse_reads) read_cache.get(expansion_table, null, item) else null;
+                    const cached = if (reuse_reads) read_cache.pin(expansion_table, null, item) else null;
+                    defer read_cache.unpin();
                     var fresh: ?CanonicalGraphStep = null;
                     defer if (fresh) |*step| step.deinit(alloc);
                     if (cached == null) {
@@ -5471,7 +5504,8 @@ fn executeDistributedTraverse(
             while (pending.next()) |batch| {
                 var count: usize = 0;
                 for (batch.value_ptr.frontier_ids.items) |id| {
-                    if (read_cache.get(batch.key_ptr.table_name, batch.key_ptr.group_id, frontier[id])) |cached| {
+                    if (read_cache.pin(batch.key_ptr.table_name, batch.key_ptr.group_id, frontier[id])) |cached| {
+                        defer read_cache.unpin();
                         try mergeGraphMetricStatuses(alloc, &state.metric_status, cached.result.metric_status);
                         const allowed = try graphResultNodeAdmissionMaskAlloc(alloc, admission, table_name, batch.key_ptr.table_name, cached.result.nodes);
                         defer alloc.free(allowed);
@@ -16121,6 +16155,40 @@ test "distributed graph traverse routes cross-table frontier by table generation
     try std.testing.expectEqualStrings("entities", results[0].hits[0].source_table.?);
 }
 
+test "distributed graph adjacency cache surrenders optional memory" {
+    const a = std.testing.allocator;
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 32 * 1024 });
+    var cache = TraversalReadCache{};
+    defer cache.deinit();
+    const node = FrontierState{ .key = @constCast("root") };
+    const result = db_mod.types.GraphSearchResult{ .name = @constCast(""), .nodes = @constCast(&[_]graph_query_mod.GraphResultNode{.{ .key = @constCast("child"), .depth = 1, .distance = 1 }}), .hits = &.{}, .total_hits = 1 };
+    cache.put(a, &budget, "docs", null, node, result, &.{});
+    try std.testing.expect(cache.get("docs", null, node) != null);
+    const actual = cache.tracked.?.live_bytes;
+    try std.testing.expect(actual > 0 and actual < 4096);
+    try std.testing.expectEqual(actual, budget.retained_state_bytes);
+    const large_key = try a.alloc(u8, 8192);
+    defer a.free(large_key);
+    @memset(large_key, 'x');
+    const large = db_mod.types.GraphSearchResult{ .name = @constCast(""), .nodes = @constCast(&[_]graph_query_mod.GraphResultNode{.{ .key = large_key, .depth = 1, .distance = 1 }}), .hits = &.{}, .total_hits = 1 };
+    const other = FrontierState{ .key = @constCast("other") };
+    cache.put(a, &budget, "docs", null, other, large, &.{});
+    try std.testing.expect(cache.get("docs", null, other) == null);
+    try std.testing.expectEqual(actual, budget.retained_state_bytes);
+    // Required state reclaims the optional entry before reporting exhaustion.
+    try budget.retainStateBytes(budget.max_retained_state_bytes);
+    try std.testing.expect(cache.get("docs", null, node) == null);
+    budget.releaseStateBytes(budget.max_retained_state_bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    cache.put(a, &budget, "docs", null, node, result, &.{});
+    const pinned = cache.pin("docs", null, node).?;
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, budget.retainStateBytes(budget.max_retained_state_bytes));
+    try std.testing.expectEqualStrings("child", pinned.result.nodes[0].key);
+    cache.unpin();
+    try budget.retainStateBytes(budget.max_retained_state_bytes);
+    budget.releaseStateBytes(budget.max_retained_state_bytes);
+}
+
 test "distributed graph visited maps charge actual allocations and reject undersized budgets" {
     const a = std.testing.allocator;
     var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 1024 });
@@ -17673,6 +17741,32 @@ test "distributed graph metric post processing applies max results after filter 
     const epoch = try table_catalog.topologyEpoch(alloc, FakeCatalog.iface(), "docs");
     var admission = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&test_state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
     defer admission.deinit();
+    // Root 64 reaches the same identity as root 0. A duplicate at the
+    // second window boundary must not suppress batching of entries 65..127.
+    {
+        var overlap_graph = try graph_mod.GraphIndex.openWithPrivateStores(alloc, "unused-overlap-out", "unused-overlap-in", "graph_idx", .{ .reverse_backend = .mem });
+        defer overlap_graph.close();
+        for (roots[0..130], 0..) |root, i| {
+            const target = targets[if (i == 64) 0 else i];
+            try overlap_graph.addEdge(root, target, "R", 1, 0, 0, "");
+            try overlap_graph.addEdge(target, "leaf", "R", 1, 0, 0, "");
+        }
+        var fixture = TestState{ .graph = &overlap_graph };
+        var gate = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&fixture), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+        defer gate.deinit();
+        var work = graph_work_budget.WorkBudget.initWithLimits(.{});
+        var overlap_query = query;
+        overlap_query.query.start_nodes = .{ .keys = roots[0..130] };
+        overlap_query.query.target_nodes = null;
+        overlap_query.query.metrics = &.{};
+        overlap_query.query.params = .{ .max_depth = 2, .max_results = 0, .include_paths = true };
+        const base = db_mod.types.SearchResult{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+        var overlapping = try executeDistributedTraverse(alloc, FakeCatalog.iface(), FakeWorker.iface(&fixture), "docs", req, base, &.{}, overlap_query, .read_index, &gate, &work);
+        defer overlapping.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 260), overlapping.nodes.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.edge_calls);
+        try std.testing.expectEqual(@as(usize, 12), fixture.batch_edge_calls);
+    }
     // Compare selection ownership with a wide cached payload, independently
     // of response creation. No filtered-out payload needs a second copy.
     for ([_]bool{ false, true }) |borrow| {

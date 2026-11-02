@@ -5930,6 +5930,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const graph_admission_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = selectTestFilters(b, &.{
+            "graph legacy ordinal batches bound resolver calls and preserve membership",
+            "graph predicate cache clones outside locks and pins evicted membership",
             "db graph analyzed admission intersects resolved row permissions",
             "db graph indexed admission reuses compressed membership and honors cancellation and memory",
             "db graph search filters result nodes and hidden traversal intermediates",
@@ -6002,6 +6004,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     chaos_test_step.dependOn(storage_vopr_step);
 
     const graph_metric_unit_filters = [_][]const u8{
+        "graph predicate cache clones outside locks and pins evicted membership",
+        "graph legacy ordinal batches bound resolver calls and preserve membership",
         "db graph analyzed admission intersects resolved row permissions",
         "db graph indexed admission reuses compressed membership and honors cancellation and memory",
         "graph committed intents survive canceled durability fences",
@@ -6167,6 +6171,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed graph path materialization preserves table provenance",
         "distributed graph root-specific traversal matches independent roots",
         "distributed graph visited maps charge actual allocations and reject undersized budgets",
+        "distributed graph adjacency cache surrenders optional memory",
         "api query contract legacy graph node filters use retrieval validation",
         "api query contract graph permission filters stop denied roots and intermediates",
         "public graph metric borrowed wire",

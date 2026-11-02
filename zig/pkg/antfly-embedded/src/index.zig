@@ -945,9 +945,29 @@ const max_bm25_bound_tables_per_snapshot: usize = 4;
 /// retained. Both entry count and cloned physical storage have hard ceilings.
 pub const GraphPredicateCache = struct {
     pub const max_bytes: usize = 64 * 1024 * 1024;
-    const Entry = struct { key: []u8, rows: roaring.RoaringBitmap, bytes: usize };
-    entries: [16]?Entry = @splat(null),
+    const Entry = struct {
+        key: []u8,
+        rows: roaring.RoaringBitmap,
+        bytes: usize,
+        refs: std.atomic.Value(usize) = .init(1),
+        owner: *GraphPredicateCache,
+        alloc: Allocator,
+
+        fn release(self: *@This()) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            const owner = self.owner;
+            const bytes = self.bytes;
+            const a = self.alloc;
+            a.free(self.key);
+            self.rows.deinit();
+            a.destroy(self);
+            _ = owner.resident_bytes.fetchSub(bytes, .acq_rel);
+        }
+    };
+    entries: [16]?*Entry = @splat(null),
     bytes: usize = 0,
+    // Includes builders and evicted entries still pinned by readers.
+    resident_bytes: std.atomic.Value(usize) = .init(0),
     cursor: usize = 0,
     hits: usize = 0,
     misses: usize = 0,
@@ -965,52 +985,152 @@ pub const GraphPredicateCache = struct {
         return lock;
     }
     pub fn get(self: *@This(), a: Allocator, key: []const u8, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
+        try control.check();
         while (!self.mutex.tryLock()) {
             try control.check();
             spinOrYield();
         }
-        defer self.mutex.unlock();
-        for (&self.entries) |*entry| if (entry.*) |*value| {
-            if (std.mem.eql(u8, value.key, key)) {
-                self.hits += 1;
-                return try value.rows.cloneExact(a);
-            }
+        const pinned = blk: {
+            for (self.entries) |entry| if (entry) |value| {
+                if (std.mem.eql(u8, value.key, key)) {
+                    self.hits += 1;
+                    _ = value.refs.fetchAdd(1, .monotonic);
+                    break :blk value;
+                }
+            };
+            self.misses += 1;
+            break :blk null;
         };
-        self.misses += 1;
-        return null;
+        self.mutex.unlock();
+        const entry = pinned orelse return null;
+        defer entry.release();
+        try control.check();
+        var rows = try entry.rows.cloneExact(a);
+        errdefer rows.deinit();
+        try control.check();
+        return rows;
     }
-    fn evict(self: *@This(), a: Allocator, index: usize) void {
-        if (self.entries[index]) |*entry| {
-            a.free(entry.key);
-            entry.rows.deinit();
-            self.bytes -= entry.bytes;
-            self.entries[index] = null;
+    // Only directory mutations hold the mutex. Destruction and copying never do.
+    fn remove(self: *@This(), index: usize) ?*Entry {
+        const entry = self.entries[index] orelse return null;
+        self.entries[index] = null;
+        self.bytes -= entry.bytes;
+        return entry;
+    }
+    fn reserve(self: *@This(), bytes: usize) bool {
+        var used = self.resident_bytes.load(.acquire);
+        while (used <= max_bytes - bytes) {
+            used = self.resident_bytes.cmpxchgWeak(used, used + bytes, .acq_rel, .acquire) orelse return true;
         }
+        return false;
     }
     pub fn put(self: *@This(), a: Allocator, key: []const u8, rows: *const roaring.RoaringBitmap) void {
-        const bytes = std.math.add(usize, key.len, rows.cloneStorageBound()) catch return;
+        const bytes = std.math.add(usize, key.len, rows.cloneStorageBound() + @sizeOf(Entry)) catch return;
         if (bytes > max_bytes) return;
-        while (!self.mutex.tryLock()) spinOrYield();
-        defer self.mutex.unlock();
-        for (self.entries) |entry| if (entry) |value| if (std.mem.eql(u8, value.key, key)) return;
-        while (self.bytes > max_bytes - bytes) {
-            self.evict(a, self.cursor);
+        var attempts: usize = 0;
+        while (!self.reserve(bytes)) {
+            // Optional admission never waits behind another cache operation.
+            if (attempts == self.entries.len or !self.mutex.tryLock()) return;
+            const retired = self.remove(self.cursor);
             self.cursor = (self.cursor + 1) % self.entries.len;
+            self.mutex.unlock();
+            if (retired) |entry| entry.release();
+            attempts += 1;
         }
-        self.evict(a, self.cursor);
-        const owned_key = a.dupe(u8, key) catch return;
-        const owned_rows = rows.cloneExact(a) catch {
-            a.free(owned_key);
-            return;
+        var admitted = false;
+        defer if (!admitted) {
+            _ = self.resident_bytes.fetchSub(bytes, .acq_rel);
         };
-        self.entries[self.cursor] = .{ .key = owned_key, .rows = owned_rows, .bytes = bytes };
-        self.bytes += bytes;
-        self.cursor = (self.cursor + 1) % self.entries.len;
+        const owned = a.create(Entry) catch return;
+        var installed = false;
+        defer if (!installed) a.destroy(owned);
+        const owned_key = a.dupe(u8, key) catch return;
+        defer if (!installed) a.free(owned_key);
+        var owned_rows = rows.cloneExact(a) catch return;
+        defer if (!installed) owned_rows.deinit();
+        owned.* = .{ .key = owned_key, .rows = owned_rows, .bytes = bytes, .owner = self, .alloc = a };
+        if (!self.mutex.tryLock()) return;
+        const retired = blk: {
+            defer self.mutex.unlock();
+            for (self.entries) |entry| if (entry) |value| if (std.mem.eql(u8, value.key, key)) return;
+            const retired = self.remove(self.cursor);
+            self.entries[self.cursor] = owned;
+            self.bytes += bytes;
+            self.cursor = (self.cursor + 1) % self.entries.len;
+            installed = true;
+            admitted = true;
+            break :blk retired;
+        };
+        if (retired) |entry| entry.release();
     }
-    pub fn deinit(self: *@This(), a: Allocator) void {
-        for (0..self.entries.len) |i| self.evict(a, i);
+    pub fn deinit(self: *@This(), _: Allocator) void {
+        for (0..self.entries.len) |i| if (self.remove(i)) |entry| entry.release();
+        std.debug.assert(self.resident_bytes.load(.acquire) == 0);
     }
 };
+
+test "graph predicate cache clones outside locks and pins evicted membership" {
+    const a = std.testing.allocator;
+    var cache = GraphPredicateCache{};
+    const Guard = struct {
+        cache: *GraphPredicateCache,
+        backing: Allocator,
+        evict_on_alloc: bool = false,
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn check(self: *@This()) void {
+            std.debug.assert(self.cache.mutex.tryLock());
+            self.cache.mutex.unlock();
+        }
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.check();
+            if (self.evict_on_alloc) {
+                self.evict_on_alloc = false;
+                std.debug.assert(self.cache.mutex.tryLock());
+                const retired = self.cache.remove(0);
+                self.cache.mutex.unlock();
+                if (retired) |entry| entry.release();
+            }
+            return self.backing.rawAlloc(len, alignment, ret_addr);
+        }
+        fn resize(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.check();
+            return self.backing.rawResize(bytes, alignment, len, ret_addr);
+        }
+        fn remap(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.check();
+            return self.backing.rawRemap(bytes, alignment, len, ret_addr);
+        }
+        fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.check();
+            self.backing.rawFree(bytes, alignment, ret_addr);
+        }
+    };
+    var guard = Guard{ .cache = &cache, .backing = a };
+    defer cache.deinit(a);
+    var rows = roaring.RoaringBitmap.init(a);
+    defer rows.deinit();
+    try rows.add(7);
+    try rows.add(70000);
+    cache.put(guard.allocator(), "permissions", &rows);
+    try std.testing.expect(cache.bytes > 0);
+    guard.evict_on_alloc = true;
+    var cloned = (try cache.get(guard.allocator(), "permissions", .{})).?;
+    defer cloned.deinit();
+    try std.testing.expect(cloned.contains(7) and cloned.contains(70000));
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+    try std.testing.expectEqual(@as(usize, 0), cache.resident_bytes.load(.acquire));
+    // Optional insertion must decline contention rather than wait indefinitely.
+    std.debug.assert(cache.mutex.tryLock());
+    cache.put(a, "contended", &rows);
+    cache.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), cache.resident_bytes.load(.acquire));
+}
 
 /// Immutable, ref-counted snapshot of the index state.
 ///
