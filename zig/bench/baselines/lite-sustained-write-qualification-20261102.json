@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "status": "local diagnostic qualification in progress; final host qualification pending",
+  "status": "local sustained gate passed; final integrated and matched final-host qualification in progress",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
-  "previous_pushed_runtime_commit": "a5e9e20401733311c28ad850a6c54e369fc358b0",
+  "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
   "constraints": [
     "Original importer unchanged",
@@ -374,13 +374,92 @@
       }
     },
     {
+      "status": "ok",
+      "library_sha256": "88335f9470b3addb5dd03aa8fcdf82cc932f35321758555e222702229d1bcaa3",
+      "successful_calls": 22656,
+      "busy_calls": 0,
+      "elapsed_seconds": 600.2079071250046,
+      "success_p50_ns": 167028583,
+      "success_p95_ns": 484494750,
+      "success_p99_ns": 621849458,
+      "file_bytes": 22945792,
+      "peak_file_bytes": 22945792,
+      "allocator_proof_walks": 1,
+      "sustained_qualification": {
+        "active_visibility": {
+          "maximum_allowed_seconds": 60,
+          "maximum_watermark_visibility_upper_seconds": 32.18628962500952,
+          "passed": true,
+          "samples": 113
+        },
+        "late_to_early_throughput_fraction": 0.7824401052485805,
+        "minute_successful_calls": [
+          3474,
+          2661,
+          2397,
+          2163,
+          1993,
+          2128,
+          2190,
+          2022,
+          1860,
+          1768
+        ],
+        "passed": true,
+        "policy": {
+          "maximum_tail_growth_fraction": 0.25,
+          "minimum_growth_allowance_bytes": 16777216,
+          "minimum_late_throughput_fraction": 0.75,
+          "warmup_seconds": 180
+        },
+        "tail_growth_allowance_bytes": 16777216,
+        "tail_growth_bytes": 3710976,
+        "tail_initial_file_bytes": 19234816
+      },
       "source": {
         "base_commit": "a5e9e20401733311c28ad850a6c54e369fc358b0",
         "patch_sha256": "830b6c9dacd06c1b83d525505dc14fce99d7b087eab6135aeaa5dedb57fb3b40",
         "library_sha256": "88335f9470b3addb5dd03aa8fcdf82cc932f35321758555e222702229d1bcaa3",
         "mode": "Debug"
       },
-      "status": "pending"
+      "acknowledged_latest_values_verified": 1024,
+      "integrity_and_acknowledgments": {
+        "checked_last_writes": 1024,
+        "integrity": {
+          "compact_size": 8560640,
+          "file_size": 22945792,
+          "issue": null,
+          "live_accounting": {
+            "control_documents": {
+              "key_bytes": 432445,
+              "records": 18874,
+              "value_bytes": 456930
+            },
+            "documents": {
+              "key_bytes": 21605,
+              "records": 1536,
+              "value_bytes": 3179008
+            },
+            "index_catalog": {
+              "key_bytes": 2361,
+              "records": 40,
+              "value_bytes": 540047
+            },
+            "metadata_catalog": {
+              "key_bytes": 33,
+              "records": 1,
+              "value_bytes": 16
+            }
+          },
+          "live_bytes": 4632445,
+          "live_file_count": 20451,
+          "reclaimable_bytes": 14385152,
+          "record_count": 20578,
+          "tail_bytes": 0,
+          "valid": true,
+          "valid_prefix_size": 22945792
+        }
+      }
     }
   ],
   "ae7_correctness": {
@@ -453,12 +532,383 @@
       ],
       "short_debug_sst_count": 11,
       "short_debug_wal_bytes": 174905,
-      "note": "Three-minute diagnostic; ten-minute gate still pending"
+      "note": "The subsequent ten-minute gate passed; see local_debug_diagnostics and catch-up receipt"
     },
     "final_integrated_gates": "pending"
   },
+  "local_sustained_catchup": {
+    "library_sha256": "88335f9470b3addb5dd03aa8fcdf82cc932f35321758555e222702229d1bcaa3",
+    "initial_file_bytes": 22945792,
+    "catchup_seconds": 5.777320624969434,
+    "indexes": [
+      {
+        "name": "full_text_index_v0",
+        "kind": "full_text",
+        "replay_applied_sequence": 22688,
+        "replay_target_sequence": 22688,
+        "replay_catch_up_required": false,
+        "catch_up_active": false,
+        "catch_up_phase": "idle",
+        "doc_count": 1536,
+        "term_count": 107,
+        "edge_count": 0,
+        "graph_counts_pending": false,
+        "node_count": 0,
+        "repair_degraded": false,
+        "repair_issue_count": 0,
+        "repair_summary_ready": true,
+        "repair_issue_count_estimated": false,
+        "coverage_produced_count": 0,
+        "coverage_skipped_count": 0,
+        "coverage_terminal_failed_count": 0,
+        "coverage_summary_ready": true
+      }
+    ],
+    "search_canary": true,
+    "integrity": {
+      "live_accounting": {
+        "metadata_catalog": {
+          "records": 1,
+          "key_bytes": 33,
+          "value_bytes": 16
+        },
+        "index_catalog": {
+          "records": 26,
+          "key_bytes": 1552,
+          "value_bytes": 306063
+        },
+        "control_documents": {
+          "records": 14887,
+          "key_bytes": 392728,
+          "value_bytes": 239897
+        },
+        "documents": {
+          "records": 1537,
+          "key_bytes": 21624,
+          "value_bytes": 3179051
+        }
+      },
+      "valid": true,
+      "file_size": 22945792,
+      "valid_prefix_size": 22945792,
+      "tail_bytes": 0,
+      "record_count": 16460,
+      "live_file_count": 16451,
+      "live_bytes": 4140964,
+      "compact_size": 7831552,
+      "reclaimable_bytes": 15114240,
+      "issue": null
+    },
+    "pending_work": {
+      "derived_target_sequence": 22689,
+      "has_async_indexes": true,
+      "portable_import_publication_in_progress": false,
+      "portable_import_recovery_required": false,
+      "portable_runtime_activation_pending": false,
+      "portable_runtime_activation_attempts": 0,
+      "enrichment": {
+        "output_counts": {
+          "embedding": {
+            "complete": 0,
+            "failed": 0,
+            "terminal": 0,
+            "degraded": 0
+          },
+          "transcribe": {
+            "complete": 0,
+            "failed": 0,
+            "terminal": 0,
+            "degraded": 0
+          },
+          "classify": {
+            "complete": 0,
+            "failed": 0,
+            "terminal": 0,
+            "degraded": 0
+          },
+          "diarize": {
+            "complete": 0,
+            "failed": 0,
+            "terminal": 0,
+            "degraded": 0
+          }
+        },
+        "output_counts_available": true,
+        "last_error_code": "",
+        "enabled": false,
+        "lease_owned": true,
+        "has_lease": false,
+        "acquisition_count": 0,
+        "lease_acquire_failures": 0,
+        "lost_leases": 0,
+        "last_acquired_ms": 0,
+        "target_sequence": 0,
+        "applied_sequence": 0,
+        "projection_checkpoint_status": "clean",
+        "projection_checkpoint_applied_sequence": 0,
+        "projection_checkpoint_generation": 0,
+        "projection_checkpoint_config_hash": 0,
+        "projection_checkpoint_identity_consistent": true,
+        "checkpoint_replay_tail_sequence_count": 0,
+        "processed_requests": 0,
+        "error_count": 0,
+        "retryable_error_count": 0,
+        "fatal_error_count": 0,
+        "consecutive_retry_count": 0,
+        "next_retry_at_ms": 0,
+        "retrying": false,
+        "worker_failed": false,
+        "worker_started": false,
+        "stalled": false,
+        "stall_reason": "",
+        "active_phase": "idle",
+        "active_model": "",
+        "active_backend": "",
+        "active_deadline_ms": 0,
+        "last_progress_ms": 0,
+        "active_progress_completed": 0,
+        "active_progress_total": 0,
+        "inference_timeout_count": 0,
+        "inference_cancel_count": 0,
+        "skip_by_hash_count": 0,
+        "skipped_source_count": 0,
+        "codec_decode_failures": 0,
+        "embed_batches_started": 0,
+        "embed_batches_completed": 0,
+        "embed_items_started": 0,
+        "embed_items_completed": 0,
+        "active_embed_batch_items": 0,
+        "active_embed_batch_bytes": 0,
+        "active_embed_batch_max_bytes": 0,
+        "active_embed_batch_started_ms": 0,
+        "last_embed_batch_items": 0,
+        "last_embed_batch_bytes": 0,
+        "last_embed_batch_max_bytes": 0,
+        "last_embed_batch_completed_ms": 0,
+        "last_embed_batch_ns": 0,
+        "total_embed_ns": 0,
+        "dense_artifact_bytes_written": 0,
+        "sparse_artifact_bytes_written": 0,
+        "chunk_artifact_bytes_written": 0,
+        "artifact_bytes_written": 0
+      },
+      "resolution": {
+        "enabled": false,
+        "target_sequence": 0,
+        "applied_sequence": 0,
+        "catch_up_required": false,
+        "blocked": false,
+        "blocked_reason": "",
+        "error_count": 0
+      },
+      "promotion": {
+        "enabled": false,
+        "target_sequence": 0,
+        "applied_sequence": 0,
+        "catch_up_required": false,
+        "blocked": false,
+        "blocked_reason": "",
+        "error_count": 0
+      },
+      "resolution_worker_started": false,
+      "promotion_worker_started": false,
+      "text_merge": {
+        "enabled": true,
+        "active_indexes": 1,
+        "active_segments": 8,
+        "max_active_segments_per_index": 8,
+        "pending_indexes": 0,
+        "pending_segments": 0,
+        "pending_bytes": 0,
+        "pending_heap_bytes": 0,
+        "pending_mmap_bytes": 0,
+        "in_flight_merges": 0,
+        "in_flight_segments": 0,
+        "completed_merges": 0,
+        "skipped_stale_merges": 0,
+        "failed_merges": 0,
+        "merge_input_segments_total": 0,
+        "merge_input_bytes_total": 0,
+        "merge_output_segments_total": 0,
+        "merge_output_bytes_total": 0,
+        "merge_elapsed_ns_total": 0,
+        "merge_peak_task_alloc_bytes": 0,
+        "last_merge_input_segments": 0,
+        "last_merge_input_bytes": 0,
+        "last_merge_output_segments": 0,
+        "last_merge_output_bytes": 0,
+        "last_merge_elapsed_ns": 0,
+        "last_merge_peak_task_alloc_bytes": 0,
+        "quarantined_merges": 0,
+        "quarantined_segments": 0,
+        "last_merge_error": "",
+        "retry_after_ns": 0,
+        "deferred_for_pressure": 0,
+        "forced_drains": 0,
+        "backpressure_events": 0,
+        "backpressure_ns": 0,
+        "backpressure_timeouts": 0,
+        "backpressure_failures": 0,
+        "max_pending_segments": 64,
+        "max_pending_bytes": 268435456
+      },
+      "repair_metadata_rebuild_pending": false,
+      "graph_metric": {
+        "metrics_scanned": 0,
+        "queued_builds": 0,
+        "active_builds": 0,
+        "active_pages": 0,
+        "failed_pages": 0,
+        "paused_metrics": 0,
+        "truncated_pages": false
+      },
+      "resolver_curation": {
+        "resolvers": []
+      },
+      "index_replay_debt": [
+        {
+          "index_name": "full_text_index_v0",
+          "kind": "full_text",
+          "applied_sequence": 22689,
+          "target_sequence": 22689,
+          "catch_up_required": false,
+          "replay_document_not_visible_skipped": 0
+        }
+      ],
+      "replacements": [],
+      "background_publications": {
+        "maintenance_rounds": 24,
+        "retirement_work_pages": 148,
+        "replay_budget_table_id": 14930048931520930745,
+        "replay_budget": {
+          "records": [
+            32,
+            64,
+            64,
+            64,
+            64
+          ],
+          "bytes": [
+            524288,
+            1048576,
+            1048576,
+            1048576,
+            1048576
+          ],
+          "observations": 23,
+          "overruns": 1,
+          "retention_pressure": false,
+          "target_quantum_ns": 25000000
+        },
+        "attempts": 719,
+        "refused": 0,
+        "rebased": 0,
+        "generated_attempts": 0,
+        "generated_refused": 0,
+        "storage_guard_validations": 0,
+        "serving_runtime_refreshes": 31,
+        "replay_backlog": {
+          "bytes": 0,
+          "records": 0,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        },
+        "replay_backpressure_waits": 0,
+        "replay_index_groups": 24,
+        "source_inputs_released": 24,
+        "publication_hold_ns": 821096386,
+        "replay_metadata_groups": 24,
+        "replay_attempts": 0,
+        "replay_refused": 0,
+        "maintenance_errors": 0,
+        "maintenance_queue_timeouts": 0,
+        "allocator_refusals": 0,
+        "allocator_service_admissions": 48,
+        "index_input_refusals": 0,
+        "allocator_proof_walks": 0,
+        "allocator_proof_failures": 0,
+        "allocator_proof_ns": 0,
+        "allocator_proof_max_ns": 0,
+        "mutation_admission_count": 1,
+        "mutation_admission_ns": 196459,
+        "mutation_admission_max_ns": 196459,
+        "mutation_admission_log2_ns": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "last_maintenance_error": null
+      },
+      "unavailable_tables": {},
+      "tables": {}
+    },
+    "reopen": true,
+    "final_file_bytes": 22945792
+  },
   "pending": [
-    "Finish local sustained throughput and active visibility qualification",
     "Final integrated native/CAPI/ABI/SDK/model/shared-storage gates",
     "Matched wolfspider Debug and ReleaseFast comparisons",
     "All frozen original-importer inputs and three-writer/one-reader contention",

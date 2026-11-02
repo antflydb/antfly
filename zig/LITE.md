@@ -1424,6 +1424,15 @@ allows tail growth of 25% of the warm file size or 16 MiB, whichever is larger.
 These are workload-specific regression tolerances; an idle shrink or a successful
 integrity check alone does not establish a storage plateau. Index catch-up,
 visibility under active load, search and reopen checks remain separate gates.
+Run both the historical `--text-payload words` workload and
+`--text-payload changing-words`. The latter adds a different searchable token
+to every acknowledged replacement, so replay cannot qualify by only advancing
+through unchanged text. Once indexes catch up, run
+`scripts/bench/lite_churn_visibility.py --library <library> --report <jsonl>
+--database <database.aflite> --output <receipt.json>` to verify every retained
+key's latest token and the absence of its replaced token through a read-only
+open. Keep workload variants separate in comparisons; the verifier requires the
+same library hash as the measured run.
 
 Physical maintenance releases detached catalog/source pins before starting
 allocator service or a vacuum assessment. Bounded allocator/orphan service joins

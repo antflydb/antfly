@@ -263,15 +263,27 @@ def native_worker(config, index, ready, start, results, finish=None):
             next_visibility = began + visibility_interval
             text_payload = (
                 ("searchable churn alpha beta gamma delta " * 28)[:1024]
-                if config.get("text_payload") == "words"
+                if config.get("text_payload") in ("words", "changing-words")
                 else "v" * 1024
             )
             last_write = None
             latest_churn_writes = {}
             while time.monotonic() < deadline:
                 key = f"worker-{index}-{sequence if config['workload'] == 'append' else sequence % 128}"
+                token = (
+                    f"churnworker{index}sequence{sequence}"
+                    if config.get("text_payload") == "changing-words"
+                    else None
+                )
                 payload = {
-                    "inserts": {key: {"text": text_payload, "sequence": sequence}}
+                    "inserts": {
+                        key: {
+                            "text": f"{token} {text_payload}"
+                            if token
+                            else text_payload,
+                            "sequence": sequence,
+                        }
+                    }
                 }
                 began_call = time.perf_counter_ns()
                 try:
@@ -282,6 +294,8 @@ def native_worker(config, index, ready, start, results, finish=None):
                     )
                     success_windows[window] += 1
                     last_write = {"key": key, "sequence": sequence}
+                    if token:
+                        last_write["text_token"] = token
                     if config["workload"] == "churn":
                         latest_churn_writes[key] = last_write
                 except af.BusyError:
@@ -432,7 +446,11 @@ def verify(library: str, database: Path, expected: list[dict]) -> None:
     af = sdk(library)
     with af.open(database, busy_timeout=5.0) as db:
         for write in expected:
-            if db.lookup(write["key"])["sequence"] != write["sequence"]:
+            document = db.lookup(write["key"])
+            if document["sequence"] != write["sequence"] or (
+                write.get("text_token")
+                and not document["text"].startswith(write["text_token"] + " ")
+            ):
                 raise RuntimeError(
                     f"last successful write was not retained: {write['key']}"
                 )
@@ -932,7 +950,11 @@ def main():
         default=0,
         help="sample index progress during writes; observations consume measured wall time",
     )
-    parser.add_argument("--text-payload", choices=("opaque", "words"), default="opaque")
+    parser.add_argument(
+        "--text-payload",
+        choices=("opaque", "words", "changing-words"),
+        default="opaque",
+    )
     parser.add_argument("--no-sync", action="store_true")
     parser.add_argument(
         "--allocator-diagnostics",
