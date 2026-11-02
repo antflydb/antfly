@@ -22,6 +22,7 @@ test {
     _ = @import("serverless/query/lake_parquet_encoded.zig");
     _ = @import("serverless/query/lake_parquet_page.zig");
     _ = @import("serverless/external_source/mod.zig");
+    _ = @import("serverless/external_source/lake_catalog/mod.zig");
     _ = @import("serverless/lake_host.zig");
     _ = @import("storage/rowsource/identity.zig");
     _ = @import("storage/db/column_source.zig");

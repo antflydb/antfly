@@ -68,6 +68,7 @@ pub const QueryRequest = struct {
     offset: usize = 0,
     min_score: u32 = 0,
     num_probes: u32 = 2,
+    coarse_probes: u32 = 0,
     search_effort: ?f32 = null,
     mode: QueryMode = .text,
     operator: QueryOperator = .all_terms,

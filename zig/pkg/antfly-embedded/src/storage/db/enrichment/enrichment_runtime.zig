@@ -2245,6 +2245,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.EmbedRequestFailed,
         error.InferenceEndpointAccessDenied,
         error.ReadRequestFailed,
+        error.ReadOutputTruncated,
         error.ExtractionInvalidRequest,
         error.ExtractionUnauthorized,
         error.ExtractionForbidden,
@@ -21826,7 +21827,11 @@ fn markRuntimeGeneratedUnitTextFailureNamed(
         .ocr => "failed_ocr",
         .transcript => "failed_transcription",
     };
-    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, error_name });
+    const hint = if (kind == .ocr and std.mem.eql(u8, error_name, "ReadOutputTruncated"))
+        "; OCR reached max_tokens before completing the page; increase ocr.reader.max_tokens within model and deployment limits, or inspect the output for repetition if already at the limit"
+    else
+        "";
+    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}{s}", .{ method, error_name, hint });
     errdefer alloc.free(warning);
     const owned_method = try alloc.dupe(u8, if (kind == .ocr and !std.mem.eql(u8, unit.unit_type, "image")) "pdf_text" else method);
     errdefer alloc.free(owned_method);
@@ -36225,81 +36230,90 @@ test "document extraction rejects and records Florence prompt echoes" {
     try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "OcrPromptEcho") != null);
 }
 
-test "document extraction missing OCR model is a terminal unit failure" {
+test "document extraction missing model and truncated OCR are actionable terminal unit failures" {
     const alloc = std.testing.allocator;
+    for ([_]anyerror{ error.ModelNotFound, error.ReadOutputTruncated }) |failure| {
+        const FailedReaderProducer = struct {
+            failure: anyerror,
+            fn producer(self: *@This()) asset_producer_mod.Producer {
+                return .{
+                    .ptr = self,
+                    .vtable = &.{
+                        .produce = produce,
+                        .produce_batch = produceBatch,
+                        .invocation_memory_for_requests = testInvocationMemoryForRequests,
+                    },
+                };
+            }
 
-    const MissingModelProducer = struct {
-        fn producer(self: *@This()) asset_producer_mod.Producer {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .produce = produce,
-                    .produce_batch = produceBatch,
-                    .invocation_memory_for_requests = testInvocationMemoryForRequests,
-                },
-            };
+            fn produce(ptr: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                return self.failure;
+            }
+
+            fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                return self.failure;
+            }
+        };
+
+        var fake = FailedReaderProducer{ .failure = failure };
+        const producer = fake.producer();
+        var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+        defer resource_manager.deinit(alloc);
+        var runtime = EnrichmentRuntime{
+            .alloc = alloc,
+            .io_impl = null,
+            .store = undefined,
+            .owns_store = false,
+            .change_journal = undefined,
+            .replay_source = undefined,
+            .index_manager = undefined,
+            .write_ctx = undefined,
+            .write_fn = undefined,
+            .notify_ctx = undefined,
+            .notify_fn = undefined,
+            .config = .{
+                .asset_producer = producer,
+                .resource_manager = &resource_manager,
+            },
+            .ownership = undefined,
+        };
+        var units = [_]document_extraction_mod.Unit{.{
+            .unit_id = try alloc.dupe(u8, "unit:1"),
+            .unit_type = try alloc.dupe(u8, "image"),
+            .text = try alloc.dupe(u8, ""),
+            .method = try alloc.dupe(u8, "ocr_pending"),
+            .extraction_status = try alloc.dupe(u8, "pending_ocr"),
+        }};
+        defer units[0].deinit(alloc);
+
+        try completeRuntimeDocumentExtractionGeneratedTextBatch(
+            &runtime,
+            alloc,
+            producer,
+            .{ .ocr_enabled = true },
+            .{ .max_items = 8, .max_bytes = 1024 * 1024 },
+            "https://example.test/image.png",
+            "",
+            "image",
+            "image/png",
+            units[0..],
+            .ocr,
+        );
+
+        try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
+        try std.testing.expect(!units[0].ocr_used);
+        // Neither failure can recover without an operator changing the request;
+        // neither should schedule an automatic retry loop.
+        try std.testing.expectEqual(@as(?bool, false), units[0].ocr_failure_retryable);
+        try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, @errorName(failure)) != null);
+        if (failure == error.ReadOutputTruncated) {
+            try std.testing.expectEqualStrings("", units[0].text);
+            try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "ocr.reader.max_tokens") != null);
+            try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "repetition") != null);
         }
-
-        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
-            return error.ModelNotFound;
-        }
-
-        fn produceBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
-            return error.ModelNotFound;
-        }
-    };
-
-    var fake = MissingModelProducer{};
-    const producer = fake.producer();
-    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
-    defer resource_manager.deinit(alloc);
-    var runtime = EnrichmentRuntime{
-        .alloc = alloc,
-        .io_impl = null,
-        .store = undefined,
-        .owns_store = false,
-        .change_journal = undefined,
-        .replay_source = undefined,
-        .index_manager = undefined,
-        .write_ctx = undefined,
-        .write_fn = undefined,
-        .notify_ctx = undefined,
-        .notify_fn = undefined,
-        .config = .{
-            .asset_producer = producer,
-            .resource_manager = &resource_manager,
-        },
-        .ownership = undefined,
-    };
-    var units = [_]document_extraction_mod.Unit{.{
-        .unit_id = try alloc.dupe(u8, "unit:1"),
-        .unit_type = try alloc.dupe(u8, "image"),
-        .text = try alloc.dupe(u8, ""),
-        .method = try alloc.dupe(u8, "ocr_pending"),
-        .extraction_status = try alloc.dupe(u8, "pending_ocr"),
-    }};
-    defer units[0].deinit(alloc);
-
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(
-        &runtime,
-        alloc,
-        producer,
-        .{ .ocr_enabled = true },
-        .{ .max_items = 8, .max_bytes = 1024 * 1024 },
-        "https://example.test/image.png",
-        "",
-        "image",
-        "image/png",
-        units[0..],
-        .ocr,
-    );
-
-    try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
-    try std.testing.expect(!units[0].ocr_used);
-    // A missing configured model is terminal until the operator repairs the
-    // configuration; it must not schedule an automatic retry loop.
-    try std.testing.expectEqual(@as(?bool, false), units[0].ocr_failure_retryable);
-    try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "ModelNotFound") != null);
+    }
 }
 
 test "asset batch fallback isolates malformed envelope and preserves typed mixed results" {

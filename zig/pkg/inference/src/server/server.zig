@@ -8670,10 +8670,10 @@ pub const Node = struct {
             try std.math.add(usize, if (share_vision_peak) shared_vision_bytes else 0, solo_decoder_peak),
             if (share_vision_peak) shared_vision_host_bytes else 0,
         );
-        if (!(solo.fitsLimits(limits) catch false)) {
-            std.log.warn("LightOnOCR3 read page exceeds the generation budget even when admitted alone scratch_bytes={d} scratch_limit_bytes={d}; raise --scratch-budget-mb or the other generation budgets", .{
-                solo.host_scratch_bytes +| solo.backend_scratch_bytes, limits.scratch_limit_bytes,
-            });
+        const solo_denial = solo.firstLimitExceeded(limits) catch return error.ResourceLimitExceeded;
+        if (solo_denial) |denial| {
+            var detail: [512]u8 = undefined;
+            std.log.warn("{s}", .{try lightOnSoloBudgetDenialMessage(&detail, denial)});
             return error.ResourceLimitExceeded;
         }
         const extended_epoch = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_EXTENDED_EPOCH");
@@ -8701,7 +8701,6 @@ pub const Node = struct {
         var admission_wait = LightOnAdmissionWait{ .last_progress_ns = admission_wait_started, .observed_steps = if (progress_aware_admission) ctx.coordinator.schedulerStats().step_batches_total else 0 };
         var admission_progress_poll_ns = admission_wait_started;
         var logged_wait = false;
-        var retry_delay_ns: u64 = std.time.ns_per_ms;
         var admission = while (true) {
             try control.check();
             const admitted = ctx.admitRegisteredPage(&factory, index, if (share_vision_peak) shared_vision_bytes else null, if (share_vision_peak) shared_vision_host_bytes else 0, amounts) catch |err| {
@@ -8725,8 +8724,7 @@ pub const Node = struct {
                     });
                     logged_wait = true;
                 }
-                platform.time.sleepNs(retry_delay_ns);
-                if (ctx.phase_wait_ns != 0) retry_delay_ns = @min(retry_delay_ns * 2, 10 * std.time.ns_per_ms);
+                platform.time.sleepNs(admission_wait.nextRetryDelayNs());
                 continue;
             };
             break admitted;
@@ -21141,7 +21139,9 @@ pub const Node = struct {
             ) catch |err| switch (err) {
                 error.ReadOutputTruncated => return ctx.status(400).json(.{
                     .@"error" = "OUTPUT_TRUNCATED",
-                    .message = "Qwen3-VL reached 'max_tokens' before completing OCR; increase 'max_tokens' and retry",
+                    .message = try std.fmt.allocPrint(ctx.allocator, "{s} reached max_tokens={d} before completing OCR; increase max_tokens within model and deployment limits, or inspect output for repetition if already at the limit", .{
+                        if (admission_manifest.isLightOnOcr3()) @as([]const u8, "LightOnOCR-3") else "Qwen3-VL", max_tokens.?,
+                    }),
                 }),
                 error.ImageDecodeFailed => return readImageErrorResponse(ctx, err),
                 error.QueueFull => return transientCapacityFailureResponse(
@@ -28567,6 +28567,13 @@ fn lightOnPhysicalRowCeiling() usize {
 const LightOnAdmissionWait = struct {
     last_progress_ns: u64,
     observed_steps: u64 = 0,
+    retry_delay_ns: u64 = std.time.ns_per_ms,
+
+    fn nextRetryDelayNs(self: *LightOnAdmissionWait) u64 {
+        const delay = self.retry_delay_ns;
+        self.retry_delay_ns = @min(delay * 2, 10 * std.time.ns_per_ms);
+        return delay;
+    }
 
     fn expired(self: *LightOnAdmissionWait, now: u64, steps: ?u64) bool {
         if (steps) |current| {
@@ -28579,6 +28586,22 @@ const LightOnAdmissionWait = struct {
     }
 };
 
+fn lightOnSoloBudgetDenialMessage(buf: []u8, denial: runtime.tier.memory.AdmissionAmounts.LimitExceeded) ![]const u8 {
+    const limit = @tagName(denial.limit);
+    return std.fmt.bufPrint(buf, "LightOnOCR3 read page exceeds the generation budget even when admitted alone limit={s} required_bytes={d} limit_bytes={d}; increase --{s}-budget-mb (standalone: --inference-{s}-budget-mb) or reduce image size or output tokens", .{
+        limit, denial.requested_bytes, denial.limit_bytes, limit, limit,
+    });
+}
+
+test "LightOnOCR3 solo denial names the combined budget rather than scratch" {
+    var buf: [512]u8 = undefined;
+    const message = try lightOnSoloBudgetDenialMessage(&buf, .{ .limit = .combined, .requested_bytes = 130, .limit_bytes = 120 });
+    try std.testing.expect(std.mem.indexOf(u8, message, "limit=combined required_bytes=130 limit_bytes=120") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "--combined-budget-mb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "--inference-combined-budget-mb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "scratch") == null);
+}
+
 test "LightOnOCR3 wide admission waits for progressing cohorts and bounds stalled capacity" {
     const second = std.time.ns_per_s;
     var active = LightOnAdmissionWait{ .last_progress_ns = 0, .observed_steps = 7 };
@@ -28589,6 +28612,8 @@ test "LightOnOCR3 wide admission waits for progressing cohorts and bounds stalle
     try std.testing.expect(!active.expired(89 * second, 10));
     try std.testing.expect(active.expired(90 * second, 10));
     var legacy = LightOnAdmissionWait{ .last_progress_ns = second };
+    for ([_]u64{ 1, 2, 4, 8, 10, 10 }) |ms|
+        try std.testing.expectEqual(ms * std.time.ns_per_ms, legacy.nextRetryDelayNs());
     try std.testing.expect(!legacy.expired(30 * second, null));
     try std.testing.expect(legacy.expired(31 * second, null));
     // Saturate a clock sample preceding initialization rather than underflow.

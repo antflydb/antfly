@@ -24,6 +24,13 @@ const std = @import("std");
 
 pub const abi_version: u32 = 1;
 
+test "OCR truncation preserves terminal identity across runtime callbacks" {
+    const transported = statusFromError(error.ReadOutputTruncated);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
+    try std.testing.expectEqual(error.ReadOutputTruncated, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.ReadOutputTruncated));
+}
+
 test "FK publication progress and corrupt retirement proofs retain distinct boundary semantics" {
     const pending = statusFromError(error.GenerationAdmissionAcknowledgementPending);
     const changed = statusFromError(error.GenerationRetirementChanged);
@@ -952,6 +959,7 @@ pub const Detail = enum(c_int) {
     ha_catalog_replication_sources_unsupported,
     // Append-only: numeric Detail values are part of the stable C ABI.
     embed_admission_refused,
+    read_output_truncated,
     invalid_document_extraction_config,
     document_extraction_model_required,
 };
@@ -1833,6 +1841,7 @@ pub fn statusFromError(err: anyerror) Status {
         // identity (the enrichment retry-budget exemption) can tell them
         // apart by name.
         error.EmbedAdmissionRefused => status(.retryable, .embed_admission_refused),
+        error.ReadOutputTruncated => status(.invalid_argument, .read_output_truncated),
         else => status(.internal, .none),
     };
 }
@@ -2724,6 +2733,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .runtime_stopping => "RuntimeStopping",
         .runtime_already_ready => "RuntimeAlreadyReady",
         .embed_admission_refused => "EmbedAdmissionRefused",
+        .read_output_truncated => "ReadOutputTruncated",
         .invalid_document_extraction_config => "InvalidDocumentExtractionConfig",
         .document_extraction_model_required => "DocumentExtractionModelRequired",
     };

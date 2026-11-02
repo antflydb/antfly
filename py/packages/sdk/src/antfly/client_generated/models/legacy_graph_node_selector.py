@@ -28,7 +28,9 @@ class LegacyGraphNodeSelector:
             - "$fused_results" - use fused retrieval results
             - "$graph_results.<query-name>" - use a prior graph query result
         limit (int | Unset): Maximum number of nodes to select from result_ref; invalid with keys or identities.
-        node_filter (NodeFilter | Unset): Filter nodes during graph traversal using existing query primitives
+        node_filter (NodeFilter | Unset): Admission predicate applied to every start, target and intermediate node
+            before returning or expanding it, for all graph operations. Denied nodes cannot occur in result paths or expose
+            descendants through traversal.
     """
 
     keys: list[str] | Unset = UNSET
