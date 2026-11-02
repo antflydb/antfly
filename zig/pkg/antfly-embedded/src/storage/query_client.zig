@@ -59,9 +59,22 @@ pub const QueryResponse = struct {
     identity_read_generation: ?u64,
 };
 
+/// Physical compatibility callers obtain their capability from the storage
+/// owner. Only that issuer resolves this checked borrow; the query dispatcher
+/// has no private type or layout dependency.
+fn issueExecution(db: anytype, out_failure: *abi.FailureIdentity) !abi.QueryExecution {
+    var execution: abi.QueryExecution = .{};
+    var failure: abi.FailureIdentity = .{};
+    const borrow = abi.CheckedDbBorrow.borrow(db);
+    const status = abi.antfly_storage_query_execution_v1(&borrow, &execution, &failure);
+    try acceptProviderFailure(status, failure, .validate_request, out_failure);
+    try error_identity.statusToError(status);
+    return execution;
+}
+
 pub fn executeJsonAlloc(
     alloc: std.mem.Allocator,
-    db: abi.LocalQueryDb,
+    db: anytype,
     table_name: []const u8,
     request_json: []const u8,
     dialect: abi.LocalQueryDialect,
@@ -74,7 +87,7 @@ pub fn executeJsonAlloc(
     return executeAlloc(alloc, .{
         .dialect = dialect,
         .kind = .search,
-        .db = db,
+        .execution = try issueExecution(db, out_failure),
         .table_name = .fromSlice(table_name),
         .request_json = .fromSlice(request_json),
         .execution_options = execution_options,
@@ -88,7 +101,7 @@ pub fn executeJsonAlloc(
 pub fn executeControlledJsonAlloc(
     alloc: std.mem.Allocator,
     kind: abi.LocalQueryKind,
-    db: abi.LocalQueryDb,
+    db: anytype,
     table_name: []const u8,
     request_json: []const u8,
     execution_deadline_ns: ?u64,
@@ -99,7 +112,7 @@ pub fn executeControlledJsonAlloc(
     std.debug.assert(kind != .search);
     const response = try executeAlloc(alloc, .{
         .kind = kind,
-        .db = db,
+        .execution = try issueExecution(db, out_failure),
         .table_name = .fromSlice(table_name),
         .request_json = .fromSlice(request_json),
         .has_execution_deadline = @intFromBool(execution_deadline_ns != null),

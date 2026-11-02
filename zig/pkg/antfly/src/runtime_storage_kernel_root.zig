@@ -37,6 +37,9 @@ const restore_staging_exports = @import("standalone/restore_staging_exports.zig"
 
 const storage_kernel_exports = @import("capi/server_owner.zig");
 comptime {
+    exportInternal(&storage_kernel_exports.storageQueryExecutionIssue, "antfly_storage_query_execution_v1");
+}
+comptime {
     _ = @import("antfly_local_sources").capi_db;
 }
 

@@ -18,6 +18,7 @@
 
 The temporary overlay and compiler caches stay inside the task worktree. This
 checks real owner code generation, not cold-build performance or final linking.
+Private DB edits must preserve the independent dispatcher and opaque consumer.
 """
 
 import argparse
@@ -50,18 +51,59 @@ def main():
     with tempfile.TemporaryDirectory(dir=cache) as directory:
         root = Path(directory) / "zig"
         link_children(ZIG_ROOT, root)
+        # Freeze authored code and construction inputs for the complete matrix.
+        # Implementation work can continue in the source tree without changing
+        # the compiler's inputs halfway through an initial or mutation phase.
+        # Assets remain shared; every mutated source is a private overlay copy.
+        sources = [ZIG_ROOT / "build.zig"]
+        for family in ("lib", "pkg", "build_support"):
+            sources.extend((ZIG_ROOT / family).rglob("*.zig"))
+        for source in sources:
+            own(root, source.relative_to(ZIG_ROOT))
+        report["source_snapshot"] = {
+            "files": len(sources),
+            "bytes": sum(source.stat().st_size for source in sources),
+        }
         provider = own(root, "pkg/antfly/src/storage/local_query_provider.zig")
+        dispatcher = own(root, "pkg/antfly/src/storage/local_query_dispatch.zig")
+        layout = own(root, "pkg/antfly-embedded/src/storage/db/db.zig")
         storage = own(root, "pkg/antfly/src/capi/server_owner.zig")
         contract = own(root, "pkg/antfly-embedded/src/storage/local_query_abi.zig")
-        for phase in ("initial", "warm", "query", "storage", "contract"):
-            changed = {"query": provider, "storage": storage, "contract": contract}.get(
-                phase
-            )
+        for phase in (
+            "initial",
+            "warm",
+            "dispatch",
+            "execution",
+            "storage",
+            "private_layout",
+            "contract",
+        ):
+            changed = {
+                "dispatch": dispatcher,
+                "execution": provider,
+                "storage": storage,
+                "private_layout": layout,
+                "contract": contract,
+            }.get(phase)
             if changed:
-                changed.write_text(
-                    changed.read_text()
-                    + "\n// Isolated production owner cache mutation.\n"
-                )
+                source = changed.read_text()
+                if phase == "private_layout":
+                    marker = (
+                        "    query_schema_identity: std.atomic.Value(u64) = .init(0),"
+                    )
+                    if source.count(marker) != 1:
+                        raise RuntimeError(
+                            "DB declaration changed; update private-layout probe"
+                        )
+                    changed.write_text(
+                        source.replace(
+                            marker, "    query_layout_cache_probe: u64 = 0,\n" + marker
+                        )
+                    )
+                else:
+                    changed.write_text(
+                        source + "\n// Isolated production owner cache mutation.\n"
+                    )
             print("query owner:", phase, flush=True)
             started = time.monotonic()
             process = subprocess.Popen(
@@ -72,6 +114,7 @@ def main():
                     "build",
                     "runtime-unit-local_query",
                     "runtime-unit-storage-adapter",
+                    "opaque-query-consumer-compile",
                     "-Doptimize=debug",
                     "-Dmetal=false",
                     "-Dcuda=false",
@@ -114,15 +157,45 @@ def main():
             actual = {
                 "query": compile_state(output, "lib", "antfly-runtime-local_query"),
                 "storage": compile_state(output, "lib", "antfly-storage-kernel"),
+                "consumer": compile_state(
+                    output, "test_obj", "opaque-query-owner-tests"
+                ),
             }
             expected = {
-                "initial": {"query": "success", "storage": "success"},
-                "warm": {"query": "cached", "storage": "cached"},
-                "query": {"query": "success", "storage": "cached"},
-                "storage": {"query": "cached", "storage": "success"},
-                "contract": {"query": "success", "storage": "success"},
+                "initial": {
+                    "query": "success",
+                    "storage": "success",
+                    "consumer": "success",
+                },
+                "warm": {"query": "cached", "storage": "cached", "consumer": "cached"},
+                "dispatch": {
+                    "query": "success",
+                    "storage": "cached",
+                    "consumer": "cached",
+                },
+                "execution": {
+                    "query": "cached",
+                    "storage": "success",
+                    "consumer": "cached",
+                },
+                "storage": {
+                    "query": "cached",
+                    "storage": "success",
+                    "consumer": "cached",
+                },
+                "private_layout": {
+                    "query": "cached",
+                    "storage": "success",
+                    "consumer": "cached",
+                },
+                "contract": {
+                    "query": "success",
+                    "storage": "success",
+                    "consumer": "success",
+                },
             }[phase]
             row["compilers"] = actual
+            row["expected"] = expected
             report_path.write_text(json.dumps(report, indent=2) + "\n")
             if actual != expected:
                 raise RuntimeError(

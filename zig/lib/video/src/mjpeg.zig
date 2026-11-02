@@ -57,13 +57,12 @@ pub fn decodeFrame(allocator: std.mem.Allocator, reader: *media.mp4.Reader, inde
     defer lease.deinit();
     var scope = image.work_control.Scope.enter(.{ .context = reader.input.control.context, .check_fn = reader.input.control.check_fn });
     defer scope.deinit();
-    const structure = try image.jpeg.parseStructure(lease.bytes);
-    const info = structure.info;
+    const info = try image.jpeg.inspectMjpeg(lease.bytes);
     if (info.width != reader.track.width or info.height != reader.track.height) return error.UnsupportedDynamicGeometry;
-    if (info.frame_kind != .baseline_dct or info.bits_per_sample != 8 or (info.component_count != 1 and info.component_count != 3) or !image.jpeg.supportsPlannedBaselineDecode(structure)) return error.UnsupportedVideoProfile;
+    if (!info.supported_profile) return error.UnsupportedVideoProfile;
     (image.DecodeLimits{ .max_pixels = options.max_pixels, .max_rgba_bytes = options.max_decode_bytes }).validate(info.width, info.height) catch return error.ResourceLimitExceeded;
     // One complete JPEG per sample, no concatenated fields/trailing payload.
-    if (lease.bytes.len < 4 or structure.scans[0].entropy_end != lease.bytes.len - 2 or !image.jpeg.hasSignature(lease.bytes) or !std.mem.eql(u8, lease.bytes[lease.bytes.len - 2 ..], &.{ 0xff, 0xd9 })) return error.MalformedVideoPacket;
+    if (!info.complete_packet) return error.MalformedVideoPacket;
     try reader.input.control.check();
     var budget = Budget{ .backing = allocator, .limit = options.max_decode_bytes };
     const decoded = image.jpeg.decodeRgba(budget.allocator(), lease.bytes) catch |err| {

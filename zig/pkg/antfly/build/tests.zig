@@ -2995,7 +2995,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    test_imports.configure(b, lake_integration_mod, true, true);
+    var lake_integration_imports = test_imports;
+    lake_integration_imports.runtime = @import("lake_execution_tests.zig").sourceImports(b, antfly_imports);
+    lake_integration_imports.configure(b, lake_integration_mod, true, true);
     lake_integration_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lake_integration_tests = b.addTest(.{
         .root_module = lake_integration_mod,

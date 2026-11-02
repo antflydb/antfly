@@ -44,12 +44,33 @@ library by 347 KB; `-Dshared-pdf-templates=false` permits comparison.
 
 The separately selectable `-Dshared-pdf-sessions=true` migration routes retained
 readers, fork caches, analysis and complete PNG/raster batches through that same
-owner. Shared PDF values import no implementation. Its eight-phase cache matrix
+owner. Shared PDF values import no implementation. Its eleven-phase Debug cache matrix
 preserves the client object across reader/renderer edits. Routine ownership,
 cancellation, GPU-scene transport and cache checks now default to Debug; use
 `--optimize fast` on the PDF cache/scene tools for final optimized qualification.
 Whole-product size and
 memory qualification remains separate; see the [retained-owner evidence](../docs/design/compilation/history/retained-pdf-owner-2026-11-02.md).
+
+## Image operations and query capabilities
+
+`-Dshared-image-operations=true` routes complete image codec operations and
+retained CPU VP8 sessions through the media owner and enables shared PDF
+sessions. It is opt-in on supported native 64-bit macOS/Linux profiles. The
+[image qualification](../docs/design/compilation/history/image-owner-2026-11-02.md)
+records source/native equivalence and nine Debug cache phases; combined product
+qualification and final Release size/cost measurements remain separate.
+
+Local query parsing, execution and encoding now run beside the private database
+in the storage kernel. The local-query archive dispatches a checked operation
+capability instead of casting a transported private DB layout. This removes one
+private-layout consumer; other engine/lifecycle boundaries remain checked and
+still depend on their private layouts. See the
+[query capability evidence](../docs/design/compilation/history/query-execution-capability-2026-11-02.md).
+
+`-Dshared-lake-execution=true` selects whole lake-index attempts in the serverless
+owner, retaining publication/lease authority in the coordinator. This opt-in
+migration passes combined Debug integration; its production cache qualification
+is recorded in the [lake owner evidence](../docs/design/compilation/history/lake-execution-owner-2026-11-02.md).
 
 ## Compile-cost experiments
 

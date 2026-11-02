@@ -967,7 +967,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    test_imports.configure(b, write_implementation_module, true, true);
+    var write_implementation_imports = test_imports;
+    write_implementation_imports.runtime = @import("lake_execution_tests.zig").sourceImports(b, antfly_imports);
+    write_implementation_imports.configure(b, write_implementation_module, true, true);
     write_implementation_module.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const api_table_reads_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),

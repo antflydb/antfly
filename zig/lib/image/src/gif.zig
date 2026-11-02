@@ -23,12 +23,7 @@ pub fn hasSignature(bytes: []const u8) bool {
     return bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"));
 }
 
-pub const Frame = struct {
-    rgba: []u8,
-    width: u32,
-    height: u32,
-    delay_ms: u32,
-};
+pub const Frame = @import("image_values").GifFrame;
 
 const GraphicControl = struct {
     disposal_method: u3 = 0,
@@ -121,14 +116,9 @@ pub fn decodeFirstFrameAlloc(alloc: Allocator, gif_bytes: []const u8) !Frame {
     return frames[0];
 }
 
-pub const VisitResult = struct { frames: usize = 0, duration_ms: u64 = 0, complete: bool = false };
-pub const BorrowedFrame = struct { rgba: []const u8, width: u32, height: u32, delay_ms: u32 };
-pub const Visitor = struct {
-    context: *anyopaque,
-    /// Borrowed composited canvas; false stops before the next picture.
-    accept: *const fn (*anyopaque, usize, BorrowedFrame) anyerror!bool,
-    result: *VisitResult,
-};
+pub const VisitResult = @import("image_values").GifVisitResult;
+pub const BorrowedFrame = @import("image_values").GifBorrowedFrame;
+pub const Visitor = @import("image_values").GifVisitor;
 /// Retains two canvases regardless of animation length. No frame escapes accept.
 pub fn visitFramesAllocBounded(alloc: Allocator, bytes: []const u8, max_canvas_bytes: usize, visitor: Visitor) !void {
     if (max_canvas_bytes == 0) return error.ImageTooLarge;

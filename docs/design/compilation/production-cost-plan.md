@@ -17,9 +17,11 @@ rejected mutation outlining experiment are recorded in
 | P0 measurement tools | Both-product CPU profiling, tested Mach-O map reader, pinned compiler time-report collector, scoped Linux memory snapshots implemented; full baseline qualification and server map still pending |
 | P1a opaque PDF session | Retained state, stable allocator/deadline adapters, operation cancellation, directly charged PNG output and compiled source-free tests implemented |
 | Media build isolation | Fixed automatic storage/inference linking into media-only tests; provider/client/contract cache matrix passed |
-| P1b/P1c production migration | [Opt-in template migration](history/template-pdf-owner-2026-11-02.md) passes native regressions: server −6.72 MB, library +347 KB. User accepted the template tradeoff; now default. No build-time/memory gain established. [Retained analysis, raster/batch and fork-cache migration](history/retained-pdf-owner-2026-11-02.md) passes focused tests, eleven Debug cache phases, both Debug products and 13 HTTP regressions; optimized product size/cost screening remains. Image callers remain open |
+| P1b/P1c production migration | [Opt-in template migration](history/template-pdf-owner-2026-11-02.md) passes native regressions: server −6.72 MB, library +347 KB. User accepted the template tradeoff; now default. No build-time/memory gain established. [Retained analysis, raster/batch and fork-cache migration](history/retained-pdf-owner-2026-11-02.md) passes focused tests, eleven Debug cache phases, both Debug products and 13 HTTP regressions; optimized product size/cost screening remains. [Image operations](history/image-owner-2026-11-02.md) now pass source/native fixture equivalence and nine focused Debug cache phases; final combined Debug products pass all 225 steps. Optimized size/cost qualification remains |
 | P6 Q8K specialization | [Repeatable isolated loop screens](history/q8-projection-loops-2026-11-02.md) pass numerical checks and reduce estimated emitted work; mixed small-row timing prevents rollout |
-| P2–P5/P7 redesigns | Open, apart from the media cache matrix above; acceptance gates remain unchanged |
+| P2 lake execution | [Whole-attempt provider/client](history/lake-execution-owner-2026-11-02.md) implemented behind an opt-in flag; native/source and combined Debug integration pass. Five production cache phases pass: implementation edits rebuild serverless only; client edits rebuild API only |
+| P4 local query layout coupling | [Query capability migration](history/query-execution-capability-2026-11-02.md) co-locates complete execution with private DB; focused and combined Debug tests pass; all seven strict cache phases pass, including a real DB-layout edit preserving dispatcher/opaque-consumer caches. Other private engine boundaries remain |
+| P3/P5/P7 redesigns | Open; acceptance gates remain unchanged |
 
 P1a and the measurement tools do not establish smaller production binaries or
 faster complete builds. The first-phase native product regression passed with
@@ -386,6 +388,19 @@ the query provider resolves a checked native DB borrow. `TypeContract.of` uses
 size/alignment and a shallow layout hash; it still requires those private type
 definitions. Simply deleting checks would remove safety without removing the
 borrow or its compilation dependency.
+
+The current query increment co-locates parsing/execution/encoding in the storage
+kernel and leaves a storage-free capability dispatcher. This removes the query
+owner's DB borrow; it does not complete the global P4 exit gate. The engine still
+returns concrete DB values for open/query-cut/restore/managed-open operations and
+transports relational/document sessions and typed-page pointers.
+
+The next bounded migration is owner-issued relational statement/read-session
+handles with whole typed-page and batch-lookup operations plus explicit page
+release. Preserve statement generation, fences, cancellation, IO and donor drain.
+Then migrate one DB lifecycle consumer (restore or query-cut carrier) to owner
+open/close and complete operations. Keep legacy descriptor checks until every
+concrete consumer has moved.
 
 Migrate one native-borrow family at a time to owner-issued handles and concrete
 operation values. Start with complete operations whose client does not need

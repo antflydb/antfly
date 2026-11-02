@@ -185,7 +185,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const readers_mod = shared.readers_mod;
     const inference_steps = shared.inference_steps;
     const antfly_imports = shared.antfly_imports;
-    const production_antfly_imports = shared.production_antfly_imports;
+    var production_antfly_imports = shared.production_antfly_imports;
     production_antfly_imports.configureRuntimeContracts(usermgr_mod);
     production_antfly_imports.storage_boundary.configureSources(usermgr_mod, false, false);
     const onnx_build = @import("onnx_graph").support;
@@ -253,6 +253,9 @@ pub fn create(b: *std.Build) ?Artifacts {
             .flags = &.{ "-fobjc-arc", "-fblocks" },
         });
     }
+
+    production_antfly_imports = @import("build_support/antfly/dependencies.zig").finalizeMediaClients(b, production_antfly_imports);
+    @import("pkg/antfly/build/lake_execution_tests.zig").add(b, target, optimize, antfly_imports, vopr_mod, lmdb_engine_mod);
 
     // The public package has the same storage boundary as the linked server:
     // LMDB is retained only by explicitly configured test/benchmark modules.
@@ -642,6 +645,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     b.step("lib-image-jpeg2000-test", "Run direct JPEG 2000 decoder tests").dependOn(&run_jpeg2000_decode_tests.step);
     const image_test_step = b.step("lib-image-test", "Run shared image tests");
     image_test_step.dependOn(&run_lib_image_tests.step);
+    image_test_step.dependOn(&image_tests.run_processing_tests.step);
     image_test_step.dependOn(&run_png_tests.step);
     image_test_step.dependOn(&run_jpeg_tests.step);
     image_test_step.dependOn(&run_webp_tests.step);
@@ -695,6 +699,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = .fast,
     });
     webp_codec_mod.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
+    webp_codec_mod.addImport("image_values", image_mod.import_table.get("image_values").?);
     webp_bench_mod.addImport("antfly_webp", webp_codec_mod);
     const webp_bench = b.addExecutable(.{ .name = "lib-image-webp-bench", .root_module = webp_bench_mod });
     b.step("lib-image-webp-bench", "Build the bounded WebP decode batch benchmark").dependOn(&b.addInstallArtifact(webp_bench, .{}).step);

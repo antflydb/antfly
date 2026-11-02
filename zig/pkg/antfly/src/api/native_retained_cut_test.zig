@@ -343,13 +343,13 @@ pub fn verifySingleRangeRemoteContinuation(comptime compiled: bool) !void {
         try request_body.value.object.put(request_body.arena.allocator(), "profile", .{ .bool = profile });
         const bytes = try std.json.Stringify.valueAlloc(a, request_body.value, .{});
         defer a.free(bytes);
-        const request: abi.LocalQueryRequest = .{ .db = .borrow(&carrier), .table_name = .fromSlice("docs"), .request_json = .fromSlice(bytes), .execution_options = .{ .enabled = 1, .raw_search_result = 1 } };
+        const request: abi.LocalQueryRequest = .{ .execution = @import("../storage/local_query_provider.zig").issueForDb(&carrier), .table_name = .fromSlice("docs"), .request_json = .fromSlice(bytes), .execution_options = .{ .enabled = 1, .raw_search_result = 1 } };
         var response: abi.QueryOwnedResponse = .{};
         var failure: abi.FailureIdentity = .{};
         const status = if (compiled)
             abi.antfly_local_query_execute(&request, &response, &failure)
         else
-            @import("../storage/local_query_provider.zig").execute(&request, &response, &failure);
+            request.execution.execute_fn.?(request.execution.context, &request, &response, &failure);
         try std.testing.expectEqual(abi.Status.ok, status);
         defer std.heap.c_allocator.free(response.buffer.ptr.?[0..@intCast(response.buffer.len)]);
         var parsed = try std.json.parseFromSlice(std.json.Value, a, response.buffer.ptr.?[0..@intCast(response.buffer.len)], .{});

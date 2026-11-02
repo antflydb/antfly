@@ -228,5 +228,5 @@ fn Bridge(comptime name: []const u8) type {
 }
 pub fn exportOperations() void {
     inline for (@typeInfo(c.Methods).@"struct".field_names) |name|
-        @export(&Bridge(name).get, .{ .name = "antfly_pdf_native_" ++ name ++ "_v2", .visibility = .hidden });
+        @export(&Bridge(name).get, .{ .name = "antfly_pdf_native_" ++ name ++ "_v3", .visibility = .hidden });
 }

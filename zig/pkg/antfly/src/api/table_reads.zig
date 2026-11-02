@@ -30395,12 +30395,13 @@ fn implementationTests() type {
                     defer alloc.free(body);
                     var response: abi.QueryOwnedResponse = .{};
                     var failure: abi.FailureIdentity = .{};
-                    const status = provider.execute(&.{
-                        .db = .borrow(&db),
+                    const request: abi.LocalQueryRequest = .{
+                        .execution = provider.issueForDb(&db),
                         .table_name = .fromSlice("docs"),
                         .request_json = .fromSlice(body),
                         .execution_options = .{ .enabled = 1, .raw_search_result = @intFromBool(raw) },
-                    }, &response, &failure);
+                    };
+                    const status = request.execution.execute_fn.?(request.execution.context, &request, &response, &failure);
                     defer if (response.buffer.ptr) |ptr| std.heap.c_allocator.free(ptr[0..@intCast(response.buffer.len)]);
                     try std.testing.expectEqual(abi.Status.ok, status);
                     var parsed = try std.json.parseFromSlice(Response, alloc, response.buffer.slice(), .{ .ignore_unknown_fields = true });

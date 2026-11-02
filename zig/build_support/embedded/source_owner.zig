@@ -80,7 +80,10 @@ pub fn registerStorageProvider(provider: *std.Build.Step.Compile, dependencies: 
 /// One local source owner per consumer profile. Source files are never copied
 /// into a server root; source selection remains explicit at the module boundary.
 pub fn attach(consumer: *std.Build.Module) void {
-    consumer.addImport("antfly_decisions", @import("../../lib/decisions/build.zig").create(consumer.owner, consumer.owner.path("lib/decisions/root.zig")));
+    // A production media graph may provide a fork with implementation-free
+    // dependencies. Preserve that identity when attaching source ownership.
+    if (!consumer.import_table.contains("antfly_decisions"))
+        consumer.addImport("antfly_decisions", @import("../../lib/decisions/build.zig").create(consumer.owner, consumer.owner.path("lib/decisions/root.zig")));
     if (consumer.import_table.contains("antfly_local_sources")) return;
     const b = consumer.owner;
     const root = consumer.root_source_file orelse return;
@@ -215,4 +218,18 @@ fn usesSharedStorageEngine(module: *std.Build.Module) bool {
     const options = step.cast(std.Build.Step.Options) orelse return true;
     return std.mem.indexOf(u8, options.contents.items, "storage_engine_owner: bool = true;") == null and
         std.mem.indexOf(u8, options.contents.items, "shared_storage_core: bool = false;") == null;
+}
+
+/// A forked consumer must not share late-bound source-catalog imports with its
+/// source graph. Bind a separate catalog and let finalize populate it from the
+/// fork's own imports, preserving its source/type identity.
+pub fn forkContext(original: *std.Build.Module, consumer: *std.Build.Module) void {
+    if (isStorageIndependent(original)) registerStorageIndependent(consumer);
+    const local = localFor(original) orelse return;
+    const copied = cloneModule(consumer.owner, local);
+    consumer.addImport("antfly_local_sources", copied);
+    if (consumer.import_table.get("antfly_source_root")) |root| {
+        if (root == local) consumer.addImport("antfly_source_root", copied);
+    }
+    adopt(consumer);
 }

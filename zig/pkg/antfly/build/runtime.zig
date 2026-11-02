@@ -139,7 +139,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         // The server executable and focused server artifacts reuse their owning
         // runtime units. Public embedded products have independent owners.
         const role_mod = b.createModule(.{
-            .root_source_file = b.path(b.fmt("pkg/antfly/src/runtime_{s}_root.zig", .{@tagName(unit)})),
+            .root_source_file = if (production_antfly_imports.shared_lake_execution and (unit == .api_kernel or unit == .distributed)) b.path(b.fmt("pkg/antfly/src/runtime_{s}_native_lake_root.zig", .{@tagName(unit)})) else b.path(b.fmt("pkg/antfly/src/runtime_{s}_root.zig", .{@tagName(unit)})),
             .target = target,
             .optimize = if (unit == .cli) cli_optimize else optimize,
             .sanitize_thread = sanitize_thread,
@@ -150,19 +150,32 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .cli, .inference => .common,
             .distributed, .api_kernel, .serverless => .owner,
             .enrichment_compute => .enrichment,
-            .storage_kernel, .local_query => .all,
+            .storage_kernel => .all,
+            .local_query => .common,
         };
         switch (unit) {
             .cli => role_imports.configureCli(role_mod, link_libc),
             .inference => role_imports.configureInference(b, role_mod, link_libc),
-            .distributed, .storage_kernel, .local_query => role_imports.configureStorage(b, role_mod, link_libc),
+            .distributed, .storage_kernel => role_imports.configureStorage(b, role_mod, link_libc),
+            .local_query => {
+                role_mod.addImport("local_query_abi", role_imports.storage_boundary.query);
+                role_mod.addImport("kernel_error_identity", role_imports.storage_boundary.identity);
+                @import("../../../build_support/embedded/source_owner.zig").registerStorageIndependent(role_mod);
+                role_mod.link_libc = true;
+            },
             .enrichment_compute => role_imports.configureEnrichment(b, role_mod, link_libc),
             .api_kernel => role_imports.configureApi(role_mod, link_libc),
             .serverless => role_imports.configureServerless(b, role_mod, link_libc),
         }
+        if (unit == .local_query) {
+            const tests = b.addTest(.{ .name = "local-query-dispatch-tests", .root_module = role_mod, .filters = &.{"opaque query dispatcher"} });
+            const run = b.addRunArtifact(tests);
+            run.has_side_effects = true;
+            b.step("local-query-dispatch-test", "Verify opaque query capabilities without storage layouts").dependOn(&run.step);
+        }
         // Compute owns document/media processing, not a physical storage handle.
         // Storage and complete local query operations declare physical DB inputs.
-        role_imports.storage_boundary.configureProfile(role_mod, unit != .storage_kernel and unit != .local_query, true, role_imports.boundary_profile);
+        if (unit != .local_query) role_imports.storage_boundary.configureProfile(role_mod, unit != .storage_kernel, true, role_imports.boundary_profile);
         if (unit == .inference) {
             const native_exports = b.createModule(.{
                 .root_source_file = b.path("pkg/inference/src/host/native_exports.zig"),
@@ -172,7 +185,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             production_antfly_imports.configureInference(b, native_exports, link_libc);
             role_mod.addImport("antfly_inference_native_exports", native_exports);
         }
-        if (unit == .storage_kernel or unit == .local_query) {
+        if (unit == .storage_kernel) {
             const capi_options = b.addOptions();
             capi_options.addOption(bool, "linked_storage", true);
             // This archive is shared by the default `libantfly` and by the
@@ -184,9 +197,9 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             role_mod.addOptions("capi_build_options", capi_options);
         }
         addMacosSdkPaths(b, role_mod, target);
-        if (unit == .cli or unit == .distributed or unit == .storage_kernel or unit == .local_query) role_mod.addImport("antfly-client", antfly_client_pkg_mod);
-        if (unit == .storage_kernel or unit == .local_query) role_mod.addImport("antfly_storage_root", role_mod);
-        if (unit != .cli and unit != .inference and unit != .enrichment_compute) {
+        if (unit == .cli or unit == .distributed or unit == .storage_kernel) role_mod.addImport("antfly-client", antfly_client_pkg_mod);
+        if (unit == .storage_kernel) role_mod.addImport("antfly_storage_root", role_mod);
+        if (unit != .cli and unit != .inference and unit != .enrichment_compute and unit != .local_query) {
             const role_usermgr_storage_mod = b.createModule(.{
                 .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
                 .target = target,
@@ -240,7 +253,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             if (options.native_storage) |owner| runtime_unit_step.dependOn(&owner.step);
         }
         runtime_library_artifacts[@backingInt(unit)] = role_artifact;
-        if (unit == .storage_kernel or unit == .local_query) {
+        if (unit == .storage_kernel) {
             // The executable and C ABI libraries share this one optimized
             // PIC object. Give the final links enough section granularity
             // to retain only the C ABI roots in the shared libraries while

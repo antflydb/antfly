@@ -16,57 +16,9 @@
 const std = @import("std");
 pub const work_control = @import("image_work_control");
 
-pub const Resample = enum(u32) {
-    nearest = 0,
-    lanczos = 1,
-    bilinear = 2,
-    bicubic = 3,
-    /// Pillow's antialiased, quantized two-pass BICUBIC implementation. This
-    /// is distinct from the legacy bicubic sampler used by existing model
-    /// configurations so parity-sensitive callers must opt in explicitly.
-    pillow_bicubic = 4,
-    /// Torchvision uint8 antialiased bicubic, with adaptive int16 coefficients.
-    torchvision_bicubic = 5,
-};
-
-pub const PixelFormat = enum(u8) {
-    rgb8 = 3,
-    rgba8 = 4,
-};
-
-pub const ImageU8 = struct {
-    data: []const u8,
-    width: u32,
-    height: u32,
-    format: PixelFormat,
-    /// Zero selects the tightly packed width*channels layout. A non-zero
-    /// stride permits borrowing renderer-owned rows without repacking them.
-    row_stride_bytes: usize = 0,
-
-    pub fn channels(self: ImageU8) usize {
-        return @backingInt(self.format);
-    }
-
-    pub fn rowStride(self: ImageU8) !usize {
-        const packed_row = std.math.mul(usize, self.width, self.channels()) catch
-            return error.InvalidImageBuffer;
-        const stride = if (self.row_stride_bytes == 0) packed_row else self.row_stride_bytes;
-        if (stride < packed_row) return error.InvalidImageBuffer;
-        return stride;
-    }
-
-    pub fn validate(self: ImageU8) !void {
-        if (self.width == 0 or self.height == 0) return error.InvalidImageBuffer;
-        const stride = try self.rowStride();
-        const last_row_offset = std.math.mul(usize, self.height - 1, stride) catch
-            return error.InvalidImageBuffer;
-        const packed_row = std.math.mul(usize, self.width, self.channels()) catch
-            return error.InvalidImageBuffer;
-        const required = std.math.add(usize, last_row_offset, packed_row) catch
-            return error.InvalidImageBuffer;
-        if (self.data.len < required) return error.InvalidImageBuffer;
-    }
-};
+pub const Resample = @import("image_values").Resample;
+pub const PixelFormat = @import("image_values").PixelFormat;
+pub const ImageU8 = @import("image_values").ImageU8;
 
 /// Convert a decoded RGB/RGBA image into normalized CHW f32 layout.
 pub fn preprocessDecoded(

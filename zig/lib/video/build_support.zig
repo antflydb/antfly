@@ -20,6 +20,12 @@ fn standaloneImageModule(b: *std.Build, root: std.Build.LazyPath, target: std.Bu
     const image = b.createModule(.{ .root_source_file = root.path(b, "../image/src/mod.zig"), .target = target, .optimize = mode });
     image.addImport("antfly_hash", hash);
     image.addImport("image_work_control", b.createModule(.{ .root_source_file = root.path(b, "../image/src/work_control.zig"), .target = target, .optimize = mode }));
+    const values = b.createModule(.{ .root_source_file = root.path(b, "../image/src/values.zig"), .target = target, .optimize = mode });
+    const processing = b.createModule(.{ .root_source_file = root.path(b, "../image/src/processing.zig"), .target = target, .optimize = mode });
+    processing.addImport("image_values", values);
+    processing.addImport("image_work_control", image.import_table.get("image_work_control").?);
+    image.addImport("image_values", values);
+    image.addImport("image_processing", processing);
     return image;
 }
 pub const SharedModules = struct { media: *std.Build.Module, image: *std.Build.Module };

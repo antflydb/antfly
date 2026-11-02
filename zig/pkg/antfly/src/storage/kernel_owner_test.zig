@@ -2099,9 +2099,9 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     );
     try std.testing.expectEqualStrings("InvalidAbiVersion", invalid_abi_failure.errorName());
 
-    // Reject a non-null incompatible native borrow before pointer alignment
-    // or dereference. Such a pointer must never reach a provider cast.
-    invalid_abi_request = .{ .db = .{ .ptr = @ptrFromInt(1) }, .table_name = .fromSlice("docs"), .request_json = .fromSlice("{}") };
+    // Reject an incompatible owner-issued capability before invoking it.
+    // A poisoned context must never reach an owner callback.
+    invalid_abi_request = .{ .execution = .{ .version = 0, .context = @ptrFromInt(1) }, .table_name = .fromSlice("docs"), .request_json = .fromSlice("{}") };
     const incompatible_db_status = abi.antfly_local_query_execute(&invalid_abi_request, &invalid_abi_response, &invalid_abi_failure);
     try std.testing.expectEqual(abi.Status.invalid_abi, incompatible_db_status);
     try std.testing.expectEqualStrings("InvalidAbiVersion", invalid_abi_failure.errorName());

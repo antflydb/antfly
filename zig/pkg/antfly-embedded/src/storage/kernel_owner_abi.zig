@@ -164,7 +164,7 @@ pub const LocalQueryKind = query_abi.LocalQueryKind;
 pub const LocalQueryOperation = query_abi.LocalQueryOperation;
 pub const LocalQueryReturnMode = query_abi.LocalQueryReturnMode;
 pub const LocalQueryExecutionOptions = query_abi.LocalQueryExecutionOptions;
-pub const LocalQueryDb = query_abi.LocalQueryDb;
+pub const LocalQueryExecution = query_abi.QueryExecution;
 pub const LocalQueryRequest = query_abi.LocalQueryRequest;
 
 /// Process-scoped physical-storage owner. The handle owns shared caches and

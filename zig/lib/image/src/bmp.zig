@@ -23,11 +23,7 @@ const file_header_len = 14;
 const dib_bitmap_info_header_len = 40;
 const compression_rgb = 0;
 
-pub const DecodedImage = struct {
-    rgba: []u8,
-    width: u32,
-    height: u32,
-};
+pub const DecodedImage = @import("image_values").DecodedRgba;
 
 pub const Info = struct {
     width: u32,

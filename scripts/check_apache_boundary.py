@@ -173,7 +173,6 @@ SOURCE_MODULES = {
     "antfly_decision_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig",
     ),
-    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_document_runs": ("zig/lib/readers/src/document_runs.zig",),
     "antfly_embeddings_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_embeddings_openapi/root.zig",
@@ -190,7 +189,26 @@ SOURCE_MODULES = {
     ),
     "antfly_google": ("zig/lib/google/src/root.zig",),
     "antfly_hash": ("zig/lib/hash/src/mod.zig",),
-    "antfly_image": ("zig/lib/image/src/mod.zig",),
+    "antfly_image": (
+        "zig/lib/image/src/mod.zig",
+        "zig/pkg/antfly-embedded/src/storage/image_facade.zig",
+    ),
+    "image_values": ("zig/lib/image/src/values.zig",),
+    "image_processing": ("zig/lib/image/src/processing.zig",),
+    "image_work_control": ("zig/lib/image/src/work_control.zig",),
+    "image_native_contract": (
+        "zig/pkg/antfly-embedded/src/storage/image_native_contract.zig",
+    ),
+    "media_native_abi": ("zig/pkg/antfly-embedded/src/storage/media_native_abi.zig",),
+    "pdf_values": ("zig/lib/pdf/src/values.zig",),
+    "pdf_syntax": ("zig/lib/pdf/src/syntax.zig",),
+    "pdf_text_encoding": ("zig/lib/pdf/src/text_encoding.zig",),
+    "pdf_native_contract": (
+        "zig/pkg/antfly-embedded/src/storage/pdf_native_contract.zig",
+    ),
+    "antfly_pdf_backend_client": (
+        "zig/pkg/antfly-embedded/src/storage/pdf_backend_client.zig",
+    ),
     "antfly_video_media": ("zig/lib/media/src/inference.zig",),
     "antfly_indexes_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_indexes_openapi/root.zig",
@@ -250,8 +268,10 @@ SOURCE_MODULES = {
     "antfly_middleware_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_middleware_openapi/root.zig",
     ),
-    "antfly_pdf": ("zig/lib/pdf/src/mod.zig",),
-    "antfly_documents": ("zig/lib/documents/src/root.zig",),
+    "antfly_pdf": (
+        "zig/lib/pdf/src/mod.zig",
+        "zig/pkg/antfly-embedded/src/storage/pdf_facade.zig",
+    ),
     "antfly_platform": ("zig/lib/platform/src/root.zig",),
     "antfly_provider_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_provider_openapi/root.zig",
@@ -262,7 +282,6 @@ SOURCE_MODULES = {
     "antfly_query_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_query_openapi/root.zig",
     ),
-    "antfly_documents": ("zig/lib/documents/src/root.zig",),
     "antfly_reader_config": ("zig/lib/readers/src/config.zig",),
     "antfly_readers": ("zig/lib/readers/src/mod.zig",),
     "antfly_regex": ("zig/lib/regex/src/mod.zig",),
@@ -339,6 +358,7 @@ SOURCE_MODULES = {
     "kernel_owner_abi": ("zig/pkg/antfly-embedded/src/storage/kernel_owner_abi.zig",),
     "lmdb_engine": ("zig/lib/lmdb/src/root.zig",),
     "local_query_client": ("zig/pkg/antfly-embedded/src/storage/query_client.zig",),
+    "local_query_abi": ("zig/pkg/antfly-embedded/src/storage/local_query_abi.zig",),
     "metal_jit_identity": ("zig/pkg/inference/tools/jit_identity.zig",),
     "ml": ("zig/lib/ml/src/root.zig",),
     "ml_tabular": ("zig/lib/ml/tabular/src/root.zig",),

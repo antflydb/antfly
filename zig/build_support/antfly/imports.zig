@@ -19,6 +19,7 @@ const addSnowballModule = @import("../embedded/snowball.zig").addSnowballModule;
 
 pub const AntflyRootImports = struct {
     sql_parser: *std.Build.Module,
+    decisions: *std.Build.Module,
     storage_boundary: @import("../embedded/storage_boundary.zig").Modules,
     cancellation: *std.Build.Module,
     cache_budget: *std.Build.Module,
@@ -59,8 +60,15 @@ pub const AntflyRootImports = struct {
     build_info: @import("../../lib/build_info/build_support.zig").BuildInfo,
     build_options: *std.Build.Step.Options,
     shared_pdf_templates: bool = false,
+    shared_lake_execution: bool = false,
+    lake_execution_options: *std.Build.Module,
+    lake_provider_options: *std.Build.Module,
     pdf_implementation: ?*std.Build.Module = null,
     pdf_native_contract: ?*std.Build.Module = null,
+    image_native_contract: ?*std.Build.Module = null,
+    image_facade: ?*std.Build.Module = null,
+    image_implementation: ?*std.Build.Module = null,
+    media_implementation_imports: ?*const @This() = null,
     lite_options: *std.Build.Module,
     // HTTP schema serving is opt-in at the owning compilation roots.
     embedded_openapi: *std.Build.Module,
@@ -239,6 +247,7 @@ pub const AntflyRootImports = struct {
     /// they do not depend on local tokenization, inference, or storage engines.
     pub fn configureCli(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
         mod.addImport("antfly_public_limits", self.public_limits);
+        mod.addImport("antfly_decisions", self.decisions);
         @import("../embedded/source_owner.zig").attach(mod);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_runtime_fs", self.runtime_fs);
@@ -255,6 +264,7 @@ pub const AntflyRootImports = struct {
     }
 
     pub fn configureInference(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
+        mod.addImport("antfly_decisions", self.decisions);
         // The inference host consumes provider/configuration contracts, not
         // database engines or storage build settings.
         const options = b.addOptions();
@@ -397,25 +407,29 @@ pub const AntflyRootImports = struct {
     }
 
     pub fn configureEnrichment(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
+        const implementation = if (self.media_implementation_imports) |source| source.* else self;
         const options = b.addOptions();
         options.addOption(bool, "bench_minimal_deps", false);
         options.addOption(bool, "pdf_native_provider", self.pdf_native_contract != null);
+        options.addOption(bool, "image_native_provider", self.image_native_contract != null);
         mod.addOptions("build_options", options);
         // Document/media compute has no physical storage handle, including in
         // the independently compiled public embedded enrichment archive.
         // This constructor also builds the shared embedded compute archive,
         // whose caller may carry the default full storage profile. Declare
         // only compute contracts so storage ABI edits cannot invalidate it.
+        mod.addImport("antfly_decisions", implementation.decisions);
         self.storage_boundary.configureProfile(mod, true, false, .enrichment);
         @import("../embedded/source_owner.zig").registerStorageIndependent(mod);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_cancellation", self.cancellation);
-        mod.addImport("antfly_template_content", self.template_content);
+        mod.addImport("antfly_template_content", implementation.template_content);
         mod.addImport("antfly_runtime_fs", self.runtime_fs);
         mod.link_libc = link_libc;
-        inline for (.{ "image", "font", "pdf", "json", "scraping", "scraping_openapi", "reader_config", "chunking", "hash", "httpx", "structlog" }) |field| self.addImport(mod, field);
-        if (self.pdf_implementation) |implementation| mod.addImport("antfly_pdf", implementation);
+        inline for (.{ "image", "font", "pdf", "json", "scraping", "scraping_openapi", "reader_config", "chunking", "hash", "httpx", "structlog" }) |field| implementation.addImport(mod, field);
+        if (self.pdf_implementation) |raw_pdf| mod.addImport("antfly_pdf", raw_pdf);
         if (self.pdf_native_contract) |contract| mod.addImport("pdf_native_contract", contract);
+        if (self.image_native_contract) |contract| mod.addImport("image_native_contract", contract);
     }
 
     pub fn configureApi(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
@@ -432,6 +446,7 @@ pub const AntflyRootImports = struct {
     pub fn configureServerless(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         mod.addImport("antfly_resolver", self.resolver);
         self.configureDatabase(mod, link_libc);
+        mod.addImport("lake_execution_options", self.lake_provider_options);
         mod.addImport("antfly_provision_contract", self.provision_contract);
         inline for (object_runtime_imports) |field| self.addImport(mod, field);
         addSnowballModule(b, mod);
@@ -468,8 +483,14 @@ pub const AntflyRootImports = struct {
 
     fn configureBase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
         mod.addImport("sql_parser", self.sql_parser);
+        mod.addImport("antfly_decisions", self.decisions);
         self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
         mod.addOptions("build_options", self.build_options);
+        mod.addImport("lake_execution_options", self.lake_execution_options);
+        const lake_backend = mod.owner.createModule(.{ .root_source_file = mod.owner.path("pkg/antfly/src/api/lake_execution_backend.zig"), .target = mod.resolved_target, .optimize = mod.optimize });
+        lake_backend.addImport("lake_execution_root", mod);
+        mod.addImport("lake_execution_backend", lake_backend);
+        mod.addImport("engine_errors", self.storage_boundary.engine_errors);
         if (self.shared_pdf_templates) mod.addImport("antfly_pdf_backend_client", self.storage_boundary.pdf_backend_client);
         mod.addImport("antfly_platform", self.platform);
         self.configureLocalDatabaseContracts(mod);

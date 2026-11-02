@@ -17,7 +17,7 @@ const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
 const Adler32 = @import("antfly_hash").Adler32;
 const test_support = @import("test_support.zig");
-const ImageU8 = @import("processing.zig").ImageU8;
+const ImageU8 = @import("image_values").ImageU8;
 
 const Allocator = std.mem.Allocator;
 const cancellation_work_bytes: usize = 64 * 1024;
@@ -26,21 +26,8 @@ const adam7_y_starts = [_]usize{ 0, 0, 4, 0, 2, 0, 1 };
 const adam7_x_steps = [_]usize{ 8, 8, 4, 4, 2, 2, 1 };
 const adam7_y_steps = [_]usize{ 8, 8, 8, 4, 4, 2, 2 };
 
-pub const DecodedImage = struct {
-    rgba: []u8,
-    width: u32,
-    height: u32,
-};
-
-/// Borrowed, allocation-free cancellation source for bounded PNG work.
-pub const CancellationProbe = struct {
-    context: ?*const anyopaque = null,
-    is_cancelled_fn: ?*const fn (?*const anyopaque) bool = null,
-
-    pub fn check(self: CancellationProbe) !void {
-        if (self.is_cancelled_fn) |is_cancelled| if (is_cancelled(self.context)) return error.Canceled;
-    }
-};
+pub const DecodedImage = @import("image_values").DecodedRgba;
+pub const CancellationProbe = @import("image_values").PngCancellationProbe;
 
 pub fn hasSignature(bytes: []const u8) bool {
     return bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' });
@@ -55,13 +42,7 @@ pub fn encodeRgbaWithCancellation(scratch_alloc: Allocator, output_alloc: Alloca
     return encodeRgbaWithOptions(scratch_alloc, output_alloc, width, height, rgba, .{ .cancellation = cancellation });
 }
 
-pub const EncodeOptions = struct {
-    cancellation: CancellationProbe = .{},
-    /// Includes signature, chunks and zlib data. Exceeding this ceiling returns
-    /// ImageTooLarge before allocating the final PNG or growing compression
-    /// storage beyond the ceiling plus Deflate's fixed lookahead.
-    max_output_bytes: usize = std.math.maxInt(usize),
-};
+pub const EncodeOptions = @import("image_values").PngEncodeOptions;
 
 pub fn encodeRgbaWithOptions(scratch_alloc: Allocator, output_alloc: Allocator, width: u32, height: u32, rgba: []const u8, options: EncodeOptions) ![]u8 {
     const cancellation = options.cancellation;

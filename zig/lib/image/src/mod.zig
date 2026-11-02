@@ -24,131 +24,20 @@ pub const gif = @import("gif.zig");
 pub const bmp = @import("bmp.zig");
 pub const webp = @import("webp.zig");
 pub const ccitt = @import("ccitt.zig");
-pub const processing = @import("processing.zig");
+pub const processing = @import("image_processing");
 pub const work_control = @import("image_work_control");
 pub const conformance = conformance_impl;
+pub const test_support = if (@import("builtin").is_test) @import("test_support.zig") else struct {};
 
-pub const Format = enum { png, jpeg, jpeg2000_jp2, jpeg2000_j2k, gif, bmp, webp, unknown };
-pub const DecodeLimits = limits.DecodeLimits;
-
-/// Canonical MIME for the linked-process raw raster ABI. This is deliberately
-/// not an encoded-image MIME and must never be sent over HTTP or advertised as
-/// a model input codec. `RasterFormat` remains separately explicit so a future
-/// ABI extension cannot reinterpret existing bytes based on a MIME string.
-pub const rgba8_raster_mime_type = "image/x-antfly-rgba8";
-
-pub const RasterFormat = enum {
-    rgba8,
-
-    pub fn channels(self: RasterFormat) usize {
-        return switch (self) {
-            .rgba8 => 4,
-        };
-    }
-
-    pub fn mimeType(self: RasterFormat) []const u8 {
-        return switch (self) {
-            .rgba8 => rgba8_raster_mime_type,
-        };
-    }
-};
-
-/// A synchronous borrowed view of a decoded raster plus stable work identity.
-/// The producer owns `bytes` and every identity slice for the complete
-/// invocation; consumers must not retain any pointer after returning. Rows may
-/// contain padding. A buffer ends either after the last pixel or its complete
-/// padded row, allowing borrowed crop views without copying unrelated pixels.
-///
-/// This physical ABI is task-neutral. Reader, generator, embedder, reranker,
-/// and extractor adapters may use it only after their resolved local executor
-/// advertises a concrete raw-raster path.
-pub const BorrowedRasterAttachment = struct {
-    bytes: []const u8,
-    width: u32,
-    height: u32,
-    stride_bytes: usize,
-    format: RasterFormat = .rgba8,
-    mime_type: []const u8 = rgba8_raster_mime_type,
-    item_id: []const u8 = "",
-    source_fingerprint: ?[]const u8 = null,
-    page_number: ?u32 = null,
-
-    pub fn validate(self: BorrowedRasterAttachment) !void {
-        if (self.width == 0 or self.height == 0) return error.InvalidRasterDimensions;
-        if (!std.mem.eql(u8, self.mime_type, self.format.mimeType()))
-            return error.InvalidRasterMimeType;
-        const row_bytes = std.math.mul(
-            usize,
-            @as(usize, self.width),
-            self.format.channels(),
-        ) catch return error.InvalidRasterDimensions;
-        if (self.stride_bytes < row_bytes) return error.InvalidRasterStride;
-        const required = std.math.mul(
-            usize,
-            self.stride_bytes,
-            @as(usize, self.height),
-        ) catch return error.InvalidRasterDimensions;
-        const minimum = std.math.add(usize, required - self.stride_bytes, row_bytes) catch
-            return error.InvalidRasterDimensions;
-        if (self.bytes.len != required and self.bytes.len != minimum) return error.InvalidRasterBuffer;
-    }
-
-    pub fn pixels(self: BorrowedRasterAttachment) !u64 {
-        return std.math.mul(u64, self.width, self.height) catch
-            error.InvalidRasterDimensions;
-    }
-
-    pub fn imageView(self: BorrowedRasterAttachment) !processing.ImageU8 {
-        try self.validate();
-        return .{
-            .data = self.bytes,
-            .width = self.width,
-            .height = self.height,
-            .format = switch (self.format) {
-                .rgba8 => .rgba8,
-            },
-            .row_stride_bytes = self.stride_bytes,
-        };
-    }
-};
-
-/// Resolve a canonical MIME essence to a format supported by the shared
-/// inference image decoder. Keeping this registry beside `detectFormat` makes
-/// capability advertisement, header inspection, and decoding use one codec
-/// contract instead of three independently maintained allowlists.
-pub fn inferenceFormatForMimeEssence(essence: []const u8) ?Format {
-    if (std.ascii.eqlIgnoreCase(essence, "image/png")) return .png;
-    if (std.ascii.eqlIgnoreCase(essence, "image/jpeg") or
-        std.ascii.eqlIgnoreCase(essence, "image/jpg")) return .jpeg;
-    if (std.ascii.eqlIgnoreCase(essence, "image/gif")) return .gif;
-    if (std.ascii.eqlIgnoreCase(essence, "image/bmp")) return .bmp;
-    if (std.ascii.eqlIgnoreCase(essence, "image/webp")) return .webp;
-    return null;
-}
-
-pub fn inferenceMimeEssenceForFormat(format: Format) ?[]const u8 {
-    return switch (format) {
-        .png => "image/png",
-        .jpeg => "image/jpeg",
-        .gif => "image/gif",
-        .bmp => "image/bmp",
-        .webp => "image/webp",
-        else => null,
-    };
-}
-
-pub fn supportsInferenceMimeEssence(essence: []const u8) bool {
-    return inferenceFormatForMimeEssence(essence) != null;
-}
-
-pub const EncodedImageInfo = struct {
-    width: u32,
-    height: u32,
-
-    pub fn pixels(self: EncodedImageInfo) !u64 {
-        return std.math.mul(u64, self.width, self.height) catch error.ImageDimensionsOverflow;
-    }
-};
+pub const Format = @import("image_values").Format;
+pub const DecodeLimits = @import("image_values").DecodeLimits;
+pub const rgba8_raster_mime_type = @import("image_values").rgba8_raster_mime_type;
+pub const RasterFormat = @import("image_values").RasterFormat;
+pub const BorrowedRasterAttachment = @import("image_values").BorrowedRasterAttachment;
+pub const inferenceFormatForMimeEssence = @import("image_values").inferenceFormatForMimeEssence;
+pub const inferenceMimeEssenceForFormat = @import("image_values").inferenceMimeEssenceForFormat;
+pub const supportsInferenceMimeEssence = @import("image_values").supportsInferenceMimeEssence;
+pub const EncodedImageInfo = @import("image_values").EncodedImageInfo;
 
 pub fn detectFormat(bytes: []const u8) Format {
     if (png.hasSignature(bytes)) return .png;

@@ -62,8 +62,10 @@ DTOs. This module imports only `std`; neither the contract nor facade imports
 the reader/renderer implementation. Transient render-font references are opaque
 and cleared before render runs escape the provider. Shape/pattern/shading enums
 have stable names so native layout fingerprints do not depend on compiler-local
-anonymous enum IDs. The private storage descriptor version is 32 (native PDF endpoint v2); public CAPI
-signatures and durable JSON/record formats are unchanged.
+anonymous enum IDs. The initial rollout used private storage descriptor 32 and
+native PDF endpoint v2. The subsequent shared image-value migration uses
+descriptor 33; the counted-table guard below advances the PDF endpoint to v3.
+Public CAPI signatures and durable JSON/record formats are unchanged.
 
 ## Focused qualification
 
@@ -167,3 +169,19 @@ optimized compile-time or peak-memory claims.
 Debug archive guards also pass: neither storage nor inference emits the raw
 PDF image decoder. The image-decoder inventory remains a separate P1c task,
 including fused JPEG preprocessing and retained VP8 state, not just RGBA decode.
+
+## Counted endpoint layout tables
+
+The image/lake integration review also found that a differently sized PDF
+supplementary layout table could be read using the consumer's length. PDF
+endpoint v3 now carries a checked count and borrowed table pointer. An old
+version or either shorter/longer count is rejected before the pointer is read.
+The regression uses an unreadable table pointer to enforce that order. The
+focused combined-image/lake Debug run passes all 37 steps, including nine native
+PDF tests and the image/source equivalence suites
+(`pdf-counted-table-debug.log`). Earlier cache receipts remain evidence for their
+recorded source versions; this guard change receives fresh functional checks.
+
+The subsequent combined Debug replay passes 225/225 steps, including both
+products, and all 13 HTTP regressions against the final installed server
+(`media-lake-layout-products-debug-v4.log`, `media-lake-layout-debug-v4-http.log`).

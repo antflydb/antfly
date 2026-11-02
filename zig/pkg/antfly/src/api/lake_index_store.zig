@@ -103,6 +103,12 @@ pub const Store = struct {
         if (opened.locator.protocol != locator.protocol or opened.locator.tls != locator.tls or !std.mem.eql(u8, opened.locator.root, locator.root) or !std.mem.eql(u8, opened.locator.bucket, locator.bucket) or !std.mem.eql(u8, opened.locator.prefix, locator.prefix)) return error.NativeArtifactStoreLocationChanged;
         return opened;
     }
+    /// A synchronous execution lease borrows only configuration and immutable
+    /// identity values. The receiving owner reconstructs its own clients.
+    pub fn executionDescriptor(self: *const Store) !@import("lake_execution_values.zig").StoreDescriptor {
+        const options = self.reopen_options orelse return error.NativeArtifactStorageRequired;
+        return .{ .config = options.config, .secrets = options.secrets, .deployment = options.deployment, .local_base_dir = options.local_base_dir, .locator = self.locator, .identity = self.identity, .cloud_vacuum = self.implementation.cloud_vacuum };
+    }
     /// Reopen independent client ownership for a query-local lazy selector.
     /// Both physical location and current credential scope must still match.
     pub fn reopenReadOnly(self: *const Store, a: A) !Store {

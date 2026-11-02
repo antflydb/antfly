@@ -64,7 +64,15 @@ test "compiled PDF native batch PNG raster and prepared plans" {
 test "compiled PDF native rejects incompatible operation layout" {
     // The endpoint guard rejects stale contracts before touching opaque state.
     var endpoint: c.Endpoint = .{ .contract = c.signature("count"), .invoke = undefined };
-    endpoint.version = 0;
+    try c.validate("count", &endpoint);
+    // A stale provider/table shape must fail before the borrowed table is read.
+    endpoint.layout = @ptrFromInt(@alignOf(@TypeOf(c.layouts)));
+    endpoint.version = 2;
+    try std.testing.expectError(error.InvalidArgument, c.validate("count", &endpoint));
+    endpoint.version = 3;
+    endpoint.layout_count = c.layouts.len - 1;
+    try std.testing.expectError(error.InvalidArgument, c.validate("count", &endpoint));
+    endpoint.layout_count = c.layouts.len + 1;
     try std.testing.expectError(error.InvalidArgument, c.validate("count", &endpoint));
 }
 

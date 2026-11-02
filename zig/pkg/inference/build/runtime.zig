@@ -244,6 +244,12 @@ pub fn create(config: Config) Graph {
     if (shared.image == null) {
         image_mod.addImport("antfly_hash", hash_mod);
         image_mod.addImport("image_work_control", createSharedModule(config, "lib/image/src/work_control.zig"));
+        const values = createSharedModule(config, "lib/image/src/values.zig");
+        const processing = createSharedModule(config, "lib/image/src/processing.zig");
+        processing.addImport("image_values", values);
+        processing.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
+        image_mod.addImport("image_values", values);
+        image_mod.addImport("image_processing", processing);
     }
     const prometheus_mod = shared.prometheus;
     const structlog_mod = shared.structlog;
@@ -1011,9 +1017,12 @@ pub fn addX86Kernels(b: *std.Build, module: *std.Build.Module, root: std.Build.L
 /// Source library suites use the original PDF package without changing the
 /// production document module's native owner selection.
 pub fn sourceDocumentsModule(b: *std.Build, original: *std.Build.Module, pdf: *std.Build.Module) *std.Build.Module {
-    const copy = b.createModule(.{ .root_source_file = original.root_source_file, .target = original.resolved_target, .optimize = original.optimize, .link_libc = original.link_libc });
-    var imports = original.import_table.iterator();
-    while (imports.next()) |entry| copy.addImport(entry.key_ptr.*, entry.value_ptr.*);
-    copy.addImport("antfly_pdf", pdf);
-    return copy;
+    const graph = @import("module_rewrite.zig");
+    const image = pdf.import_table.get("antfly_image").?;
+    const replacements = [_]graph.Replacement{
+        .{ .source = original.import_table.get("antfly_image").?, .target = image },
+        .{ .source = original.import_table.get("antfly_pdf").?, .target = pdf },
+    };
+    var source: graph.Rewriter = .{ .b = b, .replacements = &replacements };
+    return source.rewrite(original);
 }

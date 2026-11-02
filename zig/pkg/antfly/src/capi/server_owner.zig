@@ -25,6 +25,7 @@ pub const local_write = handles.local_write;
 pub const capi = handles.capi;
 pub const kernel_owner_abi = handles.kernel_owner_abi;
 pub const local_query_client = handles.local_query_client;
+pub const storageQueryExecutionIssue = @import("../storage/local_query_provider.zig").issue;
 pub const capi_build_options = handles.capi_build_options;
 pub const db_mod = handles.db_mod;
 pub const read_consistency = handles.read_consistency;
@@ -5592,7 +5593,7 @@ pub fn executeStorageOwnerCompiledQueryOperation(
     const response = local_query_client.executeControlledJsonAlloc(
         std.heap.c_allocator,
         kind,
-        .borrow(&handle.db),
+        &handle.db,
         table_name,
         request_json,
         null,
@@ -5761,7 +5762,7 @@ pub fn executeStorageOwnerCompiledGraph(
     const response = local_query_client.executeControlledJsonAlloc(
         std.heap.c_allocator,
         kind,
-        .borrow(&handle.db),
+        &handle.db,
         table_name,
         request.request_json.slice(),
         if (request.has_execution_deadline != 0) request.execution_deadline_ns else null,
@@ -6292,7 +6293,7 @@ pub fn searchStorageKernelQueryJson(
         };
         const response = local_query_client.executeJsonAlloc(
             std.heap.c_allocator,
-            .borrow(&handle.db),
+            &handle.db,
             table_name,
             request_json.bytes(),
             .internal,

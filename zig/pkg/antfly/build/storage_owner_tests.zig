@@ -116,6 +116,26 @@ pub fn add(
     });
     pdf_client.addImport("enrichment_compute_abi", imports.storage_boundary.enrichment);
     pdf_client.addImport("kernel_error_identity", imports.storage_boundary.identity);
+    if (imports.image_native_contract) |contract| {
+        const step = b.step("compiled-image-native-test", "Verify source and compiled image transport including retained VP8");
+        inline for (.{ false, true }) |native| {
+            const client = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/image_native_owner_test_root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+            client.addImport("image", if (native) imports.image_facade.? else imports.image_implementation.?);
+            client.addImport("media", b.createModule(.{ .root_source_file = b.path("lib/media/src/mod.zig"), .target = target, .optimize = optimize }));
+            client.addImport("image_native_contract", contract);
+            if (native) client.addImport("fixtures", b.createModule(.{ .root_source_file = b.path("lib/image/src/test_support.zig"), .target = target, .optimize = optimize }));
+            const options = b.addOptions();
+            options.addOption([]const u8, "mode", if (native) "native" else "source");
+            client.addOptions("test_options", options);
+            @import("../../../build_support/embedded/source_owner.zig").registerStorageIndependent(client);
+            const tests = @import("linked_tests.zig").add(b, .{ .name = if (native) "image-native-owner-tests" else "image-source-oracle-tests", .root_module = client, .filters = &.{"compiled image native"}, .max_rss = 2 * 1024 * 1024 * 1024 });
+            if (native) tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
+            const run = tests.run(b);
+            run.has_side_effects = true;
+            additional_runs.append(b.allocator, run) catch @panic("OOM");
+            step.dependOn(&run.step);
+        }
+    }
     if (imports.pdf_native_contract) |contract| {
         const client = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/pdf_native_owner_test_root.zig"), .target = target, .optimize = optimize });
         client.link_libc = true;

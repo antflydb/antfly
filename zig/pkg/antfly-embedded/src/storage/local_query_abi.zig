@@ -14,7 +14,8 @@
 // limitations under the License.
 
 //! Storage-free wire contract for a complete synchronous local query.
-//! Native DB layout is checked only when the private provider resolves a borrow.
+//! The query dispatcher sees only an owner-issued whole-operation capability.
+//! Legacy physical callers validate their DB borrow at the owner-side issuer.
 const failure_abi = @import("runtime_failure_abi");
 // Initial independent query contract preserves the existing diagnostic version.
 pub const abi_version: u32 = 86;
@@ -141,21 +142,37 @@ pub const LocalQueryExecutionOptions = extern struct {
     response_table_name: BorrowedBytes = .{},
 };
 
-/// A synchronous native borrow. Only private static archives built by the same
-/// toolchain may resolve it; public APIs never expose this descriptor. The
-/// caller retains the DB and its readable lease until execution returns.
-pub const LocalQueryDb = extern struct {
+/// Private capability format, independently versioned from public query JSON
+/// and failure identities. A capability is borrowed for one synchronous call;
+/// its owner retains the DB and active readable lease until execution returns.
+pub const execution_abi_version: u32 = 1;
+pub const QueryExecution = extern struct {
+    version: u32 = execution_abi_version,
+    _reserved: u32 = 0,
+    context: ?*anyopaque = null,
+    execute_fn: ?*const fn (?*anyopaque, *const LocalQueryRequest, *QueryOwnedResponse, *FailureIdentity) callconv(.c) Status = null,
+
+    /// Reject stale formats before touching opaque state or calling owner code.
+    pub fn validate(self: QueryExecution) !void {
+        if (self.version != execution_abi_version or self._reserved != 0) return error.InvalidAbiVersion;
+        if (self.context == null or self.execute_fn == null) return error.InvalidArgument;
+    }
+};
+
+/// Compatibility input to the physical owner's issuer only. This value never
+/// enters the query dispatcher request or resolves in the query compilation.
+pub const CheckedDbBorrow = extern struct {
     const Contract = @import("antfly_runtime_abi").native_abi.TypeContract;
     ptr: ?*anyopaque = null,
     layout: Contract = .{ .version = 0, .alignment = 0, .size = 0, .bit_size = 0, .type_id = 0, .layout_id = 0, .compiler_id = 0 },
 
-    pub fn borrow(db: anytype) LocalQueryDb {
+    pub fn borrow(db: anytype) CheckedDbBorrow {
         const Pointer = @typeInfo(@TypeOf(db)).pointer;
         if (Pointer.size != .one or Pointer.attrs.@"const") @compileError("local queries require a mutable DB borrow");
         return .{ .ptr = @ptrCast(db), .layout = Contract.of(Pointer.child) };
     }
 
-    pub fn resolve(self: LocalQueryDb, comptime DB: type) !*DB {
+    pub fn resolve(self: CheckedDbBorrow, comptime DB: type) !*DB {
         const ptr = self.ptr orelse return error.InvalidArgument;
         if (!self.layout.matches(Contract.of(DB))) return error.InvalidAbiVersion;
         if (@intFromPtr(ptr) % @alignOf(DB) != 0) return error.InvalidArgument;
@@ -163,8 +180,8 @@ pub const LocalQueryDb = extern struct {
     }
 };
 
-/// One complete local query against a DB owned by the storage archive. The DB
-/// and cancellation token are opaque borrowed handles valid only for this
+/// One complete local query against an owner-issued execution capability. The
+/// capability and cancellation token are opaque borrows valid only for this
 /// synchronous call. No posting, candidate, stored document, or index handle
 /// crosses the compiled boundary.
 pub const LocalQueryRequest = extern struct {
@@ -173,7 +190,7 @@ pub const LocalQueryRequest = extern struct {
     kind: LocalQueryKind = .search,
     has_execution_deadline: u8 = 0,
     _reserved0: [3]u8 = @splat(0),
-    db: LocalQueryDb = .{},
+    execution: QueryExecution = .{},
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
     execution_options: LocalQueryExecutionOptions = .{},
@@ -182,9 +199,18 @@ pub const LocalQueryRequest = extern struct {
     execution_deadline_ns: u64 = 0,
 };
 
-pub extern fn antfly_local_query_execute(
+pub extern fn antfly_local_query_execute_v2(
     request: *const LocalQueryRequest,
     out_response: *QueryOwnedResponse,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+// A stale native request cannot silently bind to the new layout.
+pub const antfly_local_query_execute = antfly_local_query_execute_v2;
+
+pub extern fn antfly_storage_query_execution_v1(
+    borrow: *const CheckedDbBorrow,
+    out_execution: *QueryExecution,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
@@ -194,9 +220,9 @@ test "query DB borrow rejects incompatible contracts before pointer use" {
     const std = @import("std");
     const DB = struct { generation: u64 };
     var db: DB = .{ .generation = 42 };
-    const borrow = LocalQueryDb.borrow(&db);
+    const borrow = CheckedDbBorrow.borrow(&db);
     try std.testing.expectEqual(&db, try borrow.resolve(DB));
-    try std.testing.expectError(error.InvalidArgument, (LocalQueryDb{}).resolve(DB));
+    try std.testing.expectError(error.InvalidArgument, (CheckedDbBorrow{}).resolve(DB));
     inline for (.{ "version", "alignment", "size", "bit_size", "type_id", "layout_id", "compiler_id" }) |field| {
         var invalid = borrow;
         @field(invalid.layout, field) +%= 1;

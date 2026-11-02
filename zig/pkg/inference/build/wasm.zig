@@ -118,6 +118,12 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
     });
     wasm_image_mod.addImport("antfly_hash", wasm_hash_mod);
     wasm_image_mod.addImport("image_work_control", b.createModule(.{ .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/image/src/work_control.zig" })), .target = wasm_target, .optimize = .safe, .single_threaded = true }));
+    const image_values = b.createModule(.{ .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/image/src/values.zig" })), .target = wasm_target, .optimize = .safe, .single_threaded = true });
+    const image_processing = b.createModule(.{ .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/image/src/processing.zig" })), .target = wasm_target, .optimize = .safe, .single_threaded = true });
+    image_processing.addImport("image_values", image_values);
+    image_processing.addImport("image_work_control", wasm_image_mod.import_table.get("image_work_control").?);
+    wasm_image_mod.addImport("image_values", image_values);
+    wasm_image_mod.addImport("image_processing", image_processing);
     wasm_platform_mod.single_threaded = true;
     const wasm_linalg_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/linalg/src/mod.zig" })),

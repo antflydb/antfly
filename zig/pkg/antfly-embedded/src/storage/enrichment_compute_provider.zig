@@ -390,4 +390,6 @@ pub fn bufferDestroy(buffer: *abi.OwnedBytes) callconv(.c) void {
 pub fn exportPdfNativeOperations() void {
     if (@hasDecl(@import("build_options"), "pdf_native_provider") and @import("build_options").pdf_native_provider)
         @import("pdf_native_provider.zig").exportOperations();
+    if (@hasDecl(@import("build_options"), "image_native_provider") and @import("build_options").image_native_provider)
+        @import("image_native_provider.zig").exportOperations();
 }

@@ -39,6 +39,7 @@ pub const Options = struct {
     identity_spill_bytes: u64 = 1024 * 1024 * 1024,
     build_limits: limits.Limits = .{},
     embedding_options: ?local.inference_managed_embedder.InitOptions = null,
+    execution_source: ?@import("lake_execution_native_contract.zig").SourceOptions = null,
 };
 
 pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, authority: Authority, context: Context, cancellation: Cancellation, clock: publication.Clock, options: Options) !void {
@@ -87,13 +88,12 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     var working = try limits.WorkingSetAllocator.init(a, options.build_limits);
     defer working.deinit();
     const build_alloc = working.allocator();
-    var artifact_reads = @import("lake_index_artifact_recovery.zig").Reads.init(store.artifactStore());
-    var handle = artifact_reads.store();
-    const published_bytes = publication.buildWithReuse(build_alloc, &handle, pending, source, store.identity, build_context, cancellation, clock, .{ .ptr = &lease, .snapshot = Renewal.snapshot, .save_checkpoint = Renewal.saveCheckpoint, .discard_checkpoint = Renewal.discardCheckpoint }, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = catalog.desiredFingerprint(table), .context = build_context }, .{ .allow_reuse = !repair, .identity_spill_bytes = options.identity_spill_bytes }) catch |reported_error| {
+    var artifact_cause: ?anyerror = null;
+    const published_bytes = executePhysical(build_alloc, io, pending, source, store, build_context, cancellation, clock, .{ .ptr = &lease, .snapshot = Renewal.snapshot, .save_checkpoint = Renewal.saveCheckpoint, .discard_checkpoint = Renewal.discardCheckpoint }, options, !repair, &artifact_cause) catch |reported_error| {
         heartbeat.cancel(io);
         heartbeat_active = false;
         if (lease.terminal_error) |err| return err;
-        const build_error = if (reported_error == error.LakeIndexArtifactUnavailable) artifact_reads.cause() orelse reported_error else reported_error;
+        const build_error = if (reported_error == error.LakeIndexArtifactUnavailable) artifact_cause orelse reported_error else reported_error;
         // Only derived-artifact failures invalidate saved work. A source read
         // may also return FileNotFound; its checkpoint remains resumable.
         if (reported_error == error.LakeIndexArtifactUnavailable or reported_error == error.ArtifactIntegrityMismatch) {
@@ -125,6 +125,26 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     // Keep the final publication on the same narrowly rebased definition as
     // checkpoint and heartbeat writes; its bytes remain build-owned.
     try lease.replaceCatalog(published_bytes);
+}
+
+/// Compile-time selection keeps physical builders out of the API archive.
+fn executePhysical(a: A, io: std.Io, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, cancellation: Cancellation, clock: publication.Clock, lease: publication.Lease, options: Options, allow_reuse: bool, artifact_cause: *?anyerror) ![]u8 {
+    const build_options = @import("lake_execution_options");
+    const policy: publication.BuildPolicy = .{ .allow_reuse = allow_reuse, .identity_spill_bytes = options.identity_spill_bytes };
+    if (comptime @hasDecl(build_options, "shared_lake_execution") and build_options.shared_lake_execution) {
+        var source_options = options.execution_source orelse return error.NativeLakeExecutionResourcesRequired;
+        // A retained catalog snapshot is data, not a foreign reader callback.
+        // The provider revalidates external incarnation and attempt signature.
+        source_options.retained_catalog_metadata = source.catalog_metadata;
+        return @import("lake_execution_backend").implementation.build(a, io, table, source_options, try store.executionDescriptor(), context, cancellation, clock, lease, options.embedding_options, policy, options.build_limits, artifact_cause);
+    } else {
+        var artifact_reads = @import("lake_index_artifact_recovery.zig").Reads.init(store.artifactStore());
+        var handle = artifact_reads.store();
+        return publication.buildWithReuse(a, &handle, table, source, store.identity, context, cancellation, clock, lease, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = catalog.desiredFingerprint(table), .context = context }, policy) catch |err| {
+            artifact_cause.* = artifact_reads.cause();
+            return err;
+        };
+    }
 }
 
 /// Historical metadata recovery can restore a publication whose retired

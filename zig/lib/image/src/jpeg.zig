@@ -209,11 +209,7 @@ pub const Structure = struct {
     scans: [max_scans]ScanInfo,
 };
 
-pub const DecodedImage = struct {
-    rgba: []u8,
-    width: u32,
-    height: u32,
-};
+pub const DecodedImage = @import("image_values").DecodedRgba;
 
 pub const FourComponentMode = enum {
     /// Adobe CMYK/YCCK samples use the inverted convention expected by
@@ -8399,4 +8395,17 @@ test "huffman lookahead retains short tails and restart markers" {
     try std.testing.expectEqual(@as(u16, 255), try stuffed.readBits(8));
     for (0..8) |_| try std.testing.expectEqual(@as(u8, 42), try decodeHuffmanSymbol(&stuffed, table));
     try stuffed.consumeExpectedRestartMarker(0xd0);
+}
+
+/// Complete admission facts for the portable MJPEG consumer. Parser tables and
+/// entropy-scan internals remain with the codec implementation.
+pub fn inspectMjpeg(bytes: []const u8) !@import("image_values").MjpegInfo {
+    const structure = try parseStructure(bytes);
+    const info = structure.info;
+    return .{
+        .width = info.width,
+        .height = info.height,
+        .supported_profile = info.frame_kind == .baseline_dct and info.bits_per_sample == 8 and (info.component_count == 1 or info.component_count == 3) and supportsPlannedBaselineDecode(structure),
+        .complete_packet = bytes.len >= 4 and structure.scan_count > 0 and structure.scans[0].entropy_end == bytes.len - 2 and hasSignature(bytes) and std.mem.eql(u8, bytes[bytes.len - 2 ..], &.{ 0xff, 0xd9 }),
+    };
 }

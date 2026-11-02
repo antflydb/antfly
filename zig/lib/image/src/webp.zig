@@ -274,11 +274,7 @@ const vp8_default_luma4_probs = Vp8Luma4Probs{
     },
 };
 
-pub const DecodedImage = struct {
-    rgba: []u8,
-    width: u32,
-    height: u32,
-};
+pub const DecodedImage = @import("image_values").DecodedRgba;
 
 pub const Bitstream = enum {
     vp8,
@@ -514,24 +510,7 @@ const Vp8MacroblockGrid = struct {
     height: u32,
 };
 
-pub const Vp8FramePlanes = struct {
-    y: []u8,
-    u: []u8,
-    v: []u8,
-    width: u32,
-    height: u32,
-    y_stride: usize,
-    uv_stride: usize,
-    y_padded_height: usize,
-    uv_padded_height: usize,
-
-    pub fn deinit(self: *Vp8FramePlanes, alloc: Allocator) void {
-        alloc.free(self.y);
-        alloc.free(self.u);
-        alloc.free(self.v);
-        self.* = undefined;
-    }
-};
+pub const Vp8FramePlanes = @import("image_values").Vp8FramePlanes;
 
 const Vp8CoeffProbs = [vp8_coeff_type_count][vp8_coeff_band_count][vp8_coeff_context_count][vp8_coeff_proba_count]u8;
 
@@ -5552,6 +5531,13 @@ test "probe rejects reserved vp8x feature bits" {
 /// after reconstruction, filtering and all retained allocations succeed. The
 /// allocator must remain valid until deinit; returned planes belong to caller.
 pub const Vp8Decoder = struct {
+    /// Native clients allocate opaque metadata in this long-lived allocator;
+    /// the source implementation keeps the same metadata inline.
+    pub fn init(metadata_allocator: Allocator) !Vp8Decoder {
+        _ = metadata_allocator;
+        return .{};
+    }
+
     /// Decoder-owned immutable pictures; slots naming the same picture alias.
     /// Returned decode planes remain independently owned and may be mutated.
     references: [3]?Vp8FramePlanes = .{ null, null, null },

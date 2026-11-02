@@ -38,8 +38,10 @@ pub const max_directory_bytes: usize = 16 * 1024 * 1024;
 /// Physical namespace plus a named connection for current credential lookup.
 /// Credentials are never copied into publication metadata.
 pub const StoreLocator = struct {
+    /// Stable type identity across independently analyzed native owners.
+    pub const Protocol = enum { filesystem, s3, gcs };
     version: u16 = 1,
-    protocol: enum { filesystem, s3, gcs },
+    protocol: Protocol,
     connection: ?[]const u8 = null,
     bucket: []const u8,
     prefix: []const u8,

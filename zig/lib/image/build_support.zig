@@ -67,6 +67,7 @@ pub const AddTestsResult = struct {
     run_jpeg_tests: *std.Build.Step.Run,
     run_webp_tests: *std.Build.Step.Run,
     run_jpeg2000_decode_tests: *std.Build.Step.Run,
+    run_processing_tests: *std.Build.Step.Run,
 };
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
@@ -92,6 +93,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     png_test_mod.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
+    png_test_mod.addImport("image_values", image_mod.import_table.get("image_values").?);
+    png_test_mod.addImport("image_processing", image_mod.import_table.get("image_processing").?);
     png_test_mod.addImport("antfly_hash", hash_mod);
     const png_tests = b.addTest(.{ .root_module = png_test_mod });
     const run_png_tests = b.addRunArtifact(png_tests);
@@ -103,6 +106,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     jpeg_test_mod.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
+    jpeg_test_mod.addImport("image_values", image_mod.import_table.get("image_values").?);
+    jpeg_test_mod.addImport("image_processing", image_mod.import_table.get("image_processing").?);
     const jpeg_tests = b.addTest(.{ .root_module = jpeg_test_mod });
     const run_jpeg_tests = b.addRunArtifact(jpeg_tests);
 
@@ -112,6 +117,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     webp_test_mod.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
+    webp_test_mod.addImport("image_values", image_mod.import_table.get("image_values").?);
+    webp_test_mod.addImport("image_processing", image_mod.import_table.get("image_processing").?);
     const run_webp_tests = b.addRunArtifact(b.addTest(.{ .root_module = webp_test_mod }));
 
     const jpeg2000_decode_test_mod = b.createModule(.{
@@ -120,12 +127,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     jpeg2000_decode_test_mod.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
+    jpeg2000_decode_test_mod.addImport("image_values", image_mod.import_table.get("image_values").?);
+    jpeg2000_decode_test_mod.addImport("image_processing", image_mod.import_table.get("image_processing").?);
     const jpeg2000_decode_tests = b.addTest(.{
         .root_module = jpeg2000_decode_test_mod,
     });
     const run_jpeg2000_decode_tests = b.addRunArtifact(jpeg2000_decode_tests);
     return .{
         .run_lib_image_tests = run_lib_image_tests,
+        .run_processing_tests = b.addRunArtifact(b.addTest(.{ .root_module = image_mod.import_table.get("image_processing").? })),
         .run_png_tests = run_png_tests,
         .run_jpeg_tests = run_jpeg_tests,
         .run_webp_tests = run_webp_tests,
@@ -151,7 +161,9 @@ pub fn addBenchmark(b: *std.Build, options: AddBenchmarkOptions) *std.Build.Step
         .target = target,
         .optimize = .fast,
     });
-    lib_image_bench_mod.addImport("image_work_control", createWorkControlModule(b, options.root, target, .fast));
+    const control = createWorkControlModule(b, options.root, target, .fast);
+    lib_image_bench_mod.addImport("image_work_control", control);
+    attachValues(b, lib_image_bench_mod, options.root, target, .fast, control);
     lib_image_bench_mod.addImport("antfly_hash", hash_bench_mod);
     lib_image_bench_mod.addOptions("build_options", lib_image_bench_build_options);
     if (lib_image_spng_paths) |spng_paths| {
@@ -203,6 +215,8 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) AddConforma
         .optimize = optimize,
     });
     lib_image_conformance_test_mod.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
+    lib_image_conformance_test_mod.addImport("image_values", image_mod.import_table.get("image_values").?);
+    lib_image_conformance_test_mod.addImport("image_processing", image_mod.import_table.get("image_processing").?);
     lib_image_conformance_test_mod.addImport("antfly_hash", hash_mod);
     const lib_image_conformance_tests = b.addTest(.{
         .root_module = lib_image_conformance_test_mod,
@@ -218,6 +232,8 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) AddConforma
         .optimize = optimize,
     });
     lib_image_corpus_mod.addImport("image_work_control", image_mod.import_table.get("image_work_control").?);
+    lib_image_corpus_mod.addImport("image_values", image_mod.import_table.get("image_values").?);
+    lib_image_corpus_mod.addImport("image_processing", image_mod.import_table.get("image_processing").?);
     lib_image_corpus_mod.addImport("antfly_hash", hash_mod);
     lib_image_corpus_mod.addOptions("build_options", lib_image_corpus_build_options);
     if (lib_image_spng_paths) |spng_paths| {
@@ -303,10 +319,21 @@ pub fn createModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.R
         .optimize = optimize,
     });
     module.addImport("antfly_hash", hash);
-    module.addImport("image_work_control", createWorkControlModule(b, root, target, optimize));
+    const control = createWorkControlModule(b, root, target, optimize);
+    module.addImport("image_work_control", control);
+    attachValues(b, module, root, target, optimize, control);
     return module;
 }
 
 pub fn createWorkControlModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
     return b.createModule(.{ .root_source_file = root.path(b, "src/work_control.zig"), .target = target, .optimize = optimize });
+}
+
+pub fn attachValues(b: *std.Build, module: *std.Build.Module, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, control: *std.Build.Module) void {
+    const values = b.createModule(.{ .root_source_file = root.path(b, "src/values.zig"), .target = target, .optimize = optimize });
+    const processing = b.createModule(.{ .root_source_file = root.path(b, "src/processing.zig"), .target = target, .optimize = optimize });
+    processing.addImport("image_values", values);
+    processing.addImport("image_work_control", control);
+    module.addImport("image_values", values);
+    module.addImport("image_processing", processing);
 }

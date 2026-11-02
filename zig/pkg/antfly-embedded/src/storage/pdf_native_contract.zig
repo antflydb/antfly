@@ -181,20 +181,21 @@ pub const layouts = blk: {
     break :blk result;
 };
 pub const Endpoint = extern struct {
-    version: u32 = 2,
+    version: u32 = 3,
+    layout_count: u32 = layouts.len,
     contract: native.CallContract,
-    layout: [layouts.len]native.TypeContract = layouts,
+    layout: *const [layouts.len]native.TypeContract = &layouts,
     invoke: *const fn (*const anyopaque, *anyopaque, WorkBorrow) callconv(.c) void,
 };
 pub fn validate(comptime name: []const u8, endpoint: *const Endpoint) !void {
-    if (endpoint.version != 2 or !endpoint.contract.matches(signature(name))) return error.InvalidArgument;
-    for (endpoint.layout, layouts, 0..) |actual, expected, index| if (!actual.matches(expected)) {
+    if (endpoint.version != 3 or endpoint.layout_count != layouts.len or !endpoint.contract.matches(signature(name))) return error.InvalidArgument;
+    for (endpoint.layout.*, layouts, 0..) |actual, expected, index| if (!actual.matches(expected)) {
         std.debug.print("PDF native layout mismatch op={s} index={d} actual={any} expected={any}\n", .{ name, index, actual, expected });
         return error.InvalidArgument;
     };
 }
 pub fn call(comptime name: []const u8, args: Args(name)) !Value(name) {
-    const getter = @extern(*const fn () callconv(.c) *const Endpoint, .{ .name = "antfly_pdf_native_" ++ name ++ "_v2" });
+    const getter = @extern(*const fn () callconv(.c) *const Endpoint, .{ .name = "antfly_pdf_native_" ++ name ++ "_v3" });
     const endpoint = getter();
     try validate(name, endpoint);
     var out: Wire(name) = undefined;
