@@ -58,6 +58,7 @@ pub const AntflyRootImports = struct {
     boundary_profile: @import("../embedded/storage_boundary.zig").Profile = .all,
     build_info: @import("../../lib/build_info/build_support.zig").BuildInfo,
     build_options: *std.Build.Step.Options,
+    shared_pdf_templates: bool = false,
     lite_options: *std.Build.Module,
     // HTTP schema serving is opt-in at the owning compilation roots.
     embedded_openapi: *std.Build.Module,
@@ -464,6 +465,7 @@ pub const AntflyRootImports = struct {
         mod.addImport("sql_parser", self.sql_parser);
         self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
         mod.addOptions("build_options", self.build_options);
+        if (self.shared_pdf_templates) mod.addImport("antfly_pdf_backend_client", self.storage_boundary.pdf_backend_client);
         mod.addImport("antfly_platform", self.platform);
         self.configureLocalDatabaseContracts(mod);
         mod.addImport("antfly_inference_bridge", self.inference_bridge);

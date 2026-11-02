@@ -156,6 +156,99 @@ pub extern fn antfly_enrichment_pdf_session_render_png(
 /// Null is an empty session; close clears the caller's handle before returning.
 pub extern fn antfly_enrichment_pdf_session_close(session: *?*PdfSession) callconv(.c) void;
 
+/// Synchronous backend operations preserve the original allocator's resizing
+/// capabilities. The callback table and its context must outlive the call only;
+/// returned byte buffers contain no reference to this adapter.
+pub const BackendAllocator = extern struct {
+    base: Allocator,
+    resize: ?*const fn (*anyopaque, [*]u8, usize, usize, usize) callconv(.c) u8 = null,
+    remap: ?*const fn (*anyopaque, [*]u8, usize, usize, usize) callconv(.c) ?[*]u8 = null,
+
+    pub fn fromStd(allocator: *const @import("std").mem.Allocator) BackendAllocator {
+        return .{ .base = .fromStd(allocator), .resize = resizeStd, .remap = remapStd };
+    }
+
+    pub fn valid(self: *const BackendAllocator) bool {
+        return self.base.valid();
+    }
+
+    pub fn asStd(self: *const BackendAllocator) @import("std").mem.Allocator {
+        return .{ .ptr = @ptrCast(@constCast(self)), .vtable = &vtable };
+    }
+
+    fn resizeStd(context: *anyopaque, ptr: [*]u8, len: usize, alignment: usize, new_len: usize) callconv(.c) u8 {
+        const std = @import("std");
+        if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return 0;
+        const allocator: *const std.mem.Allocator = @ptrCast(@alignCast(context));
+        return @intFromBool(allocator.rawResize(ptr[0..len], .fromByteUnits(alignment), new_len, @returnAddress()));
+    }
+
+    fn remapStd(context: *anyopaque, ptr: [*]u8, len: usize, alignment: usize, new_len: usize) callconv(.c) ?[*]u8 {
+        const std = @import("std");
+        if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return null;
+        const allocator: *const std.mem.Allocator = @ptrCast(@alignCast(context));
+        return allocator.rawRemap(ptr[0..len], .fromByteUnits(alignment), new_len, @returnAddress());
+    }
+
+    const vtable: @import("std").mem.Allocator.VTable = .{
+        .alloc = allocate,
+        .resize = resizeAdapter,
+        .remap = remapAdapter,
+        .free = release,
+    };
+
+    fn allocate(context: *anyopaque, len: usize, alignment: @import("std").mem.Alignment, _: usize) ?[*]u8 {
+        const self: *const BackendAllocator = @ptrCast(@alignCast(context));
+        if (!self.valid()) return null;
+        return self.base.allocate(self.base.context, len, alignment.toByteUnits());
+    }
+
+    fn resizeAdapter(context: *anyopaque, bytes: []u8, alignment: @import("std").mem.Alignment, len: usize, _: usize) bool {
+        const self: *const BackendAllocator = @ptrCast(@alignCast(context));
+        if (!self.valid()) return false;
+        const callback = self.resize orelse return false;
+        return callback(self.base.context, bytes.ptr, bytes.len, alignment.toByteUnits(), len) != 0;
+    }
+
+    fn remapAdapter(context: *anyopaque, bytes: []u8, alignment: @import("std").mem.Alignment, len: usize, _: usize) ?[*]u8 {
+        const self: *const BackendAllocator = @ptrCast(@alignCast(context));
+        if (!self.valid()) return null;
+        const callback = self.remap orelse return null;
+        return callback(self.base.context, bytes.ptr, bytes.len, alignment.toByteUnits(), len);
+    }
+
+    fn release(context: *anyopaque, bytes: []u8, alignment: @import("std").mem.Alignment, _: usize) void {
+        const self: *const BackendAllocator = @ptrCast(@alignCast(context));
+        self.base.release(self.base.context, bytes.ptr, bytes.len, alignment.toByteUnits());
+    }
+};
+
+/// Complete legacy template operations. Both scratch and returned bytes are
+/// charged to allocator. Its table/context is borrowed for this call only.
+pub const PdfBackendOperation = enum(u32) { extract_text = 1, render_first_page_png = 2, _ };
+pub const PdfBackendRequest = extern struct {
+    version: u32 = abi_version,
+    operation: PdfBackendOperation,
+    allocator: ?*const BackendAllocator = null,
+    pdf_bytes: BorrowedBytes = .{},
+};
+
+/// Caller-allocated output; free with the request allocator, never buffer_destroy.
+pub const CallerOwnedBytes = extern struct {
+    ptr: ?[*]u8 = null,
+    len: u64 = 0,
+
+    pub fn slice(self: @This()) []u8 {
+        return if (self.len == 0) &.{} else self.ptr.?[0..@intCast(self.len)];
+    }
+};
+
+pub extern fn antfly_enrichment_pdf_backend(
+    request: *const PdfBackendRequest,
+    out_bytes: *CallerOwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
 pub const EnrichmentOperation = enum(u32) {
     extract_stream = 1,
     render_pdf_page = 2,
@@ -164,6 +257,8 @@ pub const EnrichmentOperation = enum(u32) {
     pdf_session_open = 5,
     pdf_session_render = 6,
     validate_pdf_session_response = 7,
+    pdf_backend = 8,
+    validate_pdf_backend_response = 9,
 };
 
 pub extern fn antfly_enrichment_extract_stream(

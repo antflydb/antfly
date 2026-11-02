@@ -233,6 +233,9 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, false);
     const standalone_runtime_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, true, false);
     const production_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, true);
+    const shared_pdf_templates = b.option(bool, "shared-pdf-templates", "Experiment: route production template PDF work through the shared media owner") orelse false;
+    if (shared_pdf_templates and (target.result.os.tag == .linux or target.result.os.tag == .macos) and (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64))
+        production_build_options.addOption(bool, "shared_pdf_templates", true);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options, platform_mod);
     const raft_engine_mod = b.createModule(.{
         .root_source_file = b.path("lib/raft/src/root.zig"),
@@ -1410,6 +1413,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     antfly_imports.storage_boundary.configureSources(storage_mod, false, false);
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;
+    production_antfly_imports.shared_pdf_templates = shared_pdf_templates and antfly_imports.storage_boundary.shared_core;
 
     return .{
         .api_bench_standalone = api_bench_standalone,

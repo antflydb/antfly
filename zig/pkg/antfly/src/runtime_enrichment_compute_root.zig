@@ -35,6 +35,7 @@ comptime {
     exportInternal(&enrichment_compute_exports.pdfSessionOpen, "antfly_enrichment_pdf_session_open");
     exportInternal(&enrichment_compute_exports.pdfSessionRenderPng, "antfly_enrichment_pdf_session_render_png");
     exportInternal(&enrichment_compute_exports.pdfSessionClose, "antfly_enrichment_pdf_session_close");
+    exportInternal(&enrichment_compute_exports.pdfBackend, "antfly_enrichment_pdf_backend");
     exportInternal(&enrichment_compute_exports.bufferDestroy, "antfly_enrichment_buffer_destroy");
 }
 

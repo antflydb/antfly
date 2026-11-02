@@ -96,3 +96,110 @@ test "opaque PDF session bounds cancellation and charges retained PNG to caller"
     defer allocator.free(rendered.png);
     try std.testing.expect(rendered.png.len > 8);
 }
+
+test "opaque PDF backend preserves exact plain text and first-page PNG" {
+    const backend = @import("pdf_backend_client");
+    const allocator = std.testing.allocator;
+    const bytes = try fixture(allocator);
+    defer allocator.free(bytes);
+    const text = switch (try backend.compute(allocator, bytes, .extract_text)) {
+        .bytes => |value| value,
+        .failure => return error.UnexpectedPdfFailure,
+    };
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("Hello Fixture\n", text);
+    const png = switch (try backend.compute(allocator, bytes, .render_first_page_png)) {
+        .bytes => |value| value,
+        .failure => return error.UnexpectedPdfFailure,
+    };
+    defer allocator.free(png);
+    try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
+}
+
+test "opaque PDF backend keeps provider diagnostics and allocation admission" {
+    const backend = @import("pdf_backend_client");
+    const broken = try backend.compute(std.testing.allocator, "not a PDF", .extract_text);
+    switch (broken) {
+        .bytes => |bytes| {
+            std.testing.allocator.free(bytes);
+            return error.ExpectedPdfFailure;
+        },
+        .failure => |failure| {
+            try std.testing.expectEqualStrings("InvalidPdfHeader", failure.errorName());
+            try std.testing.expectEqual(abi.FailureBoundary.enrichment_compute, failure.boundary);
+        },
+    }
+    const bytes = try fixture(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    switch (try backend.compute(failing.allocator(), bytes, .extract_text)) {
+        .bytes => |result| {
+            failing.allocator().free(result);
+            return error.ExpectedAllocationFailure;
+        },
+        .failure => |failure| try std.testing.expectEqual(abi.Status.out_of_memory, failure.status),
+    }
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+const ResizingTracker = struct {
+    backing: std.mem.Allocator,
+    live_bytes: usize = 0,
+    resize_calls: usize = 0,
+    remap_calls: usize = 0,
+    successful_resizes: usize = 0,
+    successful_remaps: usize = 0,
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = allocate, .resize = resize, .remap = remap, .free = release };
+    fn allocate(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const ptr = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+        self.live_bytes += len;
+        return ptr;
+    }
+    fn resize(context: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.resize_calls += 1;
+        if (!self.backing.rawResize(bytes, alignment, len, ra)) return false;
+        self.successful_resizes += 1;
+        self.live_bytes = self.live_bytes - bytes.len + len;
+        return true;
+    }
+    fn remap(context: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.remap_calls += 1;
+        const ptr = self.backing.rawRemap(bytes, alignment, len, ra) orelse return null;
+        self.successful_remaps += 1;
+        self.live_bytes = self.live_bytes - bytes.len + len;
+        return ptr;
+    }
+    fn release(context: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.live_bytes -= bytes.len;
+        self.backing.rawFree(bytes, alignment, ra);
+    }
+};
+
+test "opaque PDF backend preserves resizing and retained output charging" {
+    const backend = @import("pdf_backend_client");
+    const bytes = try fixture(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    const storage = try std.testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer std.testing.allocator.free(storage);
+    var arena = std.heap.FixedBufferAllocator.init(storage);
+    var tracker = ResizingTracker{ .backing = arena.allocator() };
+    const allocator = tracker.allocator();
+    const text = switch (try backend.compute(allocator, bytes, .extract_text)) {
+        .bytes => |value| value,
+        .failure => return error.UnexpectedPdfFailure,
+    };
+    try std.testing.expectEqualStrings("Hello Fixture\n", text);
+    try std.testing.expectEqual(text.len, tracker.live_bytes);
+    try std.testing.expect(tracker.resize_calls + tracker.remap_calls > 0);
+    try std.testing.expect(tracker.successful_resizes + tracker.successful_remaps > 0);
+    allocator.free(text);
+    try std.testing.expectEqual(@as(usize, 0), tracker.live_bytes);
+}

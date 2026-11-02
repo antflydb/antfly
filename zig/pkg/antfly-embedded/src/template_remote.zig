@@ -35,9 +35,31 @@ const FatalRenderError = error{
     OutOfMemory,
 };
 
+const PdfOperation = enum { extract_text, render_first_page_png };
+const PdfFailure = struct {
+    local: ?anyerror = null,
+    name_bytes: [127]u8 = @splat(0),
+    name_len: u8 = 0,
+    fatal: ?FatalRenderError = null,
+
+    fn fromError(err: anyerror) @This() {
+        return .{ .local = err, .fatal = switch (err) {
+            error.Canceled => error.Canceled,
+            error.Timeout => error.Timeout,
+            error.OutOfMemory => error.OutOfMemory,
+            else => null,
+        } };
+    }
+
+    fn name(self: *const @This()) []const u8 {
+        return if (self.local) |err| @errorName(err) else self.name_bytes[0..self.name_len];
+    }
+};
+const PdfOutcome = union(enum) { bytes: []u8, failure: PdfFailure };
+
 const RenderContext = struct {
     alloc: Allocator,
-    pdf_backend: pdf_mod.Backend,
+    pdf_backend: ?pdf_mod.Backend = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     secret_store: ?*common_secrets.FileStore = null,
     io: ?std.Io = null,
@@ -47,10 +69,66 @@ const RenderContext = struct {
     max_media_parts: ?usize = null,
     emitted_media_parts: usize = 0,
     fatal_error: ?FatalRenderError = null,
+
+    fn pdfBytes(self: *@This(), bytes: []const u8, operation: PdfOperation) PdfOutcome {
+        const options = @import("build_options");
+        const shared = @hasDecl(options, "shared_pdf_templates") and options.shared_pdf_templates;
+        if (shared and self.pdf_backend == null) {
+            const client = @import("antfly_pdf_backend_client");
+            const outcome = client.compute(self.alloc, bytes, switch (operation) {
+                .extract_text => .extract_text,
+                .render_first_page_png => .render_first_page_png,
+            }) catch |err| return .{ .failure = .fromError(err) };
+            return switch (outcome) {
+                .bytes => |value| .{ .bytes = value },
+                .failure => |value| .{ .failure = .{
+                    .name_bytes = value.error_name,
+                    .name_len = @intCast(value.error_name_len),
+                    .fatal = switch (value.status) {
+                        .out_of_memory => error.OutOfMemory,
+                        .canceled => error.Canceled,
+                        .timeout => error.Timeout,
+                        else => null,
+                    },
+                } },
+            };
+        }
+        // A shared production default must not refer to source backend
+        // factories: even storing their pointers retains the complete renderer.
+        // Explicit overrides still work without adding a second default owner.
+        if (shared) {
+            return callPdfBackend(self.alloc, self.pdf_backend.?, bytes, operation);
+        } else {
+            return callPdfBackend(self.alloc, self.pdf_backend orelse pdf_mod.Backend.system(), bytes, operation);
+        }
+    }
 };
 
+fn callPdfBackend(allocator: Allocator, backend: pdf_mod.Backend, bytes: []const u8, operation: PdfOperation) PdfOutcome {
+    const result = switch (operation) {
+        .extract_text => backend.extractText(allocator, bytes),
+        .render_first_page_png => backend.renderFirstPagePng(allocator, bytes),
+    } catch |err| return .{ .failure = .fromError(err) };
+    return .{ .bytes = result };
+}
+
+fn pdfBytesForHelper(arena: Allocator, render_ctx: *RenderContext, bytes: []const u8, operation: PdfOperation) !union(enum) { bytes: []u8, directive: []const u8 } {
+    return switch (render_ctx.pdfBytes(bytes, operation)) {
+        .bytes => |value| .{ .bytes = value },
+        .failure => |failure| blk: {
+            if (failure.fatal) |err| {
+                _ = latchFatalRenderError(render_ctx, err);
+                return err;
+            }
+            break :blk .{ .directive = try template_mod.formatErrorDirective(arena, 0, failure.name()) };
+        },
+    };
+}
+
 pub const RenderConfig = struct {
-    pdf_backend: pdf_mod.Backend = pdf_mod.Backend.system(),
+    /// Optional explicit backend override (including source-only test backends).
+    /// Native production roots select their compiled default in pdfBytes.
+    pdf_backend: ?pdf_mod.Backend = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     secret_store: ?*common_secrets.FileStore = null,
     /// Request-scoped I/O used by remote template helpers when provided.
@@ -318,20 +396,18 @@ fn remoteMediaHelperImpl(ctx: hbs.HelperContext) anyerror!hbs.Value {
     const response = fetched.ok;
     const is_pdf = std.mem.eql(u8, response.content_type, "application/pdf");
     if (is_pdf and extract_mode) {
-        const extracted = render_ctx.pdf_backend.extractText(render_ctx.alloc, response.data) catch |err| {
-            if (latchFatalRenderError(render_ctx, err)) return err;
-            const result = try template_mod.formatErrorDirective(ctx.arena, 0, @errorName(err));
-            return .{ .safe_string = result };
+        const extracted = switch (try pdfBytesForHelper(ctx.arena, render_ctx, response.data, .extract_text)) {
+            .bytes => |value| value,
+            .directive => |value| return .{ .safe_string = value },
         };
         defer render_ctx.alloc.free(extracted);
         return .{ .string = try ctx.arena.dupe(u8, extracted) };
     }
     if (mediaPartLimitReached(render_ctx)) return .{ .safe_string = "" };
     if (is_pdf and std.mem.eql(u8, mode, "render")) {
-        const png_bytes = render_ctx.pdf_backend.renderFirstPagePng(render_ctx.alloc, response.data) catch |err| {
-            if (latchFatalRenderError(render_ctx, err)) return err;
-            const result = try template_mod.formatErrorDirective(ctx.arena, 0, @errorName(err));
-            return .{ .safe_string = result };
+        const png_bytes = switch (try pdfBytesForHelper(ctx.arena, render_ctx, response.data, .render_first_page_png)) {
+            .bytes => |value| value,
+            .directive => |value| return .{ .safe_string = value },
         };
         defer render_ctx.alloc.free(png_bytes);
 
@@ -471,10 +547,9 @@ fn remotePdfHelperImpl(ctx: hbs.HelperContext) anyerror!hbs.Value {
     }
 
     if (std.mem.eql(u8, response.content_type, "application/pdf")) {
-        const extracted = render_ctx.pdf_backend.extractText(render_ctx.alloc, response.data) catch |err| {
-            if (latchFatalRenderError(render_ctx, err)) return err;
-            const result = try template_mod.formatErrorDirective(ctx.arena, 0, @errorName(err));
-            return .{ .safe_string = result };
+        const extracted = switch (try pdfBytesForHelper(ctx.arena, render_ctx, response.data, .extract_text)) {
+            .bytes => |value| value,
+            .directive => |value| return .{ .safe_string = value },
         };
         defer render_ctx.alloc.free(extracted);
         return .{ .string = try ctx.arena.dupe(u8, extracted) };
@@ -2274,4 +2349,61 @@ test "GCS fetch auto-selection is scoped and ambiguous peers require an explicit
     try cfg.gcs_connections.put(a, "peer", .{ .buckets = &buckets, .prefix = @constCast("objects/sha256") });
     try std.testing.expectError(error.AmbiguousGcsConnection, selectGcsConnection(&cfg, &location, null));
     try std.testing.expect((try selectGcsConnection(&cfg, &location, "peer")) == cfg.gcs_connections.getPtr("peer").?);
+}
+
+const compiled_pdf_tests = if (@hasDecl(@import("build_options"), "shared_pdf_templates") and @import("build_options").shared_pdf_templates) struct {
+    test "compiled template PDF uses shared defaults without changing text or diagnostic directives" {
+        const allocator = std.testing.allocator;
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "lib/pdf/testdata/simple_text_fixture.pdf", allocator, .limited(1024 * 1024));
+        defer allocator.free(bytes);
+        var context = RenderContext{ .alloc = allocator, .remote_bytes_remaining = 1024 * 1024 };
+        const text = switch (context.pdfBytes(bytes, .extract_text)) {
+            .bytes => |value| value,
+            .failure => return error.UnexpectedPdfFailure,
+        };
+        defer allocator.free(text);
+        try std.testing.expectEqualStrings("Hello Fixture\n", text);
+        switch (try pdfBytesForHelper(allocator, &context, "not a PDF", .extract_text)) {
+            .bytes => |value| {
+                allocator.free(value);
+                return error.ExpectedPdfFailure;
+            },
+            .directive => |directive| {
+                defer allocator.free(directive);
+                const original = try template_mod.formatErrorDirective(allocator, 0, "InvalidPdfHeader");
+                defer allocator.free(original);
+                try std.testing.expectEqualStrings(original, directive);
+                try std.testing.expect(context.fatal_error == null);
+            },
+        }
+    }
+
+    test "compiled template PDF retains explicit backend overrides and fatal allocation outcomes" {
+        const Override = struct {
+            fn extract(_: *const anyopaque, _: Allocator, _: []const u8) anyerror![]u8 {
+                return error.TemplatePdfOverrideSentinel;
+            }
+            fn render(_: *const anyopaque, _: Allocator, _: []const u8) anyerror![]u8 {
+                return error.TemplatePdfOverrideSentinel;
+            }
+        };
+        const marker: u8 = 0;
+        var context = RenderContext{ .alloc = std.testing.allocator, .remote_bytes_remaining = 1024, .pdf_backend = .{ .ptr = &marker, .extract_text_fn = Override.extract, .render_first_page_png_fn = Override.render } };
+        switch (context.pdfBytes("", .extract_text)) {
+            .bytes => return error.ExpectedOverride,
+            .failure => |failure| try std.testing.expectEqualStrings("TemplatePdfOverrideSentinel", failure.name()),
+        }
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "lib/pdf/testdata/simple_text_fixture.pdf", std.testing.allocator, .limited(1024 * 1024));
+        defer std.testing.allocator.free(bytes);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        context.pdf_backend = null;
+        context.alloc = failing.allocator();
+        try std.testing.expectError(error.OutOfMemory, pdfBytesForHelper(std.testing.allocator, &context, bytes, .extract_text));
+        try std.testing.expectEqual(error.OutOfMemory, context.fatal_error.?);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+} else struct {};
+
+test {
+    _ = compiled_pdf_tests;
 }

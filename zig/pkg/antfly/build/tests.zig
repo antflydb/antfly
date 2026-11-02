@@ -5047,6 +5047,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, template_test_mod, false, true);
     const lib_template_tests = b.addTest(.{
         .root_module = template_test_mod,
+        .filters = b.option([]const []const u8, "template-test-filter", "Compile only selected template test names") orelse &.{},
     });
     // template_remote imports Antfly runtime ABI tests, whose intentional
     // error paths use the repository runner's expected-log accounting.

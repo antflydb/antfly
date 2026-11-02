@@ -17,7 +17,7 @@ rejected mutation outlining experiment are recorded in
 | P0 measurement tools | Both-product CPU profiling, tested Mach-O map reader, pinned compiler time-report collector, scoped Linux memory snapshots implemented; full baseline qualification and server map still pending |
 | P1a opaque PDF session | Retained state, stable allocator/deadline adapters, operation cancellation, directly charged PNG output and compiled source-free tests implemented |
 | Media build isolation | Fixed automatic storage/inference linking into media-only tests; provider/client/contract cache matrix passed |
-| P1b/P1c production migration | Open: bounded batch/raster/analysis contracts, executor and admission borrowing, all existing PDF/image callers and caches |
+| P1b/P1c production migration | Template PDF defaults have a tested opt-in owner migration; [product screening is pending](history/template-pdf-owner-2026-11-02.md). Batch/raster/analysis contracts and remaining PDF/image callers/caches are open |
 | P2–P7 redesigns | Open, apart from the media cache matrix above; acceptance gates remain unchanged |
 
 P1a and the measurement tools do not establish smaller production binaries or

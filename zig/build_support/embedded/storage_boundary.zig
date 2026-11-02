@@ -34,6 +34,7 @@ pub const Modules = struct {
     query: *std.Build.Module,
     enrichment: *std.Build.Module,
     query_client: *std.Build.Module,
+    pdf_backend_client: *std.Build.Module,
     physical_sources: *std.Build.Step.Options,
     control_sources: *std.Build.Step.Options,
     direct_runtime: *std.Build.Step.Options,
@@ -111,6 +112,9 @@ pub fn createWithOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimi
     const enrichment = b.createModule(.{ .root_source_file = local_path.path(b, "storage/enrichment_compute_abi.zig"), .target = target, .optimize = optimize });
     enrichment.addImport("runtime_failure_abi", failure);
     enrichment.addImport("runtime_memory_abi", memory);
+    const pdf_backend_client = b.createModule(.{ .root_source_file = local_path.path(b, "storage/pdf_backend_client.zig"), .target = target, .optimize = optimize });
+    pdf_backend_client.addImport("enrichment_compute_abi", enrichment);
+    pdf_backend_client.addImport("kernel_error_identity", identity);
     const query_client = b.createModule(.{ .root_source_file = local_path.path(b, "storage/query_client.zig"), .target = target, .optimize = optimize });
     query_client.addImport("local_query_abi", query);
     query_client.addImport("kernel_error_identity", identity);
@@ -143,6 +147,7 @@ pub fn createWithOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimi
         .query = query,
         .enrichment = enrichment,
         .query_client = query_client,
+        .pdf_backend_client = pdf_backend_client,
         .physical_sources = physical_sources,
         .control_sources = control_sources,
         .direct_runtime = direct_runtime,

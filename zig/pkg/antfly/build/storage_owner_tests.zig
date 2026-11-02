@@ -122,17 +122,38 @@ pub fn add(
         .link_libc = true,
     });
     pdf_consumer.addImport("pdf_session_client", pdf_client);
+    pdf_consumer.addImport("pdf_backend_client", imports.storage_boundary.pdf_backend_client);
     pdf_consumer.addImport("enrichment_compute_abi", imports.storage_boundary.enrichment);
     const pdf_tests = @import("linked_tests.zig").add(b, .{
         .name = "opaque-pdf-session-tests",
         .root_module = pdf_consumer,
-        .filters = &.{"opaque PDF session"},
+        .filters = &.{ "opaque PDF session", "opaque PDF backend" },
         .max_rss = 1024 * 1024 * 1024,
     });
     pdf_tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
     runs[4] = pdf_tests.run(b);
     b.step("opaque-pdf-session-test", "Test retained PDF state from a source-free client").dependOn(&runs[4].step);
     b.step("opaque-pdf-consumer-compile", "Compile the PDF client without building its implementation owner").dependOn(&pdf_tests.object.step);
+    const template_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/template_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    var template_imports = imports;
+    template_imports.shared_pdf_templates = true;
+    const template_options = @import("../../../build_support/embedded/storage.zig").makeRootBuildOptions(b, false, false, true, false, false);
+    template_options.addOption(bool, "shared_pdf_templates", true);
+    template_imports.build_options = template_options;
+    template_imports.configureEmbedded(b, template_module, true);
+    @import("../../../build_support/embedded/source_owner.zig").registerStorageIndependent(template_module);
+    const template_tests = @import("linked_tests.zig").add(b, .{
+        .name = "compiled-template-pdf-tests",
+        .root_module = template_module,
+        .filters = &.{"compiled template PDF"},
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    template_tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
+    b.step("compiled-template-pdf-test", "Check compiled template PDF default, exact errors and backend overrides").dependOn(&template_tests.run(b).step);
     const opaque_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/opaque_query_owner_test_root.zig"), .target = target, .optimize = optimize });
     opaque_module.link_libc = true;
     opaque_module.addImport("kernel_owner_abi", imports.storage_boundary.owner);

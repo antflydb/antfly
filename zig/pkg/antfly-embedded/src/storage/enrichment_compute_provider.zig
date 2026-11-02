@@ -342,6 +342,31 @@ pub fn renderPdfPagePng(
     return status;
 }
 
+/// Use the original backend operations verbatim: text ordering/error skipping,
+/// 72-DPI first-page rendering, exact sampling and default limits remain here.
+pub fn pdfBackend(
+    request: *const abi.PdfBackendRequest,
+    out_bytes: *abi.CallerOwnedBytes,
+    out_failure: *abi.FailureIdentity,
+) callconv(.c) abi.Status {
+    out_bytes.* = .{};
+    out_failure.* = .{};
+    if (request.version != abi.abi_version)
+        return fail(error.InvalidAbiVersion, .pdf_backend, out_failure);
+    const allocator = request.allocator orelse return fail(error.InvalidArgument, .pdf_backend, out_failure);
+    if (!allocator.valid() or (request.pdf_bytes.len != 0 and request.pdf_bytes.ptr == null))
+        return fail(error.InvalidArgument, .pdf_backend, out_failure);
+    const alloc = allocator.asStd();
+    const backend = @import("antfly_pdf").Backend.native();
+    const result = switch (request.operation) {
+        .extract_text => backend.extractText(alloc, request.pdf_bytes.slice()),
+        .render_first_page_png => backend.renderFirstPagePng(alloc, request.pdf_bytes.slice()),
+        _ => return fail(error.InvalidArgument, .pdf_backend, out_failure),
+    } catch |err| return fail(err, .pdf_backend, out_failure);
+    out_bytes.* = .{ .ptr = if (result.len == 0) null else result.ptr, .len = @intCast(result.len) };
+    return .ok;
+}
+
 fn fail(
     err: anyerror,
     operation: abi.EnrichmentOperation,
