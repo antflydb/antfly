@@ -41,8 +41,10 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
       commitMutations(inputs,deadline){this.groupSizes??=[];this.groupSizes.push(inputs.length);return super.commitMutations(inputs,deadline);}
       mutationDiagnostics(){return this.groupSizes??[];}
       openReadView(options){this.views=(this.views??0)+1;return super.openReadView(options);}
-      beginPublication(...args){this.begins=(this.begins??0)+1;return super.beginPublication(...args);}
-      finalizePublication(...args){this.finals=(this.finals??0)+1;return super.finalizePublication(...args);}
+      async beginPublication(...args){this.begins=(this.begins??0)+1;if(this.publicationTestDelay)await new Promise(r=>setTimeout(r,this.publicationTestDelay));return super.beginPublication(...args);}
+      finalizePublication(...args){this.finals=(this.finals??0)+1;this.publicationObservation=args[1];if(this.publicationTestFailure){const code=this.publicationTestFailure;this.publicationTestFailure=null;throw Error(code);}return super.finalizePublication(...args);}
+      lowerPublicationBudget(...args){this.publicationReductions=(this.publicationReductions??0)+1;return super.lowerPublicationBudget(...args);}
+      async publicationTest(input){if(input.arm){this.publicationTestDelay=80;this.publicationTestFailure=input.failure??null;}return{observation:this.publicationObservation??null,reductions:this.publicationReductions??0,budget:await this.publicationBudget(Number(this.env.PUBLICATION_RECORDS))};}
       publicationCall(...args){this.legacyCalls=(this.legacyCalls??0)+1;return super.publicationCall(...args);}
       latencyDiagnostics(){return{views:this.views??0,begins:this.begins??0,finals:this.finals??0,legacy:this.legacyCalls??0};}
       loseMaintenanceFinish(){this.loseFinish=true;return true;}
@@ -68,6 +70,8 @@ async function fixture(namespace, migration = false, inlineRoots = false) {
       if(path==="/runtime-capabilities"){for(const [binding,op] of [["READERS","mutate"],["BUILDERS","lookup"]]){try{await env[binding].getByName(JSON.stringify(["runtime-v1",env.ANTFLY_INCARNATION,0])).execute({op});return Response.json({rejected:false});}catch(error){if(!String(error).includes("RuntimeCapabilityUnsupported"))throw error;}}return Response.json({rejected:true});}
       if(path==="/arm-plan-retry"){await stub.armPlanRetry((await request.json()).code);return Response.json({armed:true});}
       if(path==="/plan-retry-diagnostics")return Response.json(await stub.planRetryDiagnostics());
+      if(path==="/publication-queue"){let retries=0,acks=0;await worker.queue({messages:[{body:{kind:"publish",incarnation:env.ANTFLY_INCARNATION},ack(){acks++;},retry(){retries++;}}]},env);return Response.json({retries,acks});}
+      if(path==="/publication-test")return Response.json(await stub.publicationTest(await request.json()));
       if(path==="/latency-counts")return Response.json(await stub.latencyDiagnostics());
       if(path==="/mutation-groups"){const tenant=request.headers.get("X-Antfly-Tenant"),name=tenant?JSON.parse(env.ANTFLY_TENANTS)[tenant].incarnation:env.ANTFLY_INCARNATION;return Response.json(await env.COMMITS.getByName(name).mutationDiagnostics());}
       if(path==="/wipe-platform"){await stub.erasePlatformStorage();return Response.json({done:true});}
@@ -340,5 +344,31 @@ test('native immutable write preparation survives authority refresh but rebuilds
    assert.equal((await f.call(input)).visibility,receipt.visibility);
    assert.equal((await f.call({op:'lookup',doc_id:code,required_visibility:receipt.visibility})).body,input.mutations[0].body);
   }
+ }finally{await f.close();}
+});
+
+for(const planned of[false,true])test(`publication feedback includes admission and HTTP resource failures reduce once (planned=${planned})`,async()=>{
+ const f=await fixture('publication-feedback-'+planned);
+ try{
+  if(planned){f.options.bindings.PUBLICATION_CONTINUATIONS='true';await f.reopen();}
+  await f.call({op:'mutate',operation_id:'seed',mutations:Array.from({length:8},(_,i)=>({kind:'upsert',doc_id:'doc'+i,body:'{"text":"bounded publication"}'}))});
+  await f.call({arm:true,failure:'HostedWorkingSetBudgetExceeded'},'/publication-test');
+  await f.call({op:'publish'},'/api',409);
+  let diagnostic=await f.call({},'/publication-test');
+  assert.equal(diagnostic.reductions,1,'HTTP publication must record resource feedback exactly once');
+  assert.equal(diagnostic.budget,4);
+  assert.ok(diagnostic.observation.elapsed_ms>=80,'feedback includes beginPublication admission wait');
+  while((await f.call({op:'publish'})).has_more){}
+  diagnostic=await f.call({},'/publication-test');assert.equal(diagnostic.reductions,1);
+  assert.equal((await f.call({op:'count'})).count,'8');
+  assert.equal(JSON.parse((await f.call({op:'lookup',doc_id:'doc7'})).body).text,'bounded publication');
+  await f.call({op:'mutate',operation_id:'queued',mutations:[{kind:'upsert',doc_id:'queued',body:'{"text":"queued"}'}]});
+  const priorBudget=diagnostic.budget;
+  await f.call({arm:true,failure:'HostedWorkingSetBudgetExceeded'},'/publication-test');
+  assert.deepEqual(await f.call({},'/publication-queue'),{retries:1,acks:0});
+  diagnostic=await f.call({},'/publication-test');assert.equal(diagnostic.reductions,2,'queue wrapper must not halve capacity a second time');
+  assert.equal(diagnostic.budget,Math.max(1,Math.floor(priorBudget/2)));
+  while((await f.call({op:'publish'})).has_more){}
+  assert.equal((await f.call({op:'count'})).count,'9');
  }finally{await f.close();}
 });

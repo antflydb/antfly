@@ -33,7 +33,7 @@ test("publication feedback separates fixed network wait from admitted capacity",
  assert.equal(nextPublicationBudget(64,64,healthy),64);
  assert.equal(nextPublicationBudget(64,64,{...healthy,records:1}),64,"short WAL tails must not collapse the budget");
  let budget=1;
- for(let i=0;i<6;i++)budget=nextPublicationBudget(budget,64,{...healthy,records:budget});
+ for(let i=0;i<6;i++)budget=nextPublicationBudget(budget,64,{...healthy,records:budget,native_elapsed_ms:1000,native_io_wait_ms:900});
  assert.equal(budget,64,"healthy full prefixes recover from a previously clamped budget");
  assert.equal(nextPublicationBudget(64,64,{...healthy,operations:960}),40);
  assert.equal(nextPublicationBudget(64,64,{...healthy,transferred_bytes:30*1024*1024}),40);
@@ -46,8 +46,22 @@ test("publication feedback separates fixed network wait from admitted capacity",
 test("publication feedback retains wall deadline headroom during slow storage",()=>{
  const ioBound={records:16,operations:64,transferred_bytes:600000,working_set_peak_bytes:600000,native_elapsed_ms:24000,native_io_wait_ms:23900};
  assert.equal(nextPublicationBudget(16,64,ioBound),12,"successful slow prefixes shrink before the unchanged 30 second deadline");
- assert.equal(nextPublicationBudget(8,64,{...ioBound,records:8,native_elapsed_ms:21000,native_io_wait_ms:20900}),8,"recovered prefixes must not immediately double into timeout");
- assert.equal(nextPublicationBudget(8,64,{...ioBound,records:8,native_elapsed_ms:14000,native_io_wait_ms:13900}),16,"ample wall headroom still allows recovery");
+ assert.equal(nextPublicationBudget(8,64,{...ioBound,records:8,native_elapsed_ms:21000,native_io_wait_ms:20900}),6,"recovered prefixes must leave room for storage variation");
+ assert.equal(nextPublicationBudget(8,64,{...ioBound,records:8,native_elapsed_ms:14000,native_io_wait_ms:13900}),10,"growth must fit projected wall headroom");
+});
+test("publication feedback accounts for admission and predicts slow-storage growth",()=>{
+ const sample={records:64,operations:79,transferred_bytes:1032206,working_set_peak_bytes:162881,native_elapsed_ms:18000,native_io_wait_ms:17900};
+ assert.equal(nextPublicationBudget(64,64,{...sample,elapsed_ms:27000}),42,"admission and finalization consume wall headroom too");
+ assert.equal(nextPublicationBudget(64,64,{...sample,elapsed_ms:NaN}),64,"invalid observations cannot change capacity");
+ for(const perRecord of[100,400,1000]){
+  let budget=1;
+  for(let i=0;i<12;i++){
+   const elapsed=1000+perRecord*budget;
+   budget=nextPublicationBudget(budget,64,{...sample,records:budget,native_elapsed_ms:elapsed-500,native_io_wait_ms:elapsed-600,elapsed_ms:elapsed});
+   assert.ok(1000+perRecord*budget<=22500,"projected prefix must stay within the unchanged deadline guard");
+  }
+  assert.ok(budget>1,"healthy capacity should recover from a one-record prefix");
+ }
 });
 test("queue delay and early cancellation do not lower publication capacity",()=>{
  const canceled=Error("Canceled");

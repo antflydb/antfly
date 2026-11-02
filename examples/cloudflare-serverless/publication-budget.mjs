@@ -26,12 +26,20 @@ export function nextPublicationBudget(current,maximum,sample,{targetComputeMs=20
  const load=Math.max(sample.operations/operations,sample.transferred_bytes/bytes,sample.working_set_peak_bytes/(workingSetBytes*.75),active/targetComputeMs);
  // Network wait does not consume compute, but it still consumes the unchanged
  // native deadline. Do not grow back into a prefix that repeatedly times out.
- const wallLoad=sample.native_elapsed_ms/nativeDeadlineGuardMs;
+ // Include admission/probe/coordinator work when the caller supplies it.
+ // Older callers still supply a valid native-only lower bound.
+ if(sample.elapsed_ms!==undefined&&(!Number.isFinite(sample.elapsed_ms)||sample.elapsed_ms<0))return current;
+ const wallLoad=Math.max(sample.native_elapsed_ms,sample.elapsed_ms??0)/nativeDeadlineGuardMs;
  const boundedLoad=Math.max(load,wallLoad);
- if(boundedLoad>1)return Math.max(1,Math.min(current,Math.floor(sample.records/boundedLoad*.8)));
+ if(boundedLoad>.8)return Math.max(1,Math.min(current,Math.floor(sample.records/boundedLoad*.8)));
  // A short WAL tail is not evidence that the configured prefix is too large.
  // Grow only when a complete admitted prefix actually used little capacity.
- if(sample.records>=current&&load<.5&&wallLoad<.8)return Math.min(maximum,current*2);
+ if(sample.records>=current&&load<.5&&wallLoad<.8){
+  // A doubled prefix must fit the measured resource and wall headroom.
+  // Slow successful I/O is not evidence that twice the work will fit.
+  const projected=boundedLoad===0?maximum:Math.floor(sample.records*.8/boundedLoad);
+  return Math.max(current,Math.min(maximum,current*2,projected));
+ }
  return current;
 }
 export function publicationExecutionFailure(error,metrics){

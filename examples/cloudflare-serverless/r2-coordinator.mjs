@@ -272,6 +272,7 @@ export class R2CommitCoordinator extends DurableObject {
     return{ioBudget,deadlineMs,boot:this.env.RESIDENT_COLD_PIPELINE==="true"?await boot.encodeCompressed():boot.encode()};
   }
   async finalizePublication(batch,observation,readHints){
+    const finalizeStarted=performance.now();
     const keys=await publicationKeys(this.env.ANTFLY_INCARNATION,batch?.format===3),prepared=await this.prepareResidentPublication(batch,{},readHints);
     const result=await this.transaction(async tx=>{
       await this.nativePublication(tx,"publication_validate",batch?.lease);
@@ -282,12 +283,15 @@ export class R2CommitCoordinator extends DurableObject {
       if(head)writeReadHints(tx,this.env.ANTFLY_INCARNATION,new TextDecoder().decode(head[1].body).trim(),readHints);
       if(!(await this.nativePublication(tx,"publication_release",batch.lease)).released)throw Error("WorkLeaseLost");
       if(this.env.PUBLICATION_ADAPTIVE_SLICES==="true"&&Number.isSafeInteger(observation?.posting_quantum)&&observation.posting_quantum>=1&&observation.posting_quantum<=4096)tx.put("__antfly_publication_quantum_limit",observation.posting_quantum);
-      if(observation&&Number.isFinite(observation.elapsed_ms)&&observation.elapsed_ms>=0&&observation.elapsed_ms<=30000&&Number.isInteger(observation.records)&&observation.records>=1&&observation.records<=256){
+      if(observation&&Number.isFinite(observation.elapsed_ms)&&observation.elapsed_ms>=0&&Number.isInteger(observation.records)&&observation.records>=1&&observation.records<=256){
         const maximum=Number(this.env.PUBLICATION_RECORDS??16),target=Number(this.env.PUBLICATION_SLICE_MS??2000);
         if(!Number.isSafeInteger(target)||target<250||target>10000)throw Error("InvalidPublicationSlice");
         const current=Math.min(maximum,await tx.get("__antfly_publication_budget")??maximum);
-        const next=nextPublicationBudget(current,maximum,observation,{targetComputeMs:target,workingSetBytes:Number(this.env.WORKING_SET_BYTES??20*1024*1024)});
-        if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.publication_feedback",current,next,maximum,...observation}));
+        // Add preparation and validation to the same observation; the 25%
+        // deadline guard reserves headroom for the remaining durable commit.
+        const feedback={...observation,elapsed_ms:observation.elapsed_ms+performance.now()-finalizeStarted};
+        const next=nextPublicationBudget(current,maximum,feedback,{targetComputeMs:target,workingSetBytes:Number(this.env.WORKING_SET_BYTES??20*1024*1024)});
+        if(this.env.LOG_METRICS==="true")console.log(JSON.stringify({event:"antfly.publication_feedback",current,next,maximum,...feedback}));
         if(next!==current)tx.put("__antfly_publication_budget",next);
       }
       return{committed:true};

@@ -191,7 +191,6 @@ export default {
     for (const message of batch.messages) {
       let env;try{env=tenantEnv(rootEnv,message.body?.tenant);}catch{message.ack();continue;}
       if (message.body?.incarnation !== env.ANTFLY_INCARNATION) { message.ack(); continue; }
-      let publishing = !message.body.kind || ["publish","reindex"].includes(message.body.kind);
       try {
         if(message.body.kind==="maintenance_tick"){
           if(env.COORDINATOR_BACKEND!=="r2"||!Number.isSafeInteger(message.body.scheduled_time)||message.body.scheduled_time<0||message.body.scheduled_time>Date.now()+60000){message.ack();continue;}
@@ -225,7 +224,6 @@ export default {
         if(publication){try{if(!await takeRpcData(stub.validPublication(publication))){message.ack();continue;}}catch(error){if(!unsupportedRpc(error,"validPublication"))throw error;publication=undefined;}}
         const trace=new CriticalPath({id:publication,scope:"publication"});trace.publicationId=publication;
         let result;try{result = await run(env, { op: "publish" },undefined,undefined,trace);}finally{trace.emit(env.LOG_METRICS==="true");}
-        publishing = false;
         if (result.has_more) {
           if (!await enqueue(env,"publish",publication)) throw new Error("maintenance queue is not configured");
         } else if (publication && (await takeRpcData(stub.finishPublication(publication,result.wal_end_lsn))).has_more) {
@@ -240,9 +238,8 @@ export default {
         message.ack();
       } catch (error) {
         console.error("Antfly publication deferred", String(error));
-        if (publishing && publicationFailureReducesBudget(error)) {
-          await takeRpcData(env.COMMITS.getByName(env.ANTFLY_INCARNATION).lowerPublicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)));
-        }
+        // Reindex uses its legacy path; publication feedback lives in the runtime.
+        if(message.body.kind==="reindex"&&publicationFailureReducesBudget(error))await takeRpcData(env.COMMITS.getByName(env.ANTFLY_INCARNATION).lowerPublicationBudget(Number(env.PUBLICATION_RECORDS??16)));
         message.retry({ delaySeconds: 10 });
       }
     }

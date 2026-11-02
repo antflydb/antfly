@@ -118,6 +118,30 @@ retain takeover/receipt/collection safety. Evaluate slow and variable GET/PUT
 schedules locally before a fresh hosted attempt. Raising limits or repeatedly
 retrying a failing prefix is not evidence that this path is qualified.
 
+The runtime now feeds admitted publication wall time (including the probe and
+lease RPCs) into capacity feedback. Finalization adds its preparation and
+validation time before computing the next budget; the remaining durable commit
+uses the existing headroom reserve. Growth is capped by projected measured
+resource/wall capacity rather than blindly doubling a slow successful prefix.
+Near-guard successful prefixes shrink before hitting the hard limit. Resource
+failure feedback runs in the shared publication runtime after lease cleanup, so
+HTTP and Queue callers both reduce capacity once per failed execution. Queue
+reindex retains its existing separate feedback path. Local slow-storage models
+and workerd admission/failure/retry checks cover this feedback; these changes do
+not establish a hosted latency improvement, bound the first unobserved prefix,
+or provide a continuation inside an ordinary fast batch. Those remain work
+before another hosted qualification attempt.
+
+Validation for this feedback change: 630 Node tests pass, including simulated
+slow-storage capacity recovery. The R2 workerd suite passes 16 of 18 checks,
+including publication failure/retry through HTTP and Queue and exact count/body
+verification. Conditional-root and bounded-journal update tests trap with native
+`unreachable` on a second mutation after publication. Both reproduce using the
+previous committed JavaScript (`eef2a5a18e`) and the same retained WASM modules;
+they are unresolved existing native-path failures, not passing regression checks
+or evidence of a `SQLITE_NOMEM` cause. Preserve those failures before qualifying
+these metadata backends.
+
 All 11 Workers, six captured namespaces and four R2 buckets have explicit scoped
 404 absence checks; three disposable app-token files are removed. Two export
 configurations remain pending: deployment authentication returns 403 for their

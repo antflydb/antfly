@@ -20,7 +20,7 @@ import {PublicationReadHints} from "./publication-read-hints.mjs";
 import {PreparedPublication} from "./prepared-publication.mjs";
 import {CriticalPath} from "./trace.mjs";
 import {publicationCoordinator} from "./publication-view.mjs";
-import {publicationExecutionFailure} from "./publication-budget.mjs";
+import {publicationExecutionFailure,publicationFailureReducesBudget} from "./publication-budget.mjs";
 import {prepareReadAdmission} from "./read-admission.mjs";
 import {withReadView} from "./read-view.mjs";
 import {withPointReadLane} from "./point-read-lane.mjs";
@@ -171,7 +171,9 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
   let lane = actorMutation?null:lanes[role];
   let recycleAtBytes = 24 * 1024 * 1024;
   let physical;
-  let preparedPublication,abortPublication,publicationStarted,emitOperationMetrics,nativeMetrics,operationSucceeded=false,publicationFinalized=false,readYielded=false;
+  let preparedPublication,abortPublication,lowerPublicationBudget,publicationFailure,emitOperationMetrics,nativeMetrics,operationSucceeded=false,publicationFinalized=false,readYielded=false;
+  // Start after kernel admission, before publication planning and lease RPCs.
+  const publicationStarted=performance.now();
   try {
     const configuredRecycle = Number(env.WASM_RECYCLE_BYTES ?? recycleAtBytes);
     if (!Number.isSafeInteger(configuredRecycle) || configuredRecycle < 4 * 1024 * 1024 || configuredRecycle > recycleAtBytes) throw new Error("InvalidHostedRecycleBudget");
@@ -196,16 +198,17 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     for(const[key,value]of Object.entries(readAdmission?.nativeResume?.physical??{}))if(typeof value==="number")physical[key]=(physical[key]??0)+value;
     const stub=env.COMMITS.getByName(env.ANTFLY_INCARNATION),readHints=env.COORDINATOR_BACKEND==="r2"&&["publish","compact","reindex"].includes(input.op)?new PublicationReadHints(env.ANTFLY_INCARNATION):null;
     const rpc=async(method,...args)=>{physical.rpc_calls=(physical.rpc_calls??0)+1;if(method==="publicationCall"||method==="objectCall")countMetadataRpc(physical,args[0]);const start=performance.now();try{return await trace.span("rpc:"+method,()=>takeRpcData(stub[method](...args)));}finally{physical.rpc_wait_ms=(physical.rpc_wait_ms??0)+performance.now()-start;}};
+    lowerPublicationBudget=()=>rpc("lowerPublicationBudget",Number(env.PUBLICATION_RECORDS??16));
     const coordinator={objectCall:(request,body)=>rpc("objectCall",request,body,readHints?.forHead(request,body)),openReadView:options=>rpc("openReadView",{...options,trace_id:trace.id})};
     let publicationView;
     if(env.COORDINATOR_BACKEND==="r2"&&["publish","compact"].includes(input.op)){
       if(input.op==="compact"&&input.operation_id!==undefined){
         publicationView=await rpc("beginCompaction",input.operation_id);
         if(publicationView.complete){operationSucceeded=true;return publicationView.result;}
-        preparedPublication=new PreparedPublication(publicationView,{foldWal:env.WAL_DEFERRED_INDEXES==="true"});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);
+        preparedPublication=new PreparedPublication(publicationView,{foldWal:env.WAL_DEFERRED_INDEXES==="true"});abortPublication=()=>rpc("abortPublication",publicationView.lease);
       }
       if(input.op==="publish"&&env.BATCHED_PUBLICATION!=="false"&&env.PUBLICATION_CONTINUATIONS!=="true"){
-        try{publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16));preparedPublication=new PreparedPublication(publicationView,{foldWal:env.WAL_DEFERRED_INDEXES==="true",read:(request,body)=>rpc("objectCall",request,body)});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);}
+        try{publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16));preparedPublication=new PreparedPublication(publicationView,{foldWal:env.WAL_DEFERRED_INDEXES==="true",read:(request,body)=>rpc("objectCall",request,body)});abortPublication=()=>rpc("abortPublication",publicationView.lease);}
         catch(error){if(!unsupportedRpc(error,"beginPublication"))throw error;}
       }
       try{const method=input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"?"openPublicationPlan":"openPublication";publicationView??=await rpc(method,Number(env.PUBLICATION_RECORDS??16));}
@@ -222,7 +225,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
     if(readAdmission?.nativePlan)transport=withNativeReadPlan(transport,coordinator,env.ANTFLY_INCARNATION,{fresh:readAdmission.nativePlan.fresh,retainImmutable,onMetrics:sample=>{for(const[key,value]of Object.entries(sample))physical[key]=(physical[key]??0)+value;}});
     if(readAdmission?.nativePreparation)transport=withNativeReadPreparation(transport);
     const activeContinuation=env.PUBLICATION_PREPARED_SLICES==="true"&&input.op==="publish"&&env.PUBLICATION_CONTINUATIONS==="true"&&input.publication_action!=="status"&&publicationView?.entries?.some(([key,record])=>key.endsWith("/PUBLICATION_PLAN")&&record?.body?.byteLength>0);
-    if(activeContinuation){publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16),true);preparedPublication=new PreparedPublication(publicationView,{foldWal:env.WAL_DEFERRED_INDEXES==="true",read:(request,body)=>rpc("objectCall",request,body)});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);transport=withCommitCoordinator(transport,preparedPublication,collection);}
+    if(activeContinuation){publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16),true);preparedPublication=new PreparedPublication(publicationView,{foldWal:env.WAL_DEFERRED_INDEXES==="true",read:(request,body)=>rpc("objectCall",request,body)});abortPublication=()=>rpc("abortPublication",publicationView.lease);transport=withCommitCoordinator(transport,preparedPublication,collection);}
     const publicationBudget = publicationView?.budget??(["publish", "reindex"].includes(input.op) ? await env.COMMITS.getByName(env.ANTFLY_INCARNATION).publicationBudget(Number(env.PUBLICATION_RECORDS ?? 16)) : 16);
     const settings = input.op === "latest" ? {} : { ...(["conditional","bounded-journal"].includes(env.METADATA_ROOT_BACKEND)&&["lookup","list","count","search","status"].includes(input.op)?{bounded_manifest_reads:true}:{}), ...(env.NATIVE_READ_STATE==="true"?{native_read_state:true}:{}),...(env.WAL_DOCUMENT_INDEX==="true"?{wal_document_index:true}:{}), wal_inline_tail:env.WAL_INLINE_TAIL==="true", coarse_probes:Number(input.coarse_probes??env.ANN_COARSE_PROBES??0), enrichment: Boolean(env.EMBEDDING_MODEL), embedding_dimensions: Number(env.EMBEDDING_DIMENSIONS ?? 384), publication_records: publicationBudget,
       publication_lease:preparedPublication?.lease??null,
@@ -284,7 +287,7 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
       probeOperations=nativeMetrics.operations;probeBytes=nativeMetrics.transferred_bytes;probeMetrics=nativeMetrics;
       if(probeOperations>=1024||probeBytes>=32*1024*1024)throw Error("ObjectIoBudgetExceeded");
       if(env.LOG_METRICS==="true")console.log(JSON.stringify({event:plannedCompact?"antfly.compaction_plan":"antfly.publication_batch_plan",trace_id:trace.id,operations:probeOperations,transferred_bytes:probeBytes}));
-      publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16),preparedSlice);preparedPublication=new PreparedPublication(publicationView,{foldWal:env.WAL_DEFERRED_INDEXES==="true",read:(request,body)=>rpc("objectCall",request,body)});publicationStarted=performance.now();abortPublication=()=>rpc("abortPublication",publicationView.lease);
+      publicationView=await rpc("beginPublication",Number(env.PUBLICATION_RECORDS??16),preparedSlice);preparedPublication=new PreparedPublication(publicationView,{foldWal:env.WAL_DEFERRED_INDEXES==="true",read:(request,body)=>rpc("objectCall",request,body)});abortPublication=()=>rpc("abortPublication",publicationView.lease);
       transport=withCommitCoordinator(transport,preparedPublication,collection);
       result=await executeNative(false);
     }
@@ -298,9 +301,14 @@ async function run(env, input, signal, collection, host, trace,readAdmission,req
   } catch (error) {
     if(readAdmission?.nativePlan){try{(await readAdmission.nativePlan.fresh)?.invalidate?.();}catch{}}else readAdmission?.invalidate?.();
     if (/IntegrityMismatch/.test(String(error))) cache.clear();
-    throw preparedPublication?publicationExecutionFailure(error,nativeMetrics):error;
+    const failure=preparedPublication?publicationExecutionFailure(error,nativeMetrics):error;
+    if(input.op==="publish"&&lowerPublicationBudget&&!publicationFinalized&&publicationFailureReducesBudget(failure))publicationFailure=failure;
+    throw failure;
   } finally {
     if(abortPublication&&!publicationFinalized)try{await abortPublication();}catch(error){console.error("Antfly publication lease cleanup deferred",String(error));}
+    // Share resource feedback across HTTP and queue callers, exactly once.
+    // Release the old work lease before acquiring coordinator feedback capacity.
+    if(publicationFailure)try{await lowerPublicationBudget();}catch(error){console.error("Antfly publication budget feedback deferred",String(error));}
     requestOptions.onPhysicalMetrics?.(physical);
     try{if(readAdmission?.nativePreparation)emitOperationMetrics?.();else if(requestOptions.deferMetrics&&emitOperationMetrics)requestOptions.deferMetrics(emitOperationMetrics);else emitOperationMetrics?.();}catch{}
     // Linear memory cannot shrink. Recycle between requests before allocator
