@@ -236,13 +236,17 @@ fn directSessionRuntime(
     if (context.attachment_target != .whole_model) return null;
     if (!shouldAttach(context, .single_device)) return null;
 
-    if (cache.getSessionCompiledModelRuntime(.metal, context.attachment_target)) |runtime| {
-        return runtime;
-    }
-
     const session = context.session orelse return null;
     const gpt_config = context.gpt_config orelse return null;
     if (!metal_executor.supportsSession(session)) return null;
+    const owner = cache_mod.SessionRuntimeOwner{
+        .session_ptr = session.ptr,
+        .session_vtable = session.vtable,
+        .config_hash = cache_mod.hashConfigBytes(std.mem.asBytes(&gpt_config)),
+        .kv_dtype = context.kv_dtype,
+        .shared_moe_cache = context.shared_moe_cache,
+    };
+    if (cache.getOwnedSessionCompiledModelRuntime(.metal, context.attachment_target, owner)) |value| return value;
 
     var executor = try metal_executor.createModelExecutor(
         allocator,
@@ -253,12 +257,13 @@ fn directSessionRuntime(
     );
     defer executor.deinit();
 
-    return try compiled_backend.modelRuntimeForSessionExecutor(
+    return try compiled_backend.modelRuntimeForOwnedSessionExecutor(
         allocator,
         cache,
         .metal,
         context.attachment_target,
         &executor,
+        owner,
     );
 }
 

@@ -224,6 +224,16 @@ pub const CacheEntry = struct {
 
 pub const max_entries: usize = 32;
 
+/// A self-contained runtime owns its backend independently of request wrappers.
+/// Its loaded session must outlive the cache and every published output owner.
+pub const SessionRuntimeOwner = struct {
+    session_ptr: *anyopaque,
+    session_vtable: *const @import("../backends/session.zig").Session.VTable,
+    config_hash: u64,
+    kv_dtype: ?@import("../runtime/root.zig").kv.pool.KvDType,
+    shared_moe_cache: ?*@import("../runtime/root.zig").moe.shared.SharedExpertCache,
+};
+
 /// LRU cache of traced computation graphs.
 pub const GraphCache = struct {
     specializations: @import("../execution/specialization_cache.zig").Cache(CacheKey, *CacheEntry, entryKey, CacheKey.eql),
@@ -237,6 +247,7 @@ pub const GraphCache = struct {
     compiled_model_runtime_backend: ?contracts.BackendKind = null,
     compiled_model_runtime_attachment_target: ?CompiledAttachmentTarget = null,
     compiled_model_runtime: ?model_runtime.ModelRuntime = null,
+    compiled_model_runtime_owner: ?SessionRuntimeOwner = null,
 
     pub fn init(allocator: std.mem.Allocator) GraphCache {
         return .{
@@ -262,7 +273,9 @@ pub const GraphCache = struct {
     pub fn selectBackend(self: *GraphCache, cb: *const ComputeBackend) void {
         if (self.prepared_backend) |previous| {
             if (previous.ptr == cb.ptr and previous.vtable == cb.vtable) return;
-            self.freeSessionCompiledModelRuntime();
+            // Direct session runtimes own a separate backend. Request wrapper
+            // changes retire only resources borrowed from that wrapper.
+            if (self.compiled_model_runtime_owner == null) self.freeSessionCompiledModelRuntime();
             for (self.specializations.entries.items) |entry| retirePrepared(entry, &previous);
         }
         self.prepared_backend = cb.*;
@@ -280,6 +293,7 @@ pub const GraphCache = struct {
         self.compiled_model_runtime = null;
         self.compiled_model_runtime_backend = null;
         self.compiled_model_runtime_attachment_target = null;
+        self.compiled_model_runtime_owner = null;
     }
 
     pub fn resetSessionCompiledModelRuntime(self: *GraphCache) void {
@@ -322,6 +336,25 @@ pub const GraphCache = struct {
         self.selectSessionCompiledModelRuntimeBackend(backend, attachment_target);
         if (self.compiled_model_runtime) |*existing| existing.deinit();
         self.compiled_model_runtime = runtime_value;
+        self.compiled_model_runtime_owner = null;
+    }
+
+    pub fn getContextBoundSessionCompiledModelRuntime(self: *GraphCache, backend: contracts.BackendKind, target: CompiledAttachmentTarget) ?*model_runtime.ModelRuntime {
+        if (self.compiled_model_runtime_owner != null) return null;
+        return self.getSessionCompiledModelRuntime(backend, target);
+    }
+
+    pub fn getOwnedSessionCompiledModelRuntime(self: *GraphCache, backend: contracts.BackendKind, target: CompiledAttachmentTarget, owner: SessionRuntimeOwner) ?*model_runtime.ModelRuntime {
+        const existing = self.compiled_model_runtime_owner orelse return null;
+        if (!std.meta.eql(existing, owner)) return null;
+        return self.getSessionCompiledModelRuntime(backend, target);
+    }
+
+    /// Commit only after successful construction, preserving the old owner on
+    /// allocation failure. The slot remains bounded to one completed runtime.
+    pub fn putOwnedSessionCompiledModelRuntime(self: *GraphCache, backend: contracts.BackendKind, target: CompiledAttachmentTarget, owner: SessionRuntimeOwner, value: model_runtime.ModelRuntime) void {
+        self.putSessionCompiledModelRuntime(backend, target, value);
+        self.compiled_model_runtime_owner = owner;
     }
 
     /// Look up a cached graph by key. Returns null on cache miss.
@@ -1011,4 +1044,42 @@ test "GraphCache switches same-kind contexts without reusing device bindings" {
     entry.weight_inputs.?[0] = .{ .node_id = x, .value = &second };
     cache.clear();
     try std.testing.expectEqual(@as(usize, 1), second.frees);
+}
+
+test "owned session runtimes survive request backend changes and retire on owner replacement" {
+    var cache = GraphCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var markers = [_]u8{ 0, 1 };
+    const backend_table: ComputeBackend.VTable = undefined;
+    const session_table: @import("../backends/session.zig").Session.VTable = undefined;
+    const first = ComputeBackend{ .ptr = &markers[0], .vtable = &backend_table };
+    const second = ComputeBackend{ .ptr = &markers[1], .vtable = &backend_table };
+    const owner = SessionRuntimeOwner{ .session_ptr = &markers[0], .session_vtable = &session_table, .config_hash = 1, .kv_dtype = .f16, .shared_moe_cache = null };
+    var other = owner;
+    other.config_hash = 2;
+    var next_order: usize = 0;
+    var runtime_order: usize = 0;
+    var executor_order: usize = 0;
+    var ctx = MockModelRuntimeCtx{ .next_order = &next_order, .runtime_deinit_order = &runtime_order, .executor_deinit_order = &executor_order };
+    const value = model_runtime.ModelRuntime{ .ptr = &ctx, .vtable = &MockModelRuntimeCtx.runtime_vtable };
+    cache.selectBackend(&first);
+    cache.putOwnedSessionCompiledModelRuntime(.metal, .whole_model, owner, value);
+    cache.selectBackend(&second);
+    try std.testing.expectEqual(@as(usize, 0), next_order);
+    try std.testing.expect(cache.getOwnedSessionCompiledModelRuntime(.metal, .whole_model, owner) != null);
+    try std.testing.expect(cache.getOwnedSessionCompiledModelRuntime(.metal, .whole_model, other) == null);
+    try std.testing.expect(cache.getContextBoundSessionCompiledModelRuntime(.metal, .whole_model) == null);
+    // Probing a different namespace must not retire the current resource.
+    try std.testing.expectEqual(@as(usize, 0), next_order);
+    cache.putOwnedSessionCompiledModelRuntime(.metal, .whole_model, other, value);
+    try std.testing.expectEqual(@as(usize, 1), runtime_order);
+    cache.selectBackend(&first);
+    try std.testing.expectEqual(@as(usize, 1), next_order);
+    cache.resetSessionCompiledModelRuntime();
+    try std.testing.expectEqual(@as(usize, 2), runtime_order);
+    // Context-bound compatibility runtimes keep their original retirement rule.
+    cache.putSessionCompiledModelRuntime(.metal, .whole_model, value);
+    cache.selectBackend(&second);
+    try std.testing.expectEqual(@as(usize, 3), runtime_order);
+    try std.testing.expect(cache.compiled_model_runtime == null);
 }

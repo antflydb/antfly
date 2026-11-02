@@ -34,6 +34,7 @@ const Options = struct {
     iterations: usize = 20,
     output: ?[]const u8 = null,
     decoder_steps: usize = 0,
+    decoder_request_contexts: bool = false,
     diagnostics: bool = false,
     soak_seconds: u64 = 0,
     soak_pause_ms: u64 = 1000,
@@ -46,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
     var options = Options{};
     while (args.next()) |arg| {
         const value = args.next() orelse return error.MissingArgument;
-        if (std.mem.eql(u8, arg, "--primitive")) options.primitive = std.meta.stringToEnum(Primitive, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--rows")) options.rows = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--dim")) options.dim = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = value else if (std.mem.eql(u8, arg, "--backend")) options.backend = backend_choice.parse(value) orelse return error.InvalidBackend else if (std.mem.eql(u8, arg, "--batch")) options.batch = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--seq-len")) options.seq_len = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--warmup-iters")) options.warmup = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--measure-iters")) options.iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--output")) options.output = value else if (std.mem.eql(u8, arg, "--diagnostics")) options.diagnostics = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-steps")) options.decoder_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--soak-seconds")) options.soak_seconds = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-pause-ms")) options.soak_pause_ms = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-allocator")) options.soak_allocator = std.meta.stringToEnum(@TypeOf(options.soak_allocator), value) orelse return error.InvalidArgument else return error.InvalidArgument;
+        if (std.mem.eql(u8, arg, "--primitive")) options.primitive = std.meta.stringToEnum(Primitive, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--rows")) options.rows = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--dim")) options.dim = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = value else if (std.mem.eql(u8, arg, "--backend")) options.backend = backend_choice.parse(value) orelse return error.InvalidBackend else if (std.mem.eql(u8, arg, "--batch")) options.batch = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--seq-len")) options.seq_len = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--warmup-iters")) options.warmup = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--measure-iters")) options.iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--output")) options.output = value else if (std.mem.eql(u8, arg, "--diagnostics")) options.diagnostics = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-request-contexts")) options.decoder_request_contexts = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-steps")) options.decoder_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--soak-seconds")) options.soak_seconds = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-pause-ms")) options.soak_pause_ms = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-allocator")) options.soak_allocator = std.meta.stringToEnum(@TypeOf(options.soak_allocator), value) orelse return error.InvalidArgument else return error.InvalidArgument;
     }
     if (options.primitive) |primitive| {
         if (options.backend != .native or options.rows == 0 or options.dim == 0 or options.iterations == 0 or options.soak_seconds != 0) return error.InvalidGeometry;
@@ -74,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
     const model_loaded = inference.platform.time.awakeNs(init.io);
     const session = model.session;
     if (options.decoder_steps != 0) {
-        try runDecoder(init, model, a, options, &bounded);
+        if (options.decoder_request_contexts) try runDecoderRequests(init, model, a, options) else try runDecoder(init, model, a, options, &bounded);
         return;
     }
     if (@hasDecl(inference.backends.Session, "configureExecutionDiagnostics")) _ = session.configureExecutionDiagnostics(options.diagnostics);
@@ -338,6 +339,80 @@ fn runSoak(init: std.process.Init, session: inference.backends.Session, inputs: 
         if (options.soak_pause_ms != 0) try init.io.sleep(.fromMilliseconds(@intCast(options.soak_pause_ms)), .awake);
     }
     std.debug.print("soak_complete backend={s} iterations={d} elapsed_s={d} strict_resident={} alternating_inputs=true\n", .{ @tagName(session.backend()), iterations, (inference.platform.time.awakeNs(init.io) - start) / std.time.ns_per_s, @hasDecl(inference, "execution") });
+}
+
+/// Include request-wrapper construction and retirement. Alternating arenas
+/// keep the preceding wrapper's backing memory live, preventing pointer reuse
+/// from hiding an incorrectly context-scoped model-runtime cache.
+fn runDecoderRequests(init: std.process.Init, model: *inference.server.model_manager.LoadedModel, a: std.mem.Allocator, options: Options) !void {
+    if (options.batch != 1 or model.session.backend() != .metal or options.soak_seconds != 0) return error.UnsupportedModelRuntime;
+    const factory = inference.architectures.session_factory;
+    const graph = inference.graph;
+    const config = factory.getGptConfig(model.session) orelse return error.MissingDecoderConfig;
+    const prompt = try a.alloc(i64, options.seq_len);
+    defer a.free(prompt);
+    for (prompt, 0..) |*token, index| token.* = @intCast(1 + index % @max(@as(usize, 1), config.vocab_size - 1));
+    const samples = try a.alloc(u64, options.iterations);
+    defer a.free(samples);
+    var arenas = [_]std.heap.ArenaAllocator{ .init(a), .init(a) };
+    defer for (&arenas) |*arena| arena.deinit();
+    var cache = graph.cache.GraphCache.init(a);
+    defer cache.deinit();
+    var reference = std.ArrayListUnmanaged(f32).empty;
+    defer reference.deinit(a);
+    var previous: ?*anyopaque = null;
+    var creations: usize = 0;
+    var first_ns: u64 = 0;
+    for (0..options.warmup + options.iterations) |iteration| {
+        const start = inference.platform.time.awakeNs(init.io);
+        const index = iteration % arenas.len;
+        arenas[index].deinit();
+        arenas[index] = .init(a);
+        var cb = try factory.getComputeBackend(model.session, arenas[index].allocator());
+        var cb_live = true;
+        defer if (cb_live) cb.deinit();
+        if (previous == cb.ptr) return error.ContextAddressReused;
+        previous = cb.ptr;
+        const context = graph.execution.Context{
+            .allocator = a,
+            .cb = &cb,
+            .gpt_config = &config,
+            .session = model.session,
+            .model_dir = options.model_dir,
+            .compiled_partition_backend = .metal,
+            .compiled_attachment_target = .whole_model,
+        };
+        cache.selectBackend(&cb);
+        if (cache.compiled_model_runtime == null) creations += 1;
+        var values = std.ArrayListUnmanaged(f32).empty;
+        defer values.deinit(a);
+        const logits = (try graph.execution.graphForwardCompiledModelLast(&context, &cache, prompt, 1, prompt.len, &.{ .attention_mode = .paged_prefill, .total_sequence_len = prompt.len, .query_sequence_len = prompt.len, .kv_sequence_len = prompt.len })) orelse return error.UnsupportedModelRuntime;
+        defer a.free(logits);
+        if (logits.len != config.vocab_size) return error.InvalidDecoderOutput;
+        try values.appendSlice(a, logits);
+        for (0..options.decoder_steps) |step| {
+            const ids = [_]i64{@intCast(11 + step)};
+            const total = prompt.len + step + 1;
+            const next = (try graph.execution.graphForwardCompiledModelLast(&context, &cache, &ids, 1, total, &.{ .attention_mode = .paged_decode, .total_sequence_len = total, .query_sequence_len = 1, .kv_sequence_len = total })) orelse return error.UnsupportedModelRuntime;
+            defer a.free(next);
+            if (next.len != config.vocab_size) return error.InvalidDecoderOutput;
+            try values.appendSlice(a, next);
+        }
+        // The explicit deinit below belongs inside the measured request. Its
+        // guard is disarmed before leaving the block to avoid a second close.
+        cb.deinit();
+        cb_live = false;
+        const elapsed = inference.platform.time.awakeNs(init.io) - start;
+        if (iteration == 0) first_ns = elapsed;
+        for (values.items) |value| if (!std.math.isFinite(value)) return error.NonFiniteOutput;
+        if (iteration == 0) try reference.appendSlice(a, values.items) else if (!std.mem.eql(f32, reference.items, values.items)) return error.DecoderResetOutputChanged;
+        if (iteration >= options.warmup) samples[iteration - options.warmup] = elapsed;
+    }
+    if (options.output) |path| try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(reference.items) });
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    var checksum: f64 = 0;
+    for (reference.items) |value| checksum += value;
+    std.debug.print("unified_decoder_requests backend=metal prompt={d} decode_steps={d} iterations={d} output_elements={d} checksum={d:.9} p50_ns={d} p95_ns={d} min_ns={d} runtime_creations={d} requests={d} first_ns={d} reset_parity=exact\n", .{ prompt.len, options.decoder_steps, options.iterations, reference.items.len, checksum, samples[samples.len / 2], samples[@min(samples.len - 1, samples.len * 95 / 100)], samples[0], creations, options.warmup + options.iterations, first_ns });
 }
 
 fn runDecoder(init: std.process.Init, model: *inference.server.model_manager.LoadedModel, a: std.mem.Allocator, options: Options, bounded: *inference.runtime.bounded_allocator.BoundedAllocator) !void {

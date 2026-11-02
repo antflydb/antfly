@@ -131,6 +131,12 @@ preparation API do not by themselves complete these remaining requirements:
   model configuration is borrowed, avoiding a full metadata copy per step;
   cache keys hash its content rather than the pointer. Tied heads, optional
   scales and omitted-projection aliases live in the architecture weight adapter.
+  Self-contained Metal session runtimes have an explicit loaded-session/config,
+  KV dtype and shared-expert-cache owner key. Transient request backend wrappers
+  retire context-bound bindings while preserving that independent owner.
+  Replacement is failure-atomic; borrowed CPU/PJRT runtimes retain their stricter
+  backend lifetime. Repeated-request qualification forces distinct wrapper
+  addresses and checks logical decoder reset and exact output parity.
   Embedding indices explicitly select host IDs or a resident tensor. Traced
   host-ID placeholders need no materialized tensor; imported integer tensors
   retain their resident fast path and exact integer fallback.
@@ -141,6 +147,11 @@ preparation API do not by themselves complete these remaining requirements:
   batch metadata assembly, including per-sequence physical KV views, recurrent
   caches and position ownership. Generation retains compatibility exports and
   supplies typed state/geometry; batch layout does not depend on a task pipeline.
+  `graph/decoder_work.zig` owns borrowed queued prefill/decode records, resident
+  prefix geometry and validation. Bounded device bursts read an immutable token
+  budget rather than dereferencing task continuation state. Task publication and
+  the physical scheduled executor are still in generation; extracting the latter
+  remains required before claiming runtime ownership of the entire step loop.
 - `execution/testing/model_formats.zig` compares deterministic one-layer BERT
   and sliding-window decoder graphs loaded through real ONNX, safetensors and
   GGUF parsers. Deliberately lossy Q8_0 weights use an independently rounded CPU

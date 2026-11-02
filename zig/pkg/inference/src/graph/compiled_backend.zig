@@ -139,17 +139,29 @@ pub fn modelRuntimeForSessionExecutor(
     attachment_target: cache_mod.CompiledAttachmentTarget,
     model_executor: *model_runtime.ModelExecutor,
 ) !*model_runtime.ModelRuntime {
-    if (cache.getSessionCompiledModelRuntime(backend_kind, attachment_target)) |runtime_value| return runtime_value;
+    return sessionRuntime(allocator, cache, backend_kind, attachment_target, model_executor, null);
+}
 
-    // The runtime is cached on the session for the model's lifetime, so it
-    // must allocate from the cache's allocator. Callers often pass a
-    // request-scoped wrapper (the direct generation path's synchronized
-    // allocator lives on the request's stack), and a runtime retaining that
-    // would dereference a dead frame from the next request.
+pub fn modelRuntimeForOwnedSessionExecutor(
+    allocator: std.mem.Allocator,
+    cache: *cache_mod.GraphCache,
+    backend_kind: contracts.BackendKind,
+    attachment_target: cache_mod.CompiledAttachmentTarget,
+    model_executor: *model_runtime.ModelExecutor,
+    owner: cache_mod.SessionRuntimeOwner,
+) !*model_runtime.ModelRuntime {
+    return sessionRuntime(allocator, cache, backend_kind, attachment_target, model_executor, owner);
+}
+
+fn sessionRuntime(allocator: std.mem.Allocator, cache: *cache_mod.GraphCache, backend_kind: contracts.BackendKind, attachment_target: cache_mod.CompiledAttachmentTarget, model_executor: *model_runtime.ModelExecutor, owner: ?cache_mod.SessionRuntimeOwner) !*model_runtime.ModelRuntime {
+    const existing = if (owner) |key| cache.getOwnedSessionCompiledModelRuntime(backend_kind, attachment_target, key) else cache.getContextBoundSessionCompiledModelRuntime(backend_kind, attachment_target);
+    if (existing) |value| return value;
+    // Cached runtimes must never retain a request allocator. Construct before
+    // replacing the slot so failure leaves an independent owner usable.
     _ = allocator;
-    var runtime_value = try model_executor.createRuntime(cache.allocator);
-    errdefer runtime_value.deinit();
-    cache.putSessionCompiledModelRuntime(backend_kind, attachment_target, runtime_value);
+    var value = try model_executor.createRuntime(cache.allocator);
+    errdefer value.deinit();
+    if (owner) |key| cache.putOwnedSessionCompiledModelRuntime(backend_kind, attachment_target, key, value) else cache.putSessionCompiledModelRuntime(backend_kind, attachment_target, value);
     return cache.getSessionCompiledModelRuntime(backend_kind, attachment_target) orelse error.MissingCompiledModelRuntime;
 }
 
@@ -162,7 +174,7 @@ pub fn modelRuntimeForExecutor(
     model_executor: *const model_runtime.ModelExecutor,
 ) !*model_runtime.ModelRuntime {
     if (entry.compiled_model_runtime) |*runtime_value| return runtime_value;
-    if (cache.getSessionCompiledModelRuntime(backend_kind, attachment_target)) |runtime_value| return runtime_value;
+    if (cache.getContextBoundSessionCompiledModelRuntime(backend_kind, attachment_target)) |runtime_value| return runtime_value;
 
     // Cached for the entry's lifetime: allocate from the cache, not the request.
     _ = allocator;
@@ -175,7 +187,7 @@ pub fn modelRuntimeForExecutor(
     }
 
     cache.putSessionCompiledModelRuntime(backend_kind, attachment_target, runtime_value);
-    return cache.getSessionCompiledModelRuntime(backend_kind, attachment_target) orelse error.MissingCompiledModelRuntime;
+    return cache.getContextBoundSessionCompiledModelRuntime(backend_kind, attachment_target) orelse error.MissingCompiledModelRuntime;
 }
 
 fn partitionHasCompute(
@@ -367,6 +379,7 @@ test "modelRuntimeStrategyLabel is stable for diagnostics" {
 const RuntimeCachingMock = struct {
     ownership: model_runtime.RuntimeStateOwnership,
     created: usize = 0,
+    fail_create: bool = false,
     runtime_deinits: usize = 0,
     executor_deinits: usize = 0,
     /// Allocator handed to the most recent `createRuntime` call.
@@ -407,6 +420,7 @@ const RuntimeCachingMock = struct {
 
     fn createRuntime(ctx: *anyopaque, allocator: std.mem.Allocator) !model_runtime.ModelRuntime {
         const self: *RuntimeCachingMock = @ptrCast(@alignCast(ctx));
+        if (self.fail_create) return error.OutOfMemory;
         self.created += 1;
         self.created_with = allocator.ptr;
         return .{ .ptr = self, .vtable = &runtime_vtable };
@@ -455,6 +469,32 @@ test "cached model runtimes allocate from the cache, not the requesting allocato
     defer entry_executor.deinit();
     _ = try modelRuntimeForExecutor(request_allocator, &cache, &entry, .pjrt, .whole_model, &entry_executor);
     try std.testing.expect(entry_mock.created_with.? == cache.allocator.ptr);
+}
+
+test "owned session runtime replacement preserves the old owner when creation fails" {
+    var cache = cache_mod.GraphCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var marker: u8 = 0;
+    const session_table: @import("../backends/session.zig").Session.VTable = undefined;
+    const owner = cache_mod.SessionRuntimeOwner{ .session_ptr = &marker, .session_vtable = &session_table, .config_hash = 1, .kv_dtype = null, .shared_moe_cache = null };
+    var replacement = owner;
+    replacement.config_hash = 2;
+    var old = RuntimeCachingMock{ .ownership = .backend_owned };
+    var old_executor = old.executor();
+    defer old_executor.deinit();
+    _ = try modelRuntimeForOwnedSessionExecutor(std.testing.allocator, &cache, .metal, .whole_model, &old_executor, owner);
+    var next = RuntimeCachingMock{ .ownership = .backend_owned, .fail_create = true };
+    var next_executor = next.executor();
+    defer next_executor.deinit();
+    try std.testing.expectError(error.OutOfMemory, modelRuntimeForOwnedSessionExecutor(std.testing.allocator, &cache, .metal, .whole_model, &next_executor, replacement));
+    try std.testing.expect(cache.getOwnedSessionCompiledModelRuntime(.metal, .whole_model, owner) != null);
+    try std.testing.expectEqual(@as(usize, 0), old.runtime_deinits);
+    next.fail_create = false;
+    _ = try modelRuntimeForOwnedSessionExecutor(std.testing.allocator, &cache, .metal, .whole_model, &next_executor, replacement);
+    try std.testing.expectEqual(@as(usize, 1), old.runtime_deinits);
+    try std.testing.expectEqual(@as(usize, 1), next.created);
+    cache.resetSessionCompiledModelRuntime();
+    try std.testing.expectEqual(@as(usize, 1), next.runtime_deinits);
 }
 
 test "modelRuntimeForExecutor keeps host-assisted runtimes entry scoped" {

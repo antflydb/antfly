@@ -4163,34 +4163,21 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
-    const PendingDecodeBatchWork = struct {
-        allocator: std.mem.Allocator,
-        decode_state: *NativeDecodeState,
-        token_id: i64,
-        seq_len: usize,
-        logits: ?[]f32 = null,
-        wants_greedy: bool = false,
-        greedy_token: ?u32 = null,
-        sequence: ?*PendingGreedySequence = null,
-        failure: ?anyerror = null,
-        ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    };
+    const PendingDecodeBatchWork = graph_mod.decoder_work.Decode;
+    const PendingPrefillBatchWork = graph_mod.decoder_work.Prefill;
 
-    const PendingPrefillBatchWork = struct {
-        prepared_prompt: ?*qwen3vl_projector.PreparedPrompt = null,
-        allocator: std.mem.Allocator,
-        decode_state: *NativeDecodeState,
-        token_ids: []const i64,
-        seq_len: usize,
-        query_seq_len: usize,
-        wants_last_logits: bool,
-        wants_greedy: bool = false,
-        greedy_token: ?u32 = null,
-        allow_shared_kv_prefill: bool = false,
-        logits: ?[]f32 = null,
-        failure: ?anyerror = null,
-        ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    };
+    fn preparedPrefix(prompt: *const qwen3vl_projector.PreparedPrompt) graph_mod.decoder_work.Prefix {
+        return .{ .token_count = prompt.plan.tokenCount(), .positions = prompt.plan.mrope_positions, .embeddings = prompt.input_embeddings, .intermediate_layer_count = prompt.deepstack_layer_count };
+    }
+
+    fn pendingSequence(work: *const PendingDecodeBatchWork) ?*PendingGreedySequence {
+        return @ptrCast(@alignCast(work.continuation_context orelse return null));
+    }
+
+    fn bindPendingSequence(work: *PendingDecodeBatchWork, sequence: *PendingGreedySequence) void {
+        work.continuation_context = sequence;
+        work.remaining_tokens = sequence.remainingTokens();
+    }
 
     pub fn generate(self: *NativeGenerationPipeline, messages: []const Message, config: GenerationConfig) !GenerationResult {
         return self.generateWithCallback(messages, config, null, null);
@@ -11507,6 +11494,11 @@ pub const NativeGenerationPipeline = struct {
         max_tokens: usize,
         finish_reason: []const u8 = "length",
 
+        fn remainingTokens(self: *const @This()) usize {
+            if (self.generated >= self.max_tokens or self.seq_len.* > self.token_ids.len) return 0;
+            return @min(self.max_tokens - self.generated, self.token_ids.len - self.seq_len.*);
+        }
+
         fn acceptToken(self: *@This(), token: u32) !void {
             return self.acceptTokens(&.{token}, 0);
         }
@@ -11540,6 +11532,7 @@ pub const NativeGenerationPipeline = struct {
             const context = decode_runtime.makeDecodeContext(self.seq_len.*, 1);
             self.work.token_id = @intCast(tokens[tokens.len - 1]);
             self.work.seq_len = self.seq_len.*;
+            self.work.remaining_tokens = self.remainingTokens();
             // Enqueue transfers the borrow back to the coordinator. On
             // success an idle canceller may immediately free this stack work:
             // do not touch self after enqueue returns successfully.
@@ -11548,7 +11541,7 @@ pub const NativeGenerationPipeline = struct {
     };
 
     fn publishGreedyToken(work: *PendingDecodeBatchWork, token: u32) void {
-        if (work.sequence) |sequence| {
+        if (pendingSequence(work)) |sequence| {
             sequence.acceptToken(token) catch |err| {
                 work.failure = err;
                 work.ready.store(true, .release);
@@ -11583,7 +11576,7 @@ pub const NativeGenerationPipeline = struct {
             .generated = generated,
             .max_tokens = max_tokens,
         };
-        sequence.work.sequence = &sequence;
+        NativeGenerationPipeline.bindPendingSequence(&sequence.work, &sequence);
         defer if (sequence.work.logits) |logits| self.allocator.free(logits);
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         const context = decode_runtime.makeDecodeContext(seq_len.*, 1);
@@ -11714,7 +11707,7 @@ pub const NativeGenerationPipeline = struct {
             const final = end == seq;
             var decode_runtime = BorrowedDecodeStateRuntime.init(state);
             const context = decode_runtime.makeDecodeContext(end, query);
-            var work = PendingPrefillBatchWork{ .allocator = self.allocator, .decode_state = state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = final, .wants_greedy = final and wants_greedy, .prepared_prompt = prepared };
+            var work = PendingPrefillBatchWork{ .allocator = self.allocator, .decode_state = state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = final, .wants_greedy = final and wants_greedy, .prepared_prefix = preparedPrefix(prepared) };
             defer if (work.logits) |logits| work.allocator.free(logits);
             try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), end, query, context.kv_sequence_len, context.kv_position_offset, pendingWorkOptionsFromState(state, query));
             defer if (!work.ready.load(.acquire)) scheduler.cancelPrefillWork(@ptrCast(&work));
@@ -11937,10 +11930,8 @@ pub const NativeGenerationPipeline = struct {
         const eligible = eligible: {
             for (claimed) |item| {
                 const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                const sequence = work.sequence orelse break :eligible false;
-                if (sequence.generated >= sequence.max_tokens or sequence.max_tokens - sequence.generated < 2 or
-                    sequence.seq_len.* > sequence.token_ids.len or sequence.token_ids.len - sequence.seq_len.* < 2) break :eligible false;
-                steps = @min(steps, @min(sequence.max_tokens - sequence.generated, sequence.token_ids.len - sequence.seq_len.*));
+                if (work.continuation_context == null or work.remaining_tokens < 2) break :eligible false;
+                steps = @min(steps, work.remaining_tokens);
             }
             break :eligible true;
         };
@@ -12191,15 +12182,13 @@ pub const NativeGenerationPipeline = struct {
         var max_future: usize = 0;
         for (claimed, items, 0..) |item, mixed, i| {
             const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
-            const sequence = work.sequence orelse return self.declineLightOnGraph(2);
             if (item.phase != .decode or item.query_sequence_len != 1 or !work.wants_greedy or
-                sequence.generated >= sequence.max_tokens or sequence.max_tokens - sequence.generated < 2 or
-                sequence.seq_len.* > sequence.token_ids.len or sequence.token_ids.len - sequence.seq_len.* < 2 or
+                work.continuation_context == null or work.remaining_tokens < 2 or
                 mixed.state.kv_manager != manager or mixed.state.kv_storage != storage or mixed.state.sequence_id == null or
                 mixed.state.force_full_recompute or mixed.state.kv_compacted or mixed.state.allow_swa_ring or
                 mixed.kv_position_offset != 0 or mixed.kv_sequence_len != mixed.total_sequence_len or
                 mixed.state.qwen35_linear_cache == null) return self.declineLightOnGraph(2);
-            const remaining = @min(sequence.max_tokens - sequence.generated, sequence.token_ids.len - sequence.seq_len.*);
+            const remaining = work.remaining_tokens;
             future[i] = try std.math.add(usize, item.total_sequence_len, remaining);
             if (future[i] > @import("../ops/cuda/paged_attention_bf16.zig").max_native_context_tokens) return self.declineLightOnGraph(3);
             if (storage.storage.config.sliding_window_size) |window|
@@ -12358,27 +12347,11 @@ pub const NativeGenerationPipeline = struct {
     /// Validate every chunk against its original immutable visual prompt before
     /// reserving any peer KV or modifying any recurrent history.
     fn preparedQwenPrefillStart(work: *const PendingPrefillBatchWork, item: runtime.scheduler.native_generate.StepItem) !usize {
-        const prompt = work.prepared_prompt orelse return error.InvalidPreparedPrompt;
-        const full = prompt.plan.tokenCount();
-        const positions = std.math.mul(usize, full, 3) catch return error.InvalidPreparedPrompt;
-        if (item.phase != .prefill or work.query_seq_len == 0 or work.query_seq_len > work.seq_len or
-            work.seq_len > full or work.seq_len != item.total_sequence_len or
-            work.query_seq_len != item.query_sequence_len or prompt.plan.mrope_positions.len != positions or
-            prompt.deepstack_layer_count != 0 or prompt.input_embeddings == null or
-            work.wants_last_logits != (work.seq_len == full))
-            return error.InvalidPreparedPrompt;
-        const start = work.seq_len - work.query_seq_len;
-        if (work.decode_state.total_tokens != start) return error.InvalidPreparedPrompt;
-        return start;
+        return graph_mod.decoder_work.preparedPrefixStart(work, item);
     }
 
     fn copyPreparedQwenChunkPositions(work: *const PendingPrefillBatchWork, start: usize, output: []u32, total: usize, offset: usize) void {
-        const prompt = work.prepared_prompt.?;
-        const full = prompt.plan.tokenCount();
-        const query = work.query_seq_len;
-        std.debug.assert(output.len == 3 * total and offset <= total and query <= total - offset);
-        std.debug.assert(start <= full and query <= full - start);
-        for (0..3) |axis| @memcpy(output[axis * total + offset ..][0..query], prompt.plan.mrope_positions[axis * full + start ..][0..query]);
+        graph_mod.decoder_work.copyPrefixPositions(work, start, output, total, offset);
     }
 
     fn forwardPackedScheduledQwenStep(self: *NativeGenerationPipeline, claimed: []const runtime.scheduler.native_generate.StepItem) !StepForwardResult {
@@ -12407,10 +12380,10 @@ pub const NativeGenerationPipeline = struct {
                 .prefill => {
                     prefill_count += 1;
                     const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                    const prompt = work.prepared_prompt orelse return error.InvalidPreparedPrompt;
+                    const prompt = work.prepared_prefix orelse return error.InvalidPreparedPrompt;
                     prefill_starts[index] = try preparedQwenPrefillStart(work, item);
                     prefix_starts += @intFromBool(prefill_starts[index] == 0);
-                    prefix_finishes += @intFromBool(work.seq_len == prompt.plan.tokenCount());
+                    prefix_finishes += @intFromBool(work.seq_len == prompt.token_count);
                     mixed[index] = .{ .state = work.decode_state, .total_sequence_len = item.total_sequence_len, .query_sequence_len = item.query_sequence_len, .kv_sequence_len = item.kv_sequence_len, .kv_position_offset = item.kv_position_offset, .attention_mode = .paged_prefill };
                 },
                 .decode => {
@@ -12547,7 +12520,7 @@ pub const NativeGenerationPipeline = struct {
             const item = claimed[input_index];
             if (item.phase == .prefill) {
                 const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                if (!try cb.copyRows2D(a, combined, offsets[input_index], work.prepared_prompt.?.input_embeddings.?, prefill_starts[input_index], lengths[input_index], cfg.hidden_size)) return error.UnsupportedTensorType;
+                if (!try cb.copyRows2D(a, combined, offsets[input_index], work.prepared_prefix.?.embeddings.?, prefill_starts[input_index], lengths[input_index], cfg.hidden_size)) return error.UnsupportedTensorType;
                 input_index += 1;
             } else {
                 var count: usize = 1;
@@ -12682,7 +12655,7 @@ pub const NativeGenerationPipeline = struct {
         }
         for (claimed) |item| if (item.phase == .prefill) {
             const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
-            if (work.prepared_prompt != null) return self.forwardPackedScheduledQwenStep(claimed);
+            if (work.prepared_prefix != null) return self.forwardPackedScheduledQwenStep(claimed);
         };
         // Keep the large CUDA cohort in compact layout for both recurrent
         // packets and the existing per-page paged-attention partitions.
@@ -12831,10 +12804,8 @@ pub const NativeGenerationPipeline = struct {
                         M.lightOnPreparedStreamReady(&self.cb, self.gpt_config, claimed.len) and eligible: {
                         for (claimed) |item| {
                             const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                            const sequence = work.sequence orelse break :eligible false;
-                            if (sequence.generated >= sequence.max_tokens or sequence.max_tokens - sequence.generated < 2 or
-                                sequence.seq_len.* > sequence.token_ids.len or sequence.token_ids.len - sequence.seq_len.* < 2) break :eligible false;
-                            burst_steps = @min(burst_steps, @min(sequence.max_tokens - sequence.generated, sequence.token_ids.len - sequence.seq_len.*));
+                            if (work.continuation_context == null or work.remaining_tokens < 2) break :eligible false;
+                            burst_steps = @min(burst_steps, work.remaining_tokens);
                         }
                         break :eligible true;
                     }) {
@@ -12975,7 +12946,7 @@ pub const NativeGenerationPipeline = struct {
                 for (claimed, tokens, 0..) |item, token, row| {
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
                     if (self.second_greedy_tokens) |second| {
-                        const sequence = work.sequence orelse {
+                        const sequence = pendingSequence(work) orelse {
                             work.failure = error.InvalidBatchDecodeState;
                             work.ready.store(true, .release);
                             continue;
@@ -13051,7 +13022,7 @@ pub const NativeGenerationPipeline = struct {
         self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
         for (claimed) |item| if (item.phase == .decode) {
             const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
-            if (work.sequence != null) self.executor_tail_steps += 1;
+            if (work.continuation_context != null) self.executor_tail_steps += 1;
         };
 
         var result = self.forwardScheduledStep(claimed) catch |err| {
@@ -13257,7 +13228,7 @@ pub const NativeGenerationPipeline = struct {
             switch (item.phase) {
                 .decode => {
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
-                    if (work.sequence) |sequence| {
+                    if (pendingSequence(work)) |sequence| {
                         const allocator = work.allocator;
                         const masked = allocator.dupe(f32, slice) catch |err| {
                             work.failure = err;
@@ -18512,8 +18483,8 @@ test "LightOnOCR3 executor tail preserves per-page tokens EOS length and KV geom
         .generated = 1,
         .max_tokens = 4,
     };
-    sequence_a.work.sequence = &sequence_a;
-    sequence_b.work.sequence = &sequence_b;
+    NativeGenerationPipeline.bindPendingSequence(&sequence_a.work, &sequence_a);
+    NativeGenerationPipeline.bindPendingSequence(&sequence_b.work, &sequence_b);
     try scheduler.enqueueDecodeWork(lease_a, &sequence_a.work, 6, 6, 0, .{});
     try scheduler.enqueueDecodeWork(lease_b, &sequence_b.work, 6, 6, 0, .{});
     var storage: [16]StepItem = undefined;
@@ -18583,7 +18554,7 @@ test "LightOnOCR3 executor tail cancellation drains a claimed token or removes i
             .generated = 1,
             .max_tokens = 8,
         };
-        sequence.work.sequence = &sequence;
+        NativeGenerationPipeline.bindPendingSequence(&sequence.work, &sequence);
         try scheduler.enqueueDecodeWork(lease, &sequence.work, 5, 5, 0, .{});
         var storage: [16]StepItem = undefined;
         var step = std.ArrayListUnmanaged(StepItem).empty;
@@ -18826,7 +18797,7 @@ test "LightOnOCR3 GPU token burst publishes widths two through eight with EOS le
                 .generated = 1,
                 .max_tokens = if (scenario == 2) 1 + width else 16,
             };
-            sequence.work.sequence = &sequence;
+            NativeGenerationPipeline.bindPendingSequence(&sequence.work, &sequence);
             try scheduler.enqueueDecodeWork(lease, &sequence.work, 6, 6, 0, .{});
             var storage: [16]StepItem = undefined;
             var step = std.ArrayListUnmanaged(StepItem).empty;
@@ -18937,7 +18908,7 @@ test "LightOnOCR3 prepared chunks preserve visual axes independent KV histories 
     var previous: usize = 0;
     for ([_]usize{ 3, 6, 7 }) |end| {
         const query = end - previous;
-        var work = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = &state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = end == 7, .prepared_prompt = &prompt };
+        var work = P.PendingPrefillBatchWork{ .allocator = a, .decode_state = &state, .token_ids = &.{}, .seq_len = end, .query_seq_len = query, .wants_last_logits = end == 7, .prepared_prefix = P.preparedPrefix(&prompt) };
         var item = runtime.scheduler.native_generate.StepItem{ .work_ptr = &work, .phase = .prefill, .query_sequence_len = query, .total_sequence_len = end, .kv_sequence_len = previous, .kv_position_offset = 0 };
         const start = try P.preparedQwenPrefillStart(&work, item);
         try std.testing.expectEqual(previous, start);
