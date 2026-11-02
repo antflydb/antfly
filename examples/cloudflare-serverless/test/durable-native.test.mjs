@@ -20,7 +20,7 @@ const actor='e'.repeat(64);
 async function fixture(){
  const bucket=new Bucket(),env={DATABASE:bucket,ANTFLY_INCARNATION:'durable-native-test',COORDINATOR_BACKEND:'r2',METADATA_ROOT_BACKEND:'bounded-journal',INLINE_METADATA_ROOTS:'true',RESIDENT_SERVING:'true',RESIDENT_MVCC:'true',RESIDENT_COLD_PIPELINE:'true',RESIDENT_DURABLE_BOOTSTRAP:'true',COMMITS:{idFromName:()=>({toString:()=>actor})}},raw=createR2Transport({database:bucket});let calls=0,intercept;
  const local={value:null,failClean:false,async get(){return structuredClone(this.value);},async put(key,value){if(this.failClean&&!value.dirty)throw Error('InjectedLocalCommitFailure');this.value=structuredClone(value);},async sync(){}};
- const reopen=async()=>{const store=new R2CoordinatorStore(module,bucket,env.ANTFLY_INCARNATION,{exclusiveOwnerId:actor,inlineReadSet:{keys:['value']},transport:async(...args)=>{calls++;await intercept?.(...args);return raw(...args);}});store.durableBootstrap=new DurableServingBootstrap(local,env,actor);const authority=await store.durableBootstrap.authority()??await openAuthority(env,'r2-bounded');await store.durableBootstrap.adopt(authority);store.configureAuthority(authority.descriptor);await store.restoreDurableRead();return store;};
+ const reopen=async({restore=true}={})=>{const store=new R2CoordinatorStore(module,bucket,env.ANTFLY_INCARNATION,{exclusiveOwnerId:actor,inlineReadSet:{keys:['value']},transport:async(...args)=>{calls++;await intercept?.(...args);return raw(...args);}});store.durableBootstrap=new DurableServingBootstrap(local,env,actor);const authority=await store.durableBootstrap.authority()??await openAuthority(env,'r2-bounded');await store.durableBootstrap.adopt(authority);store.configureAuthority(authority.descriptor);if(restore)await store.restoreDurableRead();return store;};
  return{bucket,env,local,reopen,calls:()=>calls,intercept:fn=>intercept=fn};
 }
 test('native durable capsule restores cold reads with zero R2 I/O and no append authority',async()=>{
@@ -81,4 +81,32 @@ test('optional checkpoints defer without holding the metadata queue behind occup
  }finally{release();await held;}
  assert.equal((await store.flushDurableCheckpoint()).done,true);
  const recovered=await f.reopen(),before=f.calls();assert.equal(await recovered.ownerRead(tx=>tx.get('value')),2);assert.equal(f.calls(),before);
+});
+
+for(const clean of [false,true])test(`${clean?'clean capsule':'dirty recovery'} bootstrap retries after shared native admission times out`,async()=>{
+ const f=await fixture(),first=await f.reopen();await first.transaction(tx=>tx.put('value',7));if(clean)await first.flushDurableCheckpoint();
+ const cold=await f.reopen({restore:false});let entered,release;
+ const ready=new Promise(resolve=>entered=resolve),gate=new Promise(resolve=>release=resolve);
+ const held=cold.snapshotKernel.withHost(async()=>{entered();await gate;});await ready;
+ let actions=0;const codec=cold.servingCodec.bind(cold);cold.servingCodec=(...args)=>{actions++;return codec(...args);};
+ try{
+  cold.deadline=Date.now()+40;
+  const failures=await Promise.allSettled(Array.from({length:3},()=>cold.restoreDurableRead()));
+  assert.ok(failures.every(result=>result.status==='rejected'&&result.reason.message==='DeadlineExceeded'));
+  assert.equal(actions,1);assert.equal(cold.durableBootstrap.loaded,false);
+ }finally{delete cold.deadline;release();await held;}
+ await Promise.all(Array.from({length:3},()=>cold.restoreDurableRead()));
+ assert.equal(actions,2);assert.equal(cold.durableBootstrap.loaded,true);
+ const before=f.calls();assert.equal(await cold.ownerRead(tx=>tx.get('value')),7);
+ if(clean){assert.equal(f.calls(),before);assert.equal(cold.acquired,false);assert.equal(cold.state,null);assert.equal(cold.journalProof,null);}else assert.ok(f.calls()>before);
+ await cold.restoreDurableRead();assert.equal(actions,2);
+});
+test('corrupt capsule recovery retries an unconfirmed dirty intent before skipping import',async()=>{
+ const f=await fixture(),first=await f.reopen();await first.transaction(tx=>tx.put('value',8));await first.flushDurableCheckpoint();f.local.value.capsule='invalid';
+ const cold=await f.reopen({restore:false});let fail=true;
+ f.local.sync=async()=>{if(fail){fail=false;throw Error('InjectedIntentSyncFailure');}};
+ await assert.rejects(cold.restoreDurableRead(),/InjectedIntentSyncFailure/);
+ assert.equal(cold.durableBootstrap.loaded,false);assert.equal(cold.durableBootstrap.dirtyConfirmed,false);
+ await cold.restoreDurableRead();assert.equal(cold.durableBootstrap.loaded,true);assert.equal(cold.durableBootstrap.dirtyConfirmed,true);assert.equal(f.local.value.dirty,true);
+ assert.equal(await cold.ownerRead(tx=>tx.get('value')),8);
 });

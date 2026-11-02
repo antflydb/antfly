@@ -97,11 +97,17 @@ export class R2CoordinatorStore {
     if(!this.durableBootstrap)return;
     this.configureDurableCheckpoint();
     if(!WebAssembly.Module.exports(this.module).some(entry=>entry.name==="antfly_host_serving_capsule_v1"))throw Error("ServingCapsuleModuleRequired");
-    if(this.durableRestore){while(!this.durableRestore.done)await new Promise(r=>setTimeout(r,2));if(this.durableRestore.error)throw Error(this.durableRestore.error);return;}
+    // Waiters retain their attempt even if a later request starts a retry.
+    const pending=this.durableRestore;
+    if(pending){while(!pending.done)await new Promise(r=>setTimeout(r,2));if(pending.error)throw Error(pending.error);return;}
     const ticket=this.durableRestore={done:false,error:null};
     try{if(this.durableBootstrap.entry?.dirty)await this.servingCodec("probe",{},{onStage});const restored=await this.durableBootstrap.restore((action,extra)=>this.servingCodec(action,extra,{onStage}));
       if(restored){this.durableReadState=restored;this.durableWriteCursor=restored.state;this.observedState=restored.state;this.base=restored.base;this.pagePrefix=restored.page_prefix;}
-    }catch(error){ticket.error=String(error.message??error);throw error;}finally{ticket.done=true;}
+    }catch(error){ticket.error=String(error.message??error);throw error;}finally{
+      ticket.done=true;
+      // A failed admission/import must not poison this actor until eviction.
+      if(ticket.error&&this.durableRestore===ticket)this.durableRestore=null;
+    }
   }
   // Scheduling hint only: native MAC, clocks, floor and slot checks remain
   // mandatory. Refresh before preparation when an idle certificate cannot

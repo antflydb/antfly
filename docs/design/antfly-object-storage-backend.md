@@ -100,6 +100,11 @@ application SQL schema. Import checks codec capability, native roots, scope and
 checksum. A checksum detects corruption, not freshness. Import restores no acquired
 writer flag, append proof, secret MAC material or clock anchor.
 
+Concurrent restoration callers share one attempt. Failed attempts release admission
+for a later retry; they do not cache transient pool/import failures for the actor's
+lifetime. A capsule is consumed only after successful import, or after corrupt-capsule
+fallback has synchronized dirty intent.
+
 1. Persist and synchronize **dirty intent** before metadata can advance, including
    ownership recovery. A confirmed dirty interval can coalesce later intents.
 2. Perform the ordinary native **R2 commit** and receipt publication.
