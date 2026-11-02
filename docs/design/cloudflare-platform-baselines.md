@@ -84,6 +84,48 @@ Read p95 forward regressed 155.0→176.7 ms; reverse was 128.3→128.2 ms. Write
 changed 275.7→271.2 and 281.5→255.6 ms. There is no twofold gain or paired read
 non-regression. `MUTATION_ELAPSED_BATCH_WINDOW` stays off by default.
 
+## Current hosted rehearsal blocker
+
+The manual Mac-client rehearsal did not reach the offered workload. The exact
+approved control seeded and verified all four 512-document tenants. The candidate
+accepted 512 documents in tenant `a`, published the first 64-record prefix, then
+its second publication returned HTTP 503 `PublicationExecutionBudgetExceeded`
+after 34,134 ms. Remaining candidate tenants were not seeded. No paired latency
+or full-gate verdict can be inferred from this incomplete setup.
+
+The captured failed operation reports 79 native operations, 1,032,206 transferred
+bytes and 27,387 ms native elapsed/I/O wait. Physical data I/O has 20 GETs, 22 PUTs
+and 40 waves; three coordinator RPCs account for another 6,681 ms, including
+4,068 ms abort/lease cleanup. Kernel queue wait is zero in this trace. The
+162,881-byte native working-set peak is not whole-isolate memory evidence.
+This failure identifies a serial storage/deadline problem, not a reproduced
+`SQLITE_NOMEM` root cause.
+
+Separate postmortem reads verify one published and one accepted unpublished body.
+A new count check verifies all 512 accepted records after correcting a client-only
+validation error: counts require their HTTP phase profile, while resident lookups
+and mutations also require an owner profile. Wrong counts, missing HTTP profiles
+and missing owner profiles on instrumented operations still fail. HTTP resource
+errors retain their original cause when diagnostic headers are missing. The
+original rejected count check and publication failure remain preserved; none is
+retroactively qualified.
+
+Publication is the immediate engine priority before another mixed-read trial.
+Bound initial and steady-state publication by serial remote dependency waves and
+the full probe/admission/build/checkpoint path, including ordinary small-record
+fast batches. Yield durable guarded progress before the existing deadline and
+retain takeover/receipt/collection safety. Evaluate slow and variable GET/PUT
+schedules locally before a fresh hosted attempt. Raising limits or repeatedly
+retrying a failing prefix is not evidence that this path is qualified.
+
+All 11 Workers, six captured namespaces and four R2 buckets have explicit scoped
+404 absence checks; three disposable app-token files are removed. Two export
+configurations remain pending: deployment authentication returns 403 for their
+deletion, and automatic approval review blocked the separately protected account
+credential. Runtime-only cleanup keeps that outstanding obligation in its manifest
+rather than falsely reporting complete cleanup. Local setup reports, postmortem
+windows, hashes and cleanup receipts are retained. Diagnostic coverage is partial.
+
 ## Current modules and next sequence
 
 The latest main integration includes lazy navigation and reclaimer-aware quotas.
@@ -137,7 +179,7 @@ resident variant is not the approved historical control. Avoid overlapping build
 or latency workloads. Preserve negative results and verify actual activation.
 
 For hosted acceptance, use a dedicated independent client and exact approved control.
-First eliminate client overload, missing observation and mixed versions. Then fix
+First eliminate client overload, missing observation and mixed versions. First qualify bounded publication setup; then fix
 the dominant mixed/warm read wait while preserving freshness and writer progress.
 Accept improvements only if both orders meet absolute limits and paired non-regression.
 Expand cold recovery only after warm prerequisites pass.

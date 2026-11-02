@@ -39,3 +39,17 @@ test('remote rounds advance visibility only after completed durable writes and n
 test('remote driver cancels oversized streamed input before dispatching operations',async()=>{
  let cancelled=false;const stream=new ReadableStream({start(c){c.enqueue(new Uint8Array(16385));},cancel(){cancelled=true;}}),response=await driver.fetch(new Request('https://driver.invalid/run',{method:'POST',headers:{Authorization:'Bearer '+token},body:stream,duplex:'half'}),{API_TOKEN:token});assert.equal(response.status,400);assert.equal(cancelled,true);
 });
+
+
+test('profiled verification counts require HTTP evidence while lookup and mutation require their owner',async()=>{
+ const {CriticalPath}=await import('../trace.mjs'),{phaseProfileHeaders}=await import('../phase-profile.mjs');
+ const header=()=>phaseProfileHeaders({},new CriticalPath({scope:'http'}),{QUALIFICATION_PHASE_PROFILE:'true'})['X-Antfly-Profile'];
+ const countPlan={...plan,steps:[{op:'count',tenant:'a',visibility:fence}]};
+ for(const [count,expected]of [['64',undefined],['63','TrialCountMismatch']]){const r=await runPlan(countPlan,{origin,token,requireProfile:true,fetch:async()=>Response.json({count},{headers:{'X-Antfly-Version':version,'X-Antfly-Profile':header()}})});assert.equal(r.passed,!expected);assert.equal(r.samples[0].error,expected);}
+ const missing=await runPlan(countPlan,{origin,token,requireProfile:true,fetch:async()=>Response.json({count:'64'},{headers:{'X-Antfly-Version':version}})});assert.equal(missing.samples[0].error,'TrialPhaseProfileMissing');
+ const lookup=await runPlan(plan,{origin,token,requireProfile:true,fetch:async()=>Response.json({body:documentBody('a',1),visibility:fence},{headers:{'X-Antfly-Version':version,'X-Antfly-Profile':header()}})});assert.equal(lookup.samples[0].error,'TrialPhaseProfileMissing');
+ const mutation=await runPlan({...plan,steps:[{op:'mutate',tenant:'a',sequence:1}]},{origin,token,requireProfile:true,fetch:async()=>Response.json({committed:true,visibility:fence},{headers:{'X-Antfly-Version':version,'X-Antfly-Profile':header()}})});assert.equal(mutation.samples[0].error,'TrialPhaseProfileMissing');
+});
+test('missing diagnostic headers cannot hide a backend resource or publication deadline failure',async()=>{
+ for(const error of ['SQLITE_NOMEM','PublicationExecutionBudgetExceeded']){const r=await runPlan(plan,{origin,token,requireProfile:true,fetch:async()=>Response.json({error},{status:503})});assert.equal(r.passed,false);assert.equal(r.samples[0].status,503);assert.equal(r.samples[0].error,error);}
+});

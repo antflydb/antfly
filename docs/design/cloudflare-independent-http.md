@@ -174,3 +174,10 @@ await physical/maintenance drain, drain the exact bucket with bounded requests,
 remove app/private Workers, queues/DLQs/namespaces/buckets and disposable secrets,
 then verify scoped absence and save receipts. Never use broad account-wide deletion.
 `make gc` is guarded; do not force it past active builds or unknown process state.
+
+If account export administration is unavailable, the observer lifecycle's
+`cleanup-runtime` action can remove its Workers, drain/delete its buckets and
+remove its disposable app token after retirement and app-stack deletion. It does
+not access the account credential or mark export destinations deleted. The manifest
+remains incomplete until ordinary `cleanup` can delete the remaining destinations;
+resuming it skips the already deleted runtime. Each runtime cleanup step is persisted.
