@@ -58,7 +58,7 @@ const Binding = struct {
     prefix: []const []const u8 = &.{},
     used: ?*bool = null,
 };
-const PropertyPath = struct { parts: []const []const u8, presence: bool };
+const PropertyPath = struct { parts: []const []const u8, presence: bool, shape: bool = false };
 const NodePlan = struct {
     labels: std.ArrayList(catalog.Label) = .empty,
     cover: ?[]const u8 = null,
@@ -71,6 +71,7 @@ const NodePlan = struct {
 const Plan = struct {
     a: A,
     graph: catalog.Graph,
+    source: []const u8,
     table_names: []const []const u8,
     tables: std.StringHashMapUnmanaged(*NodePlan) = .empty,
     label_tables: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -224,10 +225,18 @@ const Plan = struct {
     fn lineage(self: *Plan, expr: ast.Expr) !?Binding {
         var base = &expr;
         var reversed: std.ArrayList([]const u8) = .empty;
-        while (base.value == .property) {
-            try reversed.append(self.a, base.value.property.name);
-            base = base.value.property.base;
-        }
+        while (true) switch (base.value) {
+            .property => |property_value| {
+                try reversed.append(self.a, property_value.name);
+                base = property_value.base;
+            },
+            .index => |index| {
+                if (index.index.value != .literal or index.index.value.literal != .string) return null;
+                try reversed.append(self.a, index.index.value.literal.string);
+                base = index.base;
+            },
+            else => break,
+        };
         if (base.value != .variable) return null;
         var binding = self.entities.get(base.value.variable) orelse return null;
         if (reversed.items.len == 0) return binding;
@@ -241,13 +250,16 @@ const Plan = struct {
         return binding;
     }
     fn propertyPath(self: *Plan, binding: Binding, parts: []const []const u8, presence: bool) !void {
+        return self.recordPath(binding, parts, presence, false);
+    }
+    fn recordPath(self: *Plan, binding: Binding, parts: []const []const u8, presence: bool, shape: bool) !void {
         if (binding.used) |used| used.* = true;
-        if (parts.len == 1 or parts.len > 64 or binding.kind == .path) {
+        if ((!shape and parts.len == 1) or parts.len > 64 or binding.kind == .path) {
             try self.field(binding, parts[0], presence and parts.len == 1);
             return;
         }
         try self.fields.put(self.a, parts[0], {});
-        const path: PropertyPath = .{ .parts = parts, .presence = presence };
+        const path: PropertyPath = .{ .parts = parts, .presence = presence, .shape = shape };
         if (binding.kind == .node) {
             try self.node_paths.append(self.a, path);
             for (binding.tables) |table| try self.tables.get(table).?.paths.append(self.a, path);
@@ -259,7 +271,7 @@ const Plan = struct {
         try self.propertyPath(binding, binding.prefix, presence);
         return true;
     }
-    fn clauses(self: *Plan, items: []const ast.Clause) anyerror!void {
+    fn clauses(self: *Plan, items: []const ast.Clause, internal_return: bool) anyerror!void {
         for (items) |clause| switch (clause.operation) {
             .project => |p| {
                 var next = if (p.value.wildcard) try self.entities.clone(self.a) else std.StringHashMapUnmanaged(Binding).empty;
@@ -267,10 +279,14 @@ const Plan = struct {
                 const grouping = for (p.value.items) |item| {
                     if (@import("expressions.zig").aggregates(item.expression)) break true;
                 } else false;
+                var visible = try self.entities.clone(self.a);
                 for (p.value.items) |item| {
-                    const name = item.alias orelse if (item.expression.value == .variable) item.expression.value.variable else "";
+                    const name = item.alias orelse try @import("expressions.zig").outputName(self.a, self.source, item.expression);
                     _ = next.remove(name);
-                    const forwarded = if (name.len != 0 and !p.final and !p.value.distinct and !grouping) try self.lineage(item.expression.*) else null;
+                    // Every output name shadows its input, including implicit
+                    // map-projection names whose value has no entity lineage.
+                    _ = visible.remove(name);
+                    const forwarded = if (name.len != 0 and (!p.final or internal_return) and !p.value.distinct and !grouping) try self.lineage(item.expression.*) else null;
                     if (forwarded) |source| {
                         var binding = source;
                         if (binding.prefix.len != 0 and item.expression.value != .variable) {
@@ -284,28 +300,28 @@ const Plan = struct {
                 // ORDER BY can see input bindings as well as projection aliases.
                 // Keep both scopes while collecting requirements, then retire
                 // hidden bindings before the next clause.
-                var visible = try self.entities.clone(self.a);
                 var names_iter = next.keyIterator();
                 while (names_iter.next()) |key| try visible.put(self.a, key.*, next.get(key.*).?);
-                for (p.value.items) |item| if (item.alias) |name| {
-                    if (!next.contains(name)) _ = visible.remove(name);
-                };
                 self.entities = visible;
                 try self.walk(p.value.predicate);
                 try self.walk(p.value.order);
                 try self.walk(p.value.skip);
                 try self.walk(p.value.limit);
-                if (p.final and p.value.wildcard) {
+                if (p.final and !internal_return and p.value.wildcard) {
                     var bindings = next.valueIterator();
                     while (bindings.next()) |binding| try self.whole(binding.*);
                 }
                 self.entities = next;
             },
             .subquery => |inner| {
-                const outer = try self.entities.clone(self.a);
-                try self.clauses(inner);
-                // Returning entities across a CALL boundary already requires
-                // complete values. Preserve outer bindings for later clauses.
+                var outer = try self.entities.clone(self.a);
+                try self.clauses(inner, true);
+                // CALL's RETURN is an internal binding boundary, not a public
+                // entity observer. Export only its final projected lineage.
+                if (inner.len != 0 and inner[inner.len - 1].operation == .project and inner[inner.len - 1].operation.project.final) {
+                    var exports = self.entities.iterator();
+                    while (exports.next()) |entry| try outer.put(self.a, entry.key_ptr.*, entry.value_ptr.*);
+                }
                 self.entities = outer;
             },
             .call => |procedure| {
@@ -379,10 +395,10 @@ const Plan = struct {
         const T = @TypeOf(value);
         if (T == ast.Query) {
             const initial = try self.entities.clone(self.a);
-            try self.clauses(value.clauses);
+            try self.clauses(value.clauses, false);
             for (value.unions) |arm| {
                 self.entities = try initial.clone(self.a);
-                try self.clauses(arm.clauses);
+                try self.clauses(arm.clauses, false);
             }
             return;
         }
@@ -439,7 +455,7 @@ const Plan = struct {
                 },
                 .exists => |inner| {
                     const outer = try self.entities.clone(self.a);
-                    try self.clauses(inner);
+                    try self.clauses(inner, false);
                     self.entities = outer;
                     return;
                 },
@@ -447,27 +463,33 @@ const Plan = struct {
                     if (self.entities.get(name)) |kind| try self.whole(kind);
                     return;
                 },
-                .property => {
+                .property, .index => {
                     if (try self.property(value, false)) return;
                 },
                 .map_projection => |projection| {
-                    if (projection.base.value == .variable) if (self.entities.get(projection.base.value.variable)) |kind| if (kind.prefix.len == 0) {
+                    if (try self.lineage(projection.base.*)) |binding| {
+                        if (binding.prefix.len != 0) try self.recordPath(binding, binding.prefix, false, true);
                         for (projection.items) |item| switch (item) {
-                            .property => |name| try self.field(kind, name, false),
+                            .property => |name| {
+                                const parts = try self.a.alloc([]const u8, binding.prefix.len + 1);
+                                @memcpy(parts[0..binding.prefix.len], binding.prefix);
+                                parts[parts.len - 1] = name;
+                                try self.propertyPath(binding, parts, false);
+                            },
                             .entry => |entry| try self.walk(entry.value.*),
                             .variable => |name| if (self.entities.get(name)) |other| try self.whole(other),
-                            .all => try self.whole(kind),
+                            .all => try self.whole(binding),
                         };
                         return;
-                    };
+                    }
                 },
                 .unary => |u| {
-                    if ((u.op == .is_null or u.op == .is_not_null) and (u.operand.value == .property or u.operand.value == .variable)) {
+                    if ((u.op == .is_null or u.op == .is_not_null) and (u.operand.value == .property or u.operand.value == .index or u.operand.value == .variable)) {
                         if (try self.property(u.operand.*, true)) return;
                     }
                 },
                 .call => |c| {
-                    if (std.ascii.eqlIgnoreCase(c.name, "count") and !c.distinct and c.args.len == 1 and (c.args[0].value == .property or c.args[0].value == .variable)) {
+                    if (std.ascii.eqlIgnoreCase(c.name, "count") and !c.distinct and c.args.len == 1 and (c.args[0].value == .property or c.args[0].value == .index or c.args[0].value == .variable)) {
                         if (try self.property(c.args[0].*, true)) return;
                     }
                     const identity_only = std.ascii.eqlIgnoreCase(c.name, "antfly.documentKey") or std.ascii.eqlIgnoreCase(c.name, "labels") or
@@ -525,7 +547,7 @@ pub fn analyze(a: A, query: ast.Query, graph: catalog.Graph) !Analysis {
     var table_set: Names = .empty;
     for (graph.labels) |label| try table_set.put(a, label.table, {});
     const table_names = try sortedNames(a, table_set);
-    var plan: Plan = .{ .a = a, .graph = graph, .table_names = table_names };
+    var plan: Plan = .{ .a = a, .graph = graph, .source = query.source, .table_names = table_names };
     for (table_names) |table| {
         const item = try a.create(NodePlan);
         item.* = .{};
@@ -628,13 +650,15 @@ fn entity(a: A, full: bool, values: Names, presence: Names, paths: []const Prope
 fn projectTree(a: A, name: []const u8, paths: []const PropertyPath, depth: usize) anyerror!Projection {
     var children: Names = .empty;
     var validate = false;
+    var shape = false;
     for (paths) |path| {
         if (path.parts.len == depth) {
-            if (!path.presence) return .{ .name = name, .mode = .value };
-            validate = true;
+            if (!path.presence and !path.shape) return .{ .name = name, .mode = .value };
+            validate = validate or path.presence;
+            shape = shape or path.shape;
         } else try children.put(a, path.parts[depth], {});
     }
-    if (children.count() == 0) return .{ .name = name, .mode = .presence };
+    if (children.count() == 0) return if (shape) .{ .name = name, .mode = .children, .validate = validate } else .{ .name = name, .mode = .presence };
     const keys = try sortedNames(a, children);
     const out = try a.alloc(Projection, keys.len);
     for (keys, out) |key, *child| {

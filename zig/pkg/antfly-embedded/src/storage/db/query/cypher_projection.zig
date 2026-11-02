@@ -327,3 +327,16 @@ test "Cypher demand projection retains nested nullness literal keys and validati
     _ = try rawValue(a, "{\"rank.with.dot\":7,\"ignored\":9223372036854775808}", projection);
     try std.testing.expectError(error.CypherNumericOverflow, rawValue(a, "{\"rank.with.dot\":7,\"ignored\":9223372036854775808}", observed_ancestor));
 }
+
+test "Cypher demand projection keeps empty map shapes and presence validation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var shape: Projection = .{ .name = "payload", .mode = .children };
+    const value = try rawValue(a, "{\"ignored\":9223372036854775808}", shape);
+    try std.testing.expect(value == .object and value.object.count() == 0);
+    try std.testing.expect((try rawValue(a, "null", shape)) == .null);
+    try std.testing.expect((try rawValue(a, "42", shape)).bool);
+    shape.validate = true;
+    try std.testing.expectError(error.CypherNumericOverflow, rawValue(a, "{\"ignored\":9223372036854775808}", shape));
+}

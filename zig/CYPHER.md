@@ -5418,3 +5418,68 @@ embedded / projection boundary checks, both final native builds, and all eight
 authenticated performance campaigns on the final Debug binary. Python formatting,
 lint, SDK-generator tests, and whitespace checks pass. Repository cache cleanup
 runs after the build session and preserves recent or active output.
+
+### Static selectors and internal CALL exports
+
+Literal string bracket selectors now share the same demand lineage as dotted
+properties, including mixed chains, `WITH` aliases, nullness checks and `COUNT`.
+Dynamic keys retain conservative complete-value demand. Binding names use the
+compiler's output-name rules, so implicit property-column names work across
+`WITH` and `CALL` too.
+
+Nested map projections apply their selected fields to the resolved entity or
+property lineage. A shape-only requirement distinguishes a map from NULL and
+invalid scalar/list bases without copying unused members; `{}` and projections
+containing only computed entries therefore retain correct type checks. Shape
+requirements merge with nested fields and ancestor presence validation. An `.*`
+selector, complete parent observer, opaque consumer or grouping requirement still
+upgrades to the complete value. These carriers remain private and use the
+existing projection wire representation.
+
+`CALL` returns are internal binding boundaries. Static entity/property lineage
+flows from a subquery's final projection into its caller, including nested and
+correlated calls. Inner locals stay scoped, and actual public returns still
+observe complete entities or containers. DISTINCT, grouping and whole-value
+ordering retain their complete-value barriers. Unused property exports preserve
+eager validation.
+
+Regression campaigns exercise the three previously expensive query shapes on
+wide documents, administrator and filtered-reader credentials, document and
+relational storage, and unselected values outside the signed integer range.
+Additional controls preserve selected-value errors, scalar/list base errors,
+NULL/missing behavior, complete ancestor values and map projection shapes.
+`origin/main` was fetched before this change and was initially up to date at
+`70fb539fee`. Its subsequent release-workflow update, `4e56e0315b`, was merged
+cleanly during final validation; it changes no runtime code.
+
+Projection output names also mask input bindings when the output has no entity
+lineage. This includes the implicit name in `WITH d{answer:42}`: a following
+predicate on `d.rank` observes the new map rather than adding demand for the old
+node's stored rank. The regression stores an unused out-of-range integer under
+that name and checks that the projected constant still succeeds.
+
+Measured CPU Debug query memory/work on the current one-document regression
+fixture (with the unused 2 MiB root string and 2 MiB nested sibling):
+
+| Shape | Review reproduction bytes | Current bytes | Current work |
+| --- | ---: | ---: | ---: |
+| `SUM(d['payload']['rank'])` | 46,454,752 | 82,706 | 20 |
+| `RETURN d.payload{.rank}` | 22,872,264 | 56,262 | 21 |
+| `CALL { MATCH(d:D) RETURN d } RETURN SUM(d.payload.rank)` | 46,428,448 | 80,374 | 30 |
+
+All three now fit a 1 MiB ceiling. Correlated, nested and property-exporting CALL
+variants also fit that ceiling. Explicitly returning the complete ancestor still
+uses the larger budget and retains the actual string contents. The new selector
+and map-projection forms succeed with an unused out-of-range integer, while
+selecting that integer still raises `CypherNumericOverflow`. These are reported
+allocation/work figures, without latency claims.
+
+Final qualification passes 554 core tests with optimized code and safety checks,
+16 focused Debug tests, 22 embedded/projection/adjacency checks, the final native
+build and all eight authenticated performance campaigns. The document and
+relational campaigns were rerun after giving two map-projection outputs explicit
+aliases, as required by the existing duplicate-column contract. Selected-value
+errors, unused-value success, implicit projection shadowing, row filters and
+whole-value controls all pass on the final binary. Python formatting/lint, six
+release-workflow regression tests and whitespace checks pass. Repository cache
+cleanup completed while preserving active builds and recent output.

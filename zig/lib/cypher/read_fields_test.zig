@@ -211,6 +211,7 @@ test "read demand scopes list locals while retaining their outer inputs" {
         "MATCH(d:D) RETURN reduce(d=0,x IN [1,2] | d+x)",
         "MATCH(d:D) RETURN reduce(x=0,d IN [1,2] | x+d)",
         "MATCH(d:D) RETURN [d IN [1] | [d IN [2] | d]]",
+        "MATCH(d:D) WITH d{answer:42} WHERE d.rank IS NULL RETURN d.answer",
     }) |query| {
         var diagnostic: root.compiler.Diagnostic = .{};
         var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
@@ -323,4 +324,109 @@ test "read demand forwards relationship property aliases without widening node f
     const tree = demand.relationships.projection[0];
     try std.testing.expect(tree.mode == .children);
     try std.testing.expectEqualStrings("rank", tree.children[0].name);
+}
+
+test "read demand normalizes literal bracket selectors and nested map projections" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "MATCH(d:D) RETURN sum(d['payload']['rank'])",
+        "MATCH(d:D) RETURN sum(d.payload['rank'])",
+        "MATCH(d:D) WITH d['payload'] AS p RETURN sum(p.rank)",
+        "MATCH(d:D) RETURN d.payload{.rank}",
+        "MATCH(d:D) WITH d.payload AS p RETURN p{.rank}",
+        "MATCH(d:D) RETURN d['payload']{.rank}",
+        "MATCH(d:D) WITH d.payload RETURN `d.payload`.rank",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        try expectNames(&.{"payload"}, demand.fields.?);
+        const tree = demand.projection[0];
+        try std.testing.expect(tree.mode == .children);
+        try std.testing.expectEqualStrings("rank", tree.children[0].name);
+        try std.testing.expect(tree.children[0].mode == .value);
+    }
+    for ([_][]const u8{
+        "MATCH(d:D) RETURN count(d['payload']['rank'])",
+        "MATCH(d:D) RETURN d['payload'].rank IS NULL",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        try std.testing.expect(demand.projection[0].children[0].mode == .presence);
+    }
+    for ([_][]const u8{
+        "MATCH(d:D) RETURN d.payload{}",
+        "MATCH(d:D) RETURN d.payload{answer:42}",
+        "MATCH(d:D) WITH d.payload AS p RETURN p{answer:42}",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        try expectNames(&.{"payload"}, demand.fields.?);
+        try std.testing.expect(demand.projection[0].mode == .children);
+        try std.testing.expectEqual(@as(usize, 0), demand.projection[0].children.len);
+    }
+    {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, "MATCH(d:D) RETURN d.payload{},d.payload IS NULL", .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        try std.testing.expect(demand.projection[0].mode == .children);
+        try std.testing.expect(demand.projection[0].validate);
+    }
+    for ([_][]const u8{
+        "MATCH(d:D) RETURN d.payload{.*,.rank}",
+        "MATCH(d:D) WITH d.payload AS p RETURN p{.*}",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        try expectNames(&.{"payload"}, demand.fields.?);
+        try std.testing.expectEqual(@as(usize, 0), demand.projection.len);
+    }
+}
+
+test "read demand exports CALL lineage and retains complete value barriers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "CALL { MATCH(d:D) RETURN d } RETURN sum(d.payload.rank)",
+        "CALL { MATCH(d:D) RETURN d.payload AS p } RETURN sum(p.rank)",
+        "MATCH(d:D) CALL { WITH d RETURN d.payload AS p } RETURN sum(p.rank)",
+        "CALL { CALL { MATCH(d:D) RETURN d } RETURN d AS x } RETURN sum(x.payload.rank)",
+        "CALL { MATCH(d:D) RETURN d.payload } RETURN sum(`d.payload`.rank)",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+        try expectNames(&.{"payload"}, demand.fields.?);
+        try std.testing.expect(demand.projection[0].mode == .children);
+        try std.testing.expectEqualStrings("rank", demand.projection[0].children[0].name);
+    }
+    for ([_][]const u8{
+        "CALL { MATCH(d:D) RETURN DISTINCT d } RETURN d.payload.rank",
+        "CALL { MATCH(d:D) RETURN d,count(*) AS c } RETURN d.payload.rank,c",
+        "CALL { MATCH(d:D) RETURN d ORDER BY d } RETURN d.payload.rank",
+        "CALL { MATCH(d:D) RETURN d } RETURN d",
+    }) |query| {
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(a, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        try std.testing.expect((try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes.fields == null);
+    }
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(a, "CALL { MATCH(d:D) RETURN d.payload AS p } RETURN count(*)", .{}, &diagnostic);
+    defer compiled.deinit();
+    const demand = (try root.read_fields.analyze(a, compiled.query, graph)).demand.table("docs").?.nodes;
+    try expectNames(&.{"payload"}, demand.fields.?);
+    try std.testing.expectEqual(@as(usize, 0), demand.projection.len);
 }

@@ -2336,6 +2336,19 @@ def test_authenticated_cypher_nested_and_table_demand(relational, monkeypatch):
                     expected_present,
                 ),
                 ("MATCH(d:D) WITH d AS x RETURN sum(x.payload.rank)", expected_sum),
+                ("MATCH(d:D) RETURN sum(d['payload']['rank'])", expected_sum),
+                (
+                    "CALL { MATCH(d:D) RETURN d } RETURN sum(d.payload.rank)",
+                    expected_sum,
+                ),
+                (
+                    "CALL { MATCH(d:D) RETURN d.payload AS p } RETURN sum(p.rank)",
+                    expected_sum,
+                ),
+                (
+                    "MATCH(d:D) CALL { WITH d RETURN d.payload AS p } RETURN sum(p.rank)",
+                    expected_sum,
+                ),
                 ("MATCH(d:D) WITH d.payload AS p RETURN sum(p.rank)", expected_sum),
                 (
                     "MATCH(d:D) WITH d.payload AS p WITH p AS q RETURN sum(q.rank)",
@@ -2355,6 +2368,23 @@ def test_authenticated_cypher_nested_and_table_demand(relational, monkeypatch):
                         sort_keys=True,
                     )
                 )
+            for projection in ("d.payload{.rank}", "d['payload']{.rank}"):
+                result = query(
+                    f"MATCH(d:D) WHERE d.id='d1' RETURN {projection}", session=session
+                )
+                assert result["rows"] == [
+                    [{"type": "map", "value": {"rank": integer(7)}}]
+                ], result
+            result = query(
+                "MATCH(d:D) WHERE d.id='d1' WITH d.payload AS p RETURN p{.rank} AS ranked,p{answer:42} AS computed",
+                session=session,
+            )
+            assert result["rows"] == [
+                [
+                    {"type": "map", "value": {"rank": integer(7)}},
+                    {"type": "map", "value": {"answer": integer(42)}},
+                ]
+            ], result
             for returned in ("c", "labels(c)"):
                 result = query(
                     f"MATCH(d:D),(c:C) RETURN {returned},sum(d.score)", session=session
@@ -2438,6 +2468,9 @@ def test_authenticated_cypher_nested_and_table_demand(relational, monkeypatch):
             for projection in (
                 "RETURN d.payload.rank",
                 "WITH d.payload AS p RETURN p.rank",
+                "RETURN d['payload']['rank']",
+                "RETURN d.payload{.rank}",
+                "WITH d.payload AS p RETURN p{}",
             ):
                 invalid = admin.post(
                     base + f"/graphs/{name}/query",
@@ -2592,8 +2625,22 @@ def test_authenticated_cypher_lineage_scopes_and_endpoint_domains(monkeypatch):
         for statement in (
             "MATCH(d:D) WITH d.payload AS p RETURN sum(p.rank)",
             "MATCH(d:D) WITH d.payload AS p WITH p AS q RETURN sum(q.rank)",
+            "MATCH(d:D) RETURN sum(d['payload']['rank'])",
+            "CALL { MATCH(d:D) RETURN d } RETURN sum(d.payload.rank)",
+            "CALL { MATCH(d:D) RETURN d.payload AS p } RETURN sum(p.rank)",
+            "MATCH(d:D) CALL { WITH d RETURN d.payload AS p } RETURN sum(p.rank)",
+            "CALL { CALL { MATCH(d:D) RETURN d } RETURN d AS x } RETURN sum(x.payload.rank)",
+            "CALL { MATCH(d:D) RETURN d.payload } RETURN sum(`d.payload`.rank)",
         ):
             assert query(statement)["rows"] == [[integer(7)]]
+        for statement in (
+            "MATCH(d:D) RETURN d.payload{.rank}",
+            "MATCH(d:D) RETURN d['payload']{.rank}",
+            "MATCH(d:D) WITH d.payload AS p RETURN p{.rank}",
+        ):
+            assert query(statement)["rows"] == [
+                [{"type": "map", "value": {"rank": integer(7)}}]
+            ]
         for statement in (
             "MATCH(d:D)-[:R]->(c) RETURN c,sum(d.score)",
             "MATCH(c)<-[:R]-(d:D) RETURN c,sum(d.score)",
@@ -2618,6 +2665,85 @@ def test_authenticated_cypher_lineage_scopes_and_endpoint_domains(monkeypatch):
         result = query("MATCH(d:D) WITH d.payload AS p RETURN p,p.rank", 64 << 20)
         assert result["rows"][0][0]["value"]["body"]["value"] == wide, result
         assert result["rows"][0][1] == integer(7), result
+        # Shape-only projections preserve maps, NULL, missing values and errors.
+        call(
+            f"/tables/{name}/batch",
+            {
+                "inserts": {
+                    "d1": {
+                        "rank": 9223372036854775808,
+                        "payload": {"rank": 7, "body": 9223372036854775808},
+                    },
+                },
+                "sync_level": "full_index",
+            },
+        )
+        assert query(
+            "MATCH(d:D) WITH d{answer:42} WHERE d.rank IS NULL RETURN d.answer"
+        )["rows"] == [[integer(42)]]
+        for statement in (
+            "MATCH(d:D) RETURN sum(d['payload']['rank'])",
+            "CALL { MATCH(d:D) RETURN d } RETURN sum(d.payload.rank)",
+            "CALL { MATCH(d:D) RETURN d.payload AS p } RETURN sum(p.rank)",
+        ):
+            assert query(statement)["rows"] == [[integer(7)]]
+        for projection in ("d.payload{.rank}", "d['payload']{.rank}"):
+            assert query(f"MATCH(d:D) RETURN {projection}")["rows"] == [
+                [
+                    {
+                        "type": "map",
+                        "value": {"rank": integer(7)},
+                    }
+                ]
+            ]
+        assert query("MATCH(d:D) RETURN d.payload{answer:42}")["rows"] == [
+            [
+                {
+                    "type": "map",
+                    "value": {"answer": integer(42)},
+                }
+            ]
+        ]
+        for payload in (None, {}, 42, []):
+            call(
+                f"/tables/{name}/batch",
+                {"inserts": {"d1": {"payload": payload}}, "sync_level": "full_index"},
+            )
+            for projection in (
+                "d.payload{.rank}",
+                "d.payload{}",
+                "d['payload']{answer:42}",
+            ):
+                statement = f"MATCH(d:D) RETURN {projection}"
+                if payload is None or isinstance(payload, dict):
+                    result = query(statement)
+                    if payload is None:
+                        assert result["rows"] == [[{"type": "null", "value": None}]], (
+                            result
+                        )
+                    else:
+                        expected = (
+                            {"rank": {"type": "null", "value": None}}
+                            if ".rank" in projection
+                            else (
+                                {"answer": integer(42)}
+                                if "answer" in projection
+                                else {}
+                            )
+                        )
+                        assert result["rows"] == [
+                            [{"type": "map", "value": expected}]
+                        ], result
+                else:
+                    response = session.post(
+                        base + f"/graphs/{name}/query",
+                        json={"query": statement},
+                        timeout=45,
+                    )
+                    assert (
+                        response.status_code == 400
+                        and response.json()["code"] == "CypherTypeMismatch"
+                    ), response.text
         # Unused document values outside the Cypher integer range must never
         # be evaluated because a lexical local happens to share their name.
         call(
@@ -2636,6 +2762,19 @@ def test_authenticated_cypher_lineage_scopes_and_endpoint_domains(monkeypatch):
                 f"MATCH(d:D) RETURN [{local} IN [{{payload:{{rank:7}}}}] | {local}.payload.rank]"
             )
             assert result["rows"] == [[{"type": "list", "value": [integer(7)]}]], result
+        for statement in (
+            "MATCH(d:D) RETURN d['payload']['rank']",
+            "MATCH(d:D) RETURN count(d['payload']['rank'])",
+            "MATCH(d:D) RETURN d.payload{.rank}",
+            "CALL { MATCH(d:D) RETURN d } RETURN sum(d.payload.rank)",
+        ):
+            response = session.post(
+                base + f"/graphs/{name}/query", json={"query": statement}, timeout=45
+            )
+            assert (
+                response.status_code == 400
+                and response.json()["code"] == "CypherNumericOverflow"
+            ), response.text
         assert query("MATCH(d:D) RETURN all(d IN [1,2] WHERE d>0)")["rows"] == [
             [
                 {
