@@ -86,20 +86,20 @@ non-regression. `MUTATION_ELAPSED_BATCH_WINDOW` stays off by default.
 
 ## Current modules and next sequence
 
-Latest integration incorporated main's lazy navigation and reclaimer-aware quotas.
-Rebuilt full/compact/observe module SHA-256 values are:
+The latest main integration includes lazy navigation and reclaimer-aware quotas.
+Current rebuilt full/compact/observe module SHA-256 values are:
 
-- `a5622fe8f6fc2565943b8fe8f2c9f77db5d5c3be8701a73ce136b27de47ba9dd`
-- `b8602aace3749f706c9074e1b789bea609add3d5914e40f901f9c0680eff3e0f`
-- `8d144f61f0e26ea4c402f54cf1c753144182809599905e045e51d7882e5d8cbd`
+- `d7f626e64130eb9253840fe14ff1b7e48b7a4c9fe7118f4adf07a33c143a11ec`
+- `e8022a42b86f0996acf132df7a3e19d93c0753c9999f9432fcbb253b375cc4e1`
+- `34543dcf22d16918975578daec99bea8e4f2a3b82332af5aac33480d729c4fd8`
 
-Those modules pass 623 JavaScript tests, 209 object-store checks (two provider skips),
-96 graph/page, 16 read-state, 14 publication/plan, 27 native host contracts and six
-actual-workerd checks. This is functional evidence, not a new latency comparison.
+The preceding integration passed 623 JavaScript tests, 209 object-store checks
+(two provider skips), 96 graph/page, 16 read-state, 14 publication/plan, 27 native
+host contracts and six actual-workerd checks. Rebuilt-module validation is kept
+separate from that earlier source and from latency evidence.
 The approved control remains immutable; rebuilt modules do not replace its bytes.
 
-The current short local comparison completed both execution orders on the rebuilt
-modules above, four tenants of 512 documents, 20 ms injected storage delay and
+The short local comparison before the latest main merge completed both execution orders, four tenants of 512 documents, 20 ms injected storage delay and
 zero-delay setup. It offered 128 reads at 16 reads/s with one write per sixteen
 reads, per case, using fresh stores and required fences plus latest-read checks.
 
@@ -118,6 +118,14 @@ cohort members/case, not independent physical cold boots. They compare the curre
 resident incumbent with the durable pipeline, **not approved control c44896ac8c**.
 They do not replace hosted qualification or establish a statistical SLO. Reports
 and negative earlier runs remain under local `dist/qualification/`.
+
+Same-request profiles identify the local tail reduction: the incumbent's slowest
+reads spend 118–287 ms in owner admission. The durable candidate's slowest reads
+instead mostly contain one 23–27 ms immutable dependency wave. This supports the
+existing owner/cold-pipeline path for the next hosted comparison; it is not proof
+that the historical hosted tail has the same cause. Kernel queue p95 is zero in
+these small local populations, so increasing kernel capacity is not justified by
+this evidence.
 
 Run a short 512-document comparison on the current source before longer tests.
 For local diagnosis use `read-state-latency.mjs`, separate fresh output directories,
