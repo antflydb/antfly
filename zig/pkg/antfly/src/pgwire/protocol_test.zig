@@ -2566,34 +2566,43 @@ test "pgwire pending work completion witness retains durable DDL owner" {
             return true;
         }
     };
-    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
-    defer input.deinit();
-    try startup(&input.writer);
-    try frame(&input.writer, 'Q', "CREATE UNIQUE INDEX i ON t (id)\x00");
-    try frame(&input.writer, 'Q', "SELECT 1\x00");
-    try frame(&input.writer, 'X', "");
-    var mock = Mock{ .ddl_pending = true, .renewable_auth = true };
-    var source = mock.source();
-    var vtable = source.vtable.*;
-    vtable.execute = Fixture.executeOnce;
-    vtable.completion_safe = Fixture.completion;
-    vtable.pin_completion = pinMockCompletion;
-    vtable.completion_ready = mockCompletionReady;
-    source.vtable = &vtable;
-    var reader = std.Io.Reader.fixed(input.written());
-    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
-    defer output.deinit();
-    var session = protocol.Session{ .alloc = std.testing.allocator, .io = std.testing.io, .source = source, .reader = &reader, .writer = &output.writer };
-    try session.run();
-    var completion: @import("completion.zig").Completion = .{};
-    session.completion_destination = &completion;
-    session.deinit();
-    defer completion.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), mock.executions);
-    try std.testing.expect(!mock.ddl_pending);
-    try std.testing.expect(!completion.unknown);
-    try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
-    try std.testing.expect(completion.outcomes.items[0].ddl_receipt_json != null);
+    // TCP write-half shutdown may deliver EOF at a frame boundary or in an
+    // interrupted payload. Neither path may discard joined completion evidence.
+    for (0..3) |ending| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "CREATE UNIQUE INDEX i ON t (id)\x00");
+        try frame(&input.writer, 'Q', "SELECT 1\x00");
+        if (ending == 0) try frame(&input.writer, 'X', "");
+        if (ending == 2) {
+            try input.writer.writeByte('H');
+            try input.writer.writeInt(u32, 100, .big);
+            try input.writer.writeAll("interrupted payload");
+        }
+        var mock = Mock{ .ddl_pending = true, .renewable_auth = true };
+        var source = mock.source();
+        var vtable = source.vtable.*;
+        vtable.execute = Fixture.executeOnce;
+        vtable.completion_safe = Fixture.completion;
+        vtable.pin_completion = pinMockCompletion;
+        vtable.completion_ready = mockCompletionReady;
+        source.vtable = &vtable;
+        var reader = std.Io.Reader.fixed(input.written());
+        var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer output.deinit();
+        var session = protocol.Session{ .alloc = std.testing.allocator, .io = std.testing.io, .source = source, .reader = &reader, .writer = &output.writer };
+        if (ending == 2) try std.testing.expectError(error.EndOfStream, session.run()) else try session.run();
+        var completion: @import("completion.zig").Completion = .{};
+        session.completion_destination = &completion;
+        session.deinit();
+        defer completion.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 2), mock.executions);
+        try std.testing.expect(!mock.ddl_pending);
+        try std.testing.expect(!completion.unknown);
+        try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
+        try std.testing.expect(completion.outcomes.items[0].ddl_receipt_json != null);
+    }
 }
 
 test "pgwire completion budget rejects new execution before losing known owners" {

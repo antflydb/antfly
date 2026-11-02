@@ -13746,7 +13746,7 @@ pub const ApiHttpServer = struct {
         const owner = try routing.owner(id);
         const router = self.cfg.session_router orelse return null;
         if (owner == 0 or owner == router.localNodeId()) return null;
-        if (self.txn_sessions.durable) |store| if (try routing.containsLocal(store, id, kind)) return null;
+        if (self.txn_sessions.durable) |store| if (try routing.ownsLocal(store, id, kind, router.localNodeId())) return null;
         const executor = self.cfg.session_executor orelse return error.HttpExecutorUnavailable;
         const base = (try router.nodeBaseUri(self.alloc, owner)) orelse return null;
         defer self.alloc.free(base);
@@ -61868,4 +61868,71 @@ test "SQL pgwire native shared store recovery isolates live issuer outboxes" {
     const resumed = try restarted.createRegistration(@splat(0x43), .{ .transaction_id = "resumed" });
     try std.testing.expectEqual(second_reference[0..8].*, resumed[0..8].*);
     try std.testing.expectEqual(@as(u64, 2), @import("completion_retirement.zig").sequence(resumed));
+}
+
+test "SQL pgwire native shared resource routing checks persisted ownership" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/shared-resource-routing", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var storage = try docstore_mod.DocStore.open(a, path, .{});
+    defer storage.close();
+    var owner_store = transactions_api.DurableSessionStore.init(a, &storage);
+    var peer_store = transactions_api.DurableSessionStore.init(a, &storage);
+    const Fixture = struct {
+        called: bool = false,
+        fn local(_: *anyopaque) u64 {
+            return 2;
+        }
+        fn uri(_: *anyopaque, alloc: std.mem.Allocator, node: u64) !?[]u8 {
+            try std.testing.expectEqual(@as(u64, 1), node);
+            return try alloc.dupe(u8, "http://issuer");
+        }
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            @as(*@This(), @ptrCast(@alignCast(ptr))).called = true;
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
+        }
+    };
+    var fixture: Fixture = .{};
+    var peer = ApiHttpServer.init(a, .{
+        .session_store = &peer_store,
+        .session_store_scope = .cluster_shared,
+        .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = undefined, .node_base_uri = Fixture.uri } },
+        .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
+    }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer peer.deinit();
+    const routing = @import("sql_resource_routing.zig");
+    const connections = @import("sql_connections.zig");
+    const prepared = @import("sql_prepared.zig");
+    const connection = routing.encode(1, @splat(0x41));
+    const statement = routing.encode(1, @splat(0x42));
+    _ = try connections.mutate(&owner_store, .{ .create = .{ .id = connection, .principal = "alice", .owner_node_id = 1, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 1, 1);
+    try prepared.create(&owner_store, .{ .id = statement, .principal = "alice", .owner_node_id = 1, .expires_at_ms = 1000, .database = "main", .namespace = "public", .statement = "SELECT 1", .parameter_types = &.{}, .bindings = &.{} }, 1);
+    for ([_]routing.Kind{ .connection, .prepared }) |kind| {
+        const id = if (kind == .connection) connection else statement;
+        var forwarded = false;
+        var response = try peer.forwardSQLResourceOperation(&id, kind, .{ .method = .DELETE, .uri = "/db/v1/sql/resource", .body = "" }, &forwarded);
+        defer if (response) |*value| value.deinit(a);
+        try std.testing.expect(response != null and forwarded and fixture.called);
+        fixture.called = false;
+        try std.testing.expect(try routing.ownsLocal(&peer_store, &id, kind, 1));
+        try std.testing.expect(!try routing.ownsLocal(&peer_store, &id, kind, 2));
+    }
+    try std.testing.expectError(error.SqlConnectionWrongOwner, connections.load(&peer_store, a, connection, "alice", 2, 2));
+    try std.testing.expectError(error.SqlPreparedWrongOwner, prepared.load(&peer_store, a, &statement, "alice", 2, 2));
+    // Legacy handles have random issuer bits but remain usable on their actual
+    // owner. Both forwarding and mixed-resource validation use ownsLocal.
+    const legacy_connection = routing.encode(99, @splat(0x43));
+    const legacy_statement = routing.encode(99, @splat(0x44));
+    _ = try connections.mutate(&peer_store, .{ .create = .{ .id = legacy_connection, .principal = "alice", .owner_node_id = 2, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 2, 1);
+    try prepared.create(&peer_store, .{ .id = legacy_statement, .principal = "alice", .owner_node_id = 2, .expires_at_ms = 1000, .database = "main", .namespace = "public", .statement = "SELECT 1", .parameter_types = &.{}, .bindings = &.{} }, 1);
+    for ([_]routing.Kind{ .connection, .prepared }) |kind| {
+        const id = if (kind == .connection) legacy_connection else legacy_statement;
+        try std.testing.expect(try routing.ownsLocal(&peer_store, &id, kind, 2));
+        try std.testing.expect(!try routing.ownsLocal(&peer_store, &id, kind, 1));
+        var forwarded = false;
+        try std.testing.expectEqual(@as(?contextual_operations.OwnedResponse, null), try peer.forwardSQLResourceOperation(&id, kind, .{ .method = .DELETE, .uri = "/db/v1/sql/resource", .body = "" }, &forwarded));
+        try std.testing.expect(!forwarded and !fixture.called);
+    }
 }

@@ -28,7 +28,7 @@ const key = "\x00sql-prepared-v1";
 pub const max_resources = 128;
 pub const max_statement_bytes = 64 << 10;
 pub const max_record_bytes = 4 << 20;
-const max_resource_bytes = 512 << 10;
+pub const max_resource_bytes = 512 << 10;
 pub const ttl_ms: u64 = 60 * 60 * 1000;
 
 pub const Binding = struct {

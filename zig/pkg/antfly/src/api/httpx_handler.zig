@@ -7027,7 +7027,7 @@ pub const AntflyApiHandler = struct {
             const local = self.api_server.localSessionNodeId();
             if (owner != local) {
                 if (index < 2) {
-                    if (self.api_server.txn_sessions.durable) |store| if (try @import("sql_resource_routing.zig").containsLocal(store, encoded, if (index == 0) .prepared else .connection)) {
+                    if (self.api_server.txn_sessions.durable) |store| if (try @import("sql_resource_routing.zig").ownsLocal(store, encoded, if (index == 0) .prepared else .connection, local)) {
                         owner = local;
                     };
                 } else {

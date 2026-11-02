@@ -13,30 +13,40 @@ pub fn owner(id: []const u8) !u64 {
     _ = try std.fmt.hexToBytes(&bytes, id);
     return std.mem.readInt(u64, bytes[0..8], .big);
 }
-fn contains(txn: anytype, id: []const u8, kind: Kind) !bool {
+fn owns(txn: anytype, alloc: std.mem.Allocator, id: []const u8, kind: Kind, local_node_id: u64) !bool {
     const key: []const u8 = switch (kind) {
         .prepared => &(try @import("sql_prepared.zig").resourceKey(id)),
         .connection => &(try @import("sql_connection_record.zig").key(id)),
     };
-    _ = txn.get(key) catch |err| switch (err) {
+    const raw = txn.get(key) catch |err| switch (err) {
         error.NotFound => return false,
         else => return err,
     };
-    return true;
+    const limit: usize = switch (kind) {
+        .connection => @import("sql_connection_record.zig").max_record_bytes,
+        .prepared => @import("sql_prepared.zig").max_resource_bytes,
+    };
+    if (raw.len > limit) return error.SqlProgramLimitExceeded;
+    // Read only routing metadata. Authentication, expiry and resource validation
+    // remain the responsibility of the normal load on the selected issuer.
+    const Ownership = struct { id: [32]u8, owner_node_id: u64 };
+    var parsed = try std.json.parseFromSlice(Ownership, alloc, raw, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return std.mem.eql(u8, &parsed.value.id, id) and parsed.value.owner_node_id == local_node_id;
 }
-// Legacy random handles remain usable on their issuing node. Existence never
-// grants access: normal resource loading still checks principal and ownership.
-pub fn containsLocal(store: *transactions.DurableSessionStore, id: []const u8, kind: Kind) !bool {
+// Legacy random handles may override their encoded issuer only when the
+// persisted record is owned here. Shared-store visibility does not imply ownership.
+pub fn ownsLocal(store: *transactions.DurableSessionStore, id: []const u8, kind: Kind, local_node_id: u64) !bool {
     return switch (store.backend) {
         .docstore => |backend| blk: {
             var txn = try backend.beginReadTxn();
             defer txn.abort();
-            break :blk try contains(&txn, id, kind);
+            break :blk try owns(&txn, store.alloc, id, kind, local_node_id);
         },
         .runtime => |backend| blk: {
             var txn = try backend.beginRead();
             defer txn.abort();
-            break :blk try contains(&txn, id, kind);
+            break :blk try owns(&txn, store.alloc, id, kind, local_node_id);
         },
     };
 }
