@@ -2261,6 +2261,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const chunker_tests = b.addTest(.{
+        .filters = selectTestFilters(b, &.{}),
         .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("{s}/lib/chunker/src/mod.zig", .{shared_lib_root})),
             .target = target,

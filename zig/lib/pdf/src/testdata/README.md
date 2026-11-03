@@ -18,3 +18,15 @@ original arithmetic terminator bytes.
 
 Source: https://fraser.stlouisfed.org/files/docs/publications/tbulletin/1985_03_treasurybulletin.pdf
 SHA-256: `6fcfabf9f21f9e8bc0565eed1f9430ecc18c543ee540e066ed24329e69e04b70`
+
+## NASA Hubble Servicing Mission 3A OCR text
+
+`nasa-hubble-sm3a.pdf` is the unmodified public NASA NTRS report 20000025316,
+"Hubble Space Telescope Servicing Mission 3A" (FS-1999-10-033-GSFC).
+Source: https://ntrs.nasa.gov/api/citations/20000025316/downloads/20000025316.pdf
+SHA-256: `d12bf7d43556c870cc7a724e1ae072eba4da4f8387bfb4390b49d68d95561eb3`.
+
+Its scanned pages have invisible (`3 Tr`) positioned OCR words. Excluding those
+runs from extraction produced one concatenated string per page. Regression tests
+check both plain and analyzed extraction, searchable phrase spacing, span offsets,
+and the analysis run limit. Invisible text remains excluded from paint runs.
