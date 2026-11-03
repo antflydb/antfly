@@ -741,12 +741,12 @@ pub fn embedCached(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     defer admitted.deinit();
     var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = if (native_text) admitted.allocator() else workspaceBackingAllocator(session.backend()), .limit = 512 * 1024 * 1024 };
     defer std.debug.assert(bounded.live == 0);
-    const result = embedScoped(&bounded, session, tokenizer, group, options, lock, control, cache) catch |err| blk: {
+    const result = embedScoped(&bounded, session, tokenizer, group, options, lock, control, cache, if (native_text) &admitted else null) catch |err| blk: {
         if (err == error.SpeculativeVideoAdmissionDenied) {
             options.video_ahead.?.abandon();
             var serial = options;
             serial.video_ahead = null;
-            break :blk try embedScoped(&bounded, session, tokenizer, group, serial, lock, control, cache);
+            break :blk try embedScoped(&bounded, session, tokenizer, group, serial, lock, control, cache, if (native_text) &admitted else null);
         }
         return if ((err == error.OutOfMemory and bounded.denied) or err == error.SharedAdmissionExceeded) error.MemoryBudgetExceeded else if (err == error.OutOfMemory) admitted.admission_error orelse err else err;
     };
@@ -917,7 +917,9 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
     return .{ .bounds = bounds, .input_bytes = input_bytes, .has_video = has_video, .device_bytes = device_bytes, .commands = command_slots };
 }
 
-fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllocator, session: Session, tokenizer: Tokenizer, group: Group, input_options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache) !Result {
+fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllocator, session: Session, tokenizer: Tokenizer, group: Group, input_options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache, native_allocator: ?*@import("../backends/admitted_allocator.zig").AdmittedAllocator) !Result {
+    var native_run: ?@import("../backends/admitted_allocator.zig").AdmittedAllocator.RunScope = null;
+    defer if (native_run) |*run| run.deinit();
     var pins = @import("embedding_gemma2_video.zig").CachePins{ .cache = cache };
     defer pins.deinit();
     var options = input_options;
@@ -1068,7 +1070,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
         try videoBackboneBounds(session.backend() == .metal, count, bounds.workspace);
     const phase_host = @min(bounds.host, @max(bounded.live, phase.host));
     if (native_text) {
-        permit = try session.admit(try nativeTextEncoderRequest(input_bytes, count, options.dimensions));
+        native_run = try native_allocator.?.admitRun(try nativeTextEncoderRequest(input_bytes, count, options.dimensions));
     } else {
         try lane.retain(.{ .batch = 1, .sequence = count, .input_bytes = input_bytes, .backend_input_bytes = if (session.backend() == .metal) count * 512 * 4 else null, .preprocessing_complete = session.backend() == .metal, .workspace_planned = session.backend() == .metal, .host_preprocess_bytes = phase_host, .workspace_bytes = phase.workspace, .output_bytes = options.dimensions * @sizeOf(f32) });
     }

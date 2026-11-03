@@ -211,6 +211,8 @@ Admission checks every request limit before considering contention. A request th
 
 Both permanent and temporary memory-admission failures record the error identity, requested bytes, current reservations, and configured limits in the inference process logs. For `MODEL_RESOURCE_LIMIT`, inspect the `inference run admission denied` and `inference run admission request` records before changing budgets. A loaded model's RSS does not include all request scratch or preprocessing memory. The process envelope and live host/cgroup capacity apply in addition to the individual inference budgets.
 
+Native EmbeddingGemma text execution lets physical temporary allocations consume its prepaid workspace, reserving only additional bytes. The 512 MiB temporary-allocation ceiling is a guard, not an upfront reservation. Retained output buffers keep their admission when an execution phase finishes. Cumulative scratch owned by one request is checked against the policy separately from other requests' occupancy.
+
 The [inference runtime reference](../reference/inference-runtime.md) covers weighted work admission, request ceilings, and the model-instance API.
 
 ### Loading models in Antfarm

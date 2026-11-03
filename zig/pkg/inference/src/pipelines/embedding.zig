@@ -359,6 +359,7 @@ pub const EmbeddingPipeline = struct {
     /// parallel; only device/session execution is serialized.
     execution_lock: ?*std.atomic.Mutex = null,
     execution_gate_held: bool = false,
+    gemma_workspace: ?*@import("../backends/admitted_allocator.zig").AdmittedAllocator = null,
     execution_lane: ?*@import("../execution_control.zig").ExecutionLane = null,
     execution_lane_held: bool = false,
     interactive: bool = false,
@@ -457,6 +458,7 @@ pub const EmbeddingPipeline = struct {
             defer std.debug.assert(bounded.live == 0);
             var scoped = self.*;
             scoped.allocator = bounded.allocator();
+            scoped.gemma_workspace = &admitted;
             // Length buckets retain the admitted physical allocation ceiling.
             const temporary = (if (self.config.resident_text_encoder and self.config.normalize and self.config.pooling == .mean and self.text_projection == null and (self.session.backend() == .native or self.session.backend() == .metal)) scoped.embedGemma2Texts(texts) else scoped.embedWithBatchPlan(texts, .{ .batch_size = 1, .pad_final_batch = false })) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else if (err == error.OutOfMemory) admitted.admission_error orelse err else err;
             defer {
@@ -1053,13 +1055,13 @@ pub const EmbeddingPipeline = struct {
             self.execution_gate_held = false;
             self.unlockExecution();
         };
-        var run_permit = try text_session.admit(.{
+        var run_scope = try self.admitTextRun(text_session, .{
             .batch = batch,
             .sequence = effective_len,
             .input_bytes = std.math.mul(usize, admitted_tokens, 24) catch
                 return error.ResourceLimitExceeded,
         });
-        defer run_permit.deinit();
+        defer run_scope.deinit();
         if (self.execution_control) |control| try control.check();
 
         const all_ids = try alloc.alloc(i32, batch * effective_len);
@@ -1102,7 +1104,7 @@ pub const EmbeddingPipeline = struct {
             ids_i64,
             batch,
             effective_len,
-            &run_permit,
+            &run_scope.permit,
         );
         for (all_mask[0 .. texts.len * effective_len]) |valid| if (valid != 0) {
             self.last_input_tokens +|= 1;
@@ -1161,7 +1163,7 @@ pub const EmbeddingPipeline = struct {
             self.execution_gate_held = false;
             self.unlockExecution();
         };
-        var run_permit = try text_session.admit(.{
+        var run_scope = try self.admitTextRun(text_session, .{
             .batch = if (compact_policy) 1 else batch,
             .sequence = if (compact_policy) active_rows else seq_len,
             .output_bytes = if (compact_policy) batch * self.config.embedding_gemma2_dimensions * @sizeOf(f32) else null,
@@ -1174,15 +1176,30 @@ pub const EmbeddingPipeline = struct {
             else
                 0,
         });
-        defer run_permit.deinit();
+        defer run_scope.deinit();
         if (self.execution_control) |control| try control.check();
-        return self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, &run_permit);
+        return self.embedPreparedTextInputs(input_set.slice(), mask_i32, input_ids, batch, seq_len, &run_scope.permit);
     }
 
     /// Returns backend telemetry for the most recent successful resident
     /// encoder request. Consumers must read this before starting another run.
     pub fn lastResidentBackendTiming(self: *const EmbeddingPipeline) ?ops_mod.BackendDebugTimingSnapshot {
         return self.last_resident_backend_timing;
+    }
+
+    fn admitTextRun(self: *EmbeddingPipeline, session: session_mod.Session, request: session_mod.RunRequest) !@import("../backends/admitted_allocator.zig").AdmittedAllocator.RunScope {
+        if (session.backend() == .native) if (self.gemma_workspace) |workspace| {
+            // Resolve the full encoder output before lending its workspace.
+            // Generic/non-pooled paths must not later yield this borrowed
+            // permit merely to discover the fixed Gemma output geometry.
+            const cfg = session_factory.getEmbeddingGemma2Config(session) orelse return error.InvalidAdmissionLeaseReduction;
+            const rows = std.math.mul(usize, request.batch, request.sequence) catch return error.ResourceLimitExceeded;
+            var planned = request;
+            planned.output_bytes = @max(request.output_bytes orelse 0, std.math.mul(usize, rows, cfg.embedding_dim * @sizeOf(f32)) catch return error.ResourceLimitExceeded);
+            planned.workspace_bytes = @max(request.workspace_bytes, try @import("embedding_gemma2.zig").textEncoderWorkspace(rows));
+            return workspace.admitRun(planned);
+        };
+        return .{ .permit = try session.admit(request) };
     }
 
     fn embedPreparedTextInputs(

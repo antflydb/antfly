@@ -69,7 +69,7 @@ and model residency, rather than transcription accuracy.
 
 ## Retained regression checks
 
-- `test-memory-admission`: 78 passed; 17 CUDA-only cases skipped in the CPU build.
+- `test-memory-admission`: 78 passed; 17 accelerator-dependent cases skipped in the CPU build.
   Includes actual temporary-allocation growth, default CPU scratch admission,
   overflow, refusal cleanup, session observer lock ordering and sampler gating.
 - `admission-api-test`: six passed with strict error-log expectations and no
@@ -90,3 +90,52 @@ The sampler-gate regression processes 271,168 refusals with one sampler
 invocation during that interval, then permits another sample after one second
 of logical time. Its isolated execution took 0.03 seconds including startup;
 this measures accounting overhead with a test sampler, not model throughput.
+
+## Follow-up review and main integration
+
+The follow-up merges `origin/main` at `95592ec39a`. Native encoder allocations
+now consume prepaid execution workspace rather than acquiring a second lease
+for the same bytes. At the end of each phase, the allocator adopts the execution
+lease before returning unused capacity. Retained outputs remain admitted without
+an extra copy or a fresh cleanup-time reservation. Cumulative request-owned
+scratch is checked before reserving a delta, preserving the distinction between
+an intrinsic limit and contention with another request.
+
+Dense and sparse remote providers now share classification of both
+`MODEL_RESOURCE_BUSY` and the database's `reason: "inference_admission"`
+envelope. The HTTP regression matrix includes both forms, ordinary 503s,
+non-retryable admission-looking bodies, and permanent 400/507 resource failures.
+
+`zig/e2e/inference/test_cpu_admission.py` is an opt-in real-model regression for
+native execution with default inference budgets. It checks the first HTTP
+response without capacity retries: flat/grouped text through 384 words,
+retained outputs across eight cohorts, precise concurrent-capacity refusals
+and serial recovery after contention, and permanent
+refusal of an oversized request. Against a running native server with the local
+BF16 bundle and an 8 or 14 GiB process/runtime envelope, run:
+
+```sh
+ANTFLY_INFERENCE_CPU_ADMISSION=1 \
+ANTFLY_INFERENCE_URL=http://127.0.0.1:18095 \
+uv run --project zig/e2e/inference pytest -q zig/e2e/inference/test_cpu_admission.py
+```
+
+Follow-up CPU results (all twelve tests passed in each envelope):
+
+| Runtime | Host / scratch policy | Result |
+| --- | --- | --- |
+| ARM64 Linux, hard 8 GiB cap, four CPU units | 2 GiB / 357,913,941 bytes | 12/12 passed |
+| ARM64 Linux, hard 14 GiB cap, four CPU units | 4 GiB / 715,827,882 bytes | 12/12 passed |
+| macOS native, explicit 8 GiB process envelope | 2 GiB / 357,913,941 bytes | 12/12 passed |
+
+The over-limit input contains 4096 repeated words. A 512-word request correctly
+fits the larger policy observed under the 14 GiB cap and is not a portable
+permanent-refusal case. Concurrent flat/grouped lanes may correctly return
+retryable `MODEL_RESOURCE_BUSY`; the test verifies first-response identity,
+progress by an admitted caller, and a successful single serial recovery attempt
+after competing callers have drained.
+
+The final CPU admission suite passed 81 tests with 17 accelerator-dependent
+skips. Shared inference/provider contracts (including twelve dense/sparse HTTP
+error combinations), strict focused API contracts, generated registry/catalog
+checks, and the regenerated Go SDK tests also passed.

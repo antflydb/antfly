@@ -166,6 +166,24 @@ pub const RunAdmission = struct {
         };
     }
 
+    /// Validate all host scratch already owned by one request before acquiring
+    /// a delta. Independent leases must not hide its intrinsic policy limit.
+    pub fn validateOwnedHostScratch(self: RunAdmission, bytes: usize) !void {
+        const amounts = memory.AdmissionAmounts{ .host_scratch_bytes = bytes };
+        const shared = self.controller.sharedLimitsSnapshot();
+        if ((amounts.firstLimitExceeded(self.limits) catch return error.ResourceLimitExceeded) != null or
+            (shared.host_limit_bytes != 0 and bytes > shared.host_limit_bytes) or
+            (shared.unified_limit_bytes != 0 and bytes > shared.unified_limit_bytes))
+        {
+            if (self.denial_observer) |observer| observer.record(observer.context, error.ResourceLimitExceeded, null, .{
+                .backend_class = self.backend_class,
+                .limits = self.limits,
+                .amounts = amounts,
+            });
+            return error.ResourceLimitExceeded;
+        }
+    }
+
     fn estimateResidentAmounts(
         self: RunAdmission,
         inputs: []const ResidentInput,

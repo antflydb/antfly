@@ -822,7 +822,6 @@ pub const Provider = struct {
         if (!resp.ok()) {
             logEmbedFailure("dense", url, resp.status.code, resp.body);
             if (isCapabilityStaleResponse(resp)) return error.InferenceCapabilitiesStale;
-            if (isInferenceAdmissionDenied(resp)) return error.QueueFull;
             return mapEmbedResponse(alloc, resp.status.code, resp.body);
         }
 
@@ -1046,10 +1045,13 @@ fn mapEmbedResponse(alloc: std.mem.Allocator, status: u16, body: ?[]const u8) an
         if (bytes.len > 4096) return mapEmbedStatus(status);
         const parsed = std.json.parseFromSlice(struct {
             @"error": []const u8 = "",
+            reason: ?[]const u8 = null,
             retryable: ?bool = null,
         }, alloc, bytes, .{ .ignore_unknown_fields = true }) catch return mapEmbedStatus(status);
         defer parsed.deinit();
         const code = parsed.value.@"error";
+        if (status == 503 and parsed.value.retryable == true and std.mem.eql(u8, parsed.value.reason orelse "", "inference_admission"))
+            return error.QueueFull;
         if (status == 503 and parsed.value.retryable == true and std.mem.eql(u8, code, "MODEL_RESOURCE_BUSY"))
             return error.EmbedAdmissionRefused;
         if (parsed.value.retryable != true) {
@@ -1862,6 +1864,8 @@ test "antfly embed treats service unavailability as transient" {
 test "embedding HTTP preserves admission and permanent resource identities" {
     const a = std.testing.allocator;
     try std.testing.expectEqual(error.EmbedAdmissionRefused, mapEmbedResponse(a, 503, "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true}"));
+    try std.testing.expectEqual(error.QueueFull, mapEmbedResponse(a, 503, "{\"error\":\"SERVICE_UNAVAILABLE\",\"reason\":\"inference_admission\",\"retryable\":true}"));
+    try std.testing.expectEqual(error.EmbedTransientFailure, mapEmbedResponse(a, 503, "{\"error\":\"SERVICE_UNAVAILABLE\",\"reason\":\"inference_admission\",\"retryable\":false}"));
     try std.testing.expectEqual(error.ResourceLimitExceeded, mapEmbedResponse(a, 400, "{\"error\":\"MODEL_RESOURCE_LIMIT\",\"retryable\":false}"));
     // Older inference servers omitted retryable for permanent model limits.
     try std.testing.expectEqual(error.ResourceLimitExceeded, mapEmbedResponse(a, 400, "{\"error\":\"MODEL_RESOURCE_LIMIT\"}"));
@@ -1870,4 +1874,51 @@ test "embedding HTTP preserves admission and permanent resource identities" {
         try std.testing.expectEqual(error.EmbedTransientFailure, mapEmbedResponse(a, 503, body));
         try std.testing.expectEqual(error.EmbedTransientFailure, mapEmbedResponse(a, 507, body));
     }
+}
+
+test "embedding HTTP dense and sparse share admission failure accounting" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const cases = [_]struct { status: u16, body: []const u8, expected: anyerror }{
+        .{ .status = 503, .body = "{\"error\":\"SERVICE_UNAVAILABLE\",\"reason\":\"inference_admission\",\"retryable\":true}", .expected = error.QueueFull },
+        .{ .status = 503, .body = "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true}", .expected = error.EmbedAdmissionRefused },
+        .{ .status = 503, .body = "unavailable", .expected = error.EmbedTransientFailure },
+        .{ .status = 503, .body = "{\"reason\":\"inference_admission\",\"retryable\":false}", .expected = error.EmbedTransientFailure },
+        .{ .status = 400, .body = "{\"error\":\"MODEL_RESOURCE_LIMIT\",\"retryable\":false}", .expected = error.ResourceLimitExceeded },
+        .{ .status = 507, .body = "{\"error\":\"MEMORY_BUDGET_EXCEEDED\",\"retryable\":false}", .expected = error.MemoryBudgetExceeded },
+    };
+    const Worker = struct {
+        fn run(a: std.mem.Allocator, test_io: std.Io, base: []const u8, sparse: bool, failure: *?anyerror) std.Io.Cancelable!void {
+            var client = httpx.Client.initWithConfig(a, test_io, .{ .keep_alive = false });
+            defer client.deinit();
+            var provider = Provider.init(a, &client, base);
+            defer provider.deinit();
+            if (sparse) {
+                var result = provider.embedSparse(a, "model", &.{"hello"}) catch |err| {
+                    failure.* = err;
+                    return;
+                };
+                result.deinit();
+            } else {
+                var result = provider.embedWithTask(a, "model", &.{"hello"}, null, null) catch |err| {
+                    failure.* = err;
+                    return;
+                };
+                result.deinit();
+            }
+        }
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |sparse| {
+        var server = try httpx.TestServer.start(alloc, io, &.{.{ .method = .POST, .path = "/embed", .respond = .{ .status = case.status, .body = case.body, .content_type = "application/json" } }});
+        defer server.deinit();
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        var failure: ?anyerror = null;
+        try group.concurrent(io, Worker.run, .{ alloc, io, server.baseUrl(), sparse, &failure });
+        try server.handleOne();
+        try group.await(io);
+        try std.testing.expectEqual(@as(?anyerror, case.expected), failure);
+    };
 }
