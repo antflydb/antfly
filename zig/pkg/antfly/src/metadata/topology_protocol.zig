@@ -168,7 +168,9 @@ const std = @import("std");
 // unreleased SQL profile reserves floors above 78; historical notes above
 // describe its development sequence before this rebasing. Published transition
 // tag 81 remains SQL completion references; private SQL tags begin at 82.
-pub const current_version: u16 = 157;
+pub const current_version: u16 = 158;
+/// Ordinary catalog DDL binds a prepared command to a retained native outcome.
+pub const sql_catalog_journal_version: u16 = 158;
 pub const sql_prepared_lock_handoff_version: u16 = 155;
 /// The unreleased combined catalog profile also decodes trigger-return contracts.
 /// Keep new declarations above the older scalar-only routine capability floor.

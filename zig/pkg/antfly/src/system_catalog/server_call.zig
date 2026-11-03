@@ -179,6 +179,9 @@ pub const Call = union(enum) {
     sql_cast_mutate: @import("casts.zig").Mutation,
     sql_cast_outcome: @import("casts.zig").OutcomeRequest,
     sql_routine_snapshot: @import("routines.zig").SnapshotRequest,
+    sql_catalog_prepare: @import("catalog_mutations.zig").Preparation,
+    sql_catalog_mutate: @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand,
+    sql_catalog_outcome: @import("catalog_mutations.zig").Observation,
     sql_native_index_prepare: @import("native_indexes.zig").Preparation,
     sql_native_index_mutate: @import("native_indexes.zig").Mutation,
     sql_native_index_outcome: @import("native_indexes.zig").OutcomeRequest,
@@ -239,6 +242,14 @@ pub const Call = union(enum) {
             // scope/decision identity. Membership activation and durable completion
             // reference acknowledgements are service work, not new SQL effects.
             .sql_sequence_prepare, .sql_completion_reference_mutate, .sql_lock_read, .sql_lock_mutate, .sql_lock_outcome => return result,
+            .sql_catalog_mutate => |*request| {
+                try @import("catalog_mutations.zig").validate(request.*);
+                // Prepared commands already have an exact digest. Binding at
+                // dispatch would silently change their recovery identity.
+                const old = request.sql_catalog_admission.?.request.command_fence orelse return error.InvalidCatalogMutation;
+                if (!std.meta.eql(old, value)) return error.InvalidCatalogMutation;
+                return result;
+            },
             .sql_sequence_counter_mutate, .sql_sequence_counter_outcome => |*request| {
                 if (request.request.command_fence) |old| {
                     if (!std.meta.eql(old, value)) return error.InvalidCatalogMutation;
@@ -271,7 +282,7 @@ pub const Call = union(enum) {
             .mutate => |request| request.mutation.action == .comment or request.mutation.sql_owner != null,
             .schema_validation_prepare, .schema_validation_status, .table_retirement_prepare, .table_retirement_submit, .table_retirement_receipt, .table_retirement_queue, .table_retirement_effects, .table_retirement_owner_work => true,
             .schema_validation_submit => |bytes| @import("../metadata/schema_validation_ledger.zig").requiresAdmissionAuthority(bytes),
-            .sql_index_annotations, .sql_lock_read, .sql_lock_mutate, .sql_lock_outcome, .sql_prepared_read, .sql_prepared_mutate, .sql_prepared_outcome, .sql_authorization_read, .sql_authorization_mutate, .sql_authorization_outcome, .sql_type_snapshot, .sql_type_bindings, .sql_type_mutate, .sql_type_outcome, .sql_cast_snapshot, .sql_cast_mutate, .sql_cast_outcome, .sql_native_index_prepare, .sql_native_index_mutate, .sql_native_index_outcome, .sql_routine_snapshot, .sql_routine_mutate, .sql_routine_outcome, .sql_column_sequence_handoffs, .sql_sequence_prepare, .sql_sequence_counter_mutate, .sql_sequence_counter_outcome, .sql_view_mutate, .sql_sequence_snapshot, .sql_sequence_admission_head, .sql_sequence_mutate, .sql_sequence_outcome, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin, .native_memory_create => true,
+            .sql_index_annotations, .sql_lock_read, .sql_lock_mutate, .sql_lock_outcome, .sql_prepared_read, .sql_prepared_mutate, .sql_prepared_outcome, .sql_authorization_read, .sql_authorization_mutate, .sql_authorization_outcome, .sql_type_snapshot, .sql_type_bindings, .sql_type_mutate, .sql_type_outcome, .sql_cast_snapshot, .sql_cast_mutate, .sql_cast_outcome, .sql_catalog_prepare, .sql_catalog_mutate, .sql_catalog_outcome, .sql_native_index_prepare, .sql_native_index_mutate, .sql_native_index_outcome, .sql_routine_snapshot, .sql_routine_mutate, .sql_routine_outcome, .sql_column_sequence_handoffs, .sql_sequence_prepare, .sql_sequence_counter_mutate, .sql_sequence_counter_outcome, .sql_view_mutate, .sql_sequence_snapshot, .sql_sequence_admission_head, .sql_sequence_mutate, .sql_sequence_outcome, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin, .native_memory_create => true,
             .sql_completion_reference_mutate, .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -333,14 +344,14 @@ pub const Call = union(enum) {
     /// Calls whose native owners report the first possible durable effect.
     pub fn tracksSQLSubmission(self: @This()) bool {
         return switch (self) {
-            .mutate, .relation_replace, .relation_schema_mutate, .fk_initial_create_begin, .fk_generation_publication_begin => true,
+            .mutate, .sql_catalog_mutate, .relation_replace, .relation_schema_mutate, .fk_initial_create_begin, .fk_generation_publication_begin => true,
             else => false,
         };
     }
 
     pub fn isMutation(self: @This()) bool {
         return self == .schema_validation_submit or self == .mutate or self == .fk_initial_retirement_ack or self == .relational_index_owner_ack or self == .relational_index_publish_decide or self == .relational_index_cancel or self == .relational_index_source_accept or self == .relational_index_source_complete or
-            (self != .sql_native_index_prepare and self != .sql_native_index_outcome and self != .resolve_many and self != .sql_index_annotations and self != .sql_lock_read and self != .sql_lock_outcome and self != .sql_prepared_read and self != .sql_prepared_outcome and self != .sql_authorization_read and self != .sql_authorization_outcome and self != .sql_type_snapshot and self != .sql_type_bindings and self != .sql_type_outcome and self != .sql_cast_snapshot and self != .sql_cast_outcome and self != .sql_routine_snapshot and self != .sql_routine_outcome and self != .sql_column_sequence_handoffs and self != .schema_validation_prepare and self != .table_retirement_prepare and self != .table_retirement_receipt and self != .table_retirement_queue and self != .table_retirement_effects and self != .table_retirement_owner_work and self != .schema_validation_status and self != .sql_sequence_counter_outcome and self != .sql_sequence_snapshot and self != .sql_sequence_admission_head and self != .sql_sequence_outcome and self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self != .relational_index_status and self != .relational_index_prepare and self.requiresAdministrativeGrant());
+            (self != .sql_catalog_prepare and self != .sql_catalog_outcome and self != .sql_native_index_prepare and self != .sql_native_index_outcome and self != .resolve_many and self != .sql_index_annotations and self != .sql_lock_read and self != .sql_lock_outcome and self != .sql_prepared_read and self != .sql_prepared_outcome and self != .sql_authorization_read and self != .sql_authorization_outcome and self != .sql_type_snapshot and self != .sql_type_bindings and self != .sql_type_outcome and self != .sql_cast_snapshot and self != .sql_cast_outcome and self != .sql_routine_snapshot and self != .sql_routine_outcome and self != .sql_column_sequence_handoffs and self != .schema_validation_prepare and self != .table_retirement_prepare and self != .table_retirement_receipt and self != .table_retirement_queue and self != .table_retirement_effects and self != .table_retirement_owner_work and self != .schema_validation_status and self != .sql_sequence_counter_outcome and self != .sql_sequence_snapshot and self != .sql_sequence_admission_head and self != .sql_sequence_outcome and self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self != .relational_index_status and self != .relational_index_prepare and self.requiresAdministrativeGrant());
     }
 
     pub fn isRelationalIndexOwnerCall(self: @This()) bool {
@@ -731,4 +742,26 @@ test "SQL pgwire native completion mutations require administrative grant and mu
     const read: Call = .{ .sql_completion_reference = @splat(1) };
     try std.testing.expect(read.requiresSettingAuthorityReadGrant());
     try std.testing.expect(!read.isMutation());
+}
+
+test "SQL command fence catalog preparation cannot silently rebind a prepared native command" {
+    const C = @import("catalog_mutations.zig");
+    const fence: @import("command_fence.zig").Fence = .{ .backend = .{ .incarnation = @splat(1), .id = @splat(2), .fence = 1 }, .command = .{ .sequence = 1, .nonce = @splat(3), .executor = @splat(4) }, .database = 1, .principal = @splat(5), .standalone = false };
+    var command: @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand = .{ .expected_revision = 1, .mutation = .{ .kind = .namespace, .action = .create, .name = "scoped" }, .sql_catalog_admission = .{ .request = .{ .nonce = @splat(6), .head = 0 }, .incarnation = @splat(1) } };
+    try std.testing.expectError(error.InvalidCatalogMutation, (Call{ .sql_catalog_mutate = command }).withCommandFence(&fence));
+    command.sql_catalog_admission.?.request.command_fence = fence;
+    const call: Call = .{ .sql_catalog_mutate = command };
+    try std.testing.expect(call.isMutation());
+    try std.testing.expect(call.tracksSQLSubmission());
+    try std.testing.expect(call.requiresAdministrativeGrant());
+    try std.testing.expectEqualDeep(call, try call.requireCommandFence(&fence));
+    var replacement = fence;
+    replacement.command.executor = @splat(7);
+    try std.testing.expectError(error.InvalidCatalogMutation, call.withCommandFence(&replacement));
+    const reads = [_]Call{ .{ .sql_catalog_prepare = .{ .request = .{ .mutation = command.mutation }, .nonce = @splat(6), .command_fence = fence } }, .{ .sql_catalog_outcome = try C.observation(std.testing.allocator, command) } };
+    for (reads) |read| {
+        try std.testing.expect(read.requiresAdministrativeGrant());
+        try std.testing.expect(!read.isMutation());
+        try std.testing.expectEqualDeep(read, try read.requireCommandFence(&replacement));
+    }
 }

@@ -372,6 +372,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_command_fence_audit = b.addSystemCommand(&.{"python3"});
     sql_command_fence_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
     for ([_][]const u8{
+        "SQL command fence catalog hashing streams large canonical definitions with zero heap allocation",
+        "SQL command fence catalog identity binds the whole prepared command without duplicating intent",
+        "SQL command fence catalog preparation cannot silently rebind a prepared native command",
+        "SQL command fence ordinary catalog DDL journals exact topology outcomes across cold replicas and eviction",
         "SQL command fence guards native catalog and counter effects through cold replay and bounded eviction",
         "SQL command fence remains bound to the authenticated internal HTTP body",
         "SQL command fence binds forwarded identities and rejects substitution and unjournaled mutations",
@@ -5842,6 +5846,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const memory_standalone_tests = b.addTest(.{ .root_module = system_catalog_standalone_test_mod, .filters = &.{"native memory ownership"} });
     memory_metadata_step.dependOn(&b.addRunArtifact(memory_standalone_tests).step);
+    const prepared_catalog_standalone_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"system catalog prepared ordinary DDL"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const prepared_catalog_standalone_run = addFilteredTestRunArtifact(b, prepared_catalog_standalone_tests);
+    prepared_catalog_standalone_run.addArg("--require-no-skips");
+    const prepared_catalog_inventory = b.addRunArtifact(prepared_catalog_standalone_tests);
+    prepared_catalog_inventory.addArg("--list-tests");
+    const prepared_catalog_audit = b.addSystemCommand(&.{"python3"});
+    prepared_catalog_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    prepared_catalog_audit.addArgs(&.{ "--filter", "system catalog prepared ordinary DDL submits exact native outcomes through standalone recovery", "--inventory" });
+    prepared_catalog_audit.addFileArg2(prepared_catalog_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    prepared_catalog_standalone_run.step.dependOn(&prepared_catalog_audit.step);
+    const sql_catalog_command_step = b.step("antfly-sql-catalog-command-test", "Qualify prepared ordinary catalog submission and exact standalone cold outcomes");
+    sql_catalog_command_step.dependOn(&prepared_catalog_standalone_run.step);
+    sql_catalog_command_step.dependOn(sql_command_fence_step);
     const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
     system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
     // Same physical source module and linked provider as the broad catalog

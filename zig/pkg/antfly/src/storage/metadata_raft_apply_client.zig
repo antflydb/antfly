@@ -605,6 +605,9 @@ pub const RaftApplyStore = struct {
     pub fn sqlNativeIndexPrepare(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/native_indexes.zig").Preparation) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .sql_native_index_prepare = request });
     }
+    pub fn sqlCatalogOutcome(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/catalog_mutations.zig").Observation) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_catalog_outcome = request });
+    }
     pub fn sqlNativeIndexOutcome(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/native_indexes.zig").OutcomeRequest) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .sql_native_index_outcome = request });
     }

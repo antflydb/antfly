@@ -3728,6 +3728,7 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlCatalogJournal(command.apply_system_catalog)) return metadata_topology_protocol.sql_catalog_journal_version;
     // This native home participant has a newer decoder than command fences.
     if (command == .apply_sql_prepared_transaction) return metadata_topology_protocol.sql_prepared_lock_handoff_version;
     const command_fence = switch (command) {
@@ -24417,6 +24418,7 @@ test "SQL routine catalog trigger decoder admission precedes scalar and owner fl
 }
 
 test "SQL command fence decoder admission dominates legacy catalog and counter floors" {
+    try std.testing.expectEqual(metadata_topology_protocol.sql_catalog_journal_version, baseRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"sql_catalog_admission\":{\"request\":{\"command_fence\":{}}}}" }));
     const guarded = "{\"admission\":{\"command_fence\":{}}}";
     for ([_]metadata_storage.TransitionCommand{
         .{ .apply_system_catalog = guarded },

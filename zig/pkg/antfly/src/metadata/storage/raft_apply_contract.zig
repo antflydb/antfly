@@ -248,6 +248,7 @@ pub const SystemCatalogCommand = struct {
     placement_update: ?struct { expected: metadata.TableRecord, replacement: metadata.TableRecord } = null,
     constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
     sql_view: ?@import("../../system_catalog/views.zig").Mutation = null,
+    sql_catalog_admission: ?@import("../../system_catalog/catalog_mutations.zig").Admission = null,
     sql_native_index: ?@import("../../system_catalog/native_indexes.zig").Mutation = null,
     sql_routine: ?@import("../../system_catalog/routines.zig").Mutation = null,
     sql_type: ?@import("../../system_catalog/named_types.zig").Mutation = null,
@@ -272,6 +273,7 @@ pub const SystemCatalogCommand = struct {
     }
 
     pub fn jsonStringify(self: SystemCatalogCommand, writer: anytype) !void {
+        if (self.sql_catalog_admission != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .column_sequences = self.column_sequences, .creation_sources = self.creation_sources, .creation_comment_sources = self.creation_comment_sources, .creation_object_comments = self.creation_object_comments, .sql_catalog_admission = self.sql_catalog_admission });
         if (self.sql_native_index != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_native_index = self.sql_native_index });
         if (self.creation_object_comments.len != 0) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .column_sequences = self.column_sequences, .creation_sources = self.creation_sources, .creation_comment_sources = self.creation_comment_sources, .creation_object_comments = self.creation_object_comments });
         if (self.creation_sources.len != 0) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .column_sequences = self.column_sequences, .creation_sources = self.creation_sources, .creation_comment_sources = self.creation_comment_sources });
@@ -289,7 +291,7 @@ pub const SystemCatalogCommand = struct {
     }
 };
 
-pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{}, namespace_id: u64 = 0 };
+pub const CatalogAdmission = struct { incarnation: [16]u8 = @splat(0), meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{}, namespace_id: u64 = 0 };
 
 pub fn transitionMutatesRelationSource(command: anytype) bool {
     return switch (command) {
@@ -361,6 +363,7 @@ pub const CatalogProjectionRequest = union(enum) {
     sql_cast_snapshot: @import("../../system_catalog/casts.zig").SnapshotRequest,
     sql_cast_outcome: @import("../../system_catalog/casts.zig").OutcomeRequest,
     sql_native_index_prepare: @import("../../system_catalog/native_indexes.zig").Preparation,
+    sql_catalog_outcome: @import("../../system_catalog/catalog_mutations.zig").Observation,
     sql_native_index_outcome: @import("../../system_catalog/native_indexes.zig").OutcomeRequest,
     sql_routine_snapshot: @import("../../system_catalog/routines.zig").SnapshotRequest,
     sql_routine_outcome: @import("../../system_catalog/routines.zig").OutcomeRequest,

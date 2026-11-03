@@ -24,6 +24,7 @@ const sql_fk_uses = @import("../../system_catalog/foreign_key_dependencies.zig")
 const sql_sequence_bindings = @import("../../system_catalog/sequence_binding_admission.zig");
 const sql_type_layouts = @import("antfly_local_sources").sql_catalog.named_layouts;
 const sql_casts = @import("../../system_catalog/casts.zig");
+const sql_catalog_mutations = @import("../../system_catalog/catalog_mutations.zig");
 const sql_native_indexes = @import("../../system_catalog/native_indexes.zig");
 const sql_routines = @import("../../system_catalog/routines.zig");
 const sql_sequences = @import("../../system_catalog/sequence_catalog.zig");
@@ -18204,6 +18205,7 @@ pub const RaftApplyStore = struct {
     // regressions can assert that completion work is bounded by one range.
     restore_cleanup_rows_visited: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     policy_full_owner_cut_validations: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    sql_catalog_post_effect_error: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
     alloc: std.mem.Allocator,
     io_impl: std.Io.Threaded,
     root_dir: []u8,
@@ -25946,7 +25948,8 @@ pub const RaftApplyStore = struct {
         // appear to callers as an ambiguous mutation outcome.
         const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = alloc, .txn = &txn, .group_id = group_id, .meta = meta } };
         try validateSqlDropNameMutation(reader, .{ .expected_revision = meta.revision, .mutation = request });
-        var result: CatalogAdmission = .{ .meta = meta };
+        var incarnation_key: [160]u8 = undefined;
+        var result: CatalogAdmission = .{ .meta = meta, .incarnation = if (try stagingGet(&txn, try metadataIncarnationKeyForGroup(&incarnation_key, group_id)) != null) try catalogIncarnationTxn(&txn, group_id) else @splat(0) };
         if (request.kind == .table and (request.action == .create or request.action == .set_tablespace)) {
             const view: system_catalog_storage.View = .{ .alloc = alloc, .txn = &txn, .group_id = group_id, .meta = meta };
             const namespace = try view.namespaceFor(request.database, request.namespace);
@@ -26680,6 +26683,7 @@ pub const RaftApplyStore = struct {
     /// Validate and serialize the exact admitted projection before proposing.
     fn validateSqlOwnerEnvelope(command: SystemCatalogCommand) !void {
         try command.validateCreationSources();
+        if (command.sql_catalog_admission != null) try sql_catalog_mutations.validate(command);
         if (command.sql_native_index != null and (command.sql_routine != null or command.sql_type != null or command.sql_cast != null or command.sql_authorization != null or command.sql_view != null or command.sql_sequence != null or command.column_sequences.len != 0 or command.creation_sources.len != 0 or command.creation_comment_sources.len != 0 or command.creation_object_comments.len != 0)) return error.InvalidCatalogMutation;
 
         const owner = command.mutation.sql_owner orelse return;
@@ -26699,6 +26703,10 @@ pub const RaftApplyStore = struct {
         try validateSqlOwnerEnvelope(command);
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
+        if (command.sql_catalog_admission) |admission| {
+            _ = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.sql_catalog_journal_version);
+            if (!std.mem.eql(u8, &try catalogIncarnationTxn(&txn, group_id), &admission.incarnation)) return error.CatalogGenerationChanged;
+        }
         if (command.column_sequences.len != 0 and (command.sql_sequence != null or command.sql_view != null or command.sql_routine != null or command.sql_cast != null or command.sql_type != null)) return error.InvalidCatalogMutation;
         if (command.sql_native_index != null) {
             var region: std.heap.ArenaAllocator = .init(alloc);
@@ -27245,6 +27253,12 @@ pub const RaftApplyStore = struct {
         defer parsed.deinit();
         const command = parsed.value;
         try validateSqlOwnerEnvelope(command);
+        if (command.sql_catalog_admission != null) {
+            // All ignorable admission failures are handled before effects by
+            // the journal wrapper. Any later error must abort this transaction.
+            try self.applySqlCatalogOutcomeTxn(txn, group_id, bytes, command);
+            return;
+        }
         if (command.sql_native_index != null) {
             self.applySqlNativeIndexOutcomeTxn(txn, group_id, command) catch |err| switch (err) {
                 error.CatalogGenerationChanged, error.TableTopologyProtocolUpgradeRequired, error.SequenceAdmissionExpired, error.SequenceAdmissionConflict, error.CatalogRevisionExhausted => return,
@@ -27302,21 +27316,26 @@ pub const RaftApplyStore = struct {
             };
             return;
         }
+        _ = try self.applyOrdinarySystemCatalogTxn(txn, group_id, bytes, command);
+    }
+
+    fn applyOrdinarySystemCatalogTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8, command: SystemCatalogCommand) !sql_catalog_mutations.Outcome {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
         const meta = try system_catalog_storage.readMeta(a, txn, group_id);
-        if (meta.revision != command.expected_revision) return;
+        if (meta.revision != command.expected_revision) return .{ .rejected = .CatalogGenerationChanged };
+        if (meta.revision == std.math.maxInt(u64)) return .{ .rejected = .CatalogRevisionExhausted };
         self.validateSqlTableOwnerTxn(a, txn, group_id, command.mutation) catch |err| switch (err) {
-            error.TableTopologyProtocolUpgradeRequired, error.SqlRoleNotFound => return,
+            error.TableTopologyProtocolUpgradeRequired, error.SqlRoleNotFound => return sql_catalog_mutations.Outcome.fromError(err) orelse return err,
             else => return err,
         };
         self.validateCreationSourcesTxn(txn, group_id, command) catch |err| switch (err) {
-            error.CatalogGenerationChanged, error.TableTopologyProtocolUpgradeRequired, error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady => return,
+            error.CatalogGenerationChanged, error.TableTopologyProtocolUpgradeRequired, error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady => return sql_catalog_mutations.Outcome.fromError(err) orelse return err,
             else => return err,
         };
         self.validateGeneratedConstraintNamesTxn(a, txn, group_id, command, meta) catch |err| switch (err) {
-            error.CatalogGenerationChanged, error.CatalogOccupancyNotReady, error.TableTopologyProtocolUpgradeRequired => return,
+            error.CatalogGenerationChanged, error.CatalogOccupancyNotReady, error.TableTopologyProtocolUpgradeRequired => return sql_catalog_mutations.Outcome.fromError(err) orelse return err,
             else => return err, // Storage/corruption failures must abort.
         };
         if (command.mutation.kind == .table and command.mutation.action == .create) {
@@ -27324,76 +27343,62 @@ pub const RaftApplyStore = struct {
                 std.mem.eql(u8, command.mutation.database, system_catalog.default_database_name))
                 system_catalog.default_namespace
             else blk: {
-                const database = (try system_catalog_storage.find(a, txn, group_id, .database, 0, command.mutation.database)) orelse return;
-                const ns = (try system_catalog_storage.find(a, txn, group_id, .namespace, database.value.id, command.mutation.namespace)) orelse return;
+                const database = (try system_catalog_storage.find(a, txn, group_id, .database, 0, command.mutation.database)) orelse return .{ .rejected = .CatalogGenerationChanged };
+                const ns = (try system_catalog_storage.find(a, txn, group_id, .namespace, database.value.id, command.mutation.namespace)) orelse return .{ .rejected = .CatalogGenerationChanged };
                 break :blk ns.value;
             };
             var reservation_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
             if (try stagingGet(txn, try fk_generation_publication.initialNameKey(&reservation_buf, group_id, namespace.id, command.mutation.name)) != null or
                 try stagingGet(txn, try fk_generation_publication.initialPhysicalNameKey(&reservation_buf, group_id, command.mutation.storage_name)) != null)
-                return;
+                return .{ .rejected = .CatalogGenerationChanged };
         }
         const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = txn, .group_id = group_id, .meta = meta } };
-        validateCatalogTopology(command) catch return;
+        validateCatalogTopology(command) catch return .{ .rejected = .CatalogGenerationChanged };
         validateSqlDropNameMutation(reader, command) catch |err| switch (err) {
-            error.TableTransitionActive, error.SqlDatabaseInUse => return,
+            error.TableTransitionActive, error.SqlDatabaseInUse => return sql_catalog_mutations.Outcome.fromError(err) orelse return err,
             else => return err,
         };
         var delta = system_catalog.planWithTopology(a, reader, meta.next_id, command.mutation, command.mutation.kind == .table and command.mutation.action == .drop) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => return, // A concurrent catalog/topology operation defeated admission.
+            else => return sql_catalog_mutations.Outcome.fromError(err) orelse return err,
         };
         defer delta.deinit(a);
         validateSequenceContainerDeltaTxn(txn, group_id, delta) catch |err| switch (err) {
-            error.CatalogPublicationProofPending => return,
+            error.CatalogPublicationProofPending => return sql_catalog_mutations.Outcome.fromError(err) orelse return err,
             else => return err,
         };
         const column_sequence_plan = if (command.column_sequences.len != 0) self.prepareTableColumnSequencesTxn(a, txn, group_id, command, meta, delta.next_id, false) catch |err| switch (err) {
-            error.InvalidCatalogMutation, error.InvalidSequenceDefinition, error.CatalogGenerationChanged, error.TableTopologyProtocolUpgradeRequired, error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady, error.CatalogSourceUntracked, error.UndefinedColumn, error.ProgramLimitExceeded => return,
+            error.InvalidCatalogMutation, error.InvalidSequenceDefinition, error.CatalogGenerationChanged, error.TableTopologyProtocolUpgradeRequired, error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady, error.CatalogSourceUntracked, error.UndefinedColumn, error.ProgramLimitExceeded => return sql_catalog_mutations.Outcome.fromError(err) orelse return err,
             else => return err,
         } else null;
         if (column_sequence_plan) |prepared| {
-            if (!std.mem.eql(u8, command.topology.?.create.table.schema_json, prepared.schema_json)) return;
+            if (!std.mem.eql(u8, command.topology.?.create.table.schema_json, prepared.schema_json)) return .{ .rejected = .CatalogGenerationChanged };
             try expandTableColumnSequenceDelta(a, &delta, prepared);
         }
         const creation_comments = self.prepareCreationColumnCommentsTxn(a, txn, group_id, command) catch |err| switch (err) {
-            error.CatalogGenerationChanged, error.InvalidCatalogMutation => return,
+            error.CatalogGenerationChanged, error.InvalidCatalogMutation => return sql_catalog_mutations.Outcome.fromError(err) orelse return err,
             else => return err,
         };
         var creation_object_comments = self.prepareCreationObjectCommentsTxn(txn, group_id, command) catch |err| switch (err) {
-            error.CatalogGenerationChanged, error.InvalidCatalogMutation, error.CatalogCommandTooLarge, error.CatalogGenerationExhausted, error.TableTopologyProtocolUpgradeRequired => return,
+            error.CatalogGenerationChanged, error.InvalidCatalogMutation, error.CatalogCommandTooLarge, error.CatalogGenerationExhausted, error.TableTopologyProtocolUpgradeRequired => return sql_catalog_mutations.Outcome.fromError(err) orelse return err,
             else => return err,
         };
         defer if (creation_object_comments) |*prepared| prepared.deinit();
         validateCatalogPlacement(reader, command, delta) catch |err| switch (err) {
-            error.InvalidCatalogMutation => return,
+            error.InvalidCatalogMutation => return sql_catalog_mutations.Outcome.fromError(err) orelse return err,
             else => return err, // Storage/corruption failures must abort.
         };
         if (command.placement_update) |update| {
-            if (command.mutation.kind != .table or command.mutation.action != .set_tablespace or update.expected.table_id != update.replacement.table_id or !std.mem.eql(u8, update.expected.name, update.replacement.name)) return;
-            if ((try self.loadTableTransitionFenceTxn(txn, group_id, update.expected.table_id)).active()) return;
-            const current = (try self.getTableByNameTxn(self.alloc, txn, group_id, update.expected.name)) orelse return;
+            if (command.mutation.kind != .table or command.mutation.action != .set_tablespace or update.expected.table_id != update.replacement.table_id or !std.mem.eql(u8, update.expected.name, update.replacement.name)) return .{ .rejected = .CatalogGenerationChanged };
+            if ((try self.loadTableTransitionFenceTxn(txn, group_id, update.expected.table_id)).active()) return .{ .rejected = .CatalogGenerationChanged };
+            const current = (try self.getTableByNameTxn(self.alloc, txn, group_id, update.expected.name)) orelse return .{ .rejected = .CatalogGenerationChanged };
             defer metadata_table_manager.freeTable(self.alloc, current);
-            if (!metadata_table_manager.tableDefinitionsEqual(current, update.expected)) return;
-            if (!try self.tryApplyTableCompareAndReplaceTxn(txn, group_id, update.expected, update.replacement)) return;
+            if (!metadata_table_manager.tableDefinitionsEqual(current, update.expected)) return .{ .rejected = .CatalogGenerationChanged };
+            if (!try self.tryApplyTableCompareAndReplaceTxn(txn, group_id, update.expected, update.replacement)) return .{ .rejected = .CatalogGenerationChanged };
         }
         if (command.topology) |topology| {
             const sequence_overlay = try creationSequenceOverlay(a, column_sequence_plan);
-            try self.applyTableTopologyMutationWithSequenceOverlayTxn(txn, group_id, topology, false, sequence_overlay);
-            var key_buf: [160]u8 = undefined;
-            const encoded = txn.get(try tableKeyForGroup(&key_buf, group_id, command.mutation.table_id)) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
-            switch (topology) {
-                .create => |create| {
-                    const table = try decodeTableRecord(self.alloc, encoded orelse return);
-                    defer metadata_table_manager.freeTable(self.alloc, table);
-                    const admitted = (try self.admittedResolverProjectionTxn(a, txn, group_id, create.table)) orelse return;
-                    if (!metadata_table_manager.tableDefinitionsEqual(table, admitted)) return;
-                },
-                .drop => if (encoded != null) return,
-            }
+            if (!try self.applyTableTopologyMutationWithSequenceOverlayTxn(txn, group_id, topology, false, sequence_overlay)) return .{ .rejected = .CatalogGenerationChanged };
         }
         if (column_sequence_plan) |prepared|
             try self.initializeTableColumnSequencesTxn(a, txn, group_id, command.topology.?.create.table, prepared);
@@ -27413,6 +27418,48 @@ pub const RaftApplyStore = struct {
         try self.applySystemCatalogDeltaTxn(self.alloc, txn, group_id, delta, published_meta, hash);
         // Invalidate metadata readers through the existing catalog event path.
         self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id });
+        return .{ .success = .{ .revision = meta.revision + 1, .identity = if (command.mutation.kind != .table and command.mutation.action != .drop and delta.upserts.len != 0) .{ .id = delta.upserts[0].id, .generation = meta.revision + 1 } else null, .removed = @intFromBool(command.mutation.action == .drop) } };
+    }
+
+    fn applySqlCatalogOutcomeTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, bytes: []const u8, command: SystemCatalogCommand) !void {
+        try sql_catalog_mutations.validate(command);
+        _ = self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_catalog_journal_version) catch |err| switch (err) {
+            error.TableTopologyProtocolUpgradeRequired => return,
+            else => return err,
+        };
+        const admission = command.sql_catalog_admission.?;
+        if (!std.mem.eql(u8, &try catalogIncarnationTxn(txn, group), &admission.incarnation)) return;
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const journal: sql_catalog_mutations.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = txn, .group = group, .incarnation = admission.incarnation };
+        const digest = try sql_catalog_mutations.boundDigest(a, try sql_catalog_mutations.observation(a, command));
+        const decision = journal.prepare(a, admission.request, digest) catch |err| switch (err) {
+            error.SequenceAdmissionExpired, error.SequenceAdmissionConflict, error.CatalogRevisionExhausted => return,
+            else => return err,
+        };
+        switch (decision) {
+            .replay => return,
+            .append => |ordinal| {
+                // Semantic refusals precede logical effects. From this point,
+                // every error aborts the transaction, regardless of its error tag.
+                const result = try self.applyOrdinarySystemCatalogTxn(txn, group, bytes, command);
+                if (builtin.is_test) if (self.sql_catalog_post_effect_error) |err| {
+                    self.sql_catalog_post_effect_error = null;
+                    return err;
+                };
+                try journal.append(a, ordinal, admission.request, digest, result);
+            },
+        }
+    }
+
+    pub fn sqlCatalogOutcome(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, request: sql_catalog_mutations.Observation) ![]u8 {
+        try request.validate();
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        if (!std.mem.eql(u8, &try catalogIncarnationTxn(&txn, group), &request.admission.incarnation)) return a.dupe(u8, "null");
+        const journal: sql_catalog_mutations.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = request.admission.incarnation };
+        return std.json.Stringify.valueAlloc(a, try journal.lookup(a, request.admission.request, try sql_catalog_mutations.boundDigest(a, request)), .{});
     }
 
     fn validateSequenceContainerDeltaTxn(txn: *docstore.DocStore.Txn, group: u64, delta: system_catalog.Delta) !void {
@@ -36524,29 +36571,29 @@ pub const RaftApplyStore = struct {
     }
 
     fn applyTableTopologyMutationWithSqlDropTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, mutation: TableTopologyMutation, generation_drop: bool) !void {
-        return self.applyTableTopologyMutationWithSequenceOverlayTxn(txn, group_id, mutation, generation_drop, .{});
+        _ = try self.applyTableTopologyMutationWithSequenceOverlayTxn(txn, group_id, mutation, generation_drop, .{});
     }
 
-    fn applyTableTopologyMutationWithSequenceOverlayTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, mutation: TableTopologyMutation, generation_drop: bool, sequence_overlay: sql_sequence_bindings.Overlay) !void {
+    fn applyTableTopologyMutationWithSequenceOverlayTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, mutation: TableTopologyMutation, generation_drop: bool, sequence_overlay: sql_sequence_bindings.Overlay) !bool {
         switch (mutation) {
             .create => |create| {
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena.deinit();
-                const admitted = (try self.admittedResolverProjectionTxn(arena.allocator(), txn, group_id, create.table)) orelse return;
-                if (try fk_generation_publication.schemaHasForeignKeys(self.alloc, create.table.schema_json)) return;
-                if (try self.fkGenerationTableLockedTxn(txn, group_id, create.table.table_id)) return;
-                if (!try self.relationalParentsExistForCreateTxn(txn, group_id, create.table, true)) return;
+                const admitted = (try self.admittedResolverProjectionTxn(arena.allocator(), txn, group_id, create.table)) orelse return false;
+                if (try fk_generation_publication.schemaHasForeignKeys(self.alloc, create.table.schema_json)) return false;
+                if (try self.fkGenerationTableLockedTxn(txn, group_id, create.table.table_id)) return false;
+                if (!try self.relationalParentsExistForCreateTxn(txn, group_id, create.table, true)) return false;
                 const fence = try self.loadTableTransitionFenceTxn(
                     txn,
                     group_id,
                     create.table.table_id,
                 );
                 if (fence.active() or
-                    fence.generation != create.expected_transition_generation) return;
+                    fence.generation != create.expected_transition_generation) return false;
                 var name_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
-                if (try stagingGet(txn, try fk_generation_publication.initialPhysicalNameKey(&name_buf, group_id, create.table.name)) != null) return;
+                if (try stagingGet(txn, try fk_generation_publication.initialPhysicalNameKey(&name_buf, group_id, create.table.name)) != null) return false;
                 if (try stagingGet(txn, try tableNameIndexKey(&name_buf, group_id, create.table.name))) |owner| {
-                    if (owner.len != 8 or std.mem.readInt(u64, owner[0..8], .little) != create.table.table_id) return;
+                    if (owner.len != 8 or std.mem.readInt(u64, owner[0..8], .little) != create.table.table_id) return false;
                 }
 
                 var table_key_buf: [160]u8 = undefined;
@@ -36562,40 +36609,40 @@ pub const RaftApplyStore = struct {
                 if (encoded_table) |encoded| {
                     const existing = try decodeTableRecord(self.alloc, encoded);
                     defer metadata_table_manager.freeTable(self.alloc, existing);
-                    if (!metadata_table_manager.tableDefinitionsEqual(existing, admitted)) return;
+                    if (!metadata_table_manager.tableDefinitionsEqual(existing, admitted)) return false;
                 } else if (fence.range_membership.count != 0) {
                     // Atomic creates can only encounter existing ranges when
                     // replaying an already-created table. With no table row,
                     // membership belongs to an interrupted legacy drop and
                     // must never be adopted by a new incarnation.
-                    return;
+                    return false;
                 }
 
                 var unique_groups = std.AutoHashMapUnmanaged(u64, void).empty;
                 defer unique_groups.deinit(self.alloc);
                 try unique_groups.ensureTotalCapacity(self.alloc, @intCast(create.ranges.len));
                 for (create.ranges) |record| {
-                    if (unique_groups.contains(record.group_id)) return;
+                    if (unique_groups.contains(record.group_id)) return false;
                     unique_groups.putAssumeCapacity(record.group_id, {});
-                    if (encoded_table == null and try stagingGet(txn, try restore_staging.identityKey(&name_buf, group_id, .group, record.group_id)) != null) return;
-                    if (encoded_table == null and try stagingGet(txn, try fk_generation_publication.initialGroupKey(&name_buf, group_id, record.group_id)) != null) return;
+                    if (encoded_table == null and try stagingGet(txn, try restore_staging.identityKey(&name_buf, group_id, .group, record.group_id)) != null) return false;
+                    if (encoded_table == null and try stagingGet(txn, try fk_generation_publication.initialGroupKey(&name_buf, group_id, record.group_id)) != null) return false;
                     var range_key_buf: [160]u8 = undefined;
                     const range_key = try rangeKeyForGroup(&range_key_buf, group_id, record.group_id);
                     const encoded_range = txn.get(range_key) catch |err| switch (err) {
                         error.NotFound => continue,
                         else => return err,
                     };
-                    if (encoded_table == null) return;
+                    if (encoded_table == null) return false;
                     const existing = try decodeRangeRecord(self.alloc, encoded_range);
                     defer metadata_table_manager.freeRange(self.alloc, existing);
-                    if (!metadata_table_manager.rangeRecordsEqual(existing, record)) return;
+                    if (!metadata_table_manager.rangeRecordsEqual(existing, record)) return false;
                 }
 
                 var changed = false;
                 var added_range_group_ids = std.ArrayListUnmanaged(u64).empty;
                 defer added_range_group_ids.deinit(self.alloc);
                 if (encoded_table == null) {
-                    if (!try self.tryPutTableRecordWithSequenceOverlayTxnMode(txn, group_id, table_key, admitted, false, sequence_overlay)) return;
+                    if (!try self.tryPutTableRecordWithSequenceOverlayTxnMode(txn, group_id, table_key, admitted, false, sequence_overlay)) return false;
                     changed = true;
                 }
                 // Atomic topology commands publish one table-scoped catalog
@@ -36645,28 +36692,29 @@ pub const RaftApplyStore = struct {
                 }
             },
             .drop => |drop| {
-                if (try PreparedTransactions.tableCount(self.alloc, txn, group_id, drop.table_id) != 0) return;
-                if (!generation_drop and try self.fkGenerationTableLockedTxn(txn, group_id, drop.table_id)) return;
+                if (try PreparedTransactions.tableCount(self.alloc, txn, group_id, drop.table_id) != 0) return false;
+                if (!generation_drop and try self.fkGenerationTableLockedTxn(txn, group_id, drop.table_id)) return false;
                 const fence = try self.loadTableTransitionFenceTxn(txn, group_id, drop.table_id);
-                if (fence.active() or fence.generation != drop.expected_transition_generation) return;
+                if (fence.active() or fence.generation != drop.expected_transition_generation) return false;
                 if (drop.range_contract == .membership and
-                    !fence.membership(drop.table_id).eql(drop.range_contract.membership)) return;
+                    !fence.membership(drop.table_id).eql(drop.range_contract.membership)) return false;
 
                 var table_key_buf: [160]u8 = undefined;
                 const table_key = try tableKeyForGroup(&table_key_buf, group_id, drop.table_id);
                 const encoded_table = txn.get(table_key) catch |err| switch (err) {
-                    // Replaying an already-applied drop is an idempotent
-                    // success. The caller verifies absence after its receipt.
-                    error.NotFound => return,
+                    // Absence proves an idempotent drop only with an empty
+                    // membership proof. Never certify orphaned ranges as a
+                    // completed physical topology removal.
+                    error.NotFound => return fence.range_membership.count == 0,
                     else => return err,
                 };
                 const existing = try decodeTableRecord(self.alloc, encoded_table);
                 defer metadata_table_manager.freeTable(self.alloc, existing);
-                if (!std.mem.eql(u8, existing.name, drop.expected_name)) return;
-                if (try self.extensionOwnsTableTxn(txn, group_id, existing.name)) return;
+                if (!std.mem.eql(u8, existing.name, drop.expected_name)) return false;
+                if (try self.extensionOwnsTableTxn(txn, group_id, existing.name)) return false;
                 // Recheck under the authoritative metadata transaction: an FK
                 // can have been published since the DROP admission snapshot.
-                if (!generation_drop and try self.relationalDropBlockedTxn(txn, group_id, existing)) return;
+                if (!generation_drop and try self.relationalDropBlockedTxn(txn, group_id, existing)) return false;
 
                 var owned_range_group_ids: ?[]u64 = null;
                 defer if (owned_range_group_ids) |ids| self.alloc.free(ids);
@@ -36678,7 +36726,7 @@ pub const RaftApplyStore = struct {
                             group_id,
                             drop.table_id,
                             membership,
-                        )) orelse return;
+                        )) orelse return false;
                         ranges_validated = true;
                         break :blk owned_range_group_ids.?;
                     },
@@ -36689,7 +36737,7 @@ pub const RaftApplyStore = struct {
                         var membership: topology_protocol.RangeMembershipAccumulator = .{};
                         for (ids) |range_group_id| try membership.add(range_group_id);
                         if (!membership.finish(drop.table_id).eql(fence.membership(drop.table_id)))
-                            return;
+                            return false;
                         break :blk ids;
                     },
                 };
@@ -36703,12 +36751,12 @@ pub const RaftApplyStore = struct {
                         var range_key_buf: [160]u8 = undefined;
                         const range_key = try rangeKeyForGroup(&range_key_buf, group_id, range_group_id);
                         const encoded_range = txn.get(range_key) catch |err| switch (err) {
-                            error.NotFound => return,
+                            error.NotFound => return false,
                             else => return err,
                         };
                         const record = try decodeRangeRecord(self.alloc, encoded_range);
                         defer metadata_table_manager.freeRange(self.alloc, record);
-                        if (record.table_id != drop.table_id) return;
+                        if (record.table_id != drop.table_id) return false;
                     }
                 }
                 // The table deletion below is the single catalog/lifecycle
@@ -36751,6 +36799,7 @@ pub const RaftApplyStore = struct {
                 });
             },
         }
+        return true;
     }
 
     fn extensionOwnsTableTxn(
@@ -69106,5 +69155,227 @@ test "SQL prepared transaction named lock participant survives bounded cold hand
             break;
         }
         try std.testing.expect(finished);
+    };
+}
+
+test "SQL command fence ordinary catalog DDL journals exact topology outcomes across cold replicas and eviction" {
+    const C = sql_catalog_mutations;
+    const L = @import("../../system_catalog/lock_authority.zig");
+    const T = SessionCommitRegistryFixture;
+    const backing = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const H = struct {
+        fn head(store: *RaftApplyStore, alloc: std.mem.Allocator) !u64 {
+            return (try store.systemCatalogMeta(alloc, T.group)).sequence_outcome_head orelse 0;
+        }
+        fn activation(store: *RaftApplyStore, alloc: std.mem.Allocator, version: u16) !void {
+            try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(alloc, topology_protocol.Activation{ .version = version, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+        }
+        fn scope(store: *RaftApplyStore, alloc: std.mem.Allocator, fence: L.scopes.CommandFence, nonce: u8, op: @FieldType(L.Request, "operation")) !void {
+            const request: L.Request = .{ .admission = .{ .nonce = @splat(nonce), .head = try head(store, alloc) }, .incarnation = fence.backend.incarnation, .standalone = fence.standalone, .database = fence.database, .actor = .{ .session_user = .bootstrap, .credential = "" }, .backend = fence.backend, .operation = op };
+            try store.applyStandaloneCommand(T.group, .{ .apply_sql_lock_scope = try std.json.Stringify.valueAlloc(alloc, request, .{}) });
+            const scope_result = (try std.json.parseFromSliceLeaky(?C.Outcome, alloc, try store.sqlLockOutcome(alloc, T.group, request), .{})).?;
+            _ = try scope_result.result();
+        }
+        fn prepareCommand(store: *RaftApplyStore, alloc: std.mem.Allocator, nonce: u8, fence: ?L.scopes.CommandFence, mutation: system_catalog.Mutation) !SystemCatalogCommand {
+            const cut = try store.systemCatalogAdmissionWithBinding(alloc, T.group, mutation, null);
+            return .{ .expected_revision = cut.meta.revision, .mutation = mutation, .sql_catalog_admission = .{ .request = .{ .nonce = @splat(nonce), .head = cut.meta.sequence_outcome_head orelse 0, .command_fence = fence }, .incarnation = cut.incarnation } };
+        }
+        fn apply(store: *RaftApplyStore, alloc: std.mem.Allocator, command: SystemCatalogCommand, index: u64, replicated: bool) !void {
+            const transition: TransitionCommand = .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(alloc, command, .{}) };
+            if (!replicated) return store.applyStandaloneCommand(T.group, transition);
+            const wire = try encodeTransitionCommand(alloc, transition);
+            const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = wire }});
+            try store.snapshotBuilder().applyBatch(.{ .group_id = T.group, .commit_index = index, .entries_bytes = entries });
+        }
+        fn outcome(store: *RaftApplyStore, alloc: std.mem.Allocator, command: SystemCatalogCommand) !?C.Outcome {
+            return std.json.parseFromSliceLeaky(?C.Outcome, alloc, try store.sqlCatalogOutcome(alloc, T.group, try C.observation(alloc, command)), .{});
+        }
+        fn success(store: *RaftApplyStore, alloc: std.mem.Allocator, command: SystemCatalogCommand, index: u64, replicated: bool) !C.outcomes.Result {
+            try apply(store, alloc, command, index, replicated);
+            return try ((try outcome(store, alloc, command)) orelse return error.MissingCatalogOutcome).result();
+        }
+    };
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catalog-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+        const fence: L.scopes.CommandFence = .{ .backend = .{ .incarnation = @splat(0x11), .id = @splat(2), .fence = 1 }, .command = .{ .sequence = 1, .nonce = @splat(3), .executor = @splat(4) }, .database = 1, .principal = try L.principalDigest(a, .bootstrap), .standalone = standalone };
+        var first: SystemCatalogCommand = undefined;
+        var first_result: C.outcomes.Result = undefined;
+        var stale: SystemCatalogCommand = undefined;
+        var rejected: SystemCatalogCommand = undefined;
+        var create: SystemCatalogCommand = undefined;
+        var create_result: C.outcomes.Result = undefined;
+        var drop: SystemCatalogCommand = undefined;
+        for (0..3) |pass| {
+            var store = try RaftApplyStore.init(backing, .{ .root_dir = path });
+            defer store.deinit();
+            if (pass == 0) {
+                try store.applyStandaloneCommand(T.group, .{ .initialize_metadata_incarnation = T.seed });
+                if (standalone) try store.replaceStandaloneCatalog(T.group, try store.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
+                try H.activation(&store, a, topology_protocol.sql_catalog_journal_version - 1);
+                first = try H.prepareCommand(&store, a, 50, null, .{ .kind = .namespace, .action = .create, .name = "catalog_scope" });
+                try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.prepareSystemCatalogResult(a, T.group, first));
+                try H.apply(&store, a, first, 1, replicated);
+                try std.testing.expectEqual(@as(?C.Outcome, null), try H.outcome(&store, a, first));
+                try std.testing.expectEqual(first.expected_revision, (try store.systemCatalogMeta(a, T.group)).revision);
+                try H.activation(&store, a, topology_protocol.sql_catalog_journal_version);
+                try store.applyStandaloneCommand(T.group, .{ .upsert_table = .{ .table_id = 17, .name = "owner_rows" } });
+                try adoptRelationWriterForTest(&store, a, T.group);
+                _ = try publishLiveRelationRootWithCoverageForTest(&store, a, T.group, .constraint_names);
+                try H.scope(&store, a, fence, 40, .{ .register = .{ .lease = .{ .backend = fence.backend, .database = 1, .node = if (standalone) 0 else 9, .principal = fence.principal, .expires_at_ms = 1000 }, .connection = @splat('2'), .nonce = @splat(5), .standalone = standalone } });
+                try H.scope(&store, a, fence, 41, .{ .begin = fence.command });
+                first = try H.prepareCommand(&store, a, 50, fence, .{ .kind = .namespace, .action = .create, .name = "catalog_scope" });
+                stale = try H.prepareCommand(&store, a, 51, fence, .{ .kind = .namespace, .action = .create, .name = "stale_scope" });
+                const aborted = try H.prepareCommand(&store, a, 49, fence, .{ .kind = .namespace, .action = .create, .name = "aborted_scope" });
+                const before_abort = try store.systemCatalogMeta(a, T.group);
+                {
+                    var txn = try store.store.beginWriteTxn();
+                    defer txn.abort();
+                    try store.applySqlCatalogOutcomeTxn(&txn, T.group, try std.json.Stringify.valueAlloc(a, aborted, .{}), aborted);
+                    const journal: C.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = T.group, .incarnation = aborted.sql_catalog_admission.?.incarnation };
+                    _ = try (try journal.lookup(a, aborted.sql_catalog_admission.?.request, try C.boundDigest(a, try C.observation(a, aborted)))).?.result();
+                    try std.testing.expect((try system_catalog_storage.find(a, &txn, T.group, .namespace, 1, "aborted_scope")) != null);
+                }
+                try std.testing.expectEqualDeep(before_abort, try store.systemCatalogMeta(a, T.group));
+                try std.testing.expectEqual(@as(?C.Outcome, null), try H.outcome(&store, a, aborted));
+                for ([_]anyerror{ error.InjectedCatalogWriteFailure, error.CatalogGenerationChanged }) |failure| {
+                    const before_failure = try store.systemCatalogMeta(a, T.group);
+                    store.sql_catalog_post_effect_error = failure;
+                    try std.testing.expectError(failure, H.apply(&store, a, first, 2, replicated));
+                    try std.testing.expectEqual(@as(?anyerror, null), store.sql_catalog_post_effect_error);
+                    try std.testing.expectEqualDeep(before_failure, try store.systemCatalogMeta(a, T.group));
+                    try std.testing.expectEqual(@as(?C.Outcome, null), try H.outcome(&store, a, first));
+                    var read = try store.store.beginReadTxn();
+                    defer read.abort();
+                    try std.testing.expect((try system_catalog_storage.find(a, &read, T.group, .namespace, 1, "catalog_scope")) == null);
+                }
+                first_result = try H.success(&store, a, first, 2, replicated);
+                try std.testing.expect(first_result.identity != null);
+                try std.testing.expectEqual(first.expected_revision + 1, first_result.revision);
+                const before_replay = try store.systemCatalogMeta(a, T.group);
+                try std.testing.expectEqualDeep(first_result, try H.success(&store, a, first, 3, replicated));
+                try std.testing.expectEqualDeep(before_replay, try store.systemCatalogMeta(a, T.group));
+                try H.apply(&store, a, stale, 4, replicated);
+                try std.testing.expectEqual(.CatalogGenerationChanged, (try H.outcome(&store, a, stale)).?.rejected);
+                rejected = try H.prepareCommand(&store, a, 52, fence, first.mutation);
+                try H.apply(&store, a, rejected, 5, replicated);
+                try std.testing.expectEqual(.CatalogAlreadyExists, (try H.outcome(&store, a, rejected)).?.rejected);
+                var alias = first;
+                alias.mutation.name = "other_scope";
+                try std.testing.expectError(error.SequenceAdmissionConflict, H.outcome(&store, a, alias));
+                try H.apply(&store, a, alias, 6, replicated);
+                try std.testing.expectEqualDeep(first_result, try ((try H.outcome(&store, a, first)).?).result());
+                var forged = try H.prepareCommand(&store, a, 53, fence, .{ .kind = .namespace, .action = .create, .name = "foreign_scope" });
+                forged.sql_catalog_admission.?.incarnation = @splat(8);
+                try std.testing.expectError(error.CatalogGenerationChanged, store.prepareSystemCatalogResult(a, T.group, forged));
+                try H.apply(&store, a, forged, 7, replicated);
+                try std.testing.expectEqual(@as(?C.Outcome, null), try H.outcome(&store, a, forged));
+                // Every physical byte and range precondition belongs to the
+                // same exact command digest; no second table preparation occurs.
+                create = try H.prepareCommand(&store, a, 54, fence, .{ .kind = .table, .action = .create, .name = "journal_rows" });
+                const id: u64 = 987654321;
+                create.mutation.table_id = id;
+                create.mutation.storage_name = "table:journal_rows";
+                const generation = try store.captureTableCreateGeneration(a, T.group, id);
+                create.topology = .{ .create = .{ .expected_transition_generation = generation, .table = .{ .table_id = id, .name = create.mutation.storage_name }, .ranges = &.{.{ .table_id = id, .group_id = 7017, .range_id = 7017, .start_key = "" }} } };
+                create_result = try H.success(&store, a, create, 8, replicated);
+                // Physical table IDs are hash-derived, outside the catalog
+                // allocator. Their identity is bound by the prepared topology,
+                // not misrepresented as an allocated catalog-object identity.
+                try std.testing.expectEqual(@as(?C.outcomes.Identity, null), create_result.identity);
+                drop = try H.prepareCommand(&store, a, 55, fence, .{ .kind = .table, .action = .drop, .name = "journal_rows", .table_id = id, .storage_name = create.mutation.storage_name });
+                const projection = (try store.captureTableDropProjection(a, T.group, create.mutation.storage_name)).?;
+                drop.topology = .{ .drop = .{ .table_id = id, .expected_name = create.mutation.storage_name, .expected_transition_generation = projection.fence.generation, .range_contract = .{ .membership = projection.fence.membership(id) } } };
+                try std.testing.expectEqual(@as(u64, 1), projection.fence.range_membership.count);
+                {
+                    var interrupted = try store.store.beginWriteTxn();
+                    defer interrupted.abort();
+                    var key: [160]u8 = undefined;
+                    try interrupted.delete(try tableKeyForGroup(&key, T.group, id));
+                    try std.testing.expect(!try store.applyTableTopologyMutationWithSequenceOverlayTxn(&interrupted, T.group, drop.topology.?, false, .{}));
+                    _ = try interrupted.get(try rangeKeyForGroup(&key, T.group, 7017));
+                    try std.testing.expect((try system_catalog_storage.getById(a, &interrupted, T.group, .table, id)) != null);
+                }
+                const result = try H.success(&store, a, drop, 9, replicated);
+                {
+                    var read = try store.store.beginReadTxn();
+                    defer read.abort();
+                    var key: [160]u8 = undefined;
+                    try std.testing.expectError(error.NotFound, read.get(try rangeKeyForGroup(&key, T.group, 7017)));
+                }
+                try std.testing.expectEqual(@as(usize, 1), result.removed);
+                try std.testing.expectEqual(@as(?metadata.TableRecord, null), try store.resolveSystemCatalogTable(a, T.group, .{ .table = "journal_rows" }));
+                // Refused topology cannot publish a binding or success receipt.
+                var refused = try H.prepareCommand(&store, a, 56, fence, .{ .kind = .table, .action = .create, .name = "refused_rows" });
+                refused.mutation.table_id = id;
+                refused.mutation.storage_name = create.mutation.storage_name;
+                refused.topology = create.topology;
+                try H.apply(&store, a, refused, 10, replicated);
+                try std.testing.expectEqual(.CatalogGenerationChanged, (try H.outcome(&store, a, refused)).?.rejected);
+                try std.testing.expectEqual(@as(?metadata.TableRecord, null), try store.resolveSystemCatalogTable(a, T.group, .{ .table = "refused_rows" }));
+                // Exercise the same prepared-command contract for the ordinary
+                // catalog evolution cohort, not only physical table creation.
+                const evolution = [_]system_catalog.Mutation{
+                    .{ .kind = .namespace, .action = .comment, .name = "catalog_scope", .description = "durable namespace" },
+                    .{ .kind = .namespace, .action = .rename, .name = "catalog_scope", .new_name = "renamed_scope" },
+                    .{ .kind = .tablespace, .action = .create, .name = "journal_space" },
+                    .{ .kind = .namespace, .action = .set_tablespace, .name = "renamed_scope", .tablespace = "journal_space" },
+                    .{ .kind = .database, .action = .create, .name = "journal_database" },
+                    .{ .kind = .database, .action = .comment, .name = "journal_database", .description = "durable database" },
+                    .{ .kind = .database, .action = .rename, .name = "journal_database", .new_name = "renamed_database" },
+                    .{ .kind = .database, .action = .drop, .name = "renamed_database" },
+                    .{ .kind = .namespace, .action = .drop, .name = "renamed_scope" },
+                    .{ .kind = .tablespace, .action = .drop, .name = "journal_space" },
+                };
+                for (evolution, 0..) |mutation, ordinal| {
+                    const next = try H.prepareCommand(&store, a, @intCast(60 + ordinal), fence, mutation);
+                    const result_evolution = try H.success(&store, a, next, 30 + ordinal * 2, replicated);
+                    try std.testing.expectEqual(next.expected_revision + 1, result_evolution.revision);
+                    try std.testing.expectEqual(@as(usize, @intFromBool(mutation.action == .drop)), result_evolution.removed);
+                    try std.testing.expectEqualDeep(result_evolution, try H.success(&store, a, next, 31 + ordinal * 2, replicated));
+                }
+                try H.scope(&store, a, fence, 42, .{ .fence = .close });
+            } else {
+                // Results survive unrelated writes, ended executors and restart.
+                try std.testing.expectEqualDeep(first_result, try H.success(&store, a, first, 60 + pass * 10, replicated));
+                try std.testing.expectEqualDeep(create_result, try H.success(&store, a, create, 61 + pass * 10, replicated));
+                try std.testing.expectEqual(.CatalogGenerationChanged, (try H.outcome(&store, a, stale)).?.rejected);
+                try std.testing.expectEqual(.CatalogAlreadyExists, (try H.outcome(&store, a, rejected)).?.rejected);
+                try std.testing.expectEqual(@as(usize, 1), (try ((try H.outcome(&store, a, drop)).?).result()).removed);
+                var late = try H.prepareCommand(&store, a, 57, fence, .{ .kind = .namespace, .action = .create, .name = "late_scope" });
+                try std.testing.expectEqual(.CatalogGenerationChanged, (try H.outcome(&store, a, late)).?.rejected);
+                try H.apply(&store, a, late, 62 + pass * 10, replicated);
+                try std.testing.expectEqual(.CatalogGenerationChanged, (try H.outcome(&store, a, late)).?.rejected);
+                if (pass == 1) {
+                    const snapshot = try store.snapshotBuilder().buildSnapshot(a, T.group);
+                    var clone = try RaftApplyStore.init(backing, .{ .root_dir = try std.fmt.allocPrint(a, "{s}-replica", .{path}) });
+                    defer clone.deinit();
+                    if (standalone) {
+                        try clone.applyStandaloneCommand(T.group, .{ .initialize_metadata_incarnation = T.seed });
+                        try clone.replaceStandaloneCatalog(T.group, try clone.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
+                    }
+                    try RaftApplyStore.installSnapshotFromRaft(&clone, a, T.group, 500, snapshot);
+                    try std.testing.expectEqualDeep(first_result, try ((try H.outcome(&clone, a, first)).?).result());
+                    try std.testing.expectEqualDeep(create_result, try ((try H.outcome(&clone, a, create)).?).result());
+                    try std.testing.expectEqual(.CatalogAlreadyExists, (try H.outcome(&clone, a, rejected)).?.rejected);
+                }
+                if (pass == 2) {
+                    // Bounded retention expires old admissions instead of
+                    // executing a replacement object after their nonce is evicted.
+                    for (0..C.outcomes.retained) |ordinal| {
+                        late = try H.prepareCommand(&store, a, @intCast(100 + ordinal), null, .{ .kind = .namespace, .action = .create, .name = try std.fmt.allocPrint(a, "eviction_{d}", .{ordinal}) });
+                        _ = try H.success(&store, a, late, 100 + ordinal, replicated);
+                    }
+                    const meta = try store.systemCatalogMeta(a, T.group);
+                    try H.apply(&store, a, first, 200, replicated);
+                    try std.testing.expectEqualDeep(meta, try store.systemCatalogMeta(a, T.group));
+                    try std.testing.expectEqual(@as(?C.Outcome, null), try H.outcome(&store, a, first));
+                }
+            }
+        }
     };
 }

@@ -3993,6 +3993,35 @@ const LocalStandaloneMetadata = struct {
                 self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                 return store.sqlCastOutcome(alloc, group_ids.main_metadata_group_id, try casts.observation(alloc, request)) catch error.MetadataMutationOutcomeUnknown;
             },
+            .sql_catalog_outcome => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlCatalogOutcome(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .sql_catalog_mutate => |command| {
+                const catalog = @import("../system_catalog/catalog_mutations.zig");
+                if (!context.setting_admin) return error.Forbidden;
+                try catalog.validate(command);
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
+                const observation = try catalog.observation(alloc, command);
+                const previous = try store.sqlCatalogOutcome(alloc, group_ids.main_metadata_group_id, observation);
+                defer alloc.free(previous);
+                if (!std.mem.eql(u8, previous, "null")) return alloc.dupe(u8, previous);
+                const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+                defer alloc.free(bytes);
+                if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+                try context.ensureActive();
+                context.markSQLSubmission();
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_system_catalog = bytes }) catch return error.MetadataMutationOutcomeUnknown;
+                self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                const outcome = store.sqlCatalogOutcome(alloc, group_ids.main_metadata_group_id, observation) catch return error.MetadataMutationOutcomeUnknown;
+                if (std.mem.eql(u8, outcome, "null")) {
+                    alloc.free(outcome);
+                    return error.MetadataMutationOutcomeUnknown;
+                }
+                return outcome;
+            },
             .sql_native_index_prepare => |request| {
                 if (!context.setting_admin) return error.Forbidden;
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
@@ -4199,7 +4228,20 @@ const LocalStandaloneMetadata = struct {
             },
             .relation_replace => |request| return self.replaceRelationLocked(alloc, context, request),
             .native_memory_create => unreachable,
-            .mutate => |request| {
+            .mutate, .sql_catalog_prepare => {
+                const scoped = call == .sql_catalog_prepare;
+                const request = if (scoped) call.sql_catalog_prepare.request else call.mutate;
+                if (scoped) {
+                    if (!context.setting_admin) return error.Forbidden;
+                    if (!std.meta.eql(call.sql_catalog_prepare.command_fence, if (context.sql_command_fence) |fence| fence.* else null)) return error.InvalidCatalogMutation;
+                    if (std.mem.allEqual(u8, &call.sql_catalog_prepare.nonce, 0)) return error.InvalidCatalogMutation;
+                    if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
+                }
+                try request.validateBinding();
+                if (scoped) {
+                    const table_create = request.mutation.kind == .table and request.mutation.action == .create;
+                    if ((request.generated_constraint_names.len != 0 and !table_create) or request.column_sequences.len > 256 or (request.column_sequences.len != 0 and !table_create)) return error.InvalidCatalogMutation;
+                }
                 if (request.mutation.sql_owner != null and !context.setting_admin) return error.Forbidden;
                 if (request.mutation.native_service != null and request.mutation.native_service != context.native_service) return error.Forbidden;
                 if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
@@ -4241,6 +4283,49 @@ const LocalStandaloneMetadata = struct {
                     }
                     return err;
                 };
+                if (scoped) {
+                    const native = @import("../metadata/storage/raft_apply_contract.zig");
+                    const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                    const admission = try store.systemCatalogAdmissionWithBinding(a, group_ids.main_metadata_group_id, request.mutation, request.binding_guard);
+                    if (request.creation_revision) |revision| if (revision != admission.meta.revision) return error.CatalogGenerationChanged;
+                    var prepared: native.SystemCatalogCommand = .{ .expected_revision = admission.meta.revision, .mutation = command, .version = if (request.creation_sources.len != 0) native.SystemCatalogCommand.creation_sources_version else 1, .column_sequences = request.column_sequences, .creation_sources = request.creation_sources, .creation_comment_sources = request.creation_comment_sources, .creation_object_comments = request.creation_object_comments };
+                    if (table) |*created| {
+                        if (request.generated_constraint_names.len != 0) {
+                            const encoded_names = try store.prepareConstraintNamesJsonWithContext(a, group_ids.main_metadata_group_id, .{ .create = .{ .expected_revision = admission.meta.revision, .namespace_id = admission.namespace_id, .logical_name = request.mutation.name, .schema_json = created.schema_json, .generated_names = request.generated_constraint_names } }, context);
+                            const names = try std.json.parseFromSliceLeaky(system_catalog.ConstraintNamePrepared, a, encoded_names, .{});
+                            created.schema_json = names.schema_json orelse return error.InvalidCatalogRecord;
+                            prepared.constraint_name_admission = names.admission;
+                            prepared.version = if (request.creation_sources.len != 0) native.SystemCatalogCommand.creation_sources_version else 2;
+                        }
+                        const generation = try store.captureTableCreateGeneration(a, group_ids.main_metadata_group_id, created.table_id);
+                        if (created.storage.engine == .object) created.object_storage_generation = generation;
+                        ranges = try antfly.public_api.tables.deriveInitialRangesForGeneration(a, created.*, generation);
+                        prepared.topology = .{ .create = .{ .expected_transition_generation = generation, .table = created.*, .ranges = ranges } };
+                        if (prepared.column_sequences.len != 0) {
+                            prepared.version = if (request.creation_sources.len != 0) native.SystemCatalogCommand.creation_sources_version else 3;
+                            prepared = try std.json.parseFromSliceLeaky(native.SystemCatalogCommand, a, try store.bindTableColumnSequences(a, group_ids.main_metadata_group_id, prepared), .{});
+                        }
+                    } else if (dropping_table) {
+                        var drop = (try store.captureTableDropProjection(a, group_ids.main_metadata_group_id, command.storage_name)) orelse return error.TableNotFound;
+                        defer drop.deinit(a);
+                        if (drop.table.table_id != command.table_id or drop.fence.active()) return error.CatalogGenerationChanged;
+                        prepared.topology = .{ .drop = .{ .table_id = command.table_id, .expected_name = command.storage_name, .expected_transition_generation = drop.fence.generation, .range_contract = .{ .membership = drop.fence.membership(command.table_id) } } };
+                    } else if (command.kind == .table and command.action == .set_tablespace) {
+                        const current = (try store.resolveSystemCatalogTable(a, group_ids.main_metadata_group_id, .{ .database = command.database, .namespace = command.namespace, .table = command.name })) orelse return error.TableNotFound;
+                        var replacement = current;
+                        replacement.placement_role = admission.placement_policy.placement_role orelse "data";
+                        replacement.min_ranges = if (replacement.storage.engine == .object) 0 else admission.placement_policy.min_ranges orelse 1;
+                        if (self.storage_engine == .lite and replacement.storage.engine == .local and replacement.min_ranges != 1) return error.InvalidCreateTableRequest;
+                        prepared.placement_update = .{ .expected = current, .replacement = replacement };
+                    }
+                    prepared.sql_catalog_admission = .{ .request = .{ .nonce = call.sql_catalog_prepare.nonce, .head = admission.meta.sequence_outcome_head orelse 0, .command_fence = call.sql_catalog_prepare.command_fence }, .incarnation = admission.incarnation };
+                    const preview = try store.prepareSystemCatalogResult(a, group_ids.main_metadata_group_id, prepared);
+                    a.free(preview);
+                    const encoded = try std.json.Stringify.valueAlloc(alloc, prepared, .{});
+                    errdefer alloc.free(encoded);
+                    if (encoded.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+                    return encoded;
+                }
                 const empty: system_catalog.StateIndex = .{};
                 const reader: CatalogReader = .{ .owner = self, .alloc = a, .index = if (self.system_catalog_state) |*catalog| &catalog.index else &empty };
                 const result = try std.json.Stringify.valueAlloc(alloc, try system_catalog.mutationResult(reader, state.revision + 1, delta), .{});
@@ -19059,6 +19144,62 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
             defer begun.deinit();
             try Helper.command(alloc, api, begun.value.session_id.?, "PREPARE TRANSACTION 'local_commit'", "PREPARE TRANSACTION");
             try Helper.command(alloc, api, null, "COMMIT PREPARED 'local_commit'", "COMMIT PREPARED");
+        }
+    }
+}
+
+test "system catalog prepared ordinary DDL submits exact native outcomes through standalone recovery" {
+    if (comptime control_only_storage_sources) return error.SkipZigTest;
+    const C = @import("../system_catalog/catalog_mutations.zig");
+    const Command = @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/prepared-catalog.json", .{tmp.sub_path});
+    defer a.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer backend.deinit();
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var prepared: Command = undefined;
+    var accepted: C.outcomes.Result = undefined;
+    for (0..2) |pass| {
+        var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        var cancellation: antfly.common.runtime_lifecycle.CancellationSource = .{};
+        try metadata.awaitInitialRelationPublication(std.testing.io, cancellation.token());
+        const source = metadata.statusSource();
+        const private: antfly.public_api.operation.RequestContext = .{ .setting_admin = true };
+        if (pass == 0) {
+            const request: @import("../system_catalog/server_call.zig").Call = .{ .sql_catalog_prepare = .{ .nonce = @splat(1), .request = .{ .mutation = .{ .action = .create, .kind = .table, .name = "prepared_rows" }, .physical_name = "table:prepared-rows", .create_table_json = "{\"num_shards\":1}" } } };
+            try std.testing.expectError(error.Forbidden, source.systemCatalog(scratch, .{}, request));
+            const before = try metadata.lifecycle_store.?.systemCatalogMeta(scratch, group_ids.main_metadata_group_id);
+            prepared = try std.json.parseFromSliceLeaky(Command, scratch, try source.systemCatalog(scratch, private, request), .{});
+            try std.testing.expect(prepared.topology != null);
+            try std.testing.expectEqualDeep(before, try metadata.lifecycle_store.?.systemCatalogMeta(scratch, group_ids.main_metadata_group_id));
+            const reply = try source.systemCatalog(scratch, private, .{ .sql_catalog_mutate = prepared });
+            accepted = try (try std.json.parseFromSliceLeaky(C.Outcome, scratch, reply, .{})).result();
+            try std.testing.expectEqual(@as(?C.outcomes.Identity, null), accepted.identity);
+            try std.testing.expectEqual(@as(usize, 0), accepted.removed);
+            try std.testing.expectEqual(prepared.expected_revision + 1, accepted.revision);
+            // A concurrent ordinary catalog update cannot erase the exact reply.
+            const unrelated = try source.systemCatalog(scratch, private, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .namespace, .name = "unrelated_scope" } } });
+            _ = unrelated;
+        } else {
+            const before = try metadata.lifecycle_store.?.systemCatalogMeta(scratch, group_ids.main_metadata_group_id);
+            const repeated = try source.systemCatalog(scratch, private, .{ .sql_catalog_mutate = prepared });
+            try std.testing.expectEqualDeep(accepted, try (try std.json.parseFromSliceLeaky(C.Outcome, scratch, repeated, .{})).result());
+            const observation = try C.observation(scratch, prepared);
+            const observed = try source.systemCatalog(scratch, private, .{ .sql_catalog_outcome = observation });
+            try std.testing.expectEqualDeep(accepted, try (try std.json.parseFromSliceLeaky(?C.Outcome, scratch, observed, .{})).?.result());
+            try std.testing.expectEqualDeep(before, try metadata.lifecycle_store.?.systemCatalogMeta(scratch, group_ids.main_metadata_group_id));
+            const resolved = try source.systemCatalog(scratch, private, .{ .resolve = .{ .table = "prepared_rows" } });
+            const table = (try std.json.parseFromSliceLeaky(?system_catalog.ResolvedTable, scratch, resolved, .{})).?;
+            try std.testing.expectEqual(prepared.mutation.table_id, table.table_id);
+            var alias = prepared;
+            alias.mutation.name = "replacement_rows";
+            try std.testing.expectError(error.SequenceAdmissionConflict, source.systemCatalog(scratch, private, .{ .sql_catalog_mutate = alias }));
         }
     }
 }

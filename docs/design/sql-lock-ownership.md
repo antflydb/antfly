@@ -1140,3 +1140,72 @@ without skips, failures or leaks. The PostgreSQL 18 oracle passes **221
 assertions**, including mixed sequence/advisory ordering and error postimages.
 Formatting, license, Apache-boundary, control-catalog and inventory audits pass.
 The original inventory remains unchanged at **87 unresolved (64 DDL/catalog)**.
+
+
+## Prepared ordinary catalog commands
+
+Ordinary catalog DDL uses a private prepare/submit/observe contract, alongside
+specialized sequence, type, callable, authorization and native-index commands.
+Preparation resolves physical table identities, initial ranges, placement,
+constraint names, copied source proofs and column sequence bindings exactly
+once. It returns the complete native command, with a catalog incarnation,
+bounded journal admission and the originating command fence already attached.
+Submission cannot silently attach or replace that fence. The canonical prepared
+command digest, rather than a second copy of the original JSON intent, identifies
+the retained outcome. Hashing streams canonical JSON into SHA-256 with fixed
+scratch and no heap allocation; it also enforces the native command byte limit.
+Observation is a compact admission/incarnation/digest
+projection; it does not carry schema bytes or grant resubmission authority.
+
+Decoder capability 158 is required at both proposal and receiving native apply.
+The command retains its ordinary format version, so creation-source and column
+sequence validation keep their existing contracts. Unscoped predecessors omit
+the new descriptor entirely. A fresh catalog can prepare against journal head
+zero; the catalog incarnation and owner/name proof are captured in one native
+read transaction. Preparation performs no logical DDL effect. Cluster preparation
+and encoding do not require the catalog mutation mutex; only final readiness
+validation and proposal are serialized, and apply waiting occurs after unlock.
+
+The receiving native transaction consults the bounded shared outcome journal
+before testing current command liveness. Thus an accepted success or rejection
+survives unrelated catalog revisions, executor retirement and restart. A changed
+prepared command cannot reuse its nonce. Expired admissions cannot recreate an
+object after eviction. Catalog revision disagreement is a definite retained
+rejection, rather than an inference from the newest catalog hash. Successful
+outcomes retain a fixed-size revision/object identity or removal flag, never an
+unbounded resource/schema response. Hash-derived physical table IDs remain bound
+by the prepared topology rather than masquerading as catalog-counter identities.
+
+Physical topology admission returns an explicit result. Every refusal precedes
+logical catalog/topology effects; once admitted, storage failures abort the transaction containing
+both topology/catalog publication and the journal outcome. The caller no longer
+recomputes resolver projections after writing topology to infer whether creation
+was admitted. Tablespace replacement and topology creation/drop are mutually
+exclusive under the existing native envelope validator.
+
+Public SQL automatic connection enrollment is still gated. Its remaining work
+includes joining ordinary DDL to public recovery receipts/authorization labels,
+activating this private producer on both ingress paths, and guarding the remaining
+schema/view/lifecycle mutation families. A private native outcome is not evidence
+that those complete public features are activated. The original parity inventory
+therefore remains unchanged by this command-boundary work.
+
+
+The prepared catalog command Debug gate passes the standalone production startup,
+preparation, submission, unrelated-mutation and cold-reopen case; ten native
+command-fence contracts; and three decoder contracts. Its lifecycle campaign
+covers cluster/standalone realms through both local and Raft apply, arbitrary
+physical table IDs, database/namespace/tablespace evolution, stale/changed commands,
+ended executors, bounded eviction, aborted transactions and installed snapshots.
+Faults after provisional catalog effects include both an injected storage failure
+and `CatalogGenerationChanged`: neither may be swallowed as an admission refusal,
+and both must roll back catalog effects and the retained outcome together.
+
+
+Range-bearing create/drop cases additionally verify complete membership removal
+and reject an absent primary table with surviving range membership. That state
+must not certify a completed drop or erase the remaining logical binding. Run
+`zig build antfly-sql-catalog-command-test -Doptimize=Debug` from `zig/` for the
+combined native and standalone contract gate. The separate
+`antfly-sql-command-producer-test` Debug gate passes all 49 source/controller
+regressions after the catalog atomicity change.

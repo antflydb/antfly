@@ -83,6 +83,10 @@ pub fn requiresSqlCast(bytes: []const u8) bool {
     return requiresMarker(bytes, "sql_cast");
 }
 
+pub fn requiresSqlCatalogJournal(bytes: []const u8) bool {
+    return requiresMarker(bytes, "sql_catalog_admission");
+}
+
 pub fn requiresSqlCommandFence(bytes: []const u8) bool {
     return requiresMarker(bytes, "command_fence");
 }
@@ -513,4 +517,9 @@ test "SQL command fence decoder projection finds escaped fields without parsing 
         try std.testing.expect(!requiresSqlCommandFence(bytes));
     for ([_][]const u8{ "{\"admission\":{\"command_fence\":{}}}", "{\"request\":{\"command_\\u0066ence\":{}}}", "{" }) |bytes|
         try std.testing.expect(requiresSqlCommandFence(bytes));
+}
+
+test "SQL command fence decoder catalog journal cannot be hidden in escaped fields or source text" {
+    for ([_][]const u8{ "{}", "{\"source_json\":\"sql_catalog_admission\"}", "{\"sql_catalog_admission\":null}" }) |bytes| try std.testing.expect(!requiresSqlCatalogJournal(bytes));
+    for ([_][]const u8{ "{\"sql_catalog_admission\":{}}", "{\"sql_catalog_admiss\\u0069on\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlCatalogJournal(bytes));
 }

@@ -18314,3 +18314,27 @@ including 49 source/controller, 42 native-result, two mounted routine/prepared,
 and the mounted transaction lifecycle plus 18 lifecycle contract cases. There
 are no skips, failures or leaks; formatting and the source/control, license,
 Apache-boundary and inventory audits pass.
+
+
+### Prepared ordinary catalog command boundary
+
+Ordinary database/namespace/tablespace/table DDL now has a private complete-native-
+command preparation, mutation and exact observation contract. Capability 158
+joins its catalog incarnation, already-bound SQL command fence, physical topology,
+source/constraint/sequence proofs and canonical command digest to the existing
+bounded native outcome journal. Native topology admission is explicit, replacing
+post-write inference. Cluster preparation avoids the catalog mutation mutex;
+submission releases it before waiting. Standalone lifecycle storage shares the
+same native command/outcome machinery.
+
+This is shared execution/recovery infrastructure, not a new original-case credit.
+Public receipt/permission-label integration and remaining mutation-family guards
+must be completed before automatic SQL connection enrollment is enabled. The
+original inventory stays at 87 unresolved, including 64 DDL/catalog cases.
+
+
+The dedicated Debug catalog-command gate passes ten native fence contracts,
+three decoder contracts and the real standalone startup/preparation/cold-reopen
+case, without skips or leaks. Post-effect fault injection proves that even an
+error tag also used for admission rejection aborts the whole native transaction;
+only pre-effect admission failures can be ignored by receiving apply.

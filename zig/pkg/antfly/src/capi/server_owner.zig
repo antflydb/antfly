@@ -2089,6 +2089,13 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.sqlNativeIndexPrepare(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .sql_catalog_outcome => |input| {
+                    const value = handle.store.sqlCatalogOutcome(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(switch (err) {
+                        error.SequenceAdmissionExpired, error.SequenceAdmissionConflict => error.MetadataMutationOutcomeUnknown,
+                        else => err,
+                    });
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .sql_native_index_outcome => |input| {
                     const value = handle.store.sqlNativeIndexOutcome(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(switch (err) {
                         error.SequenceAdmissionExpired, error.SequenceAdmissionConflict => error.MetadataMutationOutcomeUnknown,
