@@ -95,10 +95,15 @@ def request(base, case, timeout):
         raw = response.read(16 * 1024 * 1024 + 1)
         if response.status != 200 or len(raw) > 16 * 1024 * 1024:
             raise ValueError("unsuccessful or oversized response")
-    duration = time.perf_counter_ns() - start
+    completed = time.perf_counter_ns()
+    duration = completed - start
     output = strict_json(raw)
     require_equal(case["expected"], output, case["confidence_tolerance"])
-    return {"duration_ns": duration, "output": output}
+    return {
+        "duration_ns": duration,
+        "response_completed_ns": completed,
+        "output": output,
+    }
 
 
 def request_round(base, case, timeout, concurrency):
@@ -116,7 +121,9 @@ def request_round(base, case, timeout, concurrency):
         start = time.perf_counter_ns()
         ready.wait()
         samples = [future.result() for future in pending]
-        duration = time.perf_counter_ns() - start
+        # Result parsing/comparison must finish before the next arm starts,
+        # but is not part of the measured HTTP completion interval.
+        duration = max(sample["response_completed_ns"] for sample in samples) - start
     return {"duration_ns": duration, "requests": samples}
 
 
@@ -182,6 +189,10 @@ def main():
         "round_scope": "single_request"
         if args.concurrency == 1
         else "synchronized_burst",
+        "timing": {
+            "client_latency": "HTTP send through response-body read; excludes JSON parsing and oracle comparison",
+            "burst": "barrier release through last response-body read; includes client dispatch and payload encoding",
+        },
         "performance_release_qualified": False,
         "samples": [],
         "comparisons": {},

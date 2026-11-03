@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -32,7 +33,11 @@ class ContractTests(unittest.TestCase):
 
         def checked_request(*_):
             entered.wait()
-            return {"duration_ns": 1, "output": {"ok": True}}
+            return {
+                "duration_ns": 1,
+                "response_completed_ns": time.perf_counter_ns(),
+                "output": {"ok": True},
+            }
 
         with patch.object(bench, "request", side_effect=checked_request):
             result = bench.request_round("http://localhost", {}, 10, 4)
