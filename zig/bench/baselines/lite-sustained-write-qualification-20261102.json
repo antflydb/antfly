@@ -6932,5 +6932,35 @@
     "native_smoke_and_abi": "passed, 134 exports and executable/shared library consumers",
     "platform": "macOS ARM64 runtime process fixtures; Linux x86_64 and ARM64 range-lock cross-compilation only",
     "qualification": "Full native/contract gates and optimized final host measurements still required."
+  },
+  "fair_admission_broad_gate_20261103": {
+    "source_commit": "143757252c",
+    "native": {
+      "passed": 752,
+      "skipped": 5,
+      "failed": 0,
+      "leaked": 0,
+      "expected_error_logs": 8,
+      "unexpected_error_logs": 0
+    },
+    "backup_preflight": {
+      "passed": 2,
+      "failed": 0
+    },
+    "physical_capi": {
+      "passed": 279,
+      "skipped": 3,
+      "failed": 1,
+      "leaked": 0,
+      "failure": "The new checkpoint-loss crash fixture passed reconciliation/data assertions but assumed four poison-close error logs; only three finalizers remained dirty in the broad run. It now uses the existing immutable teardown to model process loss without publishing close-time state. No production error logging was relaxed.",
+      "consumer_gate": "blocked by physical partition failure"
+    },
+    "abi_and_smoke": "passed, 134 exports and C executable/shared-library linkage",
+    "partial_enrollment_fault": {
+      "red": "A partial new-slot write followed by delayed descriptor close let a peer observe InvalidNativeWriterQueue.",
+      "green": "Keep the queue guard through failed-description close. The same isolated real-file fault probe passes; the committed queue component suite and six process fixtures pass with this cleanup.",
+      "scope": "Admission availability and cleanup; safety flock remains authoritative."
+    },
+    "proof_retention_followup": "Completed verification now caches its immutable witness before lease reacquisition. Both timed local handoffs preserve refusal after mandatory cleanup, and new tests require a later stable-tip request to reuse the completed walk. These owner changes are awaiting integration validation."
   }
 }

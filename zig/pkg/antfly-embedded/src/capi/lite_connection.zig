@@ -2954,6 +2954,29 @@ pub const Owner = struct {
     /// Runtime pins keep the reader's borrowed allocator/executor alive while
     /// the graph walk runs with both publication locks released.
     fn verifyAllocatorAssumeLocked(self: *Owner, lease: *?native.PathWriterLock, connection: ?*Connection) !void {
+        var gate_refusal: ?anyerror = null;
+        try self.verifyAllocatorWithCleanupAssumeLocked(lease, connection, &gate_refusal);
+        // Reader teardown must return with the gate held, even after expiry.
+        // Its mandatory drain cannot authorize fresh work after a timed-out
+        // handoff. The completed proof remains cached for a later request.
+        if (gate_refusal) |err| return err;
+    }
+
+    fn reacquireAllocatorProofGate(self: *Owner, connection: ?*Connection, refusal: *?anyerror) void {
+        const io = h.handleLockIo();
+        if (connection) |caller| if (caller.admission_deadline_ns) |deadline| {
+            self.gate.mutex.lockUntil(io, deadline) catch |err| {
+                // Runtime/proof references must be released under this gate.
+                // Join that teardown, but retain the admission refusal.
+                self.gate.mutex.lockUncancelable(io);
+                if (refusal.* == null) refusal.* = err;
+            };
+            return;
+        };
+        self.gate.mutex.lockUncancelable(io);
+    }
+
+    fn verifyAllocatorWithCleanupAssumeLocked(self: *Owner, lease: *?native.PathWriterLock, connection: ?*Connection, gate_refusal: *?anyerror) !void {
         const io = h.handleLockIo();
         if (!try self.retainMaintenanceTurnAssumeLocked()) return error.FileBusy;
         defer self.releaseMaintenanceTurnAssumeLocked();
@@ -2983,7 +3006,7 @@ pub const Owner = struct {
             if (comptime h.builtin.is_test) if (self.test_before_allocator_reader_close) |hook| hook.notify(hook.ptr, reader);
             reader.close();
             proof_alloc.destroy(reader);
-            self.gate.mutex.lockUncancelable(io);
+            self.reacquireAllocatorProofGate(connection, gate_refusal);
         }
         lease.*.?.close();
         lease.* = null;
@@ -2992,7 +3015,7 @@ pub const Owner = struct {
         const proof_started = std.Io.Clock.awake.now(io).nanoseconds;
         const verified = reader.completeAllocatorVerification();
         const proof_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - proof_started));
-        self.gate.mutex.lockUncancelable(io);
+        self.reacquireAllocatorProofGate(connection, gate_refusal);
         self.publication_stats.allocator_proof_walks +|= 1;
         self.publication_stats.allocator_proof_ns +|= proof_ns;
         self.publication_stats.allocator_proof_max_ns = @max(self.publication_stats.allocator_proof_max_ns, proof_ns);
@@ -3000,6 +3023,16 @@ pub const Owner = struct {
             self.publication_stats.allocator_proof_failures +|= 1;
         }
         try verified;
+        if (self.current) |current| {
+            if (needsOutcomeReconciliation(current)) return error.OutcomeUnknown;
+            const live = &current.owned_lite_backend.?.native_docstore.?.file;
+            // Cache the immutable proof witness against its exact checkpoint
+            // (or checked append-only lineage) before seeking another lease.
+            // A Busy refusal must not discard a completed whole-file walk.
+            // This shares no mutable verifier ledger with borrowed runtimes.
+            try live.inheritAllocatorVerification(reader);
+        }
+        if (gate_refusal.*) |err| return err;
         // A foreground operation has not started its mutation yet. Preserve
         // its connection-local busy policy when another process wins the
         // writer lease during the detached proof. Background turns stay
@@ -4027,6 +4060,15 @@ test "capi native allocator proof reacquisition honors per-connection busy admis
                 try std.testing.expectError(error.WouldBlock, result);
                 try std.testing.expectEqual(@as(usize, 0), probe.retries);
             },
+        }
+        try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+        if (scenario != .foreground) {
+            probe.release();
+            owner.test_after_allocator_capture = null;
+            lease = try connection.acquirePathLeaseAssumeLocked();
+            const completed_walks = owner.publication_stats.allocator_proof_walks;
+            try owner.verifyAllocatorAssumeLocked(&lease, connection);
+            try std.testing.expectEqual(completed_walks, owner.publication_stats.allocator_proof_walks);
         }
     }
 }
@@ -7737,5 +7779,82 @@ test "capi native allocator proof zero timeout preserves process local serializa
         joined = true;
         try std.testing.expect(queued and !refused_early);
         try std.testing.expectEqual(h.capi.ErrorCode.ok, probe.result);
+    }
+}
+
+test "capi native allocator proof timed handoffs retain verification without admitting a mutation" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    inline for (.{ false, true }) |during_reader_close| {
+        var fixture = try AdmissionFollowupFixture.init(if (during_reader_close) "proof-close-handoff-budget" else "proof-walk-handoff-budget", 50, .batch);
+        defer fixture.deinit();
+        const owner = fixture.connection.owner;
+        const Probe = struct {
+            owner: *Owner,
+            entered: std.Io.Event = .unset,
+            thread: ?std.Thread = null,
+            failure: ?anyerror = null,
+            watchdog_fired: bool = false,
+            fn hold(self: *@This()) void {
+                const input_io = h.handleLockIo();
+                const mutex = &self.owner.gate.mutex;
+                mutex.lockUncancelable(input_io);
+                defer mutex.unlock(input_io);
+                mutex.state.lockUncancelable(input_io);
+                const serving = mutex.serving;
+                mutex.state.unlock(input_io);
+                self.entered.set(input_io);
+                const deadline = std.Io.Clock.awake.now(input_io).nanoseconds + 2 * std.time.ns_per_s;
+                while (true) {
+                    mutex.state.lockUncancelable(input_io);
+                    // Expiring the queued timed admission completes its node
+                    // even though this actor still owns the gate. Release only
+                    // after that refusal, so mandatory cleanup can drain.
+                    const refused = mutex.serving != serving;
+                    mutex.state.unlock(input_io);
+                    if (refused) return;
+                    if (std.Io.Clock.awake.now(input_io).nanoseconds >= deadline) {
+                        self.watchdog_fired = true;
+                        return;
+                    }
+                    input_io.sleep(.fromMilliseconds(1), .awake) catch return;
+                }
+            }
+            fn captured(ptr: *anyopaque, _: *native.NativeFile) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.start() catch |err| {
+                    self.failure = err;
+                };
+            }
+            fn start(self: *@This()) !void {
+                if (self.thread != null) return error.UnexpectedRepeatedProof;
+                self.thread = try std.Thread.spawn(.{}, hold, .{self});
+                try self.entered.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } });
+            }
+            fn join(self: *@This()) void {
+                if (self.thread) |thread| thread.join();
+                self.thread = null;
+            }
+        };
+        var probe: Probe = .{ .owner = owner };
+        defer probe.join();
+        if (during_reader_close) owner.test_before_allocator_reader_close = .{ .ptr = &probe, .notify = Probe.captured } else owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.captured };
+        defer {
+            owner.test_after_allocator_capture = null;
+            owner.test_before_allocator_reader_close = null;
+        }
+        const walks_before = owner.publication_stats.allocator_proof_walks;
+        const result = fixture.call(.batch);
+        probe.join();
+        owner.test_after_allocator_capture = null;
+        owner.test_before_allocator_reader_close = null;
+        if (probe.failure) |err| return err;
+        try std.testing.expectEqual(h.capi.ErrorCode.busy, result);
+        try std.testing.expect(!probe.watchdog_fired);
+        try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+        try std.testing.expectEqual(walks_before + 1, owner.publication_stats.allocator_proof_walks);
+        try fixture.expectWritten(.batch, false);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+        try fixture.expectWritten(.batch, true);
+        try std.testing.expectEqual(walks_before + 1, owner.publication_stats.allocator_proof_walks);
     }
 }

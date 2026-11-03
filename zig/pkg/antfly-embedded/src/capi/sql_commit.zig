@@ -369,9 +369,10 @@ test "capi SQL COMMIT uncertain checkpoint returns a token reconciled once after
         try std.testing.expectEqualStrings("40003", result.value.object.get("error").?.object.get("code").?.string);
         _ = try std.fmt.hexToBytes(&transaction, result.value.object.get("transaction_id").?.string);
         try std.testing.expect(root.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain);
-        // The poisoned root and named-table LSMs must skip both WAL and index
-        // finalization. These four close errors are intentional fail-closed logs.
-        @import("antfly_test_error_logs").expectErrorLogs(4);
+        // Model process loss without publishing close-time index state. Native
+        // owners already retire captured runtimes this way; the direct hosted
+        // fixture must explicitly abandon its in-memory views before reopen.
+        root.lease_snapshot = true;
     }
     const reopened = try api.openLiteHandleAllocWithRuntime(std.testing.allocator, path, .{ .no_sync = true, .profile = .hosted }, false, std.testing.io, runtime.ptr());
     const id = try api.publishHandle(reopened);

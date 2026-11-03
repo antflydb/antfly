@@ -202,7 +202,8 @@ pub fn enroll(a: Allocator, io: std.Io, safety_lock_path: []const u8, kind: Kind
             error.FileNotFound, error.AccessDenied, error.ReadOnlyFileSystem => return null,
             else => return err,
         };
-    errdefer file.close(io);
+    var file_owned = true;
+    errdefer if (file_owned) file.close(io);
     var backoff: i96 = initial_backoff_ns;
     var waited = false;
     while (true) {
@@ -210,6 +211,14 @@ pub fn enroll(a: Allocator, io: std.Io, safety_lock_path: []const u8, kind: Kind
         waited = try lockGuard(file, io, deadline) or waited;
         var guarded = true;
         defer if (guarded) range.unlock(file, guard_offset, 1) catch {};
+        // A failed write can leave an invalid new slot. Retain the guard
+        // through descriptor close, which drops both ownership ranges before
+        // another participant can inspect that partially written ticket.
+        errdefer if (guarded) {
+            file.close(io);
+            file_owned = false;
+            guarded = false;
+        };
         var slots = try load(file, io);
         _ = try reap(file, &slots, null);
         var free: ?usize = null;
@@ -437,4 +446,76 @@ test "writer queue full table stays bounded and resets after all descriptions cl
     defer next.close(io);
     try std.testing.expectEqual(@as(u64, 1), sequence(next.raw));
     try next.waitTurn(io, null);
+}
+
+test "writer queue failed partial enrollment retains its guard through descriptor close" {
+    if (!range.supported) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const safety = try tmp.dir.createFile(io, "database.lock", .{});
+    safety.close(io);
+    const path = try tmp.dir.realPathFileAlloc(io, "database.lock", a);
+    defer a.free(path);
+    var first = (try enroll(a, io, path, .exclusive, null, true)).?;
+    defer first.close(io);
+    // The next ticket is 128, whose encoded writer value is 257. Losing the
+    // write after its first byte leaves raw=1, an invalid live sequence.
+    first.raw = 255;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, first.raw, .little);
+    try first.file.writePositionalAll(io, &raw, header_bytes + first.slot * 8);
+    const Fault = struct {
+        var close_entered: std.Io.Event = .unset;
+        var release_close: std.Io.Event = .unset;
+        var injected = false;
+        fn write(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            if (offset == header_bytes and !injected) {
+                injected = true;
+                try file.writePositionalAll(std.testing.io, data[0][0..9], offset);
+                return error.NoSpaceLeft;
+            }
+            return std.testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
+        }
+        fn close(userdata: ?*anyopaque, files: []const std.Io.File) void {
+            close_entered.set(std.testing.io);
+            release_close.waitUncancelable(std.testing.io);
+            std.testing.io.vtable.fileClose(userdata, files);
+        }
+    };
+    Fault.close_entered = .unset;
+    Fault.release_close = .unset;
+    Fault.injected = false;
+    var vtable = io.vtable.*;
+    vtable.fileWritePositional = Fault.write;
+    vtable.fileClose = Fault.close;
+    const fault_io = std.Io{ .userdata = io.userdata, .vtable = &vtable };
+    const Worker = struct {
+        failure: ?anyerror = null,
+        fn run(self: *@This(), path_value: []const u8, input_io: std.Io) void {
+            if (enroll(std.testing.allocator, input_io, path_value, .exclusive, null, true)) |maybe| {
+                if (maybe) |ticket| {
+                    var owned = ticket;
+                    owned.close(input_io);
+                }
+            } else |err| self.failure = err;
+        }
+    };
+    var worker: Worker = .{};
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &worker, path, fault_io });
+    var joined = false;
+    defer {
+        Fault.release_close.set(io);
+        if (!joined) thread.join();
+    }
+    try Fault.close_entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expectError(error.WouldBlock, enroll(a, io, path, .exclusive, null, true));
+    Fault.release_close.set(io);
+    thread.join();
+    joined = true;
+    try std.testing.expectEqual(error.NoSpaceLeft, worker.failure.?);
+    var successor = (try enroll(a, io, path, .exclusive, null, true)).?;
+    defer successor.close(io);
+    try std.testing.expectError(error.WouldBlock, successor.waitTurn(io, null));
 }

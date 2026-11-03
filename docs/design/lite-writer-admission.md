@@ -37,6 +37,10 @@ The safety descriptor closes before the ticket descriptor. Cancellation closes
 both in that order, and process death releases their kernel ownership. The next
 visit reaps stale metadata. Interrupted initialization can be repaired only while
 the queue guard and the entire ticket-lock range prove that no live ticket exists.
+Failed enrollment retains the guard through descriptor close. A partial new-slot
+write therefore cannot appear live to a peer while its failed description is
+still draining.
+
 Queue metadata needs no data-durability barrier: after a machine restart all its
 former descriptions are gone, so their records cannot authorize a new operation.
 
@@ -68,8 +72,14 @@ the transition into a timed wait.
 
 A successful detached allocator proof may outlast its waiting budget. Admission
 must retain that finished proof, allow an uncontended stable-tip acquisition, and
-refuse new contention waits after expiry. Runtime and reader references remain
-owned until cancellation/verification work has drained.
+refuse new contention waits after expiry. The completed verification witness is retained against its matching cached
+checkpoint or checked append-only lineage before lease reacquisition. A Busy
+refusal therefore cannot force another full walk on a stable tip. No mutable
+verifier ledger is shared with borrowed runtimes. Both local handoffs after
+verification and reader teardown use the original admission budget; mandatory
+teardown still drains under the gate, and a refused handoff cannot start a new
+mutation afterward. Runtime and reader references remain owned until that drain
+finishes.
 
 ## Work under a turn
 
@@ -118,7 +128,8 @@ original retry policy.
 ## Qualification
 
 Component coverage includes the ordering model, slot reuse, bounded capacity,
-partial initialization, cancellation, and deadline expiry. Real process fixtures
+partial initialization, partial enrollment writes, delayed descriptor close,
+cancellation, and deadline expiry. Real process fixtures
 exercise immediate holder reentry, death while queued and while holding a turn,
 middle-waiter timeout, read cohorts, and interoperability with a legacy flock
 holder. Database/API tests must also cover ownership transfer, failed opens,

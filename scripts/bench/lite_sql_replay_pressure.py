@@ -195,6 +195,7 @@ def run(args):
                         report["failed_commit"] = {
                             "ordinal": transaction,
                             "sqlstate": getattr(error, "sqlstate", None),
+                            "commit_outcome": getattr(error, "commit_outcome", None),
                             "has_transaction_receipt": bool(
                                 getattr(error, "transaction_id", None)
                             ),
@@ -283,7 +284,11 @@ def run(args):
         report.update(
             status="failed", error_type=type(error).__name__, error=str(error)
         )
-        if report.get("failed_commit", {}).get("sqlstate") == "55P03":
+        failed_commit = report.get("failed_commit", {})
+        if (
+            failed_commit.get("commit_outcome") == "not_applied"
+            or failed_commit.get("sqlstate") == "55P03"
+        ):
             # Verify the refusal after session/handle teardown. An exit status
             # or absent receipt cannot establish that COMMIT changed no rows.
             successful = len(report["transactions"])
