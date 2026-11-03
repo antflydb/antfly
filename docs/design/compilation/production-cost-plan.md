@@ -40,6 +40,32 @@ files and produced no comparable product pair. The harness now maintains active
 cache leases and rejects eviction, missing memory captures and failed builds;
 those failed attempts establish no compile-time, size or memory improvement.
 
+The protected CPU-only ReleaseFast screen subsequently completed for frozen
+`6dd5b52232` versus `7bedd1eb66` (both image/lake ownership options enabled on
+the candidate). This compares the earlier media/lake/query milestone, **not**
+the later `619d435205` mutation/retained-read/capacity redesign. The receipt is
+`paired-owners-release-leased.json` under the ignored compile-cost results;
+both installed binaries, CAPI maps and raw process samples are retained.
+
+| Local screen metric | Baseline | Earlier owner milestone |
+| --- | ---: | ---: |
+| Stripped antfly bytes | 222,918,872 | 220,079,240 |
+| Stripped libantfly bytes | 80,389,920 | 77,151,552 |
+| Cold combined build seconds | 3,596.41 | 3,172.23 |
+| Warm combined build seconds | 9.53 | 12.86 |
+| Sampled aggregate compiler peak GiB | 7.878 | 7.783 |
+| API kernel compiler peak GiB | 7.878 | 4.428 |
+| Storage engine compiler peak GiB | 4.362 | 7.783 |
+
+This is one serialized, contended macOS ARM64 screen with pinned compiler/SDK,
+baseline CPU, stripped products and Metal/CUDA/system BLAS disabled. It shows
+2.84 MB and 3.24 MB smaller artifacts and an 11.8% shorter cold build, while
+warm time regresses and total sampled memory is nearly unchanged. The peak
+moves between owners. It establishes neither an order-of-magnitude gain nor
+normal-runner/GPU qualification; repeat controlled pairs before tuning claims
+or promoting defaults. The newer source candidate needs its own optimized
+product capture.
+
 ## Decision
 
 Start by completing the shared **PDF/image compute owner** that already exists.

@@ -16,9 +16,13 @@
 """Prevent partial compiler summaries from qualifying session isolation."""
 
 import hashlib
+import json
 from pathlib import Path
+import shutil
+import sys
 import tarfile
 import tempfile
+import threading
 import unittest
 
 import check_read_session_owner_cache as cache
@@ -32,6 +36,61 @@ def summary():
 
 
 class SessionCompilerAttribution(unittest.TestCase):
+    def fixture_parent(self):
+        parent = cache.ZIG / ".zig-cache/tool-fixtures"
+        parent.mkdir(parents=True, exist_ok=True)
+        return parent
+
+    def test_partial_cache_eviction_invalidates_without_recreating_marker(self):
+        with tempfile.TemporaryDirectory(dir=self.fixture_parent()) as directory:
+            root = Path(directory) / "cache"
+            with cache.CacheLease((root,)) as lease:
+                removed = root / "o"
+                shutil.rmtree(removed)
+                with self.assertRaises(cache.CacheEvicted):
+                    lease.pulse()
+                with self.assertRaises(cache.CacheEvicted):
+                    lease.protect(Path(directory) / "another-cache")
+                self.assertFalse(removed.exists())
+                self.assertFalse((Path(directory) / "another-cache").exists())
+
+    def test_running_build_is_terminated_and_diagnosed_when_cache_disappears(self):
+        with tempfile.TemporaryDirectory(dir=self.fixture_parent()) as directory:
+            root = Path(directory) / "zig"
+            local = root / ".zig-cache"
+            with cache.CacheLease((local,)) as lease:
+                arguments = local / "args/command"
+                arguments.parent.mkdir(exist_ok=True)
+                arguments.write_text("--name fixture\n")
+                timer = threading.Timer(0.2, lambda: shutil.rmtree(local / "o"))
+                timer.start()
+                try:
+                    result = cache.run(
+                        root,
+                        [sys.executable, "-c", "import time; time.sleep(30)"],
+                        Path(directory) / "build.log",
+                        5,
+                        lease,
+                    )
+                finally:
+                    timer.join()
+                self.assertTrue(result["cache_invalid"])
+                self.assertEqual(result["interruption"], "CacheEvicted")
+                self.assertIsNotNone(result["returncode"])
+                self.assertNotEqual(result["returncode"], 0)
+                self.assertLess(result["elapsed_s"], 5)
+                diagnostic = cache.failure_diagnostics(
+                    root, Path(directory) / "report.json", "fixture", lease
+                )
+                saved = json.loads(Path(diagnostic["cache_diagnostics"]).read_text())
+                self.assertTrue(saved["lease_invalid"])
+                self.assertEqual(len(saved["preserved_compiler_args"]), 1)
+                self.assertEqual(
+                    Path(saved["preserved_compiler_args"][0]).read_text(),
+                    arguments.read_text(),
+                )
+                self.assertFalse((local / "o").exists())
+
     def test_source_fixture_cannot_substitute_for_independent_native_client(self):
         output = "\n".join(
             row

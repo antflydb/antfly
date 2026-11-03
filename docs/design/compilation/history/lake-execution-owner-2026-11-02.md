@@ -148,3 +148,10 @@ also calls some shared dense writer helpers, so those helpers may remain there
 even after archive build/rebuild entry points migrate. Moving complete pinned
 queries and complete recent-vector operations are separate next boundaries;
 this work does not claim that every lake-related symbol has left the API.
+
+
+The rollout follow-up advances the private lake endpoint to v3 with a checked,
+creator-issued dynamic allocator-capacity query. It restores optional parallel
+publication work without inspecting foreign allocator vtables or removing hard
+limits. Final coherent runtime modes and real S3-compatible pinned-catalog
+qualification are recorded in [operation-owner rollout qualification](operation-owner-rollout-2026-11-02.md).
