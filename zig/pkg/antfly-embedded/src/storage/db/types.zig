@@ -375,6 +375,10 @@ pub const BatchRequest = struct {
     /// Bounded authenticated upload stages for a large ordered publication.
     /// Only the owner leader proposes these private controls.
     artifact_publication_transport: ?@import("artifact_publication_transport.zig").Request = null,
+    /// Leader-planned LEANN graph record (see storage/leann_replica.zig).
+    /// Only the owner leader proposes it; replicas persist the committed
+    /// bytes and apply them verbatim in log order. Never public JSON.
+    leann_record: ?LeannRecordCommand = null,
     /// Private replicated hidden-owner lifecycle; public JSON cannot set it.
     restore_staging: ?@import("restore_staging_contract.zig").Control = null,
     restore_staging_scope: ?[32]u8 = null,
@@ -1944,6 +1948,8 @@ pub const SearchRequest = struct {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Trusted graph admission workspace; never part of the public wire DSL.
+    graph_work_budget: ?*@import("../../graph/work_budget.zig").WorkBudget = null,
     /// Trusted request-local preparation, never decoded from public input.
     value_search_execution: @import("../../search/value_query.zig").Policy = .{},
     value_search_work: ?*@import("../../search/value_query.zig").Work = null,
@@ -2156,6 +2162,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "graph_work_budget",
     // Conditional delivery runs after child authorization and retrieval.
     "field_projection_json",
     "field_projection_plan",
@@ -5470,6 +5477,51 @@ pub const GraphEndpointCleanupStatus = struct {
         };
     }
 };
+
+pub const LeannRecordCommand = struct {
+    index_name: []const u8,
+    record: []const u8,
+};
+
+/// Leader's planned LEANN records, returned by the `leann_plan` topology
+/// lookup. The caller proposes each proposal's records in order as
+/// `leann_record` commands.
+pub const LeannPlanStatus = struct {
+    proposals: []const Proposal = &.{},
+
+    pub const Proposal = struct {
+        index_name: []const u8,
+        records_base64: []const []const u8,
+    };
+};
+
+/// Upper bound for one record: writes plus an inline generation.
+pub const leann_record_max_bytes: usize = 8 << 20;
+
+/// A LEANN record is a standalone private command: it carries no other
+/// effect, so replicas never apply part of a batch.
+pub fn validateLeannRecordCommand(req: BatchRequest) !void {
+    const command = req.leann_record orelse return;
+    if (command.index_name.len == 0 or command.index_name.len > 1024) return error.InvalidBatchRequest;
+    if (command.record.len == 0 or command.record.len > leann_record_max_bytes) return error.InvalidBatchRequest;
+    const defaults = BatchRequest{};
+    inline for (@typeInfo(BatchRequest).@"struct".field_names, @typeInfo(BatchRequest).@"struct".field_types) |field_name, field_type| {
+        if (comptime !std.mem.eql(u8, field_name, "leann_record") and !std.mem.eql(u8, field_name, "timestamp_ns") and !std.mem.eql(u8, field_name, "sync_level")) {
+            const value = @field(req, field_name);
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
+                if (value.len != 0) return error.InvalidBatchRequest;
+            } else if (!std.meta.eql(value, @field(defaults, field_name))) return error.InvalidBatchRequest;
+        }
+    }
+}
+
+test "leann record command must stand alone" {
+    try validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .sync_level = .write });
+    try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "", .record = "r" } }));
+    try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "" } }));
+    try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .deletes = &.{"doc"} }));
+    try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .activate_range_tracking = true }));
+}
 
 /// Cleanup is a private, effect-bearing command, never a flag that can be
 /// attached to a public mutation or a lifecycle control.

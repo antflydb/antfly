@@ -98,3 +98,14 @@ a separate 64 MiB memory budget; the default transaction intent budget is
 128 MiB. Relational rows are limited to 16 MiB and persisted index keys to
 1 MiB. See [SQL resource limits](src/sql/COMPILER_SUPPORT.md) for accounting
 and native configuration details.
+
+
+## Object-native storage surface
+
+The Zig package exports `object_database` and `object_commit_log` (also through
+`db`). They provide bounded ordered transactions, immutable object-store commits,
+ownership fencing and checkpoint recovery through a supplied `objectstore.Client`.
+The Cloudflare hosted coordinator uses the same implementation. This surface
+shares the authenticated page engine with serverless indexes; it does not emulate
+local `.aflite` files or change local SQL/LSM persistence. See the
+[object-storage design](../../../docs/design/antfly-object-storage-backend.md).

@@ -143,15 +143,21 @@ const DebertaMirrorPreference = struct {
 };
 
 fn debertaMirrorPreference(config: Config, prefer_weight_mirrors: bool) DebertaMirrorPreference {
-    const requested = prefer_weight_mirrors and !platform.env.getenvBool("TERMITE_METAL_DISABLE_DEBERTA_WEIGHT_MIRRORS");
-    const prefer_q8 = requested and platform.env.getenvBool("TERMITE_METAL_DEBERTA_USE_Q8_MIRRORS");
+    const require_f32 = config.metal_require_f32_weight_mirrors;
+    // An exact qualified model policy is not a diagnostic preference: it must
+    // neither inherit a process-wide precision experiment nor silently lose
+    // its reviewed arithmetic to the ordinary mirror byte cap.
+    const requested = require_f32 or
+        (prefer_weight_mirrors and !platform.env.getenvBool("TERMITE_METAL_DISABLE_DEBERTA_WEIGHT_MIRRORS"));
+    const prefer_q8 = requested and !require_f32 and platform.env.getenvBool("TERMITE_METAL_DEBERTA_USE_Q8_MIRRORS");
     const prefer_bf16_requested = requested and !prefer_q8 and
+        !require_f32 and
         platform.env.getenvBool("TERMITE_METAL_DEBERTA_USE_BF16_MIRRORS");
     const prefer_f32_requested = requested and !prefer_q8 and !prefer_bf16_requested and
-        platform.env.getenvBool("TERMITE_METAL_DEBERTA_USE_F32_MIRRORS");
+        (require_f32 or platform.env.getenvBool("TERMITE_METAL_DEBERTA_USE_F32_MIRRORS"));
     const mirror_bytes = debertaDenseMirrorBytes(config, if (prefer_f32_requested) @sizeOf(f32) else @sizeOf(u16)) orelse
         std.math.maxInt(usize);
-    const enabled = requested and mirror_bytes <= metalDebertaWeightMirrorMaxBytes();
+    const enabled = requested and (require_f32 or mirror_bytes <= metalDebertaWeightMirrorMaxBytes());
     return .{
         .enabled = enabled,
         .reservation_bytes = if (enabled) mirror_bytes else 0,
@@ -160,6 +166,23 @@ fn debertaMirrorPreference(config: Config, prefer_weight_mirrors: bool) DebertaM
         .prefer_f32_mps = enabled and !prefer_q8 and !prefer_bf16_requested and prefer_f32_requested,
         .prefer_f16_mps = enabled and !prefer_q8 and !prefer_bf16_requested and !prefer_f32_requested,
     };
+}
+
+test "DeBERTa PII specialty requires F32 mirrors independent of ordinary preference" {
+    const config = Config{ .metal_require_f32_weight_mirrors = true };
+    const mirrors = debertaMirrorPreference(config, false);
+    try std.testing.expect(mirrors.enabled);
+    try std.testing.expect(mirrors.prefer_f32_mps);
+    try std.testing.expect(!mirrors.prefer_f16_mps);
+    try std.testing.expect(!mirrors.prefer_bf16);
+    try std.testing.expect(!mirrors.prefer_q8);
+    try std.testing.expectEqual(debertaDenseMirrorBytes(config, @sizeOf(f32)).?, mirrors.reservation_bytes);
+
+    const reservation = metalFastPathReservationBytes(config, false);
+    const relative = relativeCacheReservationBytes(config, uniqueRelativePositionProjectionEnabled()).?;
+    const packed_bytes = densePackReservationBytes(config, @sizeOf(f32)).?;
+    const prepared_slot_bytes = preparedSlotReservationBytes(config).?;
+    try std.testing.expectEqual(relative + mirrors.reservation_bytes + packed_bytes + prepared_slot_bytes, reservation.persistent_bytes);
 }
 
 pub fn densePackReservationBytes(config: Config, bytes_per_element: usize) ?usize {
@@ -176,6 +199,20 @@ pub fn densePackReservationBytes(config: Config, bytes_per_element: usize) ?usiz
     const packed_biases = std.math.mul(usize, hidden, 5 * @sizeOf(f32)) catch return null;
     const bytes_per_layer = std.math.add(usize, packed_weights, packed_biases) catch return null;
     return std.math.mul(usize, bytes_per_layer, layers) catch null;
+}
+
+/// Prepared encoder slots retain their own F32 bias and LayerNorm buffers in
+/// addition to the checkpoint tensors. There are six linear biases per layer
+/// (Q/K/V/O, intermediate, output) and two LayerNorm weight/bias pairs.
+pub fn preparedSlotReservationBytes(config: Config) ?usize {
+    const layers: usize = @intCast(config.num_hidden_layers);
+    const hidden: usize = @intCast(config.hidden_size);
+    const intermediate: usize = @intCast(config.intermediate_size);
+    const linear_bias_elements = std.math.add(usize, std.math.mul(usize, hidden, 5) catch return null, intermediate) catch return null;
+    const norm_elements = std.math.mul(usize, hidden, 4) catch return null;
+    const elements_per_layer = std.math.add(usize, linear_bias_elements, norm_elements) catch return null;
+    const total_elements = std.math.mul(usize, elements_per_layer, layers) catch return null;
+    return std.math.mul(usize, total_elements, @sizeOf(f32)) catch null;
 }
 
 /// Persistent f32 device buffers retained by the relative-position path:
@@ -226,7 +263,8 @@ pub fn metalFastPathReservationBytes(config: Config, prefer_weight_mirrors: bool
         config,
         uniqueRelativePositionProjectionEnabled(),
     ) orelse std.math.maxInt(usize);
-    var persistent_bytes = relative_cache_bytes;
+    const prepared_slot_bytes = preparedSlotReservationBytes(config) orelse std.math.maxInt(usize);
+    var persistent_bytes = std.math.add(usize, relative_cache_bytes, prepared_slot_bytes) catch std.math.maxInt(usize);
     if (mirrors.enabled) {
         const pack_bytes = if (mirrors.prefer_f16_mps)
             densePackReservationBytes(config, @sizeOf(u16)) orelse std.math.maxInt(usize)
@@ -253,6 +291,18 @@ test "DeBERTa dense pack reservation covers QKV and relative QK caches" {
         @as(?usize, 2 * expected_per_layer),
         densePackReservationBytes(config, @sizeOf(u16)),
     );
+}
+
+test "DeBERTa specialty reservation covers prepared linear biases and LayerNorm slots" {
+    const config = Config{
+        .hidden_size = 768,
+        .num_hidden_layers = 12,
+        .intermediate_size = 3072,
+    };
+    try std.testing.expectEqual(@as(?usize, 479_232), preparedSlotReservationBytes(config));
+    const relative = relativeCacheReservationBytes(config, uniqueRelativePositionProjectionEnabled()).?;
+    const reservation = metalFastPathReservationBytes(config, false);
+    try std.testing.expectEqual(relative + 479_232, reservation.persistent_bytes);
 }
 
 test "DeBERTa relative cache reservation covers compact and expanded layouts" {
@@ -330,6 +380,10 @@ pub fn preplanMetalDebertaEncoderFrame(
     defer allocator.free(layers);
 
     for (0..layer_count) |layer| {
+        // Cold mirror construction can upload hundreds of MiB. Observe a
+        // disconnected or expired request between layers rather than making it
+        // wait for the entire model to be prepared.
+        try cb.checkExecutionControl();
         var q_w_buf: [256]u8 = undefined;
         var q_b_buf: [256]u8 = undefined;
         const q_w = try getLayerWeight(cb, layer, "attention.self.query_proj.weight", &q_w_buf);
@@ -410,7 +464,14 @@ pub fn preplanMetalDebertaEncoderFrame(
             .{ .slot = ffn_i_slot, .weight = ffn_i_w, .bias = ffn_i_b, .in_dim = H, .out_dim = I },
             .{ .slot = ffn_o_slot, .weight = ffn_o_w, .bias = ffn_o_b, .in_dim = I, .out_dim = H },
         };
+        // Weight lookup may fault checkpoint pages. Re-check before the device
+        // upload batch so cancellation cannot race that potentially long host
+        // work and then commit a full layer unnecessarily. Any already-built
+        // slots remain model-owned, covered by the model's full resident
+        // reservation, reusable by a retry, and released with the runtime.
+        try cb.checkExecutionControl();
         for (prep_specs) |spec| {
+            try cb.checkExecutionControl();
             if (!(try cb.decoderRuntimePrepareLinear(&.{
                 .slot = spec.slot,
                 .weight = spec.weight,
@@ -429,9 +490,12 @@ pub fn preplanMetalDebertaEncoderFrame(
                 .prefer_bf16_fallback = mirrors.prefer_bf16,
                 .prefer_f16_mps_fallback = mirrors.prefer_f16_mps,
                 .prefer_f32_mps_fallback = mirrors.prefer_f32_mps,
+                .require_preferred_dense_precision = config.metal_require_f32_weight_mirrors,
             }))) return false;
         }
+        try cb.checkExecutionControl();
         if (!(try cb.decoderRuntimePrepareLayerNorm(&.{ .slot = attn_ln_slot, .weight = attn_ln_w, .bias = attn_ln_b, .hidden_size = H }))) return false;
+        try cb.checkExecutionControl();
         if (!(try cb.decoderRuntimePrepareLayerNorm(&.{ .slot = ffn_ln_slot, .weight = ffn_ln_w, .bias = ffn_ln_b, .hidden_size = H }))) return false;
 
         layers[layer] = .{
@@ -524,6 +588,8 @@ pub fn forwardCtProfiled(
     const total = batch * seq_len;
 
     const resident_slots = try preplanMetalDebertaEncoderFrame(cb, allocator, config, batch, seq_len, prefer_weight_mirrors);
+    if (cb.kind() == .metal and config.metal_require_f32_weight_mirrors and !resident_slots)
+        return error.RequiredDebertaF32MirrorsUnavailable;
 
     var encoder_frame_active = false;
     if (cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {

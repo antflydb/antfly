@@ -41,6 +41,28 @@ fn readHttpStatusError(status: u16, capability_stale: bool) anyerror {
         error.ReadRequestFailed;
 }
 
+fn readAntflyHttpError(alloc: Allocator, status: u16, capability_stale: bool, body: []const u8) anyerror {
+    if (status == 400) {
+        if (document_failure.recognized(alloc, body)) |failure| {
+            if (failure.cause) |cause|
+                if (cause == error.ReadOutputTruncated) return error.ReadOutputTruncated;
+        }
+    }
+    return readHttpStatusError(status, capability_stale);
+}
+
+test "reader preserves native OCR truncation across HTTP without accepting arbitrary errors" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "{\"error\":\"OUTPUT_TRUNCATED\"}", "{\"error\":\"ReadOutputTruncated\"}" }) |body| {
+        try std.testing.expectEqual(error.ReadOutputTruncated, readAntflyHttpError(a, 400, false, body));
+        try std.testing.expectEqual(error.ReadTransientFailure, readAntflyHttpError(a, 503, false, body));
+    }
+    for ([_][]const u8{ "invalid", "{}", "{\"error\":\"private error\"}", "{\"error\":\"OUTPUT_TRUNCATED\",\"error\":\"Timeout\"}" }) |body|
+        try std.testing.expectEqual(error.ReadRequestFailed, readAntflyHttpError(a, 400, false, body));
+    try std.testing.expectEqual(error.ReadRequestFailed, readAntflyHttpError(a, 400, false, &@as([4097]u8, @splat(' '))));
+    try std.testing.expectEqual(error.InferenceCapabilitiesStale, readAntflyHttpError(a, 409, true, "{}"));
+}
+
 test "reader classifies retryable HTTP statuses" {
     try std.testing.expect(readHttpStatusError(429, false) == error.ReadTransientFailure);
     try std.testing.expect(readHttpStatusError(503, false) == error.ReadTransientFailure);
@@ -656,7 +678,7 @@ const AntflyReaderState = struct {
             }
             var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms", .cancellation = self.cancellation, .max_response_size = req.max_response_bytes });
             defer response.deinit();
-            if (!response.ok()) return readHttpStatusError(response.status.code, responseCapabilityStale(response));
+            if (!response.ok()) return readAntflyHttpError(alloc, response.status.code, responseCapabilityStale(response), response.body orelse "");
             return documentBatchResult(alloc, response.body orelse return error.InvalidReadResultCount);
         }
         const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
@@ -701,7 +723,7 @@ const AntflyReaderState = struct {
             .cancellation = self.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
+        if (!resp.ok()) return readAntflyHttpError(alloc, resp.status.code, responseCapabilityStale(resp), resp.body orelse "");
 
         return decodeReadBatch(alloc, resp.body orelse return error.EmptyResponse, req.images.len);
     }
@@ -766,7 +788,7 @@ const AntflyReaderState = struct {
             .cancellation = self.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
+        if (!resp.ok()) return readAntflyHttpError(alloc, resp.status.code, responseCapabilityStale(resp), resp.body orelse "");
 
         var batch = try decodeReadBatch(alloc, resp.body orelse return error.EmptyResponse, req.images.len);
         errdefer batch.deinit(alloc);

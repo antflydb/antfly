@@ -1,5 +1,7 @@
 # GLiNER2.5 Decide artifact contract
 
+For the separate PII and GLiGuard extraction profiles, see [SPECIALTY.md](SPECIALTY.md).
+
 Antfly's decision runtime targets the published legacy span checkpoint
 `fastino/GLiNER2.5-Decide`, Hugging Face revision
 `7ee5da4c2415e32259bcdc0b1a7367c32ce8d6f6`.

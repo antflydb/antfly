@@ -7,9 +7,11 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.create_embeddings_index_request_type import CreateEmbeddingsIndexRequestType
+from ..models.dense_index_algorithm import DenseIndexAlgorithm
 from ..models.derived_coverage_policy import DerivedCoveragePolicy
 from ..models.distance_metric import DistanceMetric
 from ..models.index_publication_policy import IndexPublicationPolicy
+from ..models.quantization_refine import QuantizationRefine
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -22,6 +24,7 @@ if TYPE_CHECKING:
     from ..models.enrichment_config import EnrichmentConfig
     from ..models.google_embedder_config import GoogleEmbedderConfig
     from ..models.index_execution_config import IndexExecutionConfig
+    from ..models.leann_index_config import LeannIndexConfig
     from ..models.ollama_embedder_config import OllamaEmbedderConfig
     from ..models.open_ai_embedder_config import OpenAIEmbedderConfig
     from ..models.open_router_embedder_config import OpenRouterEmbedderConfig
@@ -69,7 +72,27 @@ class CreateEmbeddingsIndexRequest:
         distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
             models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
             product similarity. Use "l2_squared" for models trained with Euclidean distance. The default is "l2_squared".
+        algorithm (DenseIndexAlgorithm | Unset): Dense vector index algorithm (dense only). "hbc" (default) keeps
+            quantized codes plus full-precision rerank data. "leann" keeps only a pruned proximity graph and compact RaBitQ
+            codes and recomputes exact distances for a few candidates per query, re-embedding them (see
+            leann.vector_storage) or reading their stored embedding, trading query-time work for index size. LEANN indexes
+            do not yet support shard splits or native index backups.
+        leann (LeannIndexConfig | Unset): Tuning for algorithm=leann dense indexes. All fields are optional.
         mem_only (bool | Unset): Whether to use in-memory only storage (dense only)
+        quantization_bits (int | Unset): RaBitQ bits per dimension for dense indexes (dense only). Fixed when the index
+            is created.
+            HBC (default 1): larger values also store extended RaBitQ codes and use them to rescore
+            candidates, which improves recall and reduces exact reranking at the cost of index size
+            (about dims * bits / 8 extra bytes per vector). Values above 1 enable a random rotation
+            of vectors.
+            LEANN (default 4 with the rabitq quantizer; pq allows only 1): more bits tighten the
+            error bounds, so fewer candidates get exact distances (about 15x fewer at 4 bits than 1
+            on NYTimes-256), and codes take bits / 8 bytes per dimension.
+        quantization_refine (QuantizationRefine | Unset): How an HBC dense index with quantization_bits above 1 uses its
+            extended codes (not
+            allowed with algorithm=leann).
+            near_cutoff scores with 1-bit codes and rescores only candidates that could still
+            enter the result candidates; all rescores every scanned vector.
         embedder (AntflyEmbedderConfig | BedrockEmbedderConfig | CloudflareEmbedderConfig | CohereEmbedderConfig |
             GoogleEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig | OpenRouterEmbedderConfig | Unset |
             VertexEmbedderConfig): Embedding provider configuration accepted when Antfly creates and
@@ -100,7 +123,11 @@ class CreateEmbeddingsIndexRequest:
     source_artifact_name: str | Unset = UNSET
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
+    algorithm: DenseIndexAlgorithm | Unset = UNSET
+    leann: LeannIndexConfig | Unset = UNSET
     mem_only: bool | Unset = UNSET
+    quantization_bits: int | Unset = UNSET
+    quantization_refine: QuantizationRefine | Unset = UNSET
     embedder: (
         AntflyEmbedderConfig
         | BedrockEmbedderConfig
@@ -176,7 +203,21 @@ class CreateEmbeddingsIndexRequest:
         if not isinstance(self.distance_metric, Unset):
             distance_metric = self.distance_metric.value
 
+        algorithm: str | Unset = UNSET
+        if not isinstance(self.algorithm, Unset):
+            algorithm = self.algorithm.value
+
+        leann: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.leann, Unset):
+            leann = self.leann.to_dict()
+
         mem_only = self.mem_only
+
+        quantization_bits = self.quantization_bits
+
+        quantization_refine: str | Unset = UNSET
+        if not isinstance(self.quantization_refine, Unset):
+            quantization_refine = self.quantization_refine.value
 
         embedder: dict[str, Any] | Unset
         if isinstance(self.embedder, Unset):
@@ -249,8 +290,16 @@ class CreateEmbeddingsIndexRequest:
             field_dict["template"] = template
         if distance_metric is not UNSET:
             field_dict["distance_metric"] = distance_metric
+        if algorithm is not UNSET:
+            field_dict["algorithm"] = algorithm
+        if leann is not UNSET:
+            field_dict["leann"] = leann
         if mem_only is not UNSET:
             field_dict["mem_only"] = mem_only
+        if quantization_bits is not UNSET:
+            field_dict["quantization_bits"] = quantization_bits
+        if quantization_refine is not UNSET:
+            field_dict["quantization_refine"] = quantization_refine
         if embedder is not UNSET:
             field_dict["embedder"] = embedder
         if chunker is not UNSET:
@@ -277,6 +326,7 @@ class CreateEmbeddingsIndexRequest:
         from ..models.enrichment_config import EnrichmentConfig
         from ..models.google_embedder_config import GoogleEmbedderConfig
         from ..models.index_execution_config import IndexExecutionConfig
+        from ..models.leann_index_config import LeannIndexConfig
         from ..models.ollama_embedder_config import OllamaEmbedderConfig
         from ..models.open_ai_embedder_config import OpenAIEmbedderConfig
         from ..models.open_router_embedder_config import OpenRouterEmbedderConfig
@@ -342,7 +392,30 @@ class CreateEmbeddingsIndexRequest:
         else:
             distance_metric = DistanceMetric(_distance_metric)
 
+        _algorithm = d.pop("algorithm", UNSET)
+        algorithm: DenseIndexAlgorithm | Unset
+        if isinstance(_algorithm, Unset):
+            algorithm = UNSET
+        else:
+            algorithm = DenseIndexAlgorithm(_algorithm)
+
+        _leann = d.pop("leann", UNSET)
+        leann: LeannIndexConfig | Unset
+        if isinstance(_leann, Unset):
+            leann = UNSET
+        else:
+            leann = LeannIndexConfig.from_dict(_leann)
+
         mem_only = d.pop("mem_only", UNSET)
+
+        quantization_bits = d.pop("quantization_bits", UNSET)
+
+        _quantization_refine = d.pop("quantization_refine", UNSET)
+        quantization_refine: QuantizationRefine | Unset
+        if isinstance(_quantization_refine, Unset):
+            quantization_refine = UNSET
+        else:
+            quantization_refine = QuantizationRefine(_quantization_refine)
 
         def _parse_embedder(
             data: object,
@@ -468,7 +541,11 @@ class CreateEmbeddingsIndexRequest:
             source_artifact_name=source_artifact_name,
             template=template,
             distance_metric=distance_metric,
+            algorithm=algorithm,
+            leann=leann,
             mem_only=mem_only,
+            quantization_bits=quantization_bits,
+            quantization_refine=quantization_refine,
             embedder=embedder,
             chunker=chunker,
             top_k=top_k,

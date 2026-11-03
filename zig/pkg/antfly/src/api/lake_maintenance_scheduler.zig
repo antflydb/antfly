@@ -111,7 +111,7 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
     // Work has a shorter monotonic deadline than the ownership lease. Allow
     // clock skew using the same grace contract as reader leases.
     state.lease_until_ms = now +| 120000;
-    var claimed = client.putObject(opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, state, .{}), .{ .if_none_match = saved == null, .if_match_etag = if (saved) |value| value.metadata.etag orelse return error.MissingObjectEtag else null, .cancellation = catalog.types.contextCancellation(&parent) }) catch |err| switch (err) {
+    var claimed = client.compareAndPut(opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, state, .{}), if (saved) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = catalog.types.contextCancellation(&parent) }) catch |err| switch (err) {
         error.PreconditionFailed, error.ConditionalCheckFailed => return false,
         else => return err,
     };
@@ -140,7 +140,7 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
         }
     }
     state.lease_until_ms = 0;
-    var completed = try client.putObject(opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, state, .{}), .{ .if_match_etag = claimed.etag orelse return error.MissingObjectEtag, .cancellation = catalog.types.contextCancellation(&parent) });
+    var completed = try client.compareAndPut(opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, state, .{}), claimed.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = catalog.types.contextCancellation(&parent) });
     completed.deinit(client.allocator);
     return mutated;
 }

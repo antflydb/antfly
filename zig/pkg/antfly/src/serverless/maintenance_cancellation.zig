@@ -37,6 +37,14 @@ pub const Token = struct {
         }
     }
 
+    /// Transport watchdogs run in separately canceled tasks. Poll only shared
+    /// sources here: never run a lease renewal or inspect that task's Io state.
+    pub fn isRequested(self: Token) bool {
+        if (self.requested) |requested| if (requested.load(.acquire)) return true;
+        if (self.cooperative.ptr) |ptr| if (self.cooperative.is_cancelled_fn) |probe| return probe(ptr);
+        return false;
+    }
+
     pub fn withCheckpoint(
         self: Token,
         ptr: *anyopaque,
@@ -60,6 +68,7 @@ pub const GraphBridge = struct {
     maintenance: ?Token,
     mutex: std.Io.Mutex = .init,
     failure: ?anyerror = null,
+    failed: std.atomic.Value(bool) = .init(false),
 
     pub fn token(self: *GraphBridge) CancellationToken {
         if (self.maintenance == null) return .none;
@@ -67,8 +76,8 @@ pub const GraphBridge = struct {
     }
 
     fn isCancelled(ptr: *const anyopaque) bool {
-        checkpoint(ptr) catch return true;
-        return false;
+        const self: *const GraphBridge = @ptrCast(@alignCast(ptr));
+        return self.failed.load(.acquire) or self.maintenance.?.isRequested();
     }
 
     fn checkpoint(ptr: *const anyopaque) !void {
@@ -79,6 +88,7 @@ pub const GraphBridge = struct {
         if (self.failure) |err| return err;
         maintenance.check() catch |err| {
             self.failure = err;
+            self.failed.store(true, .release);
             return err;
         };
     }
@@ -125,4 +135,48 @@ test "serverless graph maintenance bridge serializes renewal and preserves lease
     try std.testing.expect(transport_token.is_cancelled_fn.?(transport_token.ptr.?));
     state.lost = false;
     try std.testing.expectError(error.WorkLeaseLost, bridge.token().check());
+}
+
+test "serverless graph transport polling cannot poison a request when its watchdog is canceled" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Poll = struct {
+        ready: std.atomic.Value(bool) = .init(false),
+        bridge: *GraphBridge,
+        fn run(self: *@This(), task_io: std.Io) bool {
+            self.ready.store(true, .release);
+            task_io.sleep(.fromSeconds(60), .awake) catch {};
+            // HTTP cancellation joins a stopped watchdog. A probe in that
+            // canceled task must not cache its task-local cancellation as a
+            // terminal error belonging to the still-live parent request.
+            return self.bridge.token().is_cancelled_fn.?(self.bridge);
+        }
+    };
+    var requested = std.atomic.Value(bool).init(false);
+    var bridge = GraphBridge{ .maintenance = .{ .io = io, .requested = &requested } };
+    var poll = Poll{ .bridge = &bridge };
+    var future = try io.concurrent(Poll.run, .{ &poll, io });
+    while (!poll.ready.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expect(!future.cancel(io));
+    try bridge.token().check();
+    requested.store(true, .release);
+    try std.testing.expect(bridge.token().is_cancelled_fn.?(&bridge));
+}
+
+test "serverless multiprovider transport cancellation probes never run renewal I/O" {
+    const State = struct {
+        checks: usize = 0,
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            return error.WorkLeaseLost;
+        }
+    };
+    var state = State{};
+    var bridge = GraphBridge{ .maintenance = (Token{ .io = std.testing.io }).withCheckpoint(&state, State.checkpoint) };
+    try std.testing.expect(!bridge.token().is_cancelled_fn.?(&bridge));
+    try std.testing.expectEqual(@as(usize, 0), state.checks);
+    try std.testing.expectError(error.WorkLeaseLost, bridge.token().check());
+    try std.testing.expect(bridge.token().is_cancelled_fn.?(&bridge));
 }

@@ -174,6 +174,14 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
     );
     var wal = wal_impl.walStore();
     defer wal.deinit();
+    // Layout selection is independently reconciled. Lose the WAL commit's
+    // acknowledgement, rather than consuming this fault on the format marker.
+    var wal_fault_target: u8 = 0;
+    faults.put_filter = .{ .ptr = &wal_fault_target, .matches = struct {
+        fn matches(_: *anyopaque, _: []const u8, key: []const u8, _: []const u8) bool {
+            return std.mem.endsWith(u8, key, "/wal.log");
+        }
+    }.matches };
     faults.commitNextPutThenFail(error.Timeout);
     try std.testing.expectError(error.Timeout, wal.appendIdempotent("docs", 20, "mutation", "request-1"));
     try std.testing.expectEqual(@as(u64, 1), try wal.appendIdempotent("docs", 20, "mutation", "request-1"));

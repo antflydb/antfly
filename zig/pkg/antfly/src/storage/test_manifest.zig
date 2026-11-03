@@ -220,6 +220,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_derived_index_generation_manifest;
     _ = @import("antfly_local_sources").storage_db_derived_index_repair_state;
     _ = @import("antfly_local_sources").storage_db_derived_io_threaded_runtime;
+    _ = @import("antfly_local_sources").storage_db_derived_replay_budget;
     _ = @import("antfly_local_sources").storage_db_derived_replay_source;
     _ = @import("antfly_local_sources").storage_db_derived_replay_stream;
     _ = @import("antfly_local_sources").storage_db_derived_runtime_types;
@@ -377,6 +378,9 @@ comptime {
     _ = @import("hot_standby/write_gate.zig");
     _ = @import("hot_standby/seed_materialization.zig");
     _ = @import("antfly_local_sources").storage_hbc_adapter;
+    _ = @import("antfly_local_sources").storage_leann_store;
+    _ = @import("antfly_local_sources").storage_leann_replica;
+    _ = @import("antfly_local_sources").storage_leann_replicated;
     _ = @import("antfly_local_sources").storage_hierarchy_navigation;
     _ = @import("antfly_local_sources").storage_internal_keys;
     _ = @import("kernel_owner_client.zig");
@@ -399,6 +403,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_paths;
     _ = @import("antfly_local_sources").storage_lite_read_workspace;
     _ = @import("antfly_local_sources").storage_lite_reader_epochs;
+    _ = @import("antfly_local_sources").storage_lite_reader_coordinator;
     _ = @import("antfly_local_sources").storage_lite_result_scratch;
     _ = @import("antfly_local_sources").storage_lite_reclamation;
     _ = @import("antfly_local_sources").storage_lite_restore_staging;

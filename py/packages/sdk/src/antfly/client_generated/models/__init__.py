@@ -314,6 +314,7 @@ from .decision_table_source_filter_query import DecisionTableSourceFilterQuery
 from .decision_table_source_mime_type import DecisionTableSourceMimeType
 from .decision_usage import DecisionUsage
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
+from .dense_index_algorithm import DenseIndexAlgorithm
 from .dense_native_storage_phase import DenseNativeStoragePhase
 from .dense_repair_backpressure_error import DenseRepairBackpressureError
 from .dense_repair_backpressure_error_code import DenseRepairBackpressureErrorCode
@@ -1213,6 +1214,9 @@ from .lake_catalog_create_request_write_order import LakeCatalogCreateRequestWri
 from .lake_catalog_response import LakeCatalogResponse
 from .lake_catalog_response_metadata import LakeCatalogResponseMetadata
 from .lake_catalog_response_state import LakeCatalogResponseState
+from .leann_index_config import LeannIndexConfig
+from .leann_index_config_quantizer import LeannIndexConfigQuantizer
+from .leann_index_config_vector_storage import LeannIndexConfigVectorStorage
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
@@ -2022,6 +2026,7 @@ from .provenance_origin_trace_type_0_kind import ProvenanceOriginTraceType0Kind
 from .prune_stats import PruneStats
 from .pruner import Pruner
 from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
+from .quantization_refine import QuantizationRefine
 from .query_admission_config import QueryAdmissionConfig
 from .query_builder_request import QueryBuilderRequest
 from .query_builder_request_constraints import QueryBuilderRequestConstraints
@@ -2844,6 +2849,7 @@ __all__ = (
     "DecisionTableSourceMimeType",
     "DecisionUsage",
     "DeleteArtifactEnrichmentResponse201",
+    "DenseIndexAlgorithm",
     "DenseNativeStoragePhase",
     "DenseRepairBackpressureError",
     "DenseRepairBackpressureErrorCode",
@@ -3735,6 +3741,9 @@ __all__ = (
     "LakeCatalogResponse",
     "LakeCatalogResponseMetadata",
     "LakeCatalogResponseState",
+    "LeannIndexConfig",
+    "LeannIndexConfigQuantizer",
+    "LeannIndexConfigVectorStorage",
     "LegacyGraphDocumentQuery",
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
@@ -4328,6 +4337,7 @@ __all__ = (
     "Pruner",
     "PruneStats",
     "PutArtifactEnrichmentResponse201",
+    "QuantizationRefine",
     "QueryAdmissionConfig",
     "QueryBuilderRequest",
     "QueryBuilderRequestConstraints",

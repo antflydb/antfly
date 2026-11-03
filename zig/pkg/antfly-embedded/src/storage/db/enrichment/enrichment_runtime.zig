@@ -1756,6 +1756,71 @@ pub fn embedDenseBatchTracked(
     return vectors;
 }
 
+/// Re-embeds documents for a LEANN index that stores only elided stubs
+/// (`vector_storage: transient`). Each request's input is rendered exactly
+/// as the dense producer renders it: a template whose embedder accepts
+/// content parts (text plus media) is embedded from its parts one document
+/// at a time, and plain source text is embedded in one batch call. Both run
+/// on the request path (no background retry). Fills `out[i * dims ..]` and
+/// sets `found[i]`; documents that are gone or have no source stay not
+/// found.
+pub fn reembedDenseDocuments(
+    runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    requests: []const enrichment_types.GeneratedEnrichmentRequest,
+    dims: u32,
+    out: []f32,
+    found: []bool,
+) !void {
+    if (requests.len == 0) return;
+    if (out.len != requests.len * @as(usize, dims) or found.len != requests.len) return error.InvalidArgument;
+    const dense_embedder = runtime.config.dense_embedder orelse return error.ReembedUnavailable;
+    const index_names = [_][]const u8{requests[0].index_name};
+    var texts: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (texts.items) |text| runtime.alloc.free(@constCast(text));
+        texts.deinit(alloc);
+    }
+    var slots: std.ArrayList(usize) = .empty;
+    defer slots.deinit(alloc);
+    for (requests, 0..) |request, i| {
+        const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+        defer runtime.alloc.free(doc_store_key);
+        // Page-image inputs embed rendered pages, not the document source;
+        // such indexes must keep their vectors.
+        if (request.embedding_input == .pdf_page_images) return error.ReembedUnsupportedInput;
+        const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse continue;
+        defer runtime.alloc.free(raw);
+        if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
+            // Same branch as the producer: a template may render media
+            // parts, which the text path would drop.
+            const name = requestEmbeddingName(request);
+            const parts = (try renderSourceParts(runtime.alloc, runtime.config, raw, request, dense_embedder.mediaPartLimit(name))) orelse continue;
+            defer template.freeContentParts(runtime.alloc, parts);
+            const vector = try embedDensePartsTracked(runtime, &index_names, alloc, dense_embedder, name, parts, dims);
+            defer alloc.free(vector);
+            if (vector.len != dims) return error.InvalidVectorDimensions;
+            @memcpy(out[i * dims ..][0..dims], vector);
+            found[i] = true;
+            continue;
+        }
+        const text = (try extractSourceText(runtime.alloc, runtime.config, raw, request)) orelse continue;
+        texts.append(alloc, text) catch |err| {
+            runtime.alloc.free(@constCast(text));
+            return err;
+        };
+        try slots.append(alloc, i);
+    }
+    if (texts.items.len == 0) return;
+    const vectors = try embedDenseBatchTracked(runtime, &index_names, alloc, dense_embedder, requestEmbeddingName(requests[0]), texts.items, dims);
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+    for (slots.items, vectors) |slot, vector| {
+        if (vector.len != dims) return error.InvalidVectorDimensions;
+        @memcpy(out[slot * dims ..][0..dims], vector);
+        found[slot] = true;
+    }
+}
+
 pub fn embedDensePartsTracked(
     runtime: *EnrichmentRuntime,
     index_names: []const []const u8,
@@ -2250,6 +2315,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.EmbedRequestFailed,
         error.InferenceEndpointAccessDenied,
         error.ReadRequestFailed,
+        error.ReadOutputTruncated,
         error.ExtractionInvalidRequest,
         error.ExtractionUnauthorized,
         error.ExtractionForbidden,
@@ -2659,9 +2725,29 @@ const FailureScope = struct {
     /// The first retryable error deferred in this scope and its identity.
     retry_error: ?anyerror = null,
     retry_fingerprint: u64 = 0,
+    /// Publication errors belong to the pipeline, even when their error tag
+    /// matches a provider error deferred earlier in this quantum.
+    publication_failed: bool = false,
+
+    fn publicationFailure(self: *FailureScope, err: anyerror) anyerror {
+        self.publication_failed = true;
+        return err;
+    }
+
+    fn publish(self: *FailureScope, runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, complete: bool) !void {
+        flushGeneratedReplayWindowWithIdentity(runtime, window, if (complete) self.completedFingerprint() else 0) catch |err|
+            return self.publicationFailure(err);
+    }
+
+    /// Only synchronous scanner callers may clear the scanner-owned identity.
+    fn scannerFailure(self: *const FailureScope, runtime: *EnrichmentRuntime, err: anyerror) anyerror {
+        if (self.publication_failed) setActiveFailureFingerprint(runtime, 0);
+        return err;
+    }
 
     fn enter(self: *FailureScope, fingerprint: u64) void {
         self.fingerprint = fingerprint;
+        self.publication_failed = false;
     }
 
     fn shouldYield(self: *const FailureScope, runtime: *EnrichmentRuntime, err: anyerror) bool {
@@ -2683,7 +2769,7 @@ const FailureScope = struct {
     /// this scope (publishing its independent siblings is pipeline progress,
     /// not proof that it succeeded).
     fn completedFingerprint(self: *const FailureScope) u64 {
-        if (self.retry_error != null and self.retry_fingerprint == self.fingerprint) return 0;
+        if (self.publication_failed or (self.retry_error != null and self.retry_fingerprint == self.fingerprint)) return 0;
         return self.fingerprint;
     }
 };
@@ -11317,12 +11403,18 @@ test "shared PDF enrollment skips completed metadata and byte fingerprints befor
         try std.testing.expect(completed.prepared and completed.completed and !completed.enabled);
         try std.testing.expectEqual(calls_before, harness.capability_calls);
 
-        // A failure manifest must still retry even with matching source state.
-        try storePutPrivateBatchWithRetry(&runtime, &runtime.store, &.{.{ .key = manifest_key, .value = "{\"generation\":1,\"last_error\":\"failed\"}" }}, &.{});
-        var failed = SharedPdfWindowScheduler.Consumer{};
-        defer if (failed.owned_config) failed.config.deinit(alloc);
-        try std.testing.expectError(error.InferenceCapabilitiesUnavailable, scheduler.prepareConsumer(&failed, request, "{\"url\":\"https://example.test/source.pdf\"}"));
-        try std.testing.expectEqual(calls_before + 1, harness.capability_calls);
+        // Neither top-level failure nor partial failed OCR coverage is a
+        // completed extraction, even with identical source fingerprints.
+        for ([_][]const u8{
+            "{\"generation\":1,\"last_error\":\"failed\"}",
+            "{\"generation\":1,\"chunk_count\":3,\"ocr_failed_count\":1,\"ocr_failure_details\":[{\"retryable\":true}]}",
+        }, 0..) |failure_manifest, attempt| {
+            try storePutPrivateBatchWithRetry(&runtime, &runtime.store, &.{.{ .key = manifest_key, .value = failure_manifest }}, &.{});
+            var failed = SharedPdfWindowScheduler.Consumer{};
+            defer if (failed.owned_config) failed.config.deinit(alloc);
+            try std.testing.expectError(error.InferenceCapabilitiesUnavailable, scheduler.prepareConsumer(&failed, request, "{\"url\":\"https://example.test/source.pdf\"}"));
+            try std.testing.expectEqual(calls_before + attempt + 1, harness.capability_calls);
+        }
     }
 }
 
@@ -13790,12 +13882,13 @@ const AssetExecutionLane = struct {
         var deferred_retry_error: ?anyerror = null;
         if (self.requests.len > 0) {
             processDeferredAssets(self.runtime, self.requests, &self.window, &self.scope) catch |err| {
+                if (self.scope.publication_failed) return err;
                 if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                     return err;
                 deferred_retry_error = err;
             };
         }
-        try flushGeneratedReplayWindowWithIdentity(self.runtime, &self.window, self.scope.completedFingerprint());
+        try self.scope.publish(self.runtime, &self.window, true);
         if (deferred_retry_error) |err| {
             // The source cursor remains unchanged until this lane's next
             // durable publish, so the failed request is retried and this
@@ -13959,6 +14052,7 @@ const LaneOutcome = struct {
 
     fn of(scope: *const FailureScope, result: anyerror!void) LaneOutcome {
         const retry_fingerprint: u64 = if (result) |_| 0 else |err| blk: {
+            if (scope.publication_failed) break :blk 0;
             const deferred = scope.retry_error orelse break :blk 0;
             break :blk if (deferred == err) scope.retry_fingerprint else 0;
         };
@@ -13973,7 +14067,10 @@ const LaneOutcome = struct {
 /// scanner or the sibling lane last touched. Applied only to the outcome
 /// whose error is actually returned to the supervisor.
 fn adoptLaneRetryIdentity(runtime: *EnrichmentRuntime, outcome: LaneOutcome) void {
-    if (outcome.retry_fingerprint != 0) restoreDeferredRequestRetryAuthorization(runtime, outcome.retry_fingerprint);
+    if (outcome.retry_fingerprint != 0)
+        restoreDeferredRequestRetryAuthorization(runtime, outcome.retry_fingerprint)
+    else
+        setActiveFailureFingerprint(runtime, 0);
 }
 
 /// The one outcome of a pair the supervisor will see, with the historical
@@ -14414,13 +14511,23 @@ fn processAsset(
     }
 
     if (producer_cfg.type == .document_extraction) {
-        try processDocumentExtractionAsset(runtime, request, raw, source_text, producer_cfg.config_json, key, prepared_sources, window);
+        try processDocumentExtractionAsset(runtime, request, raw, source_text, producer_cfg.config_json, key, prepared_sources, window, scope);
         // Failed/empty extraction owns its explicit outcome below. A converged
         // manifest is the final receipt after all unit/chunk publication.
         const manifest = try storeGetOptionalAllocWithRetry(runtime, key);
         defer if (manifest) |value| runtime.alloc.free(value);
         if (manifest) |value| {
-            if (!try documentExtractionManifestHasLastError(runtime.alloc, value) and
+            const coverage = try @import("document_extraction_completion.zig").inspect(runtime.alloc, value);
+            if (coverage.failed and !try documentExtractionEmptyCoverageIsTerminalFailure(runtime.alloc, value)) {
+                // Partial embedded text must not acknowledge failed OCR pages.
+                // Publication is durable already; use the existing per-request
+                // retry budget/backoff and repair ledger for remaining work.
+                if (coverage.retryable and scope.shouldYield(runtime, error.ReadTransientFailure))
+                    return error.ReadTransientFailure;
+                const cause = try documentExtractionFailureCauseAlloc(runtime.alloc, value);
+                defer if (cause) |name| runtime.alloc.free(name);
+                try recordIsolatedRequestErrorNamed(runtime, window, request, cause orelse @errorName(error.DocumentExtractionProducedNoUsableText), requestAttemptNumberFor(runtime, scope.fingerprint));
+            } else if (!try documentExtractionManifestHasLastError(runtime.alloc, value) and
                 !try documentExtractionEmptyCoverageIsTerminalFailure(runtime.alloc, value))
                 try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
         }
@@ -14769,7 +14876,7 @@ const PreparedAssetBatch = struct {
     fn flush(self: *@This(), runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, scope: *FailureScope) !void {
         defer self.retained_bytes = 0;
         flushAssetProducerBatch(runtime, &self.items, window, scope) catch |err| try self.retainRetry(scope, err);
-        try flushGeneratedReplayWindowWithIdentity(runtime, window, scope.completedFingerprint());
+        try scope.publish(runtime, window, true);
     }
 
     fn append(self: *@This(), runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, item: AssetProducerBatchItem, scope: *FailureScope) !void {
@@ -14822,8 +14929,8 @@ fn processPlannedAsset(
     var scope = FailureScope{ .fingerprint = runtime.active_failure_fingerprint };
     var batch = PreparedAssetBatch{};
     defer batch.deinit(runtime.alloc);
-    try processAsset(runtime, request, &batch, prepared_sources, window, &scope);
-    try batch.flush(runtime, window, &scope);
+    processAsset(runtime, request, &batch, prepared_sources, window, &scope) catch |err| return scope.scannerFailure(runtime, err);
+    batch.flush(runtime, window, &scope) catch |err| return scope.scannerFailure(runtime, err);
     if (batch.retry_error) |err| return err;
     if (try skipPersistedRequestFailure(runtime, window, request)) return false;
     try flushGeneratedReplayWindow(runtime, window);
@@ -14849,7 +14956,7 @@ fn processAssetOrDefer(
     defer batch.deinit(runtime.alloc);
     // Scanner thread: the identity is the runtime-global active request.
     var scope = FailureScope{ .fingerprint = runtime.active_failure_fingerprint };
-    try processAsset(runtime, request, &batch, prepared_sources, window, &scope);
+    processAsset(runtime, request, &batch, prepared_sources, window, &scope) catch |err| return scope.scannerFailure(runtime, err);
     std.debug.assert(batch.items.items.len == 0);
 }
 
@@ -14870,6 +14977,7 @@ fn processDeferredAssets(
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         scope.enter(requestFailureFingerprint(request));
         processAsset(runtime, request, &batch, &prepared_sources, window, scope) catch |err| {
+            if (scope.publication_failed) return err;
             if (scope.shouldYield(runtime, err)) {
                 try batch.retainRetry(scope, err);
             } else {
@@ -16144,6 +16252,7 @@ fn skipRuntimeDocumentExtractionByFingerprint(
         !documentExtractionStateHasChunkUnitFingerprints(runtime.alloc, state)) return false;
     const manifest = existing_manifest orelse return false;
     if (try documentExtractionManifestHasLastError(runtime.alloc, manifest)) return false;
+    if ((try @import("document_extraction_completion.zig").inspect(runtime.alloc, manifest)).failed) return false;
     const navigation_ready = ensureRuntimeDocumentExtractionNavigationIndex(
         runtime,
         doc_key,
@@ -16169,6 +16278,7 @@ fn processDocumentExtractionAsset(
     manifest_key: []const u8,
     prepared_sources: *PreparedDocumentSourceCache,
     window: *GeneratedReplayWindow,
+    scope: *FailureScope,
 ) !void {
     const previous_source_doc = if (runtime.shared_pdf_windows) |shared| shared.raw_doc else null;
     if (runtime.shared_pdf_windows) |shared| shared.raw_doc = raw_doc;
@@ -16579,7 +16689,9 @@ fn processDocumentExtractionAsset(
     if (existing_state) |state| {
         if (!force_reprocess and std.mem.eql(u8, state, new_state)) {
             if (existing_manifest) |value| {
-                if (!(try documentExtractionManifestHasLastError(runtime.alloc, value))) {
+                if (!(try documentExtractionManifestHasLastError(runtime.alloc, value)) and
+                    !(try @import("document_extraction_completion.zig").inspect(runtime.alloc, value)).failed)
+                {
                     _ = try ensureRuntimeDocumentExtractionNavigationIndex(
                         runtime,
                         request.doc_key,
@@ -16685,6 +16797,7 @@ fn processDocumentExtractionAsset(
         .ocr_selected_count = collect_ctx.ocr_selected_count,
         .ocr_retained_embedded_count = collect_ctx.ocr_retained_embedded_count,
         .ocr_failed_count = collect_ctx.ocr_failed_count,
+        .ocr_retryable_failed_count = collect_ctx.ocr_retryable_failed_count,
         .ocr_failed_page_numbers = collect_ctx.ocr_failed_page_numbers.items,
         .ocr_failure_details = ocr_failure_details,
     };
@@ -16819,8 +16932,8 @@ fn processDocumentExtractionAsset(
     // the generated writer begins, preserving LMDB's one-transaction-per-
     // thread constraint.
     try extraction_lease_guard.check();
-    try publication_spool.replay(runtime, window, max_window_items, &resource_tracker);
-    try flushGeneratedReplayWindow(runtime, window);
+    publication_spool.replay(runtime, window, max_window_items, &resource_tracker) catch |err| return scope.publicationFailure(err);
+    try scope.publish(runtime, window, false);
     recordArtifactBytes(runtime, .asset, manifest.len);
     // A successful extraction can legitimately produce no chunk artifacts (for
     // example, an image-only PDF whose OCR output is rejected as trivial). No
@@ -16828,7 +16941,7 @@ fn processDocumentExtractionAsset(
     // that source, so make the final outcome explicit after publication.
     if (desired_chunk_keys.items.len == 0) {
         try finalizeEmptyDocumentExtractionCoverage(runtime, window, request, manifest);
-        try flushGeneratedReplayWindow(runtime, window);
+        try scope.publish(runtime, window, false);
     }
 }
 
@@ -21898,7 +22011,11 @@ fn markRuntimeGeneratedUnitTextFailureNamed(
         .ocr => "failed_ocr",
         .transcript => "failed_transcription",
     };
-    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, error_name });
+    const hint = if (kind == .ocr and std.mem.eql(u8, error_name, "ReadOutputTruncated"))
+        "; OCR reached max_tokens before completing the page; increase ocr.reader.max_tokens within model and deployment limits, or inspect the output for repetition if already at the limit"
+    else
+        "";
+    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}{s}", .{ method, error_name, hint });
     errdefer alloc.free(warning);
     const owned_method = try alloc.dupe(u8, if (kind == .ocr and !std.mem.eql(u8, unit.unit_type, "image")) "pdf_text" else method);
     errdefer alloc.free(owned_method);
@@ -22535,6 +22652,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
     ocr_selected_count: usize = 0,
     ocr_retained_embedded_count: usize = 0,
     ocr_failed_count: usize = 0,
+    ocr_retryable_failed_count: usize = 0,
     ocr_failed_page_numbers: std.ArrayListUnmanaged(u32) = .empty,
     ocr_failure_summaries: std.ArrayListUnmanaged(RuntimeOcrFailureSummary) = .empty,
     pdf_coordinator: ?*RuntimePdfOcrCoordinator = null,
@@ -22711,6 +22829,8 @@ const RuntimeDocumentExtractionCollectContext = struct {
         if (std.mem.eql(u8, status, "completed_embedded_preferred")) self.ocr_retained_embedded_count += 1;
         if (!std.mem.eql(u8, status, "failed_ocr")) return;
         self.ocr_failed_count += 1;
+        // Aggregate every page before truncating operator-facing diagnostics.
+        if (unit.ocr_failure_retryable orelse false) self.ocr_retryable_failed_count += 1;
         if (self.ocr_failed_page_numbers.items.len < 32) if (unit.page_number) |page|
             try self.ocr_failed_page_numbers.append(self.alloc, page);
         if (self.ocr_failure_summaries.items.len < 32) {
@@ -23223,7 +23343,9 @@ const RuntimeDocumentPublicationSpool = struct {
                     ),
                 }
                 if (window.itemCount() >= max_window_items) {
-                    try flushGeneratedReplayWindow(runtime, window);
+                    // Publication can succeed while later OCR pages fail.
+                    // Only the enclosing request lane may retire retry debt.
+                    try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
                     // reserveAdditional is conservative while a window is being
                     // assembled. Reconcile after every durable flush so a large
                     // document is bounded by one window rather than accumulating
@@ -32368,6 +32490,9 @@ fn finalizeEmptyDocumentExtractionCoverage(
 ) !void {
     const outcome = try documentExtractionEmptyCoverageOutcome(runtime.alloc, manifest_json);
     if (outcome == .terminal_failed) {
+        const coverage = try @import("document_extraction_completion.zig").inspect(runtime.alloc, manifest_json);
+        if (coverage.retryable and shouldYieldRequestErrorFor(runtime, requestFailureFingerprint(request), error.ReadTransientFailure))
+            return error.ReadTransientFailure;
         // Mainline coverage transitions revalidate terminal outcomes against
         // durable repair debt. Publish that debt before queueing the guarded
         // transition so an empty OCR failure cannot look like a healthy skip.
@@ -32375,7 +32500,7 @@ fn finalizeEmptyDocumentExtractionCoverage(
         // refusal) when there is one, not the generic empty-result wrapper.
         const cause = try documentExtractionFailureCauseAlloc(runtime.alloc, manifest_json);
         defer if (cause) |value| runtime.alloc.free(value);
-        try recordIsolatedRequestErrorNamed(runtime, window, request, cause orelse @errorName(error.DocumentExtractionProducedNoUsableText), requestAttemptNumber(runtime));
+        try recordIsolatedRequestErrorNamed(runtime, window, request, cause orelse @errorName(error.DocumentExtractionProducedNoUsableText), requestAttemptNumberFor(runtime, requestFailureFingerprint(request)));
         return;
     }
     try queueCoverageOutcomeForRequest(runtime, window, request, outcome);
@@ -32893,6 +33018,7 @@ fn documentExtractionManifestPayloadAlloc(
     try appendJsonFieldUsize(alloc, &out, &first, "ocr_selected_count", extraction.ocr_selected_count);
     try appendJsonFieldUsize(alloc, &out, &first, "ocr_retained_embedded_count", extraction.ocr_retained_embedded_count);
     try appendJsonFieldUsize(alloc, &out, &first, "ocr_failed_count", extraction.ocr_failed_count);
+    try appendJsonFieldUsize(alloc, &out, &first, "ocr_retryable_failed_count", extraction.ocr_retryable_failed_count);
     try appendJsonFieldName(alloc, &out, &first, "ocr_failed_page_numbers");
     try out.append(alloc, '[');
     for (extraction.ocr_failed_page_numbers, 0..) |page, i| {
@@ -34783,6 +34909,43 @@ test "durable enrichment retry progress preserves unrelated request debt across 
     };
 
     try enrichment_state.saveRuntimeStatus(runtime.store, scope_name, runtimeStatusSnapshot(&runtime));
+    {
+        const Writer = struct {
+            fn write(_: *anyopaque, _: derived_types.DerivedBatch, _: []const GeneratedArtifactPromotion, _: []const []const u8, _: []const GeneratedSourceGuard, _: ?GeneratedWriteFence) !GeneratedRecordCommit {
+                return error.WriterLocked;
+            }
+        };
+        runtime.write_ctx = &runtime;
+        runtime.write_fn = Writer.write;
+        const max_attempts = runtime.config.worker_retry_max_attempts;
+        runtime.config.worker_retry_max_attempts = runtime.retry_failure_count;
+        defer runtime.config.worker_retry_max_attempts = max_attempts;
+        for (0..3) |_| {
+            setActiveFailureFingerprint(&runtime, 91);
+            try std.testing.expect(!shouldYieldRequestError(&runtime, error.ReadTransientFailure));
+            var window = GeneratedReplayWindow{ .alloc = alloc };
+            defer window.deinit();
+            try appendInlineFullTextDocumentToWindow(&runtime, &window, "doc", "partial text", &.{"text"});
+            var publication_scope = FailureScope{ .fingerprint = 91 };
+            // A prior provider error with the same tag must not turn the
+            // later publication error into request-owned retry debt.
+            publication_scope.deferRetry(error.WriterLocked);
+            try std.testing.expectError(error.WriterLocked, publication_scope.publish(&runtime, &window, false));
+            try std.testing.expect(publication_scope.publication_failed);
+            try std.testing.expectEqual(@as(u64, 91), runtime.active_failure_fingerprint);
+            try std.testing.expectEqual(@as(u64, 0), LaneOutcome.of(&publication_scope, error.WriterLocked).retry_fingerprint);
+            try std.testing.expectEqual(error.WriterLocked, publication_scope.scannerFailure(&runtime, error.WriterLocked));
+            try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
+            try std.testing.expect(shouldYieldRequestError(&runtime, error.WriterLocked));
+            setActiveFailureFingerprint(&runtime, 777);
+            adoptLaneRetryIdentity(&runtime, LaneOutcome.of(&publication_scope, error.WriterLocked));
+            try std.testing.expectEqual(@as(u64, 0), runtime.active_failure_fingerprint);
+            const unchanged = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
+            try std.testing.expectEqual(@as(u64, 91), unchanged.retry_failure_fingerprint);
+            try std.testing.expectEqual(@as(u32, 4), unchanged.retry_failure_count);
+        }
+        setActiveFailureFingerprint(&runtime, 0);
+    }
     // Replaying already-durable output owned by another request may clear the
     // global no-progress episode, but the failed request must retain its
     // attempt budget across process restart.
@@ -34790,6 +34953,16 @@ test "durable enrichment retry progress preserves unrelated request debt across 
 
     var persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u32, 0), persisted.consecutive_retry_count);
+    try std.testing.expectEqual(@as(u64, 91), persisted.retry_failure_fingerprint);
+    try std.testing.expectEqual(@as(u32, 4), persisted.retry_failure_count);
+
+    // A PDF can durably publish usable text while OCR pages still fail.
+    // That intermediate publish must neither clear the owner's attempt budget
+    // nor read/change the scanner thread's independently owned identity.
+    runtime.active_failure_fingerprint = 91;
+    try noteDurableRetryProgress(&runtime, 0);
+    persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
+    try std.testing.expectEqual(@as(u64, 91), runtime.active_failure_fingerprint);
     try std.testing.expectEqual(@as(u64, 91), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 4), persisted.retry_failure_count);
 
@@ -36323,81 +36496,90 @@ test "document extraction rejects and records Florence prompt echoes" {
     try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "OcrPromptEcho") != null);
 }
 
-test "document extraction missing OCR model is a terminal unit failure" {
+test "document extraction missing model and truncated OCR are actionable terminal unit failures" {
     const alloc = std.testing.allocator;
+    for ([_]anyerror{ error.ModelNotFound, error.ReadOutputTruncated }) |failure| {
+        const FailedReaderProducer = struct {
+            failure: anyerror,
+            fn producer(self: *@This()) asset_producer_mod.Producer {
+                return .{
+                    .ptr = self,
+                    .vtable = &.{
+                        .produce = produce,
+                        .produce_batch = produceBatch,
+                        .invocation_memory_for_requests = testInvocationMemoryForRequests,
+                    },
+                };
+            }
 
-    const MissingModelProducer = struct {
-        fn producer(self: *@This()) asset_producer_mod.Producer {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .produce = produce,
-                    .produce_batch = produceBatch,
-                    .invocation_memory_for_requests = testInvocationMemoryForRequests,
-                },
-            };
+            fn produce(ptr: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                return self.failure;
+            }
+
+            fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                return self.failure;
+            }
+        };
+
+        var fake = FailedReaderProducer{ .failure = failure };
+        const producer = fake.producer();
+        var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+        defer resource_manager.deinit(alloc);
+        var runtime = EnrichmentRuntime{
+            .alloc = alloc,
+            .io_impl = null,
+            .store = undefined,
+            .owns_store = false,
+            .change_journal = undefined,
+            .replay_source = undefined,
+            .index_manager = undefined,
+            .write_ctx = undefined,
+            .write_fn = undefined,
+            .notify_ctx = undefined,
+            .notify_fn = undefined,
+            .config = .{
+                .asset_producer = producer,
+                .resource_manager = &resource_manager,
+            },
+            .ownership = undefined,
+        };
+        var units = [_]document_extraction_mod.Unit{.{
+            .unit_id = try alloc.dupe(u8, "unit:1"),
+            .unit_type = try alloc.dupe(u8, "image"),
+            .text = try alloc.dupe(u8, ""),
+            .method = try alloc.dupe(u8, "ocr_pending"),
+            .extraction_status = try alloc.dupe(u8, "pending_ocr"),
+        }};
+        defer units[0].deinit(alloc);
+
+        try completeRuntimeDocumentExtractionGeneratedTextBatch(
+            &runtime,
+            alloc,
+            producer,
+            .{ .ocr_enabled = true },
+            .{ .max_items = 8, .max_bytes = 1024 * 1024 },
+            "https://example.test/image.png",
+            "",
+            "image",
+            "image/png",
+            units[0..],
+            .ocr,
+        );
+
+        try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
+        try std.testing.expect(!units[0].ocr_used);
+        // Neither failure can recover without an operator changing the request;
+        // neither should schedule an automatic retry loop.
+        try std.testing.expectEqual(@as(?bool, false), units[0].ocr_failure_retryable);
+        try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, @errorName(failure)) != null);
+        if (failure == error.ReadOutputTruncated) {
+            try std.testing.expectEqualStrings("", units[0].text);
+            try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "ocr.reader.max_tokens") != null);
+            try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "repetition") != null);
         }
-
-        fn produce(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
-            return error.ModelNotFound;
-        }
-
-        fn produceBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
-            return error.ModelNotFound;
-        }
-    };
-
-    var fake = MissingModelProducer{};
-    const producer = fake.producer();
-    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
-    defer resource_manager.deinit(alloc);
-    var runtime = EnrichmentRuntime{
-        .alloc = alloc,
-        .io_impl = null,
-        .store = undefined,
-        .owns_store = false,
-        .change_journal = undefined,
-        .replay_source = undefined,
-        .index_manager = undefined,
-        .write_ctx = undefined,
-        .write_fn = undefined,
-        .notify_ctx = undefined,
-        .notify_fn = undefined,
-        .config = .{
-            .asset_producer = producer,
-            .resource_manager = &resource_manager,
-        },
-        .ownership = undefined,
-    };
-    var units = [_]document_extraction_mod.Unit{.{
-        .unit_id = try alloc.dupe(u8, "unit:1"),
-        .unit_type = try alloc.dupe(u8, "image"),
-        .text = try alloc.dupe(u8, ""),
-        .method = try alloc.dupe(u8, "ocr_pending"),
-        .extraction_status = try alloc.dupe(u8, "pending_ocr"),
-    }};
-    defer units[0].deinit(alloc);
-
-    try completeRuntimeDocumentExtractionGeneratedTextBatch(
-        &runtime,
-        alloc,
-        producer,
-        .{ .ocr_enabled = true },
-        .{ .max_items = 8, .max_bytes = 1024 * 1024 },
-        "https://example.test/image.png",
-        "",
-        "image",
-        "image/png",
-        units[0..],
-        .ocr,
-    );
-
-    try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
-    try std.testing.expect(!units[0].ocr_used);
-    // A missing configured model is terminal until the operator repairs the
-    // configuration; it must not schedule an automatic retry loop.
-    try std.testing.expectEqual(@as(?bool, false), units[0].ocr_failure_retryable);
-    try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "ModelNotFound") != null);
+    }
 }
 
 test "asset batch fallback isolates malformed envelope and preserves typed mixed results" {
@@ -38738,6 +38920,7 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
         .units = @constCast(units[0..]),
         .ocr_attempted_count = 1,
         .ocr_failed_count = 2,
+        .ocr_retryable_failed_count = 1,
         .ocr_failed_page_numbers = &.{ 5, 6 },
         .ocr_failure_details = &.{
             .{
@@ -38851,6 +39034,7 @@ test "enrichment runtime document extraction manifest uses v2 range and merge sh
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"ocr_failure_details\":[{\"page_number\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"ocr_retryable_failed_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"error_message\":\"pdf_ocr failed: UnsupportedStreamFilter\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"failure_stage\":\"render\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"retryable\":false") != null);
@@ -41790,4 +41974,36 @@ test "model aware media diarized repair receipts reuse source identities and det
     legacy.recipe_id = &legacy_recipe;
     metadata.outputs_json = try std.json.Stringify.valueAlloc(alloc, &[_]O.Result{legacy}, .{ .emit_null_optional_fields = false });
     try std.testing.expect((try mediaRepairDecision(alloc, target, &metadata, receipt)).needed);
+}
+
+test "OCR retryability counts failures beyond the diagnostic sample" {
+    const alloc = std.testing.allocator;
+    var collector: RuntimeDocumentExtractionCollectContext = undefined;
+    collector.alloc = alloc;
+    collector.ocr_attempted_count = 0;
+    collector.ocr_selected_count = 0;
+    collector.ocr_retained_embedded_count = 0;
+    collector.ocr_failed_count = 0;
+    collector.ocr_retryable_failed_count = 0;
+    collector.ocr_failed_page_numbers = .empty;
+    collector.ocr_failure_summaries = .empty;
+    defer collector.ocr_failed_page_numbers.deinit(alloc);
+    defer {
+        for (collector.ocr_failure_summaries.items) |*detail| detail.deinit(alloc);
+        collector.ocr_failure_summaries.deinit(alloc);
+    }
+    for (0..33) |page| try collector.recordOcrSummary(.{
+        .unit_id = @constCast("page"),
+        .unit_type = @constCast("page"),
+        .text = @constCast(""),
+        .method = @constCast("ocr_pending"),
+        .page_number = @intCast(page + 1),
+        .ocr_attempted = true,
+        .extraction_status = @constCast("failed_ocr"),
+        .ocr_failure_retryable = page == 32,
+    });
+    try std.testing.expectEqual(@as(usize, 33), collector.ocr_failed_count);
+    try std.testing.expectEqual(@as(usize, 1), collector.ocr_retryable_failed_count);
+    try std.testing.expectEqual(@as(usize, 32), collector.ocr_failure_summaries.items.len);
+    for (collector.ocr_failure_summaries.items) |detail| try std.testing.expect(!detail.retryable);
 }
