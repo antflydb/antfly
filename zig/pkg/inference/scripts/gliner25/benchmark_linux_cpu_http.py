@@ -111,7 +111,13 @@ def request_round(base, case, timeout, concurrency):
     """One isolated arm: simultaneous clients, each response checked by request()."""
     if concurrency == 1:
         return request(base, case, timeout)
-    ready = threading.Barrier(concurrency + 1, timeout=timeout)
+    start = 0
+
+    def release():
+        nonlocal start
+        start = time.perf_counter_ns()
+
+    ready = threading.Barrier(concurrency + 1, action=release, timeout=timeout)
 
     def client():
         ready.wait()
@@ -119,7 +125,6 @@ def request_round(base, case, timeout, concurrency):
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         pending = [pool.submit(client) for _ in range(concurrency)]
-        start = time.perf_counter_ns()
         ready.wait()
         samples = [future.result() for future in pending]
         # Result parsing/comparison must finish before the next arm starts,
