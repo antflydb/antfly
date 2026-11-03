@@ -132,11 +132,11 @@ replaced. A document whose chunks all fall below the threshold publishes an
 empty inventory and retires its previous full-text entries and chunk vectors.
 
 Scanned PDFs with an existing invisible OCR text layer retain that layer's
-positions for word and line reconstruction. When visible text and an OCR layer
-overlap, extraction keeps the layers in separate reading orders, retaining both
-transcriptions and their source spans. Non-overlapping headings, body text, and
-footers keep their spatial reading order. Antfly does not paint invisible text
-over the scanned image.
+positions for word and line reconstruction. Within an overlapping region,
+extraction retains both transcriptions and their source spans. Complementary OCR
+words return to their geometric position in the sentence; unrelated headings,
+footers, and columns keep their existing reading order. Antfly does not paint
+invisible text over the scanned image.
 
 ### 3. Write a Scanned Document
 

@@ -18340,9 +18340,8 @@ fn appendOriginalTextRunIndices(alloc: Allocator, out: *std.ArrayList(usize), in
     try out.appendSlice(alloc, indices);
 }
 
-fn textLayoutNeedsColumnReordering(
+fn textLayoutHasProseColumns(
     runs: anytype,
-    indices: []const usize,
     lines: []const TextLayoutLine,
     metrics: TextLayoutMetrics,
     gutter: TextLayoutGutter,
@@ -18365,15 +18364,17 @@ fn textLayoutNeedsColumnReordering(
     var left_prose_lines: usize = 0;
     var right_prose_lines: usize = 0;
     for (lines) |line| {
-        var left_words: usize = 0;
-        var right_words: usize = 0;
-        var previous_left: ?usize = null;
-        var previous_right_run: ?usize = null;
+        // Overprinted copies cannot turn a two-word table cell into prose.
+        var left_words = [_]usize{ 0, 0 };
+        var right_words = [_]usize{ 0, 0 };
+        var previous_left = [_]?usize{ null, null };
+        var previous_right_run = [_]?usize{ null, null };
         for (line.run_indices.items) |index| {
             const bounds = textRunBounds(runs[index]);
             const is_left = bounds.max_x <= gutter.left;
             const is_right = bounds.min_x >= gutter.right;
-            const previous = if (is_left) previous_left else previous_right_run;
+            const layer: usize = @intFromBool(invisibleTextRun(runs[index]));
+            const previous = if (is_left) previous_left[layer] else previous_right_run[layer];
             var first = true;
             var words = std.mem.tokenizeAny(u8, runs[index].text, &std.ascii.whitespace);
             while (words.next()) |word| {
@@ -18389,21 +18390,23 @@ fn textLayoutNeedsColumnReordering(
                 for (word) |byte| has_letter = has_letter or std.ascii.isAlphabetic(byte) or byte >= 0x80;
                 const numeric = (std.fmt.parseFloat(f64, word) catch null) != null;
                 if (has_letter and !numeric and !joins_previous) {
-                    if (is_left) left_words += 1;
-                    if (is_right) right_words += 1;
+                    if (is_left) left_words[layer] += 1;
+                    if (is_right) right_words[layer] += 1;
                 }
                 first = false;
             }
-            if (is_left) previous_left = index;
-            if (is_right) previous_right_run = index;
+            if (is_left) previous_left[layer] = index;
+            if (is_right) previous_right_run[layer] = index;
         }
         const center_y = (line.bounds.min_y + line.bounds.max_y) * 0.5;
         if (center_y < gutter.body_bottom or center_y > gutter.body_top) continue;
-        if (left_words >= 3) left_prose_lines += 1;
-        if (right_words >= 3) right_prose_lines += 1;
+        if (@max(left_words[0], left_words[1]) >= 3) left_prose_lines += 1;
+        if (@max(right_words[0], right_words[1]) >= 3) right_prose_lines += 1;
     }
-    if (left_prose_lines < 3 or right_prose_lines < 3) return false;
+    return left_prose_lines >= 3 and right_prose_lines >= 3;
+}
 
+fn textLayoutColumnsAreInterleaved(runs: anytype, indices: []const usize, metrics: TextLayoutMetrics, gutter: TextLayoutGutter) bool {
     // Repair demonstrably interleaved columns, not already grouped streams.
     // A return from the right column to a later left-column row identifies
     // row-major painting. Require repeated evidence; isolated margin text
@@ -18460,9 +18463,12 @@ fn appendPartitionedTextRunOrder(
     // Without positive evidence of interleaved columns, retain content order.
     // Sorting an unpartitioned leaf can interleave overprinted glyphs or move
     // marginal annotations into otherwise intact sentences.
-    const gutter = gutter_search.best orelse return appendOriginalTextRunIndices(alloc, out, indices);
-    if (!textLayoutNeedsColumnReordering(runs, indices, lines, metrics, gutter))
-        return appendOriginalTextRunIndices(alloc, out, indices);
+    const gutter = gutter_search.best orelse return appendTextLayerRegions(alloc, out, runs, indices, lines, metrics, cancellation);
+    // Mixed layers require independent column regions even when each layer
+    // was already painted column-by-column. Tables still retain row groups.
+    if (!textLayoutHasProseColumns(runs, lines, metrics, gutter) or
+        (!textRunsHaveMixedLayers(runs, indices) and !textLayoutColumnsAreInterleaved(runs, indices, metrics, gutter)))
+        return appendTextLayerRegions(alloc, out, runs, indices, lines, metrics, cancellation);
 
     var headings = std.ArrayList(usize).empty;
     defer headings.deinit(alloc);
@@ -18510,49 +18516,187 @@ fn textBoundsOverlap(left: TextRunBounds, right: TextRunBounds) bool {
         height > @min(left.max_y - left.min_y, right.max_y - right.min_y) * 0.5;
 }
 
-/// Only ambiguous, overlapping visible/OCR layers need separate reading orders.
-/// Keep non-overlapping headings, body text and footers in their spatial order.
-/// The same 2048-run ceiling as column repair bounds this optional pair search;
-/// larger pages retain authored order and separate overlapping layer transitions.
-fn hasOverlappingTextLayers(alloc: Allocator, runs: anytype, cancellation: CancellationProbe) !bool {
-    if (runs.len > 2048) return false;
+const TextLayerRegion = struct {
+    indices: []const usize,
+    bounds: TextRunBounds,
+    overlapping: bool,
+    isolated_line: bool,
+    first_index: usize,
+    parent: usize,
+    next: ?usize = null,
+    head: ?usize = null,
+    tail: ?usize = null,
+    emitted: bool = false,
+};
+
+fn textLayerRegionRoot(regions: []TextLayerRegion, index: usize) usize {
+    var root = index;
+    while (regions[root].parent != root) root = regions[root].parent;
+    var cursor = index;
+    while (regions[cursor].parent != cursor) {
+        const next = regions[cursor].parent;
+        regions[cursor].parent = root;
+        cursor = next;
+    }
+    return root;
+}
+
+fn textRunsHaveMixedLayers(runs: anytype, indices: []const usize) bool {
     var visible = false;
     var invisible = false;
-    for (runs) |run| {
-        if (run.text.len == 0) continue;
-        if (invisibleTextRun(run)) invisible = true else visible = true;
-    }
-    if (!visible or !invisible) return false;
-    const boxes = try alloc.alloc(TextRunBounds, runs.len);
-    defer alloc.free(boxes);
-    for (runs, boxes) |run, *box| box.* = textRunBounds(run);
-    for (runs, 0..) |left, i| {
-        try cancellation.check();
-        if (left.text.len == 0) continue;
-        for (runs[i + 1 ..], i + 1..) |right, j| {
-            if (right.text.len == 0 or invisibleTextRun(left) == invisibleTextRun(right)) continue;
-            if (textBoundsOverlap(boxes[i], boxes[j])) return true;
-        }
+    for (indices) |index| {
+        if (invisibleTextRun(runs[index])) invisible = true else visible = true;
+        if (visible and invisible) return true;
     }
     return false;
 }
 
-fn orderedTextRunIndicesCancelableAlloc(alloc: Allocator, runs: anytype, cancellation: CancellationProbe) ![]usize {
-    if (!try hasOverlappingTextLayers(alloc, runs, cancellation))
-        return orderedTextLayerIndicesAlloc(alloc, runs, cancellation, null);
-    // Retain both layers and all their source spans. Never interleave OCR words
-    // into visible lines, or silently discard a differing OCR transcription.
-    const first_layer = for (runs) |run| {
-        if (run.text.len != 0) break invisibleTextRun(run);
-    } else false;
-    const first = try orderedTextLayerIndicesAlloc(alloc, runs, cancellation, first_layer);
-    defer alloc.free(first);
-    const second = try orderedTextLayerIndicesAlloc(alloc, runs, cancellation, !first_layer);
-    defer alloc.free(second);
-    return try std.mem.concat(alloc, usize, &.{ first, second });
+/// Resolve mixed text only within a contiguous region of one layout line.
+/// Wide gaps use the same geometric floor as column detection, so OCR in one
+/// column cannot pull unrelated cells or an adjacent column into its layer.
+/// Splice each region at its first authored occurrence; all other runs retain
+/// the order selected by column repair. Both transcriptions keep their spans.
+fn appendTextLayerRegions(
+    alloc: Allocator,
+    out: *std.ArrayList(usize),
+    runs: anytype,
+    indices: []const usize,
+    lines: []const TextLayoutLine,
+    metrics: TextLayoutMetrics,
+    cancellation: CancellationProbe,
+) !void {
+    if (runs.len > 2048) return appendOriginalTextRunIndices(alloc, out, indices);
+    if (!textRunsHaveMixedLayers(runs, indices)) return appendOriginalTextRunIndices(alloc, out, indices);
+
+    var regions = std.ArrayList(TextLayerRegion).empty;
+    defer regions.deinit(alloc);
+    const membership = try alloc.alloc(usize, runs.len);
+    defer alloc.free(membership);
+    @memset(membership, std.math.maxInt(usize));
+    const maximum_gap = @max(metrics.median_height * 2.0, metrics.median_space_advance * 4.0);
+    for (lines) |line| {
+        try cancellation.check();
+        const first_region = regions.items.len;
+        var overlapping_members: usize = 0;
+        var start: usize = 0;
+        while (start < line.run_indices.items.len) {
+            var end = start + 1;
+            var bounds = textRunBounds(runs[line.run_indices.items[start]]);
+            while (end < line.run_indices.items.len) : (end += 1) {
+                const next = textRunBounds(runs[line.run_indices.items[end]]);
+                if (next.min_x - bounds.max_x >= maximum_gap) break;
+                bounds.include(next);
+            }
+            const region_indices = line.run_indices.items[start..end];
+            var has_visible = false;
+            var has_invisible = false;
+            var first = region_indices[0];
+            for (region_indices) |index| {
+                if (invisibleTextRun(runs[index])) has_invisible = true else has_visible = true;
+                first = @min(first, index);
+            }
+            if (has_visible and has_invisible) {
+                var overlapping = false;
+                for (region_indices, 0..) |left, i| {
+                    try cancellation.check();
+                    const left_bounds = textRunBounds(runs[left]);
+                    for (region_indices[i + 1 ..]) |right| {
+                        // X-sorted bounds let non-overlapping words stop early.
+                        const right_bounds = textRunBounds(runs[right]);
+                        if (right_bounds.min_x >= left_bounds.max_x) break;
+                        if (invisibleTextRun(runs[left]) != invisibleTextRun(runs[right]) and
+                            textBoundsOverlap(left_bounds, right_bounds))
+                        {
+                            overlapping = true;
+                            break;
+                        }
+                    }
+                    if (overlapping) break;
+                }
+                if (overlapping) overlapping_members += region_indices.len;
+                for (region_indices) |index| membership[index] = regions.items.len;
+                try regions.append(alloc, .{
+                    .indices = region_indices,
+                    .overlapping = overlapping,
+                    .isolated_line = start == 0 and end == line.run_indices.items.len,
+                    .bounds = bounds,
+                    .first_index = first,
+                    .parent = regions.items.len,
+                });
+            }
+            start = end;
+        }
+        if (regions.items.len > first_region + 1 and overlapping_members == line.run_indices.items.len) {
+            // Fully overprinted table cells are alternate copies of one row.
+            // Keep each row association intact, rather than joining columns.
+            regions.shrinkRetainingCapacity(first_region + 1);
+            regions.items[first_region] = .{
+                .indices = line.run_indices.items,
+                .bounds = line.bounds,
+                .overlapping = true,
+                .isolated_line = false,
+                .first_index = line.first_index,
+                .parent = first_region,
+            };
+            for (line.run_indices.items) |index| membership[index] = first_region;
+        }
+    }
+    // Join adjacent overlapping lines into a transcription region. A header
+    // overlap cannot capture complementary OCR words or an unrelated footer.
+    // The caller's 2048-run ceiling bounds this optional component search.
+    for (regions.items, 0..) |left, i| {
+        try cancellation.check();
+        if (!left.overlapping or !left.isolated_line) continue;
+        for (i + 1..regions.items.len) |j| {
+            const right = regions.items[j];
+            if (!right.overlapping or !right.isolated_line) continue;
+            const horizontal = @min(left.bounds.max_x, right.bounds.max_x) - @max(left.bounds.min_x, right.bounds.min_x);
+            const vertical_gap = @max(left.bounds.min_y, right.bounds.min_y) - @min(left.bounds.max_y, right.bounds.max_y);
+            if (horizontal <= @min(left.bounds.max_x - left.bounds.min_x, right.bounds.max_x - right.bounds.min_x) * 0.5 or
+                vertical_gap > metrics.median_height) continue;
+            const left_root = textLayerRegionRoot(regions.items, i);
+            const right_root = textLayerRegionRoot(regions.items, j);
+            regions.items[right_root].parent = left_root;
+        }
+    }
+    // Build each component's list in geometric line order once. Emitting all
+    // components then costs O(number of retained runs), without rescanning.
+    for (0..regions.items.len) |i| {
+        const root_index = textLayerRegionRoot(regions.items, i);
+        const root = &regions.items[root_index];
+        root.first_index = @min(root.first_index, regions.items[i].first_index);
+        if (root.tail) |tail| regions.items[tail].next = i else root.head = i;
+        root.tail = i;
+    }
+    for (indices) |index| {
+        const region_index = membership[index];
+        if (region_index == std.math.maxInt(usize)) {
+            try out.append(alloc, index);
+            continue;
+        }
+        const root_index = textLayerRegionRoot(regions.items, region_index);
+        const root = &regions.items[root_index];
+        if (root.emitted) continue;
+        root.emitted = true;
+        if (root.overlapping) {
+            const first_layer = invisibleTextRun(runs[root.first_index]);
+            for ([_]bool{ first_layer, !first_layer }) |layer| {
+                var cursor = root.head;
+                while (cursor) |region| : (cursor = regions.items[region].next) {
+                    try cancellation.check();
+                    for (regions.items[region].indices) |member| {
+                        if (invisibleTextRun(runs[member]) == layer) try out.append(alloc, member);
+                    }
+                }
+            }
+        } else {
+            // Complementary OCR words belong in their geometric sentence.
+            try out.appendSlice(alloc, root.indices);
+        }
+    }
 }
 
-fn orderedTextLayerIndicesAlloc(alloc: Allocator, runs: anytype, cancellation: CancellationProbe, invisible: ?bool) ![]usize {
+fn orderedTextRunIndicesCancelableAlloc(alloc: Allocator, runs: anytype, cancellation: CancellationProbe) ![]usize {
     var original = std.ArrayList(usize).empty;
     defer original.deinit(alloc);
     var ordering_supported = true;
@@ -18560,7 +18704,6 @@ fn orderedTextLayerIndicesAlloc(alloc: Allocator, runs: anytype, cancellation: C
     for (runs, 0..) |run, run_index| {
         if (run_index % 256 == 0) try cancellation.check();
         if (run.text.len == 0) continue;
-        if (invisible) |layer| if (invisibleTextRun(run) != layer) continue;
         try original.append(alloc, run_index);
         if (!textRunHasSupportedOrderingGeometry(run)) {
             ordering_supported = false;
@@ -32180,6 +32323,11 @@ test "reader NASA SM3A OCR report retains searchable words in both extraction AP
 test "reader mixed OCR layers preserve words phrases and nonoverlapping reading order" {
     const a = std.testing.allocator;
     const cases = [_]struct { content: []const u8, expected: []const u8 }{
+        .{ .content = "BT /F1 10 Tf 0 Tr 1 0 0 1 10 90 Tm (First name) Tj 1 0 0 1 200 90 Tm (Alice Smith) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 10 70 Tm (Home city) Tj 1 0 0 1 200 70 Tm (Paris France) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 10 50 Tm (Job title) Tj 1 0 0 1 200 50 Tm (Chief Engineer) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (First name) Tj 1 0 0 1 200 90 Tm (Alice Smith) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Home city) Tj 1 0 0 1 200 70 Tm (Paris France) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Job title) Tj 1 0 0 1 200 50 Tm (Chief Engineer) Tj ET ", .expected = "First name Alice Smith\nFirst name Alice Smith\nHome city Paris France\nHome city Paris France\nJob title Chief Engineer\nJob title Chief Engineer\n" },
+        .{ .content = "BT /F1 10 Tf 0 Tr 1 0 0 1 10 90 Tm (Left prose one) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 10 70 Tm (Left prose two) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 10 50 Tm (Left prose three) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 200 90 Tm (Right prose one) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 200 70 Tm (Right prose two) Tj ET BT /F1 10 Tf 0 Tr 1 0 0 1 200 50 Tm (Right prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (Left prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Left prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Left prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 90 Tm (Right prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 70 Tm (Right prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 50 Tm (Right prose three) Tj ET ", .expected = "Left prose one\nLeft prose two\nLeft prose three\nLeft prose one\nLeft prose two\nLeft prose three\nRight prose one\nRight prose two\nRight prose three\nRight prose one\nRight prose two\nRight prose three\n" },
+        .{ .content = "BT /F1 12 Tf 10 90 Td (Heading) Tj ET BT /F1 12 Tf 0 Tr 10 70 Td (replace) Tj 1 0 0 1 150 70 Tm (gyroscopes) Tj ET BT /F1 12 Tf 0 Tr 10 50 Td (Footer) Tj ET BT /F1 12 Tf 3 Tr 10 90 Td (Heading) Tj ET BT /F1 12 Tf 3 Tr 70 70 Td (all six) Tj ET", .expected = "Heading\nHeading\nreplace all six gyroscopes\nFooter\n" },
+        .{ .content = "BT /F1 12 Tf 10 90 Td (first line) Tj 1 0 0 1 10 70 Tm (second line) Tj ET BT /F1 12 Tf 3 Tr 10 90 Td (first line) Tj 1 0 0 1 10 70 Tm (second line) Tj ET", .expected = "first line\nsecond line\nfirst line\nsecond line\n" },
+        .{ .content = "BT /F1 12 Tf 10 50 Td (left) Tj 1 0 0 1 200 50 Tm (right) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (left) Tj 1 0 0 1 200 50 Tm (other) Tj ET", .expected = "left right\nleft other\n" },
         .{ .content = "BT /F1 12 Tf 10 50 Td (needle) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET", .expected = "needle\nneedle\n" },
         .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (alpha) Tj 1 0 0 1 60 50 Tm (beta) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (alpha) Tj 1 0 0 1 60 50 Tm (gamma) Tj ET", .expected = "alpha beta\nalpha gamma\n" },
         .{ .content = "BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET BT /F1 12 Tf 0 Tr 10 50 Td (visible) Tj ET", .expected = "needle\nvisible\n" },
