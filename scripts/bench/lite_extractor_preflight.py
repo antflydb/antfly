@@ -131,7 +131,7 @@ def run(library, directory, history_windows=False):
                 "config": {
                     "provider": "antfly",
                     "model": MODEL,
-                    "schema": schema,
+                    "schema": history_schema if history_windows else schema,
                     "options": options,
                 },
             },
@@ -142,16 +142,20 @@ def run(library, directory, history_windows=False):
         database, local_runtime=True, generated_enrichment_replay=True, busy_timeout=5
     ) as db:
         db.add_index(config)
-        db.batch_json({"inserts": {"example": {"body": TEXT}}, "sync_level": "write"})
+        inserts = {"example": {"body": TEXT}}
+        if history_windows:
+            inserts["history-tail"] = {"body": unit * 205}
+            inserts["history-composition"] = {"body": (unit * 3200)[:190000]}
+        db.batch_json({"inserts": inserts, "sync_level": "write"})
         db.run_until_idle()
         stats = db.stats()
         enrichment = stats["enrichment"]
-        if enrichment["processed_requests"] < 1 or enrichment["error_count"]:
+        if enrichment["processed_requests"] < len(inserts) or enrichment["error_count"]:
             raise RuntimeError("Database extractor did not complete cleanly")
         graph = next(
             index for index in stats["indexes"] if index["name"] == "knowledge"
         )
-        if graph["coverage_produced_count"] != 1:
+        if graph["coverage_produced_count"] != len(inserts):
             raise RuntimeError("Database graph producer did not publish its result")
         for index in stats["indexes"]:
             if index["replay_catch_up_required"] or (
@@ -161,7 +165,13 @@ def run(library, directory, history_windows=False):
         if not db.check()["valid"]:
             raise RuntimeError("Preflight database failed integrity")
     with af.open_readonly(database) as db:
-        if db.lookup("example")["body"] != TEXT or not db.check()["valid"]:
+        if (
+            any(
+                db.lookup(key)["body"] != value["body"]
+                for key, value in inserts.items()
+            )
+            or not db.check()["valid"]
+        ):
             raise RuntimeError("Preflight database failed reopen verification")
     with Path(library).open("rb") as stream:
         library_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()

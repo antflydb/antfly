@@ -4829,7 +4829,7 @@
     },
     "investigation": "Preparation takes a context maximum across reviewed profiles with different geometry. A 1024-source-word window includes an additional terminal word and can discard the composition profile; later windows then fail the remaining profile minimum. A larger synthetic document reproduces a cross-row geometry rejection.",
     "candidate_change": "Choose a conservative context among profiles compatible with the complete feature union and public request item count, shared by workspace geometry, qualification and execution. No published profile bounds are widened; final coherent-row admission is unchanged.",
-    "validation": "31 distinct qualification tests pass across the model-free suite and installed pinned-geometry rerun, including both new regressions. Rebuilt C API model execution and end-to-end qualification remain pending.",
+    "validation": "31 distinct qualification tests, integrated Debug C API/ABI/linkage smoke, and real-model standalone plus three database producer requests pass. Candidate-only issue1431 reproduction is the next gate; no claim of end-to-end performance qualification.",
     "focused_debug_regressions": {
       "selected": 2,
       "passed": 2,
@@ -4851,6 +4851,42 @@
       "passed": 2,
       "skipped": 0,
       "scope": "Pinned tokenizer/config, single-window and long-document geometry; no learned operations."
+    },
+    "integrated_source_commit": "3b417dd180adadd11619a8c275fb512f09cfe7f5",
+    "integrated_main_commit": "3b712f22430e7dd22d8c762f2f7d53a047613b68",
+    "capi_debug": {
+      "build_passed": true,
+      "abi_public_exports": 134,
+      "linkage_smoke_passed": true,
+      "library_sha256": "e5217fe92cf80c6ce6598cec2a4a46280ae5b5d7a8d195ce1740b0adb30349de"
+    },
+    "real_model_preflight": {
+      "passed": true,
+      "model": "fastino/gliner2.5-base-v1",
+      "library_sha256": "e5217fe92cf80c6ce6598cec2a4a46280ae5b5d7a8d195ce1740b0adb30349de",
+      "standalone_entities_verified": true,
+      "history_window_cases": [
+        {
+          "case": "short_final_window",
+          "bytes": 12915,
+          "words": 1025,
+          "windows": 3,
+          "seconds": 0.8641675830585882
+        },
+        {
+          "case": "composition_document",
+          "bytes": 190000,
+          "words": 15080,
+          "windows": 31,
+          "seconds": 6.797062458936125
+        }
+      ],
+      "database_processed_requests": 3,
+      "database_errors": 0,
+      "graph_coverage_produced": 3,
+      "index_catchup_integrity_reopen": true,
+      "seconds": 36.04872883402277
     }
-  }
+  },
+  "priority": "User requested testing whether this branch fixes issue1431 first. Run candidate-only original three-writer/status reproduction, then full15 corpus and data/index/storage checks. Defer common-control builds and broad soaks until that gate passes."
 }
