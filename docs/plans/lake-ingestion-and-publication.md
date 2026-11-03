@@ -600,14 +600,33 @@ so a recreated table or changed binding cannot inherit another writer's queue.
 WAL segments and receipts are retained; automated reader-safe WAL retention is
 not enabled by this path.
 
-One transaction is drained per publication-worker pass. The native writer
+Each publication-worker pass group-commits the pending WAL suffix. Contiguous
+accepted transactions that share a source, epoch and key definition, and whose
+checkpoints chain exactly, fold into one Iceberg snapshot of at most 16,384
+changes and 8 MiB of payload. The snapshot's coverage is the group's last LSN
+and its checkpoint is the last member's checkpoint. Later images of a key replace
+earlier ones, so the result equals committing each member in order. A lone
+transaction keeps its original batch and attempt identity. The saved intent is
+keyed by the group's first LSN, so a restart replays the exact group it chose
+even if more transactions arrived since. Grouping keeps snapshot count, catalog
+commits and index publications proportional to drain passes rather than to
+producer transactions, and lets a full 64-record pending window clear in one
+pass. The native writer
 preserves Parquet field IDs and nullability and writes immutable Parquet data,
 Iceberg equality deletes, data/delete manifests, and a manifest list. Repeated
 keys in a transaction keep their final mutation. Deletes and replacement data
 share a new sequence number: equality deletes suppress earlier versions and
 leave their replacement rows visible. Unpartitioned manifests allow global key
 deletes across existing partition specs without rewriting historical files.
-Existing manifest references are retained in the new snapshot. The writer
+Existing manifest references are retained in the new snapshot. Once 100 small
+(below 1 MiB) Antfly-written unpartitioned manifests of one content kind
+accumulate, the next commit rewrites them as one manifest whose entries keep
+their original snapshot and sequence numbers with EXISTING status. Manifests that
+carry partitions or column bounds are never merged. Without merging, each commit
+and each reader's planning step would grow with the total number of commits.
+Commits also trim `metadata-log` to the newest
+`write.metadata.previous-versions-max` entries (default 100); managed recovery
+uses the immutable record chain, not that log. The writer
 supports flat primitive scalar schemas; unsupported nested and decimal schemas
 fail admission explicitly instead of dropping fields or encoding JSON as text.
 
@@ -697,8 +716,14 @@ transplanted into a newer parent.
 
 Vacuum first expires unprotected Iceberg snapshots through the catalog CAS,
 then marks retained snapshot file graphs and sweeps only unreachable objects
-with native ownership proofs. Defaults retain seven days and the newest two
-snapshots; named refs, current/live index publications, and durable snapshot
+with native ownership proofs. One job expires at most `max_expired` (default
+256) eligible snapshots, oldest first, and reports the rest as
+`remaining_snapshots`. Within a job each immutable manifest is read once, even
+though snapshots carry their ancestors' manifests forward. When a scheduled job
+completes with a backlog, the scheduler plans the next bounded job immediately
+under a fresh operation ID. A large backlog therefore drains over consecutive
+passes instead of exceeding one job's 256 MiB read budget forever. Defaults
+retain seven days and the newest two snapshots; named refs, current/live index publications, and durable snapshot
 readers are roots. SQL scans, compaction and index construction hold renewable
 snapshot pins (two-minute leases, thirty-second renewals and thirty-second
 retirement grace). Hosts must keep clock skew within that grace, as with the

@@ -24,8 +24,12 @@ const pins = @import("lake_snapshot_pins.zig");
 const iceberg = local.serverless_external_source_mod.iceberg_avro;
 const A = std.mem.Allocator;
 const V = std.json.Value;
-pub const Options = struct { operation_id: []const u8, dry_run: bool = true, exclusive_ownership: bool = false, retain_ms: u64 = 7 * 24 * 60 * 60 * 1000, keep_latest: usize = 2, max_deleted: usize = 4096 };
-pub const Result = struct { expired_snapshots: usize = 0, eligible_objects: usize = 0, deleted_objects: usize = 0, retained_objects: usize = 0, complete: bool = false, conflicted: bool = false, delegated: bool = false, provider: ?catalog.maintenance.Provider = null, provider_state: ?catalog.maintenance.State = null };
+/// `max_expired` bounds one job. Older eligible snapshots expire first and the
+/// rest are reported as `remaining_snapshots`, so a large backlog drains over
+/// several bounded jobs instead of exceeding one job's read budget forever.
+pub const Options = struct { operation_id: []const u8, dry_run: bool = true, exclusive_ownership: bool = false, retain_ms: u64 = 7 * 24 * 60 * 60 * 1000, keep_latest: usize = 2, max_deleted: usize = 4096, max_expired: usize = default_max_expired };
+pub const default_max_expired: usize = 256;
+pub const Result = struct { expired_snapshots: usize = 0, remaining_snapshots: usize = 0, eligible_objects: usize = 0, deleted_objects: usize = 0, retained_objects: usize = 0, complete: bool = false, conflicted: bool = false, delegated: bool = false, provider: ?catalog.maintenance.Provider = null, provider_state: ?catalog.maintenance.State = null };
 const Retired = struct { snapshot: []const u8, objects: []const []const u8 };
 const Job = struct { id: []const u8, expected: []const u8, body: []const u8, timestamp_ms: i64, retired: []const Retired };
 const Marker = struct { uri: []const u8, sha256: []const u8, revision: @import("objectstore").ObjectRevision, owner: []const u8 };
@@ -33,7 +37,23 @@ fn has(values: []const []const u8, value: []const u8) bool {
     for (values) |candidate| if (std.mem.eql(u8, candidate, value)) return true;
     return false;
 }
-fn collectSnapshot(a: A, files: catalog.row_commit.Files, snapshot: V, budget: *u64) ![]const []const u8 {
+/// Live data paths of each immutable manifest, read once per vacuum pass.
+/// Snapshots carry earlier manifests forward, so without this every snapshot
+/// re-reads its ancestors' manifests and one pass costs O(snapshots^2) reads.
+const ManifestFiles = std.StringHashMapUnmanaged([]const []const u8);
+fn manifestFiles(a: A, files: catalog.row_commit.Files, cache: *ManifestFiles, path: []const u8, length: u64, budget: *u64) ![]const []const u8 {
+    if (cache.get(path)) |paths| return paths;
+    if (length > budget.*) return error.LakeVacuumBudgetExceeded;
+    const manifest_bytes = try catalog.row_commit.readLimited(a, files, path, @intCast(@min(budget.*, 16 * 1024 * 1024)));
+    if (manifest_bytes.len > budget.*) return error.LakeVacuumBudgetExceeded;
+    budget.* -= manifest_bytes.len;
+    const manifest = try iceberg.parseDataManifestAlloc(a, manifest_bytes);
+    var live: std.ArrayList([]const u8) = .empty;
+    for (manifest.entries) |file| if (file.status != .deleted) try live.append(a, file.file_path);
+    try cache.put(a, path, live.items);
+    return live.items;
+}
+fn collectSnapshot(a: A, files: catalog.row_commit.Files, snapshot: V, budget: *u64, cache: *ManifestFiles) ![]const []const u8 {
     var paths: std.StringHashMapUnmanaged(void) = .empty;
     const list_uri = try catalog.metadata.str(try catalog.metadata.get(snapshot, "manifest-list"));
     const bytes = try catalog.row_commit.readLimited(a, files, list_uri, @intCast(@min(budget.*, 16 * 1024 * 1024)));
@@ -43,40 +63,36 @@ fn collectSnapshot(a: A, files: catalog.row_commit.Files, snapshot: V, budget: *
     const list = try iceberg.parseManifestListAlloc(a, bytes);
     for (list.entries) |entry| {
         try files.context.ensureActive();
-        if (entry.manifest_length > budget.*) return error.LakeVacuumBudgetExceeded;
-        const manifest_bytes = try catalog.row_commit.readLimited(a, files, entry.manifest_path, @intCast(@min(budget.*, 16 * 1024 * 1024)));
-        if (manifest_bytes.len > budget.*) return error.LakeVacuumBudgetExceeded;
-        budget.* -= manifest_bytes.len;
         try paths.put(a, entry.manifest_path, {});
-        const manifest = try iceberg.parseDataManifestAlloc(a, manifest_bytes);
-        for (manifest.entries) |file| if (file.status != .deleted) {
+        for (try manifestFiles(a, files, cache, entry.manifest_path, entry.manifest_length, budget)) |file_path| {
             if (paths.count() == 262144) return error.LakeVacuumBudgetExceeded;
-            try paths.put(a, file.file_path, {});
-        };
+            try paths.put(a, file_path, {});
+        }
     }
     const result = try a.alloc([]const u8, paths.count());
     var iterator = paths.keyIterator();
     for (result) |*path| path.* = iterator.next().?.*;
     return result;
 }
-fn retainedIds(a: A, root: V, extra: []const []const u8, keep_latest: usize, before: i64) ![]const []const u8 {
-    var retained: std.ArrayList([]const u8) = .empty;
-    try retained.appendSlice(a, extra);
+const IdSet = std.StringHashMapUnmanaged(void);
+fn retainedIds(a: A, root: V, extra: []const []const u8, keep_latest: usize, before: i64) !IdSet {
+    var retained: IdSet = .empty;
+    for (extra) |id| try retained.put(a, id, {});
     const snapshots = (try catalog.metadata.get(root, "snapshots")).array.items;
     const refs = try catalog.metadata.get(root, "refs");
     var refs_iterator = refs.object.iterator();
-    while (refs_iterator.next()) |ref| try retained.append(a, try std.fmt.allocPrint(a, "{d}", .{try catalog.metadata.int(try catalog.metadata.get(ref.value_ptr.*, "snapshot-id"))}));
+    while (refs_iterator.next()) |ref| try retained.put(a, try std.fmt.allocPrint(a, "{d}", .{try catalog.metadata.int(try catalog.metadata.get(ref.value_ptr.*, "snapshot-id"))}), {});
     // Iceberg snapshots append in commit order. Every named ref is protected
     // independently; the newest retained window additionally protects history.
     for (snapshots, 0..) |snapshot, index| {
         if (snapshots.len - index <= keep_latest or try catalog.metadata.int(try catalog.metadata.get(snapshot, "timestamp-ms")) >= before) {
-            try retained.append(a, try std.fmt.allocPrint(a, "{d}", .{try catalog.metadata.int(try catalog.metadata.get(snapshot, "snapshot-id"))}));
+            try retained.put(a, try std.fmt.allocPrint(a, "{d}", .{try catalog.metadata.int(try catalog.metadata.get(snapshot, "snapshot-id"))}), {});
         }
     }
-    return retained.items;
+    return retained;
 }
 pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, context: catalog.types.Context, request: Options, protected: []const []const u8) !Result {
-    if (request.operation_id.len == 0 or request.operation_id.len > 256 or request.retain_ms < 10 * 60 * 1000 or request.keep_latest == 0 or request.keep_latest > 1024 or request.max_deleted == 0 or request.max_deleted > 4096) return error.InvalidLakeMaintenanceLimits;
+    if (request.operation_id.len == 0 or request.operation_id.len > 256 or request.retain_ms < 10 * 60 * 1000 or request.keep_latest == 0 or request.keep_latest > 1024 or request.max_deleted == 0 or request.max_deleted > 4096 or request.max_expired == 0 or request.max_expired > 4096) return error.InvalidLakeMaintenanceLimits;
     // A local object-store retirement marker cannot fence commits or readers
     // admitted by an external catalog. An ownership assertion is insufficient:
     // late REST commits can resurrect a file after our final mark phase.
@@ -118,6 +134,7 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
     defer files.deinit();
     const destination = try ingestion.destinationFiles(scratch, files, binding.source_uri, context);
     var budget: u64 = 256 * 1024 * 1024;
+    var manifests: ManifestFiles = .empty;
     var job: Job = undefined;
     var result: Result = .{};
     if (saved) |value| {
@@ -133,8 +150,14 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
         for ((try catalog.metadata.get(root, "snapshots")).array.items) |snapshot| {
             const id = try catalog.metadata.int(try catalog.metadata.get(snapshot, "snapshot-id"));
             const text = try std.fmt.allocPrint(scratch, "{d}", .{id});
-            if (has(keep, text) or (try pin_store.deadline(a, text)) +| pins.grace_ns >= now_ns) continue;
-            try retired.append(scratch, .{ .snapshot = text, .objects = try collectSnapshot(scratch, destination, snapshot, &budget) });
+            if (keep.contains(text)) continue;
+            // Count the backlog without reading pins or manifests for it.
+            if (ids.items.len == request.max_expired) {
+                result.remaining_snapshots += 1;
+                continue;
+            }
+            if ((try pin_store.deadline(a, text)) +| pins.grace_ns >= now_ns) continue;
+            try retired.append(scratch, .{ .snapshot = text, .objects = try collectSnapshot(scratch, destination, snapshot, &budget, &manifests) });
             try ids.append(scratch, id);
         }
         result.expired_snapshots = ids.items.len;
@@ -182,7 +205,7 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
             if (std.mem.eql(u8, old.snapshot, id)) break true;
         } else false;
         if (request.dry_run and expired) continue;
-        for (try collectSnapshot(scratch, destination, snapshot, &budget)) |uri| try marked.put(scratch, uri, {});
+        for (try collectSnapshot(scratch, destination, snapshot, &budget, &manifests)) |uri| try marked.put(scratch, uri, {});
     }
     // Finish the full reader mark phase before deleting any shared object.
     // A late pin on one expired snapshot protects files shared by other expired
@@ -260,11 +283,11 @@ test "external lake vacuum retains refs newest snapshots recent commits and read
         \\{"refs":{"main":{"snapshot-id":5},"history":{"snapshot-id":1}},"snapshots":[{"snapshot-id":1,"timestamp-ms":1},{"snapshot-id":2,"timestamp-ms":2},{"snapshot-id":3,"timestamp-ms":3},{"snapshot-id":4,"timestamp-ms":100},{"snapshot-id":5,"timestamp-ms":5}]}
     , .{});
     const retained = try retainedIds(a, root, &.{"3"}, 1, 90);
-    try std.testing.expect(has(retained, "1"));
-    try std.testing.expect(!has(retained, "2"));
-    try std.testing.expect(has(retained, "3"));
-    try std.testing.expect(has(retained, "4"));
-    try std.testing.expect(has(retained, "5"));
+    try std.testing.expect(retained.contains("1"));
+    try std.testing.expect(!retained.contains("2"));
+    try std.testing.expect(retained.contains("3"));
+    try std.testing.expect(retained.contains("4"));
+    try std.testing.expect(retained.contains("5"));
 }
 
 const Collection = enum { retained, eligible, deleted };
@@ -380,4 +403,43 @@ test "external lake vacuum definitive commit conflict completes its saved operat
         try std.testing.expectEqual(@as(usize, 0), result.deleted_objects);
         try std.testing.expectEqual(@as(usize, 0), result.expired_snapshots);
     }
+}
+
+test "external lake vacuum expires a large backlog in bounded oldest-first jobs" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-vacuum-backlog");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    const binding: local.serverless_external_source_catalog_binding.Binding = .{ .table_id = "events", .format = .iceberg, .source_uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()}), .schema_fingerprint = "schema", .write_policy = .iceberg_writer, .catalog = .{ .type = .managed } };
+    const options: configured.BindingObjectStoreOpenOptions = .{ .node_config = &config, .catalog_table_id = 11 };
+    var opened = try configured.openBindingObjectStoreAlloc(alloc, binding, options);
+    defer opened.deinit();
+    var managed: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri };
+    var table = try managed.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    const files = try ingestion.destinationFiles(a, opened, binding.source_uri, .{});
+    // Six ancient commits: five are eligible once the newest is kept.
+    for (1..7) |n| {
+        const row = try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{n}), .{});
+        const batch: catalog.row_commit.Batch = .{ .batch_id = try std.fmt.allocPrint(a, "b{d}", .{n}), .source = "s", .epoch = "1", .checkpoint = try std.fmt.allocPrint(a, "{d}", .{n}), .expected_checkpoint = if (n == 1) null else try std.fmt.allocPrint(a, "{d}", .{n - 1}), .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = row }} };
+        const prepared = try catalog.row_commit.prepare(a, table, files, batch, n, @intCast(n + 1));
+        table = try managed.commit(a, .{ .id = batch.batch_id, .expected_metadata_location = table.metadata_location, .body = prepared.body, .timestamp_ms = @intCast(n + 1) });
+    }
+    const expected = [_][2]usize{ .{ 2, 3 }, .{ 2, 1 }, .{ 1, 0 } };
+    for (expected, 0..) |counts, pass| {
+        const result = try run(alloc, binding, options, .{}, .{ .operation_id = try std.fmt.allocPrint(a, "vacuum-{d}", .{pass}), .dry_run = false, .exclusive_ownership = true, .retain_ms = 10 * 60 * 1000, .keep_latest = 1, .max_expired = 2 }, &.{});
+        try std.testing.expect(result.complete and !result.conflicted);
+        try std.testing.expectEqual(counts[0], result.expired_snapshots);
+        try std.testing.expectEqual(counts[1], result.remaining_snapshots);
+        // Expired manifest lists are owned and unreferenced, so they are collected.
+        try std.testing.expect(result.deleted_objects >= counts[0]);
+    }
+    const final = try managed.load(a);
+    const root = try catalog.metadata.parse(a, final.metadata_json);
+    try std.testing.expectEqual(@as(usize, 1), (try catalog.metadata.get(root, "snapshots")).array.items.len);
+    try std.testing.expectError(error.InvalidLakeMaintenanceLimits, run(alloc, binding, options, .{}, .{ .operation_id = "bad", .max_expired = 0 }, &.{}));
 }

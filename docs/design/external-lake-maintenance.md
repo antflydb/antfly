@@ -123,6 +123,8 @@ that coordination.
 Receipts bind `protocol`, `provider`, `operation_id`, `request_hash` and
 `table_uuid`. State is `queued`, `running`, `complete` or `rejected`. Counts are
 `expired_snapshots`, `eligible_objects`, `deleted_objects` and `retained_objects`.
+Antfly-run (managed) vacuum results also report `remaining_snapshots`, the
+eligible snapshots left for the next bounded job.
 Pending receipts report no physical deletions; completed receipts report final
 counts. A dry run must report zero deletions. Rejection surfaces as a conflict;
 transport failure leaves the immutable journal available for exact retry.

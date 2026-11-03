@@ -1,0 +1,238 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Catalog cost as history grows: bounded metadata regressions plus an
+//! opt-in commit throughput benchmark for memory, filesystem, S3 and GCS.
+const std = @import("std");
+const storage = @import("objectstore");
+const platform = @import("antfly_platform");
+const types = @import("types.zig");
+const managed = @import("managed.zig");
+const metadata = @import("metadata.zig");
+const row_commit = @import("row_commit.zig");
+const iceberg = @import("../iceberg_avro.zig");
+const OpenedObjectStore = @import("../../object_store_support.zig").OpenedObjectStore;
+const A = std.mem.Allocator;
+const V = std.json.Value;
+
+const schema_request = "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true},{\"id\":2,\"name\":\"body\",\"type\":\"string\",\"required\":false}]}}";
+
+test "lake catalog metadata log keeps the newest previous versions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var bytes: []const u8 = try metadata.createAlloc(a, "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]},\"properties\":{\"write.metadata.previous-versions-max\":\"3\"}}", "00000000-0000-0000-0000-000000000000", 1, "gs://archive/t");
+    var location: []const u8 = "gs://archive/t/metadata/v0.metadata.json";
+    for (1..10) |i| {
+        const body = try std.fmt.allocPrint(a, "{{\"requirements\":[],\"updates\":[{{\"action\":\"set-properties\",\"updates\":{{\"n\":\"{d}\"}}}}]}}", .{i});
+        bytes = try metadata.applyAlloc(a, bytes, location, .{ .id = try std.fmt.allocPrint(a, "c{d}", .{i}), .expected_metadata_location = location, .body = body, .timestamp_ms = @intCast(i + 1) });
+        location = try std.fmt.allocPrint(a, "gs://archive/t/metadata/v{d}.metadata.json", .{i});
+    }
+    const root = try metadata.parse(a, bytes);
+    const log = (try metadata.get(root, "metadata-log")).array.items;
+    try std.testing.expectEqual(@as(usize, 3), log.len);
+    // The newest entry is the location the final commit replaced.
+    try std.testing.expectEqualStrings("gs://archive/t/metadata/v8.metadata.json", try metadata.str(try metadata.get(log[2], "metadata-file")));
+    try std.testing.expectEqualStrings("gs://archive/t/metadata/v6.metadata.json", try metadata.str(try metadata.get(log[0], "metadata-file")));
+    // Malformed bounds fail closed instead of silently disabling retention.
+    var invalid = try metadata.parse(a, bytes);
+    try invalid.object.getPtr("properties").?.object.put(a, metadata.previous_versions_max_property, .{ .string = "0" });
+    try std.testing.expectError(error.InvalidLakeMetadata, metadata.previousVersionsMax(invalid));
+}
+
+/// One table driven by native row commits, as the WAL drain produces them.
+const Table = struct {
+    catalog: managed.Managed,
+    files: row_commit.Files,
+    current: types.Table,
+    commits: usize = 0,
+    fn init(a: A, client: storage.Client, bucket: []const u8, prefix: []const u8, source_uri: []const u8, files_uri: []const u8) !Table {
+        const catalog: managed.Managed = .{ .client = client, .bucket = bucket, .prefix = prefix, .source_uri = source_uri };
+        return .{ .catalog = catalog, .files = .{ .client = client, .bucket = bucket, .prefix = prefix, .uri = files_uri }, .current = try catalog.create(a, "create", schema_request, 1) };
+    }
+    fn deinit(self: *Table, a: A) void {
+        self.current.deinit(a);
+    }
+    /// Commit one single-row CDC transaction whose checkpoint chains to the last.
+    fn commitRow(self: *Table, a: A, timestamp_ms: i64) !void {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const s = arena.allocator();
+        const n = self.commits + 1;
+        const row = try std.json.parseFromSliceLeaky(V, s, try std.fmt.allocPrint(s, "{{\"id\":{d},\"body\":\"row {d}\"}}", .{ n % 97, n }), .{});
+        const batch: row_commit.Batch = .{
+            .batch_id = try std.fmt.allocPrint(s, "b{d}", .{n}),
+            .source = "bench",
+            .epoch = "1",
+            .checkpoint = try std.fmt.allocPrint(s, "{d}", .{n}),
+            .expected_checkpoint = if (n == 1) null else try std.fmt.allocPrint(s, "{d}", .{n - 1}),
+            .key_fields = &.{"id"},
+            .changes = &.{.{ .op = .upsert, .row = row }},
+        };
+        const prepared = try row_commit.prepare(s, self.current, self.files, batch, n, timestamp_ms);
+        const next = try self.catalog.commit(a, .{ .id = batch.batch_id, .expected_metadata_location = self.current.metadata_location, .body = prepared.body, .timestamp_ms = timestamp_ms });
+        self.current.deinit(a);
+        self.current = next;
+        self.commits = n;
+    }
+    /// Expire all but the newest `keep` snapshots, as vacuum's catalog step does.
+    fn expire(self: *Table, a: A, keep: usize, timestamp_ms: i64) !usize {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const s = arena.allocator();
+        const root = try metadata.parse(s, self.current.metadata_json);
+        const snapshots = (try metadata.get(root, "snapshots")).array.items;
+        if (snapshots.len <= keep) return 0;
+        var ids: std.ArrayList(i64) = .empty;
+        for (snapshots[0 .. snapshots.len - keep]) |snapshot| try ids.append(s, try metadata.int(try metadata.get(snapshot, "snapshot-id")));
+        const body = try std.json.Stringify.valueAlloc(s, .{ .requirements = .{.{ .type = "assert-ref-snapshot-id", .ref = "main", .@"snapshot-id" = try metadata.get(root, "current-snapshot-id") }}, .updates = .{.{ .action = "remove-snapshots", .@"snapshot-ids" = ids.items }} }, .{});
+        const next = try self.catalog.commit(a, .{ .id = try std.fmt.allocPrint(s, "expire-{d}", .{self.commits}), .expected_metadata_location = self.current.metadata_location, .body = body, .timestamp_ms = timestamp_ms });
+        self.current.deinit(a);
+        self.current = next;
+        return ids.items.len;
+    }
+    fn counts(self: Table, a: A) !struct { snapshots: usize, metadata_log: usize } {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const root = try metadata.parse(arena.allocator(), self.current.metadata_json);
+        return .{ .snapshots = (try metadata.get(root, "snapshots")).array.items.len, .metadata_log = (try metadata.get(root, "metadata-log")).array.items.len };
+    }
+};
+
+test "lake catalog row commits keep metadata bounded with snapshot expiry" {
+    const alloc = std.testing.allocator;
+    var memory = storage.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var table = try Table.init(alloc, memory.client(), "archive", "events", "gs://archive/events", "gs://archive/events");
+    defer table.deinit(alloc);
+    var midpoint: usize = 0;
+    for (1..241) |i| {
+        try table.commitRow(alloc, @intCast(i + 1));
+        if (i % 40 == 0) _ = try table.expire(alloc, 4, @intCast(i + 1));
+        if (i == 120) midpoint = table.current.metadata_json.len;
+    }
+    const final = try table.counts(alloc);
+    try std.testing.expect(final.snapshots <= 4);
+    try std.testing.expectEqual(metadata.default_previous_versions_max, final.metadata_log);
+    // Metadata size is a function of retained state, not total commit count.
+    try std.testing.expect(table.current.metadata_json.len <= midpoint + midpoint / 4);
+}
+
+fn currentManifests(a: A, table: Table) !iceberg.ManifestList {
+    const root = try metadata.parse(a, table.current.metadata_json);
+    const current = try metadata.int(try metadata.get(root, "current-snapshot-id"));
+    for ((try metadata.get(root, "snapshots")).array.items) |snapshot| {
+        if (try metadata.int(try metadata.get(snapshot, "snapshot-id")) != current) continue;
+        return iceberg.parseManifestListAlloc(a, try row_commit.read(a, table.files, try metadata.str(try metadata.get(snapshot, "manifest-list"))));
+    }
+    return error.InvalidLakeMetadata;
+}
+
+test "lake catalog row commits merge small manifests and keep every file sequence" {
+    const alloc = std.testing.allocator;
+    var memory = storage.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var table = try Table.init(alloc, memory.client(), "archive", "events", "gs://archive/events", "gs://archive/events");
+    defer table.deinit(alloc);
+    const commits = 2 * row_commit.manifest_merge_min_count + 17;
+    for (1..commits + 1) |i| try table.commitRow(alloc, @intCast(i + 1));
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const list = try currentManifests(a, table);
+    // Without merging the list would hold one data and one delete manifest per commit.
+    try std.testing.expect(list.entries.len <= 2 * (row_commit.manifest_merge_min_count + 1));
+    var seen = try a.alloc(u2, commits + 1);
+    @memset(seen, 0);
+    var merged: usize = 0;
+    for (list.entries) |entry| {
+        if (std.mem.indexOf(u8, entry.manifest_path, "-merge-") != null) merged += 1;
+        const manifest = try iceberg.parseDataManifestAlloc(a, try row_commit.read(a, table.files, entry.manifest_path));
+        for (manifest.entries) |raw| {
+            if (raw.status == .deleted) continue;
+            const file = try @import("../iceberg_inventory.zig").resolveManifestEntry(raw, entry, 2);
+            // Sequence N belongs to commit N: one data file and one equality delete.
+            const sequence: usize = @intCast(file.data_sequence_number.?);
+            try std.testing.expect(sequence >= 1 and sequence <= commits);
+            try std.testing.expectEqual(file.data_sequence_number.?, file.file_sequence_number.?);
+            seen[sequence] += 1;
+            if (file.content == .equality_deletes) try std.testing.expectEqual(@as(i32, 1), file.equality_ids[0]);
+        }
+    }
+    try std.testing.expect(merged >= 2);
+    for (seen[1..]) |count| try std.testing.expectEqual(@as(u2, 2), count);
+    // Merged data manifests stay below compaction's whole-manifest limit,
+    // so small-file compaction can still select them.
+    const selection = try @import("compaction.zig").selectResumable(a, table.current, table.files);
+    var selected_merged = false;
+    for (selection.manifests) |path| selected_merged = selected_merged or std.mem.indexOf(u8, path, "-merge-data") != null;
+    try std.testing.expect(selected_merged);
+}
+
+fn percentile(sorted: []const u64, p: usize) u64 {
+    if (sorted.len == 0) return 0;
+    return sorted[@min(sorted.len - 1, (sorted.len * p) / 100)];
+}
+
+// Opt-in: ANTFLY_BENCH_LAKE_COMMITS=<n> runs n managed row commits and prints
+// latency against history size. ANTFLY_BENCH_LAKE_URI=s3://bucket/prefix,
+// gs://bucket/prefix or file:///dir targets a real store (default: memory).
+// ANTFLY_BENCH_LAKE_EXPIRE_KEEP=<k> expires to k snapshots every 10% of the run.
+test "lake catalog commit throughput benchmark" {
+    const total = platform.env.getenvUsize("ANTFLY_BENCH_LAKE_COMMITS") orelse return error.SkipZigTest;
+    if (total == 0) return error.SkipZigTest;
+    const alloc = std.heap.smp_allocator;
+    const keep = platform.env.getenvUsize("ANTFLY_BENCH_LAKE_EXPIRE_KEEP") orelse 0;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = storage.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var opened: ?OpenedObjectStore = null;
+    defer if (opened) |*value| value.deinit();
+    const run_id = platform.time.realtimeNs();
+    var table = if (platform.env.getenv("ANTFLY_BENCH_LAKE_URI")) |uri| remote: {
+        opened = try OpenedObjectStore.initRemoteUriWithOptions(alloc, uri, "antfly-lake-bench", .{ .ensure_bucket = true });
+        const store = opened.?;
+        const base = std.mem.trim(u8, store.prefix, "/");
+        const prefix = try std.fmt.allocPrint(a, "{s}{s}antfly-lake-commit-bench/{d}", .{ base, if (base.len == 0) "" else "/", run_id });
+        const source_uri = if (store.fs_client != null) try std.fmt.allocPrint(a, "file://bench/{d}", .{run_id}) else try std.fmt.allocPrint(a, "{s}/antfly-lake-commit-bench/{d}", .{ std.mem.trimEnd(u8, uri, "/"), run_id });
+        const files_uri = if (store.fs_client != null) try std.fmt.allocPrint(a, "object://{s}/{s}", .{ store.bucket, prefix }) else source_uri;
+        break :remote try Table.init(alloc, store.client, store.bucket, prefix, source_uri, files_uri);
+    } else try Table.init(alloc, memory.client(), "bench", "events", "gs://bench/events", "gs://bench/events");
+    defer table.deinit(alloc);
+    const bucket_size = @max(1, total / 10);
+    var latencies: std.ArrayList(u64) = .empty;
+    var bucket_ns: u64 = 0;
+    std.debug.print("\nlake catalog commit benchmark: commits={d} expire_keep={d} target={s}\n", .{ total, keep, platform.env.getenv("ANTFLY_BENCH_LAKE_URI") orelse "memory" });
+    std.debug.print("{s:>8} {s:>10} {s:>8} {s:>12} {s:>10} {s:>10} {s:>10}\n", .{ "commits", "snapshots", "md_log", "metadata_kib", "p50_ms", "p99_ms", "commit/s" });
+    for (1..total + 1) |i| {
+        const started = platform.time.monotonicNs();
+        try table.commitRow(alloc, @intCast(i + 1));
+        const elapsed = platform.time.monotonicNs() - started;
+        try latencies.append(a, elapsed);
+        bucket_ns += elapsed;
+        if (i % bucket_size == 0 or i == total) {
+            if (keep != 0) _ = try table.expire(alloc, keep, @intCast(i + 1));
+            const sorted = try a.dupe(u64, latencies.items);
+            std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
+            const state = try table.counts(alloc);
+            const rate = if (bucket_ns == 0) 0 else @as(f64, @floatFromInt(latencies.items.len)) * std.time.ns_per_s / @as(f64, @floatFromInt(bucket_ns));
+            std.debug.print("{d:>8} {d:>10} {d:>8} {d:>12.1} {d:>10.2} {d:>10.2} {d:>10.1}\n", .{ i, state.snapshots, state.metadata_log, @as(f64, @floatFromInt(table.current.metadata_json.len)) / 1024.0, @as(f64, @floatFromInt(percentile(sorted, 50))) / std.time.ns_per_ms, @as(f64, @floatFromInt(percentile(sorted, 99))) / std.time.ns_per_ms, rate });
+            latencies.clearRetainingCapacity();
+            bucket_ns = 0;
+        }
+    }
+}

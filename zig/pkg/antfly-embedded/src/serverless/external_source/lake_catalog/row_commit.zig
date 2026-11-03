@@ -203,6 +203,64 @@ pub fn readLimited(a: A, files: Files, uri: []const u8, max_bytes: usize) ![]con
 pub fn listEntry(a: A, entry: iceberg.ManifestListEntry) !V {
     return json(a, .{ .manifest_path = entry.manifest_path, .manifest_length = entry.manifest_length, .partition_spec_id = entry.partition_spec_id, .content = @backingInt(entry.content), .sequence_number = entry.sequence_number orelse 0, .min_sequence_number = entry.min_sequence_number orelse 0, .added_snapshot_id = entry.added_snapshot_id orelse 0, .added_files_count = entry.added_files_count, .existing_files_count = entry.existing_files_count, .deleted_files_count = entry.deleted_files_count, .added_rows_count = entry.added_rows_count, .existing_rows_count = entry.existing_rows_count, .deleted_rows_count = entry.deleted_rows_count });
 }
+/// Fast appends add two manifests per commit and carry every earlier manifest
+/// forward. Without merging, commit cost and reader planning grow with the
+/// number of commits. Once `manifest_merge_min_count` small Antfly-written
+/// unpartitioned manifests of one content kind accumulate, they are rewritten
+/// as one manifest whose entries keep their original snapshot and sequence
+/// numbers with EXISTING status (Iceberg's commit.manifest-merge behavior).
+pub const manifest_merge_min_count: usize = 100;
+/// Merged manifests stop growing at this size and leave the merge pool. The
+/// bound keeps them below compaction's 4 MiB whole-manifest admission limit.
+pub const manifest_merge_target_bytes: u64 = 1024 * 1024;
+const MergeContext = struct { spec_id: i32, spec_string: []const u8, schema_json: []const u8, snapshot_id: i64, sequence: i64, digest: []const u8 };
+fn mergeable(entry: iceberg.ManifestListEntry, spec_id: i32) bool {
+    if (entry.partition_spec_id != spec_id or entry.manifest_length >= manifest_merge_target_bytes) return false;
+    if (std.mem.indexOf(u8, entry.manifest_path, "/metadata/antfly-") == null) return false;
+    return std.mem.endsWith(u8, entry.manifest_path, if (entry.content == .deletes) "-delete.avro" else "-data.avro");
+}
+fn carryManifests(a: A, files: Files, previous: []const iceberg.ManifestListEntry, manifests: *V, context: MergeContext) !void {
+    inline for (.{ iceberg.ManifestContent.data, iceberg.ManifestContent.deletes }) |kind| {
+        var pool: std.ArrayList(iceberg.ManifestListEntry) = .empty;
+        for (previous) |entry| if (entry.content == kind and mergeable(entry, context.spec_id)) try pool.append(a, entry);
+        const merged = if (pool.items.len >= manifest_merge_min_count) try mergeManifests(a, files, pool.items, kind, context) else Merge.unsupported;
+        for (previous) |entry| {
+            if (entry.content != kind) continue;
+            if (merged != .unsupported and mergeable(entry, context.spec_id)) continue;
+            try append(manifests, try listEntry(a, entry));
+        }
+        if (merged == .merged) try append(manifests, merged.merged);
+    }
+}
+const Merge = union(enum) { unsupported, empty, merged: V };
+fn mergeManifests(a: A, files: Files, pool: []const iceberg.ManifestListEntry, comptime kind: iceberg.ManifestContent, context: MergeContext) !Merge {
+    var records = array(a);
+    var rows_count: u64 = 0;
+    var min_sequence: i64 = std.math.maxInt(i64);
+    for (pool) |manifest_entry| {
+        try files.context.ensureActive();
+        const manifest = try iceberg.parseDataManifestAlloc(a, try readLimited(a, files, manifest_entry.manifest_path, manifest_merge_target_bytes));
+        for (manifest.entries) |raw| {
+            if (raw.status == .deleted) continue;
+            const file = try @import("../iceberg_inventory.zig").resolveManifestEntry(raw, manifest_entry, 2);
+            // This writer never emits partitions or column bounds. Anything
+            // richer stays in its original manifest rather than losing stats.
+            if (file.partition_field_count != 0 or file.partition_values.len != 0 or file.lower_bounds.len != 0 or file.upper_bounds.len != 0) return .unsupported;
+            if ((kind == .deletes) != (file.content != .data)) return .unsupported;
+            var data_file = try json(a, .{ .content = @as(i32, @backingInt(file.content)), .file_path = file.file_path, .file_format = file.file_format, .partition = object(a), .record_count = file.record_count, .file_size_in_bytes = file.file_size_in_bytes });
+            if (file.equality_ids.len != 0) try put(a, &data_file, "equality_ids", try json(a, file.equality_ids));
+            const data_sequence = file.data_sequence_number orelse return .unsupported;
+            try append(&records, try json(a, .{ .status = 0, .snapshot_id = file.snapshot_id orelse return .unsupported, .sequence_number = data_sequence, .file_sequence_number = file.file_sequence_number orelse return .unsupported, .data_file = data_file }));
+            rows_count = try std.math.add(u64, rows_count, file.record_count);
+            min_sequence = @min(min_sequence, data_sequence);
+        }
+    }
+    if (records.array.items.len == 0) return .empty;
+    const label = if (kind == .deletes) "delete" else "data";
+    const manifest = try avro.ocf(a, avro.entry_schema, records.array.items, &.{ .{ .key = "schema", .value = context.schema_json }, .{ .key = "partition-spec", .value = "[]" }, .{ .key = "partition-spec-id", .value = context.spec_string }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = if (kind == .deletes) "deletes" else "data" } });
+    const uri = try upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-{s}-merge-{s}.avro", .{ context.digest, label }), manifest);
+    return .{ .merged = try json(a, .{ .manifest_path = uri, .manifest_length = manifest.len, .partition_spec_id = context.spec_id, .content = if (kind == .deletes) @as(i32, 1) else @as(i32, 0), .sequence_number = context.sequence, .min_sequence_number = min_sequence, .added_snapshot_id = context.snapshot_id, .added_files_count = 0, .existing_files_count = records.array.items.len, .deleted_files_count = 0, .added_rows_count = 0, .existing_rows_count = rows_count, .deleted_rows_count = 0 }) };
+}
 /// Allocations belong to a caller-owned attempt arena. The request identity
 /// includes the pinned metadata location; a confirmed CAS conflict may build a
 /// fresh attempt, but an ambiguous commit must resolve before any rebasing.
@@ -246,17 +304,17 @@ pub fn prepare(a: A, table: types.Table, files: Files, batch: Batch, wal_lsn: u6
         spec_id = max_spec + 1;
         try append(&updates, try json(a, .{ .action = "add-spec", .spec = .{ .@"spec-id" = spec_id, .fields = @as([]const V, &.{}) } }));
     }
+    const schema_json = try std.json.Stringify.valueAlloc(a, s, .{});
+    const spec_string = try std.fmt.allocPrint(a, "{d}", .{spec_id});
     if (parent != .null and try m.int(parent) != -1) {
         for ((try m.get(root, "snapshots")).array.items) |snapshot| if (try m.int(try m.get(snapshot, "snapshot-id")) == try m.int(parent)) {
             const bytes = try read(a, files, try m.str(try m.get(snapshot, "manifest-list")));
             var previous = try iceberg.parseManifestListAlloc(a, bytes);
             defer previous.deinit(a);
-            for (previous.entries) |entry| try append(&manifests, try listEntry(a, entry));
+            try carryManifests(a, files, previous.entries, &manifests, .{ .spec_id = spec_id, .spec_string = spec_string, .schema_json = schema_json, .snapshot_id = snapshot_id, .sequence = seq, .digest = &digest });
             break;
         };
     }
-    const schema_json = try std.json.Stringify.valueAlloc(a, s, .{});
-    const spec_string = try std.fmt.allocPrint(a, "{d}", .{spec_id});
     inline for (.{ false, true }) |deletes| {
         const group = if (deletes) rows.keys else rows.data;
         if (group.len != 0) {

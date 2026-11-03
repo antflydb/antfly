@@ -276,13 +276,15 @@ pub const Managed = struct {
                 for (entries.array.items) |entry| try checkUri(try metadata.str(try metadata.get(entry, "statistics-path")), index, root, selected);
             }
         }
+        // Index the parent's snapshot IDs once. Comparing every candidate
+        // snapshot against every parent snapshot made each commit O(S^2).
+        var parent_ids: std.AutoHashMapUnmanaged(i64, void) = .empty;
         if (before) |previous| {
+            const parent_snapshots = (try metadata.get(previous, "snapshots")).array.items;
+            try parent_ids.ensureTotalCapacity(a, @intCast(parent_snapshots.len));
+            for (parent_snapshots) |original| parent_ids.putAssumeCapacity(try metadata.int(try metadata.get(original, "snapshot-id")), {});
             const has_new = for ((try metadata.get(next, "snapshots")).array.items) |snapshot| {
-                const id = try metadata.int(try metadata.get(snapshot, "snapshot-id"));
-                const existed = for ((try metadata.get(previous, "snapshots")).array.items) |original| {
-                    if (try metadata.int(try metadata.get(original, "snapshot-id")) == id) break true;
-                } else false;
-                if (!existed) break true;
+                if (!parent_ids.contains(try metadata.int(try metadata.get(snapshot, "snapshot-id")))) break true;
             } else false;
             if (!has_new) return;
         }
@@ -301,11 +303,7 @@ pub const Managed = struct {
         };
         for ((try metadata.get(next, "snapshots")).array.items) |snapshot| {
             try self.context.ensureActive();
-            const id = try metadata.int(try metadata.get(snapshot, "snapshot-id"));
-            const old = if (before) |previous| for ((try metadata.get(previous, "snapshots")).array.items) |original| {
-                if (try metadata.int(try metadata.get(original, "snapshot-id")) == id) break true;
-            } else false else false;
-            if (old) continue;
+            if (parent_ids.contains(try metadata.int(try metadata.get(snapshot, "snapshot-id")))) continue;
             const list_uri = try metadata.str(try metadata.get(snapshot, "manifest-list"));
             try checkUri(list_uri, index, root, selected);
             const list_bytes = try @import("row_commit.zig").readLimited(a, files, list_uri, @min(budget, 16 * 1024 * 1024));

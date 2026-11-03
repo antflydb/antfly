@@ -50,6 +50,12 @@ const State = struct {
     failures: u32 = 0,
     last_error: ?[]const u8 = null,
 };
+fn backlog(result: std.json.Value) bool {
+    if (result != .object) return false;
+    if (result.object.get("conflicted")) |value| if (value == .bool and value.bool) return false;
+    const remaining = result.object.get("remaining_snapshots") orelse return false;
+    return remaining == .integer and remaining.integer > 0;
+}
 pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local.common_topology_records.TableRecord, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, parent: catalog.types.Context) !bool {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -131,7 +137,12 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
             const complete = if (completed.object.get("complete")) |value| value == .bool and value.bool else true;
             if (complete) {
                 state.request = null;
-                state.stage += 1;
+                // A bounded vacuum that left expirable snapshots plans the next
+                // batch under a fresh operation ID instead of waiting a full
+                // interval, so a large backlog drains in consecutive passes.
+                if (state.stage == 2 and backlog(completed)) {
+                    state.sequence = try std.math.add(u64, state.sequence, 1);
+                } else state.stage += 1;
             }
         } else |err| {
             state.failures +|= 1;
@@ -174,4 +185,14 @@ pub fn status(a: A, binding: local.serverless_external_source_catalog_binding.Bi
     if (saved) |value| if (value.body.len > 65536) return error.InvalidLakeMaintenanceLimits;
     const state: ?State = if (saved) |value| try std.json.parseFromSliceLeaky(State, scratch, value.body, .{}) else null;
     return std.json.Stringify.valueAlloc(a, .{ .policy = policy, .state = state }, .{});
+}
+
+test "external lake scheduler continues a vacuum backlog only after a clean bounded pass" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect(backlog(try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"complete\":true,\"remaining_snapshots\":3}", .{})));
+    try std.testing.expect(!backlog(try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"complete\":true,\"remaining_snapshots\":0}", .{})));
+    try std.testing.expect(!backlog(try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"complete\":true,\"conflicted\":true,\"remaining_snapshots\":3}", .{})));
+    try std.testing.expect(!backlog(try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"complete\":true}", .{})));
 }

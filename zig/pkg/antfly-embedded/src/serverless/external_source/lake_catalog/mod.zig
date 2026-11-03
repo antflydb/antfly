@@ -61,6 +61,7 @@ test {
     _ = row_commit;
     _ = @import("retirement_index.zig");
     _ = @import("tests.zig");
+    _ = @import("scale_tests.zig");
 }
 
 pub const compaction = @import("compaction.zig");

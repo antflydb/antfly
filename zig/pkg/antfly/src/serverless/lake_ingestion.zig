@@ -35,6 +35,11 @@ fn attemptId(a: A, lsn: u64, table: catalog.types.Table) ![]u8 {
     defer a.free(authority);
     return std.fmt.allocPrint(a, "wal-{d}-{s}", .{ lsn, catalog.types.digestHex(authority) });
 }
+fn groupAttemptId(a: A, first: u64, last: u64, table: catalog.types.Table) ![]u8 {
+    const authority = try std.json.Stringify.valueAlloc(a, .{ table.metadata_location, table.version, table.record_key }, .{});
+    defer a.free(authority);
+    return std.fmt.allocPrint(a, "wal-{d}-{d}-{s}", .{ first, last, catalog.types.digestHex(authority) });
+}
 pub fn openQueue(a: A, binding: Binding, options: Options) !local.serverless_object_store_support.OpenedObjectStore {
     if (binding.write_policy != .iceberg_writer or binding.catalog == null) return error.ExternalLakeReadOnly;
     const config = options.node_config orelse return error.NativeArtifactStorageRequired;
@@ -132,9 +137,65 @@ fn keyFieldsEqual(left: []const []const u8, right: []const []const u8) bool {
     for (left, right) |l, r| if (!std.mem.eql(u8, l, r)) return false;
     return true;
 }
-/// One bounded transaction per worker pass. Exact commit intents survive a
+/// Group commit bounds. One catalog snapshot may cover several contiguous WAL
+/// transactions; a group never exceeds the Parquet writer's row limit.
+pub const max_group_changes: usize = catalog.parquet_writer.max_rows;
+pub const max_group_payload_bytes: usize = 8 * 1024 * 1024;
+
+/// A contiguous accepted WAL suffix folded into one source transaction.
+pub const Group = struct { batch: Batch, first_lsn: u64, last_lsn: u64, records: usize };
+
+/// Fold the longest admissible prefix of `records` into one transaction.
+/// Members must share source, epoch and key definition and chain their
+/// checkpoints exactly. Later images of a key replace earlier ones when the
+/// commit is normalized, so the result equals committing each member in order.
+/// A single record is returned unchanged. Allocations belong to `a`.
+pub fn group(a: A, records: []const wal.Record, max_changes: usize, max_bytes: usize) !Group {
+    if (records.len == 0) return error.InvalidWal;
+    const first = try std.json.parseFromSliceLeaky(Batch, a, records[0].payload, .{ .allocate = .alloc_always });
+    var result: Group = .{ .batch = first, .first_lsn = records[0].lsn, .last_lsn = records[0].lsn, .records = 1 };
+    var changes: std.ArrayList(Batch.Change) = .empty;
+    try changes.appendSlice(a, first.changes);
+    var bytes: usize = records[0].payload.len;
+    var tail = first;
+    for (records[1..]) |record| {
+        if (record.lsn != result.last_lsn + 1) break;
+        if (bytes + record.payload.len > max_bytes) break;
+        const next = try std.json.parseFromSliceLeaky(Batch, a, record.payload, .{ .allocate = .alloc_always });
+        if (changes.items.len + next.changes.len > max_changes) break;
+        if (!matchesPrevious(tail, next) or !keyFieldsEqual(tail.key_fields, next.key_fields)) break;
+        try changes.appendSlice(a, next.changes);
+        bytes += record.payload.len;
+        result.last_lsn = record.lsn;
+        result.records += 1;
+        tail = next;
+    }
+    if (result.records == 1) return result;
+    result.batch.batch_id = try std.fmt.allocPrint(a, "wal-group-{d}-{d}", .{ result.first_lsn, result.last_lsn });
+    result.batch.checkpoint = tail.checkpoint;
+    result.batch.changes = changes.items;
+    return result;
+}
+
+/// The WAL coverage a prepared commit body publishes. Saved intents carry it
+/// in their `set-properties` update, so replay needs no extra durable field.
+pub fn plannedCoverage(a: A, body: []const u8) !u64 {
+    const root = try std.json.parseFromSliceLeaky(V, a, body, .{});
+    for ((try catalog.metadata.get(root, "updates")).array.items) |update| {
+        if (!std.mem.eql(u8, try catalog.metadata.str(try catalog.metadata.get(update, "action")), "set-properties")) continue;
+        const value = (try catalog.metadata.get(update, "updates")).object.get("antfly.wal.coverage") orelse continue;
+        return std.fmt.parseInt(u64, try catalog.metadata.str(value), 10);
+    }
+    return error.LakeWalCoverageGap;
+}
+
+/// One bounded group commit per worker pass. Exact commit intents survive a
 /// restart/timeout. A confirmed conflict alone allows a new pinned attempt.
 pub fn drain(a: A, binding: Binding, options: Options, context: Context) !bool {
+    return drainBounded(a, binding, options, context, max_group_changes, max_group_payload_bytes);
+}
+
+pub fn drainBounded(a: A, binding: Binding, options: Options, context: Context, max_changes: usize, max_bytes: usize) !bool {
     var opened = try openQueue(a, binding, options);
     defer opened.deinit();
     const base = try prefix(a, opened.prefix, binding, options);
@@ -146,10 +207,23 @@ pub fn drain(a: A, binding: Binding, options: Options, context: Context) !bool {
     var current = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
     defer current.deinit(a);
     const cut = try coverage(a, current.table);
-    const record = (try store.next(scratch, cut)) orelse return false;
-    var parsed = try std.json.parseFromSlice(Batch, a, record.payload, .{});
-    defer parsed.deinit();
-    const intent_key = try std.fmt.allocPrint(scratch, "{s}/active/{d}.json", .{ base, record.lsn });
+    // Read the bounded pending suffix once. An oversized suffix still makes
+    // progress one transaction at a time.
+    const records: []const wal.Record = suffix: {
+        const pending_range = store.range(scratch, cut) catch |err| switch (err) {
+            error.LakeOverlayTooLarge => {
+                const one = (try store.next(scratch, cut)) orelse return false;
+                break :suffix try scratch.dupe(wal.Record, &.{one});
+            },
+            else => return err,
+        };
+        break :suffix pending_range.records;
+    };
+    if (records.len == 0) return false;
+    if (records[0].lsn != cut + 1) return error.LakeWalCoverageGap;
+    // The intent key names the group's first LSN. A saved intent pins the
+    // exact group chosen before a crash, even if more records arrived since.
+    const intent_key = try std.fmt.allocPrint(scratch, "{s}/active/{d}.json", .{ base, records[0].lsn });
     var client = opened.client;
     var saved = client.getObject(opened.bucket, intent_key, .{ .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => null,
@@ -164,8 +238,10 @@ pub fn drain(a: A, binding: Binding, options: Options, context: Context) !bool {
         defer files.deinit();
         const timestamp: i64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
         const destination = try destinationFiles(scratch, files, binding.source_uri, context);
-        const built = try catalog.row_commit.prepare(scratch, current.table, destination, parsed.value, record.lsn, timestamp);
-        attempt = .{ .id = try attemptId(scratch, record.lsn, current.table), .expected = current.table.metadata_location, .body = built.body, .timestamp_ms = timestamp };
+        const planned = try group(scratch, records, max_changes, max_bytes);
+        const built = try catalog.row_commit.prepare(scratch, current.table, destination, planned.batch, planned.last_lsn, timestamp);
+        const id = if (planned.records == 1) try attemptId(scratch, planned.first_lsn, current.table) else try groupAttemptId(scratch, planned.first_lsn, planned.last_lsn, current.table);
+        attempt = .{ .id = id, .expected = current.table.metadata_location, .body = built.body, .timestamp_ms = timestamp };
         const bytes = try std.json.Stringify.valueAlloc(scratch, attempt, .{});
         var stored = client.putObject(opened.bucket, intent_key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
             error.PreconditionFailed, error.ObjectAlreadyExists => return true,
@@ -193,7 +269,7 @@ pub fn drain(a: A, binding: Binding, options: Options, context: Context) !bool {
         else => return err,
     };
     defer result.deinit(a);
-    if (try coverage(a, result.table) != record.lsn) return error.LakeWalCoverageGap;
+    if (try coverage(a, result.table) != try plannedCoverage(scratch, attempt.body)) return error.LakeWalCoverageGap;
     return true;
 }
 
@@ -429,4 +505,82 @@ test "external lake filesystem WAL retries a rejected intent after metadata pres
     try std.testing.expectEqual(lsn + 1, try accept(a, binding, options, .{}, next));
     try std.testing.expect(try drain(a, binding, options, .{}));
     try std.testing.expect(!try drain(a, binding, options, .{}));
+}
+
+test "external lake WAL grouping stops at chain breaks gaps and limits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const records = [_]wal.Record{
+        .{ .lsn = 4, .operation_id = "a", .payload = "{\"batch_id\":\"a\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"3\",\"checkpoint\":\"4\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":1}}]}" },
+        .{ .lsn = 5, .operation_id = "b", .payload = "{\"batch_id\":\"b\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"4\",\"checkpoint\":\"5\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"delete\",\"row\":{\"id\":1}},{\"op\":\"upsert\",\"row\":{\"id\":2}}]}" },
+        // The checkpoint chain breaks here, so this record starts a new group.
+        .{ .lsn = 6, .operation_id = "c", .payload = "{\"batch_id\":\"c\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"9\",\"checkpoint\":\"6\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":3}}]}" },
+    };
+    const folded = try group(a, &records, 100, 1 << 20);
+    try std.testing.expectEqual(@as(usize, 2), folded.records);
+    try std.testing.expectEqual(@as(u64, 4), folded.first_lsn);
+    try std.testing.expectEqual(@as(u64, 5), folded.last_lsn);
+    try std.testing.expectEqualStrings("wal-group-4-5", folded.batch.batch_id);
+    try std.testing.expectEqualStrings("3", folded.batch.expected_checkpoint.?);
+    try std.testing.expectEqualStrings("5", folded.batch.checkpoint);
+    try std.testing.expectEqual(@as(usize, 3), folded.batch.changes.len);
+    // A single record keeps its original identity, exactly as before grouping.
+    const alone = try group(a, records[2..], 100, 1 << 20);
+    try std.testing.expectEqualStrings("c", alone.batch.batch_id);
+    try std.testing.expectEqual(@as(usize, 1), (try group(a, &records, 2, 1 << 20)).records);
+    try std.testing.expectEqual(@as(usize, 1), (try group(a, &records, 100, records[0].payload.len)).records);
+    var gap = records;
+    gap[1].lsn = 7;
+    try std.testing.expectEqual(@as(usize, 1), (try group(a, &gap, 100, 1 << 20)).records);
+}
+
+test "external lake filesystem WAL group commit folds pending transactions into one snapshot" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-wal-group-commit");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    const binding: Binding = .{ .table_id = "events", .format = .iceberg, .source_uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()}), .schema_fingerprint = "schema", .write_policy = .iceberg_writer, .catalog = .{ .type = .managed } };
+    const options: Options = .{ .node_config = &config, .catalog_table_id = 9 };
+    var opened = try configured.openBindingObjectStoreAlloc(alloc, binding, options);
+    defer opened.deinit();
+    var managed: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri };
+    _ = try managed.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true},{\"id\":2,\"name\":\"body\",\"type\":\"string\",\"required\":false}]}}", 1);
+    const payloads = [_][]const u8{
+        "{\"batch_id\":\"b1\",\"source\":\"s\",\"epoch\":\"1\",\"checkpoint\":\"1\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":1,\"body\":\"a\"}},{\"op\":\"upsert\",\"row\":{\"id\":2,\"body\":\"b\"}}]}",
+        "{\"batch_id\":\"b2\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"1\",\"checkpoint\":\"2\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":2,\"body\":\"c\"}}]}",
+        "{\"batch_id\":\"b3\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"2\",\"checkpoint\":\"3\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"delete\",\"row\":{\"id\":1}}]}",
+        "{\"batch_id\":\"b4\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"3\",\"checkpoint\":\"4\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":3}}]}",
+        "{\"batch_id\":\"b5\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"4\",\"checkpoint\":\"5\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":4}}]}",
+    };
+    for (payloads, 1..) |payload, lsn| try std.testing.expectEqual(@as(u64, lsn), try accept(a, binding, options, .{}, payload));
+    // Four changes fit: b1..b3 fold into one snapshot; b4 would exceed the limit.
+    try std.testing.expect(try drainBounded(a, binding, options, .{}, 4, max_group_payload_bytes));
+    const first = try managed.load(a);
+    try std.testing.expectEqual(@as(u64, 3), try coverage(a, first));
+    try std.testing.expect(try drain(a, binding, options, .{}));
+    try std.testing.expect(!try drain(a, binding, options, .{}));
+    const last = try managed.load(a);
+    try std.testing.expectEqual(@as(u64, 5), try coverage(a, last));
+    const root = try catalog.metadata.parse(a, last.metadata_json);
+    try std.testing.expectEqualStrings("5", try catalog.metadata.str((try catalog.metadata.get(root, "properties")).object.get("antfly.cdc.checkpoint").?));
+    const snapshots = (try catalog.metadata.get(root, "snapshots")).array.items;
+    try std.testing.expectEqual(@as(usize, 2), snapshots.len);
+    const summary = try catalog.metadata.get(snapshots[0], "summary");
+    try std.testing.expectEqualStrings("wal-group-1-3", try catalog.metadata.str(try catalog.metadata.get(summary, "antfly.batch-id")));
+    try std.testing.expectEqualStrings("3", try catalog.metadata.str(try catalog.metadata.get(summary, "antfly.wal.coverage")));
+    // The folded group equals applying b1..b3 in order: one live row (id 2,
+    // body c) and equality deletes for both touched keys.
+    const files = try destinationFiles(a, opened, binding.source_uri, .{});
+    const list = try local.serverless_external_source_mod.iceberg_avro.parseManifestListAlloc(a, try catalog.row_commit.read(a, files, try catalog.metadata.str(try catalog.metadata.get(snapshots[0], "manifest-list"))));
+    try std.testing.expectEqual(@as(usize, 2), list.entries.len);
+    try std.testing.expectEqual(@as(u64, 1), list.entries[0].added_rows_count);
+    try std.testing.expectEqual(@as(u64, 2), list.entries[1].added_rows_count);
+    // The exact original requests stay receipts after their group publishes.
+    try std.testing.expectEqual(@as(u64, 2), try accept(a, binding, options, .{}, payloads[1]));
 }

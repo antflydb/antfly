@@ -346,13 +346,13 @@ pub fn applyAlloc(a: A, metadata_bytes: []const u8, metadata_location: []const u
             _ = root.object.getPtr("refs").?.object.swapRemove(name);
         } else if (std.mem.eql(u8, action, "remove-snapshots")) {
             const ids = try items(try get(update, "snapshot-ids"));
-            try removeIds(&root, "snapshots", "snapshot-id", ids);
-            try removeIds(&root, "snapshot-log", "snapshot-id", ids);
-            inline for (.{ "statistics", "partition-statistics" }) |key| if (root.object.contains(key)) try removeIds(&root, key, "snapshot-id", ids);
+            try removeIds(scratch, &root, "snapshots", "snapshot-id", ids);
+            try removeIds(scratch, &root, "snapshot-log", "snapshot-id", ids);
+            inline for (.{ "statistics", "partition-statistics" }) |key| if (root.object.contains(key)) try removeIds(scratch, &root, key, "snapshot-id", ids);
         } else if (std.mem.eql(u8, action, "remove-schemas")) {
-            try removeIds(&root, "schemas", "schema-id", try items(try get(update, "schema-ids")));
+            try removeIds(scratch, &root, "schemas", "schema-id", try items(try get(update, "schema-ids")));
         } else if (std.mem.eql(u8, action, "remove-partition-specs")) {
-            try removeIds(&root, "partition-specs", "spec-id", try items(try get(update, "spec-ids")));
+            try removeIds(scratch, &root, "partition-specs", "spec-id", try items(try get(update, "spec-ids")));
         } else if (std.mem.eql(u8, action, "set-properties")) {
             const updates = try get(update, "updates");
             if (updates != .object) return error.InvalidLakeCommit;
@@ -371,12 +371,12 @@ pub fn applyAlloc(a: A, metadata_bytes: []const u8, metadata_location: []const u
                     matched = true;
                     const stat = try get(update, mapping[1]);
                     const ids = [_]V{try get(stat, "snapshot-id")};
-                    if (root.object.contains(mapping[0])) try removeIds(&root, mapping[0], "snapshot-id", &ids);
+                    if (root.object.contains(mapping[0])) try removeIds(scratch, &root, mapping[0], "snapshot-id", &ids);
                     try append(scratch, &root, mapping[0], stat);
                 } else if (std.mem.eql(u8, action, "remove-" ++ mapping[0])) {
                     matched = true;
                     const ids = [_]V{try get(update, "snapshot-id")};
-                    if (root.object.contains(mapping[0])) try removeIds(&root, mapping[0], "snapshot-id", &ids);
+                    if (root.object.contains(mapping[0])) try removeIds(scratch, &root, mapping[0], "snapshot-id", &ids);
                 }
             }
             if (!matched) return error.UnsupportedLakeUpdate;
@@ -387,6 +387,11 @@ pub fn applyAlloc(a: A, metadata_bytes: []const u8, metadata_location: []const u
     try put(scratch, &log, "timestamp-ms", .{ .integer = old_time });
     try put(scratch, &log, "metadata-file", try string(scratch, metadata_location));
     try append(scratch, &root, "metadata-log", log);
+    // Iceberg bounds metadata-log by write.metadata.previous-versions-max.
+    // Without it every commit grows the metadata file until it exceeds
+    // max_metadata_bytes. Managed recovery uses its immutable record chain,
+    // never this log, so trimming discards no commit authority.
+    try keepNewest(root.object.getPtr("metadata-log").?, try previousVersionsMax(root));
     try put(scratch, root.object.getPtr("properties").?, "antfly.commit-id", try string(scratch, commit.id));
     try put(scratch, root.object.getPtr("properties").?, "antfly.commit-hash", try string(scratch, &types.commitHash(commit)));
     try validate(root);
@@ -403,17 +408,33 @@ fn appendUnique(a: A, root: *V, list: []const u8, key: []const u8, value: V) !vo
     }
     try append(a, root, list, value);
 }
-fn removeIds(root: *V, list: []const u8, key: []const u8, ids: []const V) !void {
+pub const previous_versions_max_property = "write.metadata.previous-versions-max";
+pub const default_previous_versions_max: usize = 100;
+pub fn previousVersionsMax(root: V) !usize {
+    const value = (try get(root, "properties")).object.get(previous_versions_max_property) orelse return default_previous_versions_max;
+    const count = std.fmt.parseInt(usize, try str(value), 10) catch return error.InvalidLakeMetadata;
+    if (count == 0 or count > 100_000) return error.InvalidLakeMetadata;
+    return count;
+}
+fn keepNewest(values: *V, count: usize) !void {
+    if (values.* != .array) return error.InvalidLakeMetadata;
+    const list = &values.array;
+    if (list.items.len <= count) return;
+    const drop = list.items.len - count;
+    std.mem.copyForwards(V, list.items[0..count], list.items[drop..]);
+    list.items.len = count;
+}
+fn removeIds(a: A, root: *V, list: []const u8, key: []const u8, ids: []const V) !void {
     const values = root.object.getPtr(list) orelse return;
     if (values.* != .array) return error.InvalidLakeMetadata;
+    // One set lookup per entry keeps snapshot expiry linear in table size.
+    var targets: std.AutoHashMapUnmanaged(i64, void) = .empty;
+    defer targets.deinit(a);
+    try targets.ensureTotalCapacity(a, @intCast(ids.len));
+    for (ids) |target| targets.putAssumeCapacity(try int(target), {});
     var kept: usize = 0;
     for (values.array.items) |entry| {
-        const id = try int(try get(entry, key));
-        var remove = false;
-        for (ids) |target| if (try int(target) == id) {
-            remove = true;
-            break;
-        };
+        const remove = targets.contains(try int(try get(entry, key)));
         if (!remove) {
             values.array.items[kept] = entry;
             kept += 1;
