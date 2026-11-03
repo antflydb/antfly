@@ -2950,7 +2950,9 @@ pub const Store = struct {
         }
         const io = self.file.runtime();
         var request = MutationRequest{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease };
-        defer if (publication_possible) |out| out.* = request.publication_possible;
+        defer if (publication_possible) |out| {
+            out.* = request.publication_possible;
+        };
         self.commit_mutex.lockUncancelable(io);
         if (self.commit_tail) |tail| tail.next = &request else self.commit_head = &request;
         self.commit_tail = &request;
