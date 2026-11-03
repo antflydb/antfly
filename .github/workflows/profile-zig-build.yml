@@ -33,6 +33,14 @@ on:
         description: Use the retained PDF owner (required for compiled-pdf-native-test)
         type: boolean
         default: false
+      shared_image_operations:
+        description: Route encoded-image and VP8 operations through media
+        type: boolean
+        default: false
+      shared_lake_execution:
+        description: Route whole lake builds through serverless
+        type: boolean
+        default: false
       cli_optimize:
         description: CLI entry module experiment (shared dependencies retain product mode)
         type: choice
@@ -85,6 +93,8 @@ jobs:
           BUILD_STRIP: ${{ inputs.strip }}
           SHARED_PDF_TEMPLATES: ${{ inputs.shared_pdf_templates }}
           SHARED_PDF_SESSIONS: ${{ inputs.shared_pdf_sessions }}
+          SHARED_IMAGE_OPERATIONS: ${{ inputs.shared_image_operations }}
+          SHARED_LAKE_EXECUTION: ${{ inputs.shared_lake_execution }}
         run: |
           mkdir -p .benchmark-results/compile-costs
           {
@@ -95,6 +105,7 @@ jobs:
             uname -a
             lscpu
             printf 'step=%s\noptimize=%s\ncli_optimize=%s\ntarget=%s\nstrip=%s\ncpu=baseline\nmetal=false\ncuda=false\nsystem_blas=false\nshared_pdf_templates=%s\nshared_pdf_sessions=%s\n' "$BUILD_STEP" "$BUILD_OPTIMIZE" "$CLI_OPTIMIZE" "$BUILD_TARGET" "$BUILD_STRIP" "$SHARED_PDF_TEMPLATES" "$SHARED_PDF_SESSIONS"
+            printf 'shared_image_operations=%s\nshared_lake_execution=%s\n' "$SHARED_IMAGE_OPERATIONS" "$SHARED_LAKE_EXECUTION"
             cat /proc/meminfo
             cat /proc/self/cgroup
             zig env
@@ -108,10 +119,12 @@ jobs:
           BUILD_STRIP: ${{ inputs.strip }}
           SHARED_PDF_TEMPLATES: ${{ inputs.shared_pdf_templates }}
           SHARED_PDF_SESSIONS: ${{ inputs.shared_pdf_sessions }}
+          SHARED_IMAGE_OPERATIONS: ${{ inputs.shared_image_operations }}
+          SHARED_LAKE_EXECUTION: ${{ inputs.shared_lake_execution }}
         run: |
           steps=("$BUILD_STEP")
           if [ "$BUILD_STEP" = products ]; then steps=(antfly capi runtime-archives); fi
-          args=(build "${steps[@]}" "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" "-Dshared-pdf-templates=$SHARED_PDF_TEMPLATES" "-Dshared-pdf-sessions=$SHARED_PDF_SESSIONS" -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all)
+          args=(build "${steps[@]}" "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" "-Dshared-pdf-templates=$SHARED_PDF_TEMPLATES" "-Dshared-pdf-sessions=$SHARED_PDF_SESSIONS" "-Dshared-image-operations=$SHARED_IMAGE_OPERATIONS" "-Dshared-lake-execution=$SHARED_LAKE_EXECUTION" -Dmetal=false -Dcuda=false -Dsystem-blas=false --summary all)
           if [ "$CLI_OPTIMIZE" != inherit ]; then args+=("-Dcli-optimize=$CLI_OPTIMIZE"); fi
           scripts/diagnose-zig-build-memory.sh --command --label build --no-stack-sample \
             --target "$BUILD_TARGET" --optimize "$BUILD_OPTIMIZE" --strip "$BUILD_STRIP" --install-step "$BUILD_STEP" -- \
@@ -125,8 +138,10 @@ jobs:
           BUILD_STRIP: ${{ inputs.strip }}
           SHARED_PDF_TEMPLATES: ${{ inputs.shared_pdf_templates }}
           SHARED_PDF_SESSIONS: ${{ inputs.shared_pdf_sessions }}
+          SHARED_IMAGE_OPERATIONS: ${{ inputs.shared_image_operations }}
+          SHARED_LAKE_EXECUTION: ${{ inputs.shared_lake_execution }}
         run: |
-          args=(build runtime-archives "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" "-Dshared-pdf-templates=$SHARED_PDF_TEMPLATES" "-Dshared-pdf-sessions=$SHARED_PDF_SESSIONS" -Dmetal=false -Dcuda=false -Dsystem-blas=false)
+          args=(build runtime-archives "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" "-Dshared-pdf-templates=$SHARED_PDF_TEMPLATES" "-Dshared-pdf-sessions=$SHARED_PDF_SESSIONS" "-Dshared-image-operations=$SHARED_IMAGE_OPERATIONS" "-Dshared-lake-execution=$SHARED_LAKE_EXECUTION" -Dmetal=false -Dcuda=false -Dsystem-blas=false)
           if [ "$CLI_OPTIMIZE" != inherit ]; then args+=("-Dcli-optimize=$CLI_OPTIMIZE"); fi
           (cd zig && python3 tools/run_bounded_zig_build.py -- "${args[@]}")
           artifacts=()
@@ -142,9 +157,18 @@ jobs:
             owner_checks+=(--forbid 'libantfly-runtime-api_kernel=jpeg2000.codestream.parseState')
             owner_checks+=(--forbid 'libantfly-runtime-api_kernel=reader.Reader.decodeImageToRgbaGuardedAlloc')
           fi
-          if [ "$SHARED_PDF_SESSIONS" = true ]; then
+          if [ "$SHARED_PDF_SESSIONS" = true ] || [ "$SHARED_IMAGE_OPERATIONS" = true ]; then
             owner_checks+=(--forbid 'libantfly-storage-engine=reader.Reader.decodeImageToRgbaGuardedAlloc')
             owner_checks+=(--forbid 'libantfly-inference-core=reader.Reader.decodeImageToRgbaGuardedAlloc')
+          fi
+          if [ "$SHARED_IMAGE_OPERATIONS" = true ]; then
+            for owner in libantfly-storage-engine libantfly-inference-core libantfly-runtime-api_kernel libantfly-runtime-serverless; do
+              owner_checks+=(--forbid "$owner=jpeg.decodeRgba")
+              owner_checks+=(--forbid "$owner=webp.Vp8Decoder.decode")
+            done
+          fi
+          if [ "$SHARED_LAKE_EXECUTION" = true ]; then
+            owner_checks+=(--forbid 'libantfly-runtime-api_kernel=lake_execution_build_impl.')
           fi
           python3 scripts/report_zig_archive_work.py "${artifacts[@]}" \
             --forbid 'libantfly-runtime-local_query=BoundaryImpl(storage.engine.VTable).dispatchLocal' \
@@ -190,11 +214,13 @@ jobs:
           BUILD_STRIP: ${{ inputs.strip }}
           SHARED_PDF_TEMPLATES: ${{ inputs.shared_pdf_templates }}
           SHARED_PDF_SESSIONS: ${{ inputs.shared_pdf_sessions }}
+          SHARED_IMAGE_OPERATIONS: ${{ inputs.shared_image_operations }}
+          SHARED_LAKE_EXECUTION: ${{ inputs.shared_lake_execution }}
         working-directory: zig
         run: |
           steps=("$BUILD_STEP")
           if [ "$BUILD_STEP" = products ]; then steps=(antfly capi runtime-archives); fi
-          args=(build "${steps[@]}" "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" "-Dshared-pdf-templates=$SHARED_PDF_TEMPLATES" "-Dshared-pdf-sessions=$SHARED_PDF_SESSIONS" -Dmetal=false -Dcuda=false -Dsystem-blas=false)
+          args=(build "${steps[@]}" "-Dtarget=$BUILD_TARGET" -Dcpu=baseline "-Doptimize=$BUILD_OPTIMIZE" "-Dstrip=$BUILD_STRIP" "-Dshared-pdf-templates=$SHARED_PDF_TEMPLATES" "-Dshared-pdf-sessions=$SHARED_PDF_SESSIONS" "-Dshared-image-operations=$SHARED_IMAGE_OPERATIONS" "-Dshared-lake-execution=$SHARED_LAKE_EXECUTION" -Dmetal=false -Dcuda=false -Dsystem-blas=false)
           if [ "$CLI_OPTIMIZE" != inherit ]; then args+=("-Dcli-optimize=$CLI_OPTIMIZE"); fi
           python3 ../scripts/collect_zig_time_report.py \
             --output ../.benchmark-results/compile-costs/compiler-time-report.json -- \

@@ -1,0 +1,112 @@
+name: Qualify paired Zig product costs
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Frozen baseline commit or ref
+        type: string
+        required: true
+      candidate_ref:
+        description: Candidate ref (empty uses the workflow commit)
+        type: string
+        default: ''
+      target:
+        type: choice
+        default: aarch64-linux-musl
+        options: [aarch64-linux-musl, x86_64-linux-gnu]
+      pairs:
+        description: Alternating baseline/candidate pairs (one is a screen)
+        type: choice
+        default: '3'
+        options: ['1', '3', '5']
+      baseline_args:
+        description: JSON array of additional baseline -Dname=value options
+        type: string
+        default: '[]'
+      candidate_args:
+        description: JSON array of additional candidate -Dname=value options
+        type: string
+        default: '["-Dshared-image-operations=true","-Dshared-lake-execution=true"]'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-cache
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-cache/global
+  ANTFLY_ZIG_MAX_RSS: '21474836480'
+
+jobs:
+  qualify:
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.candidate_ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: true
+      - uses: ./.github/actions/load-toolchain-policy
+        id: toolchain
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Install measurement tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential llvm pkg-config time
+      - uses: ./.github/actions/prepare-zig-dependencies
+        with:
+          mirror-only: 'true'
+      - name: Verify actual runner capacity
+        run: |
+          python3 - <<'PYCODE'
+          import platform, sys
+          sys.path.insert(0, "zig/tools")
+          from run_bounded_zig_build import detect_memory_limit
+          if platform.system() != "Linux" or detect_memory_limit() < 24 * 1024**3:
+              raise SystemExit("paired heavy profile requires actual Linux memory >=24 GiB")
+          PYCODE
+      - name: Verify comparison and memory collectors
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_measure_paired_zig_products.py'
+          python3 -m unittest discover -s scripts -p 'test_*zig*memory.py'
+      - name: Measure both installed products with normal scheduler policy
+        env:
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref || github.sha }}
+          TARGET: ${{ inputs.target }}
+          PAIRS: ${{ inputs.pairs }}
+          BASELINE_ARGS: ${{ inputs.baseline_args }}
+          CANDIDATE_ARGS: ${{ inputs.candidate_args }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+          from pathlib import Path
+          args = [sys.executable, "scripts/measure_paired_zig_products.py",
+                  "--baseline", os.environ["BASELINE_REF"],
+                  "--candidate", os.environ["CANDIDATE_REF"],
+                  "--pairs", os.environ["PAIRS"], "--target", os.environ["TARGET"],
+                  "--scope", "normal-runner",
+                  "--worktree-name", "build-cost-paired-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"],
+                  "--report", ".benchmark-results/compile-costs/paired-products.json"]
+          packages = Path(os.environ["ZIG_GLOBAL_CACHE_DIR"]) / "p"
+          if packages.is_dir():
+              args += ["--dependency-cache", str(packages)]
+          for side in ("baseline", "candidate"):
+              values = json.loads(os.environ[side.upper() + "_ARGS"])
+              if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+                  raise SystemExit("profile arguments must be JSON arrays of strings")
+              args += ["--" + side + "-arg=" + value for value in values]
+          subprocess.run(args, check=True)
+          PY
+      - name: Retain exact profiles, samples, artifacts and failed runs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: paired-products-${{ inputs.target }}-${{ github.run_id }}
+          path: .benchmark-results/compile-costs/
+          if-no-files-found: error
