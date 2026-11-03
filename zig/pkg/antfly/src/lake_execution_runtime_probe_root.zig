@@ -66,7 +66,7 @@ pub fn main(init: @import("std").process.Init) !void {
     const a = std.heap.smp_allocator;
     const binary = try std.process.executablePathAlloc(init.io, a);
     defer a.free(binary);
-    const provenance = try std.json.Stringify.valueAlloc(a, .{ .path = binary, .builtin_is_test = @import("builtin").is_test }, .{});
+    const provenance = try std.json.Stringify.valueAlloc(a, .{ .path = binary, .builtin_is_test = @import("builtin").is_test, .optimize = @tagName(@import("builtin").mode) }, .{});
     defer a.free(provenance);
     std.debug.print("LAKE_RUNTIME_EXECUTABLE {s}\n", .{provenance});
     try @import("api/lake_execution_runtime_probe.zig").run(init.io);

@@ -41,6 +41,8 @@ class Evidence(unittest.TestCase):
                     provider_io_dispatch_calls=1,
                     working_quota_layers=2 if mode == "native" else 1,
                     provider_quota_peak_bytes=1,
+                    source_optimize="debug",
+                    provider_optimize=0,
                     source_is_test=False,
                     provider_is_test=False,
                     mode=mode,
@@ -85,6 +87,20 @@ class Evidence(unittest.TestCase):
                 1,
                 8,
             )
+
+    def test_optimized_evidence_requires_both_compilation_modes(self):
+        fast = (
+            self.log()
+            .replace('"source_optimize": "debug"', '"source_optimize": "fast"')
+            .replace('"provider_optimize": 0', '"provider_optimize": 1')
+        )
+        self.assertEqual(len(observations(fast, 1, 8, optimize="fast")), 6)
+        for log in (
+            self.log(),
+            fast.replace('"provider_optimize": 1', '"provider_optimize": 0'),
+        ):
+            with self.assertRaisesRegex(ValueError, "optimization mode mismatch"):
+                observations(log, 1, 8, optimize="fast")
 
     def test_incorrect_workload_fails(self):
         with self.assertRaises(ValueError):

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Measure source/native Debug lake attempts; no release/default claim."""
+"""Measure source/native lake attempts in a verified compilation mode."""
 
 import argparse
 import hashlib
@@ -22,6 +22,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import signal
 import statistics
 import subprocess
@@ -42,7 +43,13 @@ PHASES = ("cold", "checkpoint_resume", "incremental_append")
 
 
 def observations(
-    log, rounds, rows, quota_layers=2, io_dispatch="linear", headroom="auto"
+    log,
+    rounds,
+    rows,
+    quota_layers=2,
+    io_dispatch="linear",
+    headroom="auto",
+    optimize="debug",
 ):
     found = [
         json.loads(line.split("LAKE_RUNTIME ", 1)[1])
@@ -59,6 +66,11 @@ def observations(
     if len(keys) != len(set(keys)) or set(keys) != expected:
         raise ValueError("incomplete or duplicate runtime observations")
     for item in found:
+        provider_mode = {"debug": 0, "fast": 1, "safe": 2}[optimize]
+        if item["source_optimize"] != optimize or (
+            item["mode"] == "native" and item["provider_optimize"] != provider_mode
+        ):
+            raise ValueError("source/provider optimization mode mismatch")
         if item["headroom_mode"] != headroom or (
             item["mode"] == "native" and item["headroom_queries"] <= 0
         ):
@@ -163,6 +175,9 @@ def main():
     parser.add_argument(
         "--headroom", choices=("auto", "unknown", "low"), default="auto"
     )
+    parser.add_argument(
+        "--optimize", choices=("debug", "fast", "safe"), default="debug"
+    )
     parser.add_argument("--timeout", type=int, default=1800)
     args = parser.parse_args()
     if not 1 <= args.rows <= 4096 or not 1 <= args.rounds <= 8:
@@ -176,8 +191,8 @@ def main():
         "--",
         "build",
         "lake-execution-runtime-probe",
-        "-Doptimize=debug",
-        "-Dstrip=false",
+        f"-Doptimize={args.optimize}",
+        f"-Dstrip={str(args.optimize != 'debug').lower()}",
         "-Dcpu=baseline",
         "-Dshared-image-operations=true",
         "-Dshared-lake-execution=true",
@@ -199,7 +214,8 @@ def main():
         ZIG_GLOBAL_CACHE_DIR=str(ZIG / ".zig-cache/global"),
     )
     report = {
-        "format_version": 1,
+        "format_version": 2,
+        "optimize": args.optimize,
         "passed": False,
         "host": platform.platform(),
         "command": command,
@@ -208,7 +224,7 @@ def main():
         "native_quota_layers": args.native_quota_layers,
         "io_dispatch": args.io_dispatch,
         "headroom": args.headroom,
-        "scope": "Debug non-test executable and non-test provider archive; attempt wall time with SMP backing allocator (no allocation stack tracing), alternating paired order, and charged quota peaks; API cache counters exclude provider-private cache; declaration roots do not count internal file reuse; no release SLA/default approval",
+        "scope": "Verified-mode CPU-only non-test executable and provider archive; attempt wall time with SMP backing allocator (no allocation stack tracing), alternating paired order, and charged quota peaks; API cache counters exclude provider-private cache; declaration roots do not count internal file reuse; no release SLA/default approval",
     }
     try:
         report["authored_inputs_before"] = authored_inputs()
@@ -262,6 +278,8 @@ def main():
         ]
         if len(executable_headers) != 1 or executable_headers[0]["builtin_is_test"]:
             raise ValueError("missing normal executable provenance")
+        if executable_headers[0]["optimize"] != args.optimize:
+            raise ValueError("executable optimization mode mismatch")
         binary = Path(executable_headers[0]["path"]).resolve()
         binary.relative_to((ZIG / ".zig-cache").resolve())
         binary_hash = hashlib.sha256()
@@ -273,6 +291,18 @@ def main():
             bytes=binary.stat().st_size,
             sha256=binary_hash.hexdigest(),
         )
+        retained = args.report.parent / "lake-runtime-probes" / binary_hash.hexdigest()
+        retained.mkdir(parents=True, exist_ok=True)
+        retained_binary = retained / "lake-execution-runtime-probe"
+        if not retained_binary.exists():
+            shutil.copy2(binary, retained_binary)
+        if (
+            hashlib.sha256(retained_binary.read_bytes()).hexdigest()
+            != binary_hash.hexdigest()
+        ):
+            raise ValueError("retained executable does not match measured program")
+        report["executable"]["cache_path"] = str(binary)
+        report["executable"]["path"] = str(retained_binary)
         data = observations(
             contents,
             args.rounds,
@@ -280,6 +310,7 @@ def main():
             args.native_quota_layers,
             args.io_dispatch,
             args.headroom,
+            args.optimize,
         )
         report["observations"] = data
         medians = {}

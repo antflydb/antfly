@@ -219,6 +219,12 @@ jobs:
       - name: Whole lake operation runtime and allocation probe
         working-directory: zig
         run: python3 tools/check_lake_execution_runtime.py --report ../.benchmark-results/owner-qualification/lake-runtime.json --rows 1024 --rounds 4
+      - name: Qualify optimized image equivalence and lake attempts
+        if: inputs.full_validation || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        working-directory: zig
+        run: |
+          python3 tools/check_image_owner_transport.py --optimize fast --report ../.benchmark-results/owner-qualification/image-releasefast.json --timeout 1800
+          python3 tools/check_lake_execution_runtime.py --optimize fast --report ../.benchmark-results/owner-qualification/lake-releasefast.json --rows 1024 --rounds 4
       - name: Reopen pinned catalog and artifact clients through real S3-compatible I/O
         run: scripts/test-lake-s3-integration.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

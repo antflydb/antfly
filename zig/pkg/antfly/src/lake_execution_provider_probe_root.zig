@@ -102,10 +102,19 @@ fn probeReads() callconv(.c) u64 {
 fn probeBytes() callconv(.c) u64 {
     return cache_bytes.load(.monotonic);
 }
+fn probeOptimize() callconv(.c) u8 {
+    return switch (@import("builtin").mode) {
+        .debug => 0,
+        .fast => 1,
+        .safe => 2,
+        .small => 3,
+    };
+}
 fn probeIsTest() callconv(.c) u8 {
     return @intFromBool(@import("builtin").is_test);
 }
 comptime {
+    @export(&probeOptimize, .{ .name = "antfly_lake_probe_optimize", .visibility = .hidden });
     @export(&probeIsTest, .{ .name = "antfly_lake_probe_builtin_is_test", .visibility = .hidden });
     @export(&probeParallelJobs, .{ .name = "antfly_lake_probe_parallel_jobs", .visibility = .hidden });
     @export(&probeFamilyNs, .{ .name = "antfly_lake_probe_family_ns", .visibility = .hidden });

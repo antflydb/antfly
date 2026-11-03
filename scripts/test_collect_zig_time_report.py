@@ -41,12 +41,16 @@ class DecoderTests(unittest.TestCase):
         decoder.accept(struct.pack("<BIB", 2, 0, 2))
         decoder.accept(bytes((1, 0)))
         value = decoder.report()
+        self.assertTrue(value["build_succeeded"])
+        self.assertTrue(value["diagnostic_only"])
         self.assertEqual(value["steps"][0]["status"], 2)
         compile = value["compiles"][0]
         self.assertEqual(compile["step"], "unit")
         self.assertEqual(compile["ns_total"], 123)
         self.assertEqual(compile["stats"], dict(zip(STAT_NAMES, range(13))))
         self.assertEqual(compile["llvm_pass_timings"], "llvm")
+        self.assertEqual(compile["top_semantic_declarations"], compile["declarations"])
+        self.assertEqual(compile["top_codegen_declarations"], compile["declarations"])
         self.assertEqual(
             compile["declarations"],
             [
@@ -60,6 +64,14 @@ class DecoderTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_idle_server_with_failed_or_incomplete_step_is_not_a_successful_build(self):
+        decoder = Decoder()
+        decoder.accept(struct.pack("<BBHqII", 0, 0, 1, 5, 1, 4) + b"unit" + b"\x01")
+        decoder.accept(compile_message())
+        self.assertFalse(decoder.report()["build_succeeded"])
+        decoder.accept(struct.pack("<BIB", 2, 0, 3))
+        self.assertFalse(decoder.report()["build_succeeded"])
 
     def test_truncated_or_changed_protocol_rejected(self):
         for message in (

@@ -165,6 +165,11 @@ class Decoder:
     def report(self):
         return dict(
             format_version=1,
+            build_succeeded=bool(self.compiles)
+            and self.status == 0
+            and 3 not in self.statuses
+            and all(self.statuses[index] == 2 for index in self.compiles),
+            diagnostic_only=True,
             protocol_sha256=ABI_SHA256,
             payload_reader_sha256=READER_SHA256,
             status=self.status,
@@ -177,7 +182,20 @@ class Decoder:
                 for index, name in enumerate(self.steps)
             ],
             compiles=[
-                dict(step=self.steps[index], **value)
+                dict(
+                    step=self.steps[index],
+                    top_semantic_declarations=sorted(
+                        value["declarations"],
+                        key=lambda row: row["sema_ns"],
+                        reverse=True,
+                    )[:20],
+                    top_codegen_declarations=sorted(
+                        value["declarations"],
+                        key=lambda row: row["codegen_ns"],
+                        reverse=True,
+                    )[:20],
+                    **value,
+                )
                 for index, value in sorted(self.compiles.items())
             ],
         )
@@ -363,7 +381,7 @@ def main():
                 decoder.accept(data)
             else:
                 raise TimeoutError("time-report build exceeded timeout")
-        if not decoder.compiles or 3 in decoder.statuses:
+        if not decoder.report()["build_succeeded"]:
             raise RuntimeError(
                 "missing compiler reports or failed build steps; inspect raw log"
             )
