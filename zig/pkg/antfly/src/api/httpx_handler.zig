@@ -7393,6 +7393,7 @@ pub const AntflyApiHandler = struct {
             }
             if (std.mem.startsWith(u8, @errorName(err), "ChatGPT")) return ctx.status(chatGPTStatus(err)).json(.{ .error_code = @errorName(err), .upstream = generation_runner.chatgpt_failure.summary() });
             if (try respondRetrievalReadError(ctx, err)) |response| return response;
+            if (try respondGenerationOutputError(ctx, err)) |response| return response;
             return switch (err) {
                 error.TreeRootSetTooLarge => {
                     _ = ctx.status(422);
@@ -7500,7 +7501,13 @@ pub const AntflyApiHandler = struct {
         };
     }
 
+    fn respondGenerationOutputError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
+        var response = (try http_server_mod.generationOutputErrorResponse(ctx.allocator, err)) orelse return null;
+        return try respondOwnedContextualResponse(ctx, &response, ctx.allocator);
+    }
+
     fn researchErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (try respondGenerationOutputError(ctx, err)) |response| return response;
         return switch (err) {
             error.InvalidResearchAgentRequest, error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => jsonErrorResponse(ctx, 400, "invalid research agent request"),
             error.InlineCredentialNotAllowed => jsonErrorResponse(ctx, 400, "durable research jobs must reference credentials through the secret store, environment or server connections"),
@@ -18905,6 +18912,28 @@ test "SQL catalog NUMERIC HTTP delivery preserves exact cells descriptors and NU
         }
         try std.testing.expectEqual(@as(i64, 24), result.columns[0].numeric_modifier.?.precision);
         try std.testing.expectEqual(@as(i64, 4), result.columns[0].numeric_modifier.?.scale);
+    }
+}
+
+test "httpx agent generation output failures preserve terminal upstream status and guidance" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |research| {
+        var request = try httpx.Request.init(a, .POST, if (research) "http://localhost/db/v1/agents/research" else "http://localhost/db/v1/agents/retrieval");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = if (research)
+            try AntflyApiHandler.researchErrorResponse(&ctx, error.InferenceOutputIncomplete)
+        else
+            (try AntflyApiHandler.respondGenerationOutputError(&ctx, error.InferenceOutputIncomplete)).?;
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 502), response.status.code);
+        try std.testing.expectEqualStrings("application/json", response.header("content-type").?);
+        try std.testing.expect(response.header("Retry-After") == null);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("InferenceOutputIncomplete", parsed.value.object.get("error").?.string);
+        try std.testing.expect(std.mem.indexOf(u8, parsed.value.object.get("message").?.string, "reasoning effort") != null);
     }
 }
 

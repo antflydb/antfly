@@ -27646,7 +27646,18 @@ fn contextualUnsupportedQueryResponse(alloc: std.mem.Allocator) !contextual_oper
     };
 }
 
+/// Public agents share one upstream-output failure contract. This is a
+/// completed provider attempt, so automatic retry guidance would be misleading.
+pub fn generationOutputErrorResponse(alloc: std.mem.Allocator, err: anyerror) !?contextual_operations.OwnedResponse {
+    if (err != error.InferenceOutputIncomplete) return null;
+    return contextual_operations.jsonWithStatus(502, try std.json.Stringify.valueAlloc(alloc, .{
+        .@"error" = "InferenceOutputIncomplete",
+        .message = "generator output was truncated; increase the output token budget or reduce reasoning effort",
+    }, .{}), false);
+}
+
 fn queryBuilderFailureResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
+    if (try generationOutputErrorResponse(alloc, err)) |response| return response;
     return switch (err) {
         error.InvalidQueryBuilderRequest => try contextual_operations.jsonErrorAlloc(alloc, 400, "invalid query builder request"),
         error.InvalidQueryBuilderGeneration, error.InvalidAgentToolCall => try contextual_operations.jsonErrorAlloc(alloc, 422, "generator did not submit a valid query tool call"),
@@ -58419,6 +58430,19 @@ test "api http server executes direct foreign table aggregations through registr
     var unsupported = try std.json.parseFromSlice(public_table_http.UnsupportedQueryError, alloc, unsupported_response.body, .{});
     defer unsupported.deinit();
     try std.testing.expectEqualStrings("unsupported_query_request", unsupported.value.@"error");
+}
+
+test "query builder incomplete generation preserves upstream failure and budget guidance" {
+    const a = std.testing.allocator;
+    var response = try queryBuilderFailureResponse(a, error.InferenceOutputIncomplete);
+    defer response.deinit(a);
+    try std.testing.expectEqual(@as(u16, 502), response.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("InferenceOutputIncomplete", parsed.value.object.get("error").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.object.get("message").?.string, "token budget") != null);
+    for (response.headers) |header| try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, "Retry-After"));
+    try std.testing.expect(try generationOutputErrorResponse(a, error.InvalidQueryBuilderRequest) == null);
 }
 
 test "query builder dependency 503 responses preserve public retry contract" {

@@ -16157,6 +16157,11 @@ export interface components {
             /** @description Top-k sampling parameter. */
             top_k?: number;
         };
+        /**
+         * @description OpenAI reasoning effort; model support varies. Omit to use the model default.
+         * @enum {string}
+         */
+        OpenAIReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
         /** @description Configuration for the Ollama generative AI provider. */
         OllamaGeneratorConfig: {
             /** @enum {string} */
@@ -16176,8 +16181,10 @@ export interface components {
              * @description Controls randomness in generation (0.0-2.0).
              */
             temperature?: number;
-            /** @description Maximum number of tokens to generate. */
+            /** @description Maximum number of tokens to generate, including reasoning tokens for thinking models. */
             max_tokens?: number;
+            /** @description Optional reasoning effort for Ollama's OpenAI-compatible endpoint. Use none to disable thinking on models that support it; supported values depend on the model. */
+            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
             /**
              * Format: float
              * @description Nucleus sampling parameter.
@@ -16219,11 +16226,6 @@ export interface components {
             /** @description HTTP response timeout in seconds for Inference API calls. */
             timeout?: number;
         };
-        /**
-         * @description OpenAI reasoning effort; model support varies. Omit to use the model default.
-         * @enum {string}
-         */
-        OpenAIReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
         /** @description Personal ChatGPT plan for interactive generation. Credentials stay in the local runtime. */
         ChatGPTGeneratorConfig: {
             /** @enum {string} */
