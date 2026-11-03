@@ -1289,6 +1289,12 @@ Producer sizing measures preparation separately from writer admission and
 publication, using the same cumulative publication-time counter as index replay.
 Contention must not force cheap preparation into ever smaller windows and
 multiply its fixed checkpoint/publication costs.
+Resolver replay and durable backfill receive alternating bounded turns while
+both have work. Native namespace scheduling retains this choice across runtime
+refresh, and resident workers keep it with their lifecycle. Backfill does not
+wait for a moving replay head to become idle, and a refused backfill turn cannot
+prevent ordinary replay from freeing capacity on its next turn. Sparse repair
+has separate limits for key probes and materialized artifacts, plus a deadline.
 Publication recovery witnesses admit the affected
 namespace and fence global SQL/FK decisions; unrelated unfinished DDL does not
 require a global clean-sweep witness. Quiescent allocator caches move through an

@@ -29964,7 +29964,10 @@ pub const DB = struct {
             if (self.resolution_runtime == null) try self.initResolutionRuntime();
             const resolution = self.resolution_runtime.?;
             resolution.notifySequence(self.core.nextDerivedSequence());
-            if ((!self.local_execution.optional_runtime_workers_enabled or !self.resolver_workers_enabled) and !resolution.worker_started.load(.acquire)) try resolution.catchUpOnce(deadline);
+            if ((!self.local_execution.optional_runtime_workers_enabled or !self.resolver_workers_enabled) and !resolution.worker_started.load(.acquire)) {
+                const state = self.borrowed_group_source_state orelse &self.group_source_owner.state;
+                try resolution.catchUpOnce(deadline, state.resolution_backfill_turn.fetchXor(1, .monotonic) == 0);
+            }
         }
     }
 
@@ -32627,10 +32630,10 @@ pub const DB = struct {
                     // not the next append sequence. Include that record when
                     // recovering a missed runtime notification.
                     if (drained_sequence > 0) runtime.notifySequence(drained_sequence);
-                    if (options.bounded_replay)
-                        try runtime.catchUpOnce(options.deadline_ns orelse monotonicTimeNs() +| @import("derived/replay_budget.zig").Controller.quantum_ns)
-                    else
-                        try runtime.catchUp();
+                    if (options.bounded_replay) {
+                        const state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
+                        try runtime.catchUpOnce(options.deadline_ns orelse monotonicTimeNs() +| @import("derived/replay_budget.zig").Controller.quantum_ns, state.resolution_backfill_turn.fetchXor(1, .monotonic) == 0);
+                    } else try runtime.catchUp();
                 }
 
                 if (self.promotion_runtime) |runtime| {
@@ -144033,9 +144036,9 @@ test "inline resolver replacement resolution deadline resumes a large record acr
         const runtime = db.resolution_runtime.?;
         runtime.notifySequence(sequence);
         runtime.ordered_writer = .{ .ptr = &db, .process = Clock.process };
-        try runtime.catchUpOnce(0);
+        try runtime.catchUpOnce(0, false);
         try std.testing.expect(runtime.replay_progress == null);
-        try runtime.catchUpOnce(1);
+        try runtime.catchUpOnce(1, false);
         try std.testing.expectEqual(@as(usize, 1), runtime.replay_progress.?.next_key);
         try std.testing.expect(runtime.applied_sequence.load(.acquire) < sequence);
         const first = try internal_keys.resolutionArtifactKeyAlloc(a, "doc:000", "resolved");
@@ -144052,9 +144055,9 @@ test "inline resolver replacement resolution deadline resumes a large record acr
         const runtime = db.resolution_runtime.?;
         try std.testing.expectEqual(@as(usize, 1), runtime.replay_progress.?.next_key);
         runtime.ordered_writer = .{ .ptr = &db, .process = Clock.process };
-        try runtime.catchUpOnce(2);
+        try runtime.catchUpOnce(2, false);
         try std.testing.expectEqual(@as(usize, 2), runtime.replay_progress.?.next_key);
-        try runtime.catchUpOnce(std.math.maxInt(u64));
+        try runtime.catchUpOnce(std.math.maxInt(u64), false);
         try std.testing.expectEqual(@as(usize, 34), runtime.replay_progress.?.next_key);
         // Ordinary drains/workers must honor a manual owner's partial cut.
         runtime.ordered_writer = .{ .ptr = db.resolution_append_context.?, .process = processOrderedResolutions };
@@ -146088,6 +146091,50 @@ test "background enrichment turn keeps never produced graph sources sparse acros
         defer a.free(count);
         try std.testing.expectEqual(@as(?usize, 0), try graph_edge_contender.decodeVisibleCount(count, db.core.index_manager.graphIndex("g").?.config.coverage_generation));
     }
+}
+
+test "background enrichment turn services resolver backfill despite a moving tail across reopen" {
+    const a = std.testing.allocator;
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    var tmp = try TestDirectory.init("fair-resolver-backfill");
+    defer tmp.cleanup();
+    const options: OpenOptions = .{ .backend_runtime = host.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtime_workers = false, .start_independent_maintenance = false };
+    var state: @import("group_source_owner.zig").State = .{};
+    defer state.deinit();
+    {
+        var db = try DB.open(a, tmp.path(), options);
+        defer db.close();
+        db.borrowed_group_source_state = &state;
+        _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ uslug _entity.text }}", .promote = false }, .{ .drain_backfill = false });
+        try db.runUntilIdle();
+        try db.resolution_runtime.?.requestReresolveBacklog();
+        try std.testing.expect(try resolution_runtime_mod.hasDurableReresolveBacklog(db.core.store));
+    }
+    // Start with ordinary replay, then require service of repair. Namespace
+    // scheduling state survives the same wrapper replacement as Native Lite.
+    state.resolution_backfill_turn.store(1, .monotonic);
+    var saw_replay_progress = false;
+    var backfill_completed = false;
+    for (0..4) |i| {
+        var db = try DB.open(a, tmp.path(), options);
+        defer db.close();
+        db.borrowed_group_source_state = &state;
+        var value: [64]u8 = undefined;
+        try db.batch(.{ .writes = &.{.{ .key = "moving", .value = try std.fmt.bufPrint(&value, "{{\"turn\":{d}}}", .{i}) }}, .sync_level = .write });
+        const runtime = db.resolution_runtime.?;
+        const before = runtime.applied_sequence.load(.acquire);
+        const target = db.core.nextDerivedSequence();
+        runtime.notifySequence(target);
+        // A new commit precedes every turn: gating repair on an already
+        // caught-up head never permits it, even with an otherwise empty lane.
+        try std.testing.expect(before < target);
+        _ = try db.runBackgroundTurnWithCancellation(.none, .replay);
+        saw_replay_progress = saw_replay_progress or runtime.applied_sequence.load(.acquire) > before;
+        backfill_completed = backfill_completed or !try resolution_runtime_mod.hasDurableReresolveBacklog(db.core.store);
+    }
+    try std.testing.expect(saw_replay_progress);
+    try std.testing.expect(backfill_completed);
 }
 
 test "inline resolver replacement background replay yields within a large record" {

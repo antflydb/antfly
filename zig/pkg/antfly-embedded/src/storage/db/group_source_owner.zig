@@ -20,6 +20,9 @@ const work = @import("group_source_worker.zig");
 /// Native Lite preserves group cursor/lease identity and replay feedback per table.
 pub const State = struct {
     publication_overhead_ns: std.atomic.Value(u64) = .init(0),
+    /// Alternate durable backfill and normal replay even when DB wrappers
+    /// are reconstructed between turns. A moving tail must not starve repair.
+    resolution_backfill_turn: std.atomic.Value(u8) = .init(0),
     replay_retirement: @import("../docstore.zig").ReplayRetirement = .{},
     replay_budget: @import("derived/replay_budget.zig").Controller = .{},
     producer_replay_budget: @import("derived/replay_budget.zig").Controller = .{

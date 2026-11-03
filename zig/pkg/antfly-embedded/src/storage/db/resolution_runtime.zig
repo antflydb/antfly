@@ -2716,6 +2716,7 @@ pub const ResolutionRuntime = struct {
     /// Catalog changes and cursor advancement share catch_up_mutex so an older
     /// window cannot clear a newer configuration's restart cursor.
     backfill_pending: std.atomic.Value(bool) = .init(false),
+    resident_backfill_next: bool = true,
     worker_started: std.atomic.Value(bool),
     worker_mutex: Io.Mutex = .init,
     worker_cond: Io.Condition = .init,
@@ -2866,20 +2867,28 @@ pub const ResolutionRuntime = struct {
 
     /// Cooperative maintenance checks the caller deadline between source
     /// artifacts, preserving all sibling resolver decisions for each source.
-    pub fn catchUpOnce(self: *ResolutionRuntime, deadline_ns: u64) !void {
-        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUpOnce", .{ self, deadline_ns });
+    pub fn catchUpOnce(self: *ResolutionRuntime, deadline_ns: u64, prefer_backfill: bool) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUpOnce", .{ self, deadline_ns, prefer_backfill });
         if (!self.catch_up_mutex.tryLock()) return;
         defer self.catch_up_mutex.unlock();
+        return self.catchUpTurnLocked(deadline_ns, prefer_backfill);
+    }
+
+    fn catchUpTurnLocked(self: *ResolutionRuntime, deadline_ns: u64, prefer_backfill: bool) !void {
         if (replayNowNs() >= deadline_ns) return;
         const applied = self.applied_sequence.load(.acquire);
-        if (applied >= self.target_sequence.load(.acquire)) {
-            if (self.backfill_pending.load(.acquire)) {
-                var tick = try self.runReresolveBacklogWindowLocked(deadline_ns);
-                tick.deinit(self.alloc);
-            }
+        // Waiting for the moving replay head before touching backfill can
+        // leave an accepted curation pending forever. The scheduling owner
+        // alternates these independent durable lanes; each gets one bounded
+        // operation, including when the other lane refuses publication.
+        if (self.backfill_pending.load(.acquire) and
+            (prefer_backfill or applied >= self.target_sequence.load(.acquire)))
+        {
+            var tick = try self.runReresolveBacklogWindowLocked(deadline_ns);
+            tick.deinit(self.alloc);
             return;
         }
-        try self.catchUpRecordPageLocked(deadline_ns);
+        if (applied < self.target_sequence.load(.acquire)) try self.catchUpRecordPageLocked(deadline_ns);
     }
 
     fn clearPendingReplayRecord(self: *ResolutionRuntime) void {
@@ -3167,7 +3176,9 @@ pub const ResolutionRuntime = struct {
             !self.backfill_pending.load(.acquire)) return null;
         if (!self.catch_up_mutex.tryLock()) return 25;
         defer self.catch_up_mutex.unlock();
-        self.catchUpLocked(true, default_max_records_per_window) catch |err| {
+        const prefer_backfill = self.resident_backfill_next;
+        self.resident_backfill_next = !prefer_backfill;
+        self.catchUpTurnLocked(replayNowNs() +| @import("derived/replay_budget.zig").Controller.quantum_ns, prefer_backfill) catch |err| {
             std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
             return 50;
         };
@@ -3235,6 +3246,8 @@ pub fn DbArtifactStore(comptime Store: type) type {
             cursor.setUpperBound(upper);
             var entry = try cursor.seekAtOrAfter(lower);
             while (entry) |e| {
+                // Erased cursor range hints are optional for adapters.
+                if (upper.len != 0 and !std.mem.lessThan(u8, e.key, upper)) break;
                 try consume(ctx, e.key);
                 entry = try cursor.next();
             }
@@ -3255,6 +3268,7 @@ pub fn DbArtifactStore(comptime Store: type) type {
             cursor.setUpperBound(upper);
             var entry = try cursor.seekAtOrAfter(lower);
             while (entry) |e| {
+                if (upper.len != 0 and !std.mem.lessThan(u8, e.key, upper)) break;
                 try consume(ctx, e.key, e.value);
                 entry = try cursor.next();
             }

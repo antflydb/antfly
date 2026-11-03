@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Not qualified: corrected Debug fourth-input reproduction now succeeds; active-write visibility/backfill still fail. Fixing Debug gates before optimized rebuild or final-host qualification.",
+  "status": "Not qualified: current-main Debug integration, unchanged fourth-input importer, primary/integrity and active replay/backfill gates pass. Component integration, aggregate CI and final-host optimized qualification remain pending.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -4344,14 +4344,255 @@
       "qualification": false
     },
     "sparse_repair_budget_followup": {
-      "status": "Source implemented; validation pending after current-main integration.",
+      "status": "Passed focused discovery regression and integrated Debug owner validation. Discovery budgeting alone did not fix backfill starvation.",
       "change": "Separate artifact-processing candidate budget from cheap repair-key discovery. Discovery keeps its existing deadline and hard 4096-key ceiling, including when the clock is absent. A candidate budget of 32 no longer forces a publication per 32 unrelated metadata keys.",
       "regression": "5000 unrelated primary keys before one real source. First call must yield at the hard probe ceiling; second must discover the source, while rejecting payload scans."
     },
     "current_main_integration": {
       "target": "f2b3baaee1",
-      "status": "Pending",
-      "reason": "Resolve source integration before final Debug gate and optimized rebuild."
+      "merge_commit": "306a33426a",
+      "status": "Debug integrated and validated; fair-backfill changes tested as the subsequent candidate.",
+      "native_tests": {
+        "passed": 731,
+        "skipped_benchmarks": 5,
+        "failed": 0,
+        "leaks": 0,
+        "unexpected_error_logs": 0
+      },
+      "runtime_error_identity_tests": {
+        "passed": 51,
+        "failed": 0
+      },
+      "additional_suites": {
+        "placeholder": 11,
+        "backup_inspection": 2
+      },
+      "abi": {
+        "exports": 134,
+        "executable_and_shared_library_linkage": "passed",
+        "capi_smoke": "passed"
+      },
+      "integrated_library_sha256": "03bd464ead0343c6435f0e278b6692e8ba436bc1a59010cc523e67e35ad99d3c"
+    },
+    "fair_backfill_debug_candidate": {
+      "qualification": false,
+      "source_base_commit": "306a33426a",
+      "source_changes": "Alternating bounded resolver replay/backfill turns, retained across Native runtime refresh; explicit erased-cursor upper-bound enforcement.",
+      "library_sha256": "865453e86d373a1ed72a40866591965b5bc6d245e14e69736356f43d93f46e57",
+      "owner_test_sha256": "6c39c13a5b197457e699b92cf1d605469819e285e62278cd53989c06feed957c",
+      "cause": "Bounded resolver admission serviced backfill only after ordinary replay caught its target. A write before every reconstructed turn can keep that condition false indefinitely. Cheap key discovery alone cannot make an unscheduled lane progress.",
+      "regression": "Moving primary tail before every turn, close/reopen between turns, retained namespace scheduling state: both ordinary replay progress and durable backfill completion required.",
+      "fairness": "Native/manual namespace state and resident worker lifecycle alternate lane preference; a refused repair turn cannot consume the next ordinary replay turn. Each turn retains its deadline and hard work limits.",
+      "focused_tests": {
+        "passed": 6,
+        "failed": 0,
+        "skipped": 0,
+        "leaks": 0
+      },
+      "owner_tests": {
+        "passed": 281,
+        "skipped": 3,
+        "failed": 0,
+        "leaks": 0,
+        "expected_error_logs": 2,
+        "unexpected_error_logs": 0
+      },
+      "sdk_tests": {
+        "passed": 356,
+        "conditional_skips": 4,
+        "failed": 0,
+        "seconds": 258.39
+      },
+      "model_tests": {
+        "passed": 4,
+        "failed": 0,
+        "skipped": 0,
+        "leaks": 0,
+        "environment": "Metal access required; initial sandbox denial rerun with host Metal access."
+      },
+      "reporting_tests": {
+        "passed": 26,
+        "failed": 0,
+        "skipped": 0
+      },
+      "active_resolver": [
+        {
+          "library_sha256": "865453e86d373a1ed72a40866591965b5bc6d245e14e69736356f43d93f46e57",
+          "idle_namespaces": 0,
+          "status": "ok",
+          "successful_batches": 348,
+          "active_progress": {
+            "passed": true,
+            "deadline_seconds": 8.0,
+            "excluded_indexes": [
+              "knowledge"
+            ],
+            "completed_prefixes": 1,
+            "observed_completion_seconds": [
+              6.271865750080906
+            ],
+            "overdue_observations": 0,
+            "advancing_indexes": [
+              "full_text_index_v0"
+            ],
+            "missing_evidence": false,
+            "pending_age_seconds": 2.14229433296714
+          },
+          "resolver_backfill_progress": {
+            "passed": true,
+            "completion_seconds": 1.1068964169826359,
+            "revision": 1,
+            "target_sequence": 4,
+            "deadline_seconds": 8.0
+          },
+          "verified": true,
+          "acknowledged_verification_passed": true,
+          "busy_responses": 0
+        }
+      ],
+      "namespace_bursts": [
+        {
+          "library_sha256": "865453e86d373a1ed72a40866591965b5bc6d245e14e69736356f43d93f46e57",
+          "idle_namespaces": 0,
+          "status": "ok",
+          "successful_batches": 4,
+          "active_progress": null,
+          "resolver_backfill_progress": null,
+          "verified": true,
+          "acknowledged_verification_passed": true,
+          "busy_responses": 0
+        },
+        {
+          "library_sha256": "865453e86d373a1ed72a40866591965b5bc6d245e14e69736356f43d93f46e57",
+          "idle_namespaces": 8,
+          "status": "ok",
+          "successful_batches": 4,
+          "active_progress": null,
+          "resolver_backfill_progress": null,
+          "verified": true,
+          "acknowledged_verification_passed": true,
+          "busy_responses": 0
+        },
+        {
+          "library_sha256": "865453e86d373a1ed72a40866591965b5bc6d245e14e69736356f43d93f46e57",
+          "idle_namespaces": 45,
+          "status": "ok",
+          "successful_batches": 4,
+          "active_progress": null,
+          "resolver_backfill_progress": null,
+          "verified": true,
+          "acknowledged_verification_passed": true,
+          "busy_responses": 0
+        }
+      ],
+      "grouped_copy_prior_integrated_candidate": [
+        {
+          "library_sha256": "03bd464ead0343c6435f0e278b6692e8ba436bc1a59010cc523e67e35ad99d3c",
+          "idle_namespaces": 0,
+          "status": "ok",
+          "successful_batches": 222,
+          "active_progress": {
+            "passed": true,
+            "deadline_seconds": 8.0,
+            "excluded_indexes": [],
+            "completed_prefixes": 1,
+            "observed_completion_seconds": [
+              4.875778875080869
+            ],
+            "overdue_observations": 0,
+            "advancing_indexes": [
+              "copied_text",
+              "full_text_index_v0"
+            ],
+            "missing_evidence": false,
+            "pending_age_seconds": 3.1200205829227343
+          },
+          "resolver_backfill_progress": null,
+          "verified": true,
+          "acknowledged_verification_passed": true,
+          "busy_responses": 0
+        }
+      ],
+      "unchanged_importer": {
+        "status": "completed",
+        "exit_code": 0,
+        "seconds": 480.84759249992203,
+        "child_user_seconds": 308.423604,
+        "child_system_seconds": 25.789086,
+        "final_bytes": 897044480,
+        "imported_summary": [
+          "1",
+          "0",
+          "0"
+        ],
+        "successful": true,
+        "library_sha256": "865453e86d373a1ed72a40866591965b5bc6d245e14e69736356f43d93f46e57",
+        "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+        "seed_sha256": "2444c180436f5e8fd8ad483babdd4a876e59926fb1028a6a4467fc7a4add86a8",
+        "snapshot_library_sha256": "e7d0cd3246aa770020f218dfdd52506958486dd9ea1bc92d3abaaf6f732c82f0",
+        "native_snapshot_rebound_for_destination": true,
+        "scope": "One unchanged-input local Debug diagnostic; simultaneous shared-host work means timings are not matched throughput qualification.",
+        "independent_validation": {
+          "complete": true,
+          "tables": 45,
+          "primary_rows": 92379,
+          "streamed_and_sql_counts_match": true,
+          "integrity": true,
+          "seconds": 160.85218412498944,
+          "scope": "Primary rows and integrity; indexed visibility and settled field hashes are separate final-host gates. Stats.doc_count reports visible index documents and can lag primary rows."
+        }
+      },
+      "component_integration": "Canonical pinned Bazel build passed; fresh embedded smoke running.",
+      "optimized_build": "Stopped. No optimized build of these source changes has started.",
+      "remaining": [
+        "Final-host original-importer normalized field comparisons and contention",
+        "Fresh embedded component smoke; full factory remains a separate gate",
+        "Final-host matched ReleaseFast comparisons, importer contention and ten-minute active-write/storage qualification",
+        "Human-triggered aggregate CI"
+      ],
+      "grouped_copy": [
+        {
+          "library_sha256": "865453e86d373a1ed72a40866591965b5bc6d245e14e69736356f43d93f46e57",
+          "status": "ok",
+          "successful_batches": 186,
+          "active_progress": {
+            "passed": true,
+            "deadline_seconds": 8.0,
+            "excluded_indexes": [],
+            "completed_prefixes": 1,
+            "observed_completion_seconds": [
+              6.979910541907884
+            ],
+            "overdue_observations": 0,
+            "advancing_indexes": [
+              "copied_text",
+              "full_text_index_v0"
+            ],
+            "missing_evidence": false,
+            "pending_age_seconds": 1.3468132910784334
+          },
+          "acknowledged_verification_passed": true,
+          "verified": true,
+          "verification_seconds": 102.34649487503339,
+          "busy_responses": 0
+        }
+      ]
+    },
+    "recursive_text_size_attribution": {
+      "qualification": false,
+      "rows": 69480,
+      "strings": 946111,
+      "utf8_bytes": 201817313,
+      "largest_string_bytes": 114508,
+      "large_string_minimum_bytes": 8192,
+      "large_strings": 7581,
+      "large_string_bytes": 97935166,
+      "distinct_large_strings": 7128,
+      "distinct_large_bytes": 89724552,
+      "repeated_large_occurrences": 453,
+      "repeated_large_bytes": 8210614,
+      "scope": "All recursive primary JSON strings, not actual index-binding/analyzer input attribution. No private values or digests retained in the report. Exact duplicates alone do not establish analyzer work as the dominant fix."
     }
-  }
+  },
+  "runtime_commit_scope": "Top-level runtime/base commits identify historical optimized qualification only; newer Debug candidates and immutable artifact hashes are recorded under valid_snapshot_local_diagnosis."
 }
