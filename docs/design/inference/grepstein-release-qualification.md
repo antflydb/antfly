@@ -397,3 +397,58 @@ that every source page was extracted. Keep semantic/graph publication disabled
 until the required source versions have complete artifacts and the corresponding
 model checks above pass. Public hosting additionally needs the source
 suppression and exposed-API bounds described in the Grepstein design.
+
+## CUDA reader memory admission
+
+CUDA Qwen vision admission now follows the streaming implementation rather than
+reserving a device attention-score matrix. The closed linear contract applies to
+64-dimensional heads with an FFN no wider than four hidden dimensions; other
+geometries retain the generic conservative estimate. Read, generate and multimodal
+rerank admission all select this policy from the actual session backend.
+
+The shared contract bounds retained cuDNN Q/K/V/output storage, vendor workspace,
+and overlapping FFN intermediates. `DeviceScratch.acquire` synchronizes and frees
+an older arena before growth. Both vendor entry points check the same workspace
+cap before allocation or launch and otherwise use the existing tiled CUDA path.
+The portable encoder widens a BF16 input once before F32 normalization and residual
+operations if a compact vendor block declines execution. This changes no model
+weights, image geometry, token limits, or precision default.
+
+Reader epochs reserve solo vision and decoder work initially. New admitted pages
+can grow the shared reservation to the actual available group, bounded by the
+configured microbatch maximum. The decoder still owns two queued working sets;
+CUDA no longer rounds that lease to a second power-of-two envelope. A pending
+request is not counted as an admitted page. Admission growth is transactional
+with the page lease, and failed growth rolls back before any consumer can enqueue
+GPU work. Existing peaks remain charged until backend teardown so queued work and
+cached buffers cannot outlive their reservation. Geometry planning uses current
+admitted pages; a completed large page cannot permanently multiply the estimate
+for later small-page groups.
+
+Lease bookkeeping does not invalidate a captured decoder graph. Actual compute
+and cleanup phases continue to do so. The graph's two-row requirement remains:
+serial page delivery still cannot demonstrate graph replay or maximum throughput.
+
+The explicit `bf16_vision` profile and the cuDNN route still need a complete-page
+A100 comparison of output, warm throughput, cold load, batch cardinality and peak
+memory. Spark-only fused GEMM results are not A100 results. The admission contract
+and host-side CUDA-enabled tests do not establish those performance measurements.
+
+### Extraction completion and publication ownership
+
+A partial OCR publication withholds request-completion credit. A failed
+publication also carries an explicit pipeline-failure marker through scanner
+and asynchronous lane boundaries; a matching provider error tag cannot reuse
+a document retry identity. Exhausting storage retries must not exhaust OCR
+attempts or acknowledge an incomplete generation.
+
+The raw extraction manifest persists `ocr_retryable_failed_count` across all
+pages, independently of the 32-entry failure diagnostic sample. Artifact PUT
+repairs inline declarations and stores the canonical table-wide declaration,
+which survives removal of its declaring index. An embedding declaration also
+retains the owning index's admitted, credential-free producer identity when its
+inline form inherited that producer. Artifact DELETE removes both
+forms and leaves consumers for normal dependency validation to reject.
+
+These storage and catalog regressions are distinct from the outstanding
+complete-page A100 output and memory qualification above.

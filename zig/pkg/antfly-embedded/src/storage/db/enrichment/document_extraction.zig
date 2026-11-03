@@ -1168,6 +1168,8 @@ pub const Result = struct {
     ocr_selected_count: usize = 0,
     ocr_retained_embedded_count: usize = 0,
     ocr_failed_count: usize = 0,
+    /// Complete aggregate; diagnostics below may be bounded to a sample.
+    ocr_retryable_failed_count: usize = 0,
     ocr_failed_page_numbers: []const u32 = &.{},
     /// Borrowed failure summaries used while serializing the public raw
     /// manifest. The page units remain the owning source of these strings.

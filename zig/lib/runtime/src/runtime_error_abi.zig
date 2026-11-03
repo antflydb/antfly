@@ -960,60 +960,62 @@ pub const Detail = enum(c_int) {
     // Append-only: numeric Detail values are part of the stable C ABI.
     embed_admission_refused,
     read_output_truncated,
+    invalid_document_extraction_config,
+    document_extraction_model_required,
     // Append-only SQL additions follow every published main Detail identity.
-    sql_index_already_exists = 840,
-    sql_constraint_already_exists = 841,
-    program_limit_exceeded = 842,
-    catalog_occupancy_not_ready = 843,
-    unsupported_native_index_owner = 844,
-    invalid_private_index_claim_inventory = 845,
-    invalid_private_index_claim_receipt = 846,
-    private_index_owner_job_changed = 847,
-    private_index_publication_canceled = 848,
-    private_index_job_required = 849,
-    private_index_publication_required = 850,
-    invalid_private_index_owner_job = 851,
-    invalid_private_index_inputs = 852,
-    relational_index_catalog_schema_mismatch = 853,
-    invalid_index_publication_candidate = 854,
-    immutable_relational_index_definition_conflict = 855,
-    private_index_cancellation_pending = 856,
-    private_index_cancellation_required = 857,
-    invalid_private_index_cancellation = 858,
-    invalid_private_index_native_receipt = 859,
-    invalid_relational_index_progress = 860,
-    missing_relational_index_definitions = 861,
-    index_owner_receipt_changed = 862,
-    invalid_index_owner_receipt = 863,
-    sql_invalid_power_argument = 864,
-    invalid_schema_reader_requirements = 865,
-    private_index_root_recovery_required = 866,
-    invalid_relational_index_budget = 867,
-    private_index_claim_backlog_full = 868,
-    partial_index_predicate_not_implied = 869,
-    relational_check_violation = 870,
-    row_policy_denied = 871,
-    row_policy_authentication_required = 872,
-    check_constraint_validation_required = 873,
-    foreign_key_match_full_violation = 874,
-    invalid_schema_validation_job = 875,
-    invalid_schema_validation_page_command = 876,
-    invalid_schema_validation_token = 877,
-    schema_validation_canceled = 878,
-    schema_validation_cancellation_required = 879,
-    schema_validation_command_rejected = 880,
-    schema_validation_inputs_required = 881,
-    schema_validation_job_changed = 882,
-    schema_validation_job_required = 883,
-    schema_validation_not_ready = 884,
-    schema_validation_preparation_changed = 885,
-    schema_validation_publication_required = 886,
-    schema_validation_runtime_recovery_required = 887,
-    store_registration_required = 888,
-    catalog_publication_fence_unavailable = 889,
-    undefined_column = 890,
-    foreign_key_validation_required = 891,
-    materialized_view_read_only = 892,
+    sql_index_already_exists = 842,
+    sql_constraint_already_exists = 843,
+    program_limit_exceeded = 844,
+    catalog_occupancy_not_ready = 845,
+    unsupported_native_index_owner = 846,
+    invalid_private_index_claim_inventory = 847,
+    invalid_private_index_claim_receipt = 848,
+    private_index_owner_job_changed = 849,
+    private_index_publication_canceled = 850,
+    private_index_job_required = 851,
+    private_index_publication_required = 852,
+    invalid_private_index_owner_job = 853,
+    invalid_private_index_inputs = 854,
+    relational_index_catalog_schema_mismatch = 855,
+    invalid_index_publication_candidate = 856,
+    immutable_relational_index_definition_conflict = 857,
+    private_index_cancellation_pending = 858,
+    private_index_cancellation_required = 859,
+    invalid_private_index_cancellation = 860,
+    invalid_private_index_native_receipt = 861,
+    invalid_relational_index_progress = 862,
+    missing_relational_index_definitions = 863,
+    index_owner_receipt_changed = 864,
+    invalid_index_owner_receipt = 865,
+    sql_invalid_power_argument = 866,
+    invalid_schema_reader_requirements = 867,
+    private_index_root_recovery_required = 868,
+    invalid_relational_index_budget = 869,
+    private_index_claim_backlog_full = 870,
+    partial_index_predicate_not_implied = 871,
+    relational_check_violation = 872,
+    row_policy_denied = 873,
+    row_policy_authentication_required = 874,
+    check_constraint_validation_required = 875,
+    foreign_key_match_full_violation = 876,
+    invalid_schema_validation_job = 877,
+    invalid_schema_validation_page_command = 878,
+    invalid_schema_validation_token = 879,
+    schema_validation_canceled = 880,
+    schema_validation_cancellation_required = 881,
+    schema_validation_command_rejected = 882,
+    schema_validation_inputs_required = 883,
+    schema_validation_job_changed = 884,
+    schema_validation_job_required = 885,
+    schema_validation_not_ready = 886,
+    schema_validation_preparation_changed = 887,
+    schema_validation_publication_required = 888,
+    schema_validation_runtime_recovery_required = 889,
+    store_registration_required = 890,
+    catalog_publication_fence_unavailable = 891,
+    undefined_column = 892,
+    foreign_key_validation_required = 893,
+    materialized_view_read_only = 894,
 };
 
 test "partial index proof rejection preserves exact callback error identity" {
@@ -1076,6 +1078,8 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.InvalidDocumentExtractionConfig => status(.invalid_argument, .invalid_document_extraction_config),
+        error.DocumentExtractionModelRequired => status(.invalid_argument, .document_extraction_model_required),
         error.ReadTransientFailure => status(.retryable, .read_transient_failure),
         error.ReadRequestFailed => status(.invalid_argument, .read_request_failed),
         error.InvalidGcsUrl => status(.invalid_argument, .invalid_gcs_url),
@@ -2935,6 +2939,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .runtime_already_ready => "RuntimeAlreadyReady",
         .embed_admission_refused => "EmbedAdmissionRefused",
         .read_output_truncated => "ReadOutputTruncated",
+        .invalid_document_extraction_config => "InvalidDocumentExtractionConfig",
+        .document_extraction_model_required => "DocumentExtractionModelRequired",
     };
 }
 
@@ -3466,9 +3472,11 @@ test "released document reader and inference Detail identifiers retain main wire
         .{ Detail.ha_catalog_replication_sources_unsupported, @as(c_int, 837) },
         .{ Detail.embed_admission_refused, @as(c_int, 838) },
         .{ Detail.read_output_truncated, @as(c_int, 839) },
+        .{ Detail.invalid_document_extraction_config, @as(c_int, 840) },
+        .{ Detail.document_extraction_model_required, @as(c_int, 841) },
     };
     inline for (published) |entry| try std.testing.expectEqual(entry[1], @backingInt(entry[0]));
-    try std.testing.expect(@backingInt(Detail.sql_index_already_exists) > 839);
+    try std.testing.expect(@backingInt(Detail.sql_index_already_exists) > 841);
 }
 
 test "merged runtime error details preserve main wire identifiers" {
@@ -3565,5 +3573,13 @@ test "reader failures preserve retry semantics and GCS failures preserve scope s
     try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.GcsConnectionNotFoundOrOutOfScope).code);
     inline for (.{ error.ReadTransientFailure, error.ReadRequestFailed, error.InvalidGcsUrl, error.GcsConnectionNotFoundOrOutOfScope, error.AmbiguousGcsConnection, error.InvalidConnectionCredentials }) |expected| {
         try std.testing.expectEqual(expected, errorFromStatus(statusFromError(expected)));
+    }
+}
+
+test "invalid persisted extraction policy retains identity across storage callbacks" {
+    inline for (.{ error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired }) |expected| {
+        const transported = comptime statusFromError(expected);
+        try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
+        try std.testing.expectEqual(expected, errorFromStatus(transported));
     }
 }
