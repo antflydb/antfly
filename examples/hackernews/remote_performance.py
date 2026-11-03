@@ -231,6 +231,21 @@ def execute(cells, root):
     descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(descriptor)
     try:
+        plan_sha256 = hashlib.sha256(
+            json.dumps(cells, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        planned_cells = [cell["name"] for cell in cells]
+        # Invalidate prior completion before validation or child startup. Cell
+        # reports remain retained, but only this exact plan can become complete.
+        write_json(
+            root / "matrix-summary.json",
+            {
+                "complete": False,
+                "plan_sha256": plan_sha256,
+                "planned_cells": planned_cells,
+                "cells": [],
+            },
+        )
         for cell in cells:
             state = Path(cell["state"])
             state.mkdir(parents=True, exist_ok=True)
@@ -320,6 +335,8 @@ def execute(cells, root):
             root / "matrix-summary.json",
             {
                 "complete": True,
+                "plan_sha256": plan_sha256,
+                "planned_cells": planned_cells,
                 "cells": [
                     dict(cell=cell["name"], **result)
                     for cell, result in zip(cells, results)

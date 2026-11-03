@@ -175,6 +175,85 @@ class RemotePerformanceTests(unittest.TestCase):
                 self.assertTrue((state / "data").exists())
                 self.assertFalse((root / "matrix.lock").exists())
 
+    def test_failed_extension_invalidates_summary_and_successful_resume_rebinds_plan(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "binary"
+            binary.write_bytes(b"engine")
+
+            def cell(name):
+                return {
+                    "name": name,
+                    "state": str(root / name),
+                    "harness_sha256": {},
+                    "fixture": [],
+                    "command": ["poc.py", "--binary", str(binary)],
+                    "binary_sha256": matrix.fingerprint(binary),
+                }
+
+            local, gcs = cell("local"), cell("gcs")
+
+            def passed(recipe):
+                state = Path(recipe["state"])
+                state.mkdir(exist_ok=True)
+                (state / "matrix-cell.json").write_text(json.dumps(recipe))
+                (state / "matrix-result.json").write_text(
+                    json.dumps({"status": "passed", "measurements": {"top_hits": []}})
+                )
+
+            passed(local)
+            summary = root / "matrix-summary.json"
+            with patch.object(matrix.subprocess, "Popen") as launch:
+                matrix.execute([local], root)
+                original = json.loads(summary.read_text())
+                self.assertTrue(original["complete"])
+                launch.assert_not_called()
+                launch.return_value.wait.return_value = 1
+                with self.assertRaisesRegex(RuntimeError, "Qualification failed"):
+                    matrix.execute([local, gcs], root)
+                launch.assert_called_once()
+                failed = json.loads(summary.read_text())
+                self.assertFalse(failed["complete"])
+                self.assertEqual(failed["planned_cells"], ["local", "gcs"])
+                self.assertNotEqual(failed["plan_sha256"], original["plan_sha256"])
+                self.assertEqual(
+                    json.loads(
+                        (Path(local["state"]) / "matrix-result.json").read_text()
+                    )["status"],
+                    "passed",
+                )
+            # A new, fully qualified cell report can finish the same plan;
+            # deriving its summary never launches either completed cell again.
+            passed(gcs)
+            with patch.object(matrix.subprocess, "Popen") as launch:
+                matrix.execute([local, gcs], root)
+                launch.assert_not_called()
+            resumed = json.loads(summary.read_text())
+            self.assertTrue(resumed["complete"])
+            self.assertEqual(resumed["plan_sha256"], failed["plan_sha256"])
+            self.assertEqual([c["cell"] for c in resumed["cells"]], ["local", "gcs"])
+
+    def test_validation_failure_invalidates_previous_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary = root / "matrix-summary.json"
+            summary.write_text(json.dumps({"complete": True}))
+            cell = {
+                "name": "changed",
+                "state": str(root / "changed"),
+                "harness_sha256": {"poc.py": "wrong-digest"},
+            }
+            with patch.object(matrix.subprocess, "Popen") as launch:
+                with self.assertRaisesRegex(
+                    ValueError, "Harness changed after planning"
+                ):
+                    matrix.execute([cell], root)
+                launch.assert_not_called()
+            self.assertFalse(json.loads(summary.read_text())["complete"])
+            self.assertFalse((root / "matrix.lock").exists())
+
     def test_completed_cells_resume_without_launching_again(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -69,6 +69,18 @@ Preserve failed or interrupted attempts, then use fresh state and a fresh
 artifact prefix for their replacements. Reusing an incomplete engine would
 mislabel remaining construction time as a fresh publication measurement.
 
+The runner replaces the top-level summary with `complete: false` before validating
+or launching the current plan. Its `plan_sha256` and `planned_cells` bind completion
+to that exact recipe. Extending a completed local run with a failing GCS cell
+therefore cannot leave the earlier summary looking complete. Existing cell reports
+remain available for inspection and validated resume.
+
+Lake readiness uses HTTPX's canonical retryable transport classification, including
+connection refusal and truncated/failed reads. Its name-based form reads durable
+diagnostics without changing HTTP replay policy. The Python compatibility path
+recognizes these legacy failed statuses under the original build deadline;
+authorization, integrity and TLS protocol failures remain terminal.
+
 Local GCS runs validate a conservative credential lifetime before every child
 start and refresh when insufficient. A still-valid in-memory token is retained
 across restarts even if another CLI user refreshes the shared gcloud cache. A single cached `gcloud auth print-access-token` result can

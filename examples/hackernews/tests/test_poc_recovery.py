@@ -222,6 +222,16 @@ class ConstructionRecoveryTests(unittest.TestCase):
             "NameServerFailure",
             "RateLimited",
             "RemoteUnavailable",
+            "ConnectionRefused",
+            "Closed",
+            "NotConnected",
+            "EndOfStream",
+            "UnexpectedEof",
+            "ReadFailed",
+            "WriteFailed",
+            "RecvFailed",
+            "SendFailed",
+            "StorageReadTemporarilyUnavailable",
         ):
             failed = {"status": {"readiness": {"state": "failed"}, "error": reason}}
             pending = {"status": {"readiness": {"state": "pending"}, "error": reason}}

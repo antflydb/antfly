@@ -356,6 +356,16 @@ def wait_for_index(
             "BrokenPipe",
             "RateLimited",
             "RemoteUnavailable",
+            "ConnectionRefused",
+            "Closed",
+            "NotConnected",
+            "EndOfStream",
+            "UnexpectedEof",
+            "ReadFailed",
+            "WriteFailed",
+            "RecvFailed",
+            "SendFailed",
+            "StorageReadTemporarilyUnavailable",
         }
         if readiness.get("state") == "failed" and not retryable:
             raise RuntimeError("Index construction failed: " + json.dumps(status))
