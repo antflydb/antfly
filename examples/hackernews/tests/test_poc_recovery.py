@@ -132,6 +132,8 @@ class ConstructionRecoveryTests(unittest.TestCase):
             "TlsTransportReadFailed",
             "ConnectionResetByPeer",
             "NameServerFailure",
+            "RateLimited",
+            "RemoteUnavailable",
         ):
             failed = {"status": {"readiness": {"state": "failed"}, "error": reason}}
             pending = {"status": {"readiness": {"state": "pending"}, "error": reason}}
@@ -168,6 +170,8 @@ class ConstructionRecoveryTests(unittest.TestCase):
             "TlsBadRecordMac",
             "TlsAlert",
             "AccessDenied",
+            "Unauthorized",
+            "PreconditionFailed",
         ):
             failed = {
                 "status": {
