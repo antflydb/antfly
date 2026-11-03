@@ -15,7 +15,7 @@
     "zig/pkg/inference/src/ops/cuda/cudnn_sdpa.zig": "0ffec2803477b1bf3895a9af345dc528b373250da49102d2580bfcb8d9bdce2e",
     "zig/pkg/inference/src/ops/cuda/whisper_cuda.zig": "6cebd761804c4790f31aa6e2a06c5bed63fce2f16e85be5bc2824bb7ca9a8b5b",
     "zig/pkg/inference/src/ops/cuda/whisper_kernels.cu": "ab07df7bb513bbee542c749c171b73b607a5b2aebafbacf24db1f470ad95db6a",
-    "zig/pkg/inference/scripts/whisper/benchmark.py": "fb295e94ffeec224c9b38961ac115689b7c104ce0384d14a3495716fdfbc464e",
+    "zig/pkg/inference/scripts/whisper/benchmark.py": "eaa7727c744b321e2a6de302e739cdc2768fe94d3bd24642ab2634a9ecc786ac",
     "zig/pkg/inference/scripts/whisper/regen-kernels.sh": "e9810a1a82b9cf302480269d07b70460bda6d9f9fec6fd24859c20649fcda278"
   },
   "hardware_and_weights": {
@@ -70,7 +70,11 @@
     "colony_inference_package": "passed",
     "colony_infrastructure_build_and_tests": "passed",
     "full_colony_go_suite": "failed: integration tests require unavailable external Antfly at localhost:8080",
-    "acceptance_runner": "syntax and quality-gate checks passed; live run pending"
+    "acceptance_runner": "syntax and quality-gate checks passed; live run pending",
+    "code_review_cuda_cudnn_enabled": "46 selected; 46 passed; 0 skipped, including repeated real-checkpoint transcription",
+    "code_review_cuda_cudnn_disabled": "46 selected; 46 passed; 0 skipped, including repeated real-checkpoint transcription",
+    "colony_inference_race_tests": "passed",
+    "acceptance_offline_regressions": "4 passed: named-index selection, nonempty speech timestamps, clip-bounded chunk timestamps, failure cleanup"
   },
   "current_source_accuracy_under_shared_gpu_load": {
     "english": {
@@ -208,9 +212,10 @@
     "infra/src/antfly_inference/transcription_gpu_contract_test.go": "ef27d3a2e269facf9f5e2baca9eefa316f5f1cd521e81eb2b792fa92fd2c8156",
     "infra/antfly-inference-candidates/transcription/pool.yaml": "45950df600299141f0a916595fde76c89e20e2ec80c957f6ca0cfa394d6440c0",
     "infra/antfly-inference-candidates/transcription/route.yaml": "b1997f4a67e787ec4745b5dfec19c20fb4ea74f225a7692dde944ca9b4c0a943",
-    "scripts/acceptance/cloud_transcription.py": "d092863a00f9496aa679936a349fdc7e7639c794f8c742cb6c8d522d423e07d2"
+    "scripts/acceptance/cloud_transcription.py": "e35fcf7e299d4fa1c03b7de57ed93280dc25d1ec4a5111843ac861e371e3f3ff",
+    "scripts/acceptance/test_cloud_transcription.py": "342c3bcdad479157d0a149725d2bcfc0203fca34383357112b39fec68f0ed10d"
   },
   "complete": false,
   "benchmark_servers_stopped": true,
-  "publication_note": "Repository license headers applied before publication; regenerated CUDA artifact bytes are unchanged and regeneration check passed."
+  "publication_note": "Repository license headers applied before publication; regenerated CUDA artifact bytes are unchanged and regeneration check passed. Repository formatter changed benchmark layout only; source hashes refreshed after review. Review fixed Colony acceptance index selection and timestamp validation; live acceptance and final performance qualification remain pending."
 }
