@@ -31,6 +31,11 @@ pub fn inspect(alloc: std.mem.Allocator, manifest: []const u8) !Coverage {
         if (count != .integer or count.integer < 0) return error.InvalidDocumentExtractionManifest;
         coverage.failed = count.integer > 0;
     }
+    if (parsed.value.object.get("ocr_retryable_failed_count")) |count| {
+        if (count != .integer or count.integer < 0) return error.InvalidDocumentExtractionManifest;
+        coverage.retryable = count.integer > 0;
+        coverage.failed = coverage.failed or coverage.retryable;
+    }
     if (parsed.value.object.get("ocr_failed_page_numbers")) |pages| {
         if (pages != .array) return error.InvalidDocumentExtractionManifest;
         coverage.failed = coverage.failed or pages.array.items.len > 0;
@@ -63,4 +68,17 @@ test "document extraction completion retains retryable page debt" {
     const unknown = try inspect(a, "{\"chunk_count\":3,\"ocr_failed_count\":1}");
     try std.testing.expect(unknown.failed and !unknown.retryable);
     try std.testing.expectError(error.InvalidDocumentExtractionManifest, inspect(a, "{\"ocr_failed_count\":-1}"));
+}
+
+test "aggregate OCR retry debt survives truncated terminal diagnostics" {
+    const a = std.testing.allocator;
+    const coverage = try inspect(a,
+        \\{"ocr_failed_count":33,"ocr_retryable_failed_count":1,"ocr_failed_pages_truncated":true,"ocr_failure_details":[{"retryable":false}]}
+    );
+    try std.testing.expect(coverage.failed and coverage.retryable);
+    const terminal = try inspect(a,
+        \\{"ocr_failed_count":33,"ocr_retryable_failed_count":0,"ocr_failed_pages_truncated":true,"ocr_failure_details":[{"retryable":false}]}
+    );
+    try std.testing.expect(terminal.failed and !terminal.retryable);
+    try std.testing.expectError(error.InvalidDocumentExtractionManifest, inspect(a, "{\"ocr_retryable_failed_count\":-1}"));
 }

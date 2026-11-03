@@ -1458,8 +1458,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "api-derived-coverage-tests",
         .root_module = api_derived_coverage_test_mod,
         .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-derived-coverage-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024),
-        .filters = &.{
+        .filters = selectTestFilters(b, &.{
             "artifact replacement repairs obsolete inline extraction",
+            "artifact replacement preserves inherited inline embedding producers",
             "live repair admission supersedes cached vector serviceability",
             // Own the complete status contract suite; table-write integration
             // borrows these contracts without collecting them a second time.
@@ -1646,7 +1647,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "hosted index lifecycle durable wake repairs worker admission failure",
             "structural reconcile retains ordered constant-time repair wake membership across plan resets",
             "startup configured indexes separate physical indexes from reserved metadata",
-        },
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,

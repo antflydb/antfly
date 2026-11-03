@@ -226,6 +226,38 @@ pub fn removeIndexFromTableIndexesJson(
     return try @import("antfly_local_sources").storage_db_resolver_curation.retainRetiredMetadata(alloc, current_indexes_json, out.items);
 }
 
+/// Resolve the same admitted, credential-free producer that inline collection
+/// inherits from an owning index. A table-wide declaration must retain that
+/// provenance instead of becoming a producer-less copy of an executable artifact.
+fn inheritedInlineEmbeddingProducerAlloc(alloc: std.mem.Allocator, root: std.json.ObjectMap, name: []const u8, replacement: std.json.Value) !?[]u8 {
+    const kind = replacement.object.get("kind") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "embedding")) return null;
+    if (replacement.object.get("producer") != null) return null;
+    if (replacement.object.get("producer_json")) |producer| {
+        if (producer != .string or producer.string.len != 0) return null;
+    }
+    var inherited: ?[]u8 = null;
+    errdefer if (inherited) |value| alloc.free(value);
+    var entries = root.iterator();
+    while (entries.next()) |entry| {
+        const index = entry.value_ptr.*;
+        if (index != .object or index.object.get("embedder") == null) continue;
+        const index_type = index.object.get("type") orelse continue;
+        if (index_type != .string or !std.mem.eql(u8, index_type.string, "embeddings")) continue;
+        const definitions = index.object.get("enrichments") orelse continue;
+        if (definitions != .array) continue;
+        for (definitions.array.items) |definition| {
+            if (!enrichmentValueNameEquals(definition, name)) continue;
+            const candidate = try managed_embedder.embeddingCatalogSemanticProducerJsonAllocWithOptions(alloc, index, .{});
+            defer alloc.free(candidate);
+            if (inherited) |prior| {
+                if (!try enrichment_config_validation.producerJsonValuesEqual(alloc, prior, candidate)) return error.ConflictingEnrichmentConfig;
+            } else inherited = try alloc.dupe(u8, candidate);
+        }
+    }
+    return inherited;
+}
+
 pub fn addEnrichmentToTableIndexesJson(
     alloc: std.mem.Allocator,
     current_indexes_json: []const u8,
@@ -243,7 +275,10 @@ pub fn addEnrichmentToTableIndexesJson(
         else => return error.InvalidTableIndexMetadata,
     };
     if (config.value != .object) return error.InvalidExtensionEnrichment;
-    const replaced_inline = @import("enrichment_catalog_update.zig").replaceInline(root, enrichment_name, config.value);
+    const inherited_producer = try inheritedInlineEmbeddingProducerAlloc(alloc, root, enrichment_name, config.value);
+    defer if (inherited_producer) |value| alloc.free(value);
+    if (inherited_producer) |value| try config.value.object.put(config.arena.allocator(), "producer_json", .{ .string = value });
+    _ = @import("enrichment_catalog_update.zig").replaceInline(root, enrichment_name, config.value);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -269,7 +304,7 @@ pub fn addEnrichmentToTableIndexesJson(
         try appendJsonValue(alloc, &out, entry.value_ptr.*);
     }
 
-    if (!wrote_enrichments and replaced_inline == 0) {
+    if (!wrote_enrichments) {
         if (!first) try out.append(alloc, ',');
         try appendJsonString(alloc, &out, "enrichments");
         try out.appendSlice(alloc, ":[");
@@ -293,12 +328,12 @@ pub fn removeEnrichmentFromTableIndexesJson(
         .object => |object| object,
         else => return error.InvalidTableIndexMetadata,
     };
-    const current_enrichments = root.get("enrichments") orelse return null;
-    if (current_enrichments != .array) return error.InvalidTableIndexMetadata;
+    const current_enrichments = root.get("enrichments");
+    if (current_enrichments != null and current_enrichments.? != .array) return error.InvalidTableIndexMetadata;
 
-    var removed = false;
+    var removed = @import("enrichment_catalog_update.zig").removeInline(root, enrichment_name) != 0;
     var remaining: usize = 0;
-    for (current_enrichments.array.items) |item| {
+    for (if (current_enrichments) |value| value.array.items else &.{}) |item| {
         if (enrichmentValueNameEquals(item, enrichment_name)) {
             removed = true;
         } else {
@@ -8128,6 +8163,50 @@ fn consumerTests() type {
             try std.testing.expect(std.mem.indexOf(u8, repaired, "ocr_fallback") == null);
             try std.testing.expect(std.mem.indexOf(u8, repaired, "chunks") != null);
             try std.testing.expect(std.mem.indexOf(u8, repaired, "document_text") != null);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, repaired, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("enrichments").?.array.items.len);
+            const dropped = (try removeIndexFromTableIndexesJson(alloc, repaired, "document_text")).?;
+            defer alloc.free(dropped);
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, dropped);
+            try std.testing.expect(std.mem.indexOf(u8, dropped, "units") != null);
+            const deleted = (try removeEnrichmentFromTableIndexesJson(alloc, dropped, "units")).?;
+            defer alloc.free(deleted);
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, deleted);
+            try std.testing.expect(std.mem.indexOf(u8, deleted, "units") == null);
+            // Inline copies must not silently resurrect a deleted producer.
+            const dependent = (try removeEnrichmentFromTableIndexesJson(alloc, repaired, "units")).?;
+            defer alloc.free(dependent);
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(alloc, dependent));
+        }
+
+        test "artifact replacement preserves inherited inline embedding producers" {
+            const alloc = std.testing.allocator;
+            const original =
+                \\{"vectors":{"type":"embeddings","dimension":1536,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_url":"https://embedding.example/v1","api_key":"${secret:embedding_key}"},"sources":[{"artifact":"vectors"}],"enrichments":[{"name":"vectors","kind":"embedding","field":"body","expected_dims":1536}]}}
+            ;
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, original);
+            for ([_][]const u8{
+                \\{"name":"vectors","kind":"embedding","field":"updated_body","expected_dims":1536}
+                ,
+                \\{"name":"vectors","kind":"embedding","field":"updated_body","expected_dims":1536,"producer_json":""}
+            }) |replacement| {
+                const updated = try addEnrichmentToTableIndexesJson(alloc, original, "vectors", replacement);
+                defer alloc.free(updated);
+                try validateArtifactEnrichmentsForTableIndexesJson(alloc, updated);
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc, updated, .{});
+                defer parsed.deinit();
+                const producer = parsed.value.object.get("enrichments").?.array.items[0].object.get("producer_json").?;
+                try std.testing.expect(producer == .string and producer.string.len > 0);
+                try std.testing.expect(std.mem.indexOf(u8, producer.string, "embedding_key") == null);
+                const configs = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, updated);
+                defer db_mod.types.freeEnrichmentConfigs(alloc, configs);
+                try validateArtifactEnrichmentConfigDefinitions(alloc, configs);
+                for (configs) |cfg| {
+                    try std.testing.expectEqualStrings("updated_body", cfg.field);
+                    try std.testing.expectEqualStrings(producer.string, cfg.producer_json);
+                }
+            }
         }
 
         test "index metadata validates artifact enrichment graph" {
