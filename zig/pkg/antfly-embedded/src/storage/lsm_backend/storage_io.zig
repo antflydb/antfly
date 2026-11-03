@@ -103,6 +103,9 @@ pub const AtomicWriteSink = struct {
         finish_source: ?*const fn (*anyopaque) anyerror!@import("../../segment_source.zig").Source = null,
         finish_mapped: ?*const fn (*anyopaque) anyerror!@import("../../segment_source.zig").MappedArtifact = null,
         abort: *const fn (*anyopaque) void,
+        /// Consumes the sink on every path. False certifies that a failed
+        /// finish did not publish; true remains conservatively uncertain.
+        finish_with_publication_state: ?*const fn (*anyopaque, *bool) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -154,6 +157,16 @@ pub const AtomicWriteSink = struct {
 
     pub fn finish(self: *AtomicWriteSink) !void {
         try BoundaryAbi.call("finish", self.boundary_dispatch, self.vtable.finish, .{self.ptr});
+    }
+
+    /// Legacy sinks cannot certify an unchanged destination after failure.
+    /// Implementations must capture this state before releasing publication
+    /// serialization; inspecting their mutable store after return is unsafe.
+    pub fn finishWithPublicationState(self: *AtomicWriteSink, publication_possible: *bool) !void {
+        publication_possible.* = true;
+        if (self.vtable.finish_with_publication_state) |finish_with_state|
+            return BoundaryAbi.call("finish_with_publication_state", self.boundary_dispatch, finish_with_state, .{ self.ptr, publication_possible });
+        try self.finish();
     }
 
     /// Discard all bytes and remove any temporary object.

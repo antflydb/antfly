@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Not qualified: the unchanged original importer Debug input 7 still failed with LiteReplayBacklogExceeded after 513.534 seconds and 102 batch profiles, with zero native builds. All 65 private merges applied and maintenance queue timeouts were zero. Fair admission and shared wait budgets are pushed at df36bddaac; integration, commit outcome/recovery faults and optimized final qualification remain in progress. #1431 remains open.",
+  "status": "Not qualified: original-importer Debug input 7 still failed after 513.534 seconds with LiteReplayBacklogExceeded. The fair-admission candidate passes its native and SDK gates, but the full consumer gate found a generation-control false-uncertainty diagnostic. A phase-aware native publication fix and pre-commit batch-response encoding are implemented and awaiting validation before optimized final qualification. #1431 remains open.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -6962,5 +6962,61 @@
       "scope": "Admission availability and cleanup; safety flock remains authoritative."
     },
     "proof_retention_followup": "Completed verification now caches its immutable witness before lease reacquisition. Both timed local handoffs preserve refusal after mandatory cleanup, and new tests require a later stable-tip request to reuse the completed walk. These owner changes are awaiting integration validation."
+  },
+  "comment_followup_full_gate_20261103": {
+    "source_commit": "07a9edd9b2d8b57b34149173d567a2d27765ad0a",
+    "producer_command_completed": true,
+    "producer_command_exit_code": 1,
+    "native": {
+      "passed": 753,
+      "skipped": 5,
+      "failed": 0,
+      "leaked": 0,
+      "expected_error_logs": 8,
+      "unexpected_error_logs": 0
+    },
+    "physical_curated": {
+      "passed": 281,
+      "skipped": 3,
+      "failed": 0,
+      "leaked": 0,
+      "expected_error_logs": 2,
+      "unexpected_error_logs": 0
+    },
+    "physical_unfiltered": {
+      "passed": 303,
+      "skipped": 3,
+      "failed": 0,
+      "leaked": 0
+    },
+    "consumer": {
+      "passed": 86,
+      "skipped": 0,
+      "failed": 1,
+      "leaked": 0,
+      "failure": "Concurrent text/dense search passed data assertions but emitted an unexpected generation-control error after two EnrichmentWaitCanceled admission refusals. The generic atomic sink classified all finish failures as possibly published. Idle-runtime lifecycle regression passed."
+    },
+    "consumer_root_anchors": {
+      "passed": 11,
+      "failed": 0
+    },
+    "backup_preflight": {
+      "passed": 2,
+      "failed": 0
+    },
+    "python_sql_catalog_concurrency_outcomes": {
+      "passed": 209,
+      "failed": 0,
+      "seconds": 79.88
+    },
+    "writer_queue_process_tests": {
+      "passed": 6,
+      "failed": 0
+    },
+    "current_followup": "Capture the native group publication decision before unlocking, propagate it through the atomic sink, and retain posting generations after definitive refusals. Encode request-count batch responses before mutation. New admission, lost-acknowledgement and increment allocation-fault tests are awaiting compilation.",
+    "qualification_artifact_frozen": false,
+    "optimized_final_host_started": false,
+    "original_importer_unchanged": true,
+    "parallel_pr": "#1479 independently implements a different fairness queue; reconcile overlapping implementations before landing both."
   }
 }

@@ -115,15 +115,37 @@ allocation failure before admission is reported in the allocation-free native
 last-error detail; no SQL is executed.
 
 Existing uncertain handles remain fenced even at an unchanged checkpoint. A
-new open skips cached owners with uncertain serving or detached publication state
+fresh writable open skips cached owners with uncertain serving or detached publication state
 and reconstructs the durable decision from disk. Old query/runtime references
 retain their original ownership until close.
+
+Decode the hexadecimal token into its 16-byte transaction ID and use
+`antfly_db_get_transaction_status`, or Python's
+`db.transaction_status(bytes.fromhex(token))`, on that fresh writable handle.
+A committed status forbids replay; an aborted status permits a new attempt under
+the operation's retry policy. Pending status or a failed lookup leaves the
+outcome unresolved. A read-only open cannot finish recovery of a pending decision.
+
+Raw batch JSON responses contain request counts, so the complete response is
+encoded before mutation. An encoding allocation failure therefore applies no
+transform. Success transfers the existing buffer to the caller without any
+post-commit response allocation or wire-format change.
 
 Diagnostics preserve the actual failure class alongside this disposition.
 Changing an internal error's spelling does not establish whether a mutation was
 applied. A `not_applied` disposition does not make every error retryable: failed
 SQL sessions still require rollback, and resource/constraint errors retain their
 original retry policy.
+
+Generation-control publication uses the same distinction below the API boundary.
+The native transaction group captures its checkpoint uncertainty under the store
+mutex and delivers that original result to every queued member. Atomic sinks can
+then certify a failed publication as unapplied, including admission refusal and
+staging cancellation. The control wrapper returns such a failure directly and
+posting stores retain their previous generation and prepared output. A genuinely
+uncertain publication still retries the identical control record once and then
+requires reopen. Sinks without phase information remain conservative; error
+names alone never certify that a publication did not occur.
 
 ## Qualification
 

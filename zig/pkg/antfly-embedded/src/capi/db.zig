@@ -4843,6 +4843,8 @@ pub fn antfly_db_batch(
     return executeBatchWithReplayAdmissionRetry(handle_ptr, &request, Request.apply);
 }
 
+var test_batch_response_allocator: if (builtin.is_test) ?Allocator else void = if (builtin.is_test) null else {};
+
 pub fn antfly_db_batch_json(
     handle_ptr: ?*anyopaque,
     request_json: capi.Slice,
@@ -4854,6 +4856,13 @@ pub fn antfly_db_batch_json(
     const a = std.heap.c_allocator;
     var owned = batch_api.parseBatchRequest(a, request_json.bytes()) catch |err| return capi.mapError(err);
     defer owned.deinit(a);
+    // This response contains only request counts. Encode it before admission
+    // so allocation cannot turn an applied transform into an ordinary error.
+    // The buffer stays owned here until the mutation succeeds.
+    const response_allocator = if (comptime builtin.is_test) test_batch_response_allocator orelse a else a;
+    var response: ?[]u8 = batch_api.encodeBatchResponse(response_allocator, owned.result()) catch |err|
+        return capi.mapErrorContext(err, "batch response allocation failed before mutation; no write applied");
+    defer if (response) |buffer| response_allocator.free(buffer);
     const Request = struct {
         fn apply(raw: *anyopaque, handle: *Handle) !void {
             const request: *@TypeOf(owned) = @ptrCast(@alignCast(raw));
@@ -4862,8 +4871,8 @@ pub fn antfly_db_batch_json(
     };
     const code = executeBatchWithReplayAdmissionRetry(handle_ptr, &owned, Request.apply);
     if (code != .ok) return code;
-    const response = batch_api.encodeBatchResponse(a, owned.result()) catch |err| return capi.mapError(err);
-    out_buf.* = .{ .ptr = response.ptr, .len = response.len };
+    out_buf.* = .{ .ptr = response.?.ptr, .len = response.?.len };
+    response = null;
     return .ok;
 }
 
@@ -11526,6 +11535,52 @@ test "capi native memory supersession uses filtered lexical indexes and durable 
     try std.testing.expectEqual(t.Lifecycle.superseded, record.lifecycle);
     const detail = try std.json.parseFromSliceLeaky(t.SupersessionProposalDetail, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_proposal, .{}, "", "pair"), .{});
     try std.testing.expectEqual(t.SupersessionRelation.supersedes, detail.proposal.verdict.?);
+}
+
+test "capi native batch response allocation failure precedes an increment" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("batch-response-allocation");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{directory.path()});
+    defer a.free(path);
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    const root = try openLiteHandleAllocWithRuntime(a, path, .{ .no_sync = true, .profile = .hosted }, true, std.testing.io, runtime.ptr());
+    const id = try publishHandle(root);
+    defer antfly_db_close(id);
+    const Probe = struct {
+        fn count(handle: *anyopaque) !i64 {
+            var out: capi.Buffer = .{};
+            defer antfly_buffer_free(&out);
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(handle, .fromSlice("counter"), &out));
+            const row = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.ptr.?[0..out.len], .{});
+            defer row.deinit();
+            return row.value.object.get("n").?.integer;
+        }
+    };
+    var out: capi.Buffer = .{};
+    defer antfly_buffer_free(&out);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(id, .fromSlice("{\"inserts\":{\"counter\":{\"n\":0}},\"sync_level\":\"write\"}"), &out));
+    antfly_buffer_free(&out);
+    const increment =
+        \\{"transforms":[{"key":"counter","operations":[{"op":"$inc","path":"n","value":1}]}],"sync_level":"write"}
+    ;
+    // C-backed memory preserves the exported buffer's ownership contract.
+    var failing = std.testing.FailingAllocator.init(std.heap.c_allocator, .{ .fail_index = 0 });
+    test_batch_response_allocator = failing.allocator();
+    defer test_batch_response_allocator = null;
+    try std.testing.expectEqual(capi.ErrorCode.internal, antfly_db_batch_json(id, .fromSlice(increment), &out));
+    test_batch_response_allocator = null;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(out.ptr == null and out.len == 0);
+    try std.testing.expectEqual(@as(i64, 0), try Probe.count(id));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(id, .fromSlice(increment), &out));
+    const response = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    defer response.deinit();
+    try std.testing.expectEqualStrings("committed", response.value.object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 1), response.value.object.get("transformed").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), try Probe.count(id));
 }
 
 test "capi SQL COMMIT response allocation failure preserves the applied increment" {

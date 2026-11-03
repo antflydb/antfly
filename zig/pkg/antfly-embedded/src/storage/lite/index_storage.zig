@@ -764,6 +764,7 @@ const NativeAtomicWriteSink = struct {
         .finish_mapped = if (supports_mapped_artifacts) finishMapped else null,
         .abort = abort,
         .set_cache_intent = setCacheIntent,
+        .finish_with_publication_state = finishWithPublicationState,
     };
 
     fn create(allocator: Allocator, storage: *Store, path: []const u8) !AtomicWriteSink {
@@ -930,11 +931,17 @@ const NativeAtomicWriteSink = struct {
     }
 
     fn finish(ptr: *anyopaque) !void {
+        var publication_possible = true;
+        return finishWithPublicationState(ptr, &publication_possible);
+    }
+
+    fn finishWithPublicationState(ptr: *anyopaque, publication_possible: *bool) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
+        publication_possible.* = false;
         if (self.failure) |err| return err;
         if (self.file != null) try self.flush();
-        try self.storage.docs.submitIndexMutation(self, publish, true);
+        try self.storage.docs.submitIndexMutationWithPublicationState(self, publish, true, publication_possible);
     }
 
     fn finishSource(ptr: *anyopaque) !@import("../../segment_source.zig").Source {
@@ -1380,6 +1387,94 @@ test "lite native index storage aborts atomic writes without publishing partial 
         try std.testing.expectEqualStrings("stable", stable);
         try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/indexes/ft/new.tbl", 64));
     }
+}
+
+test "lite native control publication refusals preserve a retryable posting generation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "control-admission-refusal.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var indexes = Store.init(a, &docs);
+    const Posting = @import("../posting_segment_store.zig").Store;
+    var posting = try Posting.open(a, indexes.storage(), "/postings");
+    defer posting.deinit();
+    var segment = @import("antfly_vectorindex").posting_segment.Writer.init(a);
+    defer segment.deinit();
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    try posting.publishCheckpoint(1, 0, bytes);
+    var prepared = try posting.prepareCheckpoint(2, 0, bytes);
+    defer prepared.deinit();
+    const previous = docs.file.activeCheckpoint();
+    const Admission = struct {
+        refuse: bool = true,
+        fn enter(ptr: *anyopaque, _: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.refuse) return error.EnrichmentWaitCanceled;
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    var admission: Admission = .{};
+    docs.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer docs.writer_admission = null;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, posting.commitPrepared(&prepared));
+    try std.testing.expect(!posting.poisoned and !prepared.committed);
+    try std.testing.expectEqual(@as(?u64, 1), posting.latestSegmentGeneration());
+    try std.testing.expect(std.meta.eql(previous, docs.file.activeCheckpoint()));
+    try std.testing.expectError(error.EnrichmentWaitCanceled, posting.markAuthoritative());
+    try std.testing.expect(!posting.poisoned);
+    admission.refuse = false;
+    try posting.commitPrepared(&prepared);
+    try posting.markAuthoritative();
+    try std.testing.expectEqual(@as(?u64, 2), posting.latestSegmentGeneration());
+    try std.testing.expect(prepared.committed);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+test "lite native control publication retains uncertainty after a lost checkpoint acknowledgement" {
+    const a = std.testing.allocator;
+    const Fault = struct {
+        var armed = false;
+        fn write(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            const count = try std.testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
+            if (armed and offset == 20) {
+                armed = false;
+                return error.Canceled;
+            }
+            return count;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "control-lost-ack.aflite");
+    defer a.free(path);
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileWritePositional = Fault.write;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    {
+        var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = io, .reclamation = .{ .enabled = false } });
+        defer docs.close();
+        docs.maintenance_start_suppressed = true;
+        var indexes = Store.init(a, &docs);
+        const publication = @import("../generation_publication.zig");
+        try publication.publishControlFile(a, indexes.storage(), "/CURRENT", "generation-one");
+        Fault.armed = true;
+        defer Fault.armed = false;
+        @import("antfly_test_error_logs").expectErrorLogs(1);
+        try std.testing.expectError(error.GenerationPublicationDurabilityUncertain, publication.publishControlFile(a, indexes.storage(), "/CURRENT", "generation-two"));
+        try std.testing.expect(!Fault.armed);
+        try std.testing.expect(docs.file.checkpoint_publication_uncertain);
+    }
+    var reopened = try docstore.Store.openWithOptions(a, path, .{ .read_only = true, .io = std.testing.io });
+    defer reopened.close();
+    const current = (try reopened.file.getIndexCatalogRecordAlloc(a, "/CURRENT")).?;
+    defer a.free(current);
+    try std.testing.expectEqualStrings("generation-two", current);
+    try std.testing.expect((try reopened.checkWithCancel(null)).valid);
 }
 
 test "lite native staged abort removes staging despite pending cancellation" {

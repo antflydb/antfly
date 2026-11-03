@@ -1339,6 +1339,7 @@ const MutationRequest = struct {
     durable: bool = true,
     index_only: bool = false,
     artifact_lease: bool = false,
+    publication_possible: bool = false,
     result: anyerror!void = {},
 };
 
@@ -2898,7 +2899,14 @@ pub const Store = struct {
     }
 
     pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, true, false);
+        return self.submitScopedMutation(context, apply, durable, true, false, null);
+    }
+
+    /// Report the group's decision, captured before another group can change
+    /// the file's uncertainty flags. Queued callers receive the same snapshot
+    /// as their leader, including cancellation before checkpoint publication.
+    pub fn submitIndexMutationWithPublicationState(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, publication_possible: *bool) !void {
+        return self.submitScopedMutation(context, apply, durable, true, false, publication_possible);
     }
 
     /// A durability barrier allocates no pages and requires no allocator
@@ -2922,16 +2930,17 @@ pub const Store = struct {
     }
 
     pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, false, false);
+        return self.submitScopedMutation(context, apply, durable, false, false, null);
     }
 
     /// Immutable source aliases are read-path metadata, not authored writes.
     /// Only groups containing exclusively these aliases may defer reuse proof.
     pub fn submitArtifactLeaseMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
-        return self.submitScopedMutation(context, apply, true, false, true);
+        return self.submitScopedMutation(context, apply, true, false, true, null);
     }
 
-    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
+    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool, publication_possible: ?*bool) !void {
+        if (publication_possible) |out| out.* = false;
         if (self.read_only) return error.ReadOnly;
         defer {
             // Start after publication: even one large final mutation crossing
@@ -2941,6 +2950,7 @@ pub const Store = struct {
         }
         const io = self.file.runtime();
         var request = MutationRequest{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease };
+        defer if (publication_possible) |out| out.* = request.publication_possible;
         self.commit_mutex.lockUncancelable(io);
         if (self.commit_tail) |tail| tail.next = &request else self.commit_head = &request;
         self.commit_tail = &request;
@@ -2968,11 +2978,13 @@ pub const Store = struct {
         if (self.commit_head == null) self.commit_tail = null;
         tail.next = null;
         self.commit_mutex.unlock(io);
-        const result = self.applyMutationGroup(head);
+        var group_publication_possible = false;
+        const result = self.applyMutationGroup(head, &group_publication_possible);
         self.commit_mutex.lockUncancelable(io);
         var current: ?*MutationRequest = head;
         while (current) |item| {
             item.result = result;
+            item.publication_possible = group_publication_possible;
             item.done = true;
             current = item.next;
         }
@@ -3012,7 +3024,8 @@ pub const Store = struct {
         coordinator.destroyArtifactReleases(first);
     }
 
-    fn applyMutationGroup(self: *Store, head: *MutationRequest) !void {
+    fn applyMutationGroup(self: *Store, head: *MutationRequest, publication_possible: *bool) !void {
+        publication_possible.* = false;
         var index_only = true;
         var artifact_lease_only = true;
         var member: ?*MutationRequest = head;
@@ -3024,6 +3037,10 @@ pub const Store = struct {
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
         defer self.mutex.unlock();
+        // This runs after rollback but before unlocking. A later group's
+        // success must not erase an earlier uncertain decision, and ordinary
+        // admission/staging cancellation must not manufacture uncertainty.
+        errdefer publication_possible.* = self.file.checkpoint_publication_uncertain or self.secret_store_uncertain;
         if (self.secret_store_uncertain) return error.OutcomeUnknown;
         try self.refreshAdmissionAssumeLocked();
         try self.initializeReadGenerationAssumeLocked();
@@ -3050,6 +3067,7 @@ pub const Store = struct {
             current = item.next;
         }
         try self.file.commitTransactionWithDurability(durable);
+        publication_possible.* = true;
         if (releases) |first| coordinator.?.destroyArtifactReleases(first);
     }
 
@@ -5910,7 +5928,11 @@ test "lite group commit batches lease-only queued publications" {
     try testQueuedMutationGroups(.leases);
 }
 
-fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
+test "lite group commit reports each queued publication decision" {
+    try testQueuedMutationGroups(.reported);
+}
+
+fn testQueuedMutationGroups(mode: enum { normal, mixed, leases, reported }) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5929,6 +5951,8 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
         gate: *Gate,
         id: usize,
         artifact_lease: bool,
+        report_publication: bool,
+        publication_possible: bool = false,
         result: anyerror!void = {},
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -5946,7 +5970,12 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
             } else try file.putIndexCatalogRecord(key, "committed");
         }
         fn run(self: *@This()) void {
-            self.result = if (self.artifact_lease) self.store.submitArtifactLeaseMutation(self, apply) else self.store.submitMutation(self, apply);
+            self.result = if (self.artifact_lease)
+                self.store.submitArtifactLeaseMutation(self, apply)
+            else if (self.report_publication)
+                self.store.submitIndexMutationWithPublicationState(self, apply, true, &self.publication_possible)
+            else
+                self.store.submitMutation(self, apply);
         }
     };
     var gate = Gate{};
@@ -5958,7 +5987,7 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
         for (threads[0..spawned]) |thread| thread.join();
     }
     for (&workers, 0..) |*worker, i| {
-        worker.* = .{ .store = &store, .gate = &gate, .id = i, .artifact_lease = i != 0 and (mode == .leases or (mode == .mixed and i % 2 == 1)) };
+        worker.* = .{ .store = &store, .gate = &gate, .id = i, .artifact_lease = i != 0 and (mode == .leases or (mode == .mixed and i % 2 == 1)), .report_publication = mode == .reported };
         threads[i] = try std.Thread.spawn(.{}, Worker.run, .{worker});
         spawned += 1;
         if (i == 0) while (!gate.started.load(.acquire)) @import("antfly_platform").time.yieldNow();
@@ -5987,7 +6016,10 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
     gate.proceed.store(true, .release);
     for (threads[0..spawned]) |thread| thread.join();
     spawned = 0;
-    for (workers) |worker| try worker.result;
+    for (workers) |worker| {
+        try worker.result;
+        if (worker.report_publication) try std.testing.expect(worker.publication_possible);
+    }
     // Mixed requests were queued in alternating order. Each type boundary
     // ends a group, while homogeneous queues still coalesce into one group.
     const groups: u64 = if (mode == .mixed) workers.len else 2;
@@ -6031,7 +6063,9 @@ test "lite failed commit group discards every root and allows a clean retry" {
     var bad = Context{ .fail = true };
     var second = MutationRequest{ .context = &bad, .apply = Context.apply };
     var first = MutationRequest{ .context = &good, .apply = Context.apply, .next = &second };
-    try std.testing.expectError(error.InjectedGroupFailure, store.applyMutationGroup(&first));
+    var publication_possible = true;
+    try std.testing.expectError(error.InjectedGroupFailure, store.applyMutationGroup(&first, &publication_possible));
+    try std.testing.expect(!publication_possible);
     try std.testing.expect((try store.file.getDocumentAlloc(alloc, "doc")) == null);
     try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(alloc, "index")) == null);
     try std.testing.expect((try store.checkWithCancel(null)).valid);
