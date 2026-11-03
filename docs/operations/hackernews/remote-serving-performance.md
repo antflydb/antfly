@@ -160,3 +160,26 @@ verified checkpoints after backoff; this does not enable blind HTTP write
 replays. Integrity, TLS authentication/protocol, authorization and admission
 failures remain failed. A pending attempt never grants queryability without an
 independent serving proof.
+
+## Optional native checkpoint hints
+
+Remote extent checkpoints are deduplication hints, not publication authority.
+A stalled or transiently unavailable hint must not consume the entire query
+deadline or prevent publication from an already sealed local snapshot. Hint
+lookups and writes use a child deadline: about one second for small metadata,
+with size-based transfer headroom capped at five seconds. Caller cancellation
+always wins, and parallel lookups drain before the fallback starts.
+
+Transient hint failures fall back to verified chunk publication. Required chunk
+and manifest operations remain mandatory; their transient provider failures
+cross the native runtime boundary as `StorageReadTemporarilyUnavailable`,
+rather than an untransportable provider-specific error. Authorization, integrity
+and TLS protocol failures are not treated as cache misses. This changes neither
+commit authority nor the immutable object format and introduces no blind retries.
+
+This addresses a failure reproduced in Debug after a matched GCS run returned
+HTTP 504 during warm overlay search: the sampled stack was blocked in a remote
+checkpoint-hint GET, and the eventual TLS transport failure escaped the native
+callback ABI. That establishes one concrete failure path; it does not establish
+the cause of every timeout or the original 3.9-second local outlier. Failed
+attempts remain part of the qualification evidence in issue #1471.

@@ -29,6 +29,29 @@ const A = std.mem.Allocator;
 const Namespace = local.storage_db_doc_identity_namespace.Namespace;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const ChunkCache = local.serverless_query_lake_decoded_cache;
+fn checkpointHintTimeoutNs(byte_limit: usize) u64 {
+    // Small hints get about one second; large generation inventories also get
+    // transfer headroom. Caller cancellation still wins over this five-second cap.
+    return @min(5 * std.time.ns_per_s, std.time.ns_per_s + @as(u64, @intCast(byte_limit)) * std.time.ns_per_s / (1024 * 1024));
+}
+
+fn transientProviderFailure(err: anyerror) bool {
+    return err == error.TlsTransportReadFailed or err == error.RemoteUnavailable or err == error.RateLimited or @import("httpx").isRetryableTransportError(err);
+}
+
+/// Snapshot operations implement reads, even when retaining immutable chunks.
+/// Normalize provider failures before crossing the compilation-local error ABI.
+fn repositoryFailure(comptime operation: []const u8, err: anyerror, cancellation: Cancellation) anyerror {
+    cancellation.check() catch |cancelled| return cancelled;
+    if (!transientProviderFailure(err)) return err;
+    std.log.warn("native snapshot repository temporarily unavailable operation={s} cause={s}", .{ operation, @errorName(err) });
+    return error.StorageReadTemporarilyUnavailable;
+}
+
+fn hintMiss(err: anyerror, cancellation: Cancellation) !bool {
+    try cancellation.check();
+    return transientProviderFailure(err) or err == error.Timeout or err == error.DeadlineExceeded or err == error.Canceled or err == error.Cancelled;
+}
 /// Register discovery before publishing a capability. Even a failed physical
 /// capture must leave its descriptor discoverable after restart or table drop.
 pub fn saveWithCover(a: A, store: *Store, io: std.Io, table: anytype, now: u64, retention_ms: u64, cover: anytype, cancellation: Cancellation) ![]const u8 {
@@ -626,6 +649,17 @@ pub const Repository = struct {
     }
     fn checkpointExtent(self: *Repository, a: A, io: std.Io, namespace: Namespace, digest: [32]u8, expected_domain: [32]u8, expires: u64, source: local.storage_db_native_backup_seal.File, needed_until: u64, cancellation: Cancellation) !?[]const Ref {
         if (source.size > max_generation_bytes) return error.QueryCandidateBudgetExceeded;
+        const limit: usize = @intCast(@min(max_manifest_bytes, 65536 + (source.size / chunk_bytes + 1) * 512));
+        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = @import("antfly_platform").time.monotonicNs() +| checkpointHintTimeoutNs(limit) };
+        const result = self.lookupCheckpointExtent(a, io, namespace, digest, expected_domain, expires, source, needed_until, control.token()) catch |err| {
+            if (try hintMiss(err, cancellation)) return null;
+            return err;
+        };
+        try cancellation.check();
+        return result;
+    }
+    fn lookupCheckpointExtent(self: *Repository, a: A, io: std.Io, namespace: Namespace, digest: [32]u8, expected_domain: [32]u8, expires: u64, source: local.storage_db_native_backup_seal.File, needed_until: u64, cancellation: Cancellation) !?[]const Ref {
+        if (source.size > max_generation_bytes) return error.QueryCandidateBudgetExceeded;
         // An extent descriptor cannot need an unbounded response for a tiny
         // native control file. Include conservative escaped-path/header space.
         const limit: usize = @intCast(@min(max_manifest_bytes, 65536 + (source.size / chunk_bytes + 1) * 512));
@@ -664,6 +698,11 @@ pub const Repository = struct {
             return err;
         };
         try cancellation.check();
+        // A transient error in one optional lookup must not hide a terminal
+        // authorization/protocol error returned by its sibling.
+        for (failures) |failure| if (failure) |err| {
+            if (!try hintMiss(err, cancellation)) return err;
+        };
         for (epochs, results, failures) |epoch, object, failure| {
             if (failure) |err| return err;
             if (object) |value| if (try checkedExtent(a, value.body, expected_domain, epoch, source, true, needed_until)) |refs| return refs;
@@ -671,8 +710,19 @@ pub const Repository = struct {
         return null;
     }
     fn publishCheckpoint(self: *Repository, a: A, namespace: Namespace, expires: u64, digest: [32]u8, bytes: []const u8, cancellation: Cancellation) !void {
+        // A hint is neither a commit nor required authority. Ambiguous hint
+        // writes are safe to leave alone; the required manifest owns the chunks.
+        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = @import("antfly_platform").time.monotonicNs() +| checkpointHintTimeoutNs(bytes.len) };
+        self.publishCheckpointHint(a, namespace, expires, digest, bytes, control.token()) catch |err| {
+            if (try hintMiss(err, cancellation)) return;
+            return err;
+        };
+        try cancellation.check();
+    }
+    fn publishCheckpointHint(self: *Repository, a: A, namespace: Namespace, expires: u64, digest: [32]u8, bytes: []const u8, cancellation: Cancellation) !void {
         const bridge: TokenBridge = .{ .token = cancellation };
         const location = try self.checkpointKey(a, namespace, expires, digest);
+        defer a.free(location);
         var result = self.store.opened.client.putObject(self.store.opened.bucket, location, bytes, .{ .if_none_match = true, .cancellation = bridge.object() }) catch |err| {
             try cancellation.check();
             switch (err) {
@@ -712,6 +762,9 @@ pub const Repository = struct {
         return marked.version == 1 and marked.namespace.eql(namespace) and marked.request.table_id == request.table_id and marked.request.expires_ms == request.expires_ms and std.mem.eql(u8, marked.request.id, request.id) and std.mem.eql(u8, &marked.domain, &expected_domain);
     }
     fn canEvict(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, sequence: u64, cancellation: Cancellation) !bool {
+        return canEvictImpl(raw, executor, root, request, namespace, sequence, cancellation) catch |err| return repositoryFailure("can_evict", err, cancellation);
+    }
+    fn canEvictImpl(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, sequence: u64, cancellation: Cancellation) !bool {
         var receiver = try executor.receive();
         const io = receiver.io();
         const self = from(raw);
@@ -741,19 +794,19 @@ pub const Repository = struct {
     fn publish(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
         var receiver = try executor.receive();
         const io = receiver.io();
-        _ = try publishLimited(raw, io, root, request, namespace, cancellation, std.math.maxInt(u64));
+        _ = publishLimited(raw, io, root, request, namespace, cancellation, std.math.maxInt(u64)) catch |err| return repositoryFailure("publish", err, cancellation);
     }
     fn warm(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !bool {
         var receiver = try executor.receive();
         const io = receiver.io();
         if (max_bytes < chunk_bytes or max_bytes > 32 * 1024 * 1024) return error.InvalidQueryRequest;
-        return publishLimited(raw, io, root, request, namespace, cancellation, max_bytes);
+        return publishLimited(raw, io, root, request, namespace, cancellation, max_bytes) catch |err| return repositoryFailure("warm", err, cancellation);
     }
     fn publishWithProof(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?port.ReuseProof {
         var receiver = try executor.receive();
         const io = receiver.io();
         var proof: ?port.ReuseProof = null;
-        _ = try publishLimitedImpl(raw, io, root, request, namespace, cancellation, std.math.maxInt(u64), &proof);
+        _ = publishLimitedImpl(raw, io, root, request, namespace, cancellation, std.math.maxInt(u64), &proof) catch |err| return repositoryFailure("publish_with_proof", err, cancellation);
         return proof;
     }
     fn warmWithProof(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !port.WarmResult {
@@ -761,7 +814,7 @@ pub const Repository = struct {
         const io = receiver.io();
         if (max_bytes < chunk_bytes or max_bytes > 32 * 1024 * 1024) return error.InvalidQueryRequest;
         var proof: ?port.ReuseProof = null;
-        const complete = try publishLimitedImpl(raw, io, root, request, namespace, cancellation, max_bytes, &proof);
+        const complete = publishLimitedImpl(raw, io, root, request, namespace, cancellation, max_bytes, &proof) catch |err| return repositoryFailure("warm_with_proof", err, cancellation);
         return .{ .complete = complete, .proof = proof };
     }
     fn manifestChecksum(bytes: []const u8) [32]u8 {
@@ -904,6 +957,9 @@ pub const Repository = struct {
     /// Publish only a new authenticated manifest; never read/download/re-upload
     /// those extents or derive a checkpoint from a partial storage view.
     fn reference(raw: *anyopaque, executor: port.Executor, request: cut.Request, namespace: Namespace, source: port.Storage, cancellation: Cancellation) !bool {
+        return referenceImpl(raw, executor, request, namespace, source, cancellation) catch |err| return repositoryFailure("reference", err, cancellation);
+    }
+    fn referenceImpl(raw: *anyopaque, executor: port.Executor, request: cut.Request, namespace: Namespace, source: port.Storage, cancellation: Cancellation) !bool {
         var receiver = try executor.receive();
         const io = receiver.io();
         _ = io;
@@ -948,6 +1004,9 @@ pub const Repository = struct {
         return key_;
     }
     fn readChunk(raw: *anyopaque, a: A, ref: Ref, cancellation: Cancellation) ![]u8 {
+        return readChunkImpl(raw, a, ref, cancellation) catch |err| return repositoryFailure("read_chunk", err, cancellation);
+    }
+    fn readChunkImpl(raw: *anyopaque, a: A, ref: Ref, cancellation: Cancellation) ![]u8 {
         const self: *Repository = @ptrCast(@alignCast(raw));
         try cancellation.check();
         // Identity includes the configured credential scope as well as location.
@@ -991,6 +1050,9 @@ pub const Repository = struct {
     /// Rebind a proved unchanged physical generation to a new logical cursor.
     /// Extent horizons must cover the new cursor; never extend them by assertion.
     fn reuse(raw: *anyopaque, _: port.Executor, previous: cut.Request, request: cut.Request, namespace: Namespace, proof: port.ReuseProof, cancellation: Cancellation) !?port.ReuseProof {
+        return reuseImpl(raw, previous, request, namespace, proof, cancellation) catch |err| return repositoryFailure("reuse", err, cancellation);
+    }
+    fn reuseImpl(raw: *anyopaque, previous: cut.Request, request: cut.Request, namespace: Namespace, proof: port.ReuseProof, cancellation: Cancellation) !?port.ReuseProof {
         const self = from(raw);
         try cancellation.check();
         try request.validate(cut.nowMs());
@@ -1042,6 +1104,9 @@ pub const Repository = struct {
         return expected_domain;
     }
     fn openRead(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?port.StorageLease {
+        return openReadImpl(raw, executor, root, request, namespace, cancellation) catch |err| return repositoryFailure("open_read", err, cancellation);
+    }
+    fn openReadImpl(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?port.StorageLease {
         const self: *Repository = @ptrCast(@alignCast(raw));
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
@@ -1063,6 +1128,9 @@ pub const Repository = struct {
         return reader.lease();
     }
     fn recover(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+        return recoverImpl(raw, executor, root, request, namespace, cancellation) catch |err| return repositoryFailure("recover", err, cancellation);
+    }
+    fn recoverImpl(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
         var receiver = try executor.receive();
         const io = receiver.io();
         const self = from(raw);
@@ -2181,4 +2249,144 @@ test "external lake native checkpoint misses overlap adjacent epochs and drain b
     try std.testing.expectEqual(@as(usize, 2), fixture.started.load(.acquire));
     try std.testing.expectEqual(@as(usize, 2), fixture.peak.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), fixture.active.load(.acquire));
+}
+
+test "external lake native checkpoint hints bound stalls preserve cancellation and reject terminal errors" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-checkpoint-hint-deadline");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const expires = cut.nowMs() + 2 * cache_window_ms;
+    const digest: [32]u8 = @splat(1);
+    const primary = try repository.checkpointKey(a, namespace, expires, digest);
+    defer a.free(primary);
+    const Fixture = struct {
+        const Mode = enum { tls, stall, denied, integrity, protocol, mixed };
+        var mode: Mode = .tls;
+        var primary_key: []const u8 = undefined;
+        var active: std.atomic.Value(usize) = .init(0);
+        fn get(_: *anyopaque, _: A, _: []const u8, key_: []const u8, options: objectstore.GetOptions) anyerror!objectstore.GetResult {
+            if (std.mem.eql(u8, key_, primary_key)) return error.FileNotFound;
+            _ = active.fetchAdd(1, .acq_rel);
+            defer _ = active.fetchSub(1, .acq_rel);
+            switch (mode) {
+                .tls => return error.TlsTransportReadFailed,
+                .mixed => return if (std.mem.order(u8, key_, primary_key) == .gt) error.TlsTransportReadFailed else error.AccessDenied,
+                .denied => return error.AccessDenied,
+                .integrity => return error.ArtifactIntegrityMismatch,
+                .protocol => return error.TlsBadRecordMac,
+                .stall => {
+                    const safety = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+                    while (true) {
+                        try options.cancellation.?.check();
+                        if (@import("antfly_platform").time.monotonicNs() >= safety) return error.CheckpointLookupWasUnbounded;
+                        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    }
+                },
+            }
+        }
+        fn cancelled(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    Fixture.primary_key = primary;
+    const original = repository.store.opened.client;
+    defer repository.store.opened.client = original;
+    var vtable = original.vtable.*;
+    vtable.get_object = Fixture.get;
+    repository.store.opened.client.vtable = &vtable;
+    const source: local.storage_db_native_backup_seal.File = .{ .path = "control", .size = 32, .inode = 1, .mtime_ns = 0 };
+    for ([_]Fixture.Mode{ .tls, .stall, .denied, .integrity, .protocol, .mixed }) |mode| {
+        Fixture.mode = mode;
+        const result = repository.checkpointExtent(a, io, namespace, digest, @splat(2), expires, source, expires - 1, .none);
+        switch (mode) {
+            .tls, .stall => try std.testing.expect(try result == null),
+            .denied, .mixed => try std.testing.expectError(error.AccessDenied, result),
+            .integrity => try std.testing.expectError(error.ArtifactIntegrityMismatch, result),
+            .protocol => try std.testing.expectError(error.TlsBadRecordMac, result),
+        }
+        try std.testing.expectEqual(@as(usize, 0), Fixture.active.load(.acquire));
+    }
+    const marker: u8 = 0;
+    try std.testing.expectError(error.Canceled, repository.checkpointExtent(a, io, namespace, digest, @splat(2), expires, source, expires - 1, .{ .ptr = &marker, .is_cancelled_fn = Fixture.cancelled }));
+}
+
+test "external lake native transient hints cannot fail a sealed publication and required failures cross the ABI" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-checkpoint-hint-fallback");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const id: [64]u8 = @splat('e');
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300000, .create = true };
+    const root = try std.fmt.allocPrint(scratch, "{s}/{s}", .{ directory.path(), id });
+    try fs.createDirPathPortable(io, root);
+    const filename = try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{root});
+    _ = try local.storage_db_native_backup.writeFileDurable(io, filename, "complete sealed native data");
+    try cut.finish(a, io, root, request, namespace, 1, .none);
+    const Fixture = struct {
+        var backend: *const objectstore.Client.VTable = undefined;
+        var required_failure: bool = false;
+        var hint_reads: usize = 0;
+        var hint_writes: usize = 0;
+        fn get(raw: *anyopaque, alloc: A, bucket: []const u8, key_: []const u8, options: objectstore.GetOptions) anyerror!objectstore.GetResult {
+            if (required_failure) return error.TlsTransportReadFailed;
+            if (std.mem.indexOf(u8, key_, "/extent-") != null) {
+                hint_reads += 1;
+                return error.TlsTransportReadFailed;
+            }
+            return backend.get_object(raw, alloc, bucket, key_, options);
+        }
+        fn put(raw: *anyopaque, alloc: A, bucket: []const u8, key_: []const u8, bytes: []const u8, options: objectstore.PutOptions) anyerror!objectstore.PutResult {
+            if (required_failure) return error.TlsTransportReadFailed;
+            if (std.mem.indexOf(u8, key_, "/extent-") != null) {
+                hint_writes += 1;
+                return error.TlsTransportReadFailed;
+            }
+            return backend.put_object(raw, alloc, bucket, key_, bytes, options);
+        }
+    };
+    const original = repository.store.opened.client;
+    const original_artifacts = repository.store.implementation.client;
+    defer repository.store.implementation.client = original_artifacts;
+    defer repository.store.opened.client = original;
+    Fixture.backend = original.vtable;
+    var vtable = original.vtable.*;
+    vtable.get_object = Fixture.get;
+    vtable.put_object = Fixture.put;
+    repository.store.opened.client.vtable = &vtable;
+    repository.store.implementation.client.vtable = &vtable;
+    _ = try repository.chunkedCapability().publishReusable(io, root, request, namespace, .none);
+    try std.testing.expect(Fixture.hint_reads > 0);
+    try std.testing.expect(Fixture.hint_writes > 0);
+    const virtual = try std.fmt.allocPrint(scratch, "{s}/virtual", .{directory.path()});
+    var reader = (try repository.chunkedCapability().openRead(io, virtual, request, namespace, .none)).?;
+    defer reader.deinit();
+    const bytes = try reader.view.readFileRangeAlloc(a, try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{virtual}), 0, 27);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("complete sealed native data", bytes);
+    const manifest = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, request, namespace, .none), request, namespace);
+    var uncached_reader = (try repository.chunkedCapability().openRead(io, virtual, request, namespace, .none)).?;
+    defer uncached_reader.deinit();
+    const next_id: [64]u8 = @splat('f');
+    const next_request: cut.Request = .{ .id = &next_id, .table_id = 7, .expires_ms = request.expires_ms, .create = true };
+    const next_root = try std.fmt.allocPrint(scratch, "{s}/{s}", .{ directory.path(), next_id });
+    try fs.createDirPathPortable(io, next_root);
+    _ = try local.storage_db_native_backup.writeFileDurable(io, try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{next_root}), "complete sealed native data");
+    try cut.finish(a, io, next_root, next_request, namespace, 1, .none);
+    for (manifest.files) |file| for (file.chunks) |chunk| repository.chunkCache().discard(repository.chunkKey(chunk.artifact_id));
+    Fixture.required_failure = true;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, uncached_reader.view.readFileRangeAlloc(a, try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{virtual}), 0, 27));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, repository.chunkedCapability().openRead(io, virtual, request, namespace, .none));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, repository.chunkedCapability().publishReusable(io, next_root, next_request, namespace, .none));
+    try std.testing.expectEqual(error.AccessDenied, repositoryFailure("read", error.AccessDenied, .none));
+    try std.testing.expectEqual(error.TlsBadRecordMac, repositoryFailure("read", error.TlsBadRecordMac, .none));
 }
