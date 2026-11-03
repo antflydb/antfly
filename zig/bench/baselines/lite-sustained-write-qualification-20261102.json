@@ -5864,7 +5864,7 @@
     "next_validation": "Native staging/rollback/retry/orphan tests, active replay during blocked merge preparation, overwrite/delete/redefinition/shutdown races, then unchanged-importer diagnostics and final optimized qualification. Wolfspider remains untouched beyond a read-only readiness check."
   },
   "independent_native_text_merge": {
-    "status": "Implemented; focused correctness passes. Current end-to-end and optimized qualification pending.",
+    "status": "Focused correctness and ABI pass, but unchanged importer failed again; root qualification remains incomplete.",
     "source_base": "9b45f9b8a3e540e3fad561c3a1ad3c7e5666b4e3",
     "design": [
       "One owned immutable merge worker per file, no primary epoch held during construction.",
@@ -5904,6 +5904,14 @@
         "passed": 32,
         "skipped": 1,
         "skip_reason": "Optional native accounting fixture requires an explicit library."
+      },
+      "strict_compiled_capi": {
+        "passed": 51,
+        "skipped": 0,
+        "failed": 0,
+        "leaked": 0,
+        "unexpected_error_logs": 0,
+        "log": ".tools/import-regression/root-cause/async-text-merge-v7-strict.log"
       }
     },
     "test_fixture_corrections": [
@@ -5913,11 +5921,258 @@
     ],
     "sdk_compatibility": "No C ABI, request, or error-shape change. New background_publications JSON metrics are additive; preparation overlaps replay and is not additive wall time.",
     "remaining": [
-      "Broad native/reader/persistent/C API and SDK gates on this implementation.",
+      "Broad native/reader/persistent/C API and SDK gates after remaining implementation fixes.",
       "Quiet matched stopped-snapshot service diagnosis, then unchanged original importer input 7 with the original five-second timeout.",
       "Matched optimized original importer contention and frozen corpus, equivalent settling/accounting, active page reuse, and ten-minute active-write qualification on wolfspider.",
       "Human aggregate CI and Beads-owned full factory remain external."
     ],
-    "issue1431_resolved": false
+    "issue1431_resolved": false,
+    "debug_library": {
+      "head": "7b8a8a8f9bb20ff0c6e3ef769b08d41cc4b9bb77",
+      "clean": true,
+      "optimize": "debug",
+      "build_exit_code": 0,
+      "library_sha256": "6edc4050cda1d93c4263d0311a4dcc69fcfe1f196cea132204ec35a06a1f266d",
+      "library": ".tools/import-regression/artifacts/async-merge-v8-debug-library",
+      "build_log": ".tools/import-regression/root-cause/async-text-merge-v8-debug-library.log",
+      "abi_exports": 134,
+      "c_smoke_and_linkage": "passed"
+    },
+    "stopped_snapshot_diagnostic": {
+      "candidate": "6edc4050cda1d93c4263d0311a4dcc69fcfe1f196cea132204ec35a06a1f266d",
+      "peak_native_builds": 0,
+      "duration_seconds": 90,
+      "at_55_seconds": {
+        "prior_fts_sequence": 64,
+        "candidate_fts_sequence": 67,
+        "prior_replay_bytes": 13553063,
+        "candidate_replay_bytes": 12802523
+      },
+      "completed_merges_before_last_poll": 2,
+      "prepared_merge_ns": 16542464000,
+      "staging_ns": 6350878000,
+      "publication_ns": 429517000,
+      "staged_bytes": 62560935,
+      "scope": "Diagnostic sampled run on a quiescent clone; preparation overlaps replay. Does not establish end-to-end throughput."
+    },
+    "original_importer": {
+      "input_index": 7,
+      "importer_exit_code": 1,
+      "censored": false,
+      "importer_succeeded": false,
+      "summary": [
+        0,
+        0,
+        1
+      ],
+      "seconds": 599.1946662090486,
+      "peak_native_builds": 0,
+      "metrics_enabled": true,
+      "library_sha256": "6edc4050cda1d93c4263d0311a4dcc69fcfe1f196cea132204ec35a06a1f266d",
+      "public_errors": [
+        "LiteReplayBacklogExceeded"
+      ],
+      "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution.",
+      "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+      "batch_profiles": 101,
+      "closed_history": {
+        "target_sequence": 101,
+        "full_text_applied_sequence": 38,
+        "enrichment_applied_sequence": 39,
+        "segments": 12,
+        "segment_bytes": 118616692,
+        "replay_bytes": 16597989,
+        "replay_limit_bytes": 16777216
+      }
+    },
+    "sql_constraint_scaling": {
+      "scope": "Public two-table declared-primary-key ON CONFLICT fixture, 128-row statements, 512-byte text. Six quiet Debug runs; primary rows, integrity and reopen pass. No native builds; no model/private inputs.",
+      "runs": [
+        {
+          "tag": "v7-256",
+          "exit_code": 0,
+          "seconds": 1.6894667920423672,
+          "status": "passed",
+          "sql_prepare_seconds": 0.4123312080046162,
+          "sql_commit_seconds": 0.43853520893026143,
+          "acknowledged_rows": 513,
+          "error_type": null,
+          "error": null,
+          "block_seconds": [
+            0.05959570896811783,
+            0.09433145797811449,
+            0.11877066700253636,
+            0.13848183397203684
+          ]
+        },
+        {
+          "tag": "v8-256",
+          "exit_code": 0,
+          "seconds": 1.6259551659459248,
+          "status": "passed",
+          "sql_prepare_seconds": 0.4107695830753073,
+          "sql_commit_seconds": 0.43530149990692735,
+          "acknowledged_rows": 513,
+          "error_type": null,
+          "error": null,
+          "block_seconds": [
+            0.062151625053957105,
+            0.08789112500380725,
+            0.11114904191344976,
+            0.14832504105288535
+          ]
+        },
+        {
+          "tag": "v7-1024",
+          "exit_code": 0,
+          "seconds": 8.573573749978095,
+          "status": "passed",
+          "sql_prepare_seconds": 5.43238279200159,
+          "sql_commit_seconds": 1.7554057500092313,
+          "acknowledged_rows": 2049,
+          "error_type": null,
+          "error": null,
+          "block_seconds": [
+            0.05612466693855822,
+            0.08763474994339049,
+            0.12529591692145914,
+            0.1617170829558745,
+            0.19930075004231185,
+            0.2408266660058871,
+            0.29735241609159857,
+            0.3460310420487076,
+            0.34041800000704825,
+            0.36976095801219344,
+            0.40264058392494917,
+            0.44071154098492116,
+            0.48392950010020286,
+            0.6774143750080839,
+            0.5751405409537256,
+            0.6259363330900669
+          ]
+        },
+        {
+          "tag": "v8-1024",
+          "exit_code": 0,
+          "seconds": 8.548785290913656,
+          "status": "passed",
+          "sql_prepare_seconds": 5.311966249952093,
+          "sql_commit_seconds": 1.7424852090189233,
+          "acknowledged_rows": 2049,
+          "error_type": null,
+          "error": null,
+          "block_seconds": [
+            0.056561167002655566,
+            0.08894091693218797,
+            0.12705891602672637,
+            0.1629694999428466,
+            0.19870225002523512,
+            0.24572079197969288,
+            0.29066141601651907,
+            0.34986099996604025,
+            0.3502657919889316,
+            0.3679191250121221,
+            0.4044375419616699,
+            0.4421222909586504,
+            0.47952008293941617,
+            0.531414208933711,
+            0.5876152500277385,
+            0.6260617910884321
+          ]
+        },
+        {
+          "tag": "v7-2048",
+          "exit_code": 0,
+          "seconds": 31.651093709049746,
+          "status": "passed",
+          "sql_prepare_seconds": 25.443357624928467,
+          "sql_commit_seconds": 3.6693598749116063,
+          "acknowledged_rows": 4097,
+          "error_type": null,
+          "error": null,
+          "block_seconds": [
+            0.057129999971948564,
+            0.08858770807273686,
+            0.12700400000903755,
+            0.16340220801066607,
+            0.2010685830609873,
+            0.2415791250532493,
+            0.29732687503565103,
+            0.3480076249688864,
+            0.3919264170108363,
+            0.45126545790117234,
+            0.5093796250876039,
+            0.5732757499208674,
+            0.6411234169499949,
+            0.724617833038792,
+            0.7907601669430733,
+            0.8678128749597818,
+            0.8448690420482308,
+            0.8678127910243347,
+            0.9025924999732524,
+            0.9337557090912014,
+            0.9781354999868199,
+            1.0260057499399409,
+            1.0689361669356003,
+            1.1195659999502823,
+            1.1742617499548942,
+            1.2332456660224125,
+            1.3023775829933584,
+            1.363653791951947,
+            1.4375786249293014,
+            1.4989049170399085,
+            1.5675485410029069,
+            1.6461593329440802
+          ]
+        },
+        {
+          "tag": "v8-2048",
+          "exit_code": 0,
+          "seconds": 31.663195707951672,
+          "status": "passed",
+          "sql_prepare_seconds": 25.200592332985252,
+          "sql_commit_seconds": 3.6852697919821367,
+          "acknowledged_rows": 4097,
+          "error_type": null,
+          "error": null,
+          "block_seconds": [
+            0.05582904105540365,
+            0.08736670901998878,
+            0.12458762503229082,
+            0.162373291910626,
+            0.1973852920345962,
+            0.24173458304721862,
+            0.2861221249913797,
+            0.346981875016354,
+            0.3976802499964833,
+            0.44542595802340657,
+            0.5053150840103626,
+            0.5701351249590516,
+            0.6347322920337319,
+            0.7086668330011889,
+            0.7883774579968303,
+            0.8564117919886485,
+            0.8335172090446576,
+            0.8582053750287741,
+            0.8925270000472665,
+            0.9267805829877034,
+            0.9662574999965727,
+            1.012267707963474,
+            1.057480291929096,
+            1.1104397919261828,
+            1.159501290996559,
+            1.218384874984622,
+            1.287368749966845,
+            1.3529837089590728,
+            1.4194879999849945,
+            1.4934940830571577,
+            1.5607880000025034,
+            1.6385569580597803
+          ]
+        }
+      ],
+      "finding": "Eight times as many staged rows costs about 61 times as much SQL preparation (0.41 to 25.2 seconds). Both libraries exhibit the same curve. Actual-importer early sampled stacks also contain repeated prior-transaction constraint preparation. This is an independent remaining cost, not a regression introduced by asynchronous merges.",
+      "next": "Retain a generation-fenced, transaction-owned indexed overlay of already validated row and claim effects; invalidate on changed input state or rollback, and retain full authoritative commit validation."
+    }
   }
 }

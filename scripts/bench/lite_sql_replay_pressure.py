@@ -62,9 +62,9 @@ def snapshot(root, tables):
     }
 
 
-def verify_rows(root, name, keys, text):
+def verify_rows(root, name, keys, text, key_column="_id"):
     remaining = set(keys)
-    with closing(root.sql_cursor(f'SELECT _id, text FROM "{name}"')) as cursor:
+    with closing(root.sql_cursor(f'SELECT {key_column}, text FROM "{name}"')) as cursor:
         while True:
             page = cursor.fetch(512)
             for key, value in page["result"]["rows"]:
@@ -104,6 +104,7 @@ def run(args):
     unit = "configuration visibility admission maintenance acknowledgement transactions indexing generation publication "
     text = (unit * (args.text_bytes // len(unit) + 1))[: args.text_bytes]
     names = ["replay_left", "replay_right"]
+    key_column = "row_key" if args.relational_key else "_id"
     expected = [
         [
             identifier(table, row, args.key_bytes)
@@ -119,13 +120,28 @@ def run(args):
             ExitStack() as stack,
         ):
             for name in names:
-                root.sql(f'CREATE TABLE "{name}" (text TEXT)')
+                columns = (
+                    "row_key TEXT PRIMARY KEY, text TEXT"
+                    if args.relational_key
+                    else "text TEXT"
+                )
+                root.sql(f'CREATE TABLE "{name}" ({columns})')
             tables = [stack.enter_context(root.open_table(name)) for name in names]
             for table in tables:
                 if not args.no_text_index and not any(
                     index["kind"] == "full_text" for index in table.stats()["indexes"]
                 ):
                     table.add_index({"name": "text", "type": "full_text"})
+            probe_name = names[0]
+            probe_table = tables[0]
+            if args.relational_key:
+                # SQL primary-key claims require the SQL coordinator. Probe
+                # file-wide batch admission through an ordinary document table,
+                # matching applications which use both APIs on one file.
+                probe_name = "replay_admission_probe"
+                root.sql(f'CREATE TABLE "{probe_name}" (text TEXT)')
+                probe_table = stack.enter_context(root.open_table(probe_name))
+            probe_expected = []
             report["before"] = snapshot(root, tables)
             before = resource.getrusage(resource.RUSAGE_SELF)
             report["sql_prepare_seconds"] = 0.0
@@ -148,14 +164,14 @@ def run(args):
                                 for item in (key, row_text(text, key))
                             ]
                             statement = (
-                                f'INSERT INTO "{name}" (_id, text) VALUES '
+                                f'INSERT INTO "{name}" ({key_column}, text) VALUES '
                                 + ",".join(
                                     f"(${2 * row + 1},${2 * row + 2})"
                                     for row in range(len(block))
                                 )
                             )
                             if args.on_conflict:
-                                statement += " ON CONFLICT (_id) DO UPDATE SET text = EXCLUDED.text"
+                                statement += f" ON CONFLICT ({key_column}) DO UPDATE SET text = EXCLUDED.text"
                             block_started = time.monotonic()
                             session.execute(statement, parameters)
                             report["sql_blocks"].append(
@@ -200,11 +216,11 @@ def run(args):
                 for row in range(args.followup_rows)
             ]
             count_before = int(
-                root.sql(f'SELECT COUNT(*) FROM "{names[0]}"')["rows"][0][0]
+                root.sql(f'SELECT COUNT(*) FROM "{probe_name}"')["rows"][0][0]
             )
             probe = time.monotonic()
             try:
-                tables[0].batch_json(
+                probe_table.batch_json(
                     {
                         "inserts": {
                             key: {"text": row_text(text, key)} for key in extra
@@ -213,11 +229,14 @@ def run(args):
                     }
                 )
                 report["admission"] = "success"
-                expected[0].extend(extra)
+                if args.relational_key:
+                    probe_expected.extend(extra)
+                else:
+                    expected[0].extend(extra)
             except af.BusyError:
                 report["admission"] = "busy"
                 count_after = int(
-                    root.sql(f'SELECT COUNT(*) FROM "{names[0]}"')["rows"][0][0]
+                    root.sql(f'SELECT COUNT(*) FROM "{probe_name}"')["rows"][0][0]
                 )
                 if count_after != count_before:
                     raise RuntimeError("retryable Busy changed primary row count")
@@ -244,15 +263,21 @@ def run(args):
                             "index did not catch up without skipped documents"
                         )
             for name, keys in zip(names, expected):
-                verify_rows(root, name, keys, text)
+                verify_rows(root, name, keys, text, key_column)
+            if args.relational_key:
+                verify_rows(root, probe_name, probe_expected, text)
             report["integrity"] = root.check()
             if not report["integrity"]["valid"]:
                 raise RuntimeError("integrity failed")
         with af.open_readonly(database) as root:
             for name, keys in zip(names, expected):
-                verify_rows(root, name, keys, text)
+                verify_rows(root, name, keys, text, key_column)
+            if args.relational_key:
+                verify_rows(root, probe_name, probe_expected, text)
         report.update(
-            status="passed", acknowledged_rows=sum(map(len, expected)), reopen=True
+            status="passed",
+            acknowledged_rows=sum(map(len, expected)) + len(probe_expected),
+            reopen=True,
         )
     except Exception as error:
         report.update(
@@ -269,7 +294,9 @@ def run(args):
             }
             with af.open_readonly(database) as root:
                 for name, keys in zip(names, expected):
-                    verify_rows(root, name, keys[: successful * args.rows], text)
+                    verify_rows(
+                        root, name, keys[: successful * args.rows], text, key_column
+                    )
                 valid = root.check()["valid"]
                 if not valid:
                     raise RuntimeError("integrity failed after refused COMMIT")
@@ -317,6 +344,11 @@ if __name__ == "__main__":
         "--on-conflict",
         action="store_true",
         help="Exercise incremental SQL conflict-owner resolution",
+    )
+    parser.add_argument(
+        "--relational-key",
+        action="store_true",
+        help="Use a declared SQL primary key to exercise coordinated unique claims",
     )
     parser.add_argument(
         "--no-text-index",
