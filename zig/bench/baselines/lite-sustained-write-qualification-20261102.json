@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Not qualified: the latest completed unchanged-importer Debug diagnostic failed with LiteReplayBacklogExceeded after 497.696 seconds, with zero native builds. Repeated all-deleted private merges were reproduced and fixed. Broad native and composed C API/SDK correctness gates pass; the unchanged importer is rerunning on that frozen fix. Final optimized issue #1431 qualification remains pending.",
+  "status": "Not qualified: unchanged original importer Debug input 7 still failed with LiteReplayBacklogExceeded after 513.534 seconds and 102 batch profiles, with zero native builds. All 65 private merges applied with no discards or EmptySegment failures; maintenance lease queue timeouts were zero. The incomplete database passed integrity with zero tail bytes. Broad native and composed C API/SDK gates pass, but optimized end-to-end and contention qualification remain pending.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -4664,7 +4664,8 @@
     "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
     "original_207_library_sha256": "ef3c87e963330323b13a99973fc1268d697226c0212fdbdba0a3edcb82c97b7b",
     "factory_owner": "Beads task; user explicitly left full agent factory qualification to that task.",
-    "qualification_controller": "Final controller includes original 207 and integrated main controls. Contention includes repeated status_only opens and a persistent SQL reader, with actual successful reads while writers are active."
+    "qualification_controller": "Final controller includes original 207 and integrated main controls. Contention includes repeated status_only opens and a persistent SQL reader, with actual successful reads while writers are active.",
+    "fairness_scope": "No explicit FIFO protocol has been implemented across processes. Fair queue/deadline work should be isolated and qualified separately; these single-process runs recorded zero maintenance queue timeouts."
   },
   "final_d759_attempt": {
     "source_commit": "d75999ee48c3956f8dbe516194950e61d8b58447",
@@ -4888,7 +4889,7 @@
       "seconds": 36.04872883402277
     }
   },
-  "priority": "Finish the isolated original-importer diagnostic after the all-deleted merge fix. Preserve the original caller and five-second wait; establish replay progress before final optimized full-corpus, contention and active-write qualification.",
+  "priority": "Complete the default consumer correctness gate, then use matched optimized final qualification to establish the remaining throughput behavior. Preserve the unchanged original importer and five-second wait. Treat cross-process fairness as a separate protocol change; the current single-process failure is not evidence for that cause.",
   "issue1431_candidate_debug_first": {
     "source_commit": "e63c0a4ca8d077ec4c4e129b4c21791a1d290068",
     "runtime_source_commit": "3b417dd180adadd11619a8c275fb512f09cfe7f5",
@@ -6194,8 +6195,8 @@
       "scope": "Three C API lifecycle/conflict/FK/allocation regressions plus four fold/owned-overlay tests, before the final missing-key table-fence regression and counters."
     },
     "remaining": [
-      "Unchanged original-importer completion, durable catch-up, logical and integrity checks.",
-      "Complete default consumer gate rerun after fixture corrections.",
+      "Matched optimized unchanged original-importer completion and equivalent settled logical/index/accounting checks; Debug capacity failure remains unresolved.",
+      "Complete default consumer gate rerun after fixture corrections (in progress next).",
       "Matched optimized final-host corpus, original contention, active verified page reuse, accounting and ten-minute active-write gates.",
       "Human-triggered aggregate CI and Beads-owned full factory."
     ],
@@ -6704,19 +6705,120 @@
       ]
     },
     "unchanged_importer_v12": {
-      "status": "running",
+      "status": "failed",
       "input_index": 7,
       "timeout_seconds": 1800,
       "original_busy_timeout_seconds": 5,
       "metrics_enabled": true,
       "library_sha256": "6d183b03868e0b104775d76fee7f4e8b160ad8a4c87fe1ef3a1a8bc770188da7",
-      "result_directory": ".tools/import-regression/root-cause/local-input7-empty-merge-v12-debug"
+      "result_directory": ".tools/import-regression/root-cause/local-input7-empty-merge-v12-debug",
+      "result": {
+        "input_index": 7,
+        "importer_exit_code": 1,
+        "censored": false,
+        "importer_succeeded": false,
+        "summary": [
+          0,
+          0,
+          1
+        ],
+        "seconds": 513.5343979169847,
+        "peak_native_builds": 0,
+        "metrics_enabled": true,
+        "library_sha256": "6d183b03868e0b104775d76fee7f4e8b160ad8a4c87fe1ef3a1a8bc770188da7",
+        "public_errors": [
+          "LiteReplayBacklogExceeded"
+        ],
+        "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution."
+      },
+      "attribution": {
+        "batch_profiles": 102,
+        "maintenance_failure_events": {
+          "storage/EnrichmentWaitCanceled": 200,
+          "source/EnrichmentSourceChanged": 22,
+          "retirement/EnrichmentSourceChanged": 5,
+          "retirement/EnrichmentWaitCanceled": 1,
+          "source/Canceled": 1
+        },
+        "owner_numeric": [
+          {
+            "source_turns": 316,
+            "capture_ns": 21520805000,
+            "replay_ns": 250682335000,
+            "artifacts_ns": 103229107000,
+            "storage_ns": 78726949000,
+            "runtime_refreshes": 767,
+            "maintenance_errors": 229,
+            "maintenance_timeouts": 0,
+            "merge_started": 65,
+            "merge_applied": 65,
+            "merge_discarded": 0,
+            "merge_prepare_ns": 34458961000,
+            "merge_staging_ns": 9784441000,
+            "merge_staged_bytes": 120821042,
+            "merge_publication_ns": 26974950000,
+            "sql_overlay_hits": 1072,
+            "sql_overlay_rebuilds": 336,
+            "sql_overlay_rebuild_entries": 44366,
+            "sql_overlay_evictions": 0,
+            "sql_staged_statements": 704,
+            "replay_waits": 19,
+            "replay_refused_prepare_ns": 9580184539
+          },
+          {
+            "capture": 0,
+            "source": 23,
+            "retirement": 6,
+            "artifacts": 0,
+            "storage": 200
+          }
+        ]
+      },
+      "integrity": {
+        "live_accounting": {
+          "metadata_catalog": {
+            "records": 45,
+            "key_bytes": 2093,
+            "value_bytes": 720
+          },
+          "index_catalog": {
+            "records": 599,
+            "key_bytes": 80204,
+            "value_bytes": 146879932
+          },
+          "control_documents": {
+            "records": 1416887,
+            "key_bytes": 103899100,
+            "value_bytes": 70464473
+          },
+          "documents": {
+            "records": 351386,
+            "key_bytes": 35214639,
+            "value_bytes": 407058515
+          }
+        },
+        "valid": true,
+        "file_size": 1250070528,
+        "valid_prefix_size": 1250070528,
+        "tail_bytes": 0,
+        "record_count": 1768931,
+        "live_file_count": 1768917,
+        "live_bytes": 763599676,
+        "compact_size": 1098977280,
+        "reclaimable_bytes": 151093248,
+        "issue": null
+      },
+      "samples": [
+        "sample-active.txt",
+        "sample-pressure.txt"
+      ],
+      "interpretation": "All 65 private merge jobs applied, with no discards or EmptySegment capture failures, yet the original importer still exceeded its replay-capacity wait after 102 batch profiles. Maintenance queue timeouts were zero. This establishes the empty-merge correctness fix but does not establish the end-to-end throughput fix or implicate cross-process starvation in this single-process diagnostic."
     },
     "sdk_changes_required_for_these_fixes": false,
     "issue1431_resolved": false,
     "remaining": [
-      "Unchanged original-importer completion, durable catch-up, logical and integrity checks.",
-      "Complete default consumer gate rerun after fixture corrections.",
+      "Matched optimized unchanged original-importer completion and equivalent settled logical/index/accounting checks; Debug capacity failure remains unresolved.",
+      "Complete default consumer gate rerun after fixture corrections (in progress next).",
       "Matched optimized final-host corpus, original contention, active verified page reuse, accounting and ten-minute active-write gates.",
       "Human-triggered aggregate CI and Beads-owned full factory."
     ]
