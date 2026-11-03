@@ -445,6 +445,6 @@ fix. A preliminary copied-state probe was rejected by the expected
 Post-matrix GCS generation, size and MD5, and the local fixture SHA256, match
 the unchanged source. All source/artifact GCS operations used the existing
 qualification project/bucket; no export, VM or hosted deployment was launched.
-The complete warm sample histories and compact evidence are retained in the
-tracking issue. Same-region Cloud, archive-scale capacity and credential-lifetime
+The harness retains complete warm sample histories in its qualification reports;
+the tables above summarize them. Same-region Cloud, archive-scale capacity and credential-lifetime
 qualification remain outstanding, alongside the unexplained outliers.
