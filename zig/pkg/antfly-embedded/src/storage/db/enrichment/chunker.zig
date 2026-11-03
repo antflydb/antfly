@@ -210,3 +210,18 @@ test "enrichment configured chunker replaces invalid utf8 before dispatch" {
     try std.testing.expectEqual(@as(?u32, 9), chunks[0].end_offset);
     try std.testing.expect(utf8_text.invalidUtf8RepairCount() > repairs_before);
 }
+
+test "enrichment chunker omits short text with either fixed provider" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "mock", "antfly" }) |provider| {
+        const config = try std.fmt.allocPrint(a, "{{\"provider\":\"{s}\",\"text\":{{\"min_chars\":16}}}}", .{provider});
+        defer a.free(config);
+        const empty = try chunkTextWithConfigJson(a, "C-8\n)\n", config);
+        defer freeChunks(a, empty);
+        try std.testing.expectEqual(@as(usize, 0), empty.len);
+        const chunks = try chunkTextWithConfigJson(a, "replace all six gyroscopes", config);
+        defer freeChunks(a, chunks);
+        try std.testing.expectEqual(@as(usize, 1), chunks.len);
+        try std.testing.expectEqualStrings("replace all six gyroscopes", chunks[0].text.?);
+    }
+}
