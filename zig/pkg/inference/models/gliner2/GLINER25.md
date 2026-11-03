@@ -238,6 +238,15 @@ aggregate scratch allowance on both services (`--scratch-budget-mb 4096`); the
 initial baseline trial exhausted its default 1 GiB allowance. Per-request model,
 head and work limits remain unchanged.
 
+The [2026-11-03 local qualification receipt](../../../../bench/baselines/gliner-native-http-20261103/summary.json)
+records the fixed native service accepting exactly 16384 prompt tokens in one
+window with the unchanged 512 MiB request heap. Performance qualification remains
+partial. Some paired confidence intervals do not establish the declared 5%
+median-cost bound, and one short-request phase showed a large slowdown that was
+not consistently reproduced. Changing host/runtime state remains an unresolved
+confounder. These shared-host measurements do not establish production tail
+latency or long-context extraction accuracy, and aggregate CI remains outstanding.
+
 ## Current status
 
 | Artifact | Backbone | Precision | Backend | Status |
