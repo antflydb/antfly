@@ -75,10 +75,16 @@ threshold, initially 64 MiB on native workers and 16 MiB on WASM.
 - The coordinator, or one task, builds the build side once and publishes it as
   an immutable broadcast artifact: typed column blocks in the existing spill
   block format plus a serialized dynamic filter.
-- Probe tasks each take a range of probe-side row-group units. Each task
-  installs the dynamic filter before its cursor starts, so min/max domains
+- Probe tasks each take a range of probe-side row-group units. When join
+  semantics permit pruning this input, the task installs its dynamic filter
+  before the cursor starts, so min/max domains
   prune files and row groups and bloom or exact keys filter batches. It then
-  probes locally and emits result pages or aggregate partials.
+  probes locally and emits result pages or aggregate partials. Install pruning
+  filters only on inputs whose unmatched rows the join may discard. A left
+  outer join must retain every unmatched left row; right and full outer joins
+  preserve their corresponding inputs. Anti joins must retain keys absent from
+  the other input. Re-evaluate these rules after choosing physical build/probe
+  sides, and keep NULL-key rows whenever the join must emit them.
 - This covers star schemas, the dominant analytical join. The dynamic filter
   often removes most of the fact table before any join work happens.
 
@@ -100,9 +106,8 @@ with bucket counts where one divides the other.
 This is the general case.
 
 **Map stage.** Each map task scans a split of one side, applies pushed-down
-filters and the other side's dynamic filter when one is available, and
-hash-partitions rows into *P* partitions by join key. It writes **one** exchange
-object per task. The object holds all *P* partitions as contiguous typed block
+filters and any semantically safe dynamic filter, and hash-partitions rows into
+*P* partitions by join key. It writes **one** exchange object per task. The object holds all *P* partitions as contiguous typed block
 runs and ends with a footer index of partition offsets, row counts and byte
 counts.
 
@@ -122,7 +127,10 @@ tenant maximum.
 **Skew.** Column statistics already carry top-4 frequency hashes, and map
 footers report per-partition sizes. When one partition is far larger than the
 median, the coordinator splits its probe side across several reduce tasks and
-replicates the matching build-side rows to each of them.
+replicates the matching build-side rows to each of them. For joins that emit
+unmatched build rows, reducers report matched row identities and a single
+owner emits the globally unmatched rows after combining those reports; local
+unmatched decisions on replicated inputs would produce incorrect duplicates.
 
 ### 5. Delegate
 
@@ -231,7 +239,9 @@ These came up while mapping the code and help single-node joins too:
 
 - **Correctness.** Run SQL parity suites for inner, left, right, full, semi
   and anti joins. Compare every strategy against the local path on the same
-  pinned snapshot, including NULL keys and duplicate-heavy keys.
+  pinned snapshot, including NULL keys and duplicate-heavy keys. Explicitly
+  test unmatched preserved rows with dynamic filtering enabled, anti joins with
+  absent keys, physical side swaps, and outer joins with replicated skew inputs.
 - **Fault injection.** Use the simulation harnesses to kill workers mid-map
   and mid-reduce, lose a task manifest response, and expire a lease during a
   commit. Results must be identical and no exchange object may leak past
