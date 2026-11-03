@@ -600,6 +600,12 @@ pub fn build(b: *std.Build) void {
     });
     const cuda_artifacts_check_step = b.step("cuda-artifacts-check", "Verify checked-in CUDA artifacts with CUDA 13.2");
     cuda_artifacts_check_step.dependOn(&cuda_artifacts_freshness_check.step);
+    const whisper_artifacts_check = b.addSystemCommand(&.{
+        "bash",
+        "scripts/whisper/regen-kernels.sh",
+        "--check",
+    });
+    cuda_artifacts_check_step.dependOn(&whisper_artifacts_check.step);
 
     const quant_kernel_cuda_attention_diff_step = b.step(
         "quant-kernel-cuda-attention-diff",
