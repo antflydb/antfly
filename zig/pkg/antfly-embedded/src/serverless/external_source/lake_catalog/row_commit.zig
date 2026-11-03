@@ -232,68 +232,105 @@ fn carryManifestKind(a: A, files: Files, previous: []const iceberg.ManifestListE
         return;
     }
     for (previous) |entry| if (entry.content == kind and !mergeable(entry, context.spec_id)) try append(manifests, try listEntry(a, entry));
-    // Bound decoded input as well as output. An upgrade can encounter an
-    // arbitrarily large pool; never decode the entire pool in one arena.
-    var start: usize = 0;
-    var bytes: u64 = 0;
-    for (pool.items, 0..) |entry, index| {
-        if (bytes + entry.manifest_length > manifest_merge_target_bytes) {
-            try carryMergePool(a, files, pool.items[start..index], manifests, kind, context);
-            start = index;
-            bytes = 0;
+    try carryMergePool(a, files, pool.items, manifests, kind, context);
+}
+fn mergeMetadata(comptime kind: iceberg.ManifestContent, context: MergeContext) [5]avro.Metadata {
+    return .{ .{ .key = "schema", .value = context.schema_json }, .{ .key = "partition-spec", .value = "[]" }, .{ .key = "partition-spec-id", .value = context.spec_string }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = if (kind == .deletes) "deletes" else "data" } };
+}
+const MergeBatch = struct {
+    arena: std.heap.ArenaAllocator,
+    records: V,
+    bytes: usize = 0,
+    rows: u64 = 0,
+    min_sequence: i64 = std.math.maxInt(i64),
+    sources: usize = 0,
+    original: ?iceberg.ManifestListEntry = null,
+
+    fn init(a: A) MergeBatch {
+        return .{ .arena = .init(a), .records = .{ .array = std.json.Array.init(a) } };
+    }
+    fn flush(self: *MergeBatch, a: A, files: Files, manifests: *V, comptime kind: iceberg.ManifestContent, context: MergeContext, header: usize) !void {
+        if (self.sources == 0) return;
+        const output_alloc = self.arena.allocator();
+        // Leave filled outputs outside the merge pool. Header-heavy manifests
+        // stay eligible while their record payload still has useful capacity.
+        const capacity = manifest_merge_target_bytes - header - 36;
+        const sealed = self.bytes >= capacity * 3 / 4;
+        if (self.sources == 1 and !sealed) {
+            try append(manifests, try listEntry(a, self.original.?));
+        } else {
+            const encoded = try avro.ocf(output_alloc, avro.entry_schema, self.records.array.items, &mergeMetadata(kind, context));
+            if (encoded.len > manifest_merge_target_bytes) return error.InvalidLakeManifest;
+            const label = if (kind == .deletes) "delete" else "data";
+            const uri = try upload(output_alloc, files, try std.fmt.allocPrint(output_alloc, "metadata/antfly-{s}-{s}-merge-{s}{s}.avro", .{ context.digest, types.digestHex(encoded), label, if (sealed) "-full" else "" }), encoded);
+            try append(manifests, try json(a, .{ .manifest_path = uri, .manifest_length = encoded.len, .partition_spec_id = context.spec_id, .content = if (kind == .deletes) @as(i32, 1) else @as(i32, 0), .sequence_number = context.sequence, .min_sequence_number = self.min_sequence, .added_snapshot_id = context.snapshot_id, .added_files_count = 0, .existing_files_count = self.records.array.items.len, .deleted_files_count = 0, .added_rows_count = 0, .existing_rows_count = self.rows, .deleted_rows_count = 0 }));
         }
-        bytes += entry.manifest_length;
+        _ = self.arena.reset(.retain_capacity);
+        self.records = array(self.arena.allocator());
+        self.bytes = 0;
+        self.rows = 0;
+        self.min_sequence = std.math.maxInt(i64);
+        self.sources = 0;
+        self.original = null;
     }
-    try carryMergePool(a, files, pool.items[start..], manifests, kind, context);
-}
-const Merge = union(enum) { unsupported, too_large, empty, merged: V };
-fn carryMergePool(a: A, files: Files, pool: []const iceberg.ManifestListEntry, manifests: *V, comptime kind: iceberg.ManifestContent, context: MergeContext) anyerror!void {
+};
+fn carryMergePool(a: A, files: Files, pool: []const iceberg.ManifestListEntry, manifests: *V, comptime kind: iceberg.ManifestContent, context: MergeContext) !void {
     if (pool.len == 0) return;
-    const merged = if (pool.len > 1) try mergeManifests(a, files, pool, kind, context) else Merge.unsupported;
-    switch (merged) {
-        .unsupported => for (pool) |entry| try append(manifests, try listEntry(a, entry)),
-        .empty => {},
-        .merged => |entry| try append(manifests, entry),
-        // Header/schema and inherited sequence encodings can grow the output.
-        // Split deterministically until every published manifest fits exactly.
-        .too_large => {
-            const middle = pool.len / 2;
-            try carryMergePool(a, files, pool[0..middle], manifests, kind, context);
-            try carryMergePool(a, files, pool[middle..], manifests, kind, context);
-        },
+    const header_bytes = try avro.ocf(a, avro.entry_schema, &.{}, &mergeMetadata(kind, context));
+    const header = header_bytes.len;
+    a.free(header_bytes);
+    if (header + 36 >= manifest_merge_target_bytes) {
+        for (pool) |entry| try append(manifests, try listEntry(a, entry));
+        return;
     }
-}
-fn mergeManifests(alloc: A, files: Files, pool: []const iceberg.ManifestListEntry, comptime kind: iceberg.ManifestContent, context: MergeContext) !Merge {
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var records = array(a);
-    var rows_count: u64 = 0;
-    var min_sequence: i64 = std.math.maxInt(i64);
+    const entry_schema = try std.json.parseFromSliceLeaky(V, a, avro.entry_schema, .{});
+    var batch = MergeBatch.init(a);
+    defer batch.arena.deinit();
+    var input = std.heap.ArenaAllocator.init(a);
+    defer input.deinit();
     for (pool) |manifest_entry| {
         try files.context.ensureActive();
-        const manifest = try iceberg.parseDataManifestAlloc(a, try readLimited(a, files, manifest_entry.manifest_path, manifest_merge_target_bytes));
+        // Reuse bounded decode scratch for one input at a time. Repeated schema
+        // headers never consume the output bin's record budget.
+        _ = input.reset(.retain_capacity);
+        const scratch = input.allocator();
+        const manifest = try iceberg.parseDataManifestAlloc(scratch, try readLimited(scratch, files, manifest_entry.manifest_path, manifest_merge_target_bytes));
+        var records = array(scratch);
+        var bytes: usize = 0;
+        var rows: u64 = 0;
+        var min_sequence: i64 = std.math.maxInt(i64);
+        var supported = true;
         for (manifest.entries) |raw| {
             if (raw.status == .deleted) continue;
             const file = try @import("../iceberg_inventory.zig").resolveManifestEntry(raw, manifest_entry, 2);
-            // This writer never emits partitions or column bounds. Anything
-            // richer stays in its original manifest rather than losing stats.
-            if (file.partition_field_count != 0 or file.partition_values.len != 0 or file.lower_bounds.len != 0 or file.upper_bounds.len != 0) return .unsupported;
-            if ((kind == .deletes) != (file.content != .data)) return .unsupported;
-            var data_file = try json(a, .{ .content = @as(i32, @backingInt(file.content)), .file_path = file.file_path, .file_format = file.file_format, .partition = object(a), .record_count = file.record_count, .file_size_in_bytes = file.file_size_in_bytes });
-            if (file.equality_ids.len != 0) try put(a, &data_file, "equality_ids", try json(a, file.equality_ids));
-            const data_sequence = file.data_sequence_number orelse return .unsupported;
-            try append(&records, try json(a, .{ .status = 0, .snapshot_id = file.snapshot_id orelse return .unsupported, .sequence_number = data_sequence, .file_sequence_number = file.file_sequence_number orelse return .unsupported, .data_file = data_file }));
-            rows_count = try std.math.add(u64, rows_count, file.record_count);
-            min_sequence = @min(min_sequence, data_sequence);
+            if (file.partition_field_count != 0 or file.partition_values.len != 0 or file.lower_bounds.len != 0 or file.upper_bounds.len != 0 or (kind == .deletes) != (file.content != .data)) {
+                supported = false;
+                break;
+            }
+            var data_file = try json(scratch, .{ .content = @as(i32, @backingInt(file.content)), .file_path = file.file_path, .file_format = file.file_format, .partition = object(scratch), .record_count = file.record_count, .file_size_in_bytes = file.file_size_in_bytes });
+            if (file.equality_ids.len != 0) try put(scratch, &data_file, "equality_ids", try json(scratch, file.equality_ids));
+            const sequence = file.data_sequence_number orelse return error.InvalidLakeManifest;
+            const record = try json(scratch, .{ .status = 0, .snapshot_id = file.snapshot_id orelse return error.InvalidLakeManifest, .sequence_number = sequence, .file_sequence_number = file.file_sequence_number orelse return error.InvalidLakeManifest, .data_file = data_file });
+            bytes += try avro.recordSize(entry_schema, record);
+            try append(&records, record);
+            rows = try std.math.add(u64, rows, file.record_count);
+            min_sequence = @min(min_sequence, sequence);
         }
+        if (!supported or try avro.ocfSize(header, records.array.items.len, bytes) > manifest_merge_target_bytes) {
+            try append(manifests, try listEntry(a, manifest_entry));
+            continue;
+        }
+        if (records.array.items.len == 0) continue;
+        if (try avro.ocfSize(header, batch.records.array.items.len + records.array.items.len, batch.bytes + bytes) > manifest_merge_target_bytes) try batch.flush(a, files, manifests, kind, context, header);
+        if (batch.sources == 0) batch.records = array(batch.arena.allocator());
+        for (records.array.items) |record| try append(&batch.records, try json(batch.arena.allocator(), record));
+        batch.bytes += bytes;
+        batch.rows = try std.math.add(u64, batch.rows, rows);
+        batch.min_sequence = @min(batch.min_sequence, min_sequence);
+        batch.sources += 1;
+        batch.original = manifest_entry;
     }
-    if (records.array.items.len == 0) return .empty;
-    const label = if (kind == .deletes) "delete" else "data";
-    const manifest = try avro.ocf(a, avro.entry_schema, records.array.items, &.{ .{ .key = "schema", .value = context.schema_json }, .{ .key = "partition-spec", .value = "[]" }, .{ .key = "partition-spec-id", .value = context.spec_string }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = if (kind == .deletes) "deletes" else "data" } });
-    if (manifest.len > manifest_merge_target_bytes) return .too_large;
-    const uri = try upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-{s}-{s}-merge-{s}.avro", .{ context.digest, types.digestHex(manifest), label }), manifest);
-    return .{ .merged = try json(alloc, .{ .manifest_path = uri, .manifest_length = manifest.len, .partition_spec_id = context.spec_id, .content = if (kind == .deletes) @as(i32, 1) else @as(i32, 0), .sequence_number = context.sequence, .min_sequence_number = min_sequence, .added_snapshot_id = context.snapshot_id, .added_files_count = 0, .existing_files_count = records.array.items.len, .deleted_files_count = 0, .added_rows_count = 0, .existing_rows_count = rows_count, .deleted_rows_count = 0 }) };
+    try batch.flush(a, files, manifests, kind, context, header);
 }
 /// Allocations belong to a caller-owned attempt arena. The request identity
 /// includes the pinned metadata location; a confirmed CAS conflict may build a
@@ -447,12 +484,18 @@ test "lake catalog manifest merge splits a large eligible pool into bounded outp
     try std.testing.expect(manifests.array.items.len < previous.items.len);
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     var total: usize = 0;
+    var sealed: usize = 0;
     for (manifests.array.items) |entry| {
         try std.testing.expect(try m.int(try m.get(entry, "manifest_length")) <= manifest_merge_target_bytes);
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const sa = scratch.allocator();
-        const bytes = try read(sa, files, try m.str(try m.get(entry, "manifest_path")));
+        const path = try m.str(try m.get(entry, "manifest_path"));
+        const bytes = try read(sa, files, path);
+        if (std.mem.endsWith(u8, path, "-full.avro")) {
+            sealed += 1;
+            try std.testing.expect(!mergeable(.{ .manifest_path = try a.dupe(u8, path), .manifest_length = bytes.len }, 0));
+        }
         const manifest = try iceberg.parseDataManifestAlloc(sa, bytes);
         for (manifest.entries) |file| {
             try std.testing.expectEqual(iceberg.ManifestEntryStatus.existing, file.status);
@@ -464,12 +507,52 @@ test "lake catalog manifest merge splits a large eligible pool into bounded outp
         }
     }
     try std.testing.expectEqual(manifest_merge_min_count * rows_per_manifest, total);
+    try std.testing.expect(sealed > 0);
     // A wider evolved schema may grow the encoded header beyond the target.
-    // Exact output validation must retain/split inputs instead of publishing it.
+    // Exact output validation retains inputs that cannot fit the new header.
     const schema_padding = try a.alloc(u8, @intCast(manifest_merge_target_bytes));
     @memset(schema_padding, ' ');
     var oversized = array(a);
     try carryMergePool(a, files, previous.items[0..2], &oversized, .data, .{ .spec_id = 0, .spec_string = "0", .schema_json = schema_padding, .snapshot_id = 101, .sequence = 101, .digest = "large-header" });
     try std.testing.expectEqual(@as(usize, 2), oversized.array.items.len);
     for (oversized.array.items, previous.items[0..2]) |entry, original| try std.testing.expectEqualStrings(original.manifest_path, try m.str(try m.get(entry, "manifest_path")));
+}
+
+test "lake catalog manifest merge deduplicates wide schema headers and preserves file sequences" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    const files: Files = .{ .client = memory.client(), .bucket = "archive", .prefix = "events", .uri = "gs://archive/events" };
+    const doc = try a.alloc(u8, 600 * 1024);
+    @memset(doc, 'x');
+    const schema_json = try std.json.Stringify.valueAlloc(a, .{ .type = "struct", .@"schema-id" = 0, .fields = .{.{ .id = 1, .name = "id", .type = "long", .required = true, .doc = doc }} }, .{});
+    var previous: std.ArrayList(iceberg.ManifestListEntry) = .empty;
+    for (0..manifest_merge_min_count) |i| {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const row = try json(sa, .{ .status = 1, .snapshot_id = i + 1, .sequence_number = i + 1, .file_sequence_number = i + 1, .data_file = .{ .content = 0, .file_path = try std.fmt.allocPrint(sa, "gs://archive/events/data/{d}.parquet", .{i}), .file_format = "PARQUET", .partition = object(sa), .record_count = 1, .file_size_in_bytes = 1 } });
+        const bytes = try avro.ocf(sa, avro.entry_schema, &.{row}, &.{ .{ .key = "schema", .value = schema_json }, .{ .key = "partition-spec", .value = "[]" }, .{ .key = "partition-spec-id", .value = "0" }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = "data" } });
+        const uri = try upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-wide-{d}-data.avro", .{i}), bytes);
+        try previous.append(a, .{ .manifest_path = try a.dupe(u8, uri), .manifest_length = bytes.len, .partition_spec_id = 0, .content = .data, .sequence_number = @intCast(i + 1), .min_sequence_number = @intCast(i + 1), .added_snapshot_id = @intCast(i + 1), .added_files_count = 1, .added_rows_count = 1 });
+    }
+    var manifests = array(a);
+    try carryManifests(a, files, previous.items, &manifests, .{ .spec_id = 0, .spec_string = "0", .schema_json = schema_json, .snapshot_id = 101, .sequence = 101, .digest = "wide" });
+    try std.testing.expectEqual(@as(usize, 1), manifests.array.items.len);
+    const entry = manifests.array.items[0];
+    try std.testing.expect(try m.int(try m.get(entry, "manifest_length")) < manifest_merge_target_bytes);
+    const output_path = try m.str(try m.get(entry, "manifest_path"));
+    // A large header alone does not seal an otherwise mostly empty output.
+    try std.testing.expect(mergeable(.{ .manifest_path = try a.dupe(u8, output_path), .manifest_length = @intCast(try m.int(try m.get(entry, "manifest_length"))) }, 0));
+    const merged = try iceberg.parseDataManifestAlloc(a, try read(a, files, output_path));
+    try std.testing.expectEqual(manifest_merge_min_count, merged.entries.len);
+    for (merged.entries, 1..) |file, sequence| {
+        try std.testing.expectEqual(iceberg.ManifestEntryStatus.existing, file.status);
+        try std.testing.expectEqual(@as(?i64, @intCast(sequence)), file.data_sequence_number);
+        try std.testing.expectEqual(file.data_sequence_number, file.file_sequence_number);
+        try std.testing.expectEqual(file.snapshot_id, file.data_sequence_number);
+    }
 }

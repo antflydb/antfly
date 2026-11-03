@@ -126,6 +126,12 @@ Receipts bind `protocol`, `provider`, `operation_id`, `request_hash` and
 Antfly-run (managed) vacuum results also report `remaining_snapshots`, the
 eligible snapshots left for the next bounded job, recomputed from current
 catalog metadata on every turn so saved-job retries preserve backlog reporting.
+Managed vacuum journals use version-two snapshot roots over shared, authenticated
+inventory chunks. Chunks stay with the immutable maintenance journal and are not
+part of the source-file sweep. Jobs cache at most 2 MiB of shared nodes in their
+root journal; larger inventories load bounded chunks on replay. Version-one inline
+jobs remain readable. Workers must be upgraded before they can resume new jobs;
+older workers reject the new journal schema without deleting files.
 Pending receipts report no physical deletions; completed receipts report final
 counts. A dry run must report zero deletions. Rejection surfaces as a conflict;
 transport failure leaves the immutable journal available for exact retry.

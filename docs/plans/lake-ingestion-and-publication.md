@@ -625,8 +625,11 @@ deletes across existing partition specs without rewriting historical files.
 Existing manifest references are retained in the new snapshot. Once 100 small
 (below 1 MiB) Antfly-written unpartitioned manifests of one content kind
 accumulate, the next commit rewrites them into manifests of at most 1 MiB each.
-Input decoding uses bounded batches, and exact encoded output checks split batches
-when schema or sequence encoding would exceed the target. Entries keep their
+Input decoding reuses scratch for one manifest at a time. Exact Avro entry sizes
+and one shared schema header determine output batches, so repeated large headers
+do not prevent merging. Outputs filled to three quarters of their record capacity
+use a `-full.avro` suffix and leave the merge pool; large headers alone do not seal
+an otherwise mostly empty output. Entries keep their
 original snapshot and sequence numbers with EXISTING status. Manifests that
 carry partitions or column bounds are never merged. Without merging, each commit
 and each reader's planning step would grow with the total number of commits.
@@ -726,8 +729,16 @@ with native ownership proofs. One job expires at most `max_expired` (default
 256) eligible snapshots, oldest first, and reports the rest as
 `remaining_snapshots`. This backlog is recomputed from current catalog metadata
 on every job turn, including saved-job replay after restarts or deletion limits.
-Within a job each immutable manifest is read once, even
-though snapshots carry their ancestors' manifests forward. When a scheduled job
+Before removing snapshots, version-two jobs save authenticated inventory chunks
+of at most 256 KiB beside the maintenance journal. Snapshot roots share immutable
+manifest inventories, and sweeps visit their union once. The root journal holds
+only snapshot/root references and at most 2 MiB of shared-node cache, so repeated
+ancestor file lists cannot overflow its 4 MiB limit. A replay uses the saved
+inventories even after another safe sweep has collected the source manifests.
+Version-one inline jobs remain replayable; older binaries fail closed on new jobs.
+Dry runs keep these inventories in memory. Within a job each immutable manifest
+is read once, even though snapshots carry their ancestors' manifests forward.
+When a scheduled job
 completes with a backlog, the scheduler plans the next bounded job immediately
 under a fresh operation ID. A large backlog therefore drains over consecutive
 passes instead of exceeding one job's 256 MiB read budget forever. Defaults
