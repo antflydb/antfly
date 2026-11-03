@@ -371,6 +371,9 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         try std.testing.expect(control.initial.observation.applied == null);
         try std.testing.expectError(error.ReadSafetyBarrierUnavailable, source.attestSchemaBootstrapAtRoot(7501, "items", bootstrap_descriptor, inputs, bootstrap_scope, bootstrap_root, .{}));
         const BootstrapBarrier = struct {
+            source: *kernel_owner_source.ProvisionedKernelOwnerSource,
+            expected_users: usize,
+            check_lease_order: bool = true,
             calls: usize = 0,
             fn wait(_: *anyopaque, _: u64, _: []const u8) !void {}
             fn capture(_: *anyopaque, group: u64) !read_gate.ReadSafetyBarrier.FrozenProof {
@@ -382,11 +385,27 @@ test "native index owner adapter inspects cold native ownership and rejects fore
                 try std.testing.expectEqual(@as(u64, 7501), group);
                 try std.testing.expectEqual(@as(u64, 2), term);
                 try std.testing.expect(minimum >= 2);
+                if (self.check_lease_order) {
+                    // The caller's existing control session is allowed; the
+                    // preparation/bootstrap must release all of its own leases
+                    // before a quorum wait can need that owner's apply writer.
+                    try std.testing.expect(self.source.mutex.tryLock());
+                    defer self.source.mutex.unlock();
+                    var users: usize = 0;
+                    for (self.source.entries.items) |entry| if (entry.group_id == group) {
+                        users += entry.active_users;
+                    };
+                    try std.testing.expectEqual(self.expected_users, users);
+                }
                 self.calls += 1;
                 return .{ .incarnation = 91, .term = 2, .applied_index = @max(3, minimum) };
             }
         };
-        var bootstrap_barrier: BootstrapBarrier = .{};
+        var expected_users: usize = 0;
+        for (source.entries.items) |entry| if (entry.group_id == 7501) {
+            expected_users += entry.active_users;
+        };
+        var bootstrap_barrier: BootstrapBarrier = .{ .source = &source, .expected_users = expected_users };
         const original_barrier = source.read_safety_barrier;
         defer source.read_safety_barrier = original_barrier;
         source.read_safety_barrier = .{ .ptr = &bootstrap_barrier, .vtable = &.{ .wait_read_safe = BootstrapBarrier.wait, .capture_frozen = BootstrapBarrier.capture, .certify_completed_prefix = BootstrapBarrier.certify } };
@@ -402,6 +421,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
             try std.testing.expectEqualDeep(actual_binding, captured.signed.value.binding);
             try std.testing.expect(captured.signed.value.position == null);
             try captured.signed.verifyFor(actual_binding, before_capture.state.physical_root_incarnation);
+            bootstrap_barrier.check_lease_order = false;
             try std.testing.expectEqualDeep(before_capture, try source.schemaOwnerStateAtRoot(7501, "items", .{}));
             {
                 const builder = @import("../api/schema_validation_plan_builder.zig");
@@ -915,7 +935,12 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         const replacement = try source.raftSchemaOwnerObservationAtRoot(7501, "items", actual_binding, .{});
         try std.testing.expectEqual(applied.root_generation, replacement.root_generation);
         try std.testing.expect(applied.observation.physical_root_incarnation != replacement.observation.physical_root_incarnation);
-        try std.testing.expect(replacement.observation.header == null and replacement.observation.applied == null);
+        try std.testing.expect(replacement.observation.header == null);
+        // This root contains the real replacement row committed above. Its
+        // data clock must remain truthful even though it has no schema job.
+        try std.testing.expect(replacement.observation.applied != null);
+        try std.testing.expectEqual(@as(u64, 1), replacement.observation.applied.?.term);
+        try std.testing.expectEqual(@as(u64, 1), replacement.observation.applied.?.index);
         try std.testing.expectEqual(@as(usize, 1), source.retireTable("items"));
         try std.Io.Dir.renameAbsolute(seed_path, replacement_path, std.testing.io);
         try std.Io.Dir.renameAbsolute(retained_path, seed_path, std.testing.io);

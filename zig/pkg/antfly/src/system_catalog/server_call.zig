@@ -344,7 +344,7 @@ pub const Call = union(enum) {
     /// Calls whose native owners report the first possible durable effect.
     pub fn tracksSQLSubmission(self: @This()) bool {
         return switch (self) {
-            .mutate, .sql_catalog_mutate, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .fk_initial_create_begin, .fk_generation_publication_begin => true,
+            .mutate, .sql_catalog_mutate, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .fk_initial_create_begin, .fk_generation_publication_begin, .schema_validation_submit, .table_retirement_submit => true,
             else => false,
         };
     }
@@ -394,8 +394,12 @@ test "system catalog schema validation administrative observations use the read 
     try std.testing.expect(retirement.isSchemaValidationCall());
     try std.testing.expect(retirement.requiresAdministrativeGrant());
     try std.testing.expect(!retirement.isMutation());
-    const submit: Call = .{ .schema_validation_submit = "" };
-    try std.testing.expect(submit.isMutation());
+    // Both staged lifecycle writers report their native first-effect witness;
+    // read-only framing/preflight failures must remain definite nonadmission.
+    for ([_]Call{ .{ .schema_validation_submit = "" }, .{ .table_retirement_submit = "" } }) |submit| {
+        try std.testing.expect(submit.isMutation());
+        try std.testing.expect(submit.tracksSQLSubmission());
+    }
 }
 
 test "sequence catalog calls bind administrative bodies and keep status reads nonmutating" {

@@ -5638,6 +5638,8 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
         schema_reads: usize = 0,
         schema_submits: usize = 0,
         schema_command: ?[]const u8 = null,
+        schema_error: ?anyerror = null,
+        schema_effect: bool = false,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return error.TestUnexpectedResult;
         }
@@ -5666,6 +5668,8 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
                 try std.testing.expect(!context.fk_generation_publication_authority);
                 try std.testing.expectEqual(call.requiresAdministrativeGrant(), context.setting_admin);
                 try std.testing.expectEqualSlices(u8, self.schema_command.?, call.schema_validation_submit);
+                if (self.schema_effect) context.markSQLSubmission();
+                if (self.schema_error) |err| return err;
             }
             if (call == .policy_publication_status) {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -5947,6 +5951,27 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
         }
         try std.testing.expectEqual(prior_reads, fixture.reads);
         try std.testing.expectEqual(prior_submits + 1, fixture.schema_submits);
+        for ([_]anyerror{ error.CatalogOccupancyNotReady, error.MetadataMutationOutcomeUnknown }, 0..) |err, index| {
+            fixture.schema_error = err;
+            fixture.schema_effect = index == 1;
+            var req = try httpx.Request.init(alloc, .POST, routes.Routes.internal_schema_validation);
+            defer req.deinit();
+            try req.setBody(command);
+            try req.headers.append("content-type", "application/octet-stream");
+            try req.headers.append(service_auth.header_name, service_token);
+            try req.headers.append(authority.header_name, good);
+            try req.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+            try req.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+            try req.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+            var ctx = httpx.Context.init(alloc, std.testing.io, &req);
+            defer ctx.deinit();
+            var response = try server.metadataSchemaValidation(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(system_catalog.httpStatus(err), response.status.code);
+            try std.testing.expectEqualStrings(if (index == 0) routes.Routes.raft_mutation_outcome_not_proposed else routes.Routes.raft_mutation_outcome_unknown, response.headers.get(routes.Routes.raft_mutation_outcome_header).?);
+        }
+        fixture.schema_error = null;
+        fixture.schema_effect = false;
     }
     const index_ack = try @import("relational_index_publication.zig").testing.fencedAck();
     const Call = @import("../system_catalog/server_call.zig").Call;

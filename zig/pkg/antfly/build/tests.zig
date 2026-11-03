@@ -760,6 +760,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL catalog ordinary view outcome decoder preserves object generations and rejects impossible completions",
         "SQL catalog ordinary schema and annotation commands retain exact outcomes across lost replies and cold reopen",
         "SQL catalog ordinary schema preparation waits for the complete route cut before any admission",
+        "SQL catalog ordinary schema preparation retries owner readiness but never authorization or submission",
         "SQL catalog ordinary relation faults roll back all definition and annotation effects and retire definite refusals",
         "SQL catalog ordinary relation completion owns response identities before admission and preserves unknown recovery",
     }) |required| ordinary_catalog_audit.addArgs(&.{ "--filter", required });

@@ -18516,3 +18516,32 @@ preparation/request budget. A missing route never admits a command, retains a
 partial cohort or triggers mutation replay; exhaustion reports publication
 readiness rather than an internal SQL error. A fault contract checks a missing
 first route cut followed by the complete cohort with zero catalog admissions.
+
+The same readiness rule covers the private read-only owner-preparation RPC:
+remote 503 responses and local owner/report lag are retried without advancing
+the cohort cursor or changing the request identity. Route and owner preparation
+share one bounded budget, with delivery hints refreshed as a whole. Authorization,
+identity and malformed-evidence refusals are not retried. A separate fault
+contract verifies readiness followed by authorization refusal makes exactly two
+read attempts and no catalog admission.
+
+Preparation captures immutable physical facts under one owner lease, releases
+that lease before quorum certification, then reacquires briefly to recheck root
+identity and generation before signing. Bootstrap holds no additional outer
+lease across the wait. This prevents a certifier from waiting for a Raft apply
+writer blocked by its own reader lease, without forcing retries on ordinary row
+churn. The physical adapter's certifier asserts no preparation-owned leases are
+live at the wait boundary. The broad mounted schema campaign now follows the
+exact validation token through all ready/installed/released barriers and uses
+the status's final active version, rather than treating a pending receipt's
+target version as publication completion. Final qualification is pending.
+
+Schema-validation and retirement submissions report first possible effects at
+the existing native observed-proposal boundary. Metadata HTTP no longer marks
+these calls submitted before their read-only preflight. Authenticated canonical
+`not_proposed` readiness refusals therefore retain definite nonadmission, while
+post-proposal wait/read failures retain unknown delivery. No uncertain command
+is replayed. Service tests check the witness before preflight and after proposal;
+the authenticated binary endpoint checks both response headers. This also
+allows the existing public test client to wait for catalog readiness using its
+strict no-receipt, definite-nonadmission predicate.

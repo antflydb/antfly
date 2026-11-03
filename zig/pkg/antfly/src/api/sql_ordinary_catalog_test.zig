@@ -722,3 +722,32 @@ test "SQL catalog ordinary schema preparation waits for the complete route cut b
     try std.testing.expectEqual(@as(usize, 0), source.prepares);
     try std.testing.expectEqual(@as(usize, 0), source.attempts);
 }
+
+test "SQL catalog ordinary schema preparation retries owner readiness but never authorization or submission" {
+    const preparation = @import("schema_validation_preparation.zig");
+    const State = struct {
+        calls: usize = 0,
+        fn prepare(raw: *anyopaque, _: A, group_id: u64, _: []const u8, request: preparation.Request, _: Context) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 11), group_id);
+            try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(2)), &request.id);
+            self.calls += 1;
+            return if (self.calls == 1) error.GenerationAdmissionPending else error.Forbidden;
+        }
+    };
+    var state: State = .{};
+    var source: Source = .{ .store = undefined };
+    var server = source.server();
+    defer server.deinit();
+    server.cfg.deployment_mode = .standalone;
+    server.cfg.schema_validation_preparation = .{ .ptr = &state, .prepare_fn = State.prepare };
+    var transport: @import("schema_validation_owner_transport.zig").Transport = .{ .server = &server, .alloc = a };
+    defer transport.deinit();
+    try transport.prepareCohort(&.{.{ .group_id = 11, .table_id = 1, .start_key = "" }}, .{});
+    const request: preparation.Request = .{ .group_id = 11, .metadata_incarnation = @splat('1'), .id = @splat(2), .provisional_plan = @splat(3), .transition_id = 4, .namespace = .{ .table_id = 1, .shard_id = 11, .range_id = 11 }, .before_schema = "{}", .after_schema = "{}", .selection = .{ .not_null = &.{"n"} } };
+    try std.testing.expectError(error.Forbidden, transport.prepare(a, 11, "rows", request, .{}));
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+    try std.testing.expectEqual(@as(usize, 1), transport.next);
+    try std.testing.expectEqual(@as(usize, 0), source.prepares);
+    try std.testing.expectEqual(@as(usize, 0), source.attempts);
+}

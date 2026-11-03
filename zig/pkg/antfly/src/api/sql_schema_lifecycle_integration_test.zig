@@ -714,6 +714,52 @@ fn expectPublicValidationRequiresRewrite(ctx: *fixture.Context, table: []const u
     try expectDeclaredValidity(ctx, table, check_name, true, "checks");
 }
 
+fn awaitSchemaReceipt(ctx: *fixture.Context, receipt: wire.SQLDDLReceipt) !u32 {
+    const token = receipt.schema_validation_token orelse return error.MissingSchemaValidationToken;
+    const path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/databases/{s}/namespaces/{s}/tables/{s}/schema/publication", .{ receipt.database, receipt.namespace, receipt.table });
+    defer ctx.alloc.free(path);
+    const headers = try ctx.alloc.alloc(@import("../raft/transport/http_common.zig").RequestHeader, ctx.admin_headers.len + 1);
+    defer ctx.alloc.free(headers);
+    @memcpy(headers[0..ctx.admin_headers.len], ctx.admin_headers);
+    headers[ctx.admin_headers.len] = .{ .name = "X-Antfly-Schema-Validation-Token", .value = token };
+    const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+    var last_phase: ?wire.SchemaValidationPhase = null;
+    while (platform.time.monotonicNs() < deadline) {
+        try ctx.checkDrivers();
+        const remaining_ms = (deadline -| platform.time.monotonicNs()) / std.time.ns_per_ms;
+        var response = fixture.requestWithTimeout(ctx.alloc, ctx.transport, headers, ctx.metadata_uri, path, .GET, null, @intCast(@max(1, @min(remaining_ms, 5_000)))) catch |err| switch (err) {
+            error.Timeout, error.DeadlineExceeded => continue,
+            else => return err,
+        };
+        defer response.deinit(ctx.alloc);
+        if (response.status == 200) {
+            var parsed = try std.json.parseFromSlice(wire.SchemaValidationStatus, ctx.alloc, response.body, .{});
+            defer parsed.deinit();
+            const status = parsed.value;
+            try std.testing.expectEqualStrings(token, status.schema_validation_token);
+            try std.testing.expectEqualStrings(receipt.table_id, status.table_id);
+            last_phase = status.phase;
+            if (status.state == .succeeded) {
+                try std.testing.expect(status.owner_count != null);
+                try std.testing.expectEqual(status.owner_count, status.ready);
+                try std.testing.expectEqual(status.owner_count, status.installed);
+                try std.testing.expectEqual(status.owner_count, status.released);
+                return std.math.cast(u32, status.active_schema_version) orelse error.InvalidSchemaReceipt;
+            }
+            if (status.state == .failed) {
+                std.debug.print("schema publication failed table={s} phase={?} failure={?}\n", .{ receipt.table, status.phase, status.failure });
+                return error.SchemaLifecyclePublicationFailed;
+            }
+        } else if (response.status != 503 and response.status != 504) {
+            std.debug.print("schema publication status={d} body={s}\n", .{ response.status, response.body });
+            return error.SchemaLifecyclePublicationFailed;
+        }
+        try ctx.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    std.debug.print("schema publication stalled table={s} phase={?} attempts={d} deferred={d} last_error={s}\n", .{ receipt.table, last_phase, ctx.data.schema_recovery_attempts.load(.acquire), ctx.data.schema_recovery_deferred.load(.acquire), ctx.data.schemaValidationLastErrorForTest() });
+    return error.SchemaLifecyclePublicationTimeout;
+}
+
 fn command(ctx: *fixture.Context, statement: []const u8, expected_error: ?[]const u8) !void {
     return commandParameters(ctx, statement, expected_error, &.{}, null, null);
 }
@@ -835,7 +881,13 @@ fn commandParameters(ctx: *fixture.Context, statement: []const u8, expected_erro
     // Pending FK/index/constraint receipts are observed through serving
     // publication. Never repeat the admitted ALTER or allocate another job.
     if (receipt.state == .invalid) return error.SchemaLifecycleInvalidConstraint;
-    const version = std.math.cast(u32, receipt.schema_version) orelse return error.InvalidSchemaReceipt;
+    // A target schema version alone does not prove publication completion.
+    // Follow the immutable token through all owner release barriers before
+    // ordinary serving reads; never replay the ALTER.
+    const version = if (receipt.schema_validation_token != null)
+        try awaitSchemaReceipt(ctx, receipt)
+    else
+        std.math.cast(u32, receipt.schema_version) orelse return error.InvalidSchemaReceipt;
     const owner = try readyTable(ctx, receipt.table, version);
     try std.testing.expectEqual(try std.fmt.parseInt(u64, receipt.table_id, 10), owner.table_id);
     if (receipt.state != .ready) try awaitConstraintReceipt(ctx, receipt, version);

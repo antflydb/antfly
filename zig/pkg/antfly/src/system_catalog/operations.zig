@@ -1506,7 +1506,7 @@ pub fn submitTableRetirement(svc: anytype, alloc: std.mem.Allocator, context: op
         return prior;
     }
     try context.ensureActive();
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_table_retirement = command });
+    const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_table_retirement = command });
     svc.unlockCatalogMutation();
     gate_held = false;
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
@@ -1565,7 +1565,7 @@ pub fn submitSchemaValidation(svc: anytype, alloc: std.mem.Allocator, context: o
         return prior;
     }
     try context.ensureActive();
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_schema_validation = command });
+    const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_schema_validation = command });
     svc.unlockCatalogMutation();
     gate_held = false;
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
@@ -1650,7 +1650,7 @@ test "system catalog schema validation submissions preflight once observe exact 
             if (self.mismatched and self.proposals != 0) result.lookup.plan_digest[0] ^= 1;
             return std.json.Stringify.valueAlloc(alloc, result, .{});
         }
-        fn proposeTransitionCommandWithReceipt(self: *@This(), command: storage.TransitionCommand) !u64 {
+        pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: storage.TransitionCommand) !u64 {
             try std.testing.expect(self.locked);
             try std.testing.expect(command == .apply_schema_validation);
             try std.testing.expectEqualSlices(u8, self.command, command.apply_schema_validation);
@@ -1697,6 +1697,17 @@ test "system catalog schema validation submissions preflight once observe exact 
     try std.testing.expectError(error.StoreRootEnrollmentChanged, submitSchemaValidation(&svc, a, context, command));
     try std.testing.expect(!svc.locked);
     try std.testing.expectEqual(@as(usize, 0), svc.proposals);
+    var submitted = false;
+    var tracked = context;
+    tracked.sql_completion_submission = &submitted;
+    svc = initial;
+    svc.preflight_error = error.CatalogOccupancyNotReady;
+    try std.testing.expectError(error.CatalogOccupancyNotReady, submitSchemaValidation(&svc, a, tracked, command));
+    try std.testing.expect(!submitted);
+    svc = initial;
+    svc.wait_error = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, submitSchemaValidation(&svc, a, tracked, command));
+    try std.testing.expect(submitted);
     for (0..7) |mode| {
         svc = initial;
         svc.wait_error = mode == 1;
