@@ -32,8 +32,8 @@ pub const Options = struct {
     control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     /// Longest window handed to the model. Whisper is trained on 30 s.
     max_window_s: u32 = audio.WHISPER_CHUNK_LENGTH,
-    /// Skip windows with no frame above the VAD threshold. Whisper tends to
-    /// hallucinate ("Thank you.") on pure silence.
+    /// Skip only exact digital silence. VAD energy thresholds guide window
+    /// boundaries, but cannot prove that quiet speech is absent.
     skip_silent_windows: bool = true,
     vad: vad.Config = .{},
     /// Text presented to the decoder as preceding context for every window:
@@ -194,7 +194,7 @@ pub fn transcribeLong(
         if (options.control) |control| try control.check();
         const window_samples = samples[window.start..window.end];
         if (window_samples.len == 0) continue;
-        if (options.skip_silent_windows and !vad.hasSpeech(window_samples, sample_rate, options.vad)) continue;
+        if (options.skip_silent_windows and try audio.digitalSilence(window_samples)) continue;
         // Only the source-sample check establishes verified silence. A model
         // no-speech prediction over a window with activity is abstention.
         silent = false;
@@ -207,7 +207,7 @@ pub fn transcribeLong(
         defer result.deinit();
         timing.add(result.timing);
         truncated = truncated or result.truncated;
-        output_tokens += result.tokens.len;
+        output_tokens += result.output_tokens;
         if (language == null) if (result.language) |detected| {
             language = try allocator.dupe(u8, detected);
             // Detect once per clip; later windows keep the same language so a
@@ -324,6 +324,7 @@ const FakeTranscriber = struct {
             .allocator = self.allocator,
             .segments = segments,
             .tokens = tokens,
+            .output_tokens = 4,
             .silent = self.silent_result,
             .truncated = self.truncated_result,
         };
@@ -511,6 +512,7 @@ test "long transcription shares output ceiling across windows and rejects partia
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), exact.calls);
     try std.testing.expectEqual(@as(?usize, 0), exact.output_budget.remaining);
+    try std.testing.expectEqual(@as(usize, 8), result.output_tokens);
 }
 
 test "long transcription keeps truncation and distinguishes silent from empty recognition" {
@@ -542,4 +544,24 @@ test "long transcription cancels before scanning silent windows" {
     var fake = FakeTranscriber{ .allocator = std.testing.allocator };
     try std.testing.expectError(error.Cancelled, transcribeLong(std.testing.allocator, &fake, &.{0}, 1000, .{ .control = .{ .check_fn = Cancel.check } }));
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "long transcription recognizes quiet nonzero audio and charges discarded output" {
+    const a = std.testing.allocator;
+    const samples = try a.alloc(f32, 16000);
+    defer a.free(samples);
+    for (samples, 0..) |*v, i| v.* = 0.005 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
+    var fake = FakeTranscriber{ .allocator = a, .empty_result = true, .silent_result = true };
+    var result = try transcribeLong(a, &fake, samples, 16000, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(!result.silent);
+    try std.testing.expectEqual(@as(usize, 4), result.output_tokens);
+    @memset(samples, 0);
+    var silent = try transcribeLong(a, &fake, samples, 16000, .{});
+    defer silent.deinit();
+    try std.testing.expect(silent.silent);
+    try std.testing.expectEqual(@as(usize, 0), silent.output_tokens);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectError(error.UnsupportedAudioFormat, transcribeLong(a, &fake, &.{}, 16000, .{}));
 }

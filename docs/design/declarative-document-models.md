@@ -109,6 +109,27 @@ measured usage, events, and the same deadline/call/token/output limits as
 image and document reads. Audio/video sources reject page selection and slide
 options. Each source must match its reader's declared input modality.
 
+Only exact decoded digital silence can produce an empty completed reading.
+Quiet nonzero audio is recognized even below the VAD energy threshold; VAD
+still chooses pause-aware window boundaries. Empty model recognition over
+nonzero audio remains unresolved. Whisper token usage includes every generated
+token across windows and temperature retries, including timestamps, EOS, and
+output discarded by a no-speech decision.
+
+Durable execution pins effective recognition options separately from physical
+model identity. Provider defaults and output-affecting settings, together with
+the speaker-model artifact revision when diarization is enabled, must match
+before cached results can replay. Credential changes do not make a verifier
+independent. `run_sha256` includes audio options and execution pins. The adapter
+revision changes when this checkpoint contract changes, so older incompatible
+runs fail with a revision mismatch instead of mixing execution policies.
+
+Local audio reads decode the source once. The generation pipeline borrows the
+admitted PCM through projector preprocessing; it retains source bytes for media
+identity and transport accounting. Hosted calls poll the complete request
+cancellation checkpoint throughout provider I/O.
+
+
 For conditional refinement, add another `operation: "read", input: "audio"`
 binding and reference it as `accurate_reader`. The planner uses it when the
 first transcript is incomplete. To accept changed literal text, configure a

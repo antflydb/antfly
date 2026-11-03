@@ -1130,12 +1130,29 @@ pub fn encodeProjectedAudioFromStore(
     return encodeProjectedAudioWithWeights(cb, allocator, &weights, audio_clips);
 }
 
+/// Internal borrowed audio input. Encoded transports and already admitted PCM
+/// share the same projector frontend, without re-encoding or decoding PCM.
+pub const AudioInput = union(enum) { encoded: []const u8, pcm: audio.PcmAudio };
+
+pub fn encodeProjectedAudioInputs(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, inputs: []const AudioInput) !ProjectedAudio {
+    var weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector);
+    defer weights.deinit();
+    return encodeProjectedAudioInputsWithWeights(cb, allocator, &weights, inputs);
+}
+
 fn encodeProjectedAudioWithWeights(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     store: *ProjectorWeights,
     audio_clips: []const []const u8,
 ) !ProjectedAudio {
+    const inputs = try allocator.alloc(AudioInput, audio_clips.len);
+    defer allocator.free(inputs);
+    for (inputs, audio_clips) |*input, bytes| input.* = .{ .encoded = bytes };
+    return encodeProjectedAudioInputsWithWeights(cb, allocator, store, inputs);
+}
+
+fn encodeProjectedAudioInputsWithWeights(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, inputs: []const AudioInput) !ProjectedAudio {
     const cfg = try parseAudioConfig(&store.gguf.?.parsed);
 
     var all_embeddings = std.ArrayListUnmanaged(f32).empty;
@@ -1143,8 +1160,11 @@ fn encodeProjectedAudioWithWeights(
     var tokens_per_audio = std.ArrayListUnmanaged(usize).empty;
     errdefer tokens_per_audio.deinit(allocator);
 
-    for (audio_clips) |audio_bytes| {
-        const encoded = try encodeSingleAudio(cb, allocator, store, cfg, audio_bytes);
+    for (inputs) |input| {
+        const encoded = switch (input) {
+            .encoded => |bytes| try encodeSingleAudio(cb, allocator, store, cfg, bytes),
+            .pcm => |pcm| try encodeSingleAudioPcm(cb, allocator, store, cfg, pcm),
+        };
         defer allocator.free(encoded.embeddings);
         try all_embeddings.appendSlice(allocator, encoded.embeddings);
         try tokens_per_audio.append(allocator, encoded.tokens);
@@ -1209,6 +1229,22 @@ fn embeddingGemma2StageTensor(cb: *const ComputeBackend, a: std.mem.Allocator, n
 fn encodeSingleAudio(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, audio_bytes: []const u8) !EncodedAudio {
     if (cfg.direct_unified) return encodeUnifiedDirectAudio(cb, allocator, store, cfg, audio_bytes);
     const result = try encodeSingleAudioResident(cb, allocator, store, cfg, audio_bytes);
+    defer cb.free(result.embeddings);
+    return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
+}
+
+fn encodeSingleAudioPcm(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, pcm: audio.PcmAudio) !EncodedAudio {
+    for (pcm.samples) |sample| if (!std.math.isFinite(sample)) return error.InvalidAudioSamples;
+    if (cfg.direct_unified) {
+        const frames = try prepareGemma4RawAudioFramesPcm(allocator, pcm, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens);
+        defer allocator.free(frames);
+        return encodeUnifiedDirectAudioFrames(cb, allocator, store, cfg, frames);
+    }
+    var prepared = try prepareAudioPcmBounded(allocator, pcm, cfg.mel_bins, cfg.reject_audio_truncation, !audioHostOps().features and supportsGemma4LogMel(cb), cfg.max_audio_samples, false);
+    defer prepared.deinit();
+    var features = try audioFeaturesFromPrepared(cb, allocator, &prepared);
+    defer features.deinit();
+    const result = try encodeAudioFeaturesResident(cb, allocator, store, cfg, &features);
     defer cb.free(result.embeddings);
     return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
 }
@@ -1420,6 +1456,10 @@ fn encodeUnifiedDirectAudio(
 ) !EncodedAudio {
     const frames = try prepareGemma4RawAudioFrames(allocator, audio_bytes, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens);
     defer allocator.free(frames);
+    return encodeUnifiedDirectAudioFrames(cb, allocator, store, cfg, frames);
+}
+
+fn encodeUnifiedDirectAudioFrames(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, frames: []const f32) !EncodedAudio {
     const token_count = frames.len / cfg.raw_samples_per_token;
     if (token_count == 0) {
         return .{
@@ -1452,12 +1492,15 @@ fn prepareGemma4RawAudioFrames(
     samples_per_token: usize,
     max_tokens: usize,
 ) ![]f32 {
+    var decoded = try audio.decodeBounded(allocator, audio_bytes, .{}, audio.default_decode_working_bytes);
+    defer decoded.deinit();
+    return prepareGemma4RawAudioFramesPcm(allocator, .{ .samples = decoded.samples, .sample_rate = decoded.sample_rate }, samples_per_token, max_tokens);
+}
+
+fn prepareGemma4RawAudioFramesPcm(allocator: std.mem.Allocator, decoded: audio.PcmAudio, samples_per_token: usize, max_tokens: usize) ![]f32 {
     if (samples_per_token == 0) return error.InvalidTensorShape;
     const target_rate: u32 = 16_000;
     const max_samples = std.math.mul(usize, samples_per_token, max_tokens) catch return error.InvalidTensorShape;
-
-    var decoded = try audio.decodeBounded(allocator, audio_bytes, .{}, audio.default_decode_working_bytes);
-    defer decoded.deinit();
     const source_limit = try sourceSampleLimitForResample(max_samples, decoded.sample_rate, target_rate);
     if (decoded.samples.len > source_limit) return error.AudioInputTooLong;
     const resampled = try audio.copyOrResample(allocator, decoded.samples, decoded.sample_rate, target_rate);
@@ -9446,4 +9489,23 @@ test "gemma4 bounded audio rejects duration overflow before resampling" {
     const bytes = try audio.wav.encodeMono(a, samples, .{ .sample_rate = 16000, .audio_format = 3, .bits_per_sample = 32 });
     defer a.free(bytes);
     try std.testing.expectError(error.AudioTooLong, prepareGemma4AudioFeatures(&cb, a, bytes, cfg));
+}
+
+test "gemma4 decoded PCM frontend matches encoded audio without codec work" {
+    const a = std.testing.allocator;
+    var samples: [1600]f32 = undefined;
+    for (&samples, 0..) |*v, i| v.* = 0.005 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
+    const bytes = try audio.wav.encodeMono(a, &samples, .{ .audio_format = 3, .bits_per_sample = 32, .sample_rate = 16000 });
+    defer a.free(bytes);
+    const pcm = audio.PcmAudio{ .samples = &samples, .sample_rate = 16000 };
+    var encoded = try prepareAudioCpuBounded(a, bytes, .{}, 128, true, false, 480000, audio.default_decode_working_bytes, false);
+    defer encoded.deinit();
+    var decoded = try prepareAudioPcmBounded(a, pcm, 128, true, false, 480000, false);
+    defer decoded.deinit();
+    const encoded_frames = try prepareGemma4RawAudioFrames(a, bytes, 640, 750);
+    defer a.free(encoded_frames);
+    const pcm_frames = try prepareGemma4RawAudioFramesPcm(a, pcm, 640, 750);
+    defer a.free(pcm_frames);
+    try std.testing.expectEqualSlices(f32, encoded_frames, pcm_frames);
+    try std.testing.expectEqualSlices(f32, encoded.samples, decoded.samples);
 }

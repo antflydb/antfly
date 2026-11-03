@@ -135,6 +135,8 @@ pub const TranscribeResult = struct {
     /// True when the window was judged silence; `text` is empty then.
     silent: bool = false,
     truncated: bool = false,
+    /// Every generated token, including EOS, timestamps and discarded retries.
+    output_tokens: usize = 0,
 
     pub fn deinit(self: *TranscribeResult) void {
         self.allocator.free(self.text);
@@ -253,6 +255,7 @@ pub const TranscriptionPipeline = struct {
         prompt_prefix: []const i32,
     ) !TranscribeResult {
         try self.output_token_budget.check();
+        const consumed_before = self.output_token_budget.consumed;
         if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const allocator = self.allocator;
         var timing = Timing{};
@@ -380,6 +383,7 @@ pub const TranscriptionPipeline = struct {
             .temperature = attempt.temperature,
             .silent = silent,
             .truncated = !silent and !attempt.completed,
+            .output_tokens = self.output_token_budget.consumed - consumed_before,
         };
     }
 

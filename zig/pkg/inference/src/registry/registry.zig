@@ -1097,7 +1097,7 @@ test "registry resolves unknown directory entry kinds" {
     );
 }
 
-fn isLegacyTaskDir(name: []const u8) bool {
+pub fn isLegacyTaskDir(name: []const u8) bool {
     return std.mem.eql(u8, name, "embedders") or
         std.mem.eql(u8, name, "chunkers") or
         std.mem.eql(u8, name, "rerankers") or

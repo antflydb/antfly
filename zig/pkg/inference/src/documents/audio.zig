@@ -16,6 +16,13 @@
 //! Recognition capabilities are backend facts, shared by dispatch and discovery.
 const std = @import("std");
 const Options = @import("antfly_documents").types.AudioReadOptions;
+/// Physical recognizer identity remains separate from execution policy. This
+/// pin includes effective options and every auxiliary output-producing model.
+pub const ExecutionSnapshot = struct {
+    identity: [32]u8,
+    speaker_revision: ?[64]u8 = null,
+};
+
 pub const Capabilities = struct {
     forced_language: bool,
     detected_language: bool,

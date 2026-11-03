@@ -26,7 +26,7 @@ const image = @import("antfly_image");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
 const V = std.json.Value;
-const adapter_version = "antfly-documents-v9";
+const adapter_version = "antfly-documents-v10";
 const durable = @import("durable.zig");
 
 pub const ReadRequest = struct {
@@ -54,6 +54,15 @@ pub fn Service(comptime Node: type) type {
                 return self.operation == other.operation and std.mem.eql(u8, self.name, other.name);
             }
         };
+        const AudioPin = struct {
+            key: durable.Digest,
+            path: []const u8,
+            options: c.AudioReadOptions,
+            snapshot: @import("audio.zig").ExecutionSnapshot,
+        };
+        fn audioKey(a: A, path: []const u8, options: c.AudioReadOptions) !durable.Digest {
+            return durable.hash(try std.json.Stringify.valueAlloc(a, .{ .path = path, .options = options }, .{}));
+        }
         const ReadScope = struct { limits: c.Limits, deadline_ns: u64 };
         const Plan = struct { key: Key, definition: c.Definition, read_scope: ?ReadScope = null };
         const DependencyKey = struct {
@@ -77,6 +86,7 @@ pub fn Service(comptime Node: type) type {
             };
         };
         const Graph = struct {
+            audio_pins: std.ArrayList(AudioPin) = .empty,
             identities: std.HashMapUnmanaged(DependencyKey, []const [32]u8, DependencyKey.Context, 80) = .empty,
             plans: std.ArrayList(Plan) = .empty,
             visits: usize = 0,
@@ -254,14 +264,29 @@ pub fn Service(comptime Node: type) type {
             return readJsonWithRun(node, backing, bytes, control, null, null, request, .read);
         }
 
-        fn validateAudioGraph(node: *Node, a: A, definition: c.Definition, graph: *const Graph, requested: c.AudioReadOptions, prompt: ?[]const u8, max_tokens: ?i64, depth: usize) !void {
+        fn validateAudioGraph(node: *Node, a: A, definition: c.Definition, graph: *Graph, requested: c.AudioReadOptions, prompt: ?[]const u8, max_tokens: ?i64, control: Control, depth: usize) !void {
             if (depth > 16) return error.DocumentDependencyCycle;
             for (definition.models) |binding| {
-                if (binding.operation != .read or binding.input != .audio) continue;
-                const effective = requested.withDefaults(binding.audio_options);
-                if (graph.get(.{ .name = binding.model, .operation = .read })) |child| {
-                    try validateAudioGraph(node, a, child, graph, effective, prompt, max_tokens, depth + 1);
-                } else if (graph.snapshot(binding)) |pinned| try node.documentValidateAudioOptions(a, pinned.path, effective, prompt, max_tokens);
+                if (binding.operation == .decide) continue;
+                const audio_binding = binding.operation == .read and binding.input == .audio;
+                const effective = if (audio_binding) requested.withDefaults(binding.audio_options) else requested;
+                if (graph.get(.{ .name = binding.model, .operation = binding.operation })) |child| {
+                    try validateAudioGraph(node, a, child, graph, effective, prompt, max_tokens, control, depth + 1);
+                } else if (audio_binding) {
+                    const pinned = graph.snapshot(binding) orelse return error.DocumentCapabilityMismatch;
+                    try node.documentValidateAudioOptions(a, pinned.path, effective, prompt, max_tokens);
+                    if (@hasDecl(Node, "documentResolveAudioExecution")) {
+                        const key = try audioKey(a, pinned.path, effective);
+                        const snapshot = try node.documentResolveAudioExecution(a, pinned.path, effective, control);
+                        var found = false;
+                        for (graph.audio_pins.items) |prior| if (std.mem.eql(u8, &key, &prior.key)) {
+                            if (!std.mem.eql(u8, &snapshot.identity, &prior.snapshot.identity)) return error.DocumentModelRevisionMismatch;
+                            found = true;
+                            break;
+                        };
+                        if (!found) try graph.audio_pins.append(a, .{ .key = key, .path = pinned.path, .options = effective, .snapshot = snapshot });
+                    }
+                }
             }
         }
 
@@ -303,7 +328,7 @@ pub fn Service(comptime Node: type) type {
                 try preflight(node, a, key, def, graph, &.{}, def.allow_remote);
                 try graph.prepareIdentities(a, def);
             }
-            if (@hasDecl(Node, "documentValidateAudioOptions")) try validateAudioGraph(node, a, def, graph, request.audio_options orelse .{}, request.prompt, request.max_tokens, 0);
+            if (@hasDecl(Node, "documentValidateAudioOptions")) try validateAudioGraph(node, a, def, graph, request.audio_options orelse .{}, request.prompt, request.max_tokens, control, 0);
             const Probe = struct {
                 fn check(raw: ?*anyopaque) !void {
                     const ctl: *Control = @ptrCast(@alignCast(raw.?));
@@ -483,7 +508,7 @@ pub fn Service(comptime Node: type) type {
             for (source_options, inputs.items) |*options, input| options.* = .{ .id = input.id, .media_type = input.media_type, .pages = input.pages, .include_notes = input.include_notes, .include_hidden = input.include_hidden, .quadrilateral = input.quadrilateral };
             const runtime_version = @import("build_info").version();
             var run_digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ .definition = std.fmt.bytesToHex(definition_digest, .lower), .sources = fingerprints.items, .models = models.items, .options = source_options, .prompt = request.prompt, .max_tokens = request.max_tokens, .limits = run.limits, .adapter_version = adapter_version, .runtime_version = runtime_version }, .{}), &run_digest, .{});
+            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ .definition = std.fmt.bytesToHex(definition_digest, .lower), .sources = fingerprints.items, .models = models.items, .options = source_options, .prompt = request.prompt, .max_tokens = request.max_tokens, .audio_options = request.audio_options, .audio_executions = graph.audio_pins.items, .limits = run.limits, .adapter_version = adapter_version, .runtime_version = runtime_version }, .{}), &run_digest, .{});
             try run.emit(.{ .phase = .complete, .source_id = "", .page_number = 0, .status = status });
             try response.raw("],\"document\":");
             try response.value(.{ .version = @as(u32, 1), .status = status, .sources = fingerprints.items, .definition_sha256 = @as([]const u8, &std.fmt.bytesToHex(definition_digest, .lower)), .run_sha256 = @as([]const u8, &std.fmt.bytesToHex(run_digest, .lower)), .runtime_version = runtime_version, .models = models.items, .adapter_version = adapter_version });
@@ -505,7 +530,7 @@ pub fn Service(comptime Node: type) type {
             const ModelPin = struct { binding: c.Binding, identity: durable.Digest, max_total_tokens: u64, token_usage: @FieldType(c.Snapshot, "token_usage") };
             var models = std.ArrayList(ModelPin).empty;
             for (graph.snapshots.items) |model| try models.append(a, .{ .binding = model.binding, .identity = model.identity, .max_total_tokens = model.max_total_tokens, .token_usage = model.token_usage });
-            try durable.pin(session, a, .{ .root = key, .definition = definition, .children = plans.items, .limits = run.limits }, models.items, adapter_version);
+            try durable.pin(session, a, .{ .root = key, .definition = definition, .children = plans.items, .limits = run.limits }, .{ .models = models.items, .audio_executions = graph.audio_pins.items }, adapter_version);
             const record = try session.store.loadAt(a, session.lease.run_id, session.lease.owner, durable.now(null));
             run.limits.max_model_calls = @min(run.limits.max_model_calls, @as(usize, @intCast(record.limits.calls)));
             run.limits.max_total_tokens = @min(run.limits.max_total_tokens, record.limits.tokens);
@@ -889,7 +914,17 @@ pub fn Service(comptime Node: type) type {
                 // Using the page arena would retain every logical free and
                 // exhaust the document ceiling even for a short recording.
                 const work = run.work_allocator orelse self.work_allocator;
-                const result = if (@hasDecl(Node, "documentReadAudio")) try self.node.documentReadAudio(work, pinned.path, self.source.bytes, self.prompt, self.max_tokens, self.audio_options.withDefaults(binding.audio_options), self.control) else return error.DocumentCapabilityMismatch;
+                const options = self.audio_options.withDefaults(binding.audio_options);
+                var control = self.control;
+                if (@hasDecl(Node, "documentResolveAudioExecution")) {
+                    const key = try audioKey(a, pinned.path, options);
+                    for (self.graph.audio_pins.items) |pin| if (std.mem.eql(u8, &pin.key, &key)) {
+                        control.audio_execution = pin.snapshot;
+                        break;
+                    };
+                    if (control.audio_execution == null) return error.DocumentModelRevisionMismatch;
+                }
+                const result = if (@hasDecl(Node, "documentReadAudio")) try self.node.documentReadAudio(work, pinned.path, self.source.bytes, self.prompt, self.max_tokens, options, control) else return error.DocumentCapabilityMismatch;
                 defer work.free(result.text);
                 defer if (@hasField(@TypeOf(result), "audio_json")) {
                     if (result.audio_json) |json| work.free(json);
@@ -1480,6 +1515,8 @@ pub fn Service(comptime Node: type) type {
             if (definition_bytes != null) try graph.plans.append(a, .{ .key = root_key, .definition = def });
             try preflight(node, a, root_key, def, &graph, &.{}, def.allow_remote);
             try graph.prepareIdentities(a, def);
+            const audio_options = if (cf.field(root, "audio_options")) |options| (try std.json.parseFromValueLeaky(c.AudioReadOptions, a, options, .{})) else c.AudioReadOptions{};
+            if (@hasDecl(Node, "documentValidateAudioOptions")) try validateAudioGraph(node, a, def, &graph, audio_options, null, null, control, 0);
             var extraction_control = control;
             const deadline = @import("antfly_platform").time.monotonicNs() +| def.budget.deadline_ms * std.time.ns_per_ms;
             extraction_control.deadline_ns = if (control.deadline_ns) |d| @min(d, deadline) else deadline;
@@ -3239,6 +3276,10 @@ fn testDurableReading(comptime Node: type, node: *Node, comptime audio: bool) !v
         const segment = metadata.object.get("segments").?.array.items[0].object;
         try std.testing.expectEqual(@as(i64, 65000), segment.get("start_ms").?.integer);
         try std.testing.expectEqualStrings("SPEAKER_00", segment.get("speaker").?.string);
+        node.audio_revision += 1;
+        try std.testing.expectError(error.DocumentModelRevisionMismatch, Service(Node).readJson(node, a, request, .{ .document_session = &session }));
+        try std.testing.expectEqual(@as(usize, 1), node.reads);
+        try std.testing.expectEqual(used, (try store.load(work, "restart", "alice")).used);
     }
 }
 
@@ -3492,6 +3533,13 @@ const AudioPlanTestNode = struct {
     mismatch: bool = false,
     budget: u64 = 1_000_000,
     retained: ?[]const u8 = null,
+    audio_revision: u8 = 0,
+    pub fn documentResolveAudioExecution(self: *@This(), a: A, path: []const u8, options: c.AudioReadOptions, control: Control) !@import("audio.zig").ExecutionSnapshot {
+        try control.check();
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .path = path, .options = options, .revision = self.audio_revision }, .{});
+        defer a.free(bytes);
+        return .{ .identity = durable.hash(bytes), .speaker_revision = if (options.diarization orelse false) @as([64]u8, @splat(self.audio_revision)) else null };
+    }
     pub fn documentValidateAudioOptions(self: *@This(), _: A, _: []const u8, options: c.AudioReadOptions, _: ?[]const u8, _: ?i64) !void {
         if (self.reject_features and (options.language != null or (options.timestamps orelse false) or (options.diarization orelse false))) return error.UnsupportedAudioReadCapability;
     }
@@ -3528,6 +3576,9 @@ const AudioPlanTestNode = struct {
     }
     pub fn documentReadAudio(self: *@This(), a: A, model: []const u8, bytes: []const u8, _: ?[]const u8, _: ?i64, options: c.AudioReadOptions, control: Control) !struct { text: []const u8, prompt_tokens: ?usize, completion_tokens: ?usize, truncated: bool, silent_audio: bool, unresolved: bool, audio_json: ?[]const u8 = null } {
         try control.check();
+        const pin = control.audio_execution orelse return error.DocumentModelRevisionMismatch;
+        const current = try self.documentResolveAudioExecution(a, model, options, control);
+        if (!std.mem.eql(u8, &pin.identity, &current.identity)) return error.DocumentModelRevisionMismatch;
         if (self.transient_work) {
             for (0..16) |_| {
                 const scratch = try a.alloc(u8, 128 * 1024);
@@ -3750,4 +3801,18 @@ test "document audio hosted allowances cover refinement verification and durable
         try std.testing.expectEqual(used, (try store.load(work, "hosted", "alice")).used);
         try std.testing.expectEqual(@as(u64, 0), replay_meter.used);
     }
+}
+
+test "document audio options distinguish published run identities" {
+    const a = std.testing.allocator;
+    var node = AudioPlanTestNode{};
+    const plain = try Service(AudioPlanTestNode).readJson(&node, a, "{\"model\":\"parent\",\"audio\":\"AAAA\"}", .{});
+    defer a.free(plain);
+    const timed = try Service(AudioPlanTestNode).readJson(&node, a, "{\"model\":\"parent\",\"audio\":\"AAAA\",\"audio_options\":{\"timestamps\":true}}", .{});
+    defer a.free(timed);
+    var p = try std.json.parseFromSlice(V, a, plain, .{});
+    defer p.deinit();
+    var t = try std.json.parseFromSlice(V, a, timed, .{});
+    defer t.deinit();
+    try std.testing.expect(!std.mem.eql(u8, p.value.object.get("document").?.object.get("run_sha256").?.string, t.value.object.get("document").?.object.get("run_sha256").?.string));
 }
