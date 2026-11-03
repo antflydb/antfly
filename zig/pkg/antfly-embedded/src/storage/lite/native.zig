@@ -27,6 +27,7 @@ const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const resource_manager_mod = @import("../resource_manager.zig");
 const maintenance = @import("../maintenance.zig");
+const writer_queue = @import("writer_queue.zig");
 pub const allocator_v4 = @import("allocator_v4.zig");
 
 const ScoreSink = @import("../backend_types.zig").ScoreSink;
@@ -554,7 +555,8 @@ test "lite allocator v4 certificate uncertain publication never rolls back publi
             const size = (try file.file.stat(io)).size;
             Fault.fail_offset = if (after_selector) active_checkpoint_offset else checkpointOffset(1 - file.header.active_checkpoint);
             defer Fault.fail_offset = null;
-            try std.testing.expectError(error.Canceled, file.certifyAllocator());
+            // Cancelled inside the publication window: the outcome is unknown.
+            try std.testing.expectError(error.OutcomeUnknown, file.certifyAllocator());
             try std.testing.expect(file.checkpoint_publication_uncertain);
             try std.testing.expect(file.transaction_header == null);
             try std.testing.expect((try file.file.stat(io)).size > size);
@@ -1416,7 +1418,8 @@ test "lite coordinator publication cancellation never performs fallible notifica
     try std.testing.expect(!file.checkpoint_publication_uncertain);
     Fault.cancel_stat = false;
     Fault.cancel_write = true;
-    try std.testing.expectError(error.Canceled, file.publishCheckpoint(checkpoint));
+    // Cancellation inside the uncertain window reports an unknown outcome.
+    try std.testing.expectError(error.OutcomeUnknown, file.publishCheckpoint(checkpoint));
     try std.testing.expect(file.checkpoint_publication_uncertain);
     try std.testing.expectEqualDeep(before, file.header);
     Fault.cancel_stat = false;
@@ -3602,6 +3605,53 @@ pub const OpenOptions = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
+/// Per-owner writer-lease timing, exposed under `background_publications`.
+/// Log2 nanosecond buckets give bounded percentile ranges. Callers update it
+/// under the in-process path gate.
+pub const LeaseTiming = struct {
+    /// Successful acquisitions, split by how the lease was obtained.
+    acquisitions: u64 = 0,
+    uncontended: u64 = 0,
+    queued: u64 = 0,
+    handoffs: u64 = 0,
+    /// Refused at the deadline (including abandoned queue tickets).
+    busy: u64 = 0,
+    busy_wait_ns: u64 = 0,
+    wait_ns: u64 = 0,
+    wait_max_ns: u64 = 0,
+    wait_log2_ns: [64]u64 = @splat(0),
+    holds: u64 = 0,
+    hold_ns: u64 = 0,
+    hold_max_ns: u64 = 0,
+    hold_log2_ns: [64]u64 = @splat(0),
+
+    pub const Kind = enum { uncontended, queued, handoff };
+
+    pub fn recordAcquired(self: *LeaseTiming, kind: Kind, wait_ns: u64) void {
+        self.acquisitions +|= 1;
+        switch (kind) {
+            .uncontended => self.uncontended +|= 1,
+            .queued => self.queued +|= 1,
+            .handoff => self.handoffs +|= 1,
+        }
+        self.wait_ns +|= wait_ns;
+        self.wait_max_ns = @max(self.wait_max_ns, wait_ns);
+        self.wait_log2_ns[std.math.log2_int(u64, @max(1, wait_ns))] +|= 1;
+    }
+
+    pub fn recordBusy(self: *LeaseTiming, wait_ns: u64) void {
+        self.busy +|= 1;
+        self.busy_wait_ns +|= wait_ns;
+    }
+
+    pub fn recordHold(self: *LeaseTiming, hold_ns: u64) void {
+        self.holds +|= 1;
+        self.hold_ns +|= hold_ns;
+        self.hold_max_ns = @max(self.hold_max_ns, hold_ns);
+        self.hold_log2_ns[std.math.log2_int(u64, @max(1, hold_ns))] +|= 1;
+    }
+};
+
 pub const PathWriterLock = struct {
     io_impl: std.Io.Threaded,
     borrowed_io: ?std.Io = null,
@@ -3609,11 +3659,49 @@ pub const PathWriterLock = struct {
     /// Admission owns this scope. Closing/yielding the kernel lease drops all
     /// idle anchors; escaped readers retain independent marker references.
     reader_registration_batch: ?ReaderCoordinator.RegistrationBatch = null,
+    /// FIFO turn held while this lease is open. Released after the kernel
+    /// lease so the next queued writer finds the sidecar free.
+    queue_turn: ?writer_queue.Turn = null,
+    /// Set instead of `queue_turn` when the lease was taken with the queue idle.
+    queue_watch: ?writer_queue.Watch = null,
+    /// When the kernel lease was first taken; kept across in-process handoffs.
+    acquired_ns: i96 = 0,
+    /// Where `close` records this holder's hold time. Cleared on handoff
+    /// (the giver records its share) so a kept lease never points at an
+    /// owner that may since have closed.
+    hold_stats: ?*LeaseTiming = null,
+    hold_started_ns: i96 = 0,
+
+    /// Starts hold accounting for the current holder.
+    pub fn startHold(self: *PathWriterLock, stats: *LeaseTiming) void {
+        self.hold_stats = stats;
+        self.hold_started_ns = std.Io.Clock.awake.now(self.borrowed_io orelse return).nanoseconds;
+    }
+
+    /// Records the current holder's share and detaches its stats.
+    pub fn endHold(self: *PathWriterLock) void {
+        const stats = self.hold_stats orelse return;
+        self.hold_stats = null;
+        const io = self.borrowed_io orelse return;
+        stats.recordHold(@intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - self.hold_started_ns)));
+    }
+
+    /// Whether a writer in another process has queued behind this lease.
+    /// Unknown (no queue) answers true so callers release instead of keeping it.
+    pub fn othersWaiting(self: *const PathWriterLock) bool {
+        const io = self.borrowed_io orelse return true;
+        if (self.queue_turn) |*turn| return turn.hasSuccessor(io);
+        if (self.queue_watch) |*watch| return watch.hasArrivals(io);
+        return true;
+    }
 
     pub fn close(self: *PathWriterLock) void {
+        self.endHold();
         if (self.reader_registration_batch) |batch| batch.end();
         const io = self.borrowed_io orelse self.io_impl.io();
         self.file.close(io);
+        if (self.queue_turn) |*turn| turn.release(io);
+        if (self.queue_watch) |*watch| watch.release(io);
         if (self.borrowed_io == null) self.io_impl.deinit();
         self.* = undefined;
     }
@@ -4672,6 +4760,9 @@ pub const NativeFile = struct {
 
     test_page_write_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_write_fail_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+    /// Fails the next checkpoint publication inside its uncertain window
+    /// (after the flag is set, before the slot write), then disarms.
+    test_fail_checkpoint_publication: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
         return try openWithOptions(allocator, path, .{ .read_only = read_only });
@@ -10677,7 +10768,7 @@ pub const NativeFile = struct {
         // read lease can use their free pool rather than exceed the hard cap.
         const verify = require_reuse_proof or self.max_file_bytes != null;
         if (self.header.indexed_reclamation) {
-            if (self.checkpoint_publication_uncertain) return error.OutcomeUnknown;
+            if (self.checkpoint_publication_uncertain) return error.OutcomeReconciliationRequired;
             const state = try self.loadLedger(checkpoint);
             state.incremental = self.reserve_retirement_capacity or self.incremental_checkpoints;
             errdefer self.invalidateLedger();
@@ -11441,7 +11532,8 @@ pub const NativeFile = struct {
     pub fn beginTransaction(self: *NativeFile) !void {
         if (self.read_only) return error.ReadOnly;
         if (self.transaction_header != null) return error.TransactionAlreadyActive;
-        if (self.checkpoint_publication_uncertain) return error.OutcomeUnknown;
+        // A new transaction never ran: it is refused, not of unknown outcome.
+        if (self.checkpoint_publication_uncertain) return error.OutcomeReconciliationRequired;
         self.transaction_header = self.header;
         self.artifact_lease_transaction = false;
         self.allocator_certificate_staged = false;
@@ -11572,13 +11664,28 @@ pub const NativeFile = struct {
         self.checkpoint_publication_uncertain = true;
         // Identity bytes and roots form one checksummed recovery slot. A crash
         // during either write invalidates this slot and retains the other one.
-        if (self.header.indexed_reclamation)
-            try self.file.writePositionalAll(io, &identities, logicalGenerationsOffset(next_slot));
-        try self.file.writePositionalAll(io, &encoded_slot, checkpointOffset(next_slot));
-        try self.syncIfRequired();
-        const active_checkpoint: [1]u8 = .{next_slot};
-        try self.file.writePositionalAll(io, &active_checkpoint, active_checkpoint_offset);
-        try self.syncIfRequired();
+        // From here until the flag clears, a failure leaves the commit's
+        // durability unknown: report exactly that, not a raw I/O error a
+        // caller might retry as if nothing had been written.
+        (blk: {
+            if (comptime builtin.is_test) if (self.test_fail_checkpoint_publication) |err| {
+                self.test_fail_checkpoint_publication = null;
+                break :blk err;
+            };
+            if (self.header.indexed_reclamation)
+                self.file.writePositionalAll(io, &identities, logicalGenerationsOffset(next_slot)) catch |err| break :blk err;
+            self.file.writePositionalAll(io, &encoded_slot, checkpointOffset(next_slot)) catch |err| break :blk err;
+            self.syncIfRequired() catch |err| break :blk err;
+            const active_checkpoint: [1]u8 = .{next_slot};
+            self.file.writePositionalAll(io, &active_checkpoint, active_checkpoint_offset) catch |err| break :blk err;
+            self.syncIfRequired() catch |err| break :blk err;
+            break :blk {};
+        }) catch {
+            // Cancellation included: once slot I/O may have started, the
+            // commit can already be durable, so "cancelled" would wrongly
+            // read as "not applied".
+            return error.OutcomeUnknown;
+        };
 
         self.header.checkpoints[next_slot] = checkpoint;
         self.header.active_checkpoint = next_slot;
@@ -12021,6 +12128,96 @@ pub fn waitPathLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, wr
     });
     const held = try @import("path_lock_wait.zig").lockUntil(file, io, if (writer) .exclusive else .shared, deadline_ns);
     return .{ .io_impl = undefined, .borrowed_io = io, .file = held };
+}
+
+/// FIFO cross-process writer admission. Writers take turns through
+/// `writer_queue` and then take the sidecar `flock`, which stays the safety
+/// authority. When nobody is queued, an uncontended writer skips the ticket
+/// entirely. An expired deadline still permits that immediate acquisition.
+/// `wait_io` must be able to run a concurrent kernel wait.
+pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
+    const lock_path = try writerLockPathAlloc(allocator, io, path);
+    defer allocator.free(lock_path);
+    var queue = writer_queue.Queue.open(allocator, io, lock_path) catch |err| switch (err) {
+        // Without a writable queue directory there is nobody to be fair to;
+        // keep the plain kernel wait.
+        error.AccessDenied, error.ReadOnlyFileSystem, error.PermissionDenied => return plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns),
+        else => return err,
+    };
+    var queue_owned = true;
+    defer if (queue_owned) queue.close(io);
+
+    var tail = try queue.lockTail(wait_io, deadline_ns);
+    var tail_held = true;
+    defer if (tail_held) tail.release(io);
+    if (try queue.isIdle(io, &tail)) {
+        // Holding the tail means no ticket can be issued ahead of us.
+        if (acquireWriterLock(allocator, io, path)) |held| {
+            queue_owned = false;
+            return .{
+                .io_impl = undefined,
+                .borrowed_io = io,
+                .file = held.file,
+                .queue_watch = .{ .queue = queue, .mark = tail.next },
+                .acquired_ns = std.Io.Clock.awake.now(io).nanoseconds,
+            };
+        } else |err| if (err != error.WouldBlock and err != error.FileBusy) return err;
+    }
+    // A zero or spent budget may only take an uncontended lease.
+    if (deadline_ns - std.Io.Clock.awake.now(io).nanoseconds <= 0) return error.FileBusy;
+    var ticket = try queue.enqueue(io, &tail);
+    tail.release(io);
+    tail_held = false;
+
+    try queue.awaitTurn(wait_io, &ticket, deadline_ns);
+    var turn: writer_queue.Turn = .{ .queue = queue, .ticket = ticket };
+    queue_owned = false;
+    errdefer turn.release(io);
+    // Our turn: only readers or a writer that bypassed the queue can still
+    // hold the sidecar, and only one queued writer ever waits here.
+    var lease = try plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns);
+    lease.queue_turn = turn;
+    lease.acquired_ns = std.Io.Clock.awake.now(io).nanoseconds;
+    return lease;
+}
+
+/// Nonblocking writer acquisition that never jumps the FIFO: returns
+/// `error.WouldBlock` while any writer is queued or holds a turn.
+pub fn tryFairWriterLockWithIo(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
+    const lock_path = try writerLockPathAlloc(allocator, io, path);
+    defer allocator.free(lock_path);
+    var queue = writer_queue.Queue.open(allocator, io, lock_path) catch |err| switch (err) {
+        error.AccessDenied, error.ReadOnlyFileSystem, error.PermissionDenied => return lockWriterPathWithIo(allocator, io, path),
+        else => return err,
+    };
+    defer queue.close(io);
+    var tail = try queue.tryLockTail(io);
+    defer tail.release(io);
+    if (!try queue.isIdle(io, &tail)) return error.WouldBlock;
+    return .{ .io_impl = undefined, .borrowed_io = io, .file = (try acquireWriterLock(allocator, io, path)).file, .acquired_ns = std.Io.Clock.awake.now(io).nanoseconds };
+}
+
+fn plainWriterLockUntil(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
+    var backoff_ns: i96 = 50 * std.time.ns_per_us;
+    while (true) {
+        if (acquireWriterLock(allocator, io, path)) |held| {
+            return .{ .io_impl = undefined, .borrowed_io = io, .file = held.file };
+        } else |err| if (err != error.WouldBlock and err != error.FileBusy) return err;
+        if (deadline_ns - std.Io.Clock.awake.now(io).nanoseconds <= 0) return error.FileBusy;
+        if (waitPathLockWithIo(allocator, wait_io, path, true, deadline_ns)) |held| {
+            var lease = held;
+            lease.borrowed_io = io;
+            return lease;
+        } else |err| switch (err) {
+            // Sidecar not yet created, or no concurrent executor: poll.
+            error.FileNotFound, error.ConcurrencyUnavailable => {},
+            else => return err,
+        }
+        const remaining = deadline_ns - std.Io.Clock.awake.now(io).nanoseconds;
+        if (remaining <= 0) return error.FileBusy;
+        try io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake);
+        backoff_ns = @min(backoff_ns * 2, 4 * std.time.ns_per_ms);
+    }
 }
 
 /// Read-only embedded calls coordinate with commits without reserving a writer.
@@ -13554,6 +13751,117 @@ test "lite native file active writer permits readers but blocks second writer" {
     try std.testing.expectEqual(@as(u64, 1), report.commit_sequence);
 
     try std.testing.expectError(error.WouldBlock, writer.vacuum());
+}
+
+const FairLockProbe = struct {
+    path: []const u8,
+    wait_io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    order: [8]u8 = undefined,
+    len: usize = 0,
+    max_wait_ns: i96 = 0,
+    failures: usize = 0,
+
+    fn takeOnce(self: *FairLockProbe, id: u8) void {
+        const io = std.testing.io;
+        var lease = fairWriterLockWithIo(std.testing.allocator, io, self.wait_io, self.path, std.Io.Clock.awake.now(io).nanoseconds + 10 * std.time.ns_per_s) catch {
+            self.mutex.lockUncancelable(io);
+            self.failures += 1;
+            self.mutex.unlock(io);
+            return;
+        };
+        defer lease.close();
+        self.mutex.lockUncancelable(io);
+        self.order[self.len] = id;
+        self.len += 1;
+        self.mutex.unlock(io);
+    }
+
+    fn loop(self: *FairLockProbe, rounds: usize) void {
+        const io = std.testing.io;
+        for (0..rounds) |_| {
+            const started = std.Io.Clock.awake.now(io).nanoseconds;
+            var lease = fairWriterLockWithIo(std.testing.allocator, io, self.wait_io, self.path, started + 10 * std.time.ns_per_s) catch {
+                self.mutex.lockUncancelable(io);
+                self.failures += 1;
+                self.mutex.unlock(io);
+                continue;
+            };
+            const waited = std.Io.Clock.awake.now(io).nanoseconds - started;
+            // Hold briefly, then immediately try again: the pattern that let
+            // a releasing writer win the kernel lock back under plain flock.
+            io.sleep(.fromMicroseconds(500), .awake) catch {};
+            lease.close();
+            self.mutex.lockUncancelable(io);
+            self.max_wait_ns = @max(self.max_wait_ns, waited);
+            self.mutex.unlock(io);
+        }
+    }
+};
+
+test "lite fair writer lock grants contended writers in arrival order" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(16) });
+    defer threaded.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(std.testing.allocator, tmp, "fair-order.aflite");
+    defer std.testing.allocator.free(path);
+    const io = std.testing.io;
+    var probe: FairLockProbe = .{ .path = path, .wait_io = threaded.io() };
+
+    var holder = try fairWriterLockWithIo(std.testing.allocator, io, threaded.io(), path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+    var threads: [3]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, FairLockProbe.takeOnce, .{ &probe, @as(u8, @intCast(i)) });
+        // Let each waiter take its ticket before the next one arrives.
+        try io.sleep(.fromMilliseconds(30), .awake);
+    }
+    holder.close();
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(usize, 0), probe.failures);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2 }, probe.order[0..probe.len]);
+}
+
+test "lite fair writer lock rule 9: a direct flock holder delays the queue without reordering it" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(16) });
+    defer threaded.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(std.testing.allocator, tmp, "fair-legacy.aflite");
+    defer std.testing.allocator.free(path);
+    const io = std.testing.io;
+    var probe: FairLockProbe = .{ .path = path, .wait_io = threaded.io() };
+
+    // An older binary takes the sidecar directly, bypassing the queue.
+    var legacy = try lockWriterPathWithIo(std.testing.allocator, io, path);
+    var threads: [3]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, FairLockProbe.takeOnce, .{ &probe, @as(u8, @intCast(i)) });
+        try io.sleep(.fromMilliseconds(30), .awake);
+    }
+    // Exclusion holds while the legacy writer has the sidecar.
+    try std.testing.expectEqual(@as(usize, 0), probe.len);
+    legacy.close();
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(usize, 0), probe.failures);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2 }, probe.order[0..probe.len]);
+}
+
+test "lite fair writer lock bounds every writer's wait under sustained contention" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(16) });
+    defer threaded.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(std.testing.allocator, tmp, "fair-bounded.aflite");
+    defer std.testing.allocator.free(path);
+    var probe: FairLockProbe = .{ .path = path, .wait_io = threaded.io() };
+    var threads: [3]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, FairLockProbe.loop, .{ &probe, 40 });
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(usize, 0), probe.failures);
+    // Each turn is ~0.5 ms, so a FIFO wait is a few turns. Leave wide slack
+    // for loaded CI hosts while still catching starvation.
+    try std.testing.expect(probe.max_wait_ns < 2 * std.time.ns_per_s);
 }
 
 test "lite native file canonicalizes writer lock path spellings" {

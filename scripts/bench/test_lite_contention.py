@@ -344,3 +344,51 @@ class ContentionReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LeaseAndFairnessTests(unittest.TestCase):
+    def lease_snapshot(self, acquisitions, waits, holds, busy=0):
+        group = dict.fromkeys(bench.LEASE_COUNTERS, 0)
+        wait_h, hold_h = [0] * 64, [0] * 64
+        for value in waits:
+            wait_h[max(0, value.bit_length() - 1)] += 1
+        for value in holds:
+            hold_h[max(0, value.bit_length() - 1)] += 1
+        group.update(
+            acquisitions=acquisitions,
+            queued=acquisitions,
+            busy=busy,
+            wait_ns=sum(waits),
+            holds=len(holds),
+            hold_ns=sum(holds),
+            wait_log2_ns=wait_h,
+            hold_log2_ns=hold_h,
+            wait_max_ns=max(waits, default=0),
+            hold_max_ns=max(holds, default=0),
+        )
+        empty = dict.fromkeys(bench.LEASE_COUNTERS, 0)
+        empty.update(wait_log2_ns=[0] * 64, hold_log2_ns=[0] * 64, wait_max_ns=0, hold_max_ns=0)
+        return {"foreground_lease": group, "maintenance_lease": empty, "gate_wait_ns": 7}
+
+    def test_lease_delta_is_none_for_a_library_without_lease_timing(self):
+        self.assertIsNone(bench.lease_delta({}, {"maintenance_rounds": 1}))
+
+    def test_lease_summary_reports_per_worker_tails_and_busy(self):
+        zero = self.lease_snapshot(0, [], [])
+        workers = [
+            {"lease": bench.lease_delta(zero, self.lease_snapshot(2, [1000, 3000], [500, 700]))},
+            {"lease": bench.lease_delta(zero, self.lease_snapshot(1, [1 << 30], [900], busy=3))},
+        ]
+        summary = bench.lease_summary(workers)
+        fg = summary["foreground_lease"]
+        self.assertEqual(fg["acquisitions"], 3)
+        self.assertEqual(fg["per_worker_busy"], [0, 3])
+        self.assertEqual(fg["per_worker_wait_p99_upper_ns"], [(1 << 12) - 1, (1 << 31) - 1])
+        self.assertEqual(fg["wait_p99_upper_ns"], (1 << 31) - 1)
+        self.assertEqual(summary["gate_wait_ns"], 0)
+
+    def test_fairness_flags_a_starved_worker(self):
+        self.assertEqual(bench.fairness([10, 10, 10])["jain_index"], 1.0)
+        starved = bench.fairness([30, 0, 0])
+        self.assertAlmostEqual(starved["jain_index"], 1 / 3)
+        self.assertEqual(starved["min_max_ratio"], 0)

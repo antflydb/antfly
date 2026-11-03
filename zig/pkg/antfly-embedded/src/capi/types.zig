@@ -561,6 +561,13 @@ fn classifyError(err: anyerror) ErrorCode {
         error.CommitDecisionUnknown,
         => .outcome_unknown,
         error.RunUntilIdleNoProgress, error.EnrichmentWaitTimeout, error.AsyncWorkerFailed, error.CommitVisibilityNotSatisfied => .stalled,
+        // Refused before running because an earlier commit's outcome is
+        // unresolved. Not applied; Lite connections reconcile on their next
+        // call, other handles after reopening.
+        error.OutcomeReconciliationRequired, error.SqlReconciliationRequired => .stalled,
+        // Classified at a commit boundary: refused before the decision.
+        error.SqlMutationNotAppliedBusy => .busy,
+        error.SqlMutationNotApplied, error.SqlMutationNotAppliedNoSpace => .internal,
         // A dimension probe against a live embedder hit an operational
         // (network/transport) failure rather than a malformed request --
         // matches `managed_embedder.isOperationalEmbeddingProbeError`'s
@@ -607,6 +614,9 @@ test "bounded Lite retirement admission is retryable while uncertain publication
     inline for (.{ error.DurabilityOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.CommitDecisionUnknown }) |err| {
         try std.testing.expectEqual(ErrorCode.outcome_unknown, mapError(err));
     }
+    // A refusal caused by an earlier unknown outcome is not itself unknown.
+    try std.testing.expectEqual(ErrorCode.stalled, mapError(error.OutcomeReconciliationRequired));
+    try std.testing.expectEqual(ErrorCode.busy, mapError(error.SqlMutationNotAppliedBusy));
 }
 
 test "capi C ABI retains codes for generic failures and copies contextual diagnostics" {

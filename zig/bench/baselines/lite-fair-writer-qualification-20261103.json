@@ -1,0 +1,337 @@
+{
+ "issue": "antflydb/antfly#1431",
+ "purpose": "Cross-process writer fairness: per-writer progress, lease wait and hold times, with a concurrent status-only reader. Synthetic churn writers, not the Codex importer; does not measure the single-process replay slowdown.",
+ "host": {
+  "system": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+  "cpu_count": 14
+ },
+ "candidate": {
+  "revision": "953ae7f93a19e8acd1f5975e6e364599c4513fa8",
+  "library_sha256": "57603ba0a51cb31421edd4348fd65168c19a499181902eb538fdd7fc5d46f031",
+  "build": "zig build capi -Doptimize=ReleaseFast"
+ },
+ "control": {
+  "revision": "f46cf111a83f857cb0b947a95deaafd506b7c0e2",
+  "library_sha256": "950cbdd84f9ac6564de4d4b7f78e9b98128600456ab8b64e24c055f622d14e43",
+  "build": "zig build capi -Doptimize=ReleaseFast"
+ },
+ "command": "python3 scripts/bench/lite_contention.py native --library <libantfly> --output <out>.jsonl --concurrency {3,8} --repeats 1 --seconds 120 --timeout-ms 5000 --seed-records 1024 --workload churn --watchdog 240 --progress-window 5 --status-interval 1",
+ "notes": [
+  "One repeat per configuration; run sequentially on an otherwise idle host.",
+  "Percentiles of lease wait/hold are log2-bucket upper bounds.",
+  "handoffs is 0 because each writer process issues calls from one thread.",
+  "The control library predates lease timing, so it has no lease section."
+ ],
+ "runs": [
+  {
+   "status": "ok",
+   "concurrency": 3,
+   "timeout_ms": 5000,
+   "workload": "churn",
+   "per_worker_successful_calls": [
+    2116,
+    2125,
+    2189
+   ],
+   "throughput_fairness": {
+    "jain_index": 0.9997701333202561,
+    "min_max_ratio": 0.966651439013248
+   },
+   "per_worker_max_progress_gap_seconds": [
+    0.444367665797472,
+    0.48354333313181996,
+    0.5353893330320716
+   ],
+   "max_progress_gap_seconds": 0.5353893330320716,
+   "successful_calls": 6430,
+   "busy_calls": 0,
+   "successful_calls_per_second": 53.496838307715976,
+   "success_p50_ns": 24060458,
+   "success_p99_ns": 288121083,
+   "success_max_ns": 535382250,
+   "status_reader": {
+    "errors": 0,
+    "first_errors": [],
+    "max_ns": 98130833,
+    "p50_ns": 20447333,
+    "reads": 112
+   },
+   "peak_file_bytes": 977932288,
+   "file_bytes": 977932288,
+   "library": "candidate",
+   "verified_latest_writes": true,
+   "lease": {
+    "foreground_lease": {
+     "acquisitions": 6433,
+     "uncontended": 2,
+     "queued": 6431,
+     "handoffs": 0,
+     "busy": 0,
+     "wait_p50_upper_ns": 16777215,
+     "wait_p99_upper_ns": 134217727,
+     "hold_p50_upper_ns": 8388607,
+     "hold_p99_upper_ns": 67108863,
+     "per_worker_acquisitions": [
+      2117,
+      2126,
+      2190
+     ],
+     "per_worker_busy": [
+      0,
+      0,
+      0
+     ],
+     "per_worker_wait_p99_upper_ns": [
+      134217727,
+      134217727,
+      134217727
+     ]
+    },
+    "maintenance_lease": {
+     "acquisitions": 1149,
+     "uncontended": 2,
+     "queued": 1147,
+     "handoffs": 0,
+     "busy": 0,
+     "wait_p50_upper_ns": 33554431,
+     "wait_p99_upper_ns": 134217727,
+     "hold_p50_upper_ns": 16777215,
+     "hold_p99_upper_ns": 67108863,
+     "per_worker_acquisitions": [
+      412,
+      400,
+      337
+     ],
+     "per_worker_busy": [
+      0,
+      0,
+      0
+     ],
+     "per_worker_wait_p99_upper_ns": [
+      134217727,
+      134217727,
+      268435455
+     ]
+    }
+   }
+  },
+  {
+   "status": "ok",
+   "concurrency": 8,
+   "timeout_ms": 5000,
+   "workload": "churn",
+   "per_worker_successful_calls": [
+    1532,
+    1631,
+    1588,
+    1626,
+    1619,
+    1534,
+    1565,
+    1552
+   ],
+   "throughput_fairness": {
+    "jain_index": 0.999413904268477,
+    "min_max_ratio": 0.9393010423053342
+   },
+   "per_worker_max_progress_gap_seconds": [
+    1.2762204157188535,
+    1.2693825419992208,
+    1.7227339576929808,
+    1.3159943749196827,
+    1.3156195408664644,
+    1.2782118753530085,
+    1.3157418328337371,
+    1.5327244577929378
+   ],
+   "max_progress_gap_seconds": 1.7227339576929808,
+   "successful_calls": 12647,
+   "busy_calls": 0,
+   "successful_calls_per_second": 105.16191326337558,
+   "success_p50_ns": 20905167,
+   "success_p99_ns": 564252041,
+   "success_max_ns": 1722726250,
+   "status_reader": {
+    "errors": 0,
+    "first_errors": [],
+    "max_ns": 393865375,
+    "p50_ns": 14179709,
+    "reads": 111
+   },
+   "peak_file_bytes": 637440000,
+   "file_bytes": 637440000,
+   "library": "candidate",
+   "verified_latest_writes": true,
+   "lease": {
+    "foreground_lease": {
+     "acquisitions": 12655,
+     "uncontended": 1,
+     "queued": 12654,
+     "handoffs": 0,
+     "busy": 0,
+     "wait_p50_upper_ns": 33554431,
+     "wait_p99_upper_ns": 536870911,
+     "hold_p50_upper_ns": 4194303,
+     "hold_p99_upper_ns": 67108863,
+     "per_worker_acquisitions": [
+      1533,
+      1632,
+      1589,
+      1627,
+      1620,
+      1535,
+      1566,
+      1553
+     ],
+     "per_worker_busy": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "per_worker_wait_p99_upper_ns": [
+      536870911,
+      536870911,
+      536870911,
+      536870911,
+      536870911,
+      536870911,
+      536870911,
+      536870911
+     ]
+    },
+    "maintenance_lease": {
+     "acquisitions": 856,
+     "uncontended": 36,
+     "queued": 820,
+     "handoffs": 0,
+     "busy": 0,
+     "wait_p50_upper_ns": 16777215,
+     "wait_p99_upper_ns": 536870911,
+     "hold_p50_upper_ns": 2097151,
+     "hold_p99_upper_ns": 67108863,
+     "per_worker_acquisitions": [
+      151,
+      52,
+      95,
+      58,
+      64,
+      149,
+      119,
+      168
+     ],
+     "per_worker_busy": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "per_worker_wait_p99_upper_ns": [
+      134217727,
+      33554431,
+      2147483647,
+      536870911,
+      536870911,
+      134217727,
+      268435455,
+      536870911
+     ]
+    }
+   }
+  },
+  {
+   "status": "ok",
+   "concurrency": 3,
+   "timeout_ms": 5000,
+   "workload": "churn",
+   "per_worker_successful_calls": [
+    1935,
+    1968,
+    1949
+   ],
+   "throughput_fairness": {
+    "jain_index": 0.9999519381678398,
+    "min_max_ratio": 0.9832317073170732
+   },
+   "per_worker_max_progress_gap_seconds": [
+    4.695466457866132,
+    4.778787999879569,
+    4.6888079168275
+   ],
+   "max_progress_gap_seconds": 4.778787999879569,
+   "successful_calls": 5852,
+   "busy_calls": 0,
+   "successful_calls_per_second": 47.139454326557185,
+   "success_p50_ns": 13886125,
+   "success_p99_ns": 731079375,
+   "success_max_ns": 4778779041,
+   "status_reader": {
+    "errors": 0,
+    "first_errors": [],
+    "max_ns": 4668834209,
+    "p50_ns": 89548667,
+    "reads": 95
+   },
+   "peak_file_bytes": 692715520,
+   "file_bytes": 692715520,
+   "library": "control",
+   "verified_latest_writes": true
+  },
+  {
+   "status": "ok",
+   "concurrency": 8,
+   "timeout_ms": 5000,
+   "workload": "churn",
+   "per_worker_successful_calls": [
+    1603,
+    1493,
+    1486,
+    1552,
+    1513,
+    1630,
+    1610,
+    1638
+   ],
+   "throughput_fairness": {
+    "jain_index": 0.9986088407814095,
+    "min_max_ratio": 0.9072039072039072
+   },
+   "per_worker_max_progress_gap_seconds": [
+    2.3579146252013743,
+    1.4744172501377761,
+    1.2310075843706727,
+    1.2838693750090897,
+    1.2217241670005023,
+    1.2151735830120742,
+    1.7678223750554025,
+    1.3114680419676006
+   ],
+   "max_progress_gap_seconds": 2.3579146252013743,
+   "successful_calls": 12525,
+   "busy_calls": 0,
+   "successful_calls_per_second": 103.63120376729351,
+   "success_p50_ns": 20692459,
+   "success_p99_ns": 608615084,
+   "success_max_ns": 2357906792,
+   "status_reader": {
+    "errors": 0,
+    "first_errors": [],
+    "max_ns": 1344097208,
+    "p50_ns": 186303000,
+    "reads": 95
+   },
+   "peak_file_bytes": 631988224,
+   "file_bytes": 631988224,
+   "library": "control",
+   "verified_latest_writes": true
+  }
+ ]
+}

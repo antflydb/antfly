@@ -175,6 +175,41 @@ ADMISSION_FIELDS = (
 )
 
 
+LEASE_GROUPS = ("foreground_lease", "maintenance_lease")
+LEASE_COUNTERS = (
+    "acquisitions",
+    "uncontended",
+    "queued",
+    "handoffs",
+    "busy",
+    "busy_wait_ns",
+    "wait_ns",
+    "holds",
+    "hold_ns",
+)
+
+
+def lease_delta(before: dict, after: dict) -> dict | None:
+    """Per-worker lease timing between two snapshots; None if not exposed."""
+    if any(group not in after for group in LEASE_GROUPS):
+        return None
+    delta = {}
+    for group in LEASE_GROUPS:
+        old, new = before.get(group, {}), after[group]
+        row = {field: new[field] - old.get(field, 0) for field in LEASE_COUNTERS}
+        for field in ("wait_log2_ns", "hold_log2_ns"):
+            row[field] = [
+                b - a
+                for a, b in zip(old.get(field, [0] * 64), new[field], strict=True)
+            ]
+        # Lifetime maxima: exact only when the worker started from zero.
+        for field in ("wait_max_ns", "hold_max_ns"):
+            row[field] = new[field] if not old.get("acquisitions") else None
+        delta[group] = row
+    delta["gate_wait_ns"] = after.get("gate_wait_ns", 0) - before.get("gate_wait_ns", 0)
+    return delta
+
+
 def measurement_stats(db) -> dict:
     from antfly_embedded import BusyError
 
@@ -255,7 +290,12 @@ def native_worker(config, index, ready, start, results, finish=None):
             began = time.monotonic()
             deadline = began + config["seconds"]
             success, busy = [], []
-            success_windows = [0] * max(1, math.ceil(config["seconds"] / 60))
+            window_seconds = config.get("progress_window_seconds", 60)
+            success_windows = [0] * max(1, math.ceil(config["seconds"] / window_seconds))
+            # Longest interval without an acknowledged write: the direct
+            # measure of starvation, independent of total throughput.
+            last_progress = 0.0
+            max_progress_gap = 0.0
             sequence = 0
             last_write = None
             latest_churn_writes = {}
@@ -266,10 +306,11 @@ def native_worker(config, index, ready, start, results, finish=None):
                 try:
                     db.batch_json(payload)
                     success.append(time.perf_counter_ns() - began_call)
-                    window = min(
-                        len(success_windows) - 1, int((time.monotonic() - began) / 60)
-                    )
+                    elapsed = time.monotonic() - began
+                    window = min(len(success_windows) - 1, int(elapsed / window_seconds))
                     success_windows[window] += 1
+                    max_progress_gap = max(max_progress_gap, elapsed - last_progress)
+                    last_progress = elapsed
                     last_write = {"key": key, "sequence": sequence}
                     if config["workload"] == "churn":
                         latest_churn_writes[key] = last_write
@@ -277,6 +318,7 @@ def native_worker(config, index, ready, start, results, finish=None):
                     busy.append(time.perf_counter_ns() - began_call)
                 sequence += 1
             ended = time.monotonic()
+            max_progress_gap = max(max_progress_gap, (ended - began) - last_progress)
             # Preserve measured progress if a later diagnostic or close fails.
             # The terminal result remains an error and cannot pass qualification.
             completed_workload = {
@@ -327,6 +369,9 @@ def native_worker(config, index, ready, start, results, finish=None):
                 "ended": ended,
                 "success_latency_ns": success,
                 "success_windows": success_windows,
+                "max_progress_gap_seconds": max_progress_gap,
+                "progress_window_seconds": window_seconds,
+                "lease": lease_delta(initial_stats, final_stats),
                 "busy_latency_ns": busy,
                 "proofs": proofs,
                 "background_publication_deltas": {
@@ -374,6 +419,37 @@ def native_worker(config, index, ready, start, results, finish=None):
         if not announced:
             ready.put(failure)
         results.put(failure)
+
+
+def status_reader(config, stop, results):
+    """The #1431 shape: an independent status-only reader once per interval."""
+    reads, errors, latencies = 0, [], []
+    try:
+        af = sdk(config["library"])
+        while not stop.wait(config["status_interval"]):
+            began = time.perf_counter_ns()
+            try:
+                options = af.OpenOptions(
+                    mode=af.OpenMode.STATUS_ONLY,
+                    profile=af.Profile.NATIVE,
+                    busy_timeout=config["timeout_ms"] / 1000,
+                )
+                with af.open_with_options(config["database"], options) as db:
+                    db.status()
+                reads += 1
+                latencies.append(time.perf_counter_ns() - began)
+            except Exception as error:  # noqa: BLE001 - every failure is a reported reader error
+                errors.append(f"{type(error).__name__}: {error}"[:300])
+    finally:
+        results.put(
+            {
+                "reads": reads,
+                "errors": len(errors),
+                "first_errors": errors[:5],
+                "p50_ns": percentile(latencies, 50),
+                "max_ns": max(latencies, default=None),
+            }
+        )
 
 
 def acknowledged_writes(workers: list[dict]) -> list[dict]:
@@ -425,6 +501,43 @@ def histogram_percentile_bounds(
     raise AssertionError("inconsistent admission histogram")
 
 
+def lease_summary(workers: list[dict]) -> dict | None:
+    rows = [row.get("lease") for row in workers]
+    if not rows or any(row is None for row in rows):
+        return None
+    summary = {}
+    for group in LEASE_GROUPS:
+        merged = {
+            field: sum(row[group][field] for row in rows) for field in LEASE_COUNTERS
+        }
+        for field in ("wait_log2_ns", "hold_log2_ns"):
+            merged[field] = [sum(row[group][field][i] for row in rows) for i in range(64)]
+        for kind, histogram in (("wait", merged["wait_log2_ns"]), ("hold", merged["hold_log2_ns"])):
+            for percent in (50, 99):
+                lower, upper = histogram_percentile_bounds(histogram, percent)
+                merged[f"{kind}_p{percent}_lower_ns"] = lower
+                merged[f"{kind}_p{percent}_upper_ns"] = upper
+        merged["per_worker_acquisitions"] = [row[group]["acquisitions"] for row in rows]
+        merged["per_worker_busy"] = [row[group]["busy"] for row in rows]
+        merged["per_worker_hold_ns"] = [row[group]["hold_ns"] for row in rows]
+        merged["per_worker_wait_p99_upper_ns"] = [
+            histogram_percentile_bounds(row[group]["wait_log2_ns"], 99)[1] for row in rows
+        ]
+        summary[group] = merged
+    summary["gate_wait_ns"] = sum(row["gate_wait_ns"] for row in rows)
+    return summary
+
+
+def fairness(per_worker: list[int]) -> dict:
+    """Jain's index (1.0 = equal shares) and min/max share ratio."""
+    total = sum(per_worker)
+    squares = sum(value * value for value in per_worker)
+    return {
+        "jain_index": (total * total) / (len(per_worker) * squares) if squares else None,
+        "min_max_ratio": (min(per_worker) / max(per_worker)) if max(per_worker, default=0) else None,
+    }
+
+
 def aggregate(workers: list[dict]) -> dict:
     successful = [value for row in workers for value in row["success_latency_ns"]]
     busy = [value for row in workers for value in row["busy_latency_ns"]]
@@ -451,7 +564,17 @@ def aggregate(workers: list[dict]) -> dict:
         "status": status,
         "workers_without_success": starved,
         "workers_with_stalled_windows": stalled,
-        "progress_window_seconds": 60,
+        "progress_window_seconds": workers[0].get("progress_window_seconds", 60),
+        "per_worker_max_progress_gap_seconds": [
+            row.get("max_progress_gap_seconds") for row in workers
+        ],
+        "max_progress_gap_seconds": max(
+            (row.get("max_progress_gap_seconds") or 0 for row in workers), default=None
+        ),
+        "throughput_fairness": fairness(
+            [len(row["success_latency_ns"]) for row in workers]
+        ),
+        "lease": lease_summary(workers),
         "per_worker_success_windows": [
             row.get("success_windows", []) for row in workers
         ],
@@ -591,7 +714,17 @@ def native_cases(args):
                 "watchdog": args.watchdog,
                 "workload": args.workload,
                 "allocator_diagnostics": args.allocator_diagnostics,
+                "progress_window_seconds": args.progress_window,
+                "status_interval": args.status_interval,
             }
+            reader_stop, reader_results = context.Event(), context.Queue()
+            reader = (
+                context.Process(
+                    target=status_reader, args=(config, reader_stop, reader_results)
+                )
+                if args.status_interval > 0
+                else None
+            )
             processes = [
                 context.Process(
                     target=native_worker,
@@ -646,6 +779,8 @@ def native_cases(args):
                         raise RuntimeError(notice["diagnostic"])
                 sample_thread = threading.Thread(target=sample_file_size, daemon=True)
                 sample_thread.start()
+                if reader is not None:
+                    reader.start()
                 start.set()
                 finish_by = (
                     time.monotonic()
@@ -661,6 +796,10 @@ def native_cases(args):
                     process.join(timeout=max(0.01, finish_by - time.monotonic()))
                 if any(process.is_alive() for process in processes):
                     raise TimeoutError("worker close exceeded watchdog")
+                if reader is not None:
+                    reader_stop.set()
+                    row["status_reader"] = reader_results.get(timeout=args.watchdog)
+                    reader.join(timeout=args.watchdog)
                 if any(worker["status"] != "ok" for worker in workers):
                     row.update(status="error", workers=workers)
                 elif any(process.exitcode != 0 for process in processes):
@@ -670,6 +809,8 @@ def native_cases(args):
                     )
                 else:
                     row.update(aggregate(workers))
+                    if row.get("status_reader", {}).get("errors"):
+                        row.update(status="status_reader_errors")
             except RuntimeError as error:
                 row.update(status="error", diagnostic=str(error))
             except (queue.Empty, TimeoutError):
@@ -681,6 +822,12 @@ def native_cases(args):
             finally:
                 start.set()
                 finish.abort()
+                reader_stop.set()
+                if reader is not None and reader.is_alive():
+                    reader.join(timeout=5)
+                    if reader.is_alive():
+                        reader.kill()
+                        reader.join()
                 for process in processes:
                     if process.is_alive():
                         process.terminate()
@@ -784,6 +931,18 @@ def main():
         help="native control: remove the default full-text index before seeding",
     )
     parser.add_argument("--watchdog", type=float, default=30)
+    parser.add_argument(
+        "--progress-window",
+        type=float,
+        default=60,
+        help="native: seconds per per-worker progress window (a zero window marks a stall)",
+    )
+    parser.add_argument(
+        "--status-interval",
+        type=float,
+        default=0,
+        help="native: run a status-only reader process every N seconds (0 disables)",
+    )
     args = parser.parse_args()
     if (
         min(args.concurrency) < 1
@@ -794,6 +953,8 @@ def main():
         or args.watchdog <= 0
         or args.timeout_ms < 0
         or args.seed_records < 1
+        or args.progress_window <= 0
+        or args.status_interval < 0
     ):
         parser.error(
             "counts/durations must be positive; concurrency <= 128; timeout >= 0"

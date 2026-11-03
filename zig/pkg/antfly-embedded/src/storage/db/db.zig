@@ -7475,6 +7475,15 @@ pub const DB = struct {
         }
     }
 
+    /// Like `batch`, also reporting whether the primary write became durable.
+    /// After it has, every error is a committed-pending or unknown outcome;
+    /// before it, the batch was not applied unless the error is an unknown
+    /// outcome (checkpoint publication failed mid-way).
+    pub fn batchTracked(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
+        primary_committed.* = false;
+        return self.batchInternal(req, null, .{ .primary_committed = primary_committed });
+    }
+
     pub fn batchWithVisibilityCancellation(self: *DB, req: types.BatchRequest, cancellation: types.CancellationToken) anyerror!void {
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
@@ -8652,7 +8661,20 @@ pub const DB = struct {
                 error.EnrichmentWaitTimeout,
                 error.EnrichmentRetryInProgress,
                 => return error.CommitVisibilityNotSatisfied,
-                else => {},
+                // Already-uncertain outcomes keep their identity, and a
+                // committed write whose enrichment failed still needs repair.
+                error.EnrichmentWorkerFailed,
+                error.OutcomeUnknown,
+                error.WriteOutcomeUnknown,
+                error.DurabilityOutcomeUnknown,
+                error.CommitDecisionUnknown,
+                error.CommitVisibilityNotSatisfied,
+                => {},
+                // The primary write is durable. Any later failure (replication
+                // append, observers, sync-level waits, memory) must not reach
+                // a caller as a plain error it could retry, re-applying a
+                // committed write. Report committed-but-not-yet-visible.
+                else => return error.CommitVisibilityNotSatisfied,
             };
             return err;
         };
