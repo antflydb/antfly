@@ -44,6 +44,12 @@ pub const Catalog = union(enum) {
             .rest => |*v| v.commit(a, request),
         };
     }
+    pub fn references(self: *const Catalog, a: std.mem.Allocator, objects: []const []const u8) !types.References {
+        return switch (self.*) {
+            .managed => |*value| value.references(a, objects),
+            .rest => error.LakeVacuumCatalogCoordinationRequired,
+        };
+    }
     pub fn retire(self: *const Catalog, a: std.mem.Allocator, request: managed.Retirement) !types.Table {
         return switch (self.*) {
             .managed => |*value| value.retire(a, request),

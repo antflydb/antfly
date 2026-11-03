@@ -412,9 +412,9 @@ pub const previous_versions_max_property = "write.metadata.previous-versions-max
 pub const default_previous_versions_max: usize = 100;
 pub fn previousVersionsMax(root: V) !usize {
     const value = (try get(root, "properties")).object.get(previous_versions_max_property) orelse return default_previous_versions_max;
-    const count = std.fmt.parseInt(usize, try str(value), 10) catch return error.InvalidLakeMetadata;
-    if (count == 0 or count > 100_000) return error.InvalidLakeMetadata;
-    return count;
+    // Iceberg clamps nonpositive values to one retained previous file.
+    const count = std.fmt.parseInt(i32, try str(value), 10) catch return error.InvalidLakeMetadata;
+    return @intCast(@max(1, count));
 }
 fn keepNewest(values: *V, count: usize) !void {
     if (values.* != .array) return error.InvalidLakeMetadata;

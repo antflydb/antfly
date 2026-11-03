@@ -21,6 +21,7 @@ const types = @import("types.zig");
 const metadata = @import("metadata.zig");
 const A = std.mem.Allocator;
 const retired = @import("retirement_index.zig");
+const reachability = @import("reachability.zig");
 pub const Retirement = struct { id: []const u8, expected_metadata_location: []const u8, expected_version: []const u8, objects: []const []const u8 };
 
 pub const Record = struct {
@@ -188,6 +189,28 @@ pub const Managed = struct {
         defer p.deinit();
         return self.loadCommitted(a, p.value);
     }
+    fn referencesFor(self: *const Managed, a: A, table: types.Table, objects: []const []const u8) !types.References {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const files: @import("row_commit.zig").Files = .{ .client = self.client, .bucket = self.bucket, .prefix = self.prefix, .uri = try self.artifactUri(scratch), .context = self.context };
+        var builder = reachability.Builder.init(scratch, files, try self.catalogKey(scratch, "reachability"), try self.catalogKey(scratch, "head.json"));
+        defer builder.deinit();
+        const proof = try builder.step(scratch, table);
+        const flags = try a.alloc(bool, if (proof.ready) objects.len else 0);
+        errdefer a.free(flags);
+        if (proof.ready) {
+            for (objects, flags) |uri, *flag| flag.* = try builder.contains(proof.members, uri);
+        }
+        // The public wrapper owns table; internal retirement borrows it.
+        return .{ .table = table, .ready = proof.ready, .referenced = flags };
+    }
+    pub fn references(self: *const Managed, a: A, objects: []const []const u8) !types.References {
+        if (objects.len > 4096) return error.InvalidLakeRetirement;
+        var table = try self.load(a);
+        errdefer table.deinit(a);
+        return self.referencesFor(a, table, objects);
+    }
     /// Atomically publish irreversible retirements through the same HEAD CAS
     /// as ordinary commits. A writer that read before this CAS must conflict;
     /// a writer that reads afterward validates against the new immutable root.
@@ -214,17 +237,29 @@ pub const Managed = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var selected: std.StringHashMapUnmanaged(void) = .empty;
         const allowed = try std.fmt.allocPrint(scratch, "{s}/", .{std.mem.trimEnd(u8, try self.artifactUri(scratch), "/")});
         for (request.objects) |uri| {
             if (uri.len > 4096 or !std.mem.startsWith(u8, uri, allowed) or std.mem.indexOf(u8, uri[allowed.len..], "..") != null) return error.InvalidLakeRetirement;
-            try selected.put(scratch, uri, {});
         }
         var index = retired.Index.init(a, self.client, self.bucket, try self.catalogKey(scratch, "retirements"), self.context);
         defer index.deinit();
-        // The authority independently checks every current root, including
-        // named branches. A coordinator's earlier mark set is not evidence.
-        try self.checkReferences(scratch, table.metadata_json, null, &index, null, &selected);
+        // Only catalog-owned, exact-metadata proofs authorize retirement.
+        // A deadline-bound maintenance call yields after one bootstrap step.
+        while (true) {
+            var work = std.heap.ArenaAllocator.init(a);
+            defer work.deinit();
+            const refs = try self.referencesFor(work.allocator(), table, request.objects);
+            if (refs.ready) {
+                for (refs.referenced) |referenced| if (referenced) return error.LakeObjectStillReferenced;
+                break;
+            }
+            if (self.context.deadline_ns != null) return error.LakeReachabilityPending;
+            // A synchronous caller must not keep rebuilding an obsolete
+            // target after another writer advances HEAD during bootstrap.
+            var current = try self.load(work.allocator());
+            defer current.deinit(work.allocator());
+            if (current.version == null or !std.mem.eql(u8, current.version.?, request.expected_version)) return error.LakeCommitConflict;
+        }
         var root = table.retirement_root;
         for (request.objects) |uri| root = try index.insert(root, uri);
         // Keep the metadata bytes unchanged. The catalog version nevertheless
@@ -257,14 +292,13 @@ pub const Managed = struct {
         const scratch = arena.allocator();
         var index = retired.Index.init(a, self.client, self.bucket, try self.catalogKey(scratch, "retirements"), self.context);
         defer index.deinit();
-        try self.checkReferences(scratch, candidate, parent.metadata_json, &index, parent.retirement_root, null);
+        try self.checkReferences(scratch, candidate, parent.metadata_json, &index, parent.retirement_root);
     }
-    fn checkUri(uri: []const u8, index: *retired.Index, root: ?retired.Digest, selected: ?*std.StringHashMapUnmanaged(void)) !void {
+    fn checkUri(uri: []const u8, index: *retired.Index, root: ?retired.Digest) !void {
         try index.context.ensureActive();
-        if (selected) |set| if (set.contains(uri)) return error.LakeObjectStillReferenced;
         if (try index.contains(root, uri)) return error.LakeObjectRetired;
     }
-    fn checkReferences(self: *const Managed, a: A, candidate: []const u8, parent: ?[]const u8, index: *retired.Index, root: ?retired.Digest, selected: ?*std.StringHashMapUnmanaged(void)) !void {
+    fn checkReferences(self: *const Managed, a: A, candidate: []const u8, parent: ?[]const u8, index: *retired.Index, root: ?retired.Digest) !void {
         const files: @import("row_commit.zig").Files = .{ .client = self.client, .bucket = self.bucket, .prefix = self.prefix, .uri = try self.artifactUri(a), .context = self.context };
         const next = try metadata.parse(a, candidate);
         const before = if (parent) |bytes_| try metadata.parse(a, bytes_) else null;
@@ -273,7 +307,7 @@ pub const Managed = struct {
         inline for (.{ "statistics", "partition-statistics" }) |kind| {
             if (next.object.get(kind)) |entries| {
                 if (entries != .array) return error.InvalidLakeMetadata;
-                for (entries.array.items) |entry| try checkUri(try metadata.str(try metadata.get(entry, "statistics-path")), index, root, selected);
+                for (entries.array.items) |entry| try checkUri(try metadata.str(try metadata.get(entry, "statistics-path")), index, root);
             }
         }
         // Index the parent's snapshot IDs once. Comparing every candidate
@@ -305,7 +339,7 @@ pub const Managed = struct {
             try self.context.ensureActive();
             if (parent_ids.contains(try metadata.int(try metadata.get(snapshot, "snapshot-id")))) continue;
             const list_uri = try metadata.str(try metadata.get(snapshot, "manifest-list"));
-            try checkUri(list_uri, index, root, selected);
+            try checkUri(list_uri, index, root);
             const list_bytes = try @import("row_commit.zig").readLimited(a, files, list_uri, @min(budget, 16 * 1024 * 1024));
             budget -= list_bytes.len;
             const list = try @import("../iceberg_avro.zig").parseManifestListAlloc(a, list_bytes);
@@ -314,11 +348,11 @@ pub const Managed = struct {
                 // contain retired files. Verify new manifests only; an append
                 // must not rescan the full archive after every vacuum turn.
                 if (existing_manifests.contains(entry.manifest_path)) continue;
-                try checkUri(entry.manifest_path, index, root, selected);
+                try checkUri(entry.manifest_path, index, root);
                 const manifest_bytes = try @import("row_commit.zig").readLimited(a, files, entry.manifest_path, @min(budget, 16 * 1024 * 1024));
                 budget -= manifest_bytes.len;
                 const manifest = try @import("../iceberg_avro.zig").parseDataManifestAlloc(a, manifest_bytes);
-                for (manifest.entries) |file| if (file.status != .deleted) try checkUri(file.file_path, index, root, selected);
+                for (manifest.entries) |file| if (file.status != .deleted) try checkUri(file.file_path, index, root);
             }
         }
     }

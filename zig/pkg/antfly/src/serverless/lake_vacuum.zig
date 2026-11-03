@@ -190,7 +190,7 @@ const Execution = struct {
     exhausted: bool = false,
     complete: bool = false,
 };
-fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, request: Options, protected: []const []const u8, pin_store: pins.Store, destination: catalog.row_commit.Files, plans: *plan.Store, job: Job, budget: *u64, manifests: *ManifestFiles) !Result {
+fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, request: Options, protected: []const []const u8, pin_store: pins.Store, destination: catalog.row_commit.Files, plans: *plan.Store, job: Job) !Result {
     var client = plans.client;
     const context = plans.context;
     const key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-execution/{s}.json", .{ plans.prefix, catalog.types.digestHex(request.operation_id) });
@@ -247,53 +247,56 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
     }
     if (progress.pinned == job.retired.len) {
         if (progress.approved.len == 0) {
-            var marked: IdSet = .empty;
-            inline for (.{ "statistics", "partition-statistics" }) |kind| {
-                if (live.object.get(kind)) |entries| {
-                    if (entries != .array) return error.InvalidLakeMetadata;
-                    for (entries.array.items) |entry| try marked.put(a, try catalog.metadata.str(try catalog.metadata.get(entry, "statistics-path")), {});
+            selection: {
+                var ready = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .references = &.{} });
+                defer ready.deinit(a);
+                if (!ready.references.ready) break :selection;
+                var candidates: std.ArrayList([]const u8) = .empty;
+                var selected: std.ArrayList([]const u8) = .empty;
+                var seen = catalog.retirement_index.Index.init(a, client, plans.bucket, try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-traversal", .{plans.prefix}), context);
+                defer seen.deinit();
+                var walker = try plan.Walker.init(plans, job.retired, &seen, progress.cursor);
+                var steps: usize = 64;
+                var exhausted = false;
+                while (candidates.items.len < @min(16, request.max_deleted)) {
+                    const uri = (walker.next(&steps) catch |err| switch (err) {
+                        error.LakeVacuumPlanYield => break,
+                        else => return err,
+                    }) orelse {
+                        exhausted = true;
+                        break;
+                    };
+                    if (!has(candidates.items, uri)) try candidates.append(a, uri);
                 }
-            }
-            for ((try catalog.metadata.get(live, "snapshots")).array.items) |snapshot| {
-                for (try collectSnapshot(a, destination, snapshot, budget, manifests)) |uri| try marked.put(a, uri, {});
-            }
-            var selected: std.ArrayList([]const u8) = .empty;
-            var seen = catalog.retirement_index.Index.init(a, client, plans.bucket, try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-traversal", .{plans.prefix}), context);
-            defer seen.deinit();
-            var walker = try plan.Walker.init(plans, job.retired, &seen, progress.cursor);
-            var steps: usize = 64;
-            var inspected: usize = 0;
-            var scanned: usize = 0;
-            while (inspected < 16 and scanned < 4096 and selected.items.len < request.max_deleted) {
-                const uri = (walker.next(&steps) catch |err| switch (err) {
-                    error.LakeVacuumPlanYield => break,
-                    else => return err,
-                }) orelse {
-                    progress.exhausted = true;
-                    break;
-                };
-                scanned += 1;
-                if (marked.contains(uri)) {
-                    result.retained_objects += 1;
-                    continue;
+                var references = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .references = candidates.items });
+                defer references.deinit(a);
+                if (!references.references.ready) break :selection;
+                for (candidates.items, references.references.referenced) |uri, referenced| {
+                    if (referenced) {
+                        result.retained_objects += 1;
+                        continue;
+                    }
+                    if (try collectOwned(a, destination, uri, true) != .eligible) {
+                        result.retained_objects += 1;
+                        continue;
+                    }
+                    if (!has(selected.items, uri)) try selected.append(a, uri);
                 }
-                inspected += 1;
-                if (try collectOwned(a, destination, uri, true) != .eligible) {
-                    result.retained_objects += 1;
-                    continue;
+                if (selected.items.len != 0) {
+                    const version = references.references.table.version orelse return error.LakeCatalogConditionalWritesRequired;
+                    const intent = try std.json.Stringify.valueAlloc(a, .{ .version = version, .objects = selected.items }, .{});
+                    var proof = configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .retire = .{ .id = try std.fmt.allocPrint(a, "vacuum-retire-{s}", .{catalog.types.digestHex(intent)}), .expected_metadata_location = references.references.table.metadata_location, .expected_version = version, .objects = selected.items } }) catch |err| switch (err) {
+                        error.LakeReachabilityPending => break :selection,
+                        else => return err,
+                    };
+                    defer proof.deinit(a);
+                    if (proof.table.retirement_root == null) return error.InvalidLakeRetirementIndex;
                 }
-                if (!has(selected.items, uri)) try selected.append(a, uri);
+                progress.approved = selected.items;
+                progress.approved_index = 0;
+                progress.cursor = walker.checkpoint();
+                progress.exhausted = exhausted;
             }
-            if (selected.items.len != 0) {
-                const version = latest.table.version orelse return error.LakeCatalogConditionalWritesRequired;
-                const intent = try std.json.Stringify.valueAlloc(a, .{ .version = version, .objects = selected.items }, .{});
-                var proof = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .retire = .{ .id = try std.fmt.allocPrint(a, "vacuum-retire-{s}", .{catalog.types.digestHex(intent)}), .expected_metadata_location = latest.table.metadata_location, .expected_version = version, .objects = selected.items } });
-                defer proof.deinit(a);
-                if (proof.table.retirement_root == null) return error.InvalidLakeRetirementIndex;
-            }
-            progress.approved = selected.items;
-            progress.approved_index = 0;
-            progress.cursor = walker.checkpoint();
             // Save the fenced deletion batch before any physical deletion.
         } else {
             const end = @min(progress.approved.len, progress.approved_index + @min(request.max_deleted, 16));
@@ -539,7 +542,7 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
         };
         defer committed.deinit(a);
     }
-    if (!request.dry_run) return executeJob(scratch, binding, options, request, protected, pin_store, destination, &plans, job, &budget, &manifests);
+    if (!request.dry_run) return executeJob(scratch, binding, options, request, protected, pin_store, destination, &plans, job);
     // Re-read authority after resolving the intent. A newer safe publication
     // can retain old native objects, and the mark set must include its roots.
     var latest = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
@@ -752,6 +755,15 @@ test "external lake vacuum expires a large backlog in bounded oldest-first jobs"
             var previous = try queue.client.getObject(queue.bucket, execution_key, .{});
             defer previous.deinit(queue.client.allocator);
             var legacy = try std.json.parseFromSliceLeaky(Execution, a, previous.body, .{ .allocate = .alloc_always });
+            // Reachability bootstrap may yield before selecting the first
+            // fenced batch. Migrate only once that batch is durable.
+            var bootstrap_turns: usize = 0;
+            while (legacy.approved.len == 0 and bootstrap_turns < 64) : (bootstrap_turns += 1) {
+                result = try run(alloc, binding, options, .{}, request, &.{});
+                previous.deinit(queue.client.allocator);
+                previous = try queue.client.getObject(queue.bucket, execution_key, .{});
+                legacy = try std.json.parseFromSliceLeaky(Execution, a, previous.body, .{ .allocate = .alloc_always });
+            }
             try std.testing.expect(legacy.approved.len != 0);
             legacy.version = 1;
             legacy.scan = 0;

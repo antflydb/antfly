@@ -48,7 +48,7 @@ test "lake catalog metadata log keeps the newest previous versions" {
     try std.testing.expectEqualStrings("gs://archive/t/metadata/v6.metadata.json", try metadata.str(try metadata.get(log[0], "metadata-file")));
     // Malformed bounds fail closed instead of silently disabling retention.
     var invalid = try metadata.parse(a, bytes);
-    try invalid.object.getPtr("properties").?.object.put(a, metadata.previous_versions_max_property, .{ .string = "0" });
+    try invalid.object.getPtr("properties").?.object.put(a, metadata.previous_versions_max_property, .{ .string = "invalid" });
     try std.testing.expectError(error.InvalidLakeMetadata, metadata.previousVersionsMax(invalid));
 }
 
@@ -235,4 +235,223 @@ test "lake catalog commit throughput benchmark" {
             bucket_ns = 0;
         }
     }
+}
+
+test "lake catalog metadata retention normalizes nonpositive values on every commit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "0", "-1", "100001", "2147483647" }) |value| {
+        const request = try std.fmt.allocPrint(a, "{{\"schema\":{{\"type\":\"struct\",\"schema-id\":0,\"fields\":[]}},\"properties\":{{\"write.metadata.previous-versions-max\":\"{s}\"}}}}", .{value});
+        var bytes: []const u8 = try metadata.createAlloc(a, request, "00000000-0000-0000-0000-000000000000", 1, "gs://archive/t");
+        for (0..3) |n| {
+            const location = try std.fmt.allocPrint(a, "gs://archive/t/metadata/{d}.metadata.json", .{n});
+            bytes = try metadata.applyAlloc(a, bytes, location, .{ .id = "update", .expected_metadata_location = location, .body = "{\"requirements\":[],\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"owner\":\"new\"}}]}", .timestamp_ms = @intCast(n + 2) });
+        }
+        const root = try metadata.parse(a, bytes);
+        const count = (try metadata.get(root, "metadata-log")).array.items.len;
+        try std.testing.expectEqual(@as(usize, if (value[0] == '0' or value[0] == '-') 1 else 3), count);
+    }
+}
+
+const AvroReads = struct {
+    a: A,
+    keys: std.StringHashMapUnmanaged(usize) = .empty,
+    fn count(raw: *anyopaque, _: []const u8, key: []const u8) bool {
+        const self: *AvroReads = @ptrCast(@alignCast(raw));
+        if (std.mem.endsWith(u8, key, ".avro")) {
+            const entry = self.keys.getOrPut(self.a, key) catch @panic("allocation failed");
+            if (!entry.found_existing) {
+                entry.key_ptr.* = self.a.dupe(u8, key) catch @panic("allocation failed");
+                entry.value_ptr.* = 0;
+            }
+            entry.value_ptr.* += 1;
+        }
+        return false; // Observe every read without consuming the fault filter.
+    }
+};
+
+fn awaitReferences(a: A, catalog: managed.Managed, objects: []const []const u8) !types.References {
+    for (0..2048) |_| {
+        var result = try catalog.references(a, objects);
+        if (result.ready) return result;
+        result.deinit(a);
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "lake catalog reachability resumes cold after lost checkpoint ACK and reuses immutable evidence" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = storage.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var faults = storage.ScriptedFaultClient.init(alloc, memory.client());
+    defer faults.deinit();
+    var table = try Table.init(alloc, faults.client(), "archive", "events", "gs://archive/events", "gs://archive/events");
+    defer table.deinit(alloc);
+    for (1..21) |n| try table.commitRow(alloc, @intCast(n + 1));
+    const before = try metadata.parse(a, table.current.metadata_json);
+    const old_list = try metadata.str(try metadata.get((try metadata.get(before, "snapshots")).array.items[0], "manifest-list"));
+    var reads: AvroReads = .{ .a = a };
+    faults.get_filter = .{ .ptr = &reads, .matches = AvroReads.count };
+    faults.put_filter = .{ .ptr = &faults, .matches = struct {
+        fn matches(_: *anyopaque, _: []const u8, key: []const u8, _: []const u8) bool {
+            return std.mem.endsWith(u8, key, "/reachability/build.json");
+        }
+    }.matches };
+    faults.next_put = .{ .commit_then_fail = error.ConnectionResetByPeer };
+    try std.testing.expectError(error.ConnectionResetByPeer, table.catalog.references(alloc, &.{}));
+
+    // Advance the metadata while bootstrap is partial. Completed roots and
+    // inventories remain reusable, while the new snapshot must be proved too.
+    faults.get_filter = null;
+    try table.commitRow(alloc, 22);
+    faults.get_filter = .{ .ptr = &reads, .matches = AvroReads.count };
+    const dead = "gs://archive/events/data/unreferenced.parquet";
+    var proof = try awaitReferences(alloc, table.catalog, &.{ old_list, dead });
+    defer proof.deinit(alloc);
+    try std.testing.expect(proof.referenced[0]);
+    try std.testing.expect(!proof.referenced[1]);
+    try std.testing.expectEqual(@as(usize, 63), reads.keys.count()); // 21 lists, 42 manifests.
+    var counts = reads.keys.valueIterator();
+    while (counts.next()) |count| try std.testing.expectEqual(@as(usize, 1), count.*);
+
+    // Cold catalog handles, small retirements, and retirement-only HEAD
+    // advancement never read the unchanged source manifests again.
+    for (0..12) |n| {
+        var current = try table.catalog.load(alloc);
+        defer current.deinit(alloc);
+        const uri = try std.fmt.allocPrint(a, "gs://archive/events/data/dead-{d}.parquet", .{n});
+        var retired_table = try table.catalog.retire(alloc, .{ .id = try std.fmt.allocPrint(a, "gc-{d}", .{n}), .expected_metadata_location = current.metadata_location, .expected_version = current.version.?, .objects = &.{uri} });
+        retired_table.deinit(alloc);
+    }
+    try std.testing.expectError(error.LakeObjectStillReferenced, table.catalog.retire(alloc, .{ .id = "unsafe", .expected_metadata_location = proof.table.metadata_location, .expected_version = blk: {
+        const current = try table.catalog.load(a);
+        break :blk current.version.?;
+    }, .objects = &.{old_list} }));
+    _ = try table.expire(alloc, 1, 23);
+    var after = try awaitReferences(alloc, table.catalog, &.{old_list});
+    defer after.deinit(alloc);
+    try std.testing.expect(!after.referenced[0]);
+    // Statistics are independent roots even without a snapshot graph change.
+    const stats_uri = "gs://archive/events/statistics/summary.puffin";
+    const root = try metadata.parse(a, table.current.metadata_json);
+    const stats_body = try std.json.Stringify.valueAlloc(a, .{ .requirements = .{}, .updates = .{.{ .action = "set-statistics", .statistics = .{ .@"snapshot-id" = try metadata.int(try metadata.get(root, "current-snapshot-id")), .@"statistics-path" = stats_uri, .@"file-size-in-bytes" = 1, .@"file-footer-size-in-bytes" = 1, .@"blob-metadata" = .{} } }} }, .{});
+    var stats = try table.catalog.commit(alloc, .{ .id = "statistics", .expected_metadata_location = table.current.metadata_location, .body = stats_body, .timestamp_ms = 24 });
+    defer stats.deinit(alloc);
+    var with_stats = try awaitReferences(alloc, table.catalog, &.{stats_uri});
+    defer with_stats.deinit(alloc);
+    try std.testing.expect(with_stats.referenced[0]);
+    try std.testing.expectError(error.LakeObjectStillReferenced, table.catalog.retire(alloc, .{ .id = "unsafe-statistics", .expected_metadata_location = with_stats.table.metadata_location, .expected_version = with_stats.table.version.?, .objects = &.{stats_uri} }));
+    // Root removal rebuilds the exact set from immutable inventories.
+    counts = reads.keys.valueIterator();
+    while (counts.next()) |count| try std.testing.expectEqual(@as(usize, 1), count.*);
+}
+
+test "lake catalog reachability bounds cold large-manifest turns and resumes inside inventory chunks" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = storage.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var faults = storage.ScriptedFaultClient.init(alloc, memory.client());
+    defer faults.deinit();
+    var table = try Table.init(alloc, faults.client(), "archive", "events", "gs://archive/events", "gs://archive/events");
+    defer table.deinit(alloc);
+    const avro = @import("avro_writer.zig");
+    const padding = try a.alloc(u8, 2048);
+    @memset(padding, 'x');
+    var entries: std.ArrayList(V) = .empty;
+    for (0..1024) |n| {
+        const uri = try std.fmt.allocPrint(a, "gs://archive/events/data/{s}-{d}.parquet", .{ padding, n });
+        try entries.append(a, try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, .{ .status = 1, .snapshot_id = 1, .sequence_number = 1, .file_sequence_number = 1, .data_file = .{ .content = 0, .file_path = uri, .file_format = "PARQUET", .partition = V{ .object = .empty }, .record_count = 1, .file_size_in_bytes = 1 } }, .{}), .{}));
+    }
+    const manifest = try avro.ocf(a, avro.entry_schema, entries.items, &.{ .{ .key = "partition-spec", .value = "[]" }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = "data" } });
+    const manifest_uri = try row_commit.upload(a, table.files, "metadata/large-manifest.avro", manifest);
+    const list_entry = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, .{ .manifest_path = manifest_uri, .manifest_length = manifest.len, .partition_spec_id = 0, .content = 0, .sequence_number = 1, .min_sequence_number = 1, .added_snapshot_id = 1, .added_files_count = 1024, .existing_files_count = 0, .deleted_files_count = 0, .added_rows_count = 1024, .existing_rows_count = 0, .deleted_rows_count = 0 }, .{}), .{});
+    const list = try avro.ocf(a, avro.list_schema, &.{list_entry}, &.{.{ .key = "format-version", .value = "2" }});
+    const list_uri = try row_commit.upload(a, table.files, "metadata/large-list.avro", list);
+    const body = try std.json.Stringify.valueAlloc(a, .{ .requirements = .{}, .updates = .{
+        .{ .action = "add-snapshot", .snapshot = .{ .@"snapshot-id" = 1, .@"sequence-number" = 1, .@"timestamp-ms" = 2, .@"manifest-list" = list_uri, .@"schema-id" = 0, .summary = .{ .operation = "append" } } },
+        .{ .action = "set-snapshot-ref", .@"ref-name" = "main", .@"snapshot-id" = 1, .type = "branch" },
+    } }, .{});
+    var published = try table.catalog.commit(alloc, .{ .id = "large", .expected_metadata_location = table.current.metadata_location, .body = body, .timestamp_ms = 2 });
+    defer published.deinit(alloc);
+    const Counter = struct {
+        avro: usize = 0,
+        chunks: usize = 0,
+        fn count(raw: *anyopaque, _: []const u8, key: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.endsWith(u8, key, ".avro")) self.avro += 1;
+            if (std.mem.indexOf(u8, key, "/reachability/chunks/") != null) self.chunks += 1;
+            return false;
+        }
+    };
+    var count: Counter = .{};
+    faults.get_filter = .{ .ptr = &count, .matches = Counter.count };
+    var constrained = table.catalog;
+    constrained.context.deadline_ns = platform.time.monotonicNs() + std.time.ns_per_s;
+    var yielded = try constrained.references(alloc, &.{manifest_uri});
+    defer yielded.deinit(alloc);
+    try std.testing.expect(!yielded.ready);
+    try std.testing.expectEqual(@as(usize, 0), count.avro);
+    var turns: usize = 0;
+    while (turns < 64) : (turns += 1) {
+        const writes = faults.put_attempts;
+        count.chunks = 0;
+        var result = try table.catalog.references(alloc, &.{manifest_uri});
+        defer result.deinit(alloc);
+        try std.testing.expect(faults.put_attempts - writes < 600);
+        // One list page plus at most two pages around a file cursor boundary.
+        try std.testing.expect(count.chunks <= 3);
+        if (result.ready) {
+            try std.testing.expect(result.referenced[0]);
+            break;
+        }
+    }
+    try std.testing.expect(turns >= 16 and turns < 64);
+    try std.testing.expectEqual(@as(usize, 2), count.avro);
+    const last = try metadata.str(try metadata.get(try metadata.get(entries.items[1023], "data_file"), "file_path"));
+    var ready = try table.catalog.references(alloc, &.{ last, list_uri });
+    defer ready.deinit(alloc);
+    try std.testing.expect(ready.ready and ready.referenced[0] and ready.referenced[1]);
+}
+
+test "lake catalog retirement conflicts when authority advances during cold proof bootstrap" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var faults = storage.ScriptedFaultClient.init(a, memory.client());
+    defer faults.deinit();
+    var table = try Table.init(a, faults.client(), "archive", "events", "gs://archive/events", "gs://archive/events");
+    defer table.deinit(a);
+    try table.commitRow(a, 2);
+    var parent = try table.catalog.load(a);
+    defer parent.deinit(a);
+    const Advance = struct {
+        a: A,
+        catalog: managed.Managed,
+        location: []const u8,
+        advanced: bool = false,
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var next = self.catalog.commit(self.a, .{ .id = "concurrent", .expected_metadata_location = self.location, .body = "{\"requirements\":[],\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"owner\":\"new\"}}]}", .timestamp_ms = 3 }) catch return;
+            defer next.deinit(self.a);
+            self.advanced = true;
+        }
+        fn matches(_: *anyopaque, _: []const u8, key: []const u8) bool {
+            return std.mem.endsWith(u8, key, ".avro");
+        }
+    };
+    var advance: Advance = .{ .a = a, .catalog = table.catalog, .location = parent.metadata_location };
+    faults.get_filter = .{ .ptr = &advance, .matches = Advance.matches };
+    faults.next_get = .{ .complete_then_callback = .{ .ptr = &advance, .run = Advance.run } };
+    try std.testing.expectError(error.LakeCommitConflict, table.catalog.retire(a, .{ .id = "stale-gc", .expected_metadata_location = parent.metadata_location, .expected_version = parent.version.?, .objects = &.{"gs://archive/events/data/dead.parquet"} }));
+    try std.testing.expect(advance.advanced);
+    var current = try table.catalog.load(a);
+    defer current.deinit(a);
+    try std.testing.expect(current.retirement_root == null);
 }
