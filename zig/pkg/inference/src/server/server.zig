@@ -36619,6 +36619,10 @@ fn applyFixedChunkConfig(config: *lib_chunker.FixedChunkConfig, raw: api.ChunkCo
             if (value < 0 or value > max_chunk_target_tokens) return error.InvalidChunkOverlapTokens;
             candidate.text.overlap_tokens = @intCast(value);
         }
+        if (text.min_chars) |value| {
+            if (value < 0 or value > max_chunk_target_tokens) return error.InvalidChunkMinChars;
+            candidate.text.min_chars = @intCast(value);
+        }
         if (text.separator) |separator| candidate.text.separator = separator;
     }
     if (candidate.text.overlap_tokens >= candidate.text.target_tokens)
@@ -36645,6 +36649,7 @@ fn fixedChunkConfigErrorMessage(err: anyerror) []const u8 {
         error.InvalidMaxChunks => "max_chunks must be between 0 and 4096",
         error.InvalidChunkThreshold => "threshold must be finite and between 0 and 1",
         error.InvalidChunkTargetTokens => "text.target_tokens is outside the supported range",
+        error.InvalidChunkMinChars => "text.min_chars is outside the supported range",
         error.InvalidChunkOverlapTokens => "text.overlap_tokens must be non-negative and less than target_tokens",
         error.InvalidChunkAudioWindow => "audio.window_duration_ms is outside the supported range",
         error.InvalidChunkAudioOverlap => "audio.overlap_duration_ms must be non-negative and less than window_duration_ms",
@@ -48119,4 +48124,15 @@ test "dynamic CUDA admission counts admitted pages and rolls back failed batch g
     defer next.release();
     ctx.unregister(pending_index);
     try std.testing.expectEqual(@as(usize, 0), ctx.admitted_pages);
+}
+
+test "fixed chunk request validates minimum content without changing defaults" {
+    var config = lib_chunker.FixedChunkConfig{};
+    try applyFixedChunkConfig(&config, .{ .text = .{ .min_chars = 16 } });
+    try std.testing.expectEqual(@as(usize, 16), config.text.min_chars);
+    try std.testing.expectError(error.InvalidChunkMinChars, applyFixedChunkConfig(&config, .{ .text = .{ .min_chars = -1 } }));
+    try std.testing.expectEqual(@as(usize, 16), config.text.min_chars);
+    try std.testing.expectError(error.InvalidChunkMinChars, applyFixedChunkConfig(&config, .{ .text = .{ .min_chars = 1000001 } }));
+    try applyFixedChunkConfig(&config, .{ .text = .{ .min_chars = 0 } });
+    try std.testing.expectEqual(@as(usize, 0), config.text.min_chars);
 }

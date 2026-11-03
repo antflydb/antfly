@@ -63,12 +63,15 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
         else
             section_tokens;
         if (current.items.len > 0 and candidate_tokens > target_tokens) {
-            try chunks.append(alloc, buildChunk(text, current.items, chunk_id));
+            const chunk = buildChunk(text, current.items, chunk_id);
+            if (hasMinimumContent(chunk.text.?, cfg.min_chars)) {
+                try chunks.append(alloc, chunk);
+                chunk_id += 1;
+            }
             previous_start = current.items[0].start;
-            chunk_id += 1;
             if (max_chunks != 0 and chunks.items.len >= max_chunks) return try chunks.toOwnedSlice(alloc);
 
-            previous_text = chunks.items[chunks.items.len - 1].text.?;
+            previous_text = chunk.text.?;
             current.clearRetainingCapacity();
 
             if (overlap_tokens > 0 and previous_text.len > 0) {
@@ -96,7 +99,8 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
     }
 
     if (current.items.len > 0 and (max_chunks == 0 or chunks.items.len < max_chunks)) {
-        try chunks.append(alloc, buildChunk(text, current.items, chunk_id));
+        const chunk = buildChunk(text, current.items, chunk_id);
+        if (hasMinimumContent(chunk.text.?, cfg.min_chars)) try chunks.append(alloc, chunk);
     }
 
     return try chunks.toOwnedSlice(alloc);
@@ -595,4 +599,57 @@ test "fixed text chunker counts unspaced CJK paragraphs per character" {
     for (chunks) |chunk| {
         try std.testing.expect(try countTokens(alloc, tokenizer, chunk.text.?) <= 256);
     }
+}
+
+/// Count scalars rather than bytes or English words. Whitespace cannot make a
+/// page label eligible. Opt-in so short captions and identifiers remain usable.
+fn hasMinimumContent(text: []const u8, minimum: usize) bool {
+    if (minimum == 0) return true;
+    const view = std.unicode.Utf8View.init(text) catch return false;
+    var it = view.iterator();
+    var count: usize = 0;
+    while (it.nextCodepoint()) |cp| {
+        switch (cp) {
+            0x09...0x0d, 0x20, 0x85, 0xa0, 0x1680, 0x2000...0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => continue,
+            else => {},
+        }
+        count += 1;
+        if (count >= minimum) return true;
+    }
+    return false;
+}
+
+test "fixed text minimum content omits page scraps without truncating later passages" {
+    const alloc = std.testing.allocator;
+    const source = "C-8\n\nreal searchable passage\n\n)\n\nsecond readable passage\n\nC-9";
+    const chunks = try chunkText(alloc, source, .{
+        .target_tokens = 5,
+        .overlap_tokens = 0,
+        .min_chars = 16,
+        .max_chunks = 2,
+    });
+    defer types.freeChunks(alloc, chunks);
+    try std.testing.expectEqual(@as(usize, 2), chunks.len);
+    try std.testing.expect(std.mem.indexOf(u8, chunks[0].text.?, "real searchable passage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chunks[1].text.?, "second readable passage") != null);
+    for (chunks, 0..) |chunk, i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i)), chunk.id);
+        try std.testing.expectEqualStrings(chunk.text.?, source[chunk.start_char.?..chunk.end_char.?]);
+    }
+    // Filtering every candidate must publish an empty replacement inventory.
+    const empty = try chunkText(alloc, "C-8\n\n)\n\n\n", .{ .min_chars = 16 });
+    defer types.freeChunks(alloc, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "fixed text minimum content counts Unicode scalars and ignores whitespace" {
+    try std.testing.expect(!hasMinimumContent(" C-8\n\t\u{a0}\u{3000}", 4));
+    try std.testing.expect(hasMinimumContent("東京 café", 6));
+    try std.testing.expect(!hasMinimumContent("東京 café", 7));
+    try std.testing.expect(!hasMinimumContent("\u{2003}\u{202f}\u{85}", 1));
+    try std.testing.expect(hasMinimumContent("x", 0));
+    const alloc = std.testing.allocator;
+    const legacy = try chunkText(alloc, "C-8", .{});
+    defer types.freeChunks(alloc, legacy);
+    try std.testing.expectEqual(@as(usize, 1), legacy.len);
 }

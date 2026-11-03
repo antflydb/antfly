@@ -96,6 +96,45 @@ curl -fsS -X PUT http://127.0.0.1:8080/db/v1/tables/scans/artifacts/document_chu
   }'
 ```
 
+### Omit Page-Number Scraps
+
+For document corpora where page labels or punctuation-only pages produce
+irrelevant vector matches, use a fixed chunker with an explicit minimum:
+
+```json
+{
+  "name": "document_chunks_v1",
+  "kind": "chunk",
+  "source_artifact_name": "document_units_v1",
+  "field": "text",
+  "chunker": {
+    "provider": "antfly",
+    "store_chunks": true,
+    "text": {"target_tokens": 256, "overlap_tokens": 32, "min_chars": 16}
+  },
+  "full_text_index": true
+}
+```
+
+`text.min_chars` counts non-whitespace Unicode scalar values in each completed
+text chunk. Chunks below the threshold are omitted before storage, full-text
+indexing, and downstream embedding. Source text remains in the extraction asset,
+and retained chunks keep their original source offsets. This avoids an
+English-word heuristic, so the same threshold can be tuned for other scripts.
+It is a length rule, not a semantic relevance or punctuation detector.
+
+The default is `0` (disabled), preserving short captions, equations, and
+identifiers. Choose the threshold for your corpus. It applies to fixed text
+chunking, including `/ai/v1/chunk`, and does not discard visual PDF pages or
+model-aware audio/image windows. After changing the policy or upgrading PDF
+extraction, reprocess the affected documents so existing chunks and vectors are
+replaced. A document whose chunks all fall below the threshold publishes an
+empty inventory and retires its previous chunk vectors.
+
+Scanned PDFs with an existing invisible OCR text layer retain that layer's
+positions for word and line reconstruction. Antfly does not paint that invisible
+text over the scanned image.
+
 ### 3. Write a Scanned Document
 
 `url` can be a remote URL or an inline data URI. This writes a local PDF inline:

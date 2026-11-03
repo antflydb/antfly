@@ -145869,3 +145869,51 @@ test "transient leann re-embedding renders templates through content parts like 
     try std.testing.expectEqual(@as(usize, 1), probe.batch_calls);
     try std.testing.expectEqual(@as(f32, 2), out[0]);
 }
+
+test "db minimum chunk content retires stale vectors and skips embedding page scraps" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .owner_id = "worker-a", .dense_embedder = counting.interface() },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","chunk_name":"body_chunks_v1","embedding_name":"chunk_dense_v1","chunker":{"provider":"antfly","store_chunks":true,"text":{"target_tokens":128,"overlap_tokens":0,"min_chars":16}}}}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"replace all six gyroscopes\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    const before = counting.calls;
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"C-8\\n)\\n\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(before, counting.calls);
+    try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    try std.testing.expectEqual(@as(usize, 0), try testChunkArtifactCount(alloc, &db, "doc:a", "body_chunks_v1"));
+    // The same empty replacement must work in background replay, too.
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"searchable guidance sensor evidence\"}" }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    const replay_before = counting.calls;
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"C-9\"}" }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(replay_before, counting.calls);
+    try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+}

@@ -131,6 +131,8 @@ pub const Chunk = struct {
 pub const FixedTextConfig = struct {
     target_tokens: usize = 500,
     overlap_tokens: usize = 50,
+    /// Minimum non-whitespace Unicode scalars; zero preserves all chunks.
+    min_chars: usize = 0,
     /// 0 = unlimited: chunk the entire unit. An explicit value is still
     /// bounded by `max_chunk_results` in `validate()`.
     max_chunks: usize = 0,
@@ -138,6 +140,7 @@ pub const FixedTextConfig = struct {
 
     pub fn validate(self: @This()) !void {
         const target = if (self.target_tokens > 0) self.target_tokens else 500;
+        if (self.min_chars > max_chunk_target_tokens) return error.InvalidChunkMinChars;
         if (target > max_chunk_target_tokens) return error.InvalidChunkTargetTokens;
         if (self.overlap_tokens > max_chunk_target_tokens or self.overlap_tokens >= target)
             return error.InvalidChunkOverlapTokens;

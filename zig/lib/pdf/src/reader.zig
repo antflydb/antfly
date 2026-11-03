@@ -17526,7 +17526,11 @@ fn appendTextRunDecodedString(
         .layout, .analysis => state.render_mode,
         .render => try effectiveTextRenderMode(state.*),
     };
-    if (render_mode != 3) switch (out) {
+    // Invisible text is commonly the searchable OCR layer of a scanned PDF.
+    // Extraction needs its positions to reconstruct spaces and line breaks;
+    // only paint runs omit it. Otherwise the preservation check falls back to
+    // concatenated canonical bytes for the entire page (including visible text).
+    if (render_mode != 3 or out.isTextOnly()) switch (out) {
         .layout => |layout_out| {
             const text = try alloc.dupe(u8, decoded);
             errdefer alloc.free(text);
@@ -32004,13 +32008,14 @@ test "document bounded PDF runs share one allowance across consumes and nested f
         for (runs.items) |*run| run.deinit(a);
         runs.deinit(a);
     }
-    var parser = try PositionedTextParser.init(a, .{ .analysis = .{ .runs = &runs, .max_runs = 2 } }, .{}, &.{}, .nonzero);
+    var parser = try PositionedTextParser.init(a, .{ .analysis = .{ .runs = &runs, .max_runs = 3 } }, .{}, &.{}, .nonzero);
     defer parser.deinit();
     try parser.consume("BT 3 Tr (Invisible) Tj 0 Tr (First) Tj ET", &.{}, &.{}, &.{});
     const form = PageForm{ .name = @constCast("Fm"), .content = @constCast("BT (Second) Tj (Excess) Tj ET") };
     try std.testing.expectError(error.TextRunLimitExceeded, parser.consume("/Fm Do", &.{}, &.{}, &.{form}));
-    try std.testing.expectEqual(@as(usize, 2), runs.items.len);
-    try std.testing.expectEqualStrings("Second", runs.items[1].text);
+    try std.testing.expectEqual(@as(usize, 3), runs.items.len);
+    try std.testing.expectEqualStrings("Invisible", runs.items[0].text);
+    try std.testing.expectEqualStrings("Second", runs.items[2].text);
 }
 
 test "document bounded PDF run allocation failures release partially collected text" {
@@ -32062,4 +32067,52 @@ test "document PDF static annotation states composite through Form geometry and 
     const center = ((raster.height / 2) * raster.width + raster.width / 2) * 4;
     try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, raster.rgba[center..][0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, raster.rgba[0..4]);
+}
+
+test "reader reconstructs invisible OCR spacing without painting the OCR layer" {
+    const alloc = std.testing.allocator;
+    const content = "BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (replace) Tj 1 0 0 1 60 50 Tm (all) Tj 1 0 0 1 85 50 Tm (six) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET";
+    const fonts = [_]PageFont{.{ .name = try alloc.dupe(u8, "F1"), .decoder = .{} }};
+    defer {
+        var font = fonts[0];
+        font.deinit(alloc);
+    }
+    var runs = std.ArrayList(TextRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+    var parser = try PositionedTextParser.init(alloc, .{ .analysis = .{ .runs = &runs, .max_runs = 4 } }, .{}, &.{}, .nonzero);
+    defer parser.deinit();
+    try parser.consume(content, &fonts, &.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 4), runs.items.len);
+    const text = try reconstructTextFromRunsAlloc(alloc, runs.items);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("replace all six gyroscopes\n", text);
+    for (runs.items) |run| {
+        try std.testing.expectEqual(@as(i64, 3), run.render_mode);
+        try std.testing.expectEqualStrings(run.text, text[run.output_span.?.start..run.output_span.?.end]);
+    }
+    var painted = std.ArrayList(TextRun).empty;
+    defer painted.deinit(alloc);
+    try extractTextRunsFromContentAppend(alloc, &painted, content, &fonts, &.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 0), painted.items.len);
+}
+
+test "reader NASA SM3A OCR report retains searchable words in both extraction APIs" {
+    const a = std.testing.allocator;
+    var reader = try Reader.init(a, @embedFile("testdata/nasa-hubble-sm3a.pdf"));
+    defer reader.deinit();
+    const text = try reader.extractPageTextAlloc(1);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "replace all six gyroscopes") != null);
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings(text, analysis.text);
+    try std.testing.expect(analysis.runs.len > 100);
+    for (analysis.runs) |run| {
+        if (run.output_span) |span| try std.testing.expectEqualStrings(run.text, analysis.text[span.start..span.end]);
+    }
+    // OCR runs still observe the caller's working-set bound.
+    try std.testing.expectError(error.TextRunLimitExceeded, reader.extractPageTextAnalysisWithRunLimitAlloc(1, 10));
 }

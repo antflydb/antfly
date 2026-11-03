@@ -43,6 +43,7 @@ pub fn chunkInputBounded(
             .overlap_tokens = cfg.text.overlap_tokens,
             .max_chunks = cfg.max_chunks,
             .separator = cfg.text.separator,
+            .min_chars = cfg.text.min_chars,
         }),
         .binary => |binary| chunkBinary(alloc, binary, cfg, max_owned_output_bytes),
     };
