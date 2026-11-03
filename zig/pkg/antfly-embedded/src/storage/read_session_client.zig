@@ -19,6 +19,24 @@ const std = @import("std");
 const Types = @import("read_session_types").types;
 const contract = Types.contract;
 const A = std.mem.Allocator;
+pub const StatementReadFence = struct {
+    handle: ?contract.Handle,
+    owner: ?*const anyopaque,
+    pub fn fromHandle(handle: contract.Handle, owner: *const anyopaque) !StatementReadFence {
+        try handle.validate(.statement_fence);
+        return .{ .handle = handle, .owner = owner };
+    }
+    pub fn captureStatement(self: *const StatementReadFence) !Statement {
+        const handle = self.handle orelse return error.InvalidArgument;
+        return Statement.fromIssued(try contract.call("capture_statement", .statement_fence, handle, .{handle}));
+    }
+    pub fn release(self: *StatementReadFence) void {
+        const handle = self.handle orelse return;
+        contract.call("close", .statement_fence, handle, .{handle}) catch @panic("incompatible statement fence owner");
+        self.handle = null;
+        self.owner = null;
+    }
+};
 pub const Statement = struct {
     handle: contract.Handle,
     schema_version: u32,

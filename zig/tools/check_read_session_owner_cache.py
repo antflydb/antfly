@@ -57,6 +57,14 @@ EDITS = {
         "pkg/antfly-embedded/src/storage/db/read_statement_snapshot.zig",
         "pub const Implementation = struct {\n",
     ),
+    "capture_fence_state": (
+        "pkg/antfly-embedded/src/storage/db/statement_capture_fence.zig",
+        "pub const Implementation = struct {\n",
+    ),
+    "shared_handle": (
+        "pkg/antfly-embedded/src/storage/read_session_contract.zig",
+        "pub const Handle = extern struct {\n",
+    ),
     "shared_budget": (
         "pkg/antfly-embedded/src/storage/read_session_values.zig",
         "pub const Budget = struct {\n",
@@ -79,6 +87,7 @@ EDITS = {
     ),
 }
 PROFILES = {
+    "capture": ("capture_fence_state", "statement_state", "shared_handle"),
     "sessions": (
         "relational_state",
         "document_state",
@@ -422,7 +431,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--zig", default="zig")
     parser.add_argument("--profile", choices=PROFILES, default="sessions")
-    parser.add_argument("--expected-tests", type=int, default=5)
+    parser.add_argument("--expected-tests", type=int, default=6)
     args = parser.parse_args()
     if args.timeout < 1:
         parser.error("timeout must be positive")

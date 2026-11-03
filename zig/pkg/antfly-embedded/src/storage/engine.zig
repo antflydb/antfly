@@ -261,9 +261,9 @@ pub const VTable = struct {
     completeSplitBootstrap: *const fn (self: *DB, alloc: std.mem.Allocator, byte_range: types.ByteRange, base_delta_sequence: u64, marker: @import("db/range_state.zig").SplitBootstrapMarker) Outcome(bool),
     split: *const fn (self: *DB, curr_range: types.ByteRange, split_key: []const u8, dest_dir1: []const u8, dest_dir2: []const u8, prepare_only: bool) Outcome(void),
     drainSnapshotMaintenance: *const fn (self: *DB, deadline_ns: u64) Outcome(void),
-    sealBackupCohort: *const fn (self: *DB, id: []const u8, expected: @import("db/relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) Outcome(@import("db/native_backup_seal.zig").Handle),
-    exportBackupCohort: *const fn (self: *DB, handle: @import("db/native_backup_seal.zig").Handle, id: []const u8, cancellation: types.CancellationToken) Outcome(u64),
-    exportBackupCohortPortable: *const fn (self: *DB, handle: @import("db/native_backup_seal.zig").Handle, writer: WriterBorrow, options: PortableExportOptions, cancellation: types.CancellationToken) Outcome(void),
+    sealBackupCohort: *const fn (self: *DB, id: []const u8, expected: @import("db/relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) Outcome(@import("db/native_backup_seal_contract.zig").Handle),
+    exportBackupCohort: *const fn (self: *DB, handle: @import("db/native_backup_seal_contract.zig").Handle, id: []const u8, cancellation: types.CancellationToken) Outcome(u64),
+    exportBackupCohortPortable: *const fn (self: *DB, handle: @import("db/native_backup_seal_contract.zig").Handle, writer: WriterBorrow, options: PortableExportOptions, cancellation: types.CancellationToken) Outcome(void),
     mergeDocumentsPage: *const fn (self: *DB, alloc: std.mem.Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) Outcome([]types.BatchWrite),
     mergeCleanupKeysPage: *const fn (self: *DB, alloc: std.mem.Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) Outcome([]types.BatchWrite),
     repairVerifiedPrimarySnapshot: *const fn (alloc: std.mem.Allocator, staged: *const @import("db/generation_lifecycle.zig").StagedGeneration, namespace: [24]u8, receipt: ?db.OrderedApplyReceipt, root_generation: u64) Outcome(void),
@@ -333,13 +333,12 @@ pub const VTable = struct {
     searchRequestAtCurrentIdentityGeneration: *const fn (self: *DB, req: types.SearchRequest) Outcome(types.SearchRequest),
     graphHasIncomingEdgesForInternalReadBoundedAt: *const fn (self: *DB, alloc: std.mem.Allocator, index_name: []const u8, keys: []const []const u8, expected: @import("db/catalog/index_manager.zig").IndexManager.CoverageIdentity, identity_read_generation: ?u64, ttl_now_ns: u64, max_scanned_rows: usize) Outcome(@import("../graph/graph.zig").GraphIndex.IncomingProbeResult),
     catchUpPendingDerivedReplayWithProgress: *const fn (*DB, *anyopaque, db.ReplayProgressHook, @import("named_callback.zig").Dispatch) Outcome(void),
-    statementFenceRelease: *const fn (*DB.StatementReadFence) Outcome(void),
     captureRelationalStatementSnapshot: *const fn (self: *DB) Outcome(session_contract.Statement),
     beginRelationalRows: *const fn (self: *DB, alloc: std.mem.Allocator, request: @import("read_reader_values.zig").Request) Outcome(session_contract.Handle),
     openDocumentReadSession: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) Outcome(session_contract.Handle),
     openRelationalReadSessionAtSnapshot: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?session_contract.Handle) Outcome(session_contract.Handle),
-    tryStatementReadFence: *const fn (self: *DB) Outcome(?DB.StatementReadFence),
-    tryEmbeddedBackupReadFence: *const fn (self: *DB) Outcome(?DB.StatementReadFence),
+    tryStatementReadFence: *const fn (self: *DB) Outcome(?@import("read_session_contract.zig").Handle),
+    tryEmbeddedBackupReadFence: *const fn (self: *DB) Outcome(?@import("read_session_contract.zig").Handle),
     catchUpPendingDerivedReplay: *const fn (self: *DB) Outcome(void),
     derivedAsyncAppendDerivedBatchRecord: *const fn (self: *DB, derived_batch: @import("db/derived/derived_types.zig").DerivedBatch) Outcome(u64),
     runDerivedUntil: *const fn (self: *DB, sequence: u64) Outcome(void),
@@ -396,7 +395,7 @@ pub const VTable = struct {
     graphHydrateKeysForInternalRead: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest, keys: []const []const u8) Outcome([]types.SearchHit),
     scanVisit: *const fn (*DB, Allocator, []const u8, []const u8, types.ScanOptions, types.ScanVisitor) Outcome(void),
     trySnapshotDenseSearch: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery, include_profile: bool) Outcome(?db.SearchWithDenseProfileResult),
-    snapshotInternal: *const fn (self: *DB, id: []const u8, include_generated: bool, cancellation: types.CancellationToken, maintenance_deadline_ns: ?u64, expected_topology_fence: ?@import("db/relational_integrity_topology.zig").Fence, backup_seal_only: bool, query_cut: ?@import("db/native_query_cut.zig").Request) Outcome(u64),
+    snapshotInternal: *const fn (self: *DB, id: []const u8, include_generated: bool, cancellation: types.CancellationToken, maintenance_deadline_ns: ?u64, expected_topology_fence: ?@import("db/relational_integrity_topology.zig").Fence, backup_seal_only: bool, query_cut: ?@import("db/native_query_cut_contract.zig").Request) Outcome(u64),
     navigateHierarchyChildren: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest) Outcome(types.SearchResult),
     searchDense: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) Outcome(types.SearchResult),
     searchSparse: *const fn (self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest, sparse: types.SparseKnnQuery) Outcome(types.SearchResult),
@@ -408,8 +407,8 @@ pub const VTable = struct {
     applyReplicatedDerivedEffect: *const fn (self: *DB, change: @import("db/derived/change_journal.zig").Record, primary: ?@import("db/replication_effects.zig").primary_effect.View, sequence: u64) Outcome(u64),
     applyDocumentArtifactChildRangeBatch: *const fn (self: *DB, child_batch: db.DocumentArtifactChildRangeApplyBatch) Outcome(u64),
     batchNativeInitialChildApply: *const fn (self: *DB, req: types.BatchRequest, receipt: db.OrderedApplyReceipt) Outcome(void),
-    captureQueryCut: *const fn (self: *DB, request: @import("db/native_query_cut.zig").Request, cancellation: types.CancellationToken) Outcome(void),
-    openQueryCut: *const fn (self: *DB, request: @import("db/native_query_cut.zig").Request, cancellation: types.CancellationToken) Outcome(DB),
+    captureQueryCut: *const fn (self: *DB, request: @import("db/native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) Outcome(void),
+    openQueryCut: *const fn (self: *DB, request: @import("db/native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) Outcome(DB),
     runSourcePinCleanupStep: *const fn (self: *DB) Outcome(bool),
     runLsmMaintenanceStepBestEffort: *const fn (self: *DB) Outcome(bool),
     getDocumentArtifactManifest: *const fn (self: *DB, alloc: std.mem.Allocator, doc_key: []const u8, artifact_name: []const u8) Outcome(?types.DocumentArtifactManifest),
@@ -506,7 +505,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 34,
+    version: u32 = 35,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -680,7 +679,7 @@ pub fn descriptorForValidation() *const Descriptor {
     return antfly_storage_engine_get_descriptor_v29();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 34 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 35 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or

@@ -26,6 +26,34 @@ const Reader = Backend.RelationalRows.Reader;
 const ReaderValues = Types.reader_values;
 const View = Types.view;
 const A = std.mem.Allocator;
+const FenceOwner = struct {
+    alloc: A,
+    value: Backend.StatementReadFence,
+    db: *anyopaque,
+    capture: *const fn (*FenceOwner) anyerror!contract.Statement,
+};
+pub fn tryFence(db: anytype, allow_unresolved: bool) !?contract.Handle {
+    var value = (try if (allow_unresolved) db.tryEmbeddedBackupReadFence() else db.tryStatementReadFence()) orelse return null;
+    errdefer value.release();
+    const owner = try db.alloc.create(FenceOwner);
+    const Capture = struct {
+        fn run(held: *FenceOwner) !contract.Statement {
+            const database: *@TypeOf(db.*) = @ptrCast(@alignCast(held.db));
+            const retained = try database.alloc.create(StatementOwner);
+            errdefer database.alloc.destroy(retained);
+            retained.* = .{ .alloc = database.alloc, .value = try database.captureRelationalStatementSnapshotAtFence(&held.value) };
+            return .{ .handle = issue(.statement, retained), .schema_version = retained.value.schema_version };
+        }
+    };
+    owner.* = .{ .alloc = db.alloc, .value = value, .db = db, .capture = Capture.run };
+    return issue(.statement_fence, owner);
+}
+pub fn closeFence(handle: contract.Handle) !void {
+    const owner = try handle.resolve(.statement_fence, FenceOwner);
+    const alloc = owner.alloc;
+    owner.value.release();
+    alloc.destroy(owner);
+}
 const StatementOwner = struct { alloc: A, value: Backend.Statement };
 pub fn capture(db: anytype) !contract.Statement {
     const retained = try db.alloc.create(StatementOwner);
@@ -173,6 +201,7 @@ const owner_c_allocator = std.heap.c_allocator;
 fn issue(comptime kind: contract.Kind, value: anytype) contract.Handle {
     return .issue(kind, value, switch (kind) {
         .statement => &statement_ops,
+        .statement_fence => &fence_ops,
         .relational => &relational_ops,
         .document => &document_ops,
         .reader => &reader_ops,
@@ -322,3 +351,12 @@ pub fn documentReaderUnderLease(lease: anytype, alloc: A, version: u32) !contrac
     owner.* = .{ .alloc = alloc, .value = try lease.documentRows(alloc, version) };
     return .issue(.document_reader, owner, &Owner.operations, contract.Boundary.local_dispatch, &owner_c_allocator);
 }
+
+fn fenceClose(handle: contract.Handle) contract.NativeOutcome(void) {
+    return .{ .value = closeFence(handle) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn fenceCapture(handle: contract.Handle) contract.NativeOutcome(contract.Statement) {
+    const owner = handle.resolve(.statement_fence, FenceOwner) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = owner.capture(owner) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+const fence_ops: contract.Operations = .{ .close = fenceClose, .capture_statement = fenceCapture };

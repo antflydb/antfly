@@ -24,3 +24,5 @@ pub const QueryReadLease = @import("db/query_read_lease.zig").For;
 
 pub const DocumentRows = @import("db/document_read_rows.zig").For;
 pub const DocumentPrimaryReadWindow = @import("db/document_primary_read_window.zig").Implementation;
+
+pub const StatementReadFence = @import("db/statement_capture_fence.zig").Implementation;

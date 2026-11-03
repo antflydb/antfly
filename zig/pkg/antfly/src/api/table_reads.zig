@@ -2750,7 +2750,7 @@ pub const BoundTableReadSource = struct {
         const opts: db_mod.types.ScanOptions = .{ .cancellation = cancellation, .execution_deadline_ns = deadline_ns };
         try self.reads.reads.prepareScanWithConsistency(self.reads.group_id, "", "", opts, consistency);
         var fence = (try self.db.tryStatementReadFence()) orelse return error.Backpressured;
-        const snapshot = self.db.captureRelationalStatementSnapshot() catch |err| {
+        const snapshot = self.db.captureRelationalStatementSnapshotAtFence(&fence) catch |err| {
             fence.release();
             return err;
         };

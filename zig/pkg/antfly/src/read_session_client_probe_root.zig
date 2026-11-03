@@ -54,7 +54,7 @@ fn run(db: *DB, alloc: std.mem.Allocator, out: *contract.ProbeResult) !void {
     if (@import("builtin").is_test or !engine.enabled) return error.UnsupportedVersion;
     const descriptor = engine.descriptorForValidation();
     mark(out, "descriptor_version");
-    if (descriptor.version != 34) return error.UnsupportedVersion;
+    if (descriptor.version != 35) return error.UnsupportedVersion;
     inline for (@typeInfo(engine.Descriptor).@"struct".field_names, @typeInfo(engine.Descriptor).@"struct".field_types) |field, T| {
         if (comptime T == @TypeOf(engine.table_layout)) {
             const actual = @field(descriptor.*, field);
@@ -68,11 +68,12 @@ fn run(db: *DB, alloc: std.mem.Allocator, out: *contract.ProbeResult) !void {
     mark(out, "fence");
     var fence = (try db.tryStatementReadFence()) orelse return error.Backpressured;
     mark(out, "capture");
-    var snapshot = db.captureRelationalStatementSnapshot() catch |err| {
+    var snapshot = db.captureRelationalStatementSnapshotAtFence(&fence) catch |err| {
         fence.release();
         return err;
     };
     fence.release();
+    fence.release(); // Public release remains idempotent across the owner boundary.
     var snapshot_open = true;
     defer if (snapshot_open) snapshot.deinit();
     out.schema_version = snapshot.schema_version;

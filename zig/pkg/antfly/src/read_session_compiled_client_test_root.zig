@@ -195,3 +195,53 @@ test "opaque read session rejects execution-private columnar and pattern state b
     page.retained_pages = &.{};
     try provider.validateExportedPage(page);
 }
+
+test "opaque read session capture fence allocation failure releases both admissions" {
+    const provider = @import("read_session_provider");
+    const Admission = local.storage_db_snapshot_admission.SnapshotAdmission;
+    const Fence = DB.StatementReadFence;
+    const Fixture = struct {
+        alloc: Allocator,
+        primary: Admission = .{},
+        replay: Admission = .{},
+        backup_requested: bool = false,
+        pub fn tryStatementReadFence(self: *@This()) !?Fence {
+            var primary = self.primary.tryAcquireCapture() orelse return null;
+            const replay = self.replay.tryAcquireCapture() orelse {
+                primary.release();
+                return null;
+            };
+            return .{ .primary = primary, .replay = replay };
+        }
+        pub fn captureRelationalStatementSnapshotAtFence(_: *@This(), _: *const Fence) !DB.RelationalStatementSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        pub fn tryEmbeddedBackupReadFence(self: *@This()) !?Fence {
+            self.backup_requested = true;
+            return self.tryStatementReadFence();
+        }
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var db: Fixture = .{ .alloc = failing.allocator() };
+    try std.testing.expectError(error.OutOfMemory, provider.tryFence(&db, false));
+    var primary = db.primary.tryAcquireCapture() orelse return error.TestUnexpectedResult;
+    primary.release();
+    var replay = db.replay.tryAcquireCapture() orelse return error.TestUnexpectedResult;
+    replay.release();
+    db.alloc = std.testing.allocator;
+    const handle = (try provider.tryFence(&db, true)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(db.backup_requested);
+    try std.testing.expect(db.primary.tryAcquireCapture() == null);
+    try std.testing.expect(db.replay.tryAcquireCapture() == null);
+    try std.testing.expect((try provider.tryFence(&db, false)) == null);
+    // Reject an incompatible capability before following its poisoned state.
+    var bad = handle;
+    bad.version = 0;
+    bad.context = @ptrFromInt(1);
+    try std.testing.expectError(error.UnsupportedVersion, provider.closeFence(bad));
+    try provider.closeFence(handle);
+    primary = db.primary.tryAcquireCapture() orelse return error.TestUnexpectedResult;
+    primary.release();
+    replay = db.replay.tryAcquireCapture() orelse return error.TestUnexpectedResult;
+    replay.release();
+}

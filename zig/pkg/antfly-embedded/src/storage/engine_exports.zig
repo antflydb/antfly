@@ -629,12 +629,12 @@ fn openRelationalReadSessionAtSnapshot(self: *DB, alloc: std.mem.Allocator, from
     return .{ .value = read_sessions.openRelational(self, alloc, from_key, to_key, opts, statement) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn tryStatementReadFence(self: *DB) engine.Outcome(?DB.StatementReadFence) {
-    return .{ .value = self.tryStatementReadFence() catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn tryStatementReadFence(self: *DB) engine.Outcome(?session_contract.Handle) {
+    return .{ .value = read_sessions.tryFence(self, false) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn tryEmbeddedBackupReadFence(self: *DB) engine.Outcome(?DB.StatementReadFence) {
-    return .{ .value = self.tryEmbeddedBackupReadFence() catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn tryEmbeddedBackupReadFence(self: *DB) engine.Outcome(?session_contract.Handle) {
+    return .{ .value = read_sessions.tryFence(self, true) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn catchUpPendingDerivedReplay(self: *DB) engine.Outcome(void) {
@@ -741,9 +741,6 @@ fn catchUpPendingDerivedReplayWithProgress(self: *DB, context: *anyopaque, hook:
     };
     var proxy: Proxy = .{ .context = context, .hook = hook, .dispatch = dispatch };
     return .{ .value = self.catchUpPendingDerivedReplayWithProgress(&proxy, Proxy.progress) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-fn statementFenceRelease(fence: *DB.StatementReadFence) engine.Outcome(void) {
-    return .{ .value = fence.release() };
 }
 
 fn resolveNativeRestoreOpenPlan(target_path: []const u8, requested_options: db.OpenOptions) engine.Outcome(db.NativeRestoreOpenPlan) {

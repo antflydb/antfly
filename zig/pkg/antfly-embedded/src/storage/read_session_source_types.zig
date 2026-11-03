@@ -47,3 +47,5 @@ pub const document_revision = @import("document_mutation_revision.zig");
 pub const backend_erased = @import("backend_erased.zig");
 pub const document_projection = @import("document_projection.zig");
 pub const value_ranges = @import("value_ranges.zig");
+
+pub const snapshot_admission = @import("db/snapshot_admission.zig");

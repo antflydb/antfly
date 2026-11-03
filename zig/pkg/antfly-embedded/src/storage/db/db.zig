@@ -3519,6 +3519,15 @@ pub const DB = struct {
     /// admission. It deliberately cannot be serialized across owners.
     pub const RelationalStatementSnapshot = @import("read_session_backend").Statement;
 
+    /// Capture through the admitted owner capability. This keeps fence leases
+    /// and the snapshot transaction in the same compilation owner.
+    pub fn captureRelationalStatementSnapshotAtFence(self: *DB, fence: *const StatementReadFence) !RelationalStatementSnapshot {
+        if (fence.owner != @as(*const anyopaque, self)) return error.InvalidArgument;
+        if (comptime storage_engine.enabled) return fence.captureStatement();
+        if (!fence.primary.active or !fence.replay.active) return error.InvalidArgument;
+        return self.captureRelationalStatementSnapshot();
+    }
+
     pub fn captureRelationalStatementSnapshot(self: *DB) !RelationalStatementSnapshot {
         if (comptime storage_engine.enabled) return RelationalStatementSnapshot.fromIssued(try storage_engine.call("captureRelationalStatementSnapshot", .{self}));
         // Capturing a visibility cut does not expose row bytes. A protected
@@ -20616,7 +20625,7 @@ pub const DB = struct {
         };
         return cut.admitWithDurability(self.alloc, io, self.core.path, id, if (repository) |value| value.limits else .{}, cancellation, if (repository) |*value| .{ .ptr = value, .confirm = Confirm.durable } else null);
     }
-    pub fn captureQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !void {
+    pub fn captureQueryCut(self: *DB, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("captureQueryCut", .{ self, request, cancellation });
         return self.captureQueryCutInternal(request, cancellation, true);
     }
@@ -20663,7 +20672,7 @@ pub const DB = struct {
     }
     /// Query-pin guard is held. Validate unchanged state at a short read point,
     /// release mutation fences before repository I/O, then rebind exact extents.
-    fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !bool {
+    fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !bool {
         const repository = self.backend_runtime.query_cut_repository orelse return false;
         if (repository.vtable.reuse == null) return false;
         const basis = self.local_execution.native_query_reuse orelse return false;
@@ -20688,7 +20697,7 @@ pub const DB = struct {
         self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
         return true;
     }
-    fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
+    fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
         try request.validate(@import("native_query_cut.zig").nowMs());
         _ = try request.namespace(self.core.identity_namespace);
         if (!request.create or request.table_id != self.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
@@ -20784,7 +20793,7 @@ pub const DB = struct {
         return completed;
     }
 
-    pub fn openQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !DB {
+    pub fn openQueryCut(self: *DB, request: @import("native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) !DB {
         if (comptime storage_engine.enabled) return storage_engine.call("openQueryCut", .{ self, request, cancellation });
         const cut = @import("native_query_cut.zig");
         try request.validate(cut.nowMs());
@@ -20929,7 +20938,7 @@ pub const DB = struct {
         maintenance_deadline_ns: ?u64,
         expected_topology_fence: ?@import("relational_integrity_topology.zig").Fence,
         backup_seal_only: bool,
-        query_cut: ?@import("native_query_cut.zig").Request,
+        query_cut: ?@import("native_query_cut_contract.zig").Request,
     ) !u64 {
         if (comptime storage_engine.enabled) return storage_engine.call("snapshotInternal", .{ self, id, requested_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut });
         const seal_only = backup_seal_only or query_cut != null;
@@ -40828,16 +40837,7 @@ pub const DB = struct {
         return try collector.finish();
     }
 
-    pub const StatementReadFence = struct {
-        primary: snapshot_admission_mod.SnapshotAdmission.CaptureLease,
-        replay: snapshot_admission_mod.SnapshotAdmission.CaptureLease,
-
-        pub fn release(fence: *StatementReadFence) void {
-            if (comptime storage_engine.enabled) return storage_engine.call("statementFenceRelease", .{fence}) catch @panic("incompatible storage owner");
-            fence.replay.release();
-            fence.primary.release();
-        }
-    };
+    pub const StatementReadFence = @import("read_session_backend").StatementReadFence;
 
     /// A short capture fence, not a transaction-long writer lock. The caller
     /// captures every participating owner, pins their read views, then releases
@@ -40845,7 +40845,10 @@ pub const DB = struct {
     /// ALL earlier fences before retrying: a prepared transaction may need one
     /// of those owners to finish resolution. Never drain it under this fence.
     pub fn tryStatementReadFence(self: *DB) !?StatementReadFence {
-        if (comptime storage_engine.enabled) return storage_engine.call("tryStatementReadFence", .{self});
+        if (comptime storage_engine.enabled) {
+            const handle = try storage_engine.call("tryStatementReadFence", .{self});
+            return if (handle) |issued| try StatementReadFence.fromHandle(issued, self) else null;
+        }
         return self.tryPrimaryReadFence(false);
     }
 
@@ -40853,7 +40856,10 @@ pub const DB = struct {
     /// the committed primary state. It need not wait for an open transaction
     /// to finish, while still excluding primary and replay mutation races.
     pub fn tryEmbeddedBackupReadFence(self: *DB) !?StatementReadFence {
-        if (comptime storage_engine.enabled) return storage_engine.call("tryEmbeddedBackupReadFence", .{self});
+        if (comptime storage_engine.enabled) {
+            const handle = try storage_engine.call("tryEmbeddedBackupReadFence", .{self});
+            return if (handle) |issued| try StatementReadFence.fromHandle(issued, self) else null;
+        }
         return self.tryPrimaryReadFence(true);
     }
 
@@ -40875,7 +40881,7 @@ pub const DB = struct {
             primary.release();
             return null;
         }
-        return .{ .primary = primary, .replay = replay };
+        return .{ .owner = self, .primary = primary, .replay = replay };
     }
 
     /// Owns a retained schema/store snapshot and its authorization predicate.
@@ -72780,7 +72786,7 @@ test "db index catalog barrier canceled query capture unwinds staging and permit
         }
     };
     const id: [64]u8 = @splat('a');
-    const request: @import("native_query_cut.zig").Request = .{
+    const request: @import("native_query_cut_contract.zig").Request = .{
         .id = &id,
         .table_id = 7,
         .expires_ms = @import("native_query_cut.zig").nowMs() + 300_000,
@@ -73020,7 +73026,7 @@ test "db query capture retains settled terminal repair debt without acknowledgin
     try std.testing.expectError(error.EnrichmentWorkerFailed, db.runMaintenanceUntilWithCancellation(sequence, .{}, .none, std.math.maxInt(u64)));
 
     const id: [64]u8 = @splat('b');
-    const request: @import("native_query_cut.zig").Request = .{
+    const request: @import("native_query_cut_contract.zig").Request = .{
         .id = &id,
         .table_id = 7,
         .expires_ms = @import("native_query_cut.zig").nowMs() + 300_000,

@@ -117,6 +117,14 @@ class SessionCompilerAttribution(unittest.TestCase):
         self.assertNotIn("kernel_client", states)
         self.assertTrue(errors)
 
+    def test_capture_fence_implementation_is_private_but_handle_is_shared(self):
+        self.assertEqual(
+            set(cache.expected_states("shared_handle").values()), {"success"}
+        )
+        for role, state in cache.expected_states("capture_fence_state").items():
+            self.assertEqual(state, "cached" if role.endswith("client") else "success")
+        self.assertIn("capture_fence_state", cache.PROFILES["capture"])
+
     def test_shared_reader_request_is_not_treated_as_private_state(self):
         self.assertEqual(
             set(cache.expected_states("shared_reader_request").values()), {"success"}

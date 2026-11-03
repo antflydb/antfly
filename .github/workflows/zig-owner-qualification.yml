@@ -347,6 +347,7 @@ jobs:
           python3 tools/check_lake_execution_cache.py --report ../.benchmark-results/production-owners/lake-cache.json --timeout 1800
           python3 tools/check_public_mutation_cache.py --report ../.benchmark-results/production-owners/public-mutation-cache.json
           python3 tools/check_read_session_owner_cache.py --report ../.benchmark-results/production-owners/read-session-cache.json
+          python3 tools/check_read_session_owner_cache.py --profile capture --report ../.benchmark-results/production-owners/statement-capture-cache.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
