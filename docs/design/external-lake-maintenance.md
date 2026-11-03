@@ -156,7 +156,20 @@ fence through HEAD CAS.
 Planning uses the same inventory format in its private journal lane, with source
 and cache credentials kept separate. Large manifest lists are cached once, then
 resumed by chunk ranges. Crossing the soft read quantum cannot force each retry
-to reread the source list without advancing its manifest cursor.
+to reread the source list without advancing its manifest cursor. Temporary
+inputs are scoped to the operation. Planners register through a conditional
+admission record and use a maximum 60-second I/O deadline. Publishing the
+immutable job closes admission; collection waits for existing writers to release
+or for their deadline plus the same 30-second clock-skew grace used by snapshot
+pins. After source-file collection finishes, each turn removes at most 16 input
+objects plus the mutable planner. A compact closed-admission record prevents
+late registration. Completed snapshot-job replay uses the immutable job and
+execution receipt, so it does not require those temporary inputs. Old shared input caches
+are drained in bounded batches without touching other active operation scopes
+or authoritative catalog proof caches. A job reports `complete: false` until its
+input cleanup also completes, including no-op and definitively rejected jobs.
+Empty operations use a version-three no-op journal without mutating the catalog;
+version-one and version-two snapshot jobs retain their existing replay format.
 
 Execution checkpoints the reader-retirement barrier and each catalog-fenced
 physical deletion batch. The sweep stores its current frame, immutable parent

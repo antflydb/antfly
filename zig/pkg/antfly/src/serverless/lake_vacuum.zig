@@ -21,6 +21,7 @@ const catalog = local.serverless_external_source_mod.lake_catalog;
 const configured = @import("configured_object_store_support.zig");
 const ingestion = @import("lake_ingestion.zig");
 const pins = @import("lake_snapshot_pins.zig");
+const inputs = @import("lake_vacuum_inputs.zig");
 const iceberg = local.serverless_external_source_mod.iceberg_avro;
 const A = std.mem.Allocator;
 const V = std.json.Value;
@@ -34,6 +35,8 @@ pub const default_max_expired: usize = 256;
 pub const Result = struct { planning: bool = false, expired_snapshots: usize = 0, remaining_snapshots: usize = 0, eligible_objects: usize = 0, deleted_objects: usize = 0, retained_objects: usize = 0, complete: bool = false, conflicted: bool = false, delegated: bool = false, provider: ?catalog.maintenance.Provider = null, provider_state: ?catalog.maintenance.State = null };
 const plan = @import("lake_vacuum_plan.zig");
 const Retired = plan.Retired;
+// Versions one and two keep their existing serialization and replay hashes.
+// Version three records a no-op that must finish cleanup without a catalog commit.
 const Job = struct { version: u8 = 1, id: []const u8, expected: []const u8, body: []const u8, timestamp_ms: i64, retired: []const Retired, nodes: []const plan.Inline = &.{} };
 // Mutable planning progress is separate from the immutable catalog intent.
 // Each turn reads a bounded number of immutable inputs. Spill nodes are durable
@@ -58,6 +61,17 @@ const Planning = struct {
     manifests: []const ManifestRoot = &.{},
 };
 fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []const u8, key: []const u8, root: V, uuid: []const u8, protected: []const []const u8, request: Options, pin_store: pins.Store, destination: catalog.row_commit.Files, plans: *plan.Store, budget: *u64, cache: *ManifestFiles) !?Planning {
+    const original_context = plans.context;
+    const input_store = try inputs.Store.init(a, client_value, bucket, plans.prefix, request.operation_id, original_context);
+    var lease = input_store.acquire(a) catch |err| switch (err) {
+        error.LakeVacuumPlanClosed => return null,
+        else => return err,
+    };
+    defer lease.release(a) catch {};
+    plans.context = lease.context();
+    defer plans.context = original_context;
+    var leased_destination = destination;
+    leased_destination.context = plans.context;
     var client = client_value;
     var saved = client.getObject(bucket, key, .{ .max_response_bytes = max_planning_bytes, .cancellation = catalog.types.contextCancellation(&plans.context) }) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => null,
@@ -91,7 +105,7 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
         try roots.put(a, entry.uri, entry.root);
         cache_bytes += entry.uri.len + 160;
     }
-    var inventories: catalog.manifest_inventory.Store = .{ .files = destination, .client = client, .bucket = bucket, .prefix = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-inputs", .{plans.prefix}) };
+    var inventories: catalog.manifest_inventory.Store = .{ .files = leased_destination, .client = client, .bucket = bucket, .prefix = std.mem.trimEnd(u8, input_store.prefix, "/") };
     var steps: usize = 0;
     const initial_budget = budget.*;
     while (!progress.spilling and progress.candidate < progress.candidates.len and retired.items.len < progress.max_expired and steps < request.max_plan_steps and initial_budget - budget.* + inventories.bytes_read < 8 * 1024 * 1024) {
@@ -140,7 +154,7 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
                 if (steps >= request.max_plan_steps) break;
                 // Inventories need only URIs; the bounded GET enforces the
                 // remaining budget without trusting a declared source length.
-                const paths = try manifestFiles(a, destination, cache, manifest_uri, 0, budget);
+                const paths = try manifestFiles(a, leased_destination, cache, manifest_uri, 0, budget);
                 steps += 1;
                 const objects = try a.alloc([]const u8, paths.len + 1);
                 objects[0] = manifest_uri;
@@ -224,17 +238,7 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
         progress.cursor = .{};
         if (!progress.complete) progress.exhausted = false;
     }
-    if (saved == null) {
-        // The immutable job now owns every dependency. Drop the larger mutable
-        // planner so completed operations do not retain two inventory caches.
-        const planning_key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-planning/{s}.json", .{ plans.prefix, catalog.types.digestHex(request.operation_id) });
-        var metadata = client.statObjectWithOptions(plans.bucket, planning_key, .{ .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
-            error.NotFound, error.ObjectNotFound, error.FileNotFound => null,
-            else => return err,
-        };
-        defer if (metadata) |*value| value.deinit(client.allocator);
-        if (metadata) |value| try client.compareAndDelete(plans.bucket, planning_key, value.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = catalog.types.contextCancellation(&context) });
-    }
+    const input_store = try inputs.Store.init(a, client, plans.bucket, plans.prefix, request.operation_id, context);
     var result: Result = .{ .expired_snapshots = job.retired.len };
     var latest = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
     defer latest.deinit(a);
@@ -246,7 +250,7 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
         if (!keep.contains(id)) result.remaining_snapshots += 1;
     }
     if (progress.complete) {
-        result.complete = true;
+        result.complete = try input_store.finish(a);
         return result;
     }
     // A retired pin marker permanently closes reader admission. Checkpoints
@@ -336,7 +340,7 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
     else
         try client.putObject(plans.bucket, key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) });
     stored.deinit(client.allocator);
-    result.complete = progress.complete;
+    result.complete = progress.complete and try input_store.finish(a);
     return result;
 }
 const Marker = struct { uri: []const u8, sha256: []const u8, revision: @import("objectstore").ObjectRevision, owner: []const u8 };
@@ -474,7 +478,8 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
     if (saved) |value| {
         if (request.dry_run) return error.LakeMaintenanceAlreadyStarted;
         job = try std.json.parseFromSliceLeaky(Job, scratch, value.body, .{ .allocate = .alloc_always });
-        if (job.version != 1 and job.version != 2) return error.InvalidLakeVacuumPlan;
+        if (job.version != 1 and job.version != 2 and job.version != 3) return error.InvalidLakeVacuumPlan;
+        if (job.version == 3 and (job.retired.len != 0 or job.nodes.len != 0)) return error.InvalidLakeVacuumPlan;
         for (job.retired) |retired| if ((job.version == 2) != (retired.object_plan != null)) return error.InvalidLakeVacuumPlan;
         try plans.seed(job.nodes);
     } else {
@@ -523,13 +528,13 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
             }
         }
         result.expired_snapshots = ids.items.len;
-        if (ids.items.len == 0) {
+        if (ids.items.len == 0 and request.dry_run) {
             result.complete = true;
             return result;
         }
         const parent = try catalog.metadata.get(authority_root, "current-snapshot-id");
         const body = try std.json.Stringify.valueAlloc(scratch, .{ .requirements = .{.{ .type = "assert-ref-snapshot-id", .ref = "main", .@"snapshot-id" = parent }}, .updates = .{.{ .action = "remove-snapshots", .@"snapshot-ids" = ids.items }} }, .{});
-        job = .{ .version = 2, .id = try std.fmt.allocPrint(scratch, "vacuum-{s}", .{catalog.types.digestHex(request.operation_id)}), .expected = current.table.metadata_location, .body = body, .timestamp_ms = now_ms, .retired = retired.items, .nodes = try plans.inlineNodes() };
+        job = .{ .version = if (ids.items.len == 0) 3 else 2, .id = try std.fmt.allocPrint(scratch, "vacuum-{s}", .{catalog.types.digestHex(request.operation_id)}), .expected = current.table.metadata_location, .body = body, .timestamp_ms = now_ms, .retired = retired.items, .nodes = try plans.inlineNodes() };
         if (!request.dry_run) {
             const roots = try scratch.alloc([]const u8, job.retired.len);
             for (job.retired, roots) |entry, *hash| hash.* = entry.object_plan.?;
@@ -543,6 +548,13 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
             stored.deinit(queue_client.allocator);
         }
     }
+    if (!request.dry_run) {
+        const input_store = try inputs.Store.init(scratch, queue.client, queue.bucket, base, request.operation_id, context);
+        // The immutable job owns all replay dependencies before closing input
+        // admission. Existing registered planners are drained before cleanup.
+        try input_store.close(scratch);
+        if (job.version == 3) return .{ .complete = try input_store.finish(scratch) };
+    }
     // Snapshot removal precedes retirement. Concurrent refs/commits must win a
     // catalog CAS; a failed job never deletes files or blindly rebases its intent.
     if (!request.dry_run) {
@@ -550,7 +562,10 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
             // Definitive rejection terminates this immutable plan. The next
             // scheduled operation can plan from current authority; uncertain
             // outcomes still retry the exact saved intent.
-            error.LakeCommitConflict => return .{ .complete = true, .conflicted = true },
+            error.LakeCommitConflict => {
+                const input_store = try inputs.Store.init(scratch, queue.client, queue.bucket, base, request.operation_id, context);
+                return .{ .complete = try input_store.finish(scratch), .conflicted = true };
+            },
             else => return err,
         };
         defer committed.deinit(a);
@@ -809,6 +824,18 @@ test "external lake vacuum expires a large backlog in bounded oldest-first jobs"
     const final = try managed.load(a);
     const root = try catalog.metadata.parse(a, final.metadata_json);
     try std.testing.expectEqual(@as(usize, 1), (try catalog.metadata.get(root, "snapshots")).array.items.len);
+    var cache_queue = try ingestion.openQueue(alloc, binding, options);
+    defer cache_queue.deinit();
+    var cache_client = cache_queue.client;
+    const cache_prefix = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-inputs/", .{try ingestion.prefix(a, cache_queue.prefix, binding, options)});
+    var listed = try cache_client.listObjects(cache_queue.bucket, .{ .prefix = cache_prefix });
+    defer listed.deinit(cache_client.allocator);
+    try std.testing.expectEqual(@as(usize, 0), listed.entries.len);
+    // Completed-job replay no longer depends on temporary input inventories.
+    for (expected, 0..) |_, pass| {
+        const replay = try run(alloc, binding, options, .{}, .{ .operation_id = try std.fmt.allocPrint(a, "vacuum-{d}", .{pass}), .dry_run = false, .exclusive_ownership = true, .retain_ms = 600000, .keep_latest = 1, .max_expired = 2, .max_deleted = 1 }, &.{});
+        try std.testing.expect(replay.complete and !replay.conflicted);
+    }
     try std.testing.expectError(error.InvalidLakeMaintenanceLimits, run(alloc, binding, options, .{}, .{ .operation_id = "bad", .max_expired = 0 }, &.{}));
 }
 
@@ -1039,4 +1066,57 @@ test "external lake vacuum progresses while ingestion advances metadata every tu
     try std.testing.expectEqual(@as(usize, 20), result.expired_snapshots);
     const current = try authority.load(a);
     try std.testing.expectEqual(@as(u64, 20 + turns), try ingestion.coverage(a, current));
+}
+
+test "external lake vacuum no-op jobs reclaim inputs and replay without catalog mutation" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-vacuum-noop-cleanup");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    const binding: local.serverless_external_source_catalog_binding.Binding = .{ .table_id = "events", .format = .iceberg, .source_uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()}), .schema_fingerprint = "schema", .write_policy = .iceberg_writer, .catalog = .{ .type = .managed } };
+    const options: configured.BindingObjectStoreOpenOptions = .{ .node_config = &config, .catalog_table_id = 11 };
+    var opened = try configured.openBindingObjectStoreAlloc(alloc, binding, options);
+    defer opened.deinit();
+    const authority: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri };
+    var table = try authority.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    const files = try ingestion.destinationFiles(a, opened, binding.source_uri, .{});
+    for (1..3) |n| {
+        const row = try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{n}), .{});
+        const batch: catalog.row_commit.Batch = .{ .batch_id = try std.fmt.allocPrint(a, "b{d}", .{n}), .source = "s", .epoch = "1", .checkpoint = try std.fmt.allocPrint(a, "{d}", .{n}), .expected_checkpoint = if (n == 1) null else "1", .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = row }} };
+        const prepared = try catalog.row_commit.prepare(a, table, files, batch, n, @intCast(n + 1));
+        table = try authority.commit(a, .{ .id = batch.batch_id, .expected_metadata_location = table.metadata_location, .body = prepared.body, .timestamp_ms = @intCast(n + 1) });
+    }
+    const root = try catalog.metadata.parse(a, table.metadata_json);
+    const snapshots = (try catalog.metadata.get(root, "snapshots")).array.items;
+    const protected = try a.alloc([]const u8, snapshots.len);
+    for (snapshots, protected) |snapshot, *id| id.* = try std.fmt.allocPrint(a, "{d}", .{try catalog.metadata.int(try catalog.metadata.get(snapshot, "snapshot-id"))});
+    const request: Options = .{ .operation_id = "noop-cleanup", .dry_run = false, .exclusive_ownership = true, .retain_ms = 600000, .keep_latest = 1, .max_plan_steps = 3 };
+    var result = try run(alloc, binding, options, .{}, request, &.{});
+    try std.testing.expect(result.planning and !result.complete);
+    // New protections invalidate the candidates after their inputs were cached.
+    for (0..16) |_| {
+        result = try run(alloc, binding, options, .{}, request, protected);
+        if (result.complete) break;
+    }
+    try std.testing.expect(result.complete and result.expired_snapshots == 0);
+    var queue = try ingestion.openQueue(alloc, binding, options);
+    defer queue.deinit();
+    var client = queue.client;
+    const base = try ingestion.prefix(a, queue.prefix, binding, options);
+    const input_store = try inputs.Store.init(a, queue.client, queue.bucket, base, request.operation_id, .{});
+    var listed = try client.listObjects(queue.bucket, .{ .prefix = input_store.prefix });
+    defer listed.deinit(client.allocator);
+    try std.testing.expectEqual(@as(usize, 0), listed.entries.len);
+    try std.testing.expectError(error.FileNotFound, client.getObject(queue.bucket, input_store.planning_key, .{}));
+    // Dropping those protections cannot replan the same already completed ID.
+    const replay = try run(alloc, binding, options, .{}, request, &.{});
+    try std.testing.expect(replay.complete and replay.expired_snapshots == 0);
+    var current = try authority.load(a);
+    defer current.deinit(a);
+    try std.testing.expectEqualStrings(table.metadata_location, current.metadata_location);
 }

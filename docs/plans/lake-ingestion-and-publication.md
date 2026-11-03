@@ -766,6 +766,12 @@ mutation budget, so continuous catalog advancement does not require a pause in
 ingestion. Final membership lookup and deadline-bound retirement consume the
 prepared proof without starting another mark pass. Planning caches large source
 manifest lists in its private journal and resumes chunk ranges across turns.
+Each operation owns its temporary input cache. Closing admission after the
+immutable job is durable fences new planners; active writers hold bounded
+60-second leases with the existing 30-second clock-skew grace. Completion waits
+for bounded cache cleanup, including no-op and rejected jobs. Immutable replay
+journals and authoritative catalog reachability proofs remain separate from
+these disposable inputs.
 Retirement-only HEAD changes reuse the proof. Append-only root changes extend
 partially completed work; root removal or replacement rebuilds the exact set
 from cached inventories. Every retirement still uses the current HEAD CAS.
