@@ -1393,13 +1393,16 @@ test "boundary preparation benchmark isolates request-local tokenizer reuse" {
     // geometry passes and a fresh store; tokenizer loading is outside timing.
     for ([_]bool{ false, true, true, false }) |reuse| {
         var store = PreparationStore.init(a);
-        defer store.deinit();
+        var store_live = true;
+        defer if (store_live) store.deinit();
         const options = long_executor.Options{ .identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1, .preparations = if (reuse) &store else null };
         const started = @import("antfly_platform").time.monotonicNs();
         for (0..3) |_| {
             const used = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
             if (expected) |value| try std.testing.expectEqualDeep(value, used) else expected = used;
         }
+        store.deinit();
+        store_live = false;
         const elapsed = @import("antfly_platform").time.monotonicNs() - started;
         totals[@intFromBool(reuse)] += elapsed;
         std.debug.print("preparation_bench reuse={} passes=3 ns={}\n", .{ reuse, elapsed });

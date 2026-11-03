@@ -3,10 +3,11 @@
   "scope": "GLiNER prepared-window reuse and physical work admission; diagnostic preparation benchmark, not end-to-end throughput",
   "source": {
     "base_commit": "8c754843fb6350cde78d3684f95e992520cff81d",
-    "tested_runtime_patch_sha256": "3bbd004f725759dba4872c2212675a42a8f944847c0dcfa0cef1dc5d7eb2181d",
+    "tested_runtime_patch_sha256": "7bb161d2fb3ec393c0da0e59462fabfce0b9db0adb93da1ee1a9c5ff56424689",
     "files_sha256": {
-      "zig/pkg/inference/src/extractors/gliner_boundary_executor.zig": "dc32a3680dde256a80f98083667054b79772a384ef5792ed7741fce57d43bee6",
+      "zig/pkg/inference/src/extractors/gliner_boundary_executor.zig": "467ebaf755525029c187af99fcce8241cb59f65f48abc95f64c1445042a64b34",
       "zig/pkg/inference/src/extractors/gliner_boundary_long_executor.zig": "e8e2c5d105d3262f1da4e7bd9fe3b60f628e916598d1b25bf6a6f10aaf85229f",
+      "zig/pkg/inference/src/extractors/gliner_window_parity_test.zig": "d673b32fc9ba5fb664a0f76466f0afdfc311aebbb9f1708dd4d61a61ded015a8",
       "zig/pkg/inference/src/pipelines/gliner_boundary_long_document.zig": "2c86d7a584275faefab27d4944380871ccea05c3eed923a1449dcff222669cdd",
       "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig": "870ea912a5d032869a3d5d7d6965bb3b85927452f00e1845fac69881d235b0f1",
       "zig/pkg/inference/src/server/server.zig": "b8a49045c45ecfaa41d612fd4be4dfeed5df076ee52b5bbbb88ef0ae315b151a"
@@ -50,31 +51,37 @@
     "optimize": "debug",
     "passed": 71,
     "skipped": 4,
-    "log_sha256": "034b7c68b1198c153552cefbe9f3e1acd128c18229ccd00ab93f364c6f87abd8",
+    "log_sha256": "b82e2ef750a47ef3044ffd13965d30eed02bcb8c31187bb8d2f52081c92b43a5",
     "preparation_benchmark": {
       "ordering": "ABBA: disabled, enabled, enabled, disabled",
       "passes_per_request": 3,
       "samples": [
         {
           "reuse": false,
-          "three_pass_request_ns": 208035000
+          "three_pass_request_ns": 204701000
         },
         {
           "reuse": true,
-          "three_pass_request_ns": 70422000
+          "three_pass_request_ns": 71104000
         },
         {
           "reuse": true,
-          "three_pass_request_ns": 70094000
+          "three_pass_request_ns": 72964000
         },
         {
           "reuse": false,
-          "three_pass_request_ns": 198973000
+          "three_pass_request_ns": 206050000
         }
       ],
-      "disabled_total_ns": 407008000,
-      "enabled_total_ns": 140516000,
-      "ratio": 2.896524239232543
+      "disabled_total_ns": 410751000,
+      "enabled_total_ns": 144068000,
+      "ratio": 2.8510911514007273,
+      "timing_includes_request_store_teardown": true,
+      "excluded_from_timing": [
+        "tokenizer/config loading",
+        "JSON/schema parsing",
+        "model execution"
+      ]
     },
     "full_context_learned": {
       "body_words": 4096,
@@ -90,31 +97,37 @@
     "optimize": "debug",
     "passed": 65,
     "skipped": 0,
-    "log_sha256": "1efd4cfa4de7f0312e75a3b919f347289bca9224f87d132c71a2e654a2eb430b",
+    "log_sha256": "edf62498fc85245d0c0591f4dfd7d88f6a84c214ab1e4545210653e67f64db36",
     "preparation_benchmark": {
       "ordering": "ABBA: disabled, enabled, enabled, disabled",
       "passes_per_request": 3,
       "samples": [
         {
           "reuse": false,
-          "three_pass_request_ns": 163578257
+          "three_pass_request_ns": 167970597
         },
         {
           "reuse": true,
-          "three_pass_request_ns": 54671744
+          "three_pass_request_ns": 59930406
         },
         {
           "reuse": true,
-          "three_pass_request_ns": 54661344
+          "three_pass_request_ns": 60019973
         },
         {
           "reuse": false,
-          "three_pass_request_ns": 162851894
+          "three_pass_request_ns": 167443544
         }
       ],
-      "disabled_total_ns": 326430151,
-      "enabled_total_ns": 109333088,
-      "ratio": 2.985648324503557
+      "disabled_total_ns": 335414141,
+      "enabled_total_ns": 119950379,
+      "ratio": 2.796274124319357,
+      "timing_includes_request_store_teardown": true,
+      "excluded_from_timing": [
+        "tokenizer/config loading",
+        "JSON/schema parsing",
+        "model execution"
+      ]
     },
     "full_context_learned": {
       "body_words": 4096,

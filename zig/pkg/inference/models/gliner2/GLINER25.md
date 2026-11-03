@@ -101,9 +101,11 @@ those extra attempts. Repacking, physical budgets, semantic identity rebinding a
 all-allocation-failure cleanup checks passed.
 
 A real-tokenizer preparation-only benchmark measured three geometry passes per
-request, alternating reuse disabled/enabled in ABBA order. Two requests per mode
-totaled 407.008/140.516 ms locally (**2.90x**) and 326.430/109.333 ms on glowworm
-(**2.99x**). This compares the request store disabled/enabled in the same Debug
+request, alternating reuse disabled/enabled in ABBA order. Timing includes final
+request-store teardown on both paths; tokenizer/config loading, JSON/schema
+parsing and model execution are excluded. Two requests per mode
+totaled 410.751/144.068 ms locally (**2.85x**) and 335.414/119.950 ms on glowworm
+(**2.80x**). This compares the request store disabled/enabled in the same Debug
 implementation; it is not an old-head comparison or an end-to-end inference
 throughput claim. The public synthetic inputs, model pins, raw measurements and
 tested runtime-source hashes are recorded in
