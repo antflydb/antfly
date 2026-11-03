@@ -2986,6 +2986,8 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     defer if (semantic_producer_json) |raw| alloc.free(raw);
 
     if (root.get("summarizer") != null) return error.UnsupportedCreateTableRequest;
+    const leann_algorithm = try denseAlgorithmIsLeann(root);
+    if (sparse and leann_algorithm) return error.InvalidCreateTableRequest;
 
     const field_name = cfg.field;
     const template_value = cfg.template;
@@ -3152,6 +3154,11 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try out.appendSlice(alloc, dims_json);
     try out.appendSlice(alloc, ",\"metric\":");
     try appendJsonString(alloc, &out, metric);
+    // Transient vector storage re-embeds candidates from the document's own
+    // field or template, so it needs the index's embedder and one vector per
+    // document: no external vectors, chunking, or artifacts from other
+    // enrichments.
+    if (leann_algorithm) try appendLeannIndexConfig(alloc, &out, root, !external and !artifact_backed and chunker_json == null and embedder_json != null);
     if (artifact_sources.len > 0) {
         try appendArtifactIndexSources(alloc, &out, artifact_sources);
     } else {
@@ -3194,9 +3201,220 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         try appendJsonString(alloc, &out, producer);
     }
 
+    // LEANN carries its code width inside its own config block.
+    if (!leann_algorithm) try appendDenseQuantizationIfPresent(alloc, &out, root, dims);
     try appendExecutionObjectIfPresent(alloc, &out, root);
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+/// Reads the public `algorithm` / `leann` fields. Returns whether the dense
+/// index uses LEANN. A `leann` block requires `algorithm: "leann"`.
+fn denseAlgorithmIsLeann(root: std.json.ObjectMap) !bool {
+    const leann = if (root.get("algorithm")) |algorithm| blk: {
+        if (algorithm != .string) return error.InvalidCreateTableRequest;
+        if (std.mem.eql(u8, algorithm.string, "leann")) break :blk true;
+        if (std.mem.eql(u8, algorithm.string, "hbc")) break :blk false;
+        return error.InvalidCreateTableRequest;
+    } else false;
+    if (root.get("leann") != null and !leann) return error.InvalidCreateTableRequest;
+    return leann;
+}
+
+/// Mirrors `leann.Config.default_rabitq_bits` (this module does not depend on
+/// the vector index library).
+const leann_default_rabitq_bits: i64 = 4;
+
+/// Emits the normalized internal `"algorithm":"leann","leann":{...}` fields,
+/// validating the public LeannIndexConfig ranges. Every knob is written so
+/// the stored config (and its hash) is explicit. The code width comes from the
+/// dense index's top-level `quantization_bits`, shared with HBC; HBC's
+/// `quantization_refine` does not apply, since LEANN's error bounds already
+/// decide which candidates get exact distances.
+fn appendLeannIndexConfig(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), root: std.json.ObjectMap, can_reembed: bool) !void {
+    var max_degree: i64 = 30;
+    var quantizer: []const u8 = "rabitq";
+    var search_ef: i64 = 0;
+    var bound_scale: f64 = 1.0;
+    var batch_size: i64 = 0;
+    var quantization_bits: i64 = 0;
+    var vector_storage: ?[]const u8 = null;
+    if (root.get("leann")) |leann| {
+        if (leann != .object) return error.InvalidCreateTableRequest;
+        var it = leann.object.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const value = entry.value_ptr.*;
+            if (std.mem.eql(u8, key, "max_degree")) {
+                max_degree = try jsonIntegerInRange(value, 4, 128);
+            } else if (std.mem.eql(u8, key, "quantizer")) {
+                if (value != .string) return error.InvalidCreateTableRequest;
+                if (!std.mem.eql(u8, value.string, "rabitq") and !std.mem.eql(u8, value.string, "pq")) return error.InvalidCreateTableRequest;
+                quantizer = value.string;
+            } else if (std.mem.eql(u8, key, "search_ef")) {
+                search_ef = try jsonIntegerInRange(value, 0, 4096);
+            } else if (std.mem.eql(u8, key, "bound_scale")) {
+                bound_scale = switch (value) {
+                    .integer => |v| @floatFromInt(v),
+                    .float => |v| v,
+                    else => return error.InvalidCreateTableRequest,
+                };
+                if (!(bound_scale >= 0 and bound_scale <= 8)) return error.InvalidCreateTableRequest;
+            } else if (std.mem.eql(u8, key, "batch_size")) {
+                batch_size = try jsonIntegerInRange(value, 0, 1024);
+            } else if (std.mem.eql(u8, key, "vector_storage")) {
+                if (value != .string) return error.InvalidCreateTableRequest;
+                if (!std.mem.eql(u8, value.string, "transient") and !std.mem.eql(u8, value.string, "persistent")) return error.InvalidCreateTableRequest;
+                vector_storage = value.string;
+            } else return error.InvalidCreateTableRequest;
+        }
+    }
+    if (root.get("quantization_bits")) |value| quantization_bits = try jsonIntegerInRange(value, 1, 8);
+    if (root.get("quantization_refine") != null) return error.InvalidCreateTableRequest;
+    // Unset picks the quantizer's default. PQ codes have no bit width above 1.
+    const rabitq = std.mem.eql(u8, quantizer, "rabitq");
+    if (!rabitq and quantization_bits > 1) return error.InvalidCreateTableRequest;
+    if (quantization_bits == 0) quantization_bits = if (rabitq) leann_default_rabitq_bits else 1;
+    // Transient storage rebuilds graphs from RaBitQ codes, so PQ keeps
+    // vectors. It is the default wherever re-embedding is possible.
+    const transient_allowed = can_reembed and rabitq;
+    if (vector_storage) |requested| {
+        if (std.mem.eql(u8, requested, "transient") and !transient_allowed) return error.InvalidCreateTableRequest;
+    }
+    const resolved_storage = vector_storage orelse if (transient_allowed) "transient" else "persistent";
+    const json = try std.fmt.allocPrint(
+        alloc,
+        ",\"algorithm\":\"leann\",\"leann\":{{\"max_degree\":{d},\"quantizer\":\"{s}\",\"quantization_bits\":{d},\"vector_storage\":\"{s}\",\"search_ef\":{d},\"bound_scale\":{d},\"batch_size\":{d}}}",
+        .{ max_degree, quantizer, quantization_bits, resolved_storage, search_ef, bound_scale, batch_size },
+    );
+    defer alloc.free(json);
+    try out.appendSlice(alloc, json);
+}
+
+fn jsonIntegerInRange(value: std.json.Value, min: i64, max: i64) !i64 {
+    if (value != .integer or value.integer < min or value.integer > max) return error.InvalidCreateTableRequest;
+    return value.integer;
+}
+
+test "managed embedder translates leann algorithm into dense config" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"external":true,"dimension":4,"distance_metric":"cosine","algorithm":"leann","leann":{"max_degree":16,"bound_scale":1.5}}
+    , .{});
+    defer parsed.deinit();
+    const out = try translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", parsed.value, .{});
+    defer alloc.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"algorithm\":\"leann\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"max_degree\":16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"quantizer\":\"rabitq\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"quantization_bits\":4") != null);
+    // External vectors cannot be re-embedded, so they stay persistent.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"vector_storage\":\"persistent\"") != null);
+
+    for ([_][2][]const u8{
+        // An embedder-backed field index defaults to transient storage.
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann"}
+            ,
+            "\"vector_storage\":\"transient\"",
+        },
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"persistent"}}
+            ,
+            "\"vector_storage\":\"persistent\"",
+        },
+        // PQ graphs rebuild from vectors, so they keep them.
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"quantizer":"pq"}}
+            ,
+            "\"vector_storage\":\"persistent\"",
+        },
+    }) |case| {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, case[0], .{});
+        defer p.deinit();
+        const translated = try translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", p.value, .{});
+        defer alloc.free(translated);
+        try std.testing.expect(std.mem.indexOf(u8, translated, case[1]) != null);
+    }
+
+    for ([_][2][]const u8{
+        .{
+            \\{"external":true,"dimension":4,"algorithm":"leann","quantization_bits":2}
+            ,
+            "\"quantization_bits\":2",
+        },
+        .{
+            \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"quantizer":"pq"}}
+            ,
+            "\"quantization_bits\":1",
+        },
+    }) |case| {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, case[0], .{});
+        defer p.deinit();
+        const translated = try translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", p.value, .{});
+        defer alloc.free(translated);
+        try std.testing.expect(std.mem.indexOf(u8, translated, case[1]) != null);
+    }
+
+    for ([_][]const u8{
+        \\{"external":true,"dimension":4,"leann":{"max_degree":16}}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"max_degree":2}}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"faiss"}
+        ,
+        \\{"external":true,"sparse":true,"algorithm":"leann"}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"leann","quantization_bits":9}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"leann","quantization_bits":4,"leann":{"quantizer":"pq"}}
+        ,
+        // The bit width is top-level now, shared with HBC.
+        \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"quantization_bits":2}}
+        ,
+        // quantization_refine is HBC-only.
+        \\{"external":true,"dimension":4,"algorithm":"leann","quantization_refine":"all"}
+        ,
+        \\{"external":true,"dimension":4,"algorithm":"leann","leann":{"vector_storage":"transient"}}
+        ,
+        \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"quantizer":"pq","vector_storage":"transient"}}
+        ,
+        \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"sometimes"}}
+        ,
+    }) |bad| {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, bad, .{});
+        defer p.deinit();
+        // Unknown enum values fail typed parsing (InvalidEnumTag) before the
+        // LEANN checks run; either rejection is fine.
+        if (translateEmbeddingsIndexConfigJsonWithOptions(alloc, "docs", p.value, .{})) |translated| {
+            alloc.free(translated);
+            return error.TestExpectedError;
+        } else |_| {}
+    }
+}
+
+/// Copies the public dense `quantization_bits` (1..8) and
+/// `quantization_refine` into the internal HBC config, validating them.
+fn appendDenseQuantizationIfPresent(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    root: std.json.ObjectMap,
+    dims: anytype,
+) !void {
+    if (root.get("quantization_bits")) |value| {
+        if (value != .integer or value.integer < 1 or value.integer > 8) return error.InvalidCreateTableRequest;
+        // Extended codes need at least two dimensions.
+        if (value.integer > 1 and dims < 2) return error.InvalidCreateTableRequest;
+        const encoded = try std.fmt.allocPrint(alloc, ",\"quantization_bits\":{d}", .{value.integer});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+    if (root.get("quantization_refine")) |value| {
+        if (value != .string or std.meta.stringToEnum(indexes_openapi.QuantizationRefine, value.string) == null)
+            return error.InvalidCreateTableRequest;
+        try out.appendSlice(alloc, ",\"quantization_refine\":");
+        try appendJsonString(alloc, out, value.string);
+    }
 }
 
 fn normalizeAntflyChunkerDefaultModelJson(
@@ -10440,25 +10658,28 @@ test "managed embedder dimension probe backoff wait is cancellable" {
     defer parsed.deinit();
 
     var cancelled = std.atomic.Value(bool).init(false);
+    var cancelled_at_ns = std.atomic.Value(u64).init(0);
     const Canceller = struct {
-        fn run(flag: *std.atomic.Value(bool)) void {
+        fn run(flag: *std.atomic.Value(bool), at: *std.atomic.Value(u64)) void {
             platform_time.sleepNs(30 * std.time.ns_per_ms);
+            at.store(monotonicNowNs(), .release);
             flag.store(true, .release);
         }
     };
-    const canceller = try std.Thread.spawn(.{}, Canceller.run, .{&cancelled});
+    const canceller = try std.Thread.spawn(.{}, Canceller.run, .{ &cancelled, &cancelled_at_ns });
     defer canceller.join();
 
-    const started_ns = monotonicNowNs();
     try std.testing.expectError(error.Cancelled, normalizeEmbeddingsIndexDimensionJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{
         .antfly_provider = .{ .ptr = &local, .embed_dense_texts = FlakyLocalAntflyEmbedder.dense, .embed_sparse_texts = FlakyLocalAntflyEmbedder.sparse, .owns_invocation_admission = true },
         .probe_retry_budget_ns = 10 * std.time.ns_per_s,
         .cancellation = CancellationToken.fromAtomic(&cancelled),
     }));
-    // Comfortably above the 30ms cancellation delay plus one 25ms poll
-    // step, comfortably below the 500ms first backoff this would otherwise
-    // have slept through.
-    try std.testing.expect(monotonicNowNs() - started_ns < 200 * std.time.ns_per_ms);
+    // An unconditional sleep cannot end early, so it would hold the probe
+    // for the rest of the 500ms first backoff after cancellation. Measure
+    // from the cancellation itself: sleeps can overrun badly under load
+    // (macOS turns a 25ms poll into ~80ms), so a bound from the start of
+    // the probe would test sleep accuracy rather than cancellation.
+    try std.testing.expect(monotonicNowNs() - cancelled_at_ns.load(.acquire) < repair_failure.repairTransientBackoffNs(1));
 }
 
 test "managed embedder dimension probe spends slow provider attempts against the same deadline" {
@@ -11774,6 +11995,44 @@ test "managed embedder cold activation precedes default probe and query inferenc
         }
         if (!case.bounded) try std.testing.expectEqual(@as(u32, 1), service.activations.load(.monotonic));
         try std.testing.expectEqual(@as(u32, if (case.bounded) 0 else 1), service.embeddings.load(.monotonic));
+    }
+}
+
+test "managed embedder forwards dense quantization settings" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","dimension":8,"external":true,"quantization_bits":4,"quantization_refine":"all"}
+    , .{});
+    defer parsed.deinit();
+    const config_json = try translateEmbeddingsIndexConfigJson(alloc, "dense_q", parsed.value);
+    defer alloc.free(config_json);
+    try ant_json.testing.expectSubsetJsonText(alloc,
+        \\{"quantization_bits":4,"quantization_refine":"all"}
+    , config_json);
+
+    // One-bit codes still work at one dimension.
+    var one_dim = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"embeddings","dimension":1,"external":true,"quantization_bits":1}
+    , .{});
+    defer one_dim.deinit();
+    const one_dim_json = try translateEmbeddingsIndexConfigJson(alloc, "dense_q", one_dim.value);
+    alloc.free(one_dim_json);
+
+    for ([_][]const u8{
+        \\{"type":"embeddings","dimension":8,"external":true,"quantization_bits":9}
+        ,
+        \\{"type":"embeddings","dimension":8,"external":true,"quantization_refine":"some"}
+        ,
+        // Extended codes need at least two dimensions.
+        \\{"type":"embeddings","dimension":1,"external":true,"quantization_bits":4}
+    }) |raw| {
+        var bad = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer bad.deinit();
+        // Rejected either here or by the generated config parser.
+        if (translateEmbeddingsIndexConfigJson(alloc, "dense_q", bad.value)) |unexpected| {
+            alloc.free(unexpected);
+            return error.TestUnexpectedResult;
+        } else |_| {}
     }
 }
 

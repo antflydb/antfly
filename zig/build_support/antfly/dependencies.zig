@@ -1387,6 +1387,10 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     sql_test_mod.addImport("antfly_sql_regex", sql_regex_mod);
     sql_test_mod.addImport("antfly_hash", hash_mod);
     sql_test_mod.addImport("bloom", bloom_mod);
+    // The SQL memory budget borrows the storage resource manager's host
+    // admission, which imports the shared cache budget.
+    sql_test_mod.addImport("antfly_cache_budget", cache_budget_mod);
+    pgwire_test_mod.addImport("antfly_cache_budget", cache_budget_mod);
     sql_test_mod.link_libc = link_libc;
     const refinement_bench_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/sql_refinement_bench_root.zig"),

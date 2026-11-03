@@ -982,6 +982,19 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const recall_harness_step = b.step("recall-harness", "Build and install recall_harness");
     recall_harness_step.dependOn(&b.addInstallArtifact(recall_harness, .{}).step);
 
+    const hbc_nyt_recall_mod = b.createModule(.{
+        .root_source_file = b.path("bench/vectors/hbc_nyt_recall.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hbc_nyt_recall_mod.addImport("antfly-zig", antfly_mod);
+    const hbc_nyt_recall = b.addExecutable(.{
+        .name = "hbc_nyt_recall",
+        .root_module = hbc_nyt_recall_mod,
+    });
+    const hbc_nyt_recall_step = b.step("hbc-nyt-recall", "Build and install hbc_nyt_recall (HBC recall vs candidate heap size)");
+    hbc_nyt_recall_step.dependOn(&b.addInstallArtifact(hbc_nyt_recall, .{}).step);
+
     // Allow full CI to compile this ReleaseFast executable alongside the
     // release-scale regressions, then reuse the cached artifact for the recall
     // phase instead of paying its compile cost on the recall critical path.

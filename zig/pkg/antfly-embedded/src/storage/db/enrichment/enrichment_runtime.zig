@@ -1751,6 +1751,71 @@ pub fn embedDenseBatchTracked(
     return vectors;
 }
 
+/// Re-embeds documents for a LEANN index that stores only elided stubs
+/// (`vector_storage: transient`). Each request's input is rendered exactly
+/// as the dense producer renders it: a template whose embedder accepts
+/// content parts (text plus media) is embedded from its parts one document
+/// at a time, and plain source text is embedded in one batch call. Both run
+/// on the request path (no background retry). Fills `out[i * dims ..]` and
+/// sets `found[i]`; documents that are gone or have no source stay not
+/// found.
+pub fn reembedDenseDocuments(
+    runtime: *EnrichmentRuntime,
+    alloc: Allocator,
+    requests: []const enrichment_types.GeneratedEnrichmentRequest,
+    dims: u32,
+    out: []f32,
+    found: []bool,
+) !void {
+    if (requests.len == 0) return;
+    if (out.len != requests.len * @as(usize, dims) or found.len != requests.len) return error.InvalidArgument;
+    const dense_embedder = runtime.config.dense_embedder orelse return error.ReembedUnavailable;
+    const index_names = [_][]const u8{requests[0].index_name};
+    var texts: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (texts.items) |text| runtime.alloc.free(@constCast(text));
+        texts.deinit(alloc);
+    }
+    var slots: std.ArrayList(usize) = .empty;
+    defer slots.deinit(alloc);
+    for (requests, 0..) |request, i| {
+        const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+        defer runtime.alloc.free(doc_store_key);
+        // Page-image inputs embed rendered pages, not the document source;
+        // such indexes must keep their vectors.
+        if (request.embedding_input == .pdf_page_images) return error.ReembedUnsupportedInput;
+        const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse continue;
+        defer runtime.alloc.free(raw);
+        if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
+            // Same branch as the producer: a template may render media
+            // parts, which the text path would drop.
+            const name = requestEmbeddingName(request);
+            const parts = (try renderSourceParts(runtime.alloc, runtime.config, raw, request, dense_embedder.mediaPartLimit(name))) orelse continue;
+            defer template.freeContentParts(runtime.alloc, parts);
+            const vector = try embedDensePartsTracked(runtime, &index_names, alloc, dense_embedder, name, parts, dims);
+            defer alloc.free(vector);
+            if (vector.len != dims) return error.InvalidVectorDimensions;
+            @memcpy(out[i * dims ..][0..dims], vector);
+            found[i] = true;
+            continue;
+        }
+        const text = (try extractSourceText(runtime.alloc, runtime.config, raw, request)) orelse continue;
+        texts.append(alloc, text) catch |err| {
+            runtime.alloc.free(@constCast(text));
+            return err;
+        };
+        try slots.append(alloc, i);
+    }
+    if (texts.items.len == 0) return;
+    const vectors = try embedDenseBatchTracked(runtime, &index_names, alloc, dense_embedder, requestEmbeddingName(requests[0]), texts.items, dims);
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+    for (slots.items, vectors) |slot, vector| {
+        if (vector.len != dims) return error.InvalidVectorDimensions;
+        @memcpy(out[slot * dims ..][0..dims], vector);
+        found[slot] = true;
+    }
+}
+
 pub fn embedDensePartsTracked(
     runtime: *EnrichmentRuntime,
     index_names: []const []const u8,

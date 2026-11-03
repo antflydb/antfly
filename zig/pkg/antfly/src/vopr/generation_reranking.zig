@@ -210,7 +210,10 @@ pub const Scenario = struct {
             self.attempts += 1;
             const primary = std.mem.eql(u8, model, "primary");
             switch (self.mode.?) {
-                .generation_retry => if (self.attempts == 1) return error.Timeout,
+                // `on_error` links retry only failures that are safe to
+                // repeat (rate limits, unavailable upstreams). A timeout may
+                // have run upstream, so it retries only under `on_timeout`.
+                .generation_retry => if (self.attempts == 1) return error.ServiceUnavailable,
                 .generation_timeout_fallback => if (primary) return error.Timeout,
                 .generation_rate_limit_fallback => if (primary) return error.RateLimit,
                 .generation_cancel => return error.Canceled,

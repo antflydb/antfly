@@ -137,10 +137,20 @@ pub fn checkAdmissionDispatch(context: RequestContext) !void {
 /// full backoff elapses. Returns the request's own cancellation/timeout
 /// error, never a provider error, if either fires during the wait.
 pub fn admissionRetryWaitNs(context: RequestContext, delay_ns: u64) !void {
-    var remaining_ns = delay_ns;
-    while (remaining_ns > 0) {
+    // Count elapsed time on the Io's own clock, so simulated Ios stay
+    // deterministic and real sleeps that overrun (macOS timer coalescing
+    // turns a 25ms poll into ~80ms) do not stretch the backoff past its
+    // delay and the deadline it was sized for. Sleeps never return early on
+    // a real clock, so the requested total only matters for an Io without
+    // one (its clock never advances), where it keeps the wait finite.
+    const started = std.Io.Clock.awake.now(context.io);
+    var requested_ns: u64 = 0;
+    while (true) {
         try checkAdmissionDispatch(context);
-        var step_ns = @min(remaining_ns, admission_retry_poll_ns);
+        const clock_elapsed = started.durationTo(std.Io.Clock.awake.now(context.io)).nanoseconds;
+        const elapsed_ns = @max(requested_ns, std.math.cast(u64, @max(clock_elapsed, 0)) orelse std.math.maxInt(u64));
+        if (elapsed_ns >= delay_ns) break;
+        var step_ns = @min(delay_ns - elapsed_ns, admission_retry_poll_ns);
         if (context.deadline_ns) |deadline| {
             step_ns = @min(step_ns, @max(deadline -| platform_time.monotonicNs(), 1));
         }
@@ -149,9 +159,8 @@ pub fn admissionRetryWaitNs(context: RequestContext, delay_ns: u64) !void {
         // bare wake here just shortens this step, and the loop re-checks
         // the request's context before sleeping again.
         context.io.sleep(std.Io.Duration.fromNanoseconds(@intCast(step_ns)), .awake) catch {};
-        remaining_ns -= step_ns;
+        requested_ns +|= step_ns;
     }
-    try checkAdmissionDispatch(context);
 }
 
 /// Decides whether an admission-refusal failure should be retried again.
@@ -355,6 +364,35 @@ test "a budget that can never fit is permanent and names the flag" {
     try std.testing.expect(!isTransientName("MemoryBudgetExceeded"));
     try std.testing.expect(std.mem.indexOf(u8, hint("MemoryBudgetExceeded"), "--inference-scratch-budget-mb") != null);
     try std.testing.expect(isTransientName("ResourceTemporarilyUnavailable"));
+}
+
+test "admission retry wait counts overrunning sleeps against its delay" {
+    // An Io whose sleeps overrun 4x, like a coalesced timer. Summing the
+    // requested steps would wait about 4x the delay; the wait must end
+    // within one overrun poll step of it.
+    const Overrun = struct {
+        var clock_ns: i96 = 0;
+
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = clock_ns };
+        }
+
+        fn sleep(_: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            clock_ns += 4 * timeout.duration.raw.nanoseconds;
+        }
+    };
+    var vtable = std.Io.failing.vtable.*;
+    vtable.now = Overrun.now;
+    vtable.sleep = Overrun.sleep;
+    const io: std.Io = .{ .userdata = null, .vtable = &vtable };
+
+    const delay_ns = 500 * std.time.ns_per_ms;
+    try admissionRetryWaitNs(.{ .io = io, .deadline_ns = null }, delay_ns);
+    try std.testing.expect(Overrun.clock_ns >= delay_ns);
+    try std.testing.expect(Overrun.clock_ns < delay_ns + 4 * admission_retry_poll_ns);
+
+    // An Io without a clock still finishes, by the requested sleep total.
+    try admissionRetryWaitNs(.{ .io = std.Io.failing, .deadline_ns = null }, delay_ns);
 }
 
 test "admission refusals are the transient failures that never ran" {

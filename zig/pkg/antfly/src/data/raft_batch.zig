@@ -588,6 +588,7 @@ fn consumerTests() type {
             try std.testing.expectEqualSlices(u8, next, decoded.batch.req.merge_artifacts[0].value);
             try std.testing.expectEqualSlices(u8, key, decoded.batch.req.merge_artifacts[0].key);
             try db_mod.types.validateGraphEndpointCleanupCommand(decoded.batch.req);
+            try db_mod.types.validateLeannRecordCommand(decoded.batch.req);
         }
     };
     return Suite;
