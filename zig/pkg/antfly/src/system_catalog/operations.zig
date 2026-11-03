@@ -243,6 +243,38 @@ pub fn mutateSqlRoutine(svc: anytype, alloc: std.mem.Allocator, context: operati
     return outcome;
 }
 
+pub fn mutateSqlLocks(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("lock_authority.zig").Request) ![]u8 {
+    const types = @import("lock_authority.zig");
+    if (!context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    if (request.standalone) return error.InvalidCatalogMutation;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, types.decoder_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const previous = try store.sqlLockOutcome(alloc, svc.metadata_group_id, request);
+    defer alloc.free(previous);
+    if (!std.mem.eql(u8, previous, "null")) return alloc.dupe(u8, previous);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > types.max_bytes) return error.CatalogCommandTooLarge;
+    svc.lockCatalogMutation();
+    var locked = true;
+    defer if (locked) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_sql_lock_scope = bytes });
+    svc.unlockCatalogMutation();
+    locked = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const outcome = store.sqlLockOutcome(alloc, svc.metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown;
+    if (std.mem.eql(u8, outcome, "null")) {
+        alloc.free(outcome);
+        return error.MetadataMutationOutcomeUnknown;
+    }
+    return outcome;
+}
+
 pub fn mutateSqlPrepared(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("prepared_transactions.zig").Mutation) ![]u8 {
     const types = @import("prepared_transactions.zig");
     if (!context.setting_admin) return error.Forbidden;
@@ -250,7 +282,7 @@ pub fn mutateSqlPrepared(svc: anytype, alloc: std.mem.Allocator, context: operat
     try request.validate();
     if (request.standalone) return error.InvalidCatalogMutation;
     try @import("../metadata/service.zig").ensureSqlPreparedCapabilityWithContext(svc, context);
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_connection_transactions_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_lock_authority_version);
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const previous = try store.sqlPreparedOutcome(alloc, svc.metadata_group_id, request);
@@ -2624,6 +2656,23 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
         },
         .sql_view_mutate => |request| mutateSqlView(svc, alloc, context, request),
+        .sql_lock_mutate => |request| mutateSqlLocks(svc, alloc, context, request),
+        .sql_lock_read => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, @import("lock_authority.zig").decoder_version);
+            try svc.ensureLinearizableReadWithContext(context);
+            try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlLockRead(alloc, svc.metadata_group_id, request, context);
+        },
+        .sql_lock_outcome => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlLockOutcome(alloc, svc.metadata_group_id, request);
+        },
         .sql_prepared_mutate => |request| mutateSqlPrepared(svc, alloc, context, request),
         .sql_prepared_read => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;

@@ -3823,6 +3823,34 @@ const LocalStandaloneMetadata = struct {
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
                 return store.sqlTypeBindings(alloc, group_ids.main_metadata_group_id, request, context);
             },
+            .sql_lock_read => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlLockRead(alloc, group_ids.main_metadata_group_id, request, context);
+            },
+            .sql_lock_outcome => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlLockOutcome(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .sql_lock_mutate => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                try context.ensureActive();
+                try request.validate();
+                if (!request.standalone) return error.InvalidCatalogMutation;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
+                const prior = try store.sqlLockOutcome(alloc, group_ids.main_metadata_group_id, request);
+                defer alloc.free(prior);
+                if (!std.mem.eql(u8, prior, "null")) return alloc.dupe(u8, prior);
+                const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+                defer alloc.free(bytes);
+                if (bytes.len > @import("../system_catalog/lock_authority.zig").max_bytes) return error.CatalogCommandTooLarge;
+                try context.ensureActive();
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_sql_lock_scope = bytes }) catch return error.MetadataMutationOutcomeUnknown;
+                self.refreshLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                return store.sqlLockOutcome(alloc, group_ids.main_metadata_group_id, request) catch error.MetadataMutationOutcomeUnknown;
+            },
             .sql_prepared_read => |request| {
                 if (!context.setting_admin) return error.Forbidden;
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
@@ -18821,6 +18849,48 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
     const alloc = std.testing.allocator;
     const SQLResponse = @import("antfly_metadata_openapi").types.SQLResponse;
     const Helper = struct {
+        const scope_types = @import("../system_catalog/lock_authority.zig");
+        fn scopeRead(a: std.mem.Allocator, api: *antfly.public_api.ApiHttpServer, backend: ?scope_types.locks.Backend) !scope_types.Snapshot {
+            const query: scope_types.Query = .{ .incarnation = if (backend) |value| value.incarnation else @splat(0), .standalone = true, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database = 1, .backend = backend, .work = if (backend == null) .{ .observed_at_ms = 0 } else null };
+            const bytes = try api.source.systemCatalog(a, .{ .setting_admin = true }, .{ .sql_lock_read = query });
+            return std.json.parseFromSliceLeaky(scope_types.Snapshot, a, bytes, .{});
+        }
+        fn scopeMutate(a: std.mem.Allocator, api: *antfly.public_api.ApiHttpServer, backend: scope_types.locks.Backend, serial: u8, operation: @FieldType(scope_types.Request, "operation")) !void {
+            const cut = try scopeRead(a, api, null);
+            const request: scope_types.Request = .{ .admission = .{ .nonce = @splat(serial), .head = cut.head }, .incarnation = cut.incarnation, .standalone = true, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database = 1, .backend = backend, .operation = operation };
+            const bytes = try api.source.systemCatalog(a, .{ .setting_admin = true }, .{ .sql_lock_mutate = request });
+            _ = try (try std.json.parseFromSliceLeaky(scope_types.outcomes.Outcome, a, bytes, .{})).result();
+        }
+        fn setupScope(backing: std.mem.Allocator, api: *antfly.public_api.ApiHttpServer) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const cut = try scopeRead(a, api, null);
+            const backend: scope_types.locks.Backend = .{ .incarnation = cut.incarnation, .id = @splat(0xec), .fence = 1 };
+            const registration: scope_types.scopes.Registration = .{ .lease = .{ .backend = backend, .database = 1, .node = 0, .principal = try scope_types.principalDigest(a, .bootstrap), .expires_at_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60000 }, .connection = @splat('e'), .nonce = @splat(22), .standalone = true };
+            const scope_frame: scope_types.scopes.Command = .{ .sequence = 1, .nonce = @splat(23), .executor = @splat(24) };
+            try scopeMutate(a, api, backend, 81, .{ .register = registration });
+            try scopeMutate(a, api, backend, 82, .{ .begin = scope_frame });
+            try scopeMutate(a, api, backend, 83, .{ .effect = .{ .command = scope_frame, .effect = .{ .backend = backend, .sequence = 1, .nonce = @splat(25), .action = .{ .try_acquire = .{ .resource = @splat(26), .mode = .{ .advisory = .exclusive }, .scope = .session } } } } });
+            try scopeMutate(a, api, backend, 84, .{ .fence = .close });
+        }
+        fn finishScope(backing: std.mem.Allocator, api: *antfly.public_api.ApiHttpServer) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const cut = try scopeRead(a, api, null);
+            const backend: scope_types.locks.Backend = .{ .incarnation = cut.incarnation, .id = @splat(0xec), .fence = 1 };
+            var cursor: ?scope_types.scopes.Work = null;
+            for (0..8) |_| {
+                const current = try scopeRead(a, api, backend);
+                if (current.scope != null and current.scope.?.state == .retired) {
+                    try std.testing.expectEqual(@as(u32, 0), current.owner.?.resources);
+                    return;
+                }
+                _ = try @import("../api/sql_prepared_coordinator.zig").advanceLockWork(api, &cursor);
+            }
+            return error.TestUnexpectedResult;
+        }
         fn sql(a: std.mem.Allocator, server: *antfly.public_api.ApiHttpServer, session: ?[]const u8, statement: []const u8) !std.json.Parsed(SQLResponse) {
             const body = try std.json.Stringify.valueAlloc(a, .{ .statement = statement, .session_id = session }, .{});
             defer a.free(body);
@@ -18891,11 +18961,17 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
             // Physical participants retain private rows; ordinary MVCC readers
             // see the preceding committed image throughout the prepared interval.
             try Helper.rows(alloc, api, &.{});
+            const reloads = metadata.lifecycle_projection_reloads;
+            try Helper.setupScope(alloc, api);
+            try std.testing.expectEqual(reloads, metadata.lifecycle_projection_reloads);
         } else if (phase == 1) {
             try Helper.rows(alloc, api, &.{});
             try Helper.command(alloc, api, null, "COMMIT PREPARED 'local_commit'", "COMMIT PREPARED");
             try Helper.command(alloc, api, null, "ROLLBACK PREPARED 'local_abort'", "ROLLBACK PREPARED");
             try Helper.rows(alloc, api, &.{"commit"});
+            const reloads = metadata.lifecycle_projection_reloads;
+            try Helper.finishScope(alloc, api);
+            try std.testing.expectEqual(reloads, metadata.lifecycle_projection_reloads);
         } else {
             try Helper.rows(alloc, api, &.{"commit"});
             // A retired GID can be reused without adopting the old admission.

@@ -236,3 +236,88 @@ old decision. This test runs in the existing native control-source cohort.
 These recovery foundations do not close any SQL lock inventory cases or enable
 public advisory functions. Connection scopes and ordered effect integration
 remain the next activation boundary.
+
+## Native command scopes and decision-gated cleanup
+
+`storage/pessimistic_lock_authority.zig` now owns the durable execution scope
+around the shared journal. Registration binds backend identity and fence,
+connection ID, database, principal, deployment realm and lease. A retained
+connection binding prevents an old registration from adopting a replacement
+backend. The active scope quota is 4,096. Command sequences and immutable
+execution nonces distinguish an active retry from a completed command; completed
+commands cannot execute effects again. This is native authority machinery, not
+yet public advisory-function activation.
+
+The journal has explicit data and metadata homes. Metadata scopes, their work
+index, connection bindings and grants all remain inside the accepting metadata
+writer's permitted namespace. Four snapshot projections retain these families.
+The metadata command rollback journal restores the complete touched-key set
+before recording a semantic rejection; allocation or I/O errors still require
+aborting the enclosing transaction. Ordinary data-home journal keys remain
+separate.
+
+The metadata adapter uses the existing catalog outcome journal and external
+transaction registry. It checks realm, catalog incarnation and decoder 137 in
+the native receiver, including late proposals. A connection with an attached
+scope cannot admit a private commit without the current command and bound
+transaction. The external admission and scope seal commit atomically. Named
+and private identities and final receipts retain an optional immutable scope
+reference; absent references retain their existing encoding.
+
+Expiry fences the command before it can release any lock. The scope receiver's
+accepting-writer guard rejects a fenced command even after a full restart.
+Renewal changes neither backend identity nor queued effect identity and cannot
+revive a fenced scope. Try results, acquisition, observation, cancellation,
+unlock-all, rollback and savepoint controls reuse the exact-effect journal.
+Internal metadata transport and standalone dispatch carry these operations
+through the existing native storage boundary. Read control carries cancellation
+and execution deadlines.
+
+Transaction cleanup independently joins the exact existing external decision.
+Only complete native resolution, or a fenced unsealed transaction that could
+never admit participants, permits retirement. Cleanup follows the transaction
+membership index one resource at a time; it preserves independent session
+references, including mixed session/transaction holdings on one resource.
+Pending release has an immediate work entry, independent of the idle lease
+expiry. The completed command serial is a durable witness that remains useful
+when later transactions replace the recent release marker.
+
+The existing prepared-transaction recovery path advances one cleanup quantum
+before handoff or delivery ACK. Native handoff and ACK admission reject pending
+lock cleanup. The final decision receipt cannot be deleted until the matching
+scope has durably adopted resolution. Scope adoption and receipt deletion share
+the same writer transaction. Local receipt adoption checks the exact scope
+reference as well as the existing owner, purpose, version and sync contract.
+
+The same leader-fenced maintenance owner advances expiry and closed-scope work
+with a keyset cursor. An unresolved decision does not prevent visiting later
+owners. Pending lock work uses bounded continuations without increasing the
+existing two-phase-commit recovery cadence: each slice has a 16-quantum and
+cooperative 20 ms budget, checked between operations. Each individual operation
+also retains its I/O deadline. Empty work returns to the idle schedule. Foreground
+wakeups that arrive during a slice are preserved. Scope and prepared-registry
+commands advance standalone durability without invalidating unchanged table
+projections.
+
+Public activation still requires the durable local connection producer and
+registration adoption, private commit selection for every scoped write, native
+command guards for metadata side effects such as sequences and DDL, pgwire and
+HTTP connection lifecycle integration, and ordered SQL effects with correct
+strict-NULL and void OID 2278 behavior. Prepared-owner handoff and distributed
+row/table participant enrollment remain separate required integrations. Retired
+scope and journal reclamation still requires an authoritative admission and
+connection-retirement floor; this implementation retains those fences rather
+than guessing when deleting them is safe. No explicit-lock original is credited
+from these foundations alone.
+
+The combined Debug qualification passes all 132 build steps: eight concrete
+LSM/WAL campaigns; 14 prepared-registry tests and one metadata declaration check;
+30 catalog/projection tests; 148 transaction contracts; three public SQL/pgwire
+recovery tests; and the public standalone cold-recovery campaign, which also
+exercises routed scope cleanup and asserts zero catalog-projection reloads.
+Native release tests abort every staged-write boundary, reopen between successful
+quanta, preserve session references after transaction cleanup, and reject obsolete
+command execution. The existing 22 contract/journal tests also pass. Independent
+PostgreSQL 18 oracles pass 130 conflict/lifetime and 31 wait/cancellation checks.
+These results qualify the backend and recovery boundary. Inventory remains 912
+implemented, 138 rejected, 449 superseded and 87 unresolved originals.

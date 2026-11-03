@@ -13375,6 +13375,7 @@ pub const TransitionCommand = union(enum) {
     /// Versioned system catalog request, applied atomically with any table topology.
     activate_topology_protocol: []const u8,
     apply_sql_prepared_transaction: []const u8,
+    apply_sql_lock_scope: []const u8,
     apply_system_catalog: []const u8,
     apply_sql_settings: []const u8,
     apply_sql_policies: []const u8,
@@ -13539,7 +13540,7 @@ pub const TransitionCommand = union(enum) {
             .apply_schema_validation => |bytes| alloc.free(bytes),
             .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
-            .apply_table_retirement, .apply_sql_prepared_transaction, .apply_resolver_authority, .apply_sql_sequence_counter, .complete_relational_index_source, .accept_relational_index_delivery, .ack_relational_index_publication, .begin_relational_index_publication, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
+            .apply_table_retirement, .apply_sql_lock_scope, .apply_sql_prepared_transaction, .apply_resolver_authority, .apply_sql_sequence_counter, .complete_relational_index_source, .accept_relational_index_delivery, .ack_relational_index_publication, .begin_relational_index_publication, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -19324,7 +19325,7 @@ pub const RaftApplyStore = struct {
         try advanceStandaloneRevisionWithProjection(&txn, switch (command) {
             .ack_relational_index_publication => index_ack_source_before.? != try relation_reconciliation.readSourceRevision(&txn, group_id),
             .apply_schema_validation, .apply_table_retirement, .apply_store_report_update => outcomeChangesCatalog(outcome.projection_signals.items),
-            .apply_sql_sequence_counter, .complete_relational_index_source, .accept_relational_index_delivery, .apply_store_root_enrollment => false,
+            .apply_sql_prepared_transaction, .apply_sql_lock_scope, .apply_sql_sequence_counter, .complete_relational_index_source, .accept_relational_index_delivery, .apply_store_root_enrollment => false,
             else => true,
         });
         try self.stageStandaloneHotStandby(&txn, &capture, group_id);
@@ -30607,6 +30608,10 @@ pub const RaftApplyStore = struct {
         sql_object_annotations,
         sql_sequence_counters,
         sql_prepared_transactions,
+        sql_lock_scopes,
+        sql_lock_work,
+        sql_lock_connections,
+        sql_lock_ledger,
         schema_validation,
         schema_validation_dependency,
     };
@@ -30619,6 +30624,10 @@ pub const RaftApplyStore = struct {
         key: MetadataSnapshotKey,
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .sql_lock_scopes, .key = .{ .prefix = SqlLocks.scopePrefixForGroup } },
+        .{ .projection = .sql_lock_work, .key = .{ .prefix = SqlLocks.workPrefixForGroup } },
+        .{ .projection = .sql_lock_connections, .key = .{ .prefix = SqlLocks.connectionPrefixForGroup } },
+        .{ .projection = .sql_lock_ledger, .key = .{ .prefix = SqlLocks.ledgerPrefixForGroup } },
         .{ .projection = .sql_prepared_transactions, .key = .{ .prefix = @import("../../system_catalog/prepared_transactions.zig").prefixForGroup } },
         .{ .projection = .schema_validation, .key = .{ .prefix = schema_validation.prefix } },
         .{ .projection = .schema_validation_dependency, .key = .{ .prefix = @import("../schema_validation_dependencies.zig").prefixForGroup } },
@@ -30737,7 +30746,8 @@ pub const RaftApplyStore = struct {
             .ack_initial_fk_retirement => metadataSnapshotProjectionBit(.fk_initial_replica) | metadataSnapshotProjectionBit(.fk_initial_retire),
             .activate_topology_protocol => metadataSnapshotProjectionBit(.topology_activation),
             .apply_store_report_baseline => metadataSnapshotProjectionBit(.store) | metadataSnapshotProjectionBit(.store_report_cursor) | metadataSnapshotProjectionBit(.store_report_baseline) | metadataSnapshotProjectionBit(.store_report_generation),
-            .apply_sql_prepared_transaction => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.sql_prepared_transactions),
+            .apply_sql_lock_scope => metadataSnapshotProjectionBit(.system_catalog) | (metadataSnapshotProjectionBit(.sql_lock_scopes) | metadataSnapshotProjectionBit(.sql_lock_work) | metadataSnapshotProjectionBit(.sql_lock_connections) | metadataSnapshotProjectionBit(.sql_lock_ledger)),
+            .apply_sql_prepared_transaction => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.sql_prepared_transactions) | (metadataSnapshotProjectionBit(.sql_lock_scopes) | metadataSnapshotProjectionBit(.sql_lock_work) | metadataSnapshotProjectionBit(.sql_lock_connections) | metadataSnapshotProjectionBit(.sql_lock_ledger)),
             .apply_system_catalog => metadataSnapshotProjectionBit(.system_catalog) |
                 metadataSnapshotProjectionBit(.sql_sequence_counters) |
                 metadataSnapshotProjectionBit(.sql_column_identities) | metadataSnapshotProjectionBit(.sql_object_identities) | metadataSnapshotProjectionBit(.sql_object_annotations) |
@@ -33701,6 +33711,7 @@ pub const RaftApplyStore = struct {
                 try txn.put(try topologyActivationKeyForGroup(&key_buf, group_id), bytes);
             },
             .apply_relation_reconciliation => |bytes| try self.applyRelationControlTxn(txn, group_id, bytes),
+            .apply_sql_lock_scope => |bytes| try self.applySqlLockScopeTxn(txn, group_id, bytes),
             .apply_sql_prepared_transaction => |bytes| try self.applySqlPreparedTransactionTxn(txn, group_id, bytes),
             .apply_system_catalog => |bytes| try self.applySystemCatalogTxn(txn, group_id, bytes),
             .apply_sql_sequence_counter => |bytes| try self.applySqlSequenceCounterTxn(txn, group_id, bytes),
@@ -40278,6 +40289,98 @@ pub const RaftApplyStore = struct {
         }
     }
 
+    const SqlLocks = @import("../../system_catalog/lock_authority.zig");
+    fn validateSqlLockEnvelopeTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, request: SqlLocks.Request) !void {
+        try request.validate();
+        if (!std.mem.eql(u8, &try catalogIncarnationTxn(txn, group), &request.incarnation)) return error.CatalogGenerationChanged;
+        const standalone = group == group_ids.main_metadata_group_id and try stagingGet(txn, standalone_catalog_key) != null;
+        if (request.standalone != standalone) return error.CatalogGenerationChanged;
+        _ = try self.standbyRelationActivationTxn(txn, group, SqlLocks.decoder_version);
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = try system_catalog_storage.readMeta(a, txn, group) };
+        if (try view.byId(.database, request.database) == null) return error.DatabaseNotFound;
+    }
+    pub fn sqlLockOutcome(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: SqlLocks.Request) ![]u8 {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        try self.validateSqlLockEnvelopeTxn(&txn, group, request);
+        const journal: SqlLocks.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = request.incarnation };
+        return std.json.Stringify.valueAlloc(alloc, try journal.lookup(scratch.allocator(), request.admission, try SqlLocks.commandDigest(scratch.allocator(), request)), .{});
+    }
+    pub fn sqlLockRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, query: SqlLocks.Query, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        try context.ensureActive();
+        try query.validate();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        const incarnation = try catalogIncarnationTxn(&txn, group);
+        if (!std.mem.allEqual(u8, &query.incarnation, 0) and !std.mem.eql(u8, &incarnation, &query.incarnation)) return error.CatalogGenerationChanged;
+        const standalone = group == group_ids.main_metadata_group_id and try stagingGet(&txn, standalone_catalog_key) != null;
+        if (query.standalone != standalone) return error.CatalogGenerationChanged;
+        _ = try self.standbyRelationActivationTxn(&txn, group, SqlLocks.decoder_version);
+        const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = incarnation };
+        const item: ?SqlLocks.scopes.WorkItem = if (query.work) |work| blk: {
+            const after = if (work.after != null and std.mem.eql(u8, &work.after.?.backend.incarnation, &incarnation)) work.after else null;
+            const next = try SqlLocks.scopes.readWork(a, &txn, ns, work.observed_at_ms, after);
+            break :blk if (next == null and work.wrap and after != null) try SqlLocks.scopes.readWork(a, &txn, ns, work.observed_at_ms, null) else next;
+        } else null;
+        const work = if (item) |value| value.work else null;
+        const backend: ?SqlLocks.locks.Backend = if (query.backend) |id| id else if (work) |next| next.backend else null;
+        const scope = if (item) |value| value.scope else if (backend) |owner| try SqlLocks.scopes.read(a, &txn, ns, owner) else null;
+        if (scope) |value| if (query.backend != null) {
+            const authority: SqlLocks.Context = .{ .a = a, .actor = query.actor, .database = query.database, .standalone = query.standalone, .maintenance = query.actor.session_user.kind == .bootstrap };
+            try authority.requireRead(value);
+        };
+        const outcomes: SqlLocks.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
+        const owner = if (backend) |id| try SqlLocks.scopes.ledger.readOwner(a, &txn, ns, id) else null;
+        const receipt = if (query.effect != null and scope != null) try SqlLocks.scopes.ledger.observe(a, &txn, ns, query.effect.?, SqlLocks.Observer{ .registration = scope.?.registration }) else null;
+        try context.ensureActive();
+        return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .incarnation = incarnation, .standalone = standalone, .head = try outcomes.head(a), .scope = scope, .owner = owner, .next_work = work, .receipt = receipt }, .{});
+    }
+    fn applySqlLockScopeTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, bytes: []const u8) !void {
+        if (bytes.len > SqlLocks.max_bytes) return error.CatalogCommandTooLarge;
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const request = try std.json.parseFromSliceLeaky(SqlLocks.Request, a, bytes, .{});
+        self.validateSqlLockEnvelopeTxn(txn, group, request) catch |err| switch (err) {
+            error.CatalogGenerationChanged, error.TableTopologyProtocolUpgradeRequired => return,
+            else => return err,
+        };
+        const outcomes: SqlLocks.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = txn, .group = group, .incarnation = request.incarnation };
+        const hash = try SqlLocks.commandDigest(a, request);
+        const prepared = outcomes.prepare(a, request.admission, hash) catch |err| switch (err) {
+            error.SequenceAdmissionExpired, error.SequenceAdmissionConflict => return,
+            else => return err,
+        };
+        switch (prepared) {
+            .replay => return,
+            .append => |ordinal| {
+                // Scope/ledger operations require abort on ANY error. Roll back
+                // their entire touched-key set before retaining a rejection.
+                var journal = command_journal.Journal.init(self.alloc, txn);
+                defer journal.deinit();
+                try journal.attach();
+                SqlLocks.apply(a, txn, group, request) catch |err| {
+                    try journal.rollback();
+                    const mapped = SqlLocks.semanticError(err);
+                    const rejection = SqlLocks.outcomes.Outcome.fromError(mapped) orelse return mapped;
+                    try outcomes.append(a, ordinal, request.admission, hash, rejection);
+                    return;
+                };
+                try journal.accept();
+                const meta = try system_catalog_storage.readMeta(a, txn, group);
+                try outcomes.append(a, ordinal, request.admission, hash, .{ .success = .{ .revision = meta.revision, .identity = null, .removed = 0 } });
+            },
+        }
+    }
+
     const PreparedTransactions = @import("../../system_catalog/prepared_transactions.zig");
 
     fn validateSqlPreparedEnvelopeTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, request: PreparedTransactions.Mutation) !void {
@@ -40287,29 +40390,72 @@ pub const RaftApplyStore = struct {
         const standalone = group == group_ids.main_metadata_group_id and try stagingGet(txn, standalone_catalog_key) != null;
         if (request.standalone != standalone) return error.CatalogGenerationChanged;
         _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_prepared_transactions_version);
-        const connection_decoder = switch (request.operation) {
-            .admit => |admission| admission.identity.requiresConnectionDecoder(),
-            .cancel_admission => |cancel| cancel.original.identity.requiresConnectionDecoder(),
+        const minimum_decoder = switch (request.operation) {
+            .admit => |admission| admission.identity.minimumDecoderVersion(),
+            .cancel_admission => |cancel| cancel.original.identity.minimumDecoderVersion(),
             .advance => |change| blk: {
                 var scratch = std.heap.ArenaAllocator.init(self.alloc);
                 defer scratch.deinit();
-                const record = (try PreparedTransactions.readOperation(scratch.allocator(), txn, group, change.owner.operation_id)) orelse break :blk false;
-                break :blk record.identity.requiresConnectionDecoder();
+                const record = (try PreparedTransactions.readOperation(scratch.allocator(), txn, group, change.owner.operation_id)) orelse break :blk topology_protocol.sql_prepared_transactions_version;
+                break :blk record.identity.minimumDecoderVersion();
             },
             .acknowledge_receipt => |ack| blk: {
                 var scratch = std.heap.ArenaAllocator.init(self.alloc);
                 defer scratch.deinit();
-                const receipt = (try PreparedTransactions.readReceipt(scratch.allocator(), txn, group, ack.owner.operation_id)) orelse break :blk false;
-                break :blk receipt.kind == .session_commit or receipt.session.standalone;
+                const receipt = (try PreparedTransactions.readReceipt(scratch.allocator(), txn, group, ack.owner.operation_id)) orelse break :blk topology_protocol.sql_prepared_transactions_version;
+                break :blk if (receipt.lock_scope != null) topology_protocol.sql_lock_authority_version else if (receipt.kind == .session_commit or receipt.session.standalone) topology_protocol.sql_connection_transactions_version else topology_protocol.sql_prepared_transactions_version;
             },
         };
-        if (connection_decoder) _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_connection_transactions_version);
+        if (minimum_decoder > topology_protocol.sql_prepared_transactions_version) _ = try self.standbyRelationActivationTxn(txn, group, minimum_decoder);
     }
 
+    fn completeSqlLockReceiptTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: PreparedTransactions.Mutation, release: bool) !void {
+        _ = self;
+        if (request.operation != .acknowledge_receipt) return;
+        const ack = request.operation.acknowledge_receipt;
+        const receipt = try PreparedTransactions.readReceipt(a, txn, group, ack.owner.operation_id) orelse return;
+        if (!receipt.owner.eql(ack.owner) or !std.mem.eql(u8, &receipt.txn_id, &ack.txn_id)) return error.ExternalTransactionDecisionChanged;
+        const connection_id = receipt.session.connection_id orelse return;
+        const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
+        const scope = try SqlLocks.scopes.connection(a, txn, ns, receipt.session.owner_node_id, connection_id) orelse return;
+        if (receipt.lock_scope) |ref| {
+            if (!ref.backend.eql(scope.registration.lease.backend)) return error.InvalidCatalogRecord;
+            if (scope.next_command > ref.command.sequence) return;
+        }
+        const transaction = scope.transaction orelse return;
+        const decision = transaction.decision orelse return;
+        if (!std.mem.eql(u8, &decision.operation, &ack.owner.operation_id)) return;
+        const authority: SqlLocks.Context = .{ .a = a, .actor = request.actor, .database = scope.registration.lease.database, .standalone = request.standalone, .maintenance = true };
+        authority.requireResolution(txn, ns, scope, transaction) catch |err| return SqlLocks.semanticError(err);
+        const lock_owner = try SqlLocks.scopes.ledger.readOwner(a, txn, ns, scope.registration.lease.backend) orelse return error.InvalidCatalogRecord;
+        if (lock_owner.waiting != null or lock_owner.job != null or lock_owner.transaction != null) return error.CatalogPublicationProofPending;
+        if (release) _ = try SqlLocks.scopes.releaseTransaction(a, txn, ns, scope.registration.lease.backend, transaction, authority);
+    }
     fn planSqlPreparedTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: PreparedTransactions.Mutation) !PreparedTransactions.Plan {
         const meta = try system_catalog_storage.readMeta(a, txn, group);
         const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = meta };
+        if (request.operation == .acknowledge_receipt) try self.completeSqlLockReceiptTxn(a, txn, group, request, false);
+        if (request.operation == .advance and request.operation.advance.action == .handoff) {
+            if (try PreparedTransactions.readOperation(a, txn, group, request.operation.advance.owner.operation_id)) |record| if (record.identity.lock_scope) |ref| {
+                const scope = try SqlLocks.scopes.read(a, txn, .{ .home = .metadata, .group = group, .incarnation = request.incarnation }, ref.backend) orelse return error.InvalidCatalogRecord;
+                if (scope.transaction != null and scope.next_command <= ref.command.sequence) return error.CatalogPublicationProofPending;
+            };
+        }
         if (request.operation == .admit) {
+            const identity = request.operation.admit.identity;
+            if (identity.session) |session| if (session.connection_id) |connection_id| {
+                const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
+                if (try SqlLocks.scopes.connection(a, txn, ns, session.owner_node_id, connection_id)) |scope| {
+                    _ = try self.standbyRelationActivationTxn(txn, group, SqlLocks.decoder_version);
+                    const ref = identity.lock_scope orelse return error.CatalogGenerationChanged;
+                    if (!ref.backend.eql(scope.registration.lease.backend)) return error.CatalogGenerationChanged;
+                    const context: SqlLocks.Context = .{ .a = a, .actor = request.actor, .database = request.database_id, .standalone = request.standalone };
+                    const current = SqlLocks.scopes.guard(a, txn, ns, ref.backend, ref.command, context) catch |err| return SqlLocks.semanticError(err);
+                    if (current.transaction == null or !std.mem.eql(u8, &current.transaction.?.id, &identity.txn_id)) return error.CatalogGenerationChanged;
+                    const lock_owner = try SqlLocks.scopes.ledger.readOwner(a, txn, ns, ref.backend) orelse return error.InvalidCatalogRecord;
+                    if (lock_owner.waiting != null or lock_owner.job != null) return error.CatalogPublicationProofPending;
+                } else if (identity.lock_scope != null) return error.CatalogGenerationChanged;
+            };
             if (try view.byId(.database, request.database_id) == null) return error.DatabaseNotFound;
             if (request.actor.principal().kind == .role and try AuthorizationRows.roleByPrincipal(a, txn, group, request.actor.principal()) == null) return error.SqlRoleNotFound;
             var revision_buffer: [160]u8 = undefined;
@@ -40397,7 +40543,16 @@ pub const RaftApplyStore = struct {
                     try journal.append(a, ordinal, request.admission, hash, outcome);
                     return;
                 };
+                // Release the bound scope before deleting its final decision
+                // receipt, in the same native writer transaction as this ACK.
+                try self.completeSqlLockReceiptTxn(a, txn, group, request, true);
                 try planned.apply(txn);
+                if (request.operation == .admit) if (request.operation.admit.identity.lock_scope) |ref| {
+                    const identity = request.operation.admit.identity;
+                    const owner = try identity.owner(a);
+                    const context: SqlLocks.Context = .{ .a = a, .actor = request.actor, .database = request.database_id, .standalone = request.standalone };
+                    try SqlLocks.scopes.seal(a, txn, .{ .home = .metadata, .group = group, .incarnation = request.incarnation }, ref.backend, ref.command, .{ .operation = owner.operation_id, .admission = owner.admission_digest }, context);
+                };
                 try journal.append(a, ordinal, request.admission, hash, .{ .success = planned.result });
             },
         }
@@ -44737,6 +44892,7 @@ fn tableRetirementPayload(bytes: []const u8) !?[]const u8 {
 const TransitionTag = enum(u8) {
     apply_table_retirement = 93,
     comment_object = 92,
+    apply_sql_lock_scope = 94,
     apply_sql_prepared_transaction = 91,
     comment_column = 87,
     apply_sql_sequence_counter = 85,
@@ -44891,6 +45047,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .apply_relation_reconciliation => |bytes| {
             _ = try relation_control.Command.decode(bytes);
             try out.append(alloc, @backingInt(TransitionTag.apply_relation_reconciliation));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .apply_sql_lock_scope => |bytes| {
+            if (bytes.len > @import("../../system_catalog/lock_authority.zig").max_bytes) return error.CatalogCommandTooLarge;
+            try out.append(alloc, @backingInt(TransitionTag.apply_sql_lock_scope));
             try appendRequiredString(alloc, &out, bytes);
         },
         .apply_sql_prepared_transaction => |bytes| {
@@ -45414,6 +45575,10 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
             if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
             _ = try relation_control.Command.decode(bytes);
             break :blk .{ .apply_relation_reconciliation = bytes };
+        },
+        .apply_sql_lock_scope => blk: {
+            if (encoded.len > @import("../../system_catalog/lock_authority.zig").max_bytes + 16) return error.CatalogCommandTooLarge;
+            break :blk .{ .apply_sql_lock_scope = try readRequiredString(alloc, encoded, &pos) };
         },
         .apply_sql_prepared_transaction => blk: {
             if (encoded.len > @import("../../system_catalog/prepared_transactions.zig").max_bytes + 16) return error.CatalogCommandTooLarge;
@@ -67433,6 +67598,141 @@ test "SQL prepared transaction standalone sessions require the native decoder fl
                 try std.testing.expectEqual(@as(u64, 20), cut.receipts[0].decision.?.version);
                 try Helper.submit(&store, a, .{ .admission = .{ .nonce = @splat(5), .head = cut.head }, .incarnation = cut.incarnation, .actor = .{ .session_user = .bootstrap, .credential = "" }, .standalone = true, .database_id = 1, .operation = .{ .acknowledge_receipt = .{ .owner = try identity.owner(a), .txn_id = identity.txn_id } } });
             } else try std.testing.expectEqual(@as(usize, 0), cut.receipts.len);
+        }
+    }
+}
+
+test "SQL prepared transaction native lock scope atomically seals private admissions and survives fenced cold snapshot recovery" {
+    const L = @import("../../system_catalog/lock_authority.zig");
+    const T = SessionCommitRegistryFixture;
+    const P = T.P;
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Helper = struct {
+        fn head(store: *RaftApplyStore, backing: std.mem.Allocator) !u64 {
+            const cut = try std.json.parseFromSliceLeaky(P.Snapshot, backing, try store.sqlPreparedRead(backing, T.group, .{ .work = null }, .{}), .{});
+            return cut.head;
+        }
+        fn scope(store: *RaftApplyStore, backing: std.mem.Allocator, backend: L.locks.Backend, standalone: bool, nonce: u8, op: @FieldType(L.Request, "operation")) !P.outcomes.Outcome {
+            const request: L.Request = .{ .admission = .{ .nonce = @splat(nonce), .head = try head(store, backing) }, .incarnation = @splat(0x11), .standalone = standalone, .database = 1, .actor = .{ .session_user = .bootstrap, .credential = "" }, .backend = backend, .operation = op };
+            const encoded = try encodeTransitionCommand(backing, .{ .apply_sql_lock_scope = try std.json.Stringify.valueAlloc(backing, request, .{}) });
+            var decoded = (try decodeTransitionCommand(backing, encoded)).?;
+            defer decoded.deinit(backing);
+            try store.applyStandaloneCommand(T.group, decoded);
+            return (try std.json.parseFromSliceLeaky(?P.outcomes.Outcome, backing, try store.sqlLockOutcome(backing, T.group, request), .{})) orelse error.MissingLockOutcome;
+        }
+        fn submit(store: *RaftApplyStore, backing: std.mem.Allocator, request: P.Mutation) !P.outcomes.Outcome {
+            try store.applyStandaloneCommand(T.group, .{ .apply_sql_prepared_transaction = try std.json.Stringify.valueAlloc(backing, request, .{}) });
+            return (try std.json.parseFromSliceLeaky(?P.outcomes.Outcome, backing, try store.sqlPreparedOutcome(backing, T.group, request), .{})) orelse error.MissingSessionCommit;
+        }
+        fn change(store: *RaftApplyStore, backing: std.mem.Allocator, identity: P.Identity, standalone: bool, nonce: u8, action: P.Action) !void {
+            const cut = try std.json.parseFromSliceLeaky(P.Snapshot, backing, try store.sqlPreparedRead(backing, T.group, .{ .operation = identity.operation_id }, .{}), .{});
+            const outcome = try submit(store, backing, .{ .admission = .{ .nonce = @splat(nonce), .head = cut.head }, .incarnation = cut.incarnation, .standalone = standalone, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database_id = 1, .operation = .{ .advance = .{ .owner = try identity.owner(backing), .expected_revision = cut.records[0].revision, .action = action } } });
+            _ = try outcome.result();
+        }
+        fn scopeRead(store: *RaftApplyStore, backing: std.mem.Allocator, backend: L.locks.Backend) !L.scopes.Record {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            return (try L.scopes.read(backing, &read, .{ .home = .metadata, .group = T.group, .incarnation = @splat(0x11) }, backend)) orelse error.MissingLockScope;
+        }
+    };
+    for ([_]bool{ false, true }) |standalone| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/lock-scope-{s}", .{ tmp.sub_path, if (standalone) "standalone" else "cluster" });
+        var identity = try T.identity(a, .session_commit, 91, "");
+        identity.session.?.standalone = standalone;
+        identity.session.?.owner_node_id = if (standalone) 0 else 9;
+        const backend: L.locks.Backend = .{ .incarnation = @splat(0x11), .id = @splat(2), .fence = 1 };
+        const command: L.scopes.Command = .{ .sequence = 1, .nonce = @splat(3), .executor = @splat(4) };
+        identity.lock_scope = .{ .backend = backend, .command = command };
+        const registration: L.scopes.Registration = .{ .lease = .{ .backend = backend, .database = 1, .node = identity.session.?.owner_node_id, .principal = try L.principalDigest(a, .bootstrap), .expires_at_ms = 1000 }, .connection = identity.session.?.connection_id.?, .nonce = @splat(5), .standalone = standalone };
+        for (0..4) |phase| {
+            var store = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+            defer store.deinit();
+            if (phase == 0) {
+                try store.applyStandaloneCommand(T.group, .{ .initialize_metadata_incarnation = T.seed });
+                if (standalone) try store.replaceStandaloneCatalog(T.group, try store.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
+                try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = L.decoder_version - 1, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+                try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, Helper.scope(&store, a, backend, standalone, 40, .{ .register = registration }));
+                var early_admission = T.admission(identity);
+                early_admission.standalone = standalone;
+                early_admission.admission.head = try Helper.head(&store, a);
+                try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.prepareSqlPreparedTransaction(a, T.group, early_admission));
+                {
+                    var read = try store.store.beginReadTxn();
+                    defer read.abort();
+                    try std.testing.expectEqual(@as(?L.scopes.Record, null), try L.scopes.read(a, &read, .{ .home = .metadata, .group = T.group, .incarnation = @splat(0x11) }, backend));
+                }
+                try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = L.decoder_version, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+                _ = try (try Helper.scope(&store, a, backend, standalone, 41, .{ .register = registration })).result();
+                _ = try (try Helper.scope(&store, a, backend, standalone, 42, .{ .begin = command })).result();
+                _ = try (try Helper.scope(&store, a, backend, standalone, 43, .{ .bind = .{ .command = command, .transaction = identity.txn_id } })).result();
+                _ = try (try Helper.scope(&store, a, backend, standalone, 44, .{ .effect = .{ .command = command, .effect = .{ .backend = backend, .sequence = 1, .nonce = @splat(6), .action = .{ .try_acquire = .{ .resource = @splat(7), .mode = .{ .advisory = .exclusive }, .scope = .{ .transaction = .{ .id = identity.txn_id, .subtransaction = 0 } } } } } } })).result();
+                var admission = T.admission(identity);
+                admission.standalone = standalone;
+                admission.admission.head = try Helper.head(&store, a);
+                var unfenced = admission;
+                unfenced.operation.admit.identity.lock_scope = null;
+                unfenced.admission.nonce = @splat(45);
+                unfenced.operation.admit.identity.operation_id = @splat(45);
+                try std.testing.expectEqual(.CatalogGenerationChanged, (try Helper.submit(&store, a, unfenced)).rejected);
+                admission.admission.head = try Helper.head(&store, a);
+                _ = try (try Helper.submit(&store, a, admission)).result();
+                const owner = try identity.owner(a);
+                try std.testing.expectEqualDeep(L.scopes.DecisionRef{ .operation = owner.operation_id, .admission = owner.admission_digest }, (try Helper.scopeRead(&store, a, backend)).transaction.?.decision.?);
+                _ = try (try Helper.scope(&store, a, backend, standalone, 46, .{ .fence = .close })).result();
+                try std.testing.expectEqual(.CatalogPublicationProofPending, (try Helper.scope(&store, a, backend, standalone, 47, .close_step)).rejected);
+                try Helper.change(&store, a, identity, standalone, 48, .prepare);
+                try Helper.change(&store, a, identity, standalone, 49, .{ .commit = .{ .version = 30, .sync_level = identity.commit_sync_level } });
+            } else if (phase == 1) {
+                const ack: P.Mutation = .{ .admission = .{ .nonce = @splat(51), .head = try Helper.head(&store, a) }, .incarnation = @splat(0x11), .standalone = standalone, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database_id = 1, .operation = .{ .acknowledge_receipt = .{ .owner = try identity.owner(a), .txn_id = identity.txn_id } } };
+                try std.testing.expectEqual(.CatalogPublicationProofPending, (try Helper.submit(&store, a, ack)).rejected);
+                const expected = (try Helper.scopeRead(&store, a, backend)).transaction.?;
+                for (0..8) |step| {
+                    _ = try (try Helper.scope(&store, a, backend, standalone, @intCast(60 + step), .{ .release = expected })).result();
+                    if ((try Helper.scopeRead(&store, a, backend)).transaction == null) break;
+                }
+                try std.testing.expect((try Helper.scopeRead(&store, a, backend)).transaction == null);
+                try Helper.change(&store, a, identity, standalone, 70, .handoff);
+                var accepted_ack = ack;
+                accepted_ack.admission = .{ .nonce = @splat(71), .head = try Helper.head(&store, a) };
+                _ = try (try Helper.submit(&store, a, accepted_ack)).result();
+            } else if (phase == 2) {
+                const current = try Helper.scopeRead(&store, a, backend);
+                try std.testing.expectEqual(.fenced, current.state);
+                // Receipt is gone, but the cold scope retains exact adoption.
+                _ = try (try Helper.scope(&store, a, backend, standalone, 52, .{ .release = current.released_transaction.? })).result();
+                for (0..6) |step| {
+                    _ = try (try Helper.scope(&store, a, backend, standalone, @intCast(53 + step), .close_step)).result();
+                    if ((try Helper.scopeRead(&store, a, backend)).state == .retired) break;
+                }
+                try std.testing.expectEqual(.retired, (try Helper.scopeRead(&store, a, backend)).state);
+            } else {
+                const snapshot = try store.snapshotBuilder().buildSnapshot(a, T.group);
+                const clone_path = try std.fmt.allocPrint(a, "{s}-replica", .{path});
+                var clone = try RaftApplyStore.init(alloc, .{ .root_dir = clone_path });
+                defer clone.deinit();
+                if (standalone) {
+                    // Deployment realm is local authority, not imported Raft
+                    // state. Initialize the receiving local realm normally.
+                    try clone.applyStandaloneCommand(T.group, .{ .initialize_metadata_incarnation = T.seed });
+                    try clone.replaceStandaloneCatalog(T.group, try clone.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
+                }
+                try RaftApplyStore.installSnapshotFromRaft(&clone, a, T.group, 10, snapshot);
+                try std.testing.expectEqual(.retired, (try Helper.scopeRead(&clone, a, backend)).state);
+                var late = T.admission(identity);
+                late.standalone = standalone;
+                late.operation.admit.identity.operation_id = @splat(99);
+                late.admission = .{ .nonce = @splat(99), .head = try Helper.head(&clone, a) };
+                try std.testing.expectEqual(.CatalogGenerationChanged, (try Helper.submit(&clone, a, late)).rejected);
+                var read = try clone.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectEqual(@as(u64, 0), try P.activeCount(a, &read, T.group));
+                try std.testing.expectEqual(@as(?L.scopes.Work, null), try L.scopes.nextWork(a, &read, .{ .home = .metadata, .group = T.group, .incarnation = @splat(0x11) }, 10000, null));
+            }
         }
     }
 }

@@ -3737,7 +3737,8 @@ fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCom
         else => false,
     };
     if (native_index_names) return metadata_topology_protocol.sql_native_index_namespace_version;
-    if (command == .apply_sql_prepared_transaction) return metadata_topology_protocol.sql_connection_transactions_version;
+    if (command == .apply_sql_lock_scope) return metadata_topology_protocol.sql_lock_authority_version;
+    if (command == .apply_sql_prepared_transaction) return metadata_topology_protocol.sql_lock_authority_version;
     if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlTriggerFunction(command.apply_system_catalog)) return metadata_topology_protocol.sql_trigger_function_version;
     const type_retirement = switch (command) {
         .apply_restore_staging => |bytes| @import("schema_reader_wire.zig").requiresTypeRetirement(bytes),
@@ -4275,7 +4276,7 @@ pub fn ensureQueryPopulationDecoderWithContext(service: anytype, bytes: []const 
 }
 
 pub fn ensureSqlPreparedCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
-    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_connection_transactions_version);
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_lock_authority_version);
 }
 
 pub fn ensureSqlAuthorizationCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {

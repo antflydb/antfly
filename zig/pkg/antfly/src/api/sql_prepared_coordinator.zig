@@ -110,6 +110,7 @@ pub const Registry = struct {
 
     fn advance(raw: *anyopaque, a: A, record: registry.Record, action: registry.Action) anyerror!registry.Record {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        if (action == .handoff and !try self.releaseScopeQuantum(a, record.identity)) return error.MetadataMutationOutcomeUnknown;
         const owner = try record.identity.owner(a);
         for (0..2) |attempt| {
             if (self.anchor == null) _ = try self.snapshot(a, .{ .operation = record.identity.operation_id });
@@ -165,7 +166,38 @@ pub const Registry = struct {
         return (fenced or head_fence) and cut.records.len == 0 and cut.receipts.len == 0;
     }
 
+    /// One journal quantum per recovery pass. Scope cleanup shares the same
+    /// native decision registry and retains its terminal receipt until done.
+    fn releaseScopeQuantum(self: *@This(), a: A, identity: registry.Identity) !bool {
+        const ref = identity.lock_scope orelse return true;
+        const types = @import("../system_catalog/lock_authority.zig");
+        const anchor = try self.snapshot(a, .{ .operation = identity.operation_id });
+        var context = self.context;
+        context.setting_admin = true;
+        const query: types.Query = .{ .incarnation = anchor.incarnation, .standalone = anchor.standalone, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database = identity.database_id, .backend = ref.backend };
+        const before = try std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }), .{});
+        const scope = before.scope orelse return error.InvalidSqlBackendResponse;
+        // A completed sealed command is a permanent cleanup witness, even if
+        // later transactions have replaced the single recent release marker.
+        if (scope.next_command > ref.command.sequence) return true;
+        const expected: types.scopes.Transaction = .{ .id = identity.txn_id, .decision = .{ .operation = identity.operation_id, .admission = (try identity.owner(a)).admission_digest } };
+        if (scope.transaction == null) {
+            if (!std.meta.eql(scope.released_transaction, @as(?types.scopes.Transaction, expected))) return error.ExternalTransactionDecisionChanged;
+            return true;
+        }
+        if (!std.meta.eql(scope.transaction, @as(?types.scopes.Transaction, expected))) return error.ExternalTransactionDecisionChanged;
+        var nonce: [16]u8 = undefined;
+        try self.server.embedding_provider_runtime.io.randomSecure(&nonce);
+        const request: types.Request = .{ .admission = .{ .nonce = nonce, .head = before.head }, .incarnation = anchor.incarnation, .standalone = anchor.standalone, .actor = query.actor, .database = identity.database_id, .backend = ref.backend, .operation = .{ .release = expected } };
+        const result = try std.json.parseFromSliceLeaky(types.outcomes.Outcome, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_mutate = request }), .{});
+        _ = try result.result();
+        self.server.sql_lock_work_pending.store(true, .release);
+        self.anchor = null; // Scope progress advances the shared admission head.
+        const after = try std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }), .{});
+        return after.scope != null and after.scope.?.transaction == null and std.meta.eql(after.scope.?.released_transaction, @as(?types.scopes.Transaction, expected));
+    }
     pub fn acknowledgeReceipt(self: *@This(), a: A, identity: registry.Identity) !void {
+        if (!try self.releaseScopeQuantum(a, identity)) return error.MetadataMutationOutcomeUnknown;
         const cut = try self.snapshot(a, .{ .receipt = identity.operation_id });
         try checkRealm(cut, identity);
         if (cut.receipts.len == 0) return;
@@ -220,6 +252,46 @@ fn recoverSessionWithContext(server: *http.ApiHttpServer, txn_id: [16]u8, bytes:
         try source.acknowledgeReceipt(a, seal.identity);
     }
     _ = (try server.txn_sessions.markExternalPreparationReceiptAcknowledged(server.alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+}
+
+/// The same leader-fenced supervisor retires expired/closed command scopes.
+/// One indexed owner and one native quantum per call; unresolved decisions
+/// remain held while the cursor advances so they cannot starve other owners.
+pub fn advanceLockWork(server: *http.ApiHttpServer, after: *?@import("../system_catalog/lock_authority.zig").scopes.Work) !bool {
+    const group = local.common_group_ids.main_metadata_group_id;
+    if (server.cfg.prepared_transaction_leadership) |leadership| {
+        if (!leadership.isLocalLeader(group)) return false;
+    } else if (server.cfg.deployment_mode != .standalone) return false;
+    const types = @import("../system_catalog/lock_authority.zig");
+    var region = std.heap.ArenaAllocator.init(server.alloc);
+    defer region.deinit();
+    const a = region.allocator();
+    const time = @import("antfly_platform").time;
+    const context: local.api_operation.RequestContext = .{ .setting_admin = true, .deadline_ns = time.monotonicNs() +| std.time.ns_per_s };
+    const now_ms = time.realtimeNs() / std.time.ns_per_ms;
+    const actor: registry.Actor = .{ .session_user = .bootstrap, .credential = "" };
+    const query: types.Query = .{ .incarnation = @splat(0), .standalone = server.cfg.deployment_mode == .standalone, .actor = actor, .database = 0, .work = .{ .observed_at_ms = now_ms, .after = after.*, .wrap = true } };
+    const cut = try std.json.parseFromSliceLeaky(types.Snapshot, a, try server.source.systemCatalog(a, context, .{ .sql_lock_read = query }), .{});
+    const work = cut.next_work orelse {
+        after.* = null;
+        return false;
+    };
+    after.* = work;
+    const scope = cut.scope orelse return error.InvalidSqlBackendResponse;
+    var nonce: [16]u8 = undefined;
+    try server.embedding_provider_runtime.io.randomSecure(&nonce);
+    const operation: @FieldType(types.Request, "operation") = if (scope.releasing)
+        .{ .release = scope.transaction orelse return error.InvalidSqlBackendResponse }
+    else if (scope.state == .active)
+        .{ .fence = .{ .expired = .{ .expected_expiry = scope.registration.lease.expires_at_ms, .observed_at_ms = now_ms } } }
+    else if (scope.transaction) |transaction| .{ .release = transaction } else .close_step;
+    const request: types.Request = .{ .admission = .{ .nonce = nonce, .head = cut.head }, .incarnation = cut.incarnation, .standalone = cut.standalone, .actor = actor, .database = scope.registration.lease.database, .backend = work.backend, .operation = operation };
+    const outcome = try std.json.parseFromSliceLeaky(types.outcomes.Outcome, a, try server.source.systemCatalog(a, context, .{ .sql_lock_mutate = request }), .{});
+    _ = outcome.result() catch |err| switch (err) {
+        error.CatalogGenerationChanged, error.CatalogPublicationProofPending => return true,
+        else => return err,
+    };
+    return true;
 }
 
 /// One job per supervisor pass, with a keyset cursor so indefinitely prepared

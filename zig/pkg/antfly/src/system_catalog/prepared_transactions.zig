@@ -80,6 +80,7 @@ pub const SessionRef = struct {
 
 pub const Identity = struct {
     kind: Kind = .named,
+    lock_scope: ?@import("lock_authority.zig").Ref = null,
     commit_sync_level: local.storage_db_types.SyncLevel = .write,
     session: ?SessionRef = null,
     gid: []const u8,
@@ -94,11 +95,20 @@ pub const Identity = struct {
     plan_digest: [32]u8,
     manifest_digest: [32]u8,
 
+    pub fn minimumDecoderVersion(self: Identity) u16 {
+        const protocol = @import("../metadata/topology_protocol.zig");
+        return if (self.lock_scope != null) protocol.sql_lock_authority_version else if (self.requiresConnectionDecoder()) protocol.sql_connection_transactions_version else protocol.sql_prepared_transactions_version;
+    }
     pub fn requiresConnectionDecoder(self: Identity) bool {
         return self.kind == .session_commit or (self.session != null and self.session.?.standalone);
     }
 
     pub fn validate(self: Identity) !void {
+        if (self.lock_scope) |scope| {
+            try scope.backend.validate();
+            try scope.command.validate();
+            if (self.session == null or self.session.?.connection_id == null or !std.mem.eql(u8, &self.metadata_incarnation, &std.fmt.bytesToHex(scope.backend.incarnation, .lower))) return error.InvalidCatalogMutation;
+        }
         if (self.session) |session| try session.validate();
         try validateGid(self.gid);
         if (self.kind == .session_commit and (self.gid.len != 0 or self.session == null or self.session.?.connection_id == null)) return error.InvalidCatalogMutation;
@@ -114,7 +124,12 @@ pub const Identity = struct {
     pub fn jsonStringify(self: Identity, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Identity).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "kind") or std.mem.eql(u8, field, "commit_sync_level")) {
+            if (comptime std.mem.eql(u8, field, "lock_scope")) {
+                if (self.lock_scope != null) {
+                    try writer.objectField(field);
+                    try writer.write(self.lock_scope);
+                }
+            } else if (comptime std.mem.eql(u8, field, "kind") or std.mem.eql(u8, field, "commit_sync_level")) {
                 if (self.kind == .session_commit) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));
@@ -552,7 +567,7 @@ pub fn plan(a: A, txn: anytype, group: u64, catalog_revision: u64, request: Muta
                 if (try receiptCount(a, txn, group) == max_receipts) return error.SqlPreparedTransactionCapacityExceeded;
                 if (try readReceipt(a, txn, group, candidate.identity.operation_id) != null) return error.ExternalTransactionDecisionChanged;
                 try changeReceiptCount(a, txn, group, true, &writes, &deletes);
-                try writeReceipt(a, group, .{ .owner = try candidate.identity.owner(a), .txn_id = candidate.identity.txn_id, .gid = candidate.identity.gid, .kind = candidate.identity.kind, .session = session, .status = .pending }, true, &writes);
+                try writeReceipt(a, group, .{ .owner = try candidate.identity.owner(a), .txn_id = candidate.identity.txn_id, .gid = candidate.identity.gid, .kind = candidate.identity.kind, .session = session, .lock_scope = candidate.identity.lock_scope, .status = .pending }, true, &writes);
             }
             if (admission.identity.kind == .named) try writes.append(a, .{ .key = try gidKey(a, group, admission.identity.gid), .value = try a.dupe(u8, &admission.identity.operation_id) });
             try writes.append(a, .{ .key = try workKey(a, group, admission.identity.operation_id), .value = "" });
@@ -638,6 +653,7 @@ pub const Receipt = struct {
     gid: []const u8,
     session: SessionRef,
     kind: Kind = .named,
+    lock_scope: ?@import("lock_authority.zig").Ref = null,
     status: enum { pending, prepared, committed, aborted },
     /// Private COMMIT recovery must retain its exact version and visibility
     /// contract after the metadata job and native coordinator are retired.
@@ -645,7 +661,12 @@ pub const Receipt = struct {
     pub fn jsonStringify(self: Receipt, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Receipt).@"struct".field_names) |field| {
-            if (!(comptime std.mem.eql(u8, field, "kind") or std.mem.eql(u8, field, "decision")) or self.kind == .session_commit) {
+            if (comptime std.mem.eql(u8, field, "lock_scope")) {
+                if (self.lock_scope != null) {
+                    try writer.objectField(field);
+                    try writer.write(self.lock_scope);
+                }
+            } else if (!(comptime std.mem.eql(u8, field, "kind") or std.mem.eql(u8, field, "decision")) or self.kind == .session_commit) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
             }
@@ -654,6 +675,11 @@ pub const Receipt = struct {
     }
     pub fn validate(self: Receipt) !void {
         try self.owner.validate();
+        if (self.lock_scope) |ref| {
+            try ref.backend.validate();
+            try ref.command.validate();
+            if (self.session.connection_id == null or !std.mem.eql(u8, &self.owner.metadata_incarnation, &std.fmt.bytesToHex(ref.backend.incarnation, .lower))) return error.InvalidCatalogRecord;
+        }
         try self.session.validate();
         try validateGid(self.gid);
         if ((self.kind == .named and self.status == .committed) or (self.kind == .session_commit and (self.status == .prepared or self.gid.len != 0 or self.session.connection_id == null))) return error.InvalidCatalogRecord;

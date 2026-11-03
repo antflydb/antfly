@@ -659,6 +659,7 @@ pub const storage_mem_ordered = @import("storage/mem_ordered.zig");
 pub const storage_object_storage = @import("storage/object_storage.zig");
 pub const storage_pessimistic_lock_contract = @import("storage/pessimistic_lock_contract.zig");
 pub const storage_pessimistic_lock_ledger = @import("storage/pessimistic_lock_ledger.zig");
+pub const storage_pessimistic_lock_authority = @import("storage/pessimistic_lock_authority.zig");
 pub const storage_persistent = @import("storage/persistent.zig");
 pub const storage_persistent_sim_fixture = @import("storage/persistent_sim_fixture.zig");
 pub const storage_portable_backup = @import("storage/portable_backup.zig");

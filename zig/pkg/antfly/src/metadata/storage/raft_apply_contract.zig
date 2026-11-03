@@ -348,6 +348,8 @@ pub const CatalogProjectionRequest = union(enum) {
     /// retirement grants. The ordinary snapshot never acquires this authority.
     sql_sequence_retirement_snapshot: @import("../../system_catalog/sequence_catalog.zig").SnapshotRequest,
     sql_prepared_read: @import("../../system_catalog/prepared_transactions.zig").Read,
+    sql_lock_read: @import("../../system_catalog/lock_authority.zig").Query,
+    sql_lock_outcome: @import("../../system_catalog/lock_authority.zig").Request,
     sql_prepared_prepare: @import("../../system_catalog/prepared_transactions.zig").Mutation,
     sql_prepared_outcome: @import("../../system_catalog/prepared_transactions.zig").Mutation,
     sql_authorization_read: @import("../../system_catalog/authorization.zig").Read,

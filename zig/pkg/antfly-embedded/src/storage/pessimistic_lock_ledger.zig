@@ -26,6 +26,7 @@ pub const max_waiters_per_resource = 128;
 pub const max_backends_per_resource = 256;
 const max_record_bytes = 8192;
 pub const Namespace = struct {
+    home: enum { data, metadata } = .data,
     group: u64,
     incarnation: [16]u8,
     pub fn validate(self: Namespace) !void {
@@ -183,7 +184,7 @@ const Lane = enum { owner, resource, holder, member, receipt, waiter };
 fn key(buffer: []u8, ns: Namespace, lane: Lane, backend: locks.Backend, resource: [32]u8, sequence: u64) ![]const u8 {
     try ns.validate();
     var base: [128]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&base, "\x00\x00__locks__:{x:0>16}:{s}:", .{ ns.group, std.fmt.bytesToHex(ns.incarnation, .lower) });
+    const prefix = try std.fmt.bufPrint(&base, "{s}{x:0>16}:{s}:", .{ if (ns.home == .metadata) "\x00\x00__metadata__:sql_locks:" else "\x00\x00__locks__:", ns.group, std.fmt.bytesToHex(ns.incarnation, .lower) });
     return switch (lane) {
         .resource => std.fmt.bufPrint(buffer, "{s}resource:{s}:head", .{ prefix, std.fmt.bytesToHex(resource, .lower) }),
         .waiter => std.fmt.bufPrint(buffer, "{s}resource:{s}:wait:{s}:{x:0>16}", .{ prefix, std.fmt.bytesToHex(resource, .lower), std.fmt.bytesToHex(backend.id, .lower), backend.fence }),
@@ -266,6 +267,27 @@ pub fn register(backing: A, txn: anytype, ns: Namespace, lease: Lease, context: 
     const encoded = try encode(a, owner);
     var buffer: [256]u8 = undefined;
     try txn.put(try key(&buffer, ns, .owner, lease.backend, @splat(0), 0), encoded);
+}
+/// Scope renewal preserves grant identity and every queued/job effect.
+/// Authority is checked independently even for an exact replay.
+pub fn renew(backing: A, txn: anytype, ns: Namespace, expected: Lease, next: Lease, context: anytype) !void {
+    try expected.validate(ns);
+    try next.validate(ns);
+    var immutable = next;
+    immutable.expires_at_ms = expected.expires_at_ms;
+    if (!std.meta.eql(immutable, expected) or next.expires_at_ms <= expected.expires_at_ms) return error.InvalidLockOwner;
+    try context.requireRenewal(txn, expected, next);
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var owner = (try readOwner(a, txn, ns, expected.backend)) orelse return error.LockOwnerNotRegistered;
+    if (owner.state != .active) return error.LockOwnerBusy;
+    if (std.meta.eql(owner.lease, next)) return;
+    if (!std.meta.eql(owner.lease, expected)) return error.LockOwnerChanged;
+    owner.lease = next;
+    try owner.validate(ns);
+    var buffer: [256]u8 = undefined;
+    try txn.put(try key(&buffer, ns, .owner, next.backend, @splat(0), 0), try encode(a, owner));
 }
 pub fn observe(backing: A, txn: anytype, ns: Namespace, effect: Effect, context: anytype) !?Receipt {
     var arena = std.heap.ArenaAllocator.init(backing);

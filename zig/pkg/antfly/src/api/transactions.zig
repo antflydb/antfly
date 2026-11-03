@@ -2967,7 +2967,7 @@ pub const SessionRegistry = struct {
         try seal.validate(region.allocator(), candidate, candidate.execution_plan);
         if (receipt.status == .pending or !receipt.owner.eql(try seal.identity.owner(alloc)) or
             !std.mem.eql(u8, &receipt.txn_id, &txn_id) or !std.mem.eql(u8, receipt.gid, seal.identity.gid) or
-            !std.meta.eql(receipt.session, seal.identity.session.?)) return error.ExternalTransactionDecisionChanged;
+            !std.meta.eql(receipt.session, seal.identity.session.?) or !std.meta.eql(receipt.lock_scope, seal.identity.lock_scope)) return error.ExternalTransactionDecisionChanged;
         if (candidate.external_preparation_prepared and receipt.status != .prepared or candidate.terminal_abort and receipt.status != .aborted) return error.ExternalTransactionDecisionChanged;
         // Exact delivery replay has already crossed local durability. Avoid
         // another session write or lease renewal before retrying metadata ACK.
@@ -2999,7 +2999,7 @@ pub const SessionRegistry = struct {
         receipt.validate() catch return error.ExternalTransactionDecisionChanged;
         if (receipt.kind != .session_commit or seal.identity.kind != .session_commit or receipt.status == .pending or receipt.status == .prepared or
             !receipt.owner.eql(try seal.identity.owner(a)) or !std.mem.eql(u8, &receipt.txn_id, &txn_id) or
-            !std.meta.eql(receipt.session, seal.identity.session.?) or !std.mem.eql(u8, receipt.gid, seal.identity.gid)) return error.ExternalTransactionDecisionChanged;
+            !std.meta.eql(receipt.session, seal.identity.session.?) or !std.meta.eql(receipt.lock_scope, seal.identity.lock_scope) or !std.mem.eql(u8, receipt.gid, seal.identity.gid)) return error.ExternalTransactionDecisionChanged;
         const decision = receipt.decision orelse return error.ExternalTransactionDecisionChanged;
         if (decision.version <= seal.identity.begin_timestamp or (decision.status == .committed and decision.sync_level != seal.identity.commit_sync_level)) return error.ExternalTransactionDecisionChanged;
         if (candidate.external_decision) |prior| {
@@ -8989,7 +8989,7 @@ test "distributed txn private COMMIT delivery retains exact cold decisions throu
                 defer plan.deinit();
                 receipt = .{ .kind = .session_commit, .owner = try identity.owner(a), .txn_id = txn_id, .gid = "", .session = identity.session.?, .status = if (aborted) .aborted else .committed, .decision = .{ .status = if (aborted) .aborted else .committed, .version = std.math.maxInt(u64), .sync_level = .write } };
             } else if (phase == 1) {
-                for (0..12) |fault| {
+                for (0..13) |fault| {
                     var wrong = receipt;
                     switch (fault) {
                         0 => wrong.kind = .named,
@@ -9007,6 +9007,12 @@ test "distributed txn private COMMIT delivery retains exact cold decisions throu
                         9 => wrong.session.connection_id = @splat('b'),
                         10 => wrong.decision.?.sync_level = .propose,
                         11 => wrong.decision.?.status = if (aborted) .committed else .aborted,
+                        12 => {
+                            var incarnation: [16]u8 = undefined;
+                            _ = try std.fmt.hexToBytes(&incarnation, &receipt.owner.metadata_incarnation);
+                            wrong.lock_scope = .{ .backend = .{ .incarnation = incarnation, .id = @splat(8), .fence = 1 }, .command = .{ .sequence = 1, .nonce = @splat(7), .executor = @splat(6) } };
+                            try wrong.validate(); // Structurally valid, wrong sealed identity.
+                        },
                         else => unreachable,
                     }
                     // Aborted outcomes do not carry a visibility requirement;

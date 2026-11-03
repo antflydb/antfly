@@ -22,7 +22,7 @@ const locks = @import("pessimistic_lock_contract.zig");
 const DocStore = @import("docstore.zig").DocStore;
 const A = std.mem.Allocator;
 const a = std.testing.allocator;
-const ns: ledger.Namespace = .{ .group = 21, .incarnation = @splat(1) };
+const ns: ledger.Namespace = .{ .home = .metadata, .group = 21, .incarnation = @splat(1) };
 const source: ledger.Lease = .{ .backend = .{ .incarnation = @splat(1), .id = @splat(2), .fence = 1 }, .database = 1, .node = 7, .principal = @splat(3), .expires_at_ms = 1000 };
 const destination: ledger.Lease = .{ .backend = .{ .incarnation = @splat(1), .id = @splat(4), .fence = 1 }, .database = 1, .node = 8, .principal = @splat(5), .expires_at_ms = 1000 };
 const transaction: [16]u8 = @splat(9);
@@ -303,4 +303,296 @@ test "pessimistic locks native LSM hard and soft cycle decisions use durable cur
     try std.testing.expectEqual(ledger.Outcome.deadlocked, (try apply(&store, b_hard, cb)).outcome);
     try finish(&store, destination, 4, cb);
     try std.testing.expectEqual(ledger.Outcome.granted, (try apply(&store, a_hard, ca)).outcome);
+}
+
+const scopes = @import("pessimistic_lock_authority.zig");
+const scope_registration: scopes.Registration = .{ .lease = source, .connection = @splat('a'), .nonce = @splat(4), .standalone = false };
+const scope_command: scopes.Command = .{ .sequence = 1, .nonce = @splat(5), .executor = @splat(6) };
+const scope_decision: scopes.DecisionRef = .{ .operation = @splat(7), .admission = @splat(8) };
+/// These fixtures use durable native authority rows, not source-provided flags.
+/// The production receiver must join the same checks to its external registry.
+const ScopeAuthority = struct {
+    allowed: bool = true,
+    pub fn requireRegistration(self: @This(), _: anytype, _: ledger.Namespace, value: scopes.Registration) !void {
+        if (!self.allowed or !std.meta.eql(value, scope_registration)) return error.Forbidden;
+    }
+    pub fn requireCommand(self: @This(), _: anytype, _: ledger.Namespace, value: scopes.Record, command: scopes.Command) !void {
+        var registration = value.registration;
+        registration.lease.expires_at_ms = source.expires_at_ms;
+        if (!self.allowed or !std.meta.eql(registration, scope_registration) or !std.mem.eql(u8, &command.executor, &scope_command.executor)) return error.Forbidden;
+    }
+    pub fn requireTransaction(self: @This(), txn: anytype, namespace: ledger.Namespace, value: scopes.Record, id: [16]u8) !void {
+        try self.requireCommand(txn, namespace, value, scope_command);
+        if (!std.mem.eql(u8, &id, &transaction)) return error.Forbidden;
+    }
+    pub fn requireSeal(self: @This(), txn: anytype, namespace: ledger.Namespace, value: scopes.Record, decision: scopes.DecisionRef) !void {
+        try self.requireCommand(txn, namespace, value, scope_command);
+        if (!std.meta.eql(decision, scope_decision) or !std.mem.eql(u8, try txn.get("scope-test/admission"), &scope_decision.admission)) return error.Forbidden;
+    }
+    pub fn requireResolution(self: @This(), txn: anytype, namespace: ledger.Namespace, value: scopes.Record, expected: scopes.Transaction) !void {
+        try self.requireCommand(txn, namespace, value, scope_command);
+        if (!std.mem.eql(u8, &expected.id, &transaction) or !std.mem.eql(u8, try txn.get("scope-test/resolved"), &transaction)) return error.LockOwnerBusy;
+    }
+    pub fn requireRenewal(self: @This(), txn: anytype, namespace: ledger.Namespace, value: scopes.Record, _: u64, _: u64) !void {
+        try self.requireCommand(txn, namespace, value, scope_command);
+    }
+    pub fn requireFence(self: @This(), txn: anytype, namespace: ledger.Namespace, value: scopes.Record, _: scopes.Fence) !void {
+        try self.requireCommand(txn, namespace, value, scope_command);
+    }
+    pub fn requireRetirement(self: @This(), txn: anytype, namespace: ledger.Namespace, value: scopes.Record) !void {
+        try self.requireCommand(txn, namespace, value, scope_command);
+        if (value.transaction != null) return error.LockOwnerBusy;
+    }
+    pub fn requirePreparedHandoff(_: @This(), _: anytype, _: ledger.Namespace, _: scopes.Record, _: ledger.Lease, _: ledger.Lease, _: [16]u8) !void {
+        return error.Forbidden;
+    }
+};
+const scope_authority: ScopeAuthority = .{};
+fn registerScope(store: *DocStore) !void {
+    var txn = try store.beginWriteTxn();
+    errdefer txn.abort();
+    try scopes.register(a, &txn, ns, scope_registration, scope_authority);
+    try std.testing.expectEqual(scopes.Begin.admitted, try scopes.begin(a, &txn, ns, source.backend, scope_command, scope_authority));
+    try txn.commit();
+}
+fn closeScope(store: *DocStore) !bool {
+    var txn = try store.beginWriteTxn();
+    errdefer txn.abort();
+    const done = try scopes.closeStep(a, &txn, ns, source.backend, scope_authority);
+    try txn.commit();
+    return done;
+}
+
+test "pessimistic locks native LSM command scope fences late writers before bounded queued cleanup" {
+    const path = try pathFor("scope-fence");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    try registerScope(&store);
+    try register(&store, destination, cb);
+    _ = try apply(&store, effect(destination, 1, 1), cb);
+    const request = waiting(source, 1, 1, .exclusive);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(ledger.Outcome.pending, (try scopes.applyEffect(a, &txn, ns, source.backend, scope_command, request, scope_authority)).outcome);
+        try scopes.renew(a, &txn, ns, source.backend, 1000, 2000, scope_authority);
+        try txn.commit();
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.LockOwnerChanged, scopes.fence(a, &txn, ns, source.backend, .{ .expired = .{ .expected_expiry = 1000, .observed_at_ms = 1001 } }, scope_authority));
+        try std.testing.expectError(error.Forbidden, scopes.guard(a, &txn, ns, source.backend, scope_command, ScopeAuthority{ .allowed = false }));
+        try std.testing.expectEqual(@as(u64, 2000), (try ledger.readOwner(a, &txn, ns, source.backend)).?.lease.expires_at_ms);
+        try std.testing.expect((try ledger.readOwner(a, &txn, ns, source.backend)).?.waiting != null);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try scopes.fence(a, &txn, ns, source.backend, .{ .expired = .{ .expected_expiry = 2000, .observed_at_ms = 2000 } }, scope_authority);
+        try txn.commit();
+    }
+    // A full cold reopen cannot restore an old command's write authority.
+    var steps: usize = 0;
+    while (true) {
+        store.close();
+        store = try DocStore.open(a, path, .{});
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectError(error.LockOwnerChanged, scopes.guard(a, &read, ns, source.backend, scope_command, scope_authority));
+        }
+        steps += 1;
+        if (try closeScope(&store)) break;
+        try std.testing.expect(steps <= 6);
+    }
+    try std.testing.expect(try closeScope(&store));
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(.retired, (try scopes.read(a, &read, ns, source.backend)).?.state);
+    // Cancelling an obsolete wait has not unlocked the independent holder.
+    try std.testing.expectEqual(@as(u32, 1), (try ledger.readOwner(a, &read, ns, destination.backend)).?.resources);
+}
+
+test "pessimistic locks native LSM sealed scope retains grants until durable transaction resolution across cold reopen" {
+    const path = try pathFor("scope-decision");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    try registerScope(&store);
+    try register(&store, destination, cb);
+    var request = effect(source, 1, 1);
+    request.action.try_acquire.scope = .{ .transaction = .{ .id = transaction, .subtransaction = 0 } };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try scopes.bindTransaction(a, &txn, ns, source.backend, scope_command, transaction, scope_authority);
+        _ = try scopes.applyEffect(a, &txn, ns, source.backend, scope_command, request, scope_authority);
+        try txn.put("scope-test/admission", &scope_decision.admission);
+        try scopes.seal(a, &txn, ns, source.backend, scope_command, scope_decision, scope_authority);
+        try scopes.seal(a, &txn, ns, source.backend, scope_command, scope_decision, scope_authority);
+        try scopes.fence(a, &txn, ns, source.backend, .close, scope_authority);
+        try txn.commit();
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    try std.testing.expectError(error.LockOwnerBusy, closeScope(&store));
+    try std.testing.expectEqual(ledger.Outcome.contended, (try apply(&store, effect(destination, 1, 1), cb)).outcome);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put("scope-test/resolved", &transaction);
+        _ = try scopes.releaseTransaction(a, &txn, ns, source.backend, .{ .id = transaction, .decision = scope_decision }, scope_authority);
+        try txn.commit();
+    }
+    var release_steps: usize = 0;
+    while (true) {
+        store.close();
+        store = try DocStore.open(a, path, .{});
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const done = try scopes.releaseTransaction(a, &txn, ns, source.backend, .{ .id = transaction, .decision = scope_decision }, scope_authority);
+        try txn.commit();
+        if (done) break;
+        release_steps += 1;
+        try std.testing.expect(release_steps <= 6);
+    }
+    var steps: usize = 0;
+    while (true) {
+        store.close();
+        store = try DocStore.open(a, path, .{});
+        steps += 1;
+        if (try closeScope(&store)) break;
+        try std.testing.expect(steps <= 6);
+    }
+    try std.testing.expectEqual(ledger.Outcome.granted, (try apply(&store, effect(destination, 2, 1), cb)).outcome);
+}
+
+test "pessimistic locks native LSM scope renewal and registration abort every partial native write" {
+    const path = try pathFor("scope-faults");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    // Ledger owner, scope and capacity counter share one accepting transaction.
+    for (0..5) |fail_after| {
+        var txn = try store.beginWriteTxn();
+        var fault: FaultTxn = .{ .txn = &txn, .remaining = fail_after };
+        try std.testing.expectError(error.InjectedLockWriteFailure, scopes.register(a, &fault, ns, scope_registration, scope_authority));
+        txn.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(?scopes.Record, null), try scopes.read(a, &read, ns, source.backend));
+        try std.testing.expectEqual(@as(?ledger.Owner, null), try ledger.readOwner(a, &read, ns, source.backend));
+    }
+    try registerScope(&store);
+    for (0..4) |fail_after| {
+        var txn = try store.beginWriteTxn();
+        var fault: FaultTxn = .{ .txn = &txn, .remaining = fail_after };
+        try std.testing.expectError(error.InjectedLockWriteFailure, scopes.renew(a, &fault, ns, source.backend, 1000, 2000, scope_authority));
+        txn.abort();
+        store.close();
+        store = try DocStore.open(a, path, .{});
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 1000), (try scopes.read(a, &read, ns, source.backend)).?.registration.lease.expires_at_ms);
+        try std.testing.expectEqual(@as(u64, 1000), (try ledger.readOwner(a, &read, ns, source.backend)).?.lease.expires_at_ms);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try scopes.finish(a, &txn, ns, source.backend, scope_command, scope_authority);
+        try scopes.finish(a, &txn, ns, source.backend, scope_command, scope_authority);
+        try std.testing.expectEqual(scopes.Begin.completed, try scopes.begin(a, &txn, ns, source.backend, scope_command, scope_authority));
+        try std.testing.expectError(error.LockEffectExpired, scopes.guard(a, &txn, ns, source.backend, scope_command, scope_authority));
+        var next = scope_command;
+        next.sequence = 2;
+        try std.testing.expectEqual(scopes.Begin.admitted, try scopes.begin(a, &txn, ns, source.backend, next, scope_authority));
+        var forged = next;
+        forged.nonce = @splat(9);
+        try std.testing.expectError(error.LockEffectChanged, scopes.begin(a, &txn, ns, source.backend, forged, scope_authority));
+        try txn.commit();
+    }
+}
+
+test "pessimistic locks native LSM active resolution wakes immediate work preserves session refs and invalidates old commands" {
+    const path = try pathFor("scope-active-resolution");
+    defer a.free(path);
+    defer cleanup(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    try registerScope(&store);
+    try register(&store, destination, cb);
+    const expected: scopes.Transaction = .{ .id = transaction, .decision = scope_decision };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try scopes.applyEffect(a, &txn, ns, source.backend, scope_command, effect(source, 1, 1), scope_authority);
+        try scopes.bindTransaction(a, &txn, ns, source.backend, scope_command, transaction, scope_authority);
+        var xact = effect(source, 2, 1);
+        xact.action.try_acquire.scope = .{ .transaction = .{ .id = transaction, .subtransaction = 0 } };
+        _ = try scopes.applyEffect(a, &txn, ns, source.backend, scope_command, xact, scope_authority);
+        try txn.put("scope-test/admission", &scope_decision.admission);
+        try txn.put("scope-test/resolved", &transaction);
+        try scopes.seal(a, &txn, ns, source.backend, scope_command, scope_decision, scope_authority);
+        // This is earlier than the backend lease expiry, not an idle timeout.
+        try std.testing.expectEqual(@as(?scopes.Work, null), try scopes.nextWork(a, &txn, ns, 100, null));
+        try txn.commit();
+    }
+    var quanta: usize = 0;
+    while (true) {
+        // Every failed write, including a fully staged but aborted quantum,
+        // preserves the prior scope, membership counts and job cursor.
+        var before = try store.beginReadTxn();
+        const before_scope = (try scopes.read(a, &before, ns, source.backend)).?;
+        const before_owner = (try ledger.readOwner(a, &before, ns, source.backend)).?;
+        before.abort();
+        for (0..16) |failure| {
+            var txn = try store.beginWriteTxn();
+            var fault: FaultTxn = .{ .txn = &txn, .remaining = failure };
+            _ = scopes.releaseTransaction(a, &fault, ns, source.backend, expected, scope_authority) catch |err| switch (err) {
+                error.InjectedLockWriteFailure => false,
+                else => return err,
+            };
+            txn.abort();
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqualDeep(before_scope, (try scopes.read(a, &read, ns, source.backend)).?);
+            try std.testing.expectEqualDeep(before_owner, (try ledger.readOwner(a, &read, ns, source.backend)).?);
+        }
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const done = try scopes.releaseTransaction(a, &txn, ns, source.backend, expected, scope_authority);
+        try txn.commit();
+        if (!done) {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            const work = (try scopes.nextWork(a, &read, ns, 100, null)).?;
+            try std.testing.expectEqual(@as(u64, 0), work.at_ms);
+            try std.testing.expect(work.backend.eql(source.backend));
+        }
+        store.close();
+        store = try DocStore.open(a, path, .{});
+        if (done) break;
+        quanta += 1;
+        try std.testing.expect(quanta <= 6);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(?[16]u8, null), (try ledger.readOwner(a, &txn, ns, source.backend)).?.transaction);
+        try std.testing.expectEqual(@as(u32, 0), (try ledger.readOwner(a, &txn, ns, source.backend)).?.transaction_resources);
+        try std.testing.expectEqual(@as(u32, 1), (try ledger.readOwner(a, &txn, ns, source.backend)).?.resources);
+        try std.testing.expectError(error.LockEffectExpired, scopes.guard(a, &txn, ns, source.backend, scope_command, scope_authority));
+        try std.testing.expectEqual(scopes.Begin.completed, try scopes.begin(a, &txn, ns, source.backend, scope_command, scope_authority));
+        try std.testing.expectEqual(@as(?scopes.Work, null), try scopes.nextWork(a, &txn, ns, 100, null));
+        try txn.commit();
+    }
+    // COMMIT releases transaction holdings, not an independent session ref.
+    try std.testing.expectEqual(ledger.Outcome.contended, (try apply(&store, effect(destination, 1, 1), cb)).outcome);
 }

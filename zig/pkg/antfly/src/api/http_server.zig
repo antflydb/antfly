@@ -4075,7 +4075,11 @@ pub const ApiHttpServer = struct {
     backup_maintenance_closing: std.atomic.Value(bool) = .init(false),
     sql_prepared_work_mutex: std.atomic.Mutex = .unlocked,
     sql_prepared_work_cursor: ?[16]u8 = null,
+    sql_lock_work_cursor: ?@import("../system_catalog/lock_authority.zig").scopes.Work = null,
     sql_prepared_work_due_ns: u64 = 0,
+    sql_lock_work_due_ns: u64 = 0,
+    sql_lock_work_pending: std.atomic.Value(bool) = .init(false),
+    last_full_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
     backup_maintenance_mutex: std.atomic.Mutex = .unlocked,
     backup_maintenance_queue: BackupRepositoryMaintenanceQueue = .{},
     backup_cohort_recovery_cursor: [192]u8 = undefined,
@@ -5522,6 +5526,7 @@ pub const ApiHttpServer = struct {
                 };
             }
         }
+        self.runSqlLockMaintenanceOnce();
         self.retryPendingTransactionRecovery(32) catch |err| {
             std.log.warn("failed to advance stable transaction recovery err={s}", .{@errorName(err)});
         };
@@ -6697,11 +6702,39 @@ pub const ApiHttpServer = struct {
         advance = self.lake_gc_store_index >= observed.stores.len;
     }
 
+    pub fn runSqlLockMaintenanceOnce(self: *ApiHttpServer) void {
+        if (!self.sql_prepared_work_mutex.tryLock()) return;
+        defer self.sql_prepared_work_mutex.unlock();
+        const now = platform_time.monotonicNs();
+        // Claim only the wake observed at entry. A foreground publication
+        // during this slice must survive an empty-work result at its end.
+        const notified = self.sql_lock_work_pending.swap(false, .acq_rel);
+        if (!notified and now < self.sql_lock_work_due_ns) return;
+        self.sql_lock_work_due_ns = now +| std.time.ns_per_s;
+        // Native quanta remain independent transactions. The outer slice also
+        // has a time and count budget, so cleanup cannot monopolize this owner.
+        const end = now +| 20 * std.time.ns_per_ms;
+        var pending = false;
+        for (0..16) |_| {
+            pending = @import("sql_prepared_coordinator.zig").advanceLockWork(self, &self.sql_lock_work_cursor) catch |err| switch (err) {
+                error.UnsupportedSqlExecution, error.TableTopologyProtocolUpgradeRequired, error.CatalogGenerationChanged, error.MetadataMutationOutcomeUnknown, error.Timeout, error.Canceled, error.DeadlineExceeded => false,
+                else => blk: {
+                    std.log.warn("SQL lock scope recovery deferred err={s}", .{@errorName(err)});
+                    break :blk false;
+                },
+            };
+            if (!pending or platform_time.monotonicNs() >= end) break;
+        }
+        if (pending) self.sql_lock_work_pending.store(true, .release);
+    }
+
     const SessionMaintenanceWork = struct {
         server: *ApiHttpServer,
+        locks_only: bool = false,
 
         fn run(ptr: *anyopaque) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.locks_only) return self.server.runSqlLockMaintenanceOnce();
             try self.server.runSessionMaintenanceOnce();
         }
 
@@ -6719,18 +6752,22 @@ pub const ApiHttpServer = struct {
         // cleanup jobs. The worker's per-task clocks retain the configured
         // cleanup and lease-renewal cadence.
         const now_ns = platform_time.monotonicNs();
-        const min_schedule_interval_ns = std.time.ns_per_s;
+        const pending_locks = self.sql_lock_work_pending.load(.acquire);
+        const min_schedule_interval_ns: u64 = if (pending_locks) 100 * std.time.ns_per_ms else std.time.ns_per_s;
         const previous_ns = self.last_session_maintenance_schedule_ns.load(.acquire);
         if (previous_ns != 0 and now_ns -| previous_ns < min_schedule_interval_ns) return;
         if (self.last_session_maintenance_schedule_ns.cmpxchgStrong(previous_ns, now_ns, .acq_rel, .acquire) != null) return;
-        const runtime = self.cfg.backend_runtime orelse return self.runSessionMaintenanceOnce();
-        if (runtime.threaded_jobs == null or self.session_maintenance_owner_id == 0) return self.runSessionMaintenanceOnce();
+        const previous_full = self.last_full_session_maintenance_schedule_ns.load(.acquire);
+        const locks_only = pending_locks and previous_full != 0 and now_ns -| previous_full < std.time.ns_per_s;
+        if (!locks_only) self.last_full_session_maintenance_schedule_ns.store(now_ns, .release);
+        const runtime = self.cfg.backend_runtime orelse return if (locks_only) self.runSqlLockMaintenanceOnce() else self.runSessionMaintenanceOnce();
+        if (runtime.threaded_jobs == null or self.session_maintenance_owner_id == 0) return if (locks_only) self.runSqlLockMaintenanceOnce() else self.runSessionMaintenanceOnce();
         if (self.session_maintenance_in_flight.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         const work = self.alloc.create(SessionMaintenanceWork) catch |err| {
             self.session_maintenance_in_flight.store(false, .release);
             return err;
         };
-        work.* = .{ .server = self };
+        work.* = .{ .server = self, .locks_only = locks_only };
         runtime.durable_jobs.submit(.{
             .owner_id = self.session_maintenance_owner_id,
             .class = .cleanup,
