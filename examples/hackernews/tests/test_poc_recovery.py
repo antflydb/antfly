@@ -31,6 +31,47 @@ spec.loader.exec_module(poc)
 
 
 class ConstructionRecoveryTests(unittest.TestCase):
+    def test_timeout_evidence_keeps_duration_and_code_without_provider_body(self):
+        failure = poc.RequestFailure.http(
+            "POST",
+            "/query?token=private-token",
+            504,
+            json.dumps(
+                {
+                    "code": "query_timeout",
+                    "retryable": True,
+                    "message": "private-token gs://private-bucket/object",
+                }
+            ),
+            30005.25,
+        )
+        self.assertEqual(failure.record["route"], "/query")
+        self.assertEqual(failure.record["http_status"], 504)
+        self.assertEqual(failure.record["code"], "query_timeout")
+        self.assertEqual(failure.record["elapsed_ms"], 30005.25)
+        self.assertTrue(failure.record["retryable"])
+        self.assertNotIn("private", json.dumps(failure.record) + str(failure))
+        for body in (
+            b"private-token invalid JSON",
+            json.dumps({"code": {"token": "private-token"}}),
+            json.dumps({"code": "private_token", "retryable": "private-token"}),
+        ):
+            unknown = poc.RequestFailure.http("POST", "/query", 502, body, 10)
+            self.assertEqual(unknown.record["code"], "http_error")
+            self.assertNotIn("private", json.dumps(unknown.record) + str(unknown))
+
+    def test_transport_evidence_preserves_errno_without_exception_text(self):
+        failure = poc.RequestFailure.transport(
+            "POST",
+            "/query",
+            poc.urllib.error.URLError(ConnectionResetError(54, "private-token")),
+            4123.5,
+        )
+        self.assertEqual(failure.record["transport_type"], "ConnectionResetError")
+        self.assertEqual(failure.record["errno"], 54)
+        self.assertEqual(failure.record["elapsed_ms"], 4123.5)
+        self.assertNotIn("private", json.dumps(failure.record) + str(failure))
+
     def test_gcs_credentials_require_lifetime_and_redact_helper_failures(self):
         expiry = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
             hours=1

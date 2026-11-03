@@ -40,6 +40,67 @@ import urllib.request
 import uuid
 
 
+class RequestFailure(RuntimeError):
+    """Retain bounded failure evidence without provider bodies or credentials."""
+
+    def __init__(self, record):
+        self.record = record
+        super().__init__(
+            f"{record['method']} {record['route']}: "
+            f"HTTP {record.get('http_status', 'transport')}: {record['code']}"
+        )
+
+    @classmethod
+    def http(cls, method, path, status, body, elapsed_ms):
+        try:
+            detail = json.loads(body)
+        except ValueError:
+            detail = {}
+        if not isinstance(detail, dict):
+            detail = {}
+        code = detail.get("code")
+        if not isinstance(code, str) or code not in {
+            "query_timeout",
+            "index_rebuilding",
+            "catalog_conflict",
+            "resource_exhausted",
+            "too_many_requests",
+            "temporarily_unavailable",
+            "invalid_request",
+            "unsupported_exact_sort",
+            "unsupported_query",
+            "unauthorized",
+            "forbidden",
+            "not_found",
+            "internal_error",
+        }:
+            code = "http_error"
+        record = {
+            "method": method,
+            "route": path.partition("?")[0],
+            "http_status": status,
+            "code": code,
+            "elapsed_ms": elapsed_ms,
+        }
+        if type(detail.get("retryable")) is bool:
+            record["retryable"] = detail["retryable"]
+        return cls(record)
+
+    @classmethod
+    def transport(cls, method, path, error, elapsed_ms):
+        reason = error.reason if isinstance(error, urllib.error.URLError) else error
+        record = {
+            "method": method,
+            "route": path.partition("?")[0],
+            "code": "transport_error",
+            "transport_type": type(reason).__name__,
+            "elapsed_ms": elapsed_ms,
+        }
+        if type(getattr(reason, "errno", None)) is int:
+            record["errno"] = reason.errno
+        return cls(record)
+
+
 def gcs_bearer(project, minimum_seconds=1800):
     """Require enough remaining lifetime; never persist helper output/errors."""
     try:
@@ -781,7 +842,7 @@ def main():
                 check=False,
             )
             container = None
-        if process is not None and process.poll() is None:
+        if (process is not None and process.poll() is None) or container is not None:
             process.terminate()
             try:
                 process.wait(timeout=30)
@@ -805,13 +866,24 @@ def main():
                 raw = response.read()
                 value = json.loads(raw) if raw else None
         except urllib.error.HTTPError as exc:
-            # Avoid echoing arbitrary server/provider bodies into task output.
-            detail = exc.read().decode(errors="replace")
-            if token:
-                detail = detail.replace(token, "[redacted]")
-            raise RuntimeError(
-                f"{method} {path}: HTTP {exc.code}: {detail[:1000]}"
-            ) from exc
+            failure = RequestFailure.http(
+                method,
+                path,
+                exc.code,
+                exc.read(4096),
+                round((time.monotonic() - request_started) * 1000, 2),
+            )
+            print(json.dumps({"failed_request": failure.record}), flush=True)
+            raise failure from None
+        except (urllib.error.URLError, OSError) as exc:
+            failure = RequestFailure.transport(
+                method,
+                path,
+                exc,
+                round((time.monotonic() - request_started) * 1000, 2),
+            )
+            print(json.dumps({"failed_request": failure.record}), flush=True)
+            raise failure from None
         print(
             json.dumps(
                 {
@@ -884,7 +956,11 @@ def main():
         metrics_before = lake_metrics() if serial_profile else None
         before = resource_counters()
         started = time.monotonic()
-        result = call("POST", path, query)
+        try:
+            result = call("POST", path, query)
+        except RequestFailure as failure:
+            failure.record["phase"] = phase
+            raise
         elapsed = round((time.monotonic() - started) * 1000, 2)
         after = resource_counters()
         metrics_after = lake_metrics() if serial_profile else None
@@ -1447,6 +1523,13 @@ def main():
                     (h["_table"], h["_id"], h["_score"]) for h in cold["hits"]["hits"]
                 ]
                 samples = []
+                # Keep both completed workloads and the current partial burst
+                # if a later request fails. Never label it a passing result.
+                composed_benchmarks[name] = {
+                    "complete": False,
+                    "first_search_ms": cold_ms,
+                    "warm_samples_ms": samples,
+                }
                 for _ in range(args.repeats):
                     result, elapsed = timed_query(
                         request, "composed_warm." + name, "/query"
@@ -1459,6 +1542,7 @@ def main():
                 # Read after the burst and before stopping its dedicated process.
                 final_metrics = lake_metrics()
                 composed_benchmarks[name] = {
+                    "complete": True,
                     "first_search_ms": cold_ms,
                     "warm_samples_ms": samples,
                     "warm_p95_ms": sorted(samples)[math.ceil(len(samples) * 0.95) - 1],
@@ -1581,6 +1665,8 @@ def main():
     except Exception as exc:
         # Do not persist arbitrary provider error bodies or credentials.
         failure = {"phase": phase, "exception": type(exc).__name__}
+        if isinstance(exc, RequestFailure):
+            failure["failed_request"] = exc.record
         if "started" in locals():
             failure["elapsed_since_build_start_seconds"] = round(
                 time.monotonic() - started, 2
@@ -1604,6 +1690,7 @@ def main():
             ("build_profile", "build_profile"),
             ("filter_results", "metadata_filters"),
             ("count", "sql_count"),
+            ("composed_benchmarks", "composed_benchmarks"),
         ):
             if name in scope:
                 measurements[target] = scope[name]
@@ -1615,6 +1702,13 @@ def main():
             )
             if phase == "index_build" and "last_status" in build_observed:
                 failure["index_status"] = build_observed["last_status"]
+        # Preserve request-local slow phases before shutdown resets owner
+        # metrics. This bounded observation is outside every query timing.
+        if process is not None and process.poll() is None:
+            try:
+                failure["lake_metrics_after_failure"] = lake_metrics()
+            except Exception as metrics_error:
+                failure["metrics_collection_error"] = type(metrics_error).__name__
         (args.state / "failure.json").write_text(json.dumps(failure, indent=2) + "\n")
         raise
     finally:
