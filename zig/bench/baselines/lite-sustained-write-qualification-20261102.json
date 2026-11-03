@@ -4888,5 +4888,106 @@
       "seconds": 36.04872883402277
     }
   },
-  "priority": "User requested testing whether this branch fixes issue1431 first. Run candidate-only original three-writer/status reproduction, then full15 corpus and data/index/storage checks. Defer common-control builds and broad soaks until that gate passes."
+  "priority": "User requested testing whether this branch fixes issue1431 first. Run candidate-only original three-writer/status reproduction, then full15 corpus and data/index/storage checks. Defer common-control builds and broad soaks until that gate passes.",
+  "issue1431_candidate_debug_first": {
+    "source_commit": "e63c0a4ca8d077ec4c4e129b4c21791a1d290068",
+    "runtime_source_commit": "3b417dd180adadd11619a8c275fb512f09cfe7f5",
+    "library_sha256": "e5217fe92cf80c6ce6598cec2a4a46280ae5b5d7a8d195ce1740b0adb30349de",
+    "build_mode": "Debug",
+    "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+    "model_preflight_passed": true,
+    "stronger_contention": {
+      "passed": false,
+      "seconds": 205.51031,
+      "topology": "Three original-importer writers; persistent SQL COUNT reader every 100 ms plus fresh native C API status_only open/status/close every second. This adds a SQL reader and uses a different status admission path from the issue's actual CLI topology.",
+      "writers": [
+        {
+          "input_index": 1,
+          "outcome": "killed after peer failure; incomplete",
+          "exit_code": -9
+        },
+        {
+          "input_index": 2,
+          "outcome": "success",
+          "seconds": 20.54776
+        },
+        {
+          "input_index": 3,
+          "outcome": "failed",
+          "seconds": 202.98964,
+          "exit_code": 1
+        }
+      ],
+      "failure_classification": {
+        "public_error_names": [
+          "FileBusy",
+          "WouldBlock"
+        ],
+        "operation": "SQL INSERT",
+        "unknown_commit_reported": false,
+        "scope": "Public token classification only; no private SQL or corpus text exported."
+      },
+      "sql_reader": {
+        "successful_reads": 105,
+        "active_writer_reads": 104,
+        "busy": 0,
+        "median_seconds": 1.79655,
+        "max_seconds": 3.36399
+      },
+      "native_status_reader": {
+        "successful_reads": 130,
+        "active_writer_reads": 129,
+        "busy": 58,
+        "median_seconds": 0.02444,
+        "max_seconds": 0.08395
+      },
+      "final_file_bytes": 300810240,
+      "qualification_scope": "Confirmed failure of this stronger Debug workload. Not a matched optimized throughput result or the original issue's exact topology. Preserve as unresolved evidence.",
+      "writer_indices": [
+        1,
+        2,
+        3
+      ]
+    },
+    "original_topology": "Pending exact input indices 3/5/10 with actual CLI and no additional SQL reader. Previous stronger run used 1/2/3.",
+    "full15": {
+      "passed": false,
+      "attempted": 8,
+      "successful": 7,
+      "failed_input_index": 7,
+      "failed_input_seconds": 112.12952062487602,
+      "failed_summary": [
+        0,
+        0,
+        1
+      ],
+      "error": "ANTFLY_BUSY: LiteReplayBacklogExceeded",
+      "operation": "batch",
+      "file_bytes_at_failure": 1243435008,
+      "additional_sql_or_status_readers": false,
+      "all_inputs_completed": false,
+      "remaining_inputs_not_run": 7,
+      "scope": "Unchanged importer and original five-second Busy timeout, Debug native library. This is a failed qualification, not proof of the same optimized outcome. Index drain, integrity/reopen and settled byte accounting were not run."
+    },
+    "original_script_verified": {
+      "seed_index": 0,
+      "writer_indices": [
+        3,
+        5,
+        10
+      ],
+      "reader": "actual antfly lite status, then one second sleep",
+      "native_busy_timeout_seconds": 5
+    },
+    "cli_build_followup": {
+      "change": "Use @hasField for compile-time callback existence validation instead of a linear std.meta.fieldIndex traversal; prevents the large storage vtable exceeding Zig's evaluation branch quota. No callback runtime semantics change.",
+      "focused_tests_passed": 2,
+      "skipped": 0,
+      "leaks": 0,
+      "unexpected_error_logs": 0,
+      "full_cli_build": "passed",
+      "cli_sha256": "245c40de0cd7a14a91d65f307c2c2c77b30343eadd102cd85a0465bfa567d2b7",
+      "public_database_status_smoke_passed": true
+    }
+  }
 }
