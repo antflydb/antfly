@@ -158,10 +158,6 @@ pub fn submitView(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIden
 }
 pub fn submitRelation(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, allocators: local.sql_catalog.DdlAllocators, intent: @import("../system_catalog/relations.zig").Intent) !Reply {
     try intent.validate();
-    if (context.sql_command_fence == null) return .{ .legacy = try server.source.systemCatalog(allocators.result, context, switch (intent) {
-        .schema => |value| .{ .relation_schema_mutate = value },
-        .description => |value| .{ .relation_description_mutate = value },
-    }) };
     const relation = @import("../system_catalog/relations.zig");
     return submitIntent(server, identity, context, allocators, .{ .mutation = relation.mutation(intent.guard(), intent.action()) }, null, intent);
 }
@@ -183,7 +179,7 @@ fn submitIntent(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     if (view) |requested| if (observation.expected_revision != requested.expected_revision) return error.InvalidCatalogMutation;
     if (relation) |requested| {
         const prepared = command.sql_relation orelse return error.InvalidCatalogMutation;
-        if (!std.mem.eql(u8, &prepared.intent_digest, &try requested.digest()) or !std.mem.eql(u8, &try native.canonicalDigest("antfly:sql-relation-guard:v1", prepared.guard()), &try native.canonicalDigest("antfly:sql-relation-guard:v1", requested.guard()))) return error.InvalidCatalogMutation;
+        if (!try prepared.matches(requested)) return error.InvalidCatalogMutation;
     } else if (command.sql_relation != null) return error.InvalidCatalogMutation;
     // A faulty/foreign preparer cannot redirect permission or recovery labels.
     if (!try native.matchesViewIntent(scratch, command.sql_view, if (view) |value| value.mutation else null)) return error.InvalidCatalogMutation;

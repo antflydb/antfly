@@ -380,6 +380,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL command fence ordinary catalog DDL journals exact topology outcomes across cold replicas and eviction",
         "SQL command fence guards native catalog and counter effects through cold replay and bounded eviction",
         "SQL command fence remains bound to the authenticated internal HTTP body",
+        "SQL command fence catalog preparation preserves definite naming diagnostics before submission",
         "SQL command fence binds forwarded identities and rejects substitution and unjournaled mutations",
         "sequence catalog allocator commands preserve catalog epochs and exact bounded cold outcomes",
     }) |required| sql_command_fence_audit.addArgs(&.{ "--filter", required });
@@ -758,6 +759,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL catalog ordinary view post effect failures abort publication and journal together",
         "SQL catalog ordinary view outcome decoder preserves object generations and rejects impossible completions",
         "SQL catalog ordinary schema and annotation commands retain exact outcomes across lost replies and cold reopen",
+        "SQL catalog ordinary schema preparation waits for the complete route cut before any admission",
         "SQL catalog ordinary relation faults roll back all definition and annotation effects and retire definite refusals",
         "SQL catalog ordinary relation completion owns response identities before admission and preserves unknown recovery",
     }) |required| ordinary_catalog_audit.addArgs(&.{ "--filter", required });
@@ -766,7 +768,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     ordinary_catalog_run.step.dependOn(&ordinary_catalog_audit.step);
     const ordinary_catalog_step = b.step("antfly-sql-catalog-recovery-test", "Verify authorized scoped DDL, native lost-reply recovery and label-bound public receipts");
     ordinary_catalog_step.dependOn(&ordinary_catalog_run.step);
-    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response" } });
+    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response", "httpx SQL original nullability relaxation" } });
     const sql_command_producer_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = &.{ "SQL command producer native", "HTTP connection", "HTTP sequence sessions", "SQL connection admission", "durable SQL session rejects duplicate savepoint ids", "durable SQL connection execution projection", "distributed txn session preserves numeric tokens" },
@@ -844,6 +846,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     for ([_][]const u8{
         "SQL index DDL drops the exact qualified owner without a catalog snapshot",
         "SQL catalog ALTER submits native schema CAS without client generations",
+        "httpx SQL original nullability relaxation preserves ambiguous metadata results across cold authority recovery",
         "httpx SQL catalog validated declarations require execution authority and preserve native owners across restart",
         "httpx SQL catalog originals commit through native authority and recover topology",
         "httpx SQL catalog diagnostics preserve authority and uncertain commits are not replayed",

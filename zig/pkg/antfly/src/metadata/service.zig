@@ -4285,6 +4285,10 @@ pub fn ensureQueryPopulationDecoderWithContext(service: anytype, bytes: []const 
         try ensureQueryPopulationCapabilityWithContext(service, context);
 }
 
+pub fn ensureSqlCatalogCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_catalog_journal_version);
+}
+
 pub fn ensureSqlPreparedCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
     try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_prepared_lock_handoff_version);
 }

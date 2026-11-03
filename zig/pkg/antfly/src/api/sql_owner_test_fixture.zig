@@ -264,6 +264,9 @@ pub fn waitServingSchemaInScope(ctx: *Context, database: []const u8, namespace: 
     const metadata = http_server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
     const reader = ctx.data.http_server.?.table_reads orelse return error.MissingOwnerReadSource;
     const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    var metadata_version: ?u32 = null;
+    var serving_version: ?u32 = null;
+    var read_error: ?anyerror = null;
     while (platform.time.monotonicNs() < deadline) {
         try ctx.checkDrivers();
         const bytes = metadata.systemCatalog(ctx.alloc, .{ .deadline_ns = deadline }, .{ .resolve_many = lookup }) catch |err| switch (err) {
@@ -278,12 +281,16 @@ pub fn waitServingSchemaInScope(ctx: *Context, database: []const u8, namespace: 
         defer resolved.deinit();
         try resolved.value.validateRelations(lookup);
         if (resolved.value.relations[0]) |relation| {
+            metadata_version = relation.owner.schema_version;
             if (relation.owner.schema_version >= minimum) {
                 const observed = reader.lookup(ctx.alloc, relation.table.name, "", .{
                     .relational_topology_json = "{\"mode\":\"public_schema\"}",
                     .execution_deadline_ns = deadline,
                 }, .read_index) catch |err| switch (err) {
-                    error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.Timeout, error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.TableNotFound, error.IntegrityCatalogChanged, error.CatalogRoutingUnavailable, error.TopologyChanged => null,
+                    error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.Timeout, error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.TableNotFound, error.IntegrityCatalogChanged, error.CatalogRoutingUnavailable, error.TopologyChanged => retry: {
+                        read_error = err;
+                        break :retry null;
+                    },
                     else => return err,
                 };
                 if (observed) |value| {
@@ -293,12 +300,15 @@ pub fn waitServingSchemaInScope(ctx: *Context, database: []const u8, namespace: 
                     defer public.deinit();
                     var schema = try std.json.parseFromSlice(struct { version: u32 }, ctx.alloc, public.value, .{ .ignore_unknown_fields = true });
                     defer schema.deinit();
+                    serving_version = schema.value.version;
+                    read_error = null;
                     if (schema.value.version == relation.owner.schema_version) return .{ .table_id = relation.owner.table_id, .version = schema.value.version };
                 }
             }
         }
         try ctx.io.sleep(.fromMilliseconds(20), .awake);
     }
+    std.debug.print("serving schema timeout table={s}.{s}.{s} minimum={d} metadata={?d} serving={?d} read_error={?} catch_up_started={d} catch_up_completed={d} catch_up_failed={d}\n", .{ database, namespace, name, minimum, metadata_version, serving_version, read_error, ctx.data.provisioned_startup_catch_up_started.load(.acquire), ctx.data.provisioned_startup_catch_up_completed.load(.acquire), ctx.data.provisioned_startup_catch_up_failed.load(.acquire) });
     return error.SqlOwnerSchemaTimeout;
 }
 

@@ -3879,10 +3879,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
         var lease = try self.acquireSchemaBoundOwner(group_id, table_name, descriptor.fence.namespace, context);
         defer lease.deinit();
-        return attestSchemaPreparationAtLease(&lease, table_name, descriptor, inputs, signer, root, context);
+        return self.attestSchemaPreparationAtLease(&lease, table_name, descriptor, inputs, signer, root, context);
     }
 
-    fn attestSchemaPreparationAtLease(lease: *Lease, table_name: []const u8, descriptor: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.PreparationDescriptor, inputs: []const u8, signer: SchemaPreparationSigner, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !SchemaAttestation.SignedPreparation {
+    fn attestSchemaPreparationAtLease(self: *ProvisionedKernelOwnerSource, lease: *Lease, table_name: []const u8, descriptor: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.PreparationDescriptor, inputs: []const u8, signer: SchemaPreparationSigner, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !SchemaAttestation.SignedPreparation {
         const normalized = try platformDeadlineContext(context);
         var cancellation = normalized.cancellation;
         const observed = try lease.owner().schemaOwnerPreparation(table_name, descriptor, inputs, .{
@@ -3892,7 +3892,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         });
         const generation = @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(lease.entry.generation) catch return error.SchemaValidationRuntimeRecoveryRequired;
         try context.ensureActive();
-        const signed = try SchemaAttestation.SignedPreparation.sign(observed, signer.identity, signer.reporter_incarnation, signer.authority, generation, root);
+        // An empty namespace has no physical data receipt, even after Raft
+        // completes its initial no-op. Certify the shared prefix independently
+        // rather than inventing a data entry or requiring report index zero.
+        const completed: ?@import("antfly_local_sources").storage_read_consistency.ReadSafetyBarrier.FrozenProof = if (descriptor.authority == .raft) prefix: {
+            const capture = self.read_safety_barrier.vtable.capture_frozen orelse return error.ReadSafetyBarrierUnavailable;
+            const certify = self.read_safety_barrier.vtable.certify_completed_prefix orelse return error.ReadSafetyBarrierUnavailable;
+            const captured = try capture(self.read_safety_barrier.ptr, descriptor.fence.owner_group_id);
+            const actual_index = if (observed.position) |position| actual: {
+                if (position != .raft) return error.InvalidControlReceiptPosition;
+                break :actual position.raft.index;
+            } else 0;
+            const certified = try certify(self.read_safety_barrier.ptr, descriptor.fence.owner_group_id, captured.term, @max(actual_index, captured.applied_index), normalized.deadline_ns, normalized.cancellation);
+            lock(&self.mutex);
+            const retired = lease.entry.retired or lease.entry.closing;
+            self.mutex.unlock();
+            const visible = try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(self.visibleRootGeneration(descriptor.fence.owner_group_id));
+            if (retired or visible != generation) return error.SchemaValidationRuntimeRecoveryRequired;
+            break :prefix certified;
+        } else null;
+        const signed = try SchemaAttestation.SignedPreparation.sign(observed, signer.identity, signer.reporter_incarnation, signer.authority, generation, completed, root);
         try context.ensureActive();
         return signed;
     }
@@ -3970,7 +3989,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer a.free(inputs);
         const descriptor: contract.PreparationDescriptor = .{ .purpose = selection.purpose(), .id = intent.id, .provisional_plan = intent.provisional_plan, .authority = if (signer.authority == .native) .native else .raft, .fence = .{ .role = .schema_validation, .transition_id = intent.transition_id, .attempt = 1, .admission_epoch = identity.value.next_epoch, .owner_group_id = group_id, .peer_group_id = group_id, .namespace = intent.namespace, .catalog_digest = identity.value.catalog_digest } };
         try descriptor.validate();
-        const signed = try attestSchemaPreparationAtLease(&lease, table_name, descriptor, inputs, signer, root, context);
+        const signed = try self.attestSchemaPreparationAtLease(&lease, table_name, descriptor, inputs, signer, root, context);
         return .{ .alloc = a, .inputs = inputs, .signed = signed };
     }
 
@@ -3991,13 +4010,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         try expected.requireBinding(prepared.value.binding);
         if (prepared.value.physical_root_incarnation != expected.physical_root_incarnation or
             prepared.proof.root_generation != expected.root_generation) return error.SchemaValidationRuntimeRecoveryRequired;
-        const certify = self.read_safety_barrier.vtable.certify_completed_prefix orelse return error.ReadSafetyBarrierUnavailable;
-        const normalized = try platformDeadlineContext(context);
-        const actual_index = if (prepared.value.position) |cut| blk: {
-            if (cut != .raft) return error.InvalidControlReceiptPosition;
-            break :blk cut.raft.index;
-        } else 0;
-        const completed = try certify(self.read_safety_barrier.ptr, group_id, expected.reported_term, @max(actual_index, expected.reported_applied_index), normalized.deadline_ns, normalized.cancellation);
+        // Initial admission and root recovery share the same certified
+        // physical preparation. Do not issue a second quorum read here.
+        const completed = prepared.completed orelse return error.ReadSafetyBarrierUnavailable;
+        // A new leader term or a report ahead of this captured prefix needs a
+        // fresh scope, not a permanently invalid recovery receipt.
+        if (completed.term > expected.reported_term or completed.applied_index < expected.reported_applied_index)
+            return error.IndexOwnerReceiptChanged;
         lock(&self.mutex);
         const retired = lease.entry.retired or lease.entry.closing;
         self.mutex.unlock();

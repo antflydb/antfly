@@ -57,16 +57,21 @@ pub const SignedPreparation = struct {
     pub const max_wire_bytes = 16 * 1024;
     value: job.Preparation,
     proof: PreparationProof,
+    completed: ?local.storage_read_consistency.ReadSafetyBarrier.FrozenProof = null,
 
     pub fn evidenceDigest(self: @This()) !Digest {
         try self.value.validate();
         if (self.value.replication_pending) return error.ReplicationPublisherUnavailable;
+        if (self.completed) |completed| {
+            if (self.value.binding.authority != .raft or completed.incarnation == 0 or completed.term == 0 or completed.applied_index == 0) return error.InvalidControlReceiptPosition;
+            if (self.value.position) |position| if (position != .raft or position.raft.term > completed.term or position.raft.index > completed.applied_index) return error.InvalidControlReceiptPosition;
+        }
         var intent = self.value;
         intent.binding.plan_digest = @splat(0);
-        return hashValue("antfly/schema-validation-prepared-physical-cut/v1", intent);
+        return hashValue("antfly/schema-validation-prepared-physical-cut/v2", .{ .preparation = intent, .completed = self.completed });
     }
-    pub fn sign(value: job.Preparation, identity: @import("store_root_enrollment.zig").Identity, reporter: u64, authority: roots.Authority, generation: u64, root: local.storage_db_root_signing_identity.State) !@This() {
-        var result: @This() = .{ .value = value, .proof = .{ .identity = identity, .reporter_incarnation = reporter, .authority = authority, .root_generation = generation, .signature = undefined } };
+    pub fn sign(value: job.Preparation, identity: @import("store_root_enrollment.zig").Identity, reporter: u64, authority: roots.Authority, generation: u64, completed: ?local.storage_read_consistency.ReadSafetyBarrier.FrozenProof, root: local.storage_db_root_signing_identity.State) !@This() {
+        var result: @This() = .{ .value = value, .completed = completed, .proof = .{ .identity = identity, .reporter_incarnation = reporter, .authority = authority, .root_generation = generation, .signature = undefined } };
         if ((value.binding.authority == .native) != (authority == .native)) return error.SchemaValidationJobChanged;
         result.proof = try result.proof.sign(root, try result.evidenceDigest());
         return result;
@@ -428,7 +433,7 @@ test "schema validation attestation preparation discovers roots without creating
     const original = Fixture.observed();
     const scope = try Fixture.scope(original);
     const value: job.Preparation = .{ .binding = original.observation.binding, .physical_root_incarnation = original.observation.physical_root_incarnation, .position = null };
-    const prepared = try SignedPreparation.sign(value, scope.signing.identity, scope.signing.reporter_incarnation, .{ .native = scope.signing.binding_digest }, scope.root_generation, try Fixture.root());
+    const prepared = try SignedPreparation.sign(value, scope.signing.identity, scope.signing.reporter_incarnation, .{ .native = scope.signing.binding_digest }, scope.root_generation, null, try Fixture.root());
     try prepared.verifyFor(value.binding, value.physical_root_incarnation);
     var final_binding = value.binding;
     final_binding.plan_digest = @splat(97);
@@ -456,11 +461,22 @@ test "schema validation attestation preparation discovers roots without creating
     try std.testing.expectError(error.InvalidGenerationPublication, phase_proof.verify(try prepared.evidenceDigest()));
     var raft_value = value;
     raft_value.binding.authority = .raft;
-    const raft = try SignedPreparation.sign(raft_value, scope.signing.identity, scope.signing.reporter_incarnation, .{ .raft = 42 }, scope.root_generation, try Fixture.root());
+    const raft = try SignedPreparation.sign(raft_value, scope.signing.identity, scope.signing.reporter_incarnation, .{ .raft = 42 }, scope.root_generation, null, try Fixture.root());
     try raft.verifyFor(raft_value.binding, raft_value.physical_root_incarnation);
+    const prefix: local.storage_read_consistency.ReadSafetyBarrier.FrozenProof = .{ .incarnation = 91, .term = 2, .applied_index = 9 };
+    const certified = try SignedPreparation.sign(raft_value, scope.signing.identity, scope.signing.reporter_incarnation, .{ .raft = 42 }, scope.root_generation, prefix, try Fixture.root());
+    try certified.verifyFor(raft_value.binding, raft_value.physical_root_incarnation);
+    try std.testing.expect(certified.value.position == null);
+    var forged_prefix = certified;
+    forged_prefix.completed.?.applied_index += 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, forged_prefix.verifyFor(raft_value.binding, raft_value.physical_root_incarnation));
+    try std.testing.expectError(error.InvalidControlReceiptPosition, SignedPreparation.sign(value, scope.signing.identity, scope.signing.reporter_incarnation, .{ .native = scope.signing.binding_digest }, scope.root_generation, prefix, try Fixture.root()));
     raft_value.position = .{ .raft = .{ .term = 2, .index = 8 } };
-    const nonempty = try SignedPreparation.sign(raft_value, scope.signing.identity, scope.signing.reporter_incarnation, .{ .raft = 42 }, scope.root_generation, try Fixture.root());
+    const nonempty = try SignedPreparation.sign(raft_value, scope.signing.identity, scope.signing.reporter_incarnation, .{ .raft = 42 }, scope.root_generation, null, try Fixture.root());
     try nonempty.verifyFor(raft_value.binding, raft_value.physical_root_incarnation);
+    var behind = prefix;
+    behind.applied_index = 7;
+    try std.testing.expectError(error.InvalidControlReceiptPosition, SignedPreparation.sign(raft_value, scope.signing.identity, scope.signing.reporter_incarnation, .{ .raft = 42 }, scope.root_generation, behind, try Fixture.root()));
 }
 
 test "schema validation attestation Raft evidence binds actual cuts and rejects foreign roots and clock domains" {

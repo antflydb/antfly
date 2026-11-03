@@ -754,6 +754,7 @@ fn rewriteCallFailure(receipt: catalog.DdlReceipt, err: anyerror, submitted: boo
     if (!submitted) return switch (err) {
         error.StoredDestinationAuthorizationRevoked => error.Forbidden,
         error.GroupLeaderUnavailable => error.RestoreValidationPending,
+        error.RelationalRewriteTypeChange => error.UnsupportedSqlShape,
         else => err,
     };
     // These errors are emitted before startRecoverable. Other errors may
@@ -1654,8 +1655,30 @@ test "SQL catalog DDL schema validates through native public admission" {
     try std.testing.expectEqualStrings("9007199254740993.2500", row.object.get("exact_amount").?.number_string);
 }
 
+// Transport doubles below retain their statement-specific schema assertions.
+// Preparation is read-only; their single simulated mutation runs only after
+// the dispatcher has bound the complete journal command and response storage.
+fn prepareRelationTestCommand(a: std.mem.Allocator, input: @import("../system_catalog/catalog_mutations.zig").Preparation, schema: []const u8) ![]u8 {
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const intent = input.relation.?;
+    const request = intent.schema;
+    const before: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = request.guard.owner.table_id, .name = "table:immutable-17", .schema_json = schema };
+    const after = try tables.applySchemaMutationRecord(scratch, &before, .replace, request.schema_json);
+    const command: @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand = .{ .expected_revision = 9, .mutation = input.request.mutation, .sql_relation = .{ .intent_digest = try intent.digest(), .change = .{ .definition = .{ .guard = request.guard, .expected = try @import("../system_catalog/relations.zig").tableDigest(before), .table = after } } }, .sql_catalog_admission = .{ .request = .{ .nonce = input.nonce, .head = 0, .command_fence = input.command_fence }, .incarnation = request.guard.incarnation } };
+    return std.json.Stringify.valueAlloc(a, command, .{});
+}
+fn relationTestReply(a: std.mem.Allocator, command: @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand, bytes: []const u8) ![]u8 {
+    const version = std.json.parseFromSlice(@import("../system_catalog/server_call.zig").RelationReplacementResult, a, bytes, .{}) catch return a.dupe(u8, "null");
+    defer version.deinit();
+    if (version.value.schema_version != command.sql_relation.?.guard().owner.schema_version + 1) return a.dupe(u8, "null");
+    return std.json.Stringify.valueAlloc(a, @import("../system_catalog/catalog_mutations.zig").Outcome{ .success = .{ .revision = command.expected_revision + 1, .identity = null, .removed = 0 } }, .{});
+}
+
 test "SQL index DDL drops the exact qualified owner without a catalog snapshot" {
     const Source = struct {
+        prepared: ?@import("../system_catalog/server_call.zig").RelationSchemaMutation = null,
         present: bool = true,
         attested: bool = true,
         invalid_reply: bool = false,
@@ -1673,6 +1696,21 @@ test "SQL index DDL drops the exact qualified owner without a catalog snapshot" 
         }
         fn run(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .sql_catalog_prepare) {
+                self.prepared = call.sql_catalog_prepare.relation.?.schema;
+                return prepareRelationTestCommand(alloc, call.sql_catalog_prepare, schema);
+            }
+            if (call == .sql_catalog_outcome) return alloc.dupe(u8, "null");
+            if (call == .sql_catalog_mutate) {
+                const request = self.prepared orelse return error.MissingPreparedRelation;
+                self.prepared = null;
+                const reply = run(raw, alloc, context, .{ .relation_schema_mutate = request }) catch |err| {
+                    const outcome = @import("../system_catalog/catalog_mutations.zig").Outcome.fromError(err) orelse return err;
+                    return std.json.Stringify.valueAlloc(alloc, outcome, .{});
+                };
+                defer alloc.free(reply);
+                return relationTestReply(alloc, call.sql_catalog_mutate, reply);
+            }
             if (call == .resolve_many) {
                 self.reads += 1;
                 const request = call.resolve_many;
@@ -1712,11 +1750,13 @@ test "SQL index DDL drops the exact qualified owner without a catalog snapshot" 
             return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").RelationReplacementResult{ .schema_version = self.reply_version }, .{});
         }
     };
-    const alloc = std.testing.allocator;
+    var command_results: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer command_results.deinit();
+    const alloc = command_results.allocator();
     var source: Source = .{};
     // No admin_snapshot or mutate_schema callback: ordinary index DDL must
     // use the captured relation and the metadata owner's table-local prepare.
-    var server = server_mod.ApiHttpServer.init(alloc, .{}, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run, .supports_query_definitions = true } }, null, null);
+    var server = server_mod.ApiHttpServer.init(alloc, .{ .imported_runtime_io = .{ .api = std.testing.io } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run, .supports_query_definitions = true } }, null, null);
     defer server.deinit();
     var statement = try @import("antfly_local_sources").sql_compiler.compile(alloc, "DROP INDEX tenant.items_id", .{});
     defer statement.deinit();
@@ -1744,11 +1784,11 @@ test "SQL index DDL drops the exact qualified owner without a catalog snapshot" 
     source.attested = true;
     source.present = true;
     source.invalid_reply = true;
-    try std.testing.expectError(error.SqlMutationOutcomeUnknown, execute(&server, null, .{}, "default", "public", alloc, input));
+    try std.testing.expectEqual(.unknown, (try execute(&server, null, .{}, "default", "public", alloc, input)).catalog_receipt.?.state);
     try std.testing.expectEqual(@as(usize, 2), source.writes);
     source.invalid_reply = false;
     source.reply_version = 7;
-    try std.testing.expectError(error.SqlMutationOutcomeUnknown, execute(&server, null, .{}, "default", "public", alloc, input));
+    try std.testing.expectEqual(.unknown, (try execute(&server, null, .{}, "default", "public", alloc, input)).catalog_receipt.?.state);
     try std.testing.expectEqual(@as(usize, 3), source.writes);
     var path: SearchPath = .{};
     try path.append(try @import("../pgwire/search_path.zig").Namespace.init("public"));
@@ -2279,6 +2319,7 @@ test "SQL catalog recovery receipt allocation failures reject before mutation ad
 
 test "SQL catalog ALTER submits native schema CAS without client generations" {
     const Source = struct {
+        prepared: ?@import("../system_catalog/server_call.zig").RelationSchemaMutation = null,
         updates: usize = 0,
         table_lookup: bool = false,
         wrong_kind: bool = false,
@@ -2306,6 +2347,22 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
         }
         fn run(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .schema_validation_prepare) return error.UnsupportedSqlExecution;
+            if (call == .sql_catalog_prepare) {
+                self.prepared = call.sql_catalog_prepare.relation.?.schema;
+                return prepareRelationTestCommand(alloc, call.sql_catalog_prepare, self.schema());
+            }
+            if (call == .sql_catalog_outcome) return alloc.dupe(u8, "null");
+            if (call == .sql_catalog_mutate) {
+                const request = self.prepared orelse return error.MissingPreparedRelation;
+                self.prepared = null;
+                const reply = run(raw, alloc, context, .{ .relation_schema_mutate = request }) catch |err| {
+                    const outcome = @import("../system_catalog/catalog_mutations.zig").Outcome.fromError(err) orelse return err;
+                    return std.json.Stringify.valueAlloc(alloc, outcome, .{});
+                };
+                defer alloc.free(reply);
+                return relationTestReply(alloc, call.sql_catalog_mutate, reply);
+            }
             if (call == .relation_schema_mutate) {
                 self.mutation_attempts += 1;
                 try std.testing.expect(context.setting_admin);
@@ -2376,9 +2433,11 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
             return .{ .version = 8, .schema_json = try alloc.dupe(u8, body) };
         }
     };
-    const alloc = std.testing.allocator;
+    var command_results: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer command_results.deinit();
+    const alloc = command_results.allocator();
     var source: Source = .{};
-    var server = server_mod.ApiHttpServer.init(alloc, .{}, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run, .supports_query_definitions = true } }, null, null);
+    var server = server_mod.ApiHttpServer.init(alloc, .{ .imported_runtime_io = .{ .api = std.testing.io } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run, .supports_query_definitions = true } }, null, null);
     defer server.deinit();
     for ([_][]const u8{ "CREATE INDEX items_id ON items (id)", "ALTER TABLE items ADD COLUMN label TEXT", "CREATE INDEX expression_key ON items ((id + 1) DESC NULLS LAST) WHERE id > 0 AND id < 100" }) |sql| {
         var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, sql, .{});
@@ -2415,7 +2474,7 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
         try std.testing.expectEqual(@as(usize, 4), source.updates);
     }
     // SET NOT NULL uses the retained validation scan rather than a rewrite.
-    // This metadata-only fixture has no native reader or shared Io provider.
+    // This metadata-only fixture has no native reader or schema coordinator.
     var not_null = try @import("antfly_local_sources").sql_compiler.compile(alloc, "ALTER TABLE items ALTER COLUMN id SET NOT NULL", .{});
     defer not_null.deinit();
     try std.testing.expectError(error.UnsupportedSqlExecution, execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = not_null.statement.catalog_ddl }));
@@ -2538,7 +2597,7 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     try std.testing.expectEqualStrings("__lake_publication", lake_server.index_installation_queue.items[0].index_name);
     const admitted_generation = lake_server.index_installation_queue.items[0].generation;
     source.uncertain = true;
-    try std.testing.expectError(error.SqlMutationOutcomeUnknown, execute(&lake_server, null, .{}, "default", "public", alloc, scoped_input));
+    try std.testing.expectEqual(.unknown, (try execute(&lake_server, null, .{}, "default", "public", alloc, scoped_input)).catalog_receipt.?.state);
     try std.testing.expectEqual(@as(usize, 0), lake_server.index_installation_reserved_slots);
     try std.testing.expectEqual(admitted_generation, lake_server.index_installation_queue.items[0].generation);
 }
@@ -2971,7 +3030,7 @@ test "SQL catalog conditional CREATE does not hide an absent-table name conflict
     defer arena.deinit();
     const a = arena.allocator();
     var source: Source = .{};
-    var server = server_mod.ApiHttpServer.init(alloc, .{}, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run, .supports_query_definitions = true } }, null, null);
+    var server = server_mod.ApiHttpServer.init(alloc, .{ .imported_runtime_io = .{ .api = std.testing.io } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run, .supports_query_definitions = true } }, null, null);
     defer server.deinit();
     const target: domain.Target = .{ .database = "default", .namespace = "tenant", .table = "foo" };
     const selected = .{ .names = &[_][]const u8{"foo_pkey3"} };
@@ -3008,6 +3067,7 @@ test "SQL catalog conditional CREATE does not hide an absent-table name conflict
 test "SQL concurrent index admission owns uncertain receipts and guards fenced UNIQUE before mutation" {
     // sql-0707, sql-0725: uncertain admission owns a handle before any proposal.
     const Source = struct {
+        prepared: ?@import("../system_catalog/server_call.zig").RelationSchemaMutation = null,
         proposals: usize = 0,
         resolutions: usize = 0,
         index_lookup: bool = false,
@@ -3020,6 +3080,21 @@ test "SQL concurrent index admission owns uncertain receipts and guards fenced U
         }
         fn run(raw: *anyopaque, a: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .sql_catalog_prepare) {
+                self.prepared = call.sql_catalog_prepare.relation.?.schema;
+                return prepareRelationTestCommand(a, call.sql_catalog_prepare, schema_json);
+            }
+            if (call == .sql_catalog_outcome) return a.dupe(u8, "null");
+            if (call == .sql_catalog_mutate) {
+                const request = self.prepared orelse return error.MissingPreparedRelation;
+                self.prepared = null;
+                const reply = run(raw, a, context, .{ .relation_schema_mutate = request }) catch |err| {
+                    const outcome = @import("../system_catalog/catalog_mutations.zig").Outcome.fromError(err) orelse return err;
+                    return std.json.Stringify.valueAlloc(a, outcome, .{});
+                };
+                defer a.free(reply);
+                return relationTestReply(a, call.sql_catalog_mutate, reply);
+            }
             switch (call) {
                 .resolve_many => |request| {
                     self.resolutions += 1;
@@ -3046,9 +3121,11 @@ test "SQL concurrent index admission owns uncertain receipts and guards fenced U
             }
         }
     };
-    const a = std.testing.allocator;
+    var command_results: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer command_results.deinit();
+    const a = command_results.allocator();
     var source: Source = .{};
-    var server = server_mod.ApiHttpServer.init(a, .{}, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run, .supports_query_definitions = true } }, null, null);
+    var server = server_mod.ApiHttpServer.init(a, .{ .imported_runtime_io = .{ .api = std.testing.io } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run, .supports_query_definitions = true } }, null, null);
     defer server.deinit();
     var compiled = try @import("antfly_local_sources").sql_compiler.compile(a, "CREATE INDEX CONCURRENTLY items_status ON items(status) WHERE status='pending'", .{});
     defer compiled.deinit();
@@ -3068,8 +3145,8 @@ test "SQL concurrent index admission owns uncertain receipts and guards fenced U
         try std.testing.expectEqual(@as(u32, 8), receipt.schema_version);
         try std.testing.expect(std.mem.indexOf(u8, receipt.diagnostic.?, "do not replay") != null);
     }
-    source.failure = error.SchemaVersionChanged;
-    try std.testing.expectError(error.SchemaVersionChanged, execute(&server, null, .{}, "default", "public", a, input));
+    source.failure = error.CatalogGenerationChanged;
+    try std.testing.expectError(error.CatalogGenerationChanged, execute(&server, null, .{}, "default", "public", a, input));
     source.index_lookup = true;
     source.failure = error.MetadataMutationOutcomeUnknown;
     var dropping = try @import("antfly_local_sources").sql_compiler.compile(a, "DROP INDEX CONCURRENTLY old_status", .{});

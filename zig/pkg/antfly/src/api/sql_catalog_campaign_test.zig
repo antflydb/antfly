@@ -47,13 +47,19 @@ const NativeOwner = struct {
         const self: *NativeOwner = @ptrCast(@alignCast(raw));
         switch (call) {
             .resolve_many => self.resolutions += 1,
-            .relation_schema_mutate => self.mutations += 1,
+            .sql_catalog_mutate => |command| if (command.sql_relation != null) {
+                self.mutations += 1;
+            },
             .snapshot => return error.UnexpectedCatalogSnapshot,
             else => {},
         }
-        const fault = if (call == .relation_schema_mutate) self.fault else .none;
-        if (call == .relation_schema_mutate) self.fault = .none;
-        if (fault == .reject_before) return error.CatalogGenerationChanged;
+        if (call == .sql_catalog_prepare and call.sql_catalog_prepare.relation != null and self.fault == .reject_before) {
+            self.fault = .none;
+            return error.CatalogGenerationChanged;
+        }
+        const relation_command = call == .sql_catalog_mutate and call.sql_catalog_mutate.sql_relation != null;
+        const fault = if (relation_command) self.fault else .none;
+        if (relation_command) self.fault = .none;
         const response = try @import("../system_catalog/operations.zig").call(self.svc, a, context, call);
         switch (fault) {
             .none => return response,
@@ -68,9 +74,10 @@ const NativeOwner = struct {
             },
             .wrong_version_after => {
                 defer a.free(response);
-                var result = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").RelationReplacementResult, a, response, .{});
+                var result = try std.json.parseFromSlice(@import("../system_catalog/catalog_mutations.zig").Outcome, a, response, .{});
                 defer result.deinit();
-                result.value.schema_version += 1;
+                try std.testing.expect(result.value == .success);
+                result.value.success.revision += 1;
                 return std.json.Stringify.valueAlloc(a, result.value, .{});
             },
         }
@@ -309,13 +316,25 @@ test "httpx SQL original nullability relaxation preserves ambiguous metadata res
         owner.fault = fault;
         var response = try request(a, &handler, original.sql);
         defer response.deinit();
-        if (response.status.code != 409) std.debug.print("metadata relaxation fault={s} status={d} body={s}\n", .{ @tagName(fault), response.status.code, response.body orelse "" });
-        try std.testing.expectEqual(@as(u16, 409), response.status.code);
-        var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, a, response.body.?, .{});
-        defer diagnostic.deinit();
-        try std.testing.expectEqualStrings(if (fault == .reject_before) "40001" else "40003", diagnostic.value.code);
-        try std.testing.expectEqual(@as(?bool, fault == .reject_before), diagnostic.value.retryable);
-        try std.testing.expectEqual(attempts + 1, owner.mutations);
+        var recovery_token: ?[]u8 = null;
+        defer if (recovery_token) |token| a.free(token);
+        if (fault == .reject_before) {
+            try std.testing.expectEqual(@as(u16, 409), response.status.code);
+            var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, a, response.body.?, .{});
+            defer diagnostic.deinit();
+            try std.testing.expectEqualStrings("40001", diagnostic.value.code);
+            try std.testing.expectEqual(@as(?bool, true), diagnostic.value.retryable);
+        } else {
+            if (response.status.code != 200 and response.status.code != 202) std.debug.print("metadata relaxation fault={s} status={d} body={s}\n", .{ @tagName(fault), response.status.code, response.body orelse "" });
+            try std.testing.expect(response.status.code == 200 or response.status.code == 202);
+            var result = try std.json.parseFromSlice(wire.SQLResponse, a, response.body.?, .{});
+            defer result.deinit();
+            const receipt = result.value.catalog_receipt orelse return error.MissingCatalogReceipt;
+            try std.testing.expectEqual(.committed, receipt.state);
+            recovery_token = try a.dupe(u8, receipt.recovery_token);
+        }
+        const admitted: usize = @intFromBool(fault != .reject_before);
+        try std.testing.expectEqual(attempts + admitted, owner.mutations);
         try std.testing.expectEqual(.none, owner.fault);
         try settleNativeOwner(&svc, "after metadata response fault");
         var after = try resolveNativeOwner(a, &svc);
@@ -341,7 +360,12 @@ test "httpx SQL original nullability relaxation preserves ambiguous metadata res
         try std.testing.expect(current.owner.eql(actual.owner));
         try std.testing.expectEqualStrings(current.table.query_definition.?.schema_json, actual.table.query_definition.?.schema_json);
         try std.testing.expectEqualSlices(u8, &after.relation_epoch.?.incarnation, &recovered.relation_epoch.?.incarnation);
-        try std.testing.expectEqual(attempts + 1, owner.mutations); // Cold observation never resubmits.
+        if (recovery_token) |token| {
+            const receipt = (try @import("sql_ordinary_catalog.zig").recoverIfOrdinary(&server, null, .{}, a, token)) orelse return error.MissingCatalogReceipt;
+            defer receipt.deinit(a);
+            try std.testing.expectEqual(.committed, receipt.state);
+        }
+        try std.testing.expectEqual(attempts + admitted, owner.mutations); // Cold observation never resubmits.
     }
 }
 

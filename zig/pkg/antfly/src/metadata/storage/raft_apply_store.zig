@@ -5902,7 +5902,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             // Actual current enrollment/report authority for both a real
             // nonempty native cut and the explicitly certified empty cut.
             for ([_]bool{ false, true }) |empty| {
-                const prepared = try attestation.SignedPreparation.sign(.{ .binding = owner.binding, .physical_root_incarnation = 97, .position = if (empty) null else .{ .raft = .{ .term = source_parent.value.origin.applied.?.term, .index = source_parent.value.origin.applied.?.index } } }, scope.identity, scope.reporter_incarnation, .{ .raft = scope.replica_id }, scope.root_generation, root);
+                const prepared = try attestation.SignedPreparation.sign(.{ .binding = owner.binding, .physical_root_incarnation = 97, .position = if (empty) null else .{ .raft = .{ .term = source_parent.value.origin.applied.?.term, .index = source_parent.value.origin.applied.?.index } } }, scope.identity, scope.reporter_incarnation, .{ .raft = scope.replica_id }, scope.root_generation, null, root);
                 const boot = try @import("../schema_validation_bootstrap.zig").CertifiedPreparation.sign(prepared, source_parent.value.completed, scope, root);
                 try context.verifyBootstrap(txn, head, owner, boot);
                 var behind = current;
@@ -6067,7 +6067,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             break :blk .{ .raft = value };
         };
         const Fault = enum { none, signature, binding, reporter, root_generation, reader_role, reader_unknown, source_namespace, source_mode, source_unknown, future_cut };
-        const preparation = try attestation.SignedPreparation.sign(.{ .binding = binding, .physical_root_incarnation = 17, .position = cut }, proof.identity, proof.reporter_incarnation, proof.authority, proof.root_generation, root);
+        const preparation = try attestation.SignedPreparation.sign(.{ .binding = binding, .physical_root_incarnation = 17, .position = cut }, proof.identity, proof.reporter_incarnation, proof.authority, proof.root_generation, null, root);
         const parent: ?attestation.SignedSnapshotParent = if (binding.authority == .raft) try attestation.SignedSnapshotParent.sign(.{
             .binding = binding,
             .origin = .{ .physical_root_incarnation = 17, .namespace = owner.namespace, .authority = current.runtime_statuses[0].source_authority, .applied = .{ .term = cut.raft.term, .index = cut.raft.index }, .schema_header = null, .transaction_directory = null, .schema_outcomes = null },
@@ -6216,7 +6216,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             };
             const permission_owner: @import("../schema_validation_publication.zig").Owner = .{ .ordinal = 0, .binding = permission_binding, .physical_root_incarnation = 17 };
             try permission_owner.validate(head);
-            const retained = try attestation.SignedPreparation.sign(.{ .binding = permission_binding, .physical_root_incarnation = 17, .position = cut }, proof.identity, proof.reporter_incarnation, proof.authority, proof.root_generation, root);
+            const retained = try attestation.SignedPreparation.sign(.{ .binding = permission_binding, .physical_root_incarnation = 17, .position = cut }, proof.identity, proof.reporter_incarnation, proof.authority, proof.root_generation, null, root);
             const preparation_key: schema_validation.Key = .{ .group = group, .table = head.table_id, .id = head.id, .kind = .preparation };
             const encoded_preparation = try schema_validation.PreparationRecord.init(retained);
             try txn.put(try preparation_key.encode(&key_buf), encoded_preparation.slice());
@@ -6230,7 +6230,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 restarted.reporter_incarnation += 1;
                 _ = try store.updateListingStoreTxn(&txn, group, current.store_id, restarted);
                 try std.testing.expectError(error.IndexOwnerReceiptChanged, authority.authorize(&txn, head, permission_owner, .begin));
-                const fresh = try attestation.SignedPreparation.sign(retained.value, proof.identity, restarted.reporter_incarnation, proof.authority, proof.root_generation, root);
+                const fresh = try attestation.SignedPreparation.sign(retained.value, proof.identity, restarted.reporter_incarnation, proof.authority, proof.root_generation, null, root);
                 var resumed: RaftApplyStore.SchemaValidationOwnerReadContext = .{ .store = store, .group = group, .witness = .{ .preparation = fresh } };
                 try resumed.authorize(&txn, head, permission_owner, .begin);
                 var bad = fresh;
@@ -6438,6 +6438,20 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             empty.value.position = null;
             empty.proof = try empty.proof.sign(root, try empty.evidenceDigest());
             try std.testing.expectError(error.IndexOwnerReceiptChanged, store.verifySchemaValidationPreparationTxn(&txn, group, binding, 17, empty, null));
+            if (binding.authority == .raft) {
+                // A real completed no-op does not create a data marker. Admit
+                // only its independently signed completed prefix, and recheck
+                // the current reporter's bounds in this accepting transaction.
+                var certified = empty;
+                certified.completed = .{ .incarnation = 91, .term = current.group_statuses[0].raft_term, .applied_index = current.group_statuses[0].raft_applied_index };
+                certified.proof = try certified.proof.sign(root, try certified.evidenceDigest());
+                try store.verifySchemaValidationPreparationTxn(&txn, group, binding, 17, certified, null);
+                var forged = certified;
+                forged.completed.?.applied_index += 1;
+                try std.testing.expectError(error.InvalidGenerationPublication, store.verifySchemaValidationPreparationTxn(&txn, group, binding, 17, forged, null));
+                forged.proof = try forged.proof.sign(root, try forged.evidenceDigest());
+                try std.testing.expectError(error.IndexOwnerReceiptChanged, store.verifySchemaValidationPreparationTxn(&txn, group, binding, 17, forged, null));
+            }
             var reporter = current;
             var runtimes = [_]metadata.RuntimeGroupStatusReport{current.runtime_statuses[0]};
             runtimes[0].source_authority.?.sequence = 0;
@@ -23736,7 +23750,7 @@ pub const RaftApplyStore = struct {
         allow_empty_preparation: bool = false,
         /// Only an independently signed native view with a certified shared
         /// prefix may have a genuinely empty data cut below that prefix.
-        allow_empty_snapshot_cut: bool = false,
+        allow_empty_data_cut: bool = false,
         completed: ?@import("antfly_local_sources").storage_read_consistency.ReadSafetyBarrier.FrozenProof = null,
     };
 
@@ -23746,7 +23760,7 @@ pub const RaftApplyStore = struct {
     /// No schema-validation receipt is converted into an index-build receipt.
     fn requireOwnerRootProofTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, owner: @import("../store_root_attestation.zig").OwnerScope, cut: ?@import("antfly_local_sources").storage_db_receipt_position.Position, proof: anytype, requirements: ?@import("antfly_local_sources").common_schema_readers.ReaderRequirements, options: OwnerRootProofOptions) !void {
         try owner.validate();
-        if (options.allow_empty_snapshot_cut and (cut != null or options.completed == null or owner.authority != .raft)) return error.InvalidControlReceiptPosition;
+        if (options.allow_empty_data_cut and (cut != null or options.completed == null or owner.authority != .raft)) return error.InvalidControlReceiptPosition;
         if (cut) |position| try position.requireNamespace(owner.namespace) else if (!options.allow_empty_preparation) return error.InvalidControlReceiptPosition;
         if (owner.authority != switch (proof.authority) {
             .native => @FieldType(@import("../store_root_attestation.zig").OwnerScope, "authority").native,
@@ -23826,7 +23840,7 @@ pub const RaftApplyStore = struct {
                 }
                 if (cut) |position| {
                     if (status.raft_applied_index < position.raft.index or status.raft_term < position.raft.term) return error.IndexOwnerReceiptChanged;
-                } else if (status.raft_applied_index != 0 and !options.allow_empty_snapshot_cut) return error.IndexOwnerReceiptChanged;
+                } else if (status.raft_applied_index != 0 and !options.allow_empty_data_cut) return error.IndexOwnerReceiptChanged;
             },
             .native => {
                 if (options.completed != null) return error.IndexOwnerReceiptChanged;
@@ -23851,7 +23865,7 @@ pub const RaftApplyStore = struct {
             .group_id = binding.fence.owner_group_id,
             .namespace = binding.fence.namespace,
             .authority = binding.authority,
-        }, signed.value.position, signed.proof, requirements, .{ .require_source_authority = true, .allow_empty_preparation = true });
+        }, signed.value.position, signed.proof, requirements, .{ .require_source_authority = true, .allow_empty_preparation = true, .allow_empty_data_cut = signed.value.position == null and signed.completed != null, .completed = signed.completed });
     }
 
     /// Pre-transfer source authentication for a durable parent grant. A later
@@ -23867,7 +23881,7 @@ pub const RaftApplyStore = struct {
         }, cut, signed.proof, requirements, .{
             .require_source_authority = true,
             .allow_empty_preparation = true,
-            .allow_empty_snapshot_cut = cut == null,
+            .allow_empty_data_cut = cut == null,
             .completed = signed.value.completed,
         });
     }
@@ -24840,7 +24854,7 @@ pub const RaftApplyStore = struct {
                             .group_id = owner.binding.fence.owner_group_id,
                             .namespace = owner.binding.fence.namespace,
                             .authority = owner.binding.authority,
-                        }, fresh.value.position, fresh.proof, head.reader_requirements, .{ .cleanup = action == .cancel, .require_source_authority = true, .allow_empty_preparation = true });
+                        }, fresh.value.position, fresh.proof, head.reader_requirements, .{ .cleanup = action == .cancel, .require_source_authority = true, .allow_empty_preparation = true, .allow_empty_data_cut = fresh.value.position == null and fresh.completed != null, .completed = fresh.completed });
                     },
                     .observation => |fresh| {
                         _ = try schema_validation.verified(fresh, owner);
@@ -24904,7 +24918,7 @@ pub const RaftApplyStore = struct {
                         .cleanup = action == .cancel,
                         .require_source_authority = true,
                         .allow_empty_preparation = true,
-                        .allow_empty_snapshot_cut = signed.preparation.value.position == null,
+                        .allow_empty_data_cut = signed.preparation.value.position == null,
                         .completed = signed.completed,
                     });
                     return;
@@ -24927,7 +24941,7 @@ pub const RaftApplyStore = struct {
                 .group_id = owner.binding.fence.owner_group_id,
                 .namespace = owner.binding.fence.namespace,
                 .authority = owner.binding.authority,
-            }, preparation.value.position, preparation.proof, head.reader_requirements, .{ .cleanup = action == .cancel, .require_source_authority = true, .allow_empty_preparation = true });
+            }, preparation.value.position, preparation.proof, head.reader_requirements, .{ .cleanup = action == .cancel, .require_source_authority = true, .allow_empty_preparation = true, .allow_empty_data_cut = preparation.value.position == null and preparation.completed != null, .completed = preparation.completed });
         }
     };
 
@@ -25536,7 +25550,7 @@ pub const RaftApplyStore = struct {
                 .cleanup = head.phase == .canceling and head.install_revision == 0,
                 .require_source_authority = true,
                 .allow_empty_preparation = true,
-                .allow_empty_snapshot_cut = signed.preparation.value.position == null,
+                .allow_empty_data_cut = signed.preparation.value.position == null,
                 .completed = signed.completed,
             });
         }
@@ -27438,18 +27452,14 @@ pub const RaftApplyStore = struct {
                 // Prepared schema deltas cannot edit unrelated placement,
                 // storage, presentation or replication metadata.
                 var allowed = current;
-                if (value.mode == .description) {
-                    allowed.description = value.table.description;
-                } else {
-                    allowed.schema_json = value.table.schema_json;
-                    allowed.read_schema_json = value.table.read_schema_json;
-                    allowed.schema_reader_requirements = value.table.schema_reader_requirements;
-                    allowed.indexes_json = value.table.indexes_json;
-                    allowed.sql_native_indexes_json = value.table.sql_native_indexes_json;
-                    allowed.full_text_read_index = value.table.full_text_read_index;
-                }
+                allowed.schema_json = value.table.schema_json;
+                allowed.read_schema_json = value.table.read_schema_json;
+                allowed.schema_reader_requirements = value.table.schema_reader_requirements;
+                allowed.indexes_json = value.table.indexes_json;
+                allowed.sql_native_indexes_json = value.table.sql_native_indexes_json;
+                allowed.full_text_read_index = value.table.full_text_read_index;
                 if (!metadata_table_manager.tableDefinitionsEqual(allowed, value.table)) return .{ .rejected = .InvalidCatalogMutation };
-                if (value.mode == .schema) {
+                {
                     const header = std.json.parseFromSliceLeaky(struct { version: u32 = 0 }, a, value.table.schema_json, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCatalogMutation;
                     const expected_version = std.math.add(u32, value.guard.owner.schema_version, 1) catch return .{ .rejected = .CatalogGenerationExhausted };
                     if (header.version != expected_version) return .{ .rejected = .InvalidCatalogMutation };
@@ -27459,6 +27469,25 @@ pub const RaftApplyStore = struct {
                 // effects. Once writing begins, every error aborts the journal
                 // transaction, including errors also used for CAS refusal.
                 if (!metadata_table_manager.tableDefinitionsEqual(current, value.table) and !try self.tryApplyKnownTableCompareAndReplaceTxn(txn, group, current, value.table, value.guard.object_renames)) return .{ .rejected = .CatalogGenerationChanged };
+            },
+            .description => |value| {
+                const current = (try self.getTableTxn(a, txn, group, value.guard.owner.table_id)) orelse return .{ .rejected = .CatalogGenerationChanged };
+                if (!std.mem.eql(u8, &try @import("../../system_catalog/relations.zig").tableDigest(current), &value.expected)) return .{ .rejected = .CatalogGenerationChanged };
+                var next = current;
+                next.description = value.value;
+                self.validateRelationMutationTxn(txn, group, value.guard, current, next) catch |err| return sql_catalog_mutations.Outcome.fromError(err) orelse return err;
+                // Presentation does not replace schema, resolver bindings or
+                // dependency directories. Only this record changes,
+                // atomically with the retained command outcome. The schema
+                // fingerprint remains byte-for-byte unchanged.
+                if (!std.mem.eql(u8, current.description, value.value)) {
+                    var key_buf: [160]u8 = undefined;
+                    const key = try tableKeyForGroup(&key_buf, group, current.table_id);
+                    const bytes = try encodeTableRecord(a, next);
+                    try txn.put(key, bytes);
+                    self.notifyCommittedKeyListeners(.{ .metadata_group_id = group, .key = key });
+                    self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group, .table_name = current.name, .table_id = current.table_id });
+                }
             },
             .column => |value| {
                 const bytes = self.prepareColumnDescriptionTxn(txn, group, value) catch |err| return sql_catalog_mutations.Outcome.fromError(err) orelse return err;

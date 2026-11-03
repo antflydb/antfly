@@ -373,23 +373,27 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         const BootstrapBarrier = struct {
             calls: usize = 0,
             fn wait(_: *anyopaque, _: u64, _: []const u8) !void {}
+            fn capture(_: *anyopaque, group: u64) !read_gate.ReadSafetyBarrier.FrozenProof {
+                try std.testing.expectEqual(@as(u64, 7501), group);
+                return .{ .incarnation = 91, .term = 2, .applied_index = 2 };
+            }
             fn certify(ptr: *anyopaque, group: u64, term: u64, minimum: u64, _: ?u64, _: local.api_operation.CancellationToken) !read_gate.ReadSafetyBarrier.FrozenProof {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 try std.testing.expectEqual(@as(u64, 7501), group);
                 try std.testing.expectEqual(@as(u64, 2), term);
-                try std.testing.expectEqual(@as(u64, 2), minimum);
+                try std.testing.expect(minimum >= 2);
                 self.calls += 1;
-                return .{ .incarnation = 91, .term = 2, .applied_index = 3 };
+                return .{ .incarnation = 91, .term = 2, .applied_index = @max(3, minimum) };
             }
         };
         var bootstrap_barrier: BootstrapBarrier = .{};
         const original_barrier = source.read_safety_barrier;
-        source.read_safety_barrier = .{ .ptr = &bootstrap_barrier, .vtable = &.{ .wait_read_safe = BootstrapBarrier.wait, .certify_completed_prefix = BootstrapBarrier.certify } };
+        defer source.read_safety_barrier = original_barrier;
+        source.read_safety_barrier = .{ .ptr = &bootstrap_barrier, .vtable = &.{ .wait_read_safe = BootstrapBarrier.wait, .capture_frozen = BootstrapBarrier.capture, .certify_completed_prefix = BootstrapBarrier.certify } };
         const certified = try source.attestSchemaBootstrapAtRoot(7501, "items", bootstrap_descriptor, inputs, bootstrap_scope, bootstrap_root, .{});
         try certified.verify(bootstrap_scope);
         try std.testing.expect(certified.preparation.value.position == null);
         try std.testing.expectEqual(@as(usize, 1), bootstrap_barrier.calls);
-        source.read_safety_barrier = original_barrier;
         {
             const before_capture = try source.schemaOwnerStateAtRoot(7501, "items", .{});
             var captured = try source.captureSchemaPreparationAtRoot(alloc, 7501, "items", .{ .id = actual_binding.id, .provisional_plan = actual_binding.plan_digest, .transition_id = actual_binding.fence.transition_id, .namespace = actual_binding.fence.namespace }, before_json, tightened, .{ .not_null = &.{"id"} }, .{ .identity = bootstrap_scope.identity, .reporter_incarnation = bootstrap_scope.reporter_incarnation, .authority = .{ .raft = bootstrap_scope.replica_id } }, bootstrap_root, .{});

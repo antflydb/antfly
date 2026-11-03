@@ -28425,7 +28425,7 @@ const RemoteMetadataSource = struct {
         return self.acceptObservedSnapshotResult(.snapshot, incoming, head, observed_fence_generation, now_ms, null);
     }
 
-    const SnapshotPublication = union(enum) { cached, miss_refresh: ?antfly.metadata_api.MetadataHead };
+    const SnapshotPublication = union(enum) { cached, miss_refresh: struct { previous: ?antfly.metadata_api.MetadataHead, head_observed_at_ms: u64 } };
 
     fn acceptObservedSnapshotResult(self: *RemoteMetadataSource, comptime kind: SnapshotResultKind, incoming: antfly.metadata_api.AdminSnapshot, head: antfly.metadata_api.MetadataHead, observed_fence_generation: u64, now_ms: u64, budget: ?antfly.metadata_http_client.RequestBudget) !SnapshotResult(kind) {
         return self.publishObservedSnapshotResult(kind, incoming, head, observed_fence_generation, now_ms, budget, .cached);
@@ -28481,10 +28481,10 @@ const RemoteMetadataSource = struct {
                     return error.MetadataSnapshotHeadMismatch;
                 }
             },
-            .miss_refresh => |observed_head| {
+            .miss_refresh => |cut| {
                 // Retain the usable cache during I/O; replace only the head
                 // captured before this fetch, with authoritative fences intact.
-                if (!std.meta.eql(self.cached_head, observed_head) and
+                if (!std.meta.eql(self.cached_head, cut.previous) and
                     !std.meta.eql(self.cached_head, @as(?antfly.metadata_api.MetadataHead, head)))
                     return error.MetadataSnapshotHeadMismatch;
                 self.snapshot_fence_generation +%= 1;
@@ -28512,8 +28512,16 @@ const RemoteMetadataSource = struct {
         self.control_read_generation_at_ms = self.awakeMs();
         published = true;
         fresh_owned = false;
+        // Snapshot refresh does not observe a new head. Renewing a borrowed
+        // head here lets alternating peer/catalog refreshes keep it alive
+        // indefinitely and starve schema/placement catch-up. Only a real head
+        // read establishes freshness; preserve any newer concurrent read.
+        const same_head = std.meta.eql(self.cached_head, @as(?antfly.metadata_api.MetadataHead, head));
+        self.cached_head_at_ms = switch (publication) {
+            .cached => if (same_head) self.cached_head_at_ms else 0,
+            .miss_refresh => |cut| if (same_head) @max(self.cached_head_at_ms, cut.head_observed_at_ms) else cut.head_observed_at_ms,
+        };
         self.cached_head = head;
-        self.cached_head_at_ms = now_ms;
         cache_locked = false;
         return self.snapshotResultLocked(kind);
     }
@@ -29310,6 +29318,7 @@ const RemoteMetadataSource = struct {
             const injected_error = if (@import("builtin").is_test) self.test_faults.fetch_head_error else null;
             self.cache_mutex.unlock();
             if (injected_error) |err| return err;
+            const head_observed_at_ms = self.awakeMs();
             const head = self.fetchRemoteHead(budget) catch |err| {
                 if (err == error.MetadataSnapshotHeadMismatch) continue;
                 return err;
@@ -29318,7 +29327,7 @@ const RemoteMetadataSource = struct {
                 if (err == error.MetadataSnapshotHeadMismatch) continue;
                 return err;
             };
-            return self.publishObservedSnapshotResult(.peers, incoming, head, fence, self.awakeMs(), budget, .{ .miss_refresh = observed_head }) catch |err| {
+            return self.publishObservedSnapshotResult(.peers, incoming, head, fence, self.awakeMs(), budget, .{ .miss_refresh = .{ .previous = observed_head, .head_observed_at_ms = head_observed_at_ms } }) catch |err| {
                 if (err == error.MetadataSnapshotHeadMismatch) continue;
                 return err;
             };
@@ -37357,6 +37366,46 @@ fn consumerTests() type {
                 try std.testing.expectEqual(@as(usize, if (mode == .overshoot) 1 else 2), probe.probes);
                 if (mode != .overshoot) try std.testing.expect(virtual_io.monotonic_ns < 5 * std.time.ns_per_s);
             }
+        }
+
+        test "remote metadata snapshot refresh cannot renew a borrowed head or hide schema publication" {
+            const alloc = std.testing.allocator;
+            var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+            defer backend_runtime.deinit();
+            var source = try RemoteMetadataSource.init(alloc, &.{"http://metadata.invalid"}, backend_runtime.ptr().apiIoImpl().?);
+            defer source.deinit();
+            const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+            const head: antfly.metadata_api.MetadataHead = .{ .metadata_group_id = 9, .metadata_incarnation = incarnation, .metadata_epoch = 42 };
+            try source.acceptMetadataIdentity(9, incarnation);
+            source.cached_head = head;
+            source.cached_head_at_ms = 1;
+            const snapshot: antfly.metadata_api.AdminSnapshot = .{
+                .status = .{ .metadata_group_id = 9, .metadata_incarnation = incarnation, .metadata_epoch = 1000, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+            for ([_]u64{ 500, 999, 1500, 2500 }) |published_at| {
+                var public = try source.acceptObservedSnapshot(try cloneAdminSnapshotOwned(alloc, snapshot), head, source.snapshot_fence_generation, published_at);
+                freeAdminSnapshotOwned(alloc, &public);
+                try std.testing.expectEqual(@as(u64, 1), source.cached_head_at_ms);
+                var peer_snapshot = snapshot;
+                peer_snapshot.peer_view = true;
+                const peers = try source.acceptObservedSnapshotResult(.peers, try cloneAdminSnapshotOwned(alloc, peer_snapshot), head, source.snapshot_fence_generation, published_at + 100, null);
+                peers.release();
+                try std.testing.expectEqual(@as(u64, 1), source.cached_head_at_ms);
+            }
+            var next_head = head;
+            next_head.metadata_epoch = 43;
+            var peers_only = snapshot;
+            peers_only.peer_view = true;
+            const peers = try source.publishObservedSnapshotResult(.peers, try cloneAdminSnapshotOwned(alloc, peers_only), next_head, source.snapshot_fence_generation, 5000, null, .{ .miss_refresh = .{ .previous = head, .head_observed_at_ms = 3000 } });
+            peers.release();
+            try std.testing.expectEqual(@as(u64, 3000), source.cached_head_at_ms);
+            try std.testing.expectEqualDeep(next_head, source.cached_head.?);
         }
 
         test "remote metadata observation accepts newer catalog from a peer with a lower lifecycle counter" {

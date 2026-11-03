@@ -1271,7 +1271,7 @@ pub const MetadataHttpClient = struct {
             const token = std.mem.trim(u8, media[0 .. std.mem.indexOfScalar(u8, media, ';') orelse media.len], " \t");
             if (!std.ascii.eqlIgnoreCase(token, input.responseContentType())) return error.InvalidGenerationPublication;
         }
-        if ((input == .table_retirement_prepare or input == .fk_initial_create_prepare or input == .query_population_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
+        if ((input == .sql_catalog_prepare or input == .table_retirement_prepare or input == .fk_initial_create_prepare or input == .query_population_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
             if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
             if (response.status == 405 and std.mem.eql(u8, response.body, "ExtensionOwnedObject")) return error.ExtensionOwnedObject;
         }
@@ -5409,7 +5409,7 @@ test "system catalog schema validation client binds exact identity projection fr
     try std.testing.expectEqualSlices(u8, frame, recovery_input);
     executor.body = corrupt;
     try std.testing.expectError(error.InvalidSchemaValidationJob, client.readSchemaValidationRecoveryInputs("http://metadata.invalid", parent, 25, null));
-    const fresh = try attestation.SignedPreparation.sign(.{ .binding = owner.binding, .physical_root_incarnation = owner.physical_root_incarnation, .position = .{ .raft = .{ .term = 2, .index = 1 } } }, parent.signed.proof.identity, 5, .{ .raft = 42 }, 6, root);
+    const fresh = try attestation.SignedPreparation.sign(.{ .binding = owner.binding, .physical_root_incarnation = owner.physical_root_incarnation, .position = .{ .raft = .{ .term = 2, .index = 1 } } }, parent.signed.proof.identity, 5, .{ .raft = 42 }, 6, null, root);
     executor.expected = .{ .lookup = request.lookup, .ordinal = owner.ordinal, .projection = .inputs, .witness = .{ .preparation = fresh } };
     executor.body = frame;
     const resumed_input = try client.readSchemaValidationOwnerInputs("http://metadata.invalid", executor.expected, native.hash(frame), 25, null);
@@ -6044,4 +6044,37 @@ test "SQL pgwire native metadata RPC preserves explicit submission evidence" {
     const response = try client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted);
     defer a.free(response);
     try std.testing.expect(submitted);
+}
+
+test "SQL command fence catalog preparation preserves definite naming diagnostics before submission" {
+    const a = std.testing.allocator;
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const Executor = struct {
+        status: u16 = 400,
+        body: []const u8 = "UndefinedColumn",
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(.POST, request.method);
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            try authority.verify("prepared-relation-secret", "prepared-relation", .admin, request.body, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
+            return .{ .status = self.status, .body = try alloc.dupe(u8, self.body), .headers = &.{} };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("prepared-relation-secret", "prepared-relation");
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .sql_catalog_prepare = .{ .request = .{ .mutation = .{ .kind = .table, .action = .comment, .name = "rows" } }, .nonce = @splat(1) } };
+    inline for (.{ error.UndefinedColumn, error.SqlConstraintNotFound, error.SqlIndexNotFound, error.CatalogGenerationExhausted, error.ExtensionOwnedObject, error.ForeignKeyValidationRequired, error.ConstraintRetirementRequired, error.TableTransitionActive }) |err| {
+        executor.status = system_catalog.httpStatus(err);
+        executor.body = @errorName(err);
+        try std.testing.expectError(err, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    }
+    executor.status = 400;
+    executor.body = "SqlConstraintNotFound";
+    try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    executor.body = "undefinedcolumn";
+    try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    try std.testing.expectEqual(@as(usize, 10), executor.calls);
 }

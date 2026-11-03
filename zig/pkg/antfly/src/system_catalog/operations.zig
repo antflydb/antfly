@@ -161,6 +161,9 @@ pub fn prepareSqlCatalog(svc: anytype, alloc: std.mem.Allocator, context: operat
     if (!context.setting_admin) return error.Forbidden;
     if (std.mem.allEqual(u8, &request.nonce, 0)) return error.InvalidCatalogMutation;
     if (!std.meta.eql(request.command_fence, if (context.sql_command_fence) |fence| fence.* else null)) return error.InvalidCatalogMutation;
+    // Capability observation cannot substitute for the durable apply barrier.
+    // Complete this control transition before capturing the user's command.
+    try @import("../metadata/service.zig").ensureSqlCatalogCapabilityWithContext(svc, context);
     if (request.view != null or request.relation != null) {
         try context.ensureActive();
         const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_catalog_journal_version);
@@ -177,6 +180,7 @@ pub fn mutateSqlCatalog(svc: anytype, alloc: std.mem.Allocator, context: operati
     if (!context.setting_admin) return error.Forbidden;
     try context.ensureActive();
     try catalog.validate(command);
+    try @import("../metadata/service.zig").ensureSqlCatalogCapabilityWithContext(svc, context);
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_catalog_journal_version);
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;

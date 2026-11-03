@@ -2012,7 +2012,7 @@ const TestProofs = struct {
     fn bootstrapRequest(head: barriers.Head, owner: barriers.Owner, destination_root: u128) !roots.Request {
         const key = try root();
         if (owner.binding.authority == .native) {
-            const prepared = try evidence.SignedPreparation.sign(.{ .binding = owner.binding, .physical_root_incarnation = destination_root, .position = position(owner, 2) }, try identity(head), 4, try authority(head, owner), 6, key);
+            const prepared = try evidence.SignedPreparation.sign(.{ .binding = owner.binding, .physical_root_incarnation = destination_root, .position = position(owner, 2) }, try identity(head), 4, try authority(head, owner), 6, null, key);
             return .{ .lookup = .fromHead(head), .ordinal = owner.ordinal, .revision = head.revision, .owner_digest = try parent.ownerDigest(owner, head), .expected_epoch = owner.root_epoch, .lineage = .native_recovery, .proposal = .{ .native_bootstrap = prepared } };
         }
         const scope: evidence.RaftScope = .{
@@ -2027,7 +2027,7 @@ const TestProofs = struct {
             .reported_term = 2,
             .reported_applied_index = 3,
         };
-        const prepared = try evidence.SignedPreparation.sign(.{ .binding = owner.binding, .physical_root_incarnation = destination_root, .position = position(owner, 2) }, scope.identity, 4, .{ .raft = 42 }, 6, key);
+        const prepared = try evidence.SignedPreparation.sign(.{ .binding = owner.binding, .physical_root_incarnation = destination_root, .position = position(owner, 2) }, scope.identity, 4, .{ .raft = 42 }, 6, null, key);
         const proof = try @import("schema_validation_bootstrap.zig").CertifiedPreparation.sign(prepared, .{ .incarnation = 77, .term = 2, .applied_index = 3 }, scope, key);
         return .{ .lookup = .fromHead(head), .ordinal = owner.ordinal, .revision = head.revision, .owner_digest = try parent.ownerDigest(owner, head), .expected_epoch = owner.root_epoch, .lineage = .raft_replay, .proposal = .{ .bootstrap = proof } };
     }
@@ -2054,7 +2054,7 @@ const TestProofs = struct {
             .{ .raft = .{ .term = 2, .index = sequence } };
     }
     fn preparation(head: barriers.Head, owner: barriers.Owner) !evidence.SignedPreparation {
-        return evidence.SignedPreparation.sign(.{ .binding = owner.binding, .physical_root_incarnation = owner.physical_root_incarnation, .position = position(owner, 1) }, try identity(head), 4, try authority(head, owner), 6, try root());
+        return evidence.SignedPreparation.sign(.{ .binding = owner.binding, .physical_root_incarnation = owner.physical_root_incarnation, .position = position(owner, 1) }, try identity(head), 4, try authority(head, owner), 6, null, try root());
     }
     fn ready(owner: barriers.Owner) contract.Header {
         return .{ .binding = owner.binding, .phase = .ready, .admitted = position(owner, 1), .frozen = position(owner, 2), .updated = position(owner, 3), .revision = 3, .records = if (owner.binding.purpose.schemaOnly()) 0 else 2, .rows_scanned = if (owner.binding.purpose.schemaOnly()) 0 else 2, .cursor_digest = contract.hash(""), .chain = @splat(14), .last_effect = @splat(15) };

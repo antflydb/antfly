@@ -52,8 +52,24 @@ pub const Transport = struct {
         if (self.server.cfg.deployment_mode == .standalone) return;
         if (self.server.cfg.deployment_mode != .distributed) return error.UnsupportedSqlExecution;
         var fallback = router.CatalogBackedGroupRouter.init(self.server.catalogSource(), self.server.localSessionNodeId());
-        const hosted = (self.server.cfg.session_router orelse fallback.router()).withBudget(.{ .clock = .{ .deadline_ns = context.deadline_ns }, .cancellation = context.cancellation });
-        self.routes = (try router.resolveGroupRoutes(self.alloc, self.server.catalogSource(), hosted, self.groups, .prefer_leader)) orelse return error.GenerationAdmissionPending;
+        const io = self.server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
+        const platform = @import("antfly_platform");
+        const deadline = @min(context.deadline_ns orelse std.math.maxInt(u64), platform.time.monotonicNs() +| preparation.max_budget_ms * std.time.ns_per_ms);
+        const hosted = (self.server.cfg.session_router orelse fallback.router()).withBudget(.{ .clock = .{ .deadline_ns = deadline }, .cancellation = context.cancellation });
+        var retry_ns: u64 = 20 * std.time.ns_per_ms;
+        // This phase is read-only: no owner fence or user command exists yet.
+        // A newly published owner cohort may briefly precede its route report.
+        // Refresh the complete route cut within the existing request budget;
+        // never retry submission or retain a partially resolved cohort.
+        while (true) {
+            try context.ensureActive();
+            self.routes = try router.resolveGroupRoutes(self.alloc, self.server.catalogSource(), hosted, self.groups, .prefer_leader);
+            if (self.routes != null) return;
+            const remaining = deadline -| platform.time.monotonicNs();
+            if (remaining == 0) return error.CatalogPublicationProofPending;
+            io.sleep(.fromNanoseconds(@min(remaining, retry_ns)), .awake) catch return error.Canceled;
+            retry_ns = @min(retry_ns * 2, 250 * std.time.ns_per_ms);
+        }
     }
 
     pub fn prepare(self: *@This(), a: std.mem.Allocator, group: u64, table: []const u8, request: preparation.Request, context: local.api_operation.RequestContext) ![]u8 {

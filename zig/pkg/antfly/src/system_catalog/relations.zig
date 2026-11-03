@@ -46,7 +46,8 @@ pub const Intent = union(enum) {
 pub const Prepared = struct {
     intent_digest: [32]u8,
     change: union(enum) {
-        definition: struct { mode: enum { schema, description }, guard: domain.RelationMutationGuard, expected: [32]u8, table: tables.TableRecord },
+        definition: struct { guard: domain.RelationMutationGuard, expected: [32]u8, table: tables.TableRecord },
+        description: struct { guard: domain.RelationMutationGuard, expected: [32]u8, value: []const u8 },
         column: contract.ColumnDescriptionCommand,
         object: contract.ObjectDescriptionCommand,
     },
@@ -57,14 +58,31 @@ pub const Prepared = struct {
         };
     }
     pub fn action(self: @This()) domain.Action {
-        return if (self.change == .definition and self.change.definition.mode == .schema) .alter else .comment;
+        return if (self.change == .definition) .alter else .comment;
+    }
+    pub fn matches(self: @This(), intent: Intent) !bool {
+        if (!std.mem.eql(u8, &self.intent_digest, &try intent.digest()) or
+            !std.mem.eql(u8, &try catalog.canonicalDigest("antfly:sql-relation-guard:v1", self.guard()), &try catalog.canonicalDigest("antfly:sql-relation-guard:v1", intent.guard()))) return false;
+        if (intent == .schema) return self.change == .definition;
+        const request = intent.description;
+        if (request.object) |key| return self.change == .object and self.change.object.request.key.eql(key) and std.mem.eql(u8, self.change.object.description orelse "", request.description);
+        if (request.column) |name| return self.change == .column and std.mem.eql(u8, self.change.column.column.name, name) and std.mem.eql(u8, self.change.column.column.value orelse "", request.description);
+        return self.change == .description and std.mem.eql(u8, self.change.description.value, request.description);
     }
     pub fn validate(self: @This()) !void {
         try self.guard().validate();
         if (std.mem.allEqual(u8, &self.intent_digest, 0)) return error.InvalidCatalogMutation;
         switch (self.change) {
             .definition => |value| {
-                if (value.guard.owner.kind != .table or value.table.table_id != value.guard.owner.table_id or std.mem.allEqual(u8, &value.expected, 0)) return error.InvalidCatalogMutation;
+                switch (value.guard.owner.kind) {
+                    .table, .index, .constraint_index => {},
+                    else => return error.InvalidCatalogMutation,
+                }
+                if (value.table.table_id != value.guard.owner.table_id or std.mem.allEqual(u8, &value.expected, 0)) return error.InvalidCatalogMutation;
+            },
+            .description => |value| {
+                try (calls.RelationDescriptionMutation{ .guard = value.guard, .description = value.value }).validate();
+                if (std.mem.allEqual(u8, &value.expected, 0)) return error.InvalidCatalogMutation;
             },
             inline else => |value| try value.validate(),
         }
@@ -106,13 +124,13 @@ pub fn prepare(a: A, store: anytype, group: u64, input: catalog.Preparation) ![]
         }
         const before = (try store.getTable(scratch, group, guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
         if (try @import("../api/tables.zig").schemaVersion(before.schema_json) != guard.owner.schema_version) return error.CatalogGenerationChanged;
-        var after = if (intent == .schema) try @import("../api/tables.zig").applySchemaMutationRecord(scratch, &before, .replace, intent.schema.schema_json) else try tables.cloneTable(scratch, before);
-        if (intent == .description) after.description = intent.description.description;
+        if (intent == .description) break :change .{ .description = .{ .guard = guard, .expected = try tableDigest(before), .value = intent.description.description } };
+        var after = try @import("../api/tables.zig").applySchemaMutationRecord(scratch, &before, .replace, intent.schema.schema_json);
         const names = local.system_catalog_relation_names.native_indexes;
         if (after.sql_native_indexes_json.len != 0) after.sql_native_indexes_json = try names.prune(scratch, after.sql_native_indexes_json, after.indexes_json);
         try @import("../api/indexes.zig").validateArtifactEnrichmentsForTableIndexesJson(scratch, after.indexes_json);
         try local.inference_managed_embedder.validateEmbeddingProducerOwnershipJson(scratch, after.indexes_json);
-        break :change .{ .definition = .{ .mode = if (intent == .schema) .schema else .description, .guard = guard, .expected = try tableDigest(before), .table = after } };
+        break :change .{ .definition = .{ .guard = guard, .expected = try tableDigest(before), .table = after } };
     } };
     try prepared.validate();
     const cut = try store.systemCatalogAdmission(scratch, group, label);

@@ -18453,3 +18453,66 @@ leaks. An earlier broader run timed out during the DROP NOT NULL lifecycle
 amid metadata snapshot catch-up errors. A final-source rerun also timed out
 waiting for the serving schema during sql-0744. This mounted schema campaign
 remains failing and is not counted as a passing qualification.
+
+
+### Unified relation admission and bounded annotation commands
+
+Straight-line SQL schema declarations and annotations use prepared native
+journal admission with or without an enrolled command fence. Public callers
+receive the same owned catalog recovery receipt; a missing transport response
+never authorizes replay. Coordinated validation, retirement and FK generation
+publication retain their existing owner protocols.
+
+Table comments carry a text patch, guarded owner and full predecessor digest.
+They do not transmit a complete table definition or normalize unrelated index
+metadata. Native apply changes only the encoded table record alongside the
+retained outcome: schema fingerprints, resolver bindings, dependency directories
+and reconciliation epochs stay intact. Column and object annotations continue
+using their stable identity stores. The API checks the actual prepared comment
+text and target as well as its claimed intent digest. Qualified index guards are
+accepted for schema retirement without relaxing native ownership validation.
+
+Qualification now exercises both enrolled and unenrolled schema/annotation
+requests, lost replies, exact cold recovery, qualified index retirement and
+unchanged reconciliation postimages for comments. A packet-size property checks
+that a table comment stays below 4 KiB even when its schema exceeds 64 KiB.
+These describe the pending qualification surface, not additional case credits;
+original dispositions remain unchanged until end-to-end evidence qualifies them.
+
+Metadata head freshness has independent ownership from snapshot freshness.
+Publishing a catalog or compact peer snapshot no longer renews its borrowed
+head's timestamp: alternating refreshes could otherwise keep an old head alive
+indefinitely. A miss refresh carries the actual head-read timestamp through
+publication, without regressing a newer concurrent read. The focused Debug
+remote-metadata gate passes all 37 contracts and all 102 build steps, including
+a regression alternating catalog and peer refreshes across the head TTL.
+The mounted schema lifecycle is still subject to final-source qualification;
+this cache fix alone is not asserted to explain every observed timeout.
+
+
+### Empty namespace preparation and durable journal activation
+
+Initial schema preparation carries a root-signed completed Raft prefix, using
+the same read-safety barrier as root recovery. An empty namespace still has no
+physical data receipt after the initial Raft no-op completes. Admission checks
+the independently certified prefix against the current enrolled owner's report
+in the accepting metadata transaction; it never manufactures a data entry or
+requires the applied index to remain zero. The prefix is included in the
+preparation signature, and native-authority preparations cannot claim one.
+Bootstrap recovery reuses that certification rather than issuing a second
+quorum read.
+
+Catalog preparation and submission complete the existing durable decoder
+activation barrier before admitting journal commands. Observed voter readiness
+alone cannot authorize a command that native apply would refuse before the
+activation record is durable. Membership changes remain subject to the shared
+capability protocol. Final Debug qualification is recorded below when complete;
+these changes do not reclassify original parity cases.
+
+A mounted qualification also found an immediate pre-admission route miss
+reported as `GenerationAdmissionPending`/XX000. Owner preparation now retries
+only the read-only complete-cohort route capture within the existing five-second
+preparation/request budget. A missing route never admits a command, retains a
+partial cohort or triggers mutation replay; exhaustion reports publication
+readiness rather than an internal SQL error. A fault contract checks a missing
+first route cut followed by the complete cohort with zero catalog admissions.

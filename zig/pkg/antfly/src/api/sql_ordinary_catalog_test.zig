@@ -32,6 +32,7 @@ fn id(value: u64) [16]u8 {
     return bytes;
 }
 const Source = struct {
+    alloc: A = a,
     store: *storage.RaftApplyStore,
     metadata_group_id: u64 = group,
     replicated: bool = false,
@@ -48,10 +49,16 @@ const Source = struct {
     fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
         return .{ .metadata_group_id = group, .metrics = .{} };
     }
-    pub fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: Context, required: u16) !void {
-        try std.testing.expect((try self.store.topologyActivation(group)).?.version >= required);
+    pub fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: Context, required: u16) !@import("../metadata/service.zig").TableTopologyProtocolReadiness {
+        const active = (try self.store.topologyActivation(group)).?;
+        try std.testing.expect(active.version >= required);
+        return .{ .term = 1, .required_version = required, .metadata_incarnation = active.incarnation, .protected_member_count = active.member_count, .protected_membership_fingerprint = active.membership_fingerprint };
     }
-    pub fn validateTableTopologyProtocolReadinessWithContext(_: *@This(), _: Context, _: void) !void {}
+    pub fn validateTableTopologyProtocolReadinessWithContext(_: *@This(), _: Context, _: @import("../metadata/service.zig").TableTopologyProtocolReadiness) !void {}
+    pub fn proposeTopologyActivationWithReceipt(self: *@This(), bytes: []const u8, _: @import("../metadata/service.zig").TableTopologyProtocolReadiness) !u64 {
+        try self.apply(a, .{ .activate_topology_protocol = bytes });
+        return self.index;
+    }
     pub fn ensureLinearizableReadWithContext(_: *@This(), _: Context) !void {}
     pub fn lockCatalogMutation(self: *@This()) void {
         std.debug.assert(!self.locked);
@@ -476,15 +483,28 @@ test "SQL catalog ordinary view outcome decoder preserves object generations and
 }
 
 fn createRows(server: *http.ApiHttpServer, alloc: A, fence: L.scopes.CommandFence, declaration_sql: []const u8) !u64 {
+    return createRowsWithIndexes(server, alloc, fence, declaration_sql, false);
+}
+fn createRowsWithIndexes(server: *http.ApiHttpServer, alloc: A, fence: L.scopes.CommandFence, declaration_sql: []const u8, indexed: bool) !u64 {
     var declaration = try local.sql_compiler.compile(alloc, declaration_sql, .{});
     defer declaration.deinit();
-    const schema = try local.sql_ddl_runtime.createSchemaAlloc(alloc, declaration.statement.create_table);
+    var schema = try local.sql_ddl_runtime.createSchemaAlloc(alloc, declaration.statement.create_table);
+    if (indexed) {
+        // The public typed CREATE contract accepts an initial relational index.
+        // This avoids manufacturing a data-owner ACK merely to retire an old
+        // layout between two mutations in this metadata recovery campaign.
+        var value = try std.json.parseFromSlice(std.json.Value, alloc, schema, .{});
+        defer value.deinit();
+        const indexes = try std.json.parseFromSliceLeaky(std.json.Value, alloc, "[{\"name\":\"rows_note_idx\",\"keys\":[{\"column\":\"note\"}]}]", .{});
+        try value.value.object.put(alloc, "relational_indexes", indexes);
+        schema = try std.json.Stringify.valueAlloc(alloc, value.value, .{});
+    }
     const outcome = try @import("sql_catalog.zig").executeWithAllocators(server, null, .{ .sql_command_fence = &fence }, "default", "public", .{ .result = alloc, .scratch = alloc }, .{ .create_table = .{ .name = .{ .table = "annotated_rows" }, .schema_json = schema, .if_not_exists = false } }, null);
     return outcome.catalog_receipt.?.object_id.?;
 }
 
 test "SQL catalog ordinary schema and annotation commands retain exact outcomes across lost replies and cold reopen" {
-    const Case = struct { declaration: []const u8, statements: []const []const u8 };
+    const Case = struct { declaration: []const u8, statements: []const []const u8, indexed: bool = false };
     const cases = [_]Case{
         .{ .declaration = "CREATE TABLE annotated_rows(id BIGINT,note TEXT,CONSTRAINT rows_id_check CHECK(id > 0))", .statements = &.{
             "COMMENT ON TABLE annotated_rows IS 'stable presentation'",
@@ -498,13 +518,16 @@ test "SQL catalog ordinary schema and annotation commands retain exact outcomes 
             "COMMENT ON CONSTRAINT rows_id_check ON annotated_rows IS NULL",
         } },
         .{ .declaration = "CREATE TABLE annotated_rows(id BIGINT,note TEXT)", .statements = &.{ "ALTER TABLE annotated_rows ADD COLUMN extra TEXT", "COMMENT ON COLUMN annotated_rows.extra IS 'added column'" } },
+        .{ .declaration = "CREATE TABLE annotated_rows(id BIGINT,note TEXT)", .indexed = true, .statements = &.{ "DROP INDEX public.rows_note_idx", "COMMENT ON TABLE annotated_rows IS 'after qualified index drop'" } },
         .{ .declaration = "CREATE TABLE annotated_rows(id BIGINT,note TEXT)", .statements = &.{"ALTER TABLE annotated_rows ALTER COLUMN note SET DEFAULT 'future'"} },
         .{ .declaration = "CREATE TABLE annotated_rows(id BIGINT,note TEXT DEFAULT 'future')", .statements = &.{"ALTER TABLE annotated_rows ALTER COLUMN note DROP DEFAULT"} },
         .{ .declaration = "CREATE TABLE annotated_rows(id BIGINT,note TEXT)", .statements = &.{ "ALTER TABLE annotated_rows ADD CONSTRAINT rows_id_check CHECK(id > 0) NOT VALID", "COMMENT ON CONSTRAINT rows_id_check ON annotated_rows IS 'deferred constraint'" } },
     };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    for (cases, 0..) |case, ordinal| {
+    for (0..cases.len * 2) |ordinal| {
+        const case = cases[ordinal % cases.len];
+        const enrolled = ordinal < cases.len;
         var arena: std.heap.ArenaAllocator = .init(a);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -515,7 +538,7 @@ test "SQL catalog ordinary schema and annotation commands retain exact outcomes 
         const fence = try source.setup(alloc);
         var server = source.server();
         defer server.deinit();
-        const table_id = try createRows(&server, alloc, fence, case.declaration);
+        const table_id = try createRowsWithIndexes(&server, alloc, fence, case.declaration, case.indexed);
         const initial = (try store.getTable(alloc, group, table_id)).?;
         defer @import("../metadata/table_manager.zig").freeTable(alloc, initial);
         var receipts: std.ArrayList(catalog.CatalogOperationReceipt) = .empty;
@@ -524,7 +547,8 @@ test "SQL catalog ordinary schema and annotation commands retain exact outcomes 
             source.lose = .after;
             const before = source.attempts;
             const prior_catalog = try store.systemCatalogMeta(alloc, group);
-            const outcome = try executeSql(&server, alloc, .{ .sql_command_fence = &fence }, sql);
+            const prior_reconciliation = try store.relationReconciliationWork(group);
+            const outcome = try executeSql(&server, alloc, .{ .sql_command_fence = if (enrolled) &fence else null }, sql);
             const receipt = outcome.catalog_receipt orelse return error.MissingRelationReceipt;
             try std.testing.expectEqual(.committed, receipt.state);
             try std.testing.expectEqual(.table, receipt.kind);
@@ -536,6 +560,7 @@ test "SQL catalog ordinary schema and annotation commands retain exact outcomes 
             if (std.mem.startsWith(u8, sql, "COMMENT")) {
                 try std.testing.expectEqual(@as(?u64, prior_catalog.revision), receipt.catalog_revision);
                 try std.testing.expectEqual(prior_version, version);
+                try std.testing.expectEqualDeep(prior_reconciliation, try store.relationReconciliationWork(group));
             } else {
                 try std.testing.expectEqual(prior_version + 1, version);
                 prior_version = version;
@@ -656,4 +681,44 @@ test "SQL catalog ordinary relation completion owns response identities before a
         try std.testing.expectEqual(.committed, recovered.state);
         try std.testing.expectEqual(attempts, source.attempts);
     }
+}
+
+test "SQL catalog ordinary schema preparation waits for the complete route cut before any admission" {
+    const router = @import("table_router.zig");
+    const State = struct {
+        calls: usize = 0,
+        missing: bool = true,
+        fn node(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn status(_: *anyopaque, _: u64) @import("../raft/host.zig").HostedReplicaStatus {
+            return .absent;
+        }
+        fn endpoint(_: *anyopaque, _: A, _: u64) !?[]u8 {
+            return error.UnexpectedScalarRoute;
+        }
+        fn resolve(raw: *anyopaque, alloc: A, groups: []const u64, _: router.RoutePolicy, budget: router.RouteBudget) !?[]router.GroupRoute {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try budget.check();
+            try std.testing.expectEqualSlices(u64, &.{ 11, 12 }, groups);
+            self.calls += 1;
+            if (self.missing and self.calls == 1) return null;
+            const routes = try alloc.alloc(router.GroupRoute, groups.len);
+            @memset(routes, .local);
+            return routes;
+        }
+    };
+    var state: State = .{};
+    var source: Source = .{ .store = undefined };
+    var server = source.server();
+    defer server.deinit();
+    server.cfg.deployment_mode = .distributed;
+    server.cfg.session_router = .{ .ptr = &state, .vtable = &.{ .local_node_id = State.node, .local_status = State.status, .node_base_uri = State.endpoint, .resolve_group_routes = State.resolve } };
+    var transport: @import("schema_validation_owner_transport.zig").Transport = .{ .server = &server, .alloc = a };
+    defer transport.deinit();
+    try transport.prepareCohort(&.{ .{ .group_id = 11, .table_id = 1, .start_key = "" }, .{ .group_id = 12, .table_id = 1, .start_key = "x" } }, .{});
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+    try std.testing.expectEqual(@as(usize, 2), transport.routes.?.len);
+    try std.testing.expectEqual(@as(usize, 0), source.prepares);
+    try std.testing.expectEqual(@as(usize, 0), source.attempts);
 }
