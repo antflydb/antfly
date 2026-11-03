@@ -228,6 +228,11 @@ fn termiteDTypeToOnnx(dtype: DType) DataType {
 fn makeValueInfo(alloc: Allocator, name: []const u8, shape: Shape) !ValueInfoProto {
     const rank = shape.rank();
     const dims = try alloc.alloc(TensorShapeProto.Dimension, rank);
+    var initialized: usize = 0;
+    errdefer {
+        for (dims[0..initialized]) |dim| if (dim.dim_param.len != 0) alloc.free(dim.dim_param);
+        alloc.free(dims);
+    }
     for (0..rank) |i| {
         const d = shape.dim(@intCast(i));
         if (d < 0) {
@@ -236,6 +241,7 @@ fn makeValueInfo(alloc: Allocator, name: []const u8, shape: Shape) !ValueInfoPro
         } else {
             dims[i] = .{ .dim_value = d };
         }
+        initialized += 1;
     }
     return .{
         .name = name,
@@ -246,6 +252,18 @@ fn makeValueInfo(alloc: Allocator, name: []const u8, shape: Shape) !ValueInfoPro
             },
         },
     };
+}
+
+fn appendValueInfo(alloc: Allocator, infos: *std.ArrayListUnmanaged(ValueInfoProto), name: []const u8, shape: Shape) !void {
+    // Reserve before constructing the owner, so transfer cannot fail.
+    try infos.ensureUnusedCapacity(alloc, 1);
+    infos.appendAssumeCapacity(try makeValueInfo(alloc, name, shape));
+}
+
+fn appendOwnedNode(alloc: Allocator, nodes: *std.ArrayListUnmanaged(NodeProto), value: NodeProto) !void {
+    var owned = value;
+    errdefer freeNodeProto(alloc, &owned);
+    try nodes.append(alloc, owned);
 }
 
 /// Build a TensorProto initializer from constant f32 data.
@@ -408,20 +426,7 @@ fn makeExternalConstantTensor(
     const length = try writeExternalTensorData(alloc, ext, shape, data);
     ext.offset += length;
 
-    const entries = try alloc.alloc(proto.ExternalDataEntry, 3);
-    errdefer alloc.free(entries);
-    entries[0] = .{
-        .key = try alloc.dupe(u8, "location"),
-        .value = try alloc.dupe(u8, ext.relative_path),
-    };
-    entries[1] = .{
-        .key = try alloc.dupe(u8, "offset"),
-        .value = try std.fmt.allocPrint(alloc, "{d}", .{offset}),
-    };
-    entries[2] = .{
-        .key = try alloc.dupe(u8, "length"),
-        .value = try std.fmt.allocPrint(alloc, "{d}", .{length}),
-    };
+    const entries = try makeExternalDataEntries(alloc, ext.relative_path, offset, length);
 
     return .{
         .name = name,
@@ -447,20 +452,7 @@ fn makeExternalRawConstantTensor(
     try writeExternalBytes(alloc, ext, data);
     ext.offset += data.len;
 
-    const entries = try alloc.alloc(proto.ExternalDataEntry, 3);
-    errdefer alloc.free(entries);
-    entries[0] = .{
-        .key = try alloc.dupe(u8, "location"),
-        .value = try alloc.dupe(u8, ext.relative_path),
-    };
-    entries[1] = .{
-        .key = try alloc.dupe(u8, "offset"),
-        .value = try std.fmt.allocPrint(alloc, "{d}", .{offset}),
-    };
-    entries[2] = .{
-        .key = try alloc.dupe(u8, "length"),
-        .value = try std.fmt.allocPrint(alloc, "{d}", .{data.len}),
-    };
+    const entries = try makeExternalDataEntries(alloc, ext.relative_path, offset, data.len);
 
     return .{
         .name = name,
@@ -510,20 +502,7 @@ fn makeExternalStreamedConstantTensor(
     if (bytes_written != stream.byte_len) return error.InvalidTensorBytes;
     ext.offset += bytes_written;
 
-    const entries = try alloc.alloc(proto.ExternalDataEntry, 3);
-    errdefer alloc.free(entries);
-    entries[0] = .{
-        .key = try alloc.dupe(u8, "location"),
-        .value = try alloc.dupe(u8, ext.relative_path),
-    };
-    entries[1] = .{
-        .key = try alloc.dupe(u8, "offset"),
-        .value = try std.fmt.allocPrint(alloc, "{d}", .{offset}),
-    };
-    entries[2] = .{
-        .key = try alloc.dupe(u8, "length"),
-        .value = try std.fmt.allocPrint(alloc, "{d}", .{bytes_written}),
-    };
+    const entries = try makeExternalDataEntries(alloc, ext.relative_path, offset, bytes_written);
 
     return .{
         .name = name,
@@ -727,8 +706,9 @@ fn exportGraphResultMaybeStream(
     //   - ops        → "node_<id>"
     const count = effective_graph.nodeCount();
     var names = try alloc.alloc([]const u8, count);
+    var named: usize = 0;
     defer {
-        for (names) |n| alloc.free(n);
+        for (names[0..named]) |n| alloc.free(n);
         alloc.free(names);
     }
 
@@ -741,6 +721,7 @@ fn exportGraphResultMaybeStream(
             .constant => try std.fmt.allocPrint(alloc, "const_{d}", .{i}),
             else => try std.fmt.allocPrint(alloc, "node_{d}", .{i}),
         };
+        named += 1;
     }
 
     // Phase 2: Build ONNX nodes, inputs, outputs, initializers.
@@ -813,6 +794,7 @@ fn exportGraphResultMaybeStream(
 
     var external_data_builder: ?ExternalDataBuilder = if (opts.external_data_location) |path| blk: {
         var builder = ExternalDataBuilder{ .relative_path = try alloc.dupe(u8, path) };
+        errdefer builder.deinit(alloc);
         if (external_absolute_path) |abs_path| {
             builder.file = try createExternalDataFile(abs_path);
         }
@@ -855,7 +837,7 @@ fn exportGraphResultMaybeStream(
                             },
                         }
                     } else {
-                        try input_infos.append(alloc, try makeValueInfo(alloc, names[i], n.output_shape));
+                        try appendValueInfo(alloc, &input_infos, names[i], n.output_shape);
                     }
                 } else if (findParameterInitializer(opts, names[i])) |init| {
                     switch (init.data) {
@@ -870,6 +852,7 @@ fn exportGraphResultMaybeStream(
                             data,
                         ),
                         else => {
+                            try initializers.ensureUnusedCapacity(alloc, 1);
                             const tensor = if (external_data_builder) |*builder| switch (init.data) {
                                 .f32 => |data| try makeExternalConstantTensor(alloc, builder, names[i], init.shape, data),
                                 .raw_bytes => |data| try makeExternalRawConstantTensor(alloc, builder, names[i], init.shape, data),
@@ -881,7 +864,7 @@ fn exportGraphResultMaybeStream(
                                 .streamed => return error.UnsupportedShape,
                                 .q8_0_block => unreachable,
                             };
-                            try initializers.append(alloc, tensor);
+                            initializers.appendAssumeCapacity(tensor);
                         },
                     }
                     if (std.meta.activeTag(init.data) == .q8_0_block) effective_opset_version = @max(effective_opset_version, 21);
@@ -900,6 +883,7 @@ fn exportGraphResultMaybeStream(
                                 data,
                             ),
                             else => {
+                                try initializers.ensureUnusedCapacity(alloc, 1);
                                 const tensor = if (external_data_builder) |*builder| switch (init.data) {
                                     .f32 => |data| try makeExternalConstantTensor(alloc, builder, names[i], init.shape, data),
                                     .raw_bytes => |data| try makeExternalRawConstantTensor(alloc, builder, names[i], init.shape, data),
@@ -911,26 +895,27 @@ fn exportGraphResultMaybeStream(
                                     .streamed => return error.UnsupportedShape,
                                     .q8_0_block => unreachable,
                                 };
-                                try initializers.append(alloc, tensor);
+                                initializers.appendAssumeCapacity(tensor);
                             },
                         }
                         if (std.meta.activeTag(init.data) == .q8_0_block) effective_opset_version = @max(effective_opset_version, 21);
                     } else {
-                        try input_infos.append(alloc, try makeValueInfo(alloc, names[i], n.output_shape));
+                        try appendValueInfo(alloc, &input_infos, names[i], n.output_shape);
                     }
                 } else {
-                    try input_infos.append(alloc, try makeValueInfo(alloc, names[i], n.output_shape));
+                    try appendValueInfo(alloc, &input_infos, names[i], n.output_shape);
                 }
             },
             .constant => |c| {
                 // Create initializer tensor
                 const byte_len = try graphConstantByteLen(n.output_shape.dtype, c.data_len);
                 const data = effective_graph.constantBytes(c.data_offset, byte_len);
+                try initializers.ensureUnusedCapacity(alloc, 1);
                 const tensor = if (external_data_builder) |*builder|
                     try makeExternalRawConstantTensor(alloc, builder, names[i], n.output_shape, data)
                 else
                     try makeRawConstantTensor(alloc, names[i], n.output_shape, data);
-                try initializers.append(alloc, tensor);
+                initializers.appendAssumeCapacity(tensor);
             },
             .rsqrt => {
                 // Rsqrt has no standard ONNX operator. Preserve its primitive
@@ -1037,7 +1022,7 @@ fn exportGraphResultMaybeStream(
                         &input_infos,
                         &shape_extras,
                     );
-                    try onnx_nodes.append(alloc, node_proto);
+                    try appendOwnedNode(alloc, &onnx_nodes, node_proto);
                 }
             },
             .fused_rope => |attrs| try appendFusedRopeSubgraph(
@@ -1071,7 +1056,7 @@ fn exportGraphResultMaybeStream(
                     &input_infos,
                     &shape_extras,
                 );
-                try onnx_nodes.append(alloc, node_proto);
+                try appendOwnedNode(alloc, &onnx_nodes, node_proto);
             },
             else => {
                 // Convert to ONNX NodeProto. Some ops (Reshape, Expand, …) need
@@ -1087,7 +1072,7 @@ fn exportGraphResultMaybeStream(
                     &input_infos,
                     &shape_extras,
                 );
-                try onnx_nodes.append(alloc, node_proto);
+                try appendOwnedNode(alloc, &onnx_nodes, node_proto);
             },
         }
     }
@@ -1100,7 +1085,7 @@ fn exportGraphResultMaybeStream(
     }
     for (effective_graph.outputs.items) |out_id| {
         const n = effective_graph.node(out_id);
-        try output_infos.append(alloc, try makeValueInfo(alloc, names[out_id], n.output_shape));
+        try appendValueInfo(alloc, &output_infos, names[out_id], n.output_shape);
     }
     try output_infos.appendSlice(alloc, semantic_output_infos.items);
     semantic_output_infos.clearRetainingCapacity();
@@ -1123,12 +1108,13 @@ fn exportGraphResultMaybeStream(
 
     const model_bytes = try serializeModel(alloc, &model);
     var result = ExportResult{ .model_bytes = model_bytes };
+    errdefer result.deinit(alloc);
     if (external_data_builder) |*builder| {
         if (builder.file != null) return result;
-        result.external_data = .{
-            .relative_path = try alloc.dupe(u8, builder.relative_path),
-            .bytes = try builder.bytes.toOwnedSlice(alloc),
-        };
+        const relative_path = try alloc.dupe(u8, builder.relative_path);
+        errdefer alloc.free(relative_path);
+        const bytes = try builder.bytes.toOwnedSlice(alloc);
+        result.external_data = .{ .relative_path = relative_path, .bytes = bytes };
     }
     return result;
 }
@@ -1232,58 +1218,17 @@ fn appendFusedRopeSubgraph(
     const reshape_in_shape = [_]i64{ @intCast(rows), @intCast(num_heads), @intCast(head_dim) };
     const reshape_out_shape = [_]i64{ @intCast(rows), @intCast(hidden) };
 
-    const shape_in_name = try std.fmt.allocPrint(alloc, "{s}__rope_shape_in", .{output_name});
-    errdefer alloc.free(shape_in_name);
-    const shape_out_name = try std.fmt.allocPrint(alloc, "{s}__rope_shape_out", .{output_name});
-    errdefer alloc.free(shape_out_name);
-    try appendOwnedInt64Initializer(alloc, initializers, shape_extras, shape_in_name, &reshape_in_shape);
-    try appendOwnedInt64Initializer(alloc, initializers, shape_extras, shape_out_name, &reshape_out_shape);
-
-    const perm_data = try buildRopePermutationMatrixData(alloc, dtype, head_dim, rope_dim, attrs.consecutive_pairs, output_name);
-    errdefer {
-        alloc.free(perm_data.name);
-        alloc.free(perm_data.raw_data);
-    }
-    try appendOwnedRawTensorInitializer(
-        alloc,
-        initializers,
-        tensor_data_extras,
-        external_data_builder,
-        perm_data.name,
-        Shape.init(dtype, &.{ @intCast(head_dim), @intCast(head_dim) }),
-        perm_data.raw_data,
-    );
-
+    const shape_in_name = try appendGeneratedShape(alloc, initializers, shape_extras, output_name, "__rope_shape_in", &reshape_in_shape);
+    const shape_out_name = try appendGeneratedShape(alloc, initializers, shape_extras, output_name, "__rope_shape_out", &reshape_out_shape);
+    const perm_data = try appendRopeTensorData(alloc, initializers, tensor_data_extras, external_data_builder, Shape.init(dtype, &.{ @intCast(head_dim), @intCast(head_dim) }), try buildRopePermutationMatrixData(alloc, dtype, head_dim, rope_dim, attrs.consecutive_pairs, output_name));
     const trig_shape = Shape.init(dtype, &.{ @intCast(rows), @intCast(num_heads), @intCast(head_dim) });
-    const cos_data = try buildRopeTrigTensorData(alloc, dtype, rows, num_heads, head_dim, rope_dim, seq_len, attrs.theta, attrs.freq_scale, attrs.position_offset, attrs.consecutive_pairs, .cos, output_name);
-    errdefer {
-        alloc.free(cos_data.name);
-        alloc.free(cos_data.raw_data);
-    }
-    try appendOwnedRawTensorInitializer(alloc, initializers, tensor_data_extras, external_data_builder, cos_data.name, trig_shape, cos_data.raw_data);
-
-    const sin_data = try buildRopeTrigTensorData(alloc, dtype, rows, num_heads, head_dim, rope_dim, seq_len, attrs.theta, attrs.freq_scale, attrs.position_offset, attrs.consecutive_pairs, .sin, output_name);
-    errdefer {
-        alloc.free(sin_data.name);
-        alloc.free(sin_data.raw_data);
-    }
-    try appendOwnedRawTensorInitializer(alloc, initializers, tensor_data_extras, external_data_builder, sin_data.name, trig_shape, sin_data.raw_data);
-
-    const reshape_name = try std.fmt.allocPrint(alloc, "{s}__rope_reshape", .{output_name});
-    errdefer alloc.free(reshape_name);
-    const rotated_name = try std.fmt.allocPrint(alloc, "{s}__rope_rotated", .{output_name});
-    errdefer alloc.free(rotated_name);
-    const mul_cos_name = try std.fmt.allocPrint(alloc, "{s}__rope_mul_cos", .{output_name});
-    errdefer alloc.free(mul_cos_name);
-    const mul_sin_name = try std.fmt.allocPrint(alloc, "{s}__rope_mul_sin", .{output_name});
-    errdefer alloc.free(mul_sin_name);
-    const add_name = try std.fmt.allocPrint(alloc, "{s}__rope_add", .{output_name});
-    errdefer alloc.free(add_name);
-    try extra_names.append(alloc, reshape_name);
-    try extra_names.append(alloc, rotated_name);
-    try extra_names.append(alloc, mul_cos_name);
-    try extra_names.append(alloc, mul_sin_name);
-    try extra_names.append(alloc, add_name);
+    const cos_data = try appendRopeTensorData(alloc, initializers, tensor_data_extras, external_data_builder, trig_shape, try buildRopeTrigTensorData(alloc, dtype, rows, num_heads, head_dim, rope_dim, seq_len, attrs.theta, attrs.freq_scale, attrs.position_offset, attrs.consecutive_pairs, .cos, output_name));
+    const sin_data = try appendRopeTensorData(alloc, initializers, tensor_data_extras, external_data_builder, trig_shape, try buildRopeTrigTensorData(alloc, dtype, rows, num_heads, head_dim, rope_dim, seq_len, attrs.theta, attrs.freq_scale, attrs.position_offset, attrs.consecutive_pairs, .sin, output_name));
+    const reshape_name = try appendGeneratedName(alloc, extra_names, output_name, "__rope_reshape");
+    const rotated_name = try appendGeneratedName(alloc, extra_names, output_name, "__rope_rotated");
+    const mul_cos_name = try appendGeneratedName(alloc, extra_names, output_name, "__rope_mul_cos");
+    const mul_sin_name = try appendGeneratedName(alloc, extra_names, output_name, "__rope_mul_sin");
+    const add_name = try appendGeneratedName(alloc, extra_names, output_name, "__rope_add");
 
     try appendSimpleNode(alloc, onnx_nodes, "Reshape", reshape_name, &.{ input_name, shape_in_name }, &.{reshape_name});
     try appendSimpleNode(alloc, onnx_nodes, "MatMul", rotated_name, &.{ reshape_name, perm_data.name }, &.{rotated_name});
@@ -1580,10 +1525,10 @@ fn appendSemanticGqaSubgraph(
     try extra_names.append(alloc, present_v_name);
 
     if (!binding.skip_kv_write) {
-        try input_infos.append(alloc, try makeValueInfo(alloc, past_k_name, cache_k_shape));
-        try input_infos.append(alloc, try makeValueInfo(alloc, past_v_name, cache_v_shape));
-        try output_infos.append(alloc, try makeValueInfo(alloc, present_k_name, cache_k_shape));
-        try output_infos.append(alloc, try makeValueInfo(alloc, present_v_name, cache_v_shape));
+        try appendValueInfo(alloc, input_infos, past_k_name, cache_k_shape);
+        try appendValueInfo(alloc, input_infos, past_v_name, cache_v_shape);
+        try appendValueInfo(alloc, output_infos, present_k_name, cache_k_shape);
+        try appendValueInfo(alloc, output_infos, present_v_name, cache_v_shape);
     }
 
     const output_name = names[node_id];
@@ -1853,12 +1798,14 @@ fn appendOwnedRawTensorInitializer(
     shape: Shape,
     raw_data: []u8,
 ) !void {
+    try initializers.ensureUnusedCapacity(alloc, 1);
+    try tensor_data_extras.ensureUnusedCapacity(alloc, 1);
     const tensor = if (external_data_builder) |builder|
         try makeExternalRawConstantTensor(alloc, builder, name, shape, raw_data)
     else
         try makeRawConstantTensor(alloc, name, shape, raw_data);
-    try initializers.append(alloc, tensor);
-    try tensor_data_extras.append(alloc, .{ .name = name, .raw_data = raw_data });
+    initializers.appendAssumeCapacity(tensor);
+    tensor_data_extras.appendAssumeCapacity(.{ .name = name, .raw_data = raw_data });
 }
 
 fn allocTensorBytesForDType(alloc: Allocator, dtype: DType, data: []const f32) ![]u8 {
@@ -3529,4 +3476,206 @@ test "encoder activation export roundtrips standard rsqrt exact GELU and last-ax
         const shape = imported.graph.node(imported.output_ids[0]).output_shape;
         try std.testing.expectEqualSlices(i64, &.{ 2, 4 }, shape.dims[0..shape.rank()]);
     }
+}
+
+fn exportNegAllocationFailureCase(allocator: Allocator, dynamic: bool) !void {
+    var graph = Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("x", Shape.init(.f32, &.{ if (dynamic) @as(i64, -1) else 1, 4 }));
+    try graph.markOutput(try builder.neg(input));
+    const bytes = try exportGraph(allocator, &graph, .{});
+    defer allocator.free(bytes);
+    var parsed = try proto.parseModelProto(std.testing.allocator, bytes);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Neg", parsed.graph.?.nodes[0].op_type);
+}
+
+test "exportGraph allocation failures retire only initialized names and every completed owner" {
+    for ([_]bool{ false, true }) |dynamic| {
+        try exportNegAllocationFailureCase(std.testing.allocator, dynamic);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, exportNegAllocationFailureCase, .{dynamic});
+    }
+}
+
+fn makeExternalDataEntries(alloc: Allocator, location: []const u8, offset: usize, length: usize) ![]proto.ExternalDataEntry {
+    const entries = try alloc.alloc(proto.ExternalDataEntry, 3);
+    var initialized: usize = 0;
+    errdefer {
+        for (entries[0..initialized]) |entry| {
+            alloc.free(entry.key);
+            alloc.free(entry.value);
+        }
+        alloc.free(entries);
+    }
+    inline for (.{ "location", "offset", "length" }, 0..) |key, index| {
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        const value = switch (index) {
+            0 => try alloc.dupe(u8, location),
+            1 => try std.fmt.allocPrint(alloc, "{d}", .{offset}),
+            2 => try std.fmt.allocPrint(alloc, "{d}", .{length}),
+            else => unreachable,
+        };
+        entries[index] = .{ .key = owned_key, .value = value };
+        initialized += 1;
+    }
+    return entries;
+}
+
+fn appendGeneratedName(alloc: Allocator, names: *std.ArrayListUnmanaged([]u8), prefix: []const u8, suffix: []const u8) ![]const u8 {
+    try names.ensureUnusedCapacity(alloc, 1);
+    const name = try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, suffix });
+    names.appendAssumeCapacity(name);
+    return name;
+}
+fn appendGeneratedShape(alloc: Allocator, initializers: *std.ArrayListUnmanaged(TensorProto), extras: *std.ArrayListUnmanaged(ShapeExtra), prefix: []const u8, suffix: []const u8, values: []const i64) ![]const u8 {
+    const name = try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, suffix });
+    errdefer alloc.free(name);
+    try appendOwnedInt64Initializer(alloc, initializers, extras, name, values);
+    return name;
+}
+/// Consumes freshly constructed temporary data on BOTH success and failure.
+/// The returned descriptor borrows the successfully published extras owner.
+fn appendRopeTensorData(alloc: Allocator, initializers: *std.ArrayListUnmanaged(TensorProto), extras: *std.ArrayListUnmanaged(TensorDataExtra), external: ?*ExternalDataBuilder, shape: Shape, data: RopeTensorData) !RopeTensorData {
+    errdefer {
+        alloc.free(data.name);
+        alloc.free(data.raw_data);
+    }
+    try appendOwnedRawTensorInitializer(alloc, initializers, extras, external, data.name, shape, data.raw_data);
+    return data;
+}
+
+const ExternalFailureKind = enum { f32, raw, streamed };
+const ExternalFailureSource = struct {
+    kind: ExternalFailureKind,
+    loads: usize = 0,
+    frees: usize = 0,
+    writes: usize = 0,
+    stream_frees: usize = 0,
+    fail_stream: bool = false,
+    const values = [_]f32{ 1, -2, 3, 4 };
+    fn load(raw: ?*anyopaque, _: Allocator, name: []const u8) !?ParameterInitializer {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (!std.mem.eql(u8, name, "weight")) return null;
+        self.loads += 1;
+        return .{ .name = name, .shape = Shape.init(.f32, &.{ 2, 2 }), .data = switch (self.kind) {
+            .f32 => .{ .f32 = &values },
+            .raw => .{ .raw_bytes = std.mem.sliceAsBytes(&values) },
+            .streamed => .{ .streamed = .{ .storage_kind_tag = .dense_native, .source_byte_len = 16, .byte_len = 16, .context = self, .write_all = write, .deinit = freeStream } },
+        } };
+    }
+    fn free(raw: ?*anyopaque, allocator: Allocator, init: *const ParameterInitializer) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.frees += 1;
+        if (init.data == .streamed) freeStreamedTensorData(allocator, init.data.streamed);
+    }
+    fn write(raw: ?*anyopaque, _: Allocator, sink: ByteSink) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.writes += 1;
+        const bytes = std.mem.sliceAsBytes(&values);
+        try sink.write(sink.context, bytes[0..8]);
+        if (self.fail_stream) return error.InjectedStreamFailure;
+        try sink.write(sink.context, bytes[8..]);
+    }
+    fn freeStream(raw: ?*anyopaque, _: Allocator) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.stream_frees += 1;
+    }
+    fn balanced(self: *const @This()) bool {
+        return self.loads == self.frees and self.stream_frees == (if (self.kind == .streamed) self.loads else @as(usize, 0)) and self.writes <= self.loads;
+    }
+};
+fn externalExportOwnershipCase(allocator: Allocator, kind: ExternalFailureKind) !void {
+    const fixture = std.testing.allocator;
+    var graph = Graph.init(fixture);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const weight = try builder.parameter("weight", Shape.init(.f32, &.{ 2, 2 }));
+    try graph.markOutput(try builder.neg(weight));
+    var source = ExternalFailureSource{ .kind = kind };
+    defer std.debug.assert(source.balanced());
+    var result = try exportGraphWithExternalData(allocator, &graph, .{ .parameter_initializer_provider = .{ .context = &source, .load = ExternalFailureSource.load, .free = ExternalFailureSource.free } }, "weights.bin");
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), source.loads);
+    try std.testing.expect(source.balanced());
+    const external = result.external_data orelse return error.MissingExternalData;
+    try std.testing.expectEqualStrings("weights.bin", external.relative_path);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&ExternalFailureSource.values), external.bytes);
+    var parsed = try proto.parseModelProto(fixture, result.model_bytes);
+    defer parsed.deinit(fixture);
+    const initializer = parsed.graph.?.initializers[0];
+    try std.testing.expect(initializer.isExternal());
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, initializer.dims);
+    try std.testing.expectEqual(@as(i64, 16), initializer.externalDataInfo().length);
+    const inline_bytes = try exportGraph(fixture, &graph, .{ .parameter_initializers = &.{.{ .name = "weight", .shape = Shape.init(.f32, &.{ 2, 2 }), .data = .{ .f32 = &ExternalFailureSource.values } }} });
+    defer fixture.free(inline_bytes);
+    var reference = try proto.parseModelProto(fixture, inline_bytes);
+    defer reference.deinit(fixture);
+    try std.testing.expectEqualStrings(reference.graph.?.nodes[0].op_type, parsed.graph.?.nodes[0].op_type);
+    try std.testing.expectEqualSlices(u8, reference.graph.?.initializers[0].raw_data, external.bytes);
+}
+
+test "external f32 raw and streamed export unwind every allocation failure with balanced callbacks and identical payload" {
+    for (std.enums.values(ExternalFailureKind)) |kind| {
+        try externalExportOwnershipCase(std.testing.allocator, kind);
+        // Stable fallback allocation coverage, independent of remap placement.
+        var no_remap = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(no_remap.allocator(), externalExportOwnershipCase, .{kind});
+    }
+}
+
+test "streamed external source errors retire provider exactly once without publishing partial result" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    try graph.markOutput(try builder.parameter("weight", Shape.init(.f32, &.{ 2, 2 })));
+    var source = ExternalFailureSource{ .kind = .streamed, .fail_stream = true };
+    try std.testing.expectError(error.InjectedStreamFailure, exportGraphWithExternalData(a, &graph, .{ .parameter_initializer_provider = .{ .context = &source, .load = ExternalFailureSource.load, .free = ExternalFailureSource.free } }, "weights.bin"));
+    try std.testing.expect(source.balanced());
+    try std.testing.expectEqual(@as(usize, 1), source.loads);
+    try std.testing.expectEqual(@as(usize, 1), source.writes);
+}
+
+fn fusedRopeExportOwnershipCase(allocator: Allocator, external: bool, consecutive: bool) !void {
+    const fixture = std.testing.allocator;
+    var graph = Graph.init(fixture);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    try graph.markOutput(try graph.addNode(.{ .op = .{ .fused_rope = .{ .seq_len = 2, .head_dim = 4, .rope_dim = 4, .theta = 10000.0, .freq_scale = 1.0, .position_offset = 0, .consecutive_pairs = consecutive } }, .output_shape = Shape.init(.f32, &.{ 2, 4 }), .inputs = .{ input, null_node, null_node, null_node }, .num_inputs = 1 }));
+    var result = if (external) try exportGraphWithExternalData(allocator, &graph, .{}, "rope.bin") else try exportGraphResult(allocator, &graph, .{});
+    defer result.deinit(allocator);
+    var parsed = try proto.parseModelProto(fixture, result.model_bytes);
+    defer parsed.deinit(fixture);
+    try std.testing.expectEqual(@as(usize, 6), parsed.graph.?.nodes.len);
+    try std.testing.expectEqual(@as(usize, 5), parsed.graph.?.initializers.len);
+    const bytes = try exportGraph(fixture, &graph, .{});
+    defer fixture.free(bytes);
+    var reference = try proto.parseModelProto(fixture, bytes);
+    defer reference.deinit(fixture);
+    for (parsed.graph.?.nodes, reference.graph.?.nodes) |actual, expected| {
+        try std.testing.expectEqualStrings(expected.name, actual.name);
+        try std.testing.expectEqualStrings(expected.op_type, actual.op_type);
+    }
+    for (parsed.graph.?.initializers, reference.graph.?.initializers) |actual, expected| {
+        try std.testing.expectEqualStrings(expected.name, actual.name);
+        try std.testing.expectEqualSlices(i64, expected.dims, actual.dims);
+        if (actual.isExternal()) {
+            const info = actual.externalDataInfo();
+            const start: usize = @intCast(info.offset);
+            const length: usize = @intCast(info.length);
+            try std.testing.expectEqualSlices(u8, expected.raw_data, result.external_data.?.bytes[start..][0..length]);
+        } else try std.testing.expectEqualSlices(u8, expected.raw_data, actual.raw_data);
+    }
+    if (!external) try std.testing.expectEqualSlices(u8, bytes, result.model_bytes);
+}
+
+test "FusedRoPE inline and external temporary owners survive every allocation failure with exact serialized parity" {
+    for ([_]bool{ false, true }) |external| for ([_]bool{ false, true }) |consecutive| {
+        try fusedRopeExportOwnershipCase(std.testing.allocator, external, consecutive);
+        var no_remap = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(no_remap.allocator(), fusedRopeExportOwnershipCase, .{ external, consecutive });
+    };
 }
