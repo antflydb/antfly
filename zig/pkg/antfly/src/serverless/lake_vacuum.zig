@@ -178,10 +178,12 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
     return if (!progress.spilling and (progress.candidate == progress.candidates.len or progress.retired.len == progress.max_expired)) progress else null;
 }
 const Execution = struct {
-    version: u8 = 1,
+    version: u8 = 2,
     job: []const u8,
     pinned: usize = 0,
+    // Legacy numeric positions are retained only to decode version-one jobs.
     scan: usize = 0,
+    cursor: plan.Cursor = .{},
     approved: []const []const u8 = &.{},
     approved_index: usize = 0,
     next_scan: usize = 0,
@@ -199,7 +201,17 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
     };
     defer if (saved) |*value| value.deinit(client.allocator);
     var progress: Execution = if (saved) |value| try std.json.parseFromSliceLeaky(Execution, a, value.body, .{ .allocate = .alloc_always }) else .{ .job = job_hash };
-    if (progress.version != 1 or !std.mem.eql(u8, progress.job, job_hash) or progress.pinned > job.retired.len or progress.approved_index > progress.approved.len) return error.InvalidLakeVacuumPlan;
+    if ((progress.version != 1 and progress.version != 2) or !std.mem.eql(u8, progress.job, job_hash) or progress.pinned > job.retired.len or progress.approved_index > progress.approved.len) return error.InvalidLakeVacuumPlan;
+    if (progress.version == 1) {
+        // Restart traversal once for legacy numeric cursors, then checkpoint
+        // bounded frontier progress. Already deleted objects stay harmless;
+        // preserve any pending batch's existing catalog retirement proof.
+        progress.version = 2;
+        progress.scan = 0;
+        progress.next_scan = 0;
+        progress.cursor = .{};
+        if (!progress.complete) progress.exhausted = false;
+    }
     if (saved == null) {
         // The immutable job now owns every dependency. Drop the larger mutable
         // planner so completed operations do not retain two inventory caches.
@@ -246,17 +258,20 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                 for (try collectSnapshot(a, destination, snapshot, budget, manifests)) |uri| try marked.put(a, uri, {});
             }
             var selected: std.ArrayList([]const u8) = .empty;
-            var iterator: plan.Iterator = .{ .store = plans, .retired = job.retired };
-            var index: usize = 0;
-            while (index < progress.scan) : (index += 1) _ = (try iterator.next()) orelse return error.InvalidLakeVacuumPlan;
+            var seen = catalog.retirement_index.Index.init(a, client, plans.bucket, try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-traversal", .{plans.prefix}), context);
+            defer seen.deinit();
+            var walker = try plan.Walker.init(plans, job.retired, &seen, progress.cursor);
+            var steps: usize = 64;
             var inspected: usize = 0;
             var scanned: usize = 0;
             while (inspected < 16 and scanned < 4096 and selected.items.len < request.max_deleted) {
-                const uri = (try iterator.next()) orelse {
+                const uri = (walker.next(&steps) catch |err| switch (err) {
+                    error.LakeVacuumPlanYield => break,
+                    else => return err,
+                }) orelse {
                     progress.exhausted = true;
                     break;
                 };
-                index += 1;
                 scanned += 1;
                 if (marked.contains(uri)) {
                     result.retained_objects += 1;
@@ -267,7 +282,7 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                     result.retained_objects += 1;
                     continue;
                 }
-                try selected.append(a, uri);
+                if (!has(selected.items, uri)) try selected.append(a, uri);
             }
             if (selected.items.len != 0) {
                 const version = latest.table.version orelse return error.LakeCatalogConditionalWritesRequired;
@@ -278,7 +293,7 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
             }
             progress.approved = selected.items;
             progress.approved_index = 0;
-            progress.next_scan = index;
+            progress.cursor = walker.checkpoint();
             // Save the fenced deletion batch before any physical deletion.
         } else {
             const end = @min(progress.approved.len, progress.approved_index + @min(request.max_deleted, 16));
@@ -294,7 +309,6 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
             }
         }
         if (progress.approved_index == progress.approved.len) {
-            progress.scan = progress.next_scan;
             progress.approved = &.{};
             progress.approved_index = 0;
             progress.complete = progress.exhausted;
@@ -728,7 +742,26 @@ test "external lake vacuum expires a large backlog in bounded oldest-first jobs"
     for (expected, 0..) |counts, pass| {
         const request: Options = .{ .operation_id = try std.fmt.allocPrint(a, "vacuum-{d}", .{pass}), .dry_run = false, .exclusive_ownership = true, .retain_ms = 10 * 60 * 1000, .keep_latest = 1, .max_expired = 2, .max_deleted = 1 };
         var result = try run(alloc, binding, options, .{}, request, &.{});
-        if (pass == 0) try std.testing.expect(!result.complete);
+        if (pass == 0) {
+            try std.testing.expect(!result.complete);
+            // Resume a pre-frontier execution journal with a fenced batch.
+            // Migration must preserve that batch and restart only traversal.
+            var queue = try ingestion.openQueue(alloc, binding, options);
+            defer queue.deinit();
+            const execution_key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-execution/{s}.json", .{ try ingestion.prefix(a, queue.prefix, binding, options), catalog.types.digestHex(request.operation_id) });
+            var previous = try queue.client.getObject(queue.bucket, execution_key, .{});
+            defer previous.deinit(queue.client.allocator);
+            var legacy = try std.json.parseFromSliceLeaky(Execution, a, previous.body, .{ .allocate = .alloc_always });
+            try std.testing.expect(legacy.approved.len != 0);
+            legacy.version = 1;
+            legacy.scan = 0;
+            legacy.next_scan = 1;
+            legacy.cursor = .{};
+            var wire = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, legacy, .{}), .{});
+            _ = wire.object.swapRemove("cursor");
+            var replaced = try queue.client.compareAndPut(queue.bucket, execution_key, try std.json.Stringify.valueAlloc(a, wire, .{}), previous.metadata.writeRevision() orelse return error.MissingObjectRevision, .{});
+            replaced.deinit(queue.client.allocator);
+        }
         var deleted = result.deleted_objects;
         // A deletion-limited job spans turns; every turn must retain backlog.
         var turns: usize = 0;
@@ -799,7 +832,7 @@ test "external lake vacuum resumes 200 snapshots within remote budgets and reval
     var deleted: usize = 0;
     var turns: usize = 0;
     var interrupted = false;
-    while (!result.complete and turns < 512) : (turns += 1) {
+    while (!result.complete and turns < 2048) : (turns += 1) {
         var operation_budget: Budget = .{ .puts = Budget.writes(), .deletes = if (interrupted) null else metrics.runtime.snapshot().calls[delete_index] };
         result = run(alloc, binding, options, .{ .checkpoint = .{ .ptr = &operation_budget, .check = Budget.check } }, request, &.{}) catch |err| {
             if (!interrupted and metrics.runtime.snapshot().calls[delete_index] >= operation_budget.deletes.? + 2) {

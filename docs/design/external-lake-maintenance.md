@@ -139,7 +139,13 @@ nodes are embedded before deciding which nodes need uploads. Planning cursors
 cover both snapshots and manifests, and the final intent rechecks fresh catalog
 references and protected snapshots, so ingestion can continue between turns.
 Execution checkpoints the reader-retirement barrier and each catalog-fenced
-physical deletion batch. Lost responses replay that batch safely. The scheduler
+physical deletion batch. The sweep stores its current frame, immutable parent
+frame pages and an authenticated paged visited-node set. Checkpoint size stays
+bounded even for deep graphs, and cold resumes never scan the completed prefix. Shared
+manifest subtrees are visited once; duplicate paths in different manifests remain
+safe under conditional ownership deletion. Version-one execution checkpoints
+upgrade by restarting traversal once while preserving any already fenced batch.
+Lost responses replay that batch safely. The scheduler
 continues checkpoint-only work even when no catalog metadata changed that turn.
 Pending receipts report no physical deletions; completed receipts report final
 counts. A dry run must report zero deletions. Rejection surfaces as a conflict;

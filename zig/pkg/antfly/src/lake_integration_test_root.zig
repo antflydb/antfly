@@ -117,5 +117,6 @@ comptime {
     _ = @import("serverless/lake_snapshot_pins.zig");
     _ = @import("serverless/lake_compaction.zig");
     _ = @import("serverless/lake_vacuum.zig");
+    _ = @import("serverless/lake_vacuum_plan.zig");
     _ = @import("api/lake_search_overlay.zig");
 }
