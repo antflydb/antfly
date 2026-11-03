@@ -76,6 +76,14 @@ type SyncClient interface {
 	Batch(context.Context, string, map[string]any, []string) error
 }
 
+// SyncMergeValidator optionally enforces application policy against the exact
+// serialized request before dispatch. Implementations must be read-only and
+// must never dispatch writes. Rejection leaves that page unverified while
+// allowing other pages to proceed. Any Merge error still fences the writer.
+type SyncMergeValidator interface {
+	ValidateMerge(context.Context, string, []byte) error
+}
+
 // SyncWriter performs non-destructive writes first. Finish reconciles missing
 // records only after every item in a complete pinned inventory is query-visible.
 // Runtimes must serialize writers for the same source; different source ranges
@@ -250,6 +258,21 @@ func (w *SyncWriter) Finish(ctx context.Context) (MergeResult, error) {
 	return result, nil
 }
 func (w *SyncWriter) merge(ctx context.Context, page ScopedMergePage, expectedTo string, count int) (result MergeResult, err error) {
+	body, err := json.Marshal(ScopedMergeRequest{ScopedMerge: page})
+	if err != nil {
+		return MergeResult{}, err
+	}
+	if len(body) > 64<<20 {
+		return MergeResult{}, fmt.Errorf("source merge page exceeds 64 MiB")
+	}
+	// A caller-owned policy may reject an exact serialized request before any
+	// mutation is dispatched. Failed items remain unverified and cannot authorize
+	// reconciliation, but independent siblings can still be written safely.
+	if validator, ok := w.client.(SyncMergeValidator); ok {
+		if err := validator.ValidateMerge(ctx, w.table, body); err != nil {
+			return MergeResult{}, err
+		}
+	}
 	// A lost/invalid acknowledgement cannot authorize another mutation or cleanup
 	// on this writer. Recover with a new inventory writer and fresh visibility.
 	defer func() {
@@ -258,13 +281,6 @@ func (w *SyncWriter) merge(ctx context.Context, page ScopedMergePage, expectedTo
 		}
 	}()
 
-	body, err := json.Marshal(ScopedMergeRequest{ScopedMerge: page})
-	if err != nil {
-		return MergeResult{}, err
-	}
-	if len(body) > 64<<20 {
-		return MergeResult{}, fmt.Errorf("source merge page exceeds 64 MiB")
-	}
 	raw, err := w.client.Merge(ctx, w.table, body)
 	if err != nil {
 		return MergeResult{}, err

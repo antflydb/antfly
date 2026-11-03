@@ -231,7 +231,10 @@ and HTTP 408/425/429/500/502/503/504 up to three total attempts, within a shared
 30-second budget or the caller's earlier deadline. Backoff is cancellable and
 honors a supported `Retry-After`; a cooldown longer than the remaining budget
 returns the error immediately. Batch, table creation and scoped merges are never
-blindly retried. An ambiguous or invalid merge acknowledgement closes that
+blindly retried. Applications can implement `SyncMergeValidator` to apply a
+read-only budget check to the exact serialized request before dispatch. Local
+rejection leaves the item unverified and allows sibling writes; it cannot
+authorize deletion. An ambiguous or invalid merge acknowledgement closes that
 writer to further mutation or cleanup. Resume the durable source run: its
 ownership journal and pinned inventory survive, and a new writer uses fresh
 visibility proofs before deciding which rows or range still need work. A
