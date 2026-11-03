@@ -20,7 +20,7 @@ mkdir -p .specialty-artifacts
 uv venv .specialty-artifacts/oracle-venv --python 3.12
 UV_CACHE_DIR="$PWD/.specialty-artifacts/uv-cache" uv pip install \
   --python .specialty-artifacts/oracle-venv/bin/python \
-  --requirement zig/pkg/inference/scripts/gliner25/requirements.txt
+  --requirement zig/pkg/inference/scripts/gliner25/specialty/requirements.txt
 export SPECIALTY_PYTHON="$PWD/.specialty-artifacts/oracle-venv/bin/python"
 export PYTHONDONTWRITEBYTECODE=1
 export HF_HOME="$PWD/.specialty-artifacts/huggingface"
@@ -102,6 +102,30 @@ Model-independent tests require only the small checked-in fixtures. Full oracle
 and serving tests are opt-in through the four environment variables above;
 Metal tests additionally require a Metal-enabled build and host.
 
+The compact checked-in 21-case corpus can also qualify physical PII batches
+without the external full captures. Build `test-bin` with the matching backend,
+then run one of the following (sequentially). The model root contains directories
+`gliner2-privacy-filter-PII-multi` and `gliguard-LLMGuardrails-300M` with the pinned
+files. Omitting `ANTFLY_GLINER_SPECIALTY_GPU_ONLY` additionally runs live native
+CPU parity before the accelerator; the frozen CPU corpus is checked in either
+mode.
+
+```bash
+export ANTFLY_GLINER_SPECIALTY_MODELS_DIR="$PWD/.specialty-artifacts/metal-models"
+export ANTFLY_GLINER_SPECIALTY_FIXTURES_DIR="$PWD/zig/pkg/inference/testdata/gliner_specialty"
+ANTFLY_GLINER_SPECIALTY_GPU_ONLY=1 ANTFLY_RUN_GLINER_SPECIALTY_METAL=1 \
+  zig/pkg/inference/zig-out/bin/antfly-inference-tests \
+  --test-filter 'forced Metal HTTP qualification'
+ANTFLY_GLINER_SPECIALTY_GPU_ONLY=1 ANTFLY_RUN_GLINER_SPECIALTY_CUDA=1 \
+  zig/pkg/inference/zig-out/bin/antfly-inference-tests \
+  --test-filter 'forced CUDA batch HTTP qualification'
+```
+
+These checks cover 8/9/128-input ragged PII batches, singleton equivalence,
+per-input schemas/options and offsets, physical readback/GRU counters, and the
+512/513 prepared-token boundary. They do not replace the separate full-capture
+or CUDA sanitizer campaigns.
+
 After merging CUDA source changes, regenerate all images with the pinned CUDA
 13.2 toolkit and inspect each target's specialty kernel bodies locally:
 
@@ -142,7 +166,9 @@ python3 zig/pkg/inference/scripts/gliner25/specialty/qualify_soak.py \
 ```
 
 The HTTP gate validates all 23 frozen cases, regardless of timing selectors.
-GLiGuard uses physical batches up to eight; PII remains serial within requests.
+GLiGuard and entity-only PII use physical GPU batches up to eight. CPU PII
+retains serial execution. Ragged PII batches pad words and labels independently
+and preserve each input's schema, thresholds, count gate and original offsets.
 The drift gate creates private negative fixtures and removes them afterward.
 Do not run it alongside a live model manager using the hard-linked originals.
 The soak checks all offset units, versionless/ragged requests, public limits,
@@ -175,6 +201,10 @@ Match case ID, prepared tokens, request cardinality and physical batch size when
 comparing results. Both paths use FP32 with TF32 disabled. Antfly timings include
 HTTP; PyTorch timings cover its in-process public API. Allocation profiling is a
 separate execution; missing CUPTI transfer data is unavailable, not zero.
+The reference benchmark probes the encoder before timing and records observed
+physical batches; an eight-input request must actually reach the encoder as
+eight inputs. Earlier serial PII benchmark results do not establish performance
+against this physically batched reference.
 Sanitizer receipts distinguish unfiltered memory checks from explicitly scoped
 project-kernel synchronization checks. Preserve generated receipts with the run
 artifacts rather than checking machine-specific snapshots into the repository.

@@ -26,11 +26,11 @@ import argparse
 import importlib.metadata
 import json
 import os
-from pathlib import Path
 import platform
 import statistics
 import sys
 import time
+from pathlib import Path
 
 from capture_oracle import FIXTURES, cases, digest_file, verify_model, verify_source
 
@@ -88,8 +88,8 @@ def benchmark(args):
     verify_source(args.source_root, manifest["upstream"]["source_sha256"])
     sys.path.insert(0, str(args.source_root.resolve()))
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    import torch
     import gliner2
+    import torch
     from gliner2 import AutoExtractor, Schema
 
     if gliner2.__version__ != manifest["upstream"]["package_version"]:
@@ -111,7 +111,7 @@ def benchmark(args):
     model = AutoExtractor.from_pretrained(
         str(args.model_dir.resolve()), map_location=args.device
     ).eval()
-    physical_batch = min(8, args.batch_size) if args.profile == "gliguard" else 1
+    physical_batch = min(8, args.batch_size)
     output = []
     selected = [
         case for case in cases(args.profile) if not args.case or case["id"] in args.case
@@ -137,6 +137,7 @@ def benchmark(args):
         if token_count > 512:
             raise ValueError("oversized benchmark case")
         texts = [case["text"]] * args.batch_size
+        threshold = case.get("threshold", 0.5)
 
         def synchronize():
             if args.device == "cuda":
@@ -144,12 +145,12 @@ def benchmark(args):
             elif args.device == "mps":
                 torch.mps.synchronize()
 
-        def run():
+        def run(texts=texts, schema=schema, threshold=threshold):
             return model.batch_extract(
                 texts,
                 schema,
                 batch_size=physical_batch,
-                threshold=case.get("threshold", 0.5),
+                threshold=threshold,
                 include_confidence=True,
                 include_spans=True,
             )
@@ -158,6 +159,35 @@ def benchmark(args):
             for _ in range(args.warmups):
                 run()
             synchronize()
+            # Probe outside measured trials: the public batch argument alone
+            # is insufficient evidence that upstream batches the encoder.
+            observed_batches = []
+
+            def observe_encoder(
+                module, inputs, kwargs, observed_batches=observed_batches
+            ):
+                ids = kwargs.get("input_ids")
+                if ids is None and inputs:
+                    ids = inputs[0]
+                if not isinstance(ids, torch.Tensor) or ids.ndim != 2:
+                    raise ValueError("cannot verify upstream encoder batch shape")
+                observed_batches.append(int(ids.shape[0]))
+
+            handle = model.encoder.register_forward_pre_hook(
+                observe_encoder, with_kwargs=True
+            )
+            try:
+                run()
+                synchronize()
+            finally:
+                handle.remove()
+            if (
+                sum(observed_batches) != args.batch_size
+                or max(observed_batches, default=0) != physical_batch
+            ):
+                raise ValueError(
+                    f"upstream did not execute the requested physical batch: {observed_batches}"
+                )
             times = []
             for _ in range(args.iterations):
                 synchronize()
@@ -215,6 +245,7 @@ def benchmark(args):
             "id": case["id"],
             "request_items": args.batch_size,
             "physical_batch_items": physical_batch,
+            "observed_encoder_batches": observed_batches,
             "prepared_tokens_per_item": token_count,
             "warmups": args.warmups,
             "iterations": args.iterations,

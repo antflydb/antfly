@@ -62,6 +62,8 @@ pub const Options = struct {
     specialty_profile: ?@import("../models/gliner_specialty_qualification.zig").Profile = null,
     /// Admitted accelerator classification rows per physical forward.
     classification_batch_items: usize = 1,
+    /// Physical PII encoder/head rows, admitted with padded word/label geometry.
+    extraction_batch_items: usize = 1,
     max_response_bytes: usize = 64 * 1024 * 1024,
     /// `max_sequence_tokens` is the hard per-sequence ceiling. It defaults to
     /// DeBERTa-v3's 512 pretraining positions, the same cap the legacy span
@@ -629,6 +631,11 @@ pub fn deviceScratchUpperBound(config: EncoderConfig, tokens: usize) !usize {
 
 pub fn plannedDeviceScratchUpperBound(config: EncoderConfig, request: *const wire.Request, request_plan: *const Plan, options: Options) !usize {
     if (request.items.len != request_plan.items.len) return error.InvalidExtractionInput;
+    if (options.specialty_profile == .pii) {
+        var geometry = try maxSpanExtractionGeometry(request, request_plan, spanExtractionProfile(options).?);
+        geometry.batch_items = extractionBatchItems(request, request_plan, options);
+        return std.math.add(usize, try spanExtractionDeviceScratchUpperBound(config, geometry), specialty_qualification.cuda_matmul_workspace_bytes);
+    }
     const encoder = try std.math.mul(usize, try deviceScratchUpperBound(config, maxPlannedSequenceTokens(request_plan)), classificationBatchItems(request, request_plan, options));
     var head_peak: usize = 0;
     const H: usize = config.hiddenSize();
@@ -658,6 +665,8 @@ pub fn plannedDeviceScratchUpperBound(config: EncoderConfig, request: *const wir
 }
 
 pub const SpanExtractionGeometry = struct {
+    batch_items: usize = 1,
+    source_bytes: usize = 0,
     tokens: usize = 0,
     words: usize = 0,
     labels: usize = 0,
@@ -679,6 +688,7 @@ pub fn maxSpanExtractionGeometry(request: *const wire.Request, request_plan: *co
         if (prepared.document != null or prepared.batches.len != 1 or prepared.batches[0].samples.len != 1) return error.UnsupportedGlinerSpanV2Task;
         const sample = prepared.batches[0].samples[0];
         result.tokens = @max(result.tokens, sample.input_ids.len);
+        result.source_bytes = @max(result.source_bytes, sample.original_text.len);
         result.words = @max(result.words, sample.words.len);
         var labels: usize = 0;
         for (sample.groups) |group| {
@@ -706,16 +716,16 @@ fn checkedAdd(left: usize, right: usize) !usize {
 /// score/readback buffers. A factor of two covers backend workspace and
 /// allocator rounding, consistent with the classifier estimator above.
 pub fn spanExtractionDeviceScratchUpperBound(config: EncoderConfig, geometry: SpanExtractionGeometry) !usize {
-    if (geometry.tokens == 0 or geometry.words == 0 or geometry.labels == 0 or geometry.max_width != 8) return error.InvalidExtractionInput;
+    if (geometry.batch_items == 0 or geometry.batch_items > 8 or geometry.tokens == 0 or geometry.words == 0 or geometry.labels == 0 or geometry.max_width != 8) return error.InvalidExtractionInput;
     const h: usize = config.hiddenSize();
     const f = @sizeOf(f32);
     const spans = try geometry.spanRows();
-    const encoder_peak = try deviceScratchUpperBound(config, geometry.tokens);
-    const hidden_bytes = try checkedProduct(&.{ geometry.tokens, h, f });
-    const word_values = try checkedProduct(&.{ geometry.words, h });
-    const span_values = try checkedProduct(&.{ spans, h });
-    const label_values = try checkedProduct(&.{ geometry.labels, h });
-    const score_values = try checkedProduct(&.{ spans, geometry.labels });
+    const encoder_peak = try checkedProduct(&.{ geometry.batch_items, try deviceScratchUpperBound(config, geometry.tokens) });
+    const hidden_bytes = try checkedProduct(&.{ geometry.batch_items, geometry.tokens, h, f });
+    const word_values = try checkedProduct(&.{ geometry.batch_items, geometry.words, h });
+    const span_values = try checkedProduct(&.{ geometry.batch_items, spans, h });
+    const label_values = try checkedProduct(&.{ geometry.batch_items, geometry.labels, h });
+    const score_values = try checkedProduct(&.{ geometry.batch_items, spans, geometry.labels });
 
     // Two word projections with one retained output peak at <=10*W*H.
     // Gather/concat/out-project peak at <=10*S*H after prompt frees.
@@ -736,9 +746,9 @@ pub fn spanExtractionDeviceScratchUpperBound(config: EncoderConfig, geometry: Sp
 /// budgets; this prevents all label decoders from accumulating in the result
 /// arena while retaining a deterministic admission estimate.
 pub fn spanExtractionHostScratchUpperBound(geometry: SpanExtractionGeometry, max_candidates: usize) !usize {
-    if (geometry.words == 0 or geometry.labels == 0 or geometry.max_width != 8 or max_candidates == 0) return error.InvalidExtractionInput;
+    if (geometry.batch_items == 0 or geometry.batch_items > 8 or geometry.words == 0 or geometry.labels == 0 or geometry.max_width != 8 or max_candidates == 0) return error.InvalidExtractionInput;
     const spans = try geometry.spanRows();
-    const readback = try checkedProduct(&.{ spans, geometry.labels, @sizeOf(f32) });
+    const readback = try checkedProduct(&.{ geometry.batch_items, spans, geometry.labels, @sizeOf(f32) });
     const candidate_bytes = @sizeOf(@import("../pipelines/gliner_boundary_decode.zig").Candidate);
     // Candidate builder capacity (up to about 2C), ranked rows, by-end rows,
     // and the selected result coexist in the explicit weighted decoder.
@@ -750,7 +760,16 @@ pub fn spanExtractionHostScratchUpperBound(geometry: SpanExtractionGeometry, max
     var decoder = try checkedAdd(candidate_arrays, history);
     decoder = try checkedAdd(decoder, scalar_arrays);
     decoder = try checkedAdd(decoder, max_candidates); // keep flags
-    return checkedAdd(readback, decoder);
+    const packed_words = try checkedProduct(&.{ geometry.batch_items, geometry.words, @sizeOf(processor.Word) + 2 * @sizeOf(usize) });
+    const packed_labels = try checkedProduct(&.{ geometry.batch_items, geometry.labels, 2 * @sizeOf(usize) });
+    const packed_spans = try checkedProduct(&.{ geometry.batch_items, spans, 2 * @sizeOf(u32) + 4 * @sizeOf(usize) });
+    const coordinate_maps = try checkedProduct(&.{ try checkedAdd(geometry.source_bytes, 1), 2 * @sizeOf(usize) });
+    const packed_metadata = try checkedProduct(&.{ geometry.batch_items, @sizeOf(@import("gliner_span_extraction.zig").BatchItem) + 20 * @sizeOf(f32) + @sizeOf(usize) + @sizeOf(bool) });
+    var packed_bytes = try checkedAdd(try checkedAdd(packed_words, packed_labels), packed_metadata);
+    packed_bytes = try checkedAdd(packed_bytes, packed_spans);
+    packed_bytes = try checkedAdd(packed_bytes, coordinate_maps);
+    packed_bytes = try checkedAdd(packed_bytes, 64 * 1024); // host tensor descriptors and temporary names
+    return checkedAdd(try checkedAdd(readback, decoder), packed_bytes);
 }
 
 /// DeBERTa span checkpoints retain their established request ceiling. A
@@ -874,6 +893,69 @@ fn canBatchClassifications(request: *const wire.Request, request_plan: *const Pl
     return true;
 }
 
+pub fn extractionBatchItems(request: *const wire.Request, request_plan: *const Plan, options: Options) usize {
+    if (options.specialty_profile != .pii or options.extraction_batch_items <= 1 or request.items.len <= 1 or request.items.len != request_plan.items.len) return 1;
+    for (request.items, request_plan.items) |item, prepared| {
+        if (item.compiled.schema.entities.len == 0 or item.compiled.schema.relations.len != 0 or item.compiled.schema.classifications.len != 0 or
+            prepared.document != null or prepared.batches.len != 1 or prepared.batches[0].samples.len != 1) return 1;
+    }
+    return @min(@min(options.extraction_batch_items, 8), request.items.len);
+}
+
+fn executePiiBatches(cb: *const compute.ComputeBackend, allocator: Allocator, config: EncoderConfig, request: *const wire.Request, request_plan: *const Plan, options: Options, writer: *wire.ResponseWriter) !void {
+    if (config != .deberta) return error.UnsupportedGlinerSpanV2Task;
+    const core = @import("gliner_span_extraction.zig");
+    var remaining_values = options.pipeline.max_output_values;
+    var offset: usize = 0;
+    while (offset < request.items.len) {
+        if (remaining_values == 0) return error.ExtractionOutputLimitExceeded;
+        try progress(options, offset, "encoder");
+        const n = @min(extractionBatchItems(request, request_plan, options), request.items.len - offset);
+        var sequence_length: usize = 0;
+        for (request_plan.items[offset..][0..n]) |prepared|
+            sequence_length = @max(sequence_length, prepared.batches[0].samples[0].input_ids.len);
+        if (sequence_length == 0 or sequence_length > 512) return error.InvalidExtractionInput;
+        const tokens = try std.math.mul(usize, n, sequence_length);
+        const ids = try allocator.alloc(i64, tokens);
+        defer allocator.free(ids);
+        const mask = try allocator.alloc(i64, tokens);
+        defer allocator.free(mask);
+        @memset(ids, 0);
+        @memset(mask, 0);
+        const items = try allocator.alloc(core.BatchItem, n);
+        defer allocator.free(items);
+        for (items, request.items[offset..][0..n], request_plan.items[offset..][0..n], 0..) |*out, *item, prepared, row| {
+            const sample = prepared.batches[0].samples[0];
+            @memcpy(ids[row * sequence_length ..][0..sample.input_ids.len], sample.input_ids);
+            @memset(mask[row * sequence_length ..][0..sample.input_ids.len], 1);
+            var native_options = item.options.native(options.pipeline);
+            native_options.control = options.control;
+            native_options.max_output_values = remaining_values;
+            out.* = .{
+                .sample = sample,
+                .compiled = &item.compiled,
+                .options = native_options,
+                .head_options = .{ .require_device_gru = true, .legacy_greedy_overlap = !item.options.overlap_explicit },
+            };
+        }
+        cb.preferEagerQuantMirrors(true);
+        const hidden = try deberta_arch.forwardCtProfiled(cb, allocator, config.deberta, ids, mask, n, sequence_length, deberta_mod.glinerPrefersWeightMirrors(config.deberta), null);
+        defer cb.free(hidden);
+        try progress(options, offset, "decoding");
+        var extracted = try core.runBatchFromHidden(cb, allocator, hidden, config.hiddenSize(), sequence_length, items);
+        defer extracted.deinit();
+        for (extracted.samples, request.items[offset..][0..n], 0..) |sample, item, row| {
+            try progress(options, offset + row, "decoding");
+            var used: usize = 0;
+            for (sample.entities) |entity| used = try std.math.add(usize, used, entity.values.len);
+            if (used > remaining_values) return error.ExtractionOutputLimitExceeded;
+            remaining_values -= used;
+            try writer.append(item, sample);
+        }
+        offset += n;
+    }
+}
+
 /// Shared by device admission and execution. Split-task and windowed plans keep
 /// their single-sequence reservation even when ordinary items support batching.
 pub fn classificationBatchItems(request: *const wire.Request, request_plan: *const Plan, options: Options) usize {
@@ -942,10 +1024,15 @@ pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, c
     if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .cuda and cb.kind() != .wasm) return error.UnsupportedExtractionBackend;
     if (request_plan.items.len != request.items.len) return error.InvalidExtractionInput;
     if (options.classification_batch_items == 0) return error.InvalidExtractionInput;
+    if (options.extraction_batch_items == 0) return error.InvalidExtractionInput;
     if (options.decide_request != null and request.items.len != 1) return error.InvalidExtractionInput;
     var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);
     defer writer.deinit();
     try writer.begin(request.model);
+    if ((cb.kind() == .cuda or cb.kind() == .metal) and extractionBatchItems(request, request_plan, options) > 1) {
+        try executePiiBatches(cb, allocator, config, request, request_plan, options, &writer);
+        return writer.finish(request_plan.prompt_tokens);
+    }
     const batched = if ((cb.kind() == .cuda or cb.kind() == .metal) and classificationBatchItems(request, request_plan, options) > 1)
         try plannedClassificationBatch(cb, allocator, config, request, request_plan, options)
     else
@@ -1704,7 +1791,7 @@ test "gliner specialty scratch reserves prepared span geometry and every physica
     const config = EncoderConfig{ .deberta = .{ .hidden_size = 768, .intermediate_size = 3072, .num_attention_heads = 12 } };
     // Only slice cardinalities are inspected. Avoid model or token buffers in
     // this geometry test; fake prepared values are never executed or deinit'd.
-    const words: [64]processor.Word = undefined;
+    const words: [400]processor.Word = undefined;
     const ids: [512]i64 = undefined;
     const markers: [42]usize = undefined;
     var groups = [_]processor.Group{std.mem.zeroes(processor.Group)};
@@ -1724,7 +1811,7 @@ test "gliner specialty scratch reserves prepared span geometry and every physica
     const large = try plannedDeviceScratchUpperBound(config, &pii, &request_plan, .{ .specialty_profile = .pii });
     const encoder = try deviceScratchUpperBound(config, 512);
     try std.testing.expect(large > small);
-    try std.testing.expect(large >= encoder + 64 * 8 * 768 * @sizeOf(f32));
+    try std.testing.expect(large >= encoder + words.len * 8 * 768 * @sizeOf(f32));
     var guard = try wire.parseJson(a,
         \\{"schema_version":2,"model":"guard","schema":{"classifications":[{"name":"safety","labels":["safe","unsafe"]}]},"inputs":[{"content":"one"},{"content":"two"}]}
     , .{});

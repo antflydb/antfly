@@ -2705,7 +2705,11 @@ fn createGpuHostedSessionWithTaskOverride(
         if (mf.gliner_specialty_profile) |profile| {
             const identity = gliner_decision_identity orelse return error.UnsupportedGlinerSpecialtyArtifact;
             if (try gliner_specialty.require(identity) != profile) return error.UnsupportedGlinerSpecialtyArtifact;
-            try gliner_specialty.requireBackend(profile, if (backend_type == .metal) .metal else .other);
+            try gliner_specialty.requireBackend(profile, switch (backend_type) {
+                .metal => .metal,
+                .cuda => .cuda,
+                else => .other,
+            });
             try applyQualifiedGlinerSpecialtyExecutionPolicy(&arch_config, profile);
         }
         const source = (try tensor_store.?.weightSource()) orelse return error.NoDenseWeightSource;
@@ -9617,9 +9621,32 @@ pub fn getGlinerSpecialtyIdentity(session: Session) !gliner_specialty.Identity {
     try gliner_specialty.requireBackend(profile, switch (session.backend()) {
         .native => .native,
         .metal => .metal,
+        .cuda => .cuda,
         else => .other,
     });
     return identity;
+}
+
+test "GLiNER specialty sealed identity accepts native Metal and CUDA sessions" {
+    inline for (.{ gliner_specialty.Profile.pii, gliner_specialty.Profile.gliguard }) |profile| {
+        var arch = ArchSession{
+            .allocator = std.testing.allocator,
+            .arch_config = .{ .deberta = .{} },
+            .task = .extractor,
+            .gliner_decision_identity = gliner_specialty.pinnedIdentity(profile),
+            .gliner_decision_identity_sealed = true,
+            .backend_type = .native,
+            // Identity queries inspect metadata only, without creating a device.
+            .backend_data = .{ .native = .{ .allocator = std.testing.allocator, .resident_weights = .empty, .lazy_weights = .empty } },
+        };
+        const session = Session{ .ptr = &arch, .vtable = &arch_vtable };
+        inline for (.{ BackendType.native, BackendType.metal, BackendType.cuda }) |backend| {
+            arch.backend_type = backend;
+            try std.testing.expectEqual(profile, try gliner_specialty.require(try getGlinerSpecialtyIdentity(session)));
+        }
+        arch.gliner_decision_identity_sealed = false;
+        try std.testing.expectError(error.MissingGlinerDecisionIdentity, getGlinerSpecialtyIdentity(session));
+    }
 }
 
 test "GLiNER decision identity seals only the exact tokenizer snapshot" {

@@ -80,7 +80,8 @@ Final moderation verdict aggregation remains caller-owned.
   rejected for these profiles. Empty or whitespace-only content is invalid.
 - GLiGuard uses Metal physical batches of up to eight rows; larger admitted
   requests are chunked while preserving item and task order.
-- PII uses serial item execution within the configured public batch ceiling.
+- Entity-only PII uses physical Metal batches of up to eight rows, with padded
+  word and label geometry and independent count gates. Native CPU remains serial.
 - PII's position-zero GRU, concat, and projector remain on Metal. The shared
   GRU primitive retains the residual mode used by existing CountLSTM-v2 models.
 - Admission includes span-construction, scoring, and readback geometry.

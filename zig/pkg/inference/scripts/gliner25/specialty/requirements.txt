@@ -1,0 +1,3 @@
+-r ../requirements.txt
+# Required by the pinned Transformers tokenizer compatibility path.
+protobuf==6.33.0

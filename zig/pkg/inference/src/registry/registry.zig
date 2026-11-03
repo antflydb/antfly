@@ -2092,7 +2092,7 @@ fn synthesizePulledModelManifestJsonInternal(
     }
     if (specialty_profile != null) {
         try body.appendSlice(allocator, ",\"qualified_limits\":{\"specialty\":{\"sequence_tokens\":512,\"physical_batch_items\":");
-        try body.appendSlice(allocator, if (specialty_profile == .pii) "1" else "8");
+        try body.appendSlice(allocator, "8");
         try body.appendSlice(allocator, "}}");
     }
     if (sparse_3d_output_layout) |layout| {

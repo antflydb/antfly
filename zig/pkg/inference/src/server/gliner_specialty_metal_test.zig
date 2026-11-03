@@ -54,7 +54,7 @@ const pii_directory = "gliner2-privacy-filter-PII-multi";
 const guard_directory = "gliguard-LLMGuardrails-300M";
 const GiB = 1024 * 1024 * 1024;
 
-const Backend = enum { native, metal };
+const Backend = enum { native, metal, cuda };
 
 const NumericContext = struct {
     backend: Backend,
@@ -524,6 +524,14 @@ fn expectGuardOracle(actual_json: []const u8, case: Value, context: NumericConte
 fn configureBackend(node: *Node, backend: Backend) void {
     switch (backend) {
         .native => native_backend.useNativeBackend(node),
+        .cuda => {
+            node.session_manager.preferred_backends = &.{.cuda};
+            node.session_manager.required_backend = .cuda;
+            node.session_manager.required_backend_invalid = false;
+            node.model_manager.session_manager.preferred_backends = &.{.cuda};
+            node.model_manager.session_manager.required_backend = .cuda;
+            node.model_manager.session_manager.required_backend_invalid = false;
+        },
         .metal => {
             node.session_manager.preferred_backends = &.{.metal};
             node.session_manager.required_backend = .metal;
@@ -541,6 +549,7 @@ fn verifyIdentity(node: *Node, directory: []const u8, backend: Backend, profile:
     try std.testing.expectEqual(@as(@import("../backends/backends.zig").BackendType, switch (backend) {
         .native => .native,
         .metal => .metal,
+        .cuda => .cuda,
     }), handle.get().session.backend());
     try std.testing.expectEqual(profile, handle.get().manifest.gliner_specialty_profile.?);
     const identity = try factory.getGlinerSpecialtyIdentity(handle.get().session);
@@ -596,12 +605,18 @@ fn repeatedText(a: Allocator, word: []const u8, count: usize) ![]u8 {
 /// Search with the held production tokenizer rather than assuming one token
 /// per source word. The selected text is re-planned and asserted by the caller.
 fn textForPreparedTokens(a: Allocator, tokenizer: @import("inference_tokenizer").Tokenizer, model: []const u8, schema: Value, target: usize, span_profile: bool) ![]u8 {
+    return textForPreparedTokensWithPrefix(a, tokenizer, model, schema, target, span_profile, "");
+}
+
+fn textForPreparedTokensWithPrefix(a: Allocator, tokenizer: @import("inference_tokenizer").Tokenizer, model: []const u8, schema: Value, target: usize, span_profile: bool, prefix: []const u8) ![]u8 {
     for ([_][]const u8{ "a", "token", "hello" }) |word| {
         var low: usize = 1;
         var high: usize = 2 * target;
         while (low <= high) {
             const count = low + (high - low) / 2;
-            const text = try repeatedText(a, word, count);
+            const repeated = try repeatedText(a, word, count);
+            defer a.free(repeated);
+            const text = try std.mem.concat(a, u8, &.{ prefix, repeated });
             const prepared = try preparedTokenCount(a, tokenizer, model, schema, text, span_profile);
             if (prepared == target) return text;
             a.free(text);
@@ -1179,9 +1194,144 @@ fn qualifySoak(
         try std.testing.expectEqual(baseline.device_owned_peak_live_bytes, current.device_owned_peak_live_bytes);
     }
     const after = metal.memoryStatsSnapshot();
-    try std.testing.expectEqual(baseline.to_host_device_calls + 25 * 4, after.to_host_device_calls);
+    // Nine PII items: two count and two span readbacks; nine GLiGuard
+    // items: two final-logit readbacks.
+    try std.testing.expectEqual(baseline.to_host_device_calls + 25 * 6, after.to_host_device_calls);
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
     std.debug.print("GLiNER specialty alternating soak cycles=25 parity=true admission_stable=true live_bytes_stable=true peak_stable=true\n", .{});
+}
+
+fn qualifyPiiBatches(a: Allocator, node: *Node, transport: *Loopback, directory: []const u8, backend: Backend, cases: []const Value, singletons: []const []u8) !void {
+    var handle = node.model_manager.acquireLoadedModel(directory) orelse return error.MissingLoadedModel;
+    defer handle.release();
+    const loaded = handle.get();
+    for ([_]usize{ 8, 9, 128 }) |count| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const temporary = arena.allocator();
+        const Input = struct { id: []const u8, content: []const u8, schema: Value, options: Value };
+        const inputs = try temporary.alloc(Input, count);
+        var active_chunks: usize = 0;
+        for (inputs, 0..) |*input, index| {
+            const case = cases[index % cases.len];
+            var schema_value = try piiCaseSchema(temporary, case);
+            defer schema_value.deinit();
+            const singleton = try piiCaseRequestBody(temporary, case, schema_value.value);
+            const parsed = try std.json.parseFromSliceLeaky(Value, temporary, singleton, .{ .allocate = .alloc_always });
+            input.* = .{
+                .id = try std.fmt.allocPrint(temporary, "row-{d}", .{index}),
+                .content = case.object.get("text").?.string,
+                .schema = parsed.object.get("schema").?,
+                .options = parsed.object.get("options").?,
+            };
+        }
+        var start: usize = 0;
+        while (start < count) : (start += 8) {
+            const last = @min(start + 8, count);
+            for (start..last) |index| {
+                if (cases[index % cases.len].object.get("heads").?.array.items[0].object.get("predicted_count").?.integer != 0) {
+                    active_chunks += 1;
+                    break;
+                }
+            }
+        }
+        const body = try std.json.Stringify.valueAlloc(temporary, .{
+            .schema_version = 2,
+            .model = pii_directory,
+            .schema = inputs[0].schema,
+            .inputs = inputs,
+        }, .{});
+        const before_metal = metal.memoryStatsSnapshot();
+        const before_cuda = factory.getCudaRuntimeStats(loaded.session);
+        const actual = try responseAt(transport, "/ai/v1/extract", body);
+        defer a.free(actual);
+        try transport.idle();
+        const chunks = (count + 7) / 8;
+        if (backend == .metal)
+            try std.testing.expectEqual(before_metal.to_host_device_calls + chunks + active_chunks, metal.memoryStatsSnapshot().to_host_device_calls);
+        if (comptime build_options.enable_cuda) {
+            if (backend == .cuda) {
+                const before = before_cuda.?;
+                const after = factory.getCudaRuntimeStats(loaded.session).?;
+                try std.testing.expectEqual(before.gliner_label_gru_no_residual_calls + active_chunks, after.gliner_label_gru_no_residual_calls);
+                try std.testing.expectEqual(before.download_events + chunks + active_chunks, after.download_events);
+            }
+        }
+        const parsed = try std.json.parseFromSlice(Value, temporary, actual, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const rows = parsed.value.object.get("data").?.array.items;
+        try std.testing.expectEqual(count, rows.len);
+        for (rows, 0..) |row, index| {
+            const expected = try std.json.parseFromSliceLeaky(Value, temporary, singletons[index % singletons.len], .{ .allocate = .alloc_always });
+            try std.testing.expectEqualStrings(inputs[index].id, row.object.get("id").?.string);
+            try family_batch.equalBatchValue(expected.object.get("data").?.array.items[0], row, 5e-4);
+        }
+        if (comptime build_options.enable_cuda) {
+            if (backend == .cuda and count == 9)
+                try family_batch.queuedCancellation(node, transport, directory, "/ai/v1/extract", body, actual);
+        }
+        std.debug.print("specialty_pii_batch backend={s} items={d} physical_forwards={d} active_gru_batches={d} ragged_labels_words=true offsets_and_order=true\n", .{ @tagName(backend), count, chunks, active_chunks });
+    }
+    try qualifyPiiBatchBoundary(a, node, transport, directory, backend, cases);
+}
+
+fn qualifyPiiBatchBoundary(a: Allocator, node: *Node, transport: *Loopback, directory: []const u8, backend: Backend, cases: []const Value) !void {
+    var handle = node.model_manager.acquireLoadedModel(directory) orelse return error.MissingLoadedModel;
+    defer handle.release();
+    const loaded = handle.get();
+    var widest: usize = 0;
+    for (cases, 0..) |case, index|
+        if (case.object.get("labels").?.array.items.len > cases[widest].object.get("labels").?.array.items.len) {
+            widest = index;
+        };
+    var schema_value = try piiCaseSchema(a, cases[widest]);
+    defer schema_value.deinit();
+    const prefix = "Contact Maria Jensen at maria.jensen@example.dk. ";
+    const text = try textForPreparedTokensWithPrefix(a, loaded.getTokenizer(), pii_directory, schema_value.value, 512, true, prefix);
+    defer a.free(text);
+    const inputs = [_]family_batch.BatchCase{.{ .text = text, .schema = schema_value.value }};
+    const singleton_body = try family_batch.batchBody(a, pii_directory, &inputs, 1, false);
+    defer a.free(singleton_body);
+    const before_singleton = metal.memoryStatsSnapshot();
+    const before_singleton_cuda = factory.getCudaRuntimeStats(loaded.session);
+    const singleton = try responseAt(transport, "/ai/v1/extract", singleton_body);
+    defer a.free(singleton);
+    const expected = try std.json.parseFromSlice(Value, a, singleton, .{});
+    defer expected.deinit();
+    var readbacks: usize = if (backend == .metal) @intCast(metal.memoryStatsSnapshot().to_host_device_calls - before_singleton.to_host_device_calls) else 0;
+    if (comptime build_options.enable_cuda) {
+        if (backend == .cuda) readbacks = factory.getCudaRuntimeStats(loaded.session).?.download_events - before_singleton_cuda.?.download_events;
+    }
+    try std.testing.expect(readbacks == 1 or readbacks == 2);
+    for ([_]usize{ 8, 9 }) |count| {
+        const body = try family_batch.batchBody(a, pii_directory, &inputs, count, false);
+        defer a.free(body);
+        const before = metal.memoryStatsSnapshot();
+        const before_cuda = factory.getCudaRuntimeStats(loaded.session);
+        const actual = try responseAt(transport, "/ai/v1/extract", body);
+        defer a.free(actual);
+        const chunks = (count + 7) / 8;
+        if (backend == .metal)
+            try std.testing.expectEqual(before.to_host_device_calls + readbacks * chunks, metal.memoryStatsSnapshot().to_host_device_calls);
+        if (comptime build_options.enable_cuda) {
+            if (backend == .cuda)
+                try std.testing.expectEqual(before_cuda.?.download_events + readbacks * chunks, factory.getCudaRuntimeStats(loaded.session).?.download_events);
+        }
+        const parsed = try std.json.parseFromSlice(Value, a, actual, .{});
+        defer parsed.deinit();
+        try expectFiniteJson(parsed.value);
+        try std.testing.expectEqual(@as(i64, @intCast(512 * count)), parsed.value.object.get("usage").?.object.get("prompt_tokens").?.integer);
+        const rows = parsed.value.object.get("data").?.array.items;
+        try std.testing.expectEqual(count, rows.len);
+        for (rows) |row| try family_batch.equalBatchValue(expected.value.object.get("data").?.array.items[0], row, 5e-4);
+        std.debug.print("specialty_pii_batch_boundary backend={s} items={d} prepared_tokens=512 physical_forwards={d} readbacks={d}\n", .{ @tagName(backend), count, chunks, readbacks * chunks });
+    }
+    const oversized = try textForPreparedTokensWithPrefix(a, loaded.getTokenizer(), pii_directory, schema_value.value, 513, true, prefix);
+    defer a.free(oversized);
+    const over_inputs = [_]family_batch.BatchCase{.{ .text = oversized, .schema = schema_value.value }};
+    const rejected_body = try family_batch.batchBody(a, pii_directory, &over_inputs, 8, false);
+    defer a.free(rejected_body);
+    try expectRejected(transport, "/ai/v1/extract", rejected_body, 413, "EXTRACTION_LIMIT_EXCEEDED");
 }
 
 fn runBackend(a: Allocator, backend: Backend, root: []const u8, pii_dir: []const u8, guard_dir: []const u8, captures: *const Captures, native: ?*const Outputs) !Outputs {
@@ -1220,6 +1370,7 @@ fn runBackend(a: Allocator, backend: Backend, root: []const u8, pii_dir: []const
     // label identity, ordering, offsets, cardinality and every non-near-tie
     // selection remain exact; only floating accumulation is approximate.
     const oracle_tolerance: f64 = if (backend == .metal) 5e-3 else 2e-3;
+    const public_tolerance: f64 = if (backend == .cuda) 5e-4 else oracle_tolerance;
     const pii_outputs = try a.alloc([]u8, pii_cases.len);
     const guard_outputs = a.alloc([]u8, guard_cases.len) catch |err| {
         a.free(pii_outputs);
@@ -1252,13 +1403,14 @@ fn runBackend(a: Allocator, backend: Backend, root: []const u8, pii_dir: []const
         if (backend == .metal)
             try std.testing.expectEqual(before.to_host_device_calls + 1 + @intFromBool(predicted_count != 0), metal.memoryStatsSnapshot().to_host_device_calls);
         const context = NumericContext{ .backend = backend, .profile = .pii, .case_id = case.object.get("id").?.string };
-        try expectPiiOracle(outputs.pii[i], case, context, oracle_tolerance);
-        if (native) |expected| try compareEnvelope(expected.pii[i], outputs.pii[i], oracle_tolerance);
+        try expectPiiOracle(outputs.pii[i], case, context, public_tolerance);
+        if (native) |expected| try compareEnvelope(expected.pii[i], outputs.pii[i], public_tolerance);
     }
     for (pii_cases) |case| if (std.mem.eql(u8, case.object.get("id").?.string, "unicode_codepoint_offsets")) {
         try qualifyDefaultByteOffsets(a, transport, case, oracle_tolerance);
         break;
     };
+    if (backend != .native) try qualifyPiiBatches(a, &node, transport, pii_dir, backend, pii_cases, outputs.pii);
     try verifyIdentity(&node, pii_dir, backend, .pii);
     try directPiiParity(a, &node, pii_dir, pii_cases, backend, oracle_tolerance);
     var pii_boundary_schema = try piiSchema(a, pii_cases[0].object.get("labels").?);
@@ -1284,8 +1436,8 @@ fn runBackend(a: Allocator, backend: Backend, root: []const u8, pii_dir: []const
         if (backend == .metal and i + 1 == guard_cases.len)
             try std.testing.expectEqual(before.to_host_device_calls + 1, metal.memoryStatsSnapshot().to_host_device_calls);
         const context = NumericContext{ .backend = backend, .profile = .gliguard, .case_id = case.object.get("id").?.string };
-        try expectGuardOracle(outputs.guard[i], case, context, oracle_tolerance);
-        if (native) |expected| try compareEnvelope(expected.guard[i], outputs.guard[i], oracle_tolerance);
+        try expectGuardOracle(outputs.guard[i], case, context, public_tolerance);
+        if (native) |expected| try compareEnvelope(expected.guard[i], outputs.guard[i], public_tolerance);
     }
     try verifyIdentity(&node, guard_dir, backend, .gliguard);
     try directGuardParity(a, &node, guard_dir, guard_cases, schemas, backend, oracle_tolerance);
@@ -1324,25 +1476,21 @@ fn runBackend(a: Allocator, backend: Backend, root: []const u8, pii_dir: []const
             .text = pii_cases[0].object.get("text").?.string,
             .schema = pii_boundary_schema.value,
         }};
-        try qualifyMaxBatch(a, transport, pii_directory, &pii_batch_cases, outputs.pii[0..1], 2 * 128);
+        try qualifyMaxBatch(a, transport, pii_directory, &pii_batch_cases, outputs.pii[0..1], 2 * 128 / 8);
         try qualifyMaxBatch(a, transport, guard_directory, batch_cases, outputs.guard, 16);
 
-        const pii_lifecycle_body = try requestBody(
-            a,
-            pii_directory,
-            pii_cases[0].object.get("id").?.string,
-            pii_cases[0].object.get("text").?.string,
-            pii_boundary_schema.value,
-        );
+        const pii_lifecycle_body = try family_batch.batchBody(a, pii_directory, &pii_batch_cases, 9, false);
         defer a.free(pii_lifecycle_body);
-        try lifecycle(a, &node, transport, pii_dir, guard_dir, pii_lifecycle_body, outputs.pii[0]);
+        const pii_lifecycle_expected = try responseAt(transport, "/ai/v1/extract", pii_lifecycle_body);
+        defer a.free(pii_lifecycle_expected);
+        try lifecycle(a, &node, transport, pii_dir, guard_dir, pii_lifecycle_body, pii_lifecycle_expected);
 
         const guard_soak_body = try family_batch.batchBody(a, guard_directory, batch_cases, 9, false);
         defer a.free(guard_soak_body);
         const guard_soak_expected = try responseAt(transport, "/ai/v1/extract", guard_soak_body);
         defer a.free(guard_soak_expected);
         try transport.idle();
-        try qualifySoak(a, &node, transport, pii_lifecycle_body, outputs.pii[0], guard_soak_body, guard_soak_expected);
+        try qualifySoak(a, &node, transport, pii_lifecycle_body, pii_lifecycle_expected, guard_soak_body, guard_soak_expected);
     }
     try rejectionChecks(a, transport, pii_directory, guard_directory);
     try transport.finish();
@@ -1458,9 +1606,34 @@ test "GLiNER specialty exact FP32 native oracle and forced Metal HTTP qualificat
     const guard_dir = try prepareModel(a, &temporary, source_root, guard_directory);
     defer a.free(guard_dir);
     const root = std.fs.path.dirname(pii_dir) orelse return error.InvalidModelPath;
-    var native = try runBackend(a, .native, root, pii_dir, guard_dir, &captures, null);
-    defer native.deinit(a);
-    var gpu = try runBackend(a, .metal, root, pii_dir, guard_dir, &captures, &native);
+    var native: ?Outputs = null;
+    defer if (native) |*outputs| outputs.deinit(a);
+    if (!platform.env.getenvBool("ANTFLY_GLINER_SPECIALTY_GPU_ONLY"))
+        native = try runBackend(a, .native, root, pii_dir, guard_dir, &captures, null);
+    const expected: ?*const Outputs = if (native) |*outputs| outputs else null;
+    var gpu = try runBackend(a, .metal, root, pii_dir, guard_dir, &captures, expected);
     defer gpu.deinit(a);
-    try qualifyCapacityEviction(a, root, pii_dir, guard_dir, &captures, &native);
+    try qualifyCapacityEviction(a, root, pii_dir, guard_dir, &captures, expected orelse &gpu);
+}
+
+test "GLiNER specialty exact FP32 native oracle and forced CUDA batch HTTP qualification" {
+    if (!platform.env.getenvBool("ANTFLY_RUN_GLINER_SPECIALTY_CUDA")) return error.SkipZigTest;
+    if (!build_options.enable_cuda) return error.RequiredGlinerSpecialtyCudaUnavailable;
+    const a = std.testing.allocator;
+    var captures = try loadCaptures(a);
+    defer captures.deinit();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const pii_dir = try prepareModel(a, &temporary, sourceModelRoot(), pii_directory);
+    defer a.free(pii_dir);
+    const guard_dir = try prepareModel(a, &temporary, sourceModelRoot(), guard_directory);
+    defer a.free(guard_dir);
+    const root = std.fs.path.dirname(pii_dir) orelse return error.InvalidModelPath;
+    var native: ?Outputs = null;
+    defer if (native) |*outputs| outputs.deinit(a);
+    if (!platform.env.getenvBool("ANTFLY_GLINER_SPECIALTY_GPU_ONLY"))
+        native = try runBackend(a, .native, root, pii_dir, guard_dir, &captures, null);
+    const expected: ?*const Outputs = if (native) |*outputs| outputs else null;
+    var gpu = try runBackend(a, .cuda, root, pii_dir, guard_dir, &captures, expected);
+    defer gpu.deinit(a);
 }

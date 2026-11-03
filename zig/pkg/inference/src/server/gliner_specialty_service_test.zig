@@ -130,7 +130,11 @@ fn expectRejected(transport: *Loopback, bytes: []const u8, status: u16) !void {
 fn reservation(loaded: *server.model_manager.LoadedModel, bytes: []const u8, profile: qualification.Profile) !usize {
     var request = try wire.parseJson(a, bytes, .{});
     defer request.deinit();
-    const options = executor.Options{ .specialty_profile = profile, .classification_batch_items = if (profile == .gliguard) 8 else 1 };
+    const options = executor.Options{
+        .specialty_profile = profile,
+        .classification_batch_items = if (profile == .gliguard) 8 else 1,
+        .extraction_batch_items = if (profile == .pii) 8 else 1,
+    };
     var planned = try executor.plan(a, loaded.getTokenizer(), &request, options);
     defer planned.deinit(a);
     const config = (try factory.getGlinerSpanConfig(loaded.session)).deberta;
@@ -213,7 +217,7 @@ fn qualify(comptime profile: qualification.Profile, comptime backend: Backend) !
     const idle = domain.admission.snapshot();
     try std.testing.expectEqual(@as(usize, 0), idle.backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), idle.host_scratch_bytes);
-    // Two physical forwards for GLiGuard and serial PII, preserving every row.
+    // Two physical GPU forwards for either profile, preserving every row.
     const first = reference.value.cases[0];
     const batched = try body(model, first, 9);
     defer a.free(batched);

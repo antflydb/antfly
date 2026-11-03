@@ -4109,8 +4109,7 @@ test "GLiNER specialty public batch limits preserve configured cardinality" {
         inline for (.{ backends_mod.BackendType.native, backends_mod.BackendType.metal, backends_mod.BackendType.cuda }) |backend| {
             node.session_manager.required_backend = backend;
             const contract = try resolvedInferenceExecutorContract(&node, "extract", &manifest);
-            const native_batch = profile == .gliguard and
-                ((backend == .cuda and build_options.enable_cuda) or (backend == .metal and build_options.enable_metal));
+            const native_batch = (backend == .cuda and build_options.enable_cuda) or (backend == .metal and build_options.enable_metal);
             try std.testing.expectEqual(max_serial_family_batch_items, contract.batch.max_items);
             try std.testing.expectEqual(@as(usize, if (native_batch) 8 else 1), contract.batch.preferred_items);
             try std.testing.expect(contract.batch.mode == (if (native_batch) .native else .serial_compatibility));
@@ -11812,8 +11811,12 @@ pub const Node = struct {
             .modern_bert => |value| .{ .modern_bert = value },
         };
         if (specialty_candidate == null and !spanV2BackendSupported(config, backend, qualified_variant)) return error.UnsupportedExtractionBackend;
-        if (specialty_candidate == .gliguard and (backend == .metal or backend == .cuda))
-            options.classification_batch_items = gliner_decide_qualification.metal_batch_items;
+        if (specialty_candidate != null and (backend == .metal or backend == .cuda)) {
+            if (specialty_candidate == .gliguard)
+                options.classification_batch_items = gliner_specialty.classification_batch_items
+            else
+                options.extraction_batch_items = gliner_specialty.classification_batch_items;
+        }
         // The executor's generic DeBERTa default is 512. An exact qualified
         // identity supplies its own measured ceiling. FP32 and Q8 evidence
         // independently cover the 1B's 1024-token budget.
@@ -11863,10 +11866,11 @@ pub const Node = struct {
         if (specialty_candidate != null and (longest > 512 or prepared_sequences != request.items.len))
             return error.UnsupportedGlinerDecisionGeometry;
         try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, longest, max_labels, 0);
-        const span_geometry: ?span_v2_executor.SpanExtractionGeometry = if (specialty_candidate == .pii)
-            try span_v2_executor.maxSpanExtractionGeometry(request, &request_plan, options.span_extraction_profile.?)
-        else
-            null;
+        const span_geometry: ?span_v2_executor.SpanExtractionGeometry = if (specialty_candidate == .pii) geometry: {
+            var shape = try span_v2_executor.maxSpanExtractionGeometry(request, &request_plan, options.span_extraction_profile.?);
+            shape.batch_items = span_v2_executor.extractionBatchItems(request, &request_plan, options);
+            break :geometry shape;
+        } else null;
         const additional_host_bytes = if (span_geometry) |geometry|
             try span_v2_executor.spanExtractionHostScratchUpperBound(geometry, options.pipeline.query_limits.max_candidates)
         else
@@ -11913,7 +11917,13 @@ pub const Node = struct {
         defer if (execution_mutex) |mutex| mutex.unlock();
         var managed = try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, control);
         defer managed.deinit();
-        const json = try span_v2_executor.executePlanned(&managed.backend, scratch, config, request, &request_plan, options);
+        const json = span_v2_executor.executePlanned(&managed.backend, scratch, config, request, &request_plan, options) catch |err| {
+            if (builtin.is_test) {
+                std.debug.print("GLiNER span execution failed: {s}\n", .{@errorName(err)});
+                if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+            }
+            return err;
+        };
         errdefer scratch.free(json);
         try effective.check();
         return json;
@@ -29124,8 +29134,8 @@ fn resolvedInferenceExecutorContract(
     var implementation = resolvedExecutorBatchImplementation(resolved_task, executor_kind);
     const cuda_decide_batch = build_options.enable_cuda and node.session_manager.required_backend == .cuda;
     const metal_decide_batch = build_options.enable_metal and node.session_manager.required_backend == .metal;
-    if (manifest.gliner_specialty_profile) |profile| {
-        const native_batch = profile == .gliguard and (metal_decide_batch or cuda_decide_batch);
+    if (manifest.gliner_specialty_profile != null) {
+        const native_batch = metal_decide_batch or cuda_decide_batch;
         if (std.mem.eql(u8, resolved_task, "extract")) implementation = .{
             .mode = if (native_batch) .native else .serial_compatibility,
             .preferred_items = if (native_batch) gliner_specialty.classification_batch_items else 1,

@@ -16,8 +16,43 @@ Decide API. Quantized or converted artifacts are outside this contract.
 Each item must fit within **512 prepared tokens, including schema tokens**.
 Oversized items and long-document requests are rejected. Schema tasks are not
 automatically split across forwards. Public request cardinality follows the
-server's configured limits. GLiGuard groups up to eight items per physical GPU
-forward; PII processes items serially and preserves their input order.
+server's configured limits. GLiGuard and entity-only PII group up to eight items
+per physical GPU forward and preserve input order. PII batches pad ragged words
+and labels while retaining each item's schema, threshold, count gate and offsets.
+Native CPU PII executes serially.
+
+## Consolidated physical PII batch qualification
+
+The combined branch was exercised on an Apple M4 Max (36 GiB unified memory)
+and NVIDIA GB10 over the compact checked-in 21-case CPU oracle. Both accelerators
+passed singleton public outputs and raw heads, ragged 8/9/128-input PII batches,
+per-input schemas/options, original-text offsets/order, and 512-token acceptance /
+513-token rejection. Physical counters establish one encoder/head batch per
+eight inputs, with one count readback and at most one span-score readback per
+chunk. CUDA additionally checks queued cancellation on a nine-input PII request.
+Metal passed the 25-cycle alternating PII/GLiGuard soak, scratch denial/retry,
+eviction/reload and balanced teardown.
+
+These runs use `ANTFLY_GLINER_SPECIALTY_GPU_ONLY=1`: they compare with the frozen
+CPU oracle and same-device singletons, without rerunning live native inference.
+They do not rerun the external full-capture or CUDA sanitizer campaigns. See the
+[reproduction commands](../../scripts/gliner25/specialty/README.md).
+
+ReleaseFast HTTP screening on M4 Max used five warmups and 30 measured requests
+per workload/cardinality. The pinned GLiNER2/PyTorch 2.9.1 FP32 reference used the
+same inputs and schemas, five warmups and 30 samples, and an encoder hook outside
+timing verified physical batch eight. Median request latency:
+
+| PII workload | Prepared tokens/item | HTTP, 1 item | HTTP, 8 items | PyTorch MPS, 8 items |
+| --- | ---: | ---: | ---: | ---: |
+| English, 5 labels | 46 | 31.40 ms | 51.83 ms | 95.93 ms |
+| All 42 labels | 207 | 41.68 ms | 126.71 ms | 305.37 ms |
+
+HTTP throughput rose from 31.8 to 154.4 items/s for English and from 24.0 to
+63.1 items/s for all labels. These are single-block shared-machine screening
+measurements, with HTTP/JSON included for Antfly and in-process public API timing
+for PyTorch. They establish the measured batch benefit, not a broad hardware or
+workload speedup claim. GLiGuard performance below remains historical evidence.
 
 ## Backend evidence
 
@@ -146,8 +181,9 @@ Each case used 10 warmups and 50 measured iterations. For PII, the reference
 harness explicitly sets physical batch size to one, including eight-item
 requests; these numbers compare serial PII execution on both sides. They do
 not establish throughput versus a physically batched PyTorch PII baseline.
-PII physical batching and comparison against that baseline remain follow-up
-work. Representative medians:
+The physical PII batching implementation supersedes that execution policy; these
+historical measurements must not be used to claim a speedup for the new batch
+path. Representative historical medians:
 
 | Workload | Request items | Antfly CUDA HTTP | PyTorch CUDA |
 |---|---:|---:|---:|

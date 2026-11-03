@@ -37,11 +37,15 @@ pub const HeadOptions = struct {
 };
 
 pub fn mlp(cb: *const compute.ComputeBackend, a: std.mem.Allocator, input: CT, H: usize, output: usize, prefix: []const u8) !CT {
+    return mlpRows(cb, a, input, 1, H, output, prefix);
+}
+
+fn mlpRows(cb: *const compute.ComputeBackend, a: std.mem.Allocator, input: CT, rows: usize, H: usize, output: usize, prefix: []const u8) !CT {
     const w0 = try cb.getWeight(try std.fmt.allocPrint(a, "{s}.0.weight", .{prefix}));
     defer cb.free(w0);
     const b0 = try cb.getWeight(try std.fmt.allocPrint(a, "{s}.0.bias", .{prefix}));
     defer cb.free(b0);
-    const linear = try cb.linear(input, w0, b0, 1, H, 2 * H);
+    const linear = try cb.linear(input, w0, b0, rows, H, 2 * H);
     defer cb.free(linear);
     const relu = try cb.relu(linear);
     defer cb.free(relu);
@@ -49,7 +53,7 @@ pub fn mlp(cb: *const compute.ComputeBackend, a: std.mem.Allocator, input: CT, H
     defer cb.free(w2);
     const b2 = try cb.getWeight(try std.fmt.allocPrint(a, "{s}.2.bias", .{prefix}));
     defer cb.free(b2);
-    return cb.linear(relu, w2, b2, 1, 2 * H, output);
+    return cb.linear(relu, w2, b2, rows, 2 * H, output);
 }
 
 pub fn gather(cb: *const compute.ComputeBackend, a: std.mem.Allocator, hidden: CT, positions: []const usize, H: usize) !CT {
@@ -239,12 +243,153 @@ pub fn runFromHidden(cb: *const compute.ComputeBackend, allocator: std.mem.Alloc
     return .{ .arena = arena, .samples = samples };
 }
 
+pub const BatchItem = struct {
+    sample: processor.Sample,
+    compiled: *const schema.CompiledSchema,
+    options: pipeline.Options,
+    head_options: HeadOptions,
+};
+
+/// A physical PII head batch over one padded encoder forward. Padding exists
+/// only in intermediate word/label rows; decoding uses each original sample's
+/// words, schema, thresholds, and offsets. No score crosses an input boundary.
+pub fn runBatchFromHidden(cb: *const compute.ComputeBackend, allocator: std.mem.Allocator, hidden: CT, H: usize, sequence_length: usize, items: []const BatchItem) !pipeline.Result {
+    if (items.len == 0 or items.len > 8 or H == 0 or sequence_length == 0) return error.InvalidExtractionInput;
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var result_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer result_arena.deinit();
+    const result_a = result_arena.allocator();
+    var word_width: usize = 0;
+    var label_width: usize = 0;
+    const parents = try a.alloc(usize, items.len);
+    for (items, parents, 0..) |item, *parent, row| {
+        if (item.options.control) |control| try control.check();
+        if (item.head_options.max_width != 8 or item.compiled.schema.entities.len == 0 or
+            item.compiled.schema.relations.len != 0 or item.compiled.schema.classifications.len != 0 or
+            item.sample.groups.len != 1 or item.sample.groups[0].kind != .entities or
+            item.sample.groups[0].child_markers.len != item.compiled.schema.entities.len or
+            item.sample.words.len == 0 or item.sample.input_ids.len > sequence_length)
+            return error.InvalidExtractionInput;
+        const group = item.sample.groups[0];
+        if (group.parent_marker >= item.sample.input_ids.len) return error.InvalidExtractionInput;
+        parent.* = row * sequence_length + group.parent_marker;
+        word_width = @max(word_width, item.sample.words.len);
+        label_width = @max(label_width, group.child_markers.len);
+    }
+    const parent_states = try gather(cb, a, hidden, parents, H);
+    defer cb.free(parent_states);
+    const count_ct = try mlpRows(cb, a, parent_states, items.len, H, 20, "count_pred");
+    defer cb.free(count_ct);
+    const counts = try cb.toFloat32(count_ct, allocator);
+    defer allocator.free(counts);
+    if (counts.len != items.len * 20) return error.InvalidExtractionOutput;
+    const active = try a.alloc(bool, items.len);
+    var any_active = false;
+    for (active, 0..) |*out, row| {
+        const logits = counts[row * 20 ..][0..20];
+        var count: usize = 0;
+        for (logits, 0..) |value, index| {
+            if (!std.math.isFinite(value)) return error.NonFiniteBoundaryScore;
+            if (value > logits[count]) count = index;
+        }
+        out.* = count != 0;
+        any_active = any_active or out.*;
+    }
+    const samples = try result_a.alloc(pipeline.Sample, items.len);
+    if (!any_active) {
+        for (items, samples) |item, *sample| {
+            const entities = try result_a.alloc(pipeline.EntityGroup, item.compiled.schema.entities.len);
+            for (item.compiled.schema.entities, entities) |entity, *group|
+                group.* = .{ .name = entity.name, .dtype = entity.dtype, .values = &.{} };
+            sample.* = .{ .entities = entities, .relations = &.{}, .classifications = &.{} };
+        }
+        return .{ .arena = result_arena, .samples = samples };
+    }
+    const label_positions = try a.alloc(usize, try std.math.mul(usize, items.len, label_width));
+    const words = try a.alloc(processor.Word, try std.math.mul(usize, items.len, word_width));
+    for (items, 0..) |item, row| {
+        if (item.options.control) |control| try control.check();
+        const markers = item.sample.groups[0].child_markers;
+        for (label_positions[row * label_width ..][0..label_width], 0..) |*position, column| {
+            const marker = markers[@min(column, markers.len - 1)];
+            if (marker >= item.sample.input_ids.len) return error.InvalidExtractionInput;
+            position.* = row * sequence_length + marker;
+        }
+        for (words[row * word_width ..][0..word_width], 0..) |*word, column| {
+            word.* = item.sample.words[@min(column, item.sample.words.len - 1)];
+            if (word.input_start >= item.sample.input_ids.len) return error.InvalidExtractionInput;
+            word.input_start += row * sequence_length;
+            word.input_end += row * sequence_length;
+        }
+    }
+    const labels = try gather(cb, a, hidden, label_positions, H);
+    defer cb.free(labels);
+    const projected = if (cb.kind() == .native)
+        try head.countLstmV1AtStep(cb, a, labels, label_positions.len, H, 0)
+    else
+        (try head.countLstmV1SlotZeroResident(cb, labels, label_positions.len, H)) orelse return error.UnsupportedExtractionBackend;
+    defer cb.free(projected);
+    var packed_sample = items[0].sample;
+    packed_sample.words = words;
+    const spans = try spanRepresentationsPackedWidth(cb, a, hidden, packed_sample, H, 8, word_width);
+    defer cb.free(spans);
+    const span_width = try std.math.mul(usize, word_width, 8);
+    const spans_shape = [_]i64{ @intCast(items.len), @intCast(span_width), @intCast(H) };
+    const labels_shape = [_]i64{ @intCast(items.len), @intCast(label_width), @intCast(H) };
+    const batched_spans = try cb.primReshape(spans, &spans_shape);
+    defer cb.free(batched_spans);
+    const batched_labels = try cb.primReshape(projected, &labels_shape);
+    defer cb.free(batched_labels);
+    const scores_ct = try cb.primDotGeneral(batched_spans, batched_labels, &spans_shape, &labels_shape, &.{2}, &.{2}, &.{0}, &.{0});
+    defer cb.free(scores_ct);
+    const scores = try cb.toFloat32(scores_ct, allocator);
+    defer allocator.free(scores);
+    if (scores.len != try std.math.mul(usize, try std.math.mul(usize, items.len, span_width), label_width)) return error.InvalidExtractionOutput;
+    var batch_output_values: usize = 0;
+    for (items, samples, active, 0..) |item, *sample, enabled, row| {
+        if (item.options.control) |control| try control.check();
+        const entities = try result_a.alloc(pipeline.EntityGroup, item.compiled.schema.entities.len);
+        var output_values: usize = 0;
+        const row_scores = scores[row * span_width * label_width ..][0 .. span_width * label_width];
+        for (item.compiled.schema.entities, entities, 0..) |entity, *group, column| {
+            // A string field retains one winner. Dispose of its other decoded
+            // candidates per label rather than retaining B*Q discarded lists.
+            var string_scratch = std.heap.ArenaAllocator.init(allocator);
+            defer string_scratch.deinit();
+            const value_allocator = if (entity.dtype == .str) string_scratch.allocator() else result_a;
+            const selected = if (enabled)
+                try values(value_allocator, allocator, item.sample, row_scores, label_width, column, @floatCast(entity.threshold orelse item.options.threshold), item.options, item.head_options)
+            else
+                try value_allocator.alloc(pipeline.Value, 0);
+            const retained = if (entity.dtype == .str) blk: {
+                const single = try result_a.alloc(pipeline.Value, @min(selected.len, 1));
+                if (single.len != 0) single[0] = best(selected).?;
+                break :blk single;
+            } else selected;
+            output_values = try std.math.add(usize, output_values, retained.len);
+            batch_output_values = try std.math.add(usize, batch_output_values, retained.len);
+            if (output_values > item.options.max_output_values) return error.ExtractionOutputLimitExceeded;
+            if (batch_output_values > items[0].options.max_output_values) return error.ExtractionOutputLimitExceeded;
+            group.* = .{ .name = entity.name, .dtype = entity.dtype, .values = retained };
+        }
+        sample.* = .{ .entities = entities, .relations = &.{}, .classifications = &.{} };
+    }
+    return .{ .arena = result_arena, .samples = samples };
+}
+
 /// Shared by production scoring and pinned intermediate-head parity tests.
 pub fn spanRepresentations(cb: *const compute.ComputeBackend, a: std.mem.Allocator, hidden: CT, sample: processor.Sample, H: usize) !CT {
     return spanRepresentationsWidth(cb, a, hidden, sample, H, 8);
 }
 
 pub fn spanRepresentationsWidth(cb: *const compute.ComputeBackend, a: std.mem.Allocator, hidden: CT, sample: processor.Sample, H: usize, max_width: usize) !CT {
+    return spanRepresentationsPackedWidth(cb, a, hidden, sample, H, max_width, sample.words.len);
+}
+
+fn spanRepresentationsPackedWidth(cb: *const compute.ComputeBackend, a: std.mem.Allocator, hidden: CT, sample: processor.Sample, H: usize, max_width: usize, word_width: usize) !CT {
+    if (word_width == 0 or sample.words.len % word_width != 0) return error.InvalidExtractionInput;
     const word_positions = try a.alloc(usize, sample.words.len);
     for (sample.words, word_positions) |word, *position| position.* = word.input_start;
     const span_count = try std.math.mul(usize, sample.words.len, max_width);
@@ -254,7 +399,8 @@ pub fn spanRepresentationsWidth(cb: *const compute.ComputeBackend, a: std.mem.Al
     const last_positions = try a.alloc(usize, span_count);
     for (starts, ends, 0..) |*start, *end, i| {
         start.* = @intCast(i / max_width);
-        end.* = @intCast(@min(i / max_width + i % max_width, sample.words.len - 1));
+        const row_end = (i / max_width / word_width + 1) * word_width - 1;
+        end.* = @intCast(@min(i / max_width + i % max_width, row_end));
     }
     for (starts, ends, first_positions, last_positions) |first, last, *f, *l| {
         f.* = first;
@@ -644,6 +790,80 @@ fn oracleNumber(value: std.json.Value) f32 {
         .integer => |x| @floatFromInt(x),
         else => std.math.nan(f32),
     };
+}
+
+test "gliner specialty PII physical head batch preserves ragged labels words Unicode and count gates" {
+    const a = std.testing.allocator;
+    var first_schema = try schema.compile(a, "{\"entities\":[\"person\",\"alias\"]}", .{ .schema_version = 2 });
+    defer first_schema.deinit();
+    var second_schema = try schema.compile(a, "{\"entities\":[\"person\"],\"entity_definitions\":{\"person\":{\"dtype\":\"str\"}}}", .{ .schema_version = 2 });
+    defer second_schema.deinit();
+    const first = processor.Sample{
+        .original_text = "a b",
+        .schema_fingerprint = @splat(0),
+        .input_ids = &.{ 0, 1, 2, 3, 4 },
+        .words = &.{
+            .{ .text = "a", .source = .{ .start = 0, .end = 1 }, .input_start = 3, .input_end = 4 },
+            .{ .text = "b", .source = .{ .start = 2, .end = 3 }, .input_start = 4, .input_end = 5 },
+        },
+        .groups = &.{.{ .kind = .entities, .schema_index = 0, .name = "entities", .model_name = "entities", .fragments = &.{}, .parent_marker = 0, .child_markers = &.{ 1, 2 } }},
+        .queries = &.{},
+        .classification_labels = &.{},
+        .enum_choices = &.{},
+        .prefix_word_count = 0,
+        .body_word_count = 2,
+        .terminal_period_added = false,
+        .is_joint_ie = false,
+    };
+    var second = first;
+    second.original_text = "é é z";
+    second.words = &.{
+        .{ .text = "é", .source = .{ .start = 0, .end = 2 }, .input_start = 2, .input_end = 3 },
+        .{ .text = "é", .source = .{ .start = 3, .end = 5 }, .input_start = 3, .input_end = 4 },
+        .{ .text = "z", .source = .{ .start = 6, .end = 7 }, .input_start = 4, .input_end = 5 },
+    };
+    second.groups = &.{.{ .kind = .entities, .schema_index = 0, .name = "entities", .model_name = "entities", .fragments = &.{}, .parent_marker = 0, .child_markers = &.{1} }};
+    second.body_word_count = 3;
+    const items = [_]BatchItem{
+        .{ .sample = first, .compiled = &first_schema, .options = .{}, .head_options = .{ .legacy_greedy_overlap = true } },
+        .{ .sample = second, .compiled = &second_schema, .options = .{ .offset_unit = .unicode_codepoints, .overlap = .allow }, .head_options = .{} },
+    };
+    // The final encoder row is padding with a large value; ragged word/label
+    // padding must never introduce it or another item's context into a score.
+    const hidden_values = [_]f32{ 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1000, 1000, 0, 0, 0.5, 0.5, 0.5, 0.5, 1, 0, 0, 1, -1000, -1000 };
+    for ([_]?usize{ 0, 1, 19, null }) |count| {
+        var store = try CountGateFixture.init(a, count orelse 0);
+        defer store.deinitOwned();
+        var native = CountGateFixture.native.NativeCompute.init(a, &store, null);
+        defer native.deinit();
+        const cb = native.computeBackend();
+        var inputs = hidden_values;
+        if (count == null) {
+            // An identity count predictor chooses zero for the first parent
+            // and one for the second, independently within the same batch.
+            inline for (.{ "count_pred.0.weight", "count_pred.2.weight", "count_pred.2.bias" }) |name| {
+                const removed = store.resident_weights.fetchRemove(name).?;
+                var old = removed.value.tensor;
+                old.deinit();
+                a.free(removed.key);
+            }
+            try CountGateFixture.weight(&store, "count_pred.0.weight", 4, 2, 0, null);
+            try CountGateFixture.weight(&store, "count_pred.2.weight", 20, 4, 0, null);
+            try CountGateFixture.weight(&store, "count_pred.2.bias", 20, 1, null, 0);
+            inputs[13] = 100;
+        }
+        const hidden = try cb.fromFloat32Shape(&inputs, &.{ 12, 2 });
+        defer cb.free(hidden);
+        var batched = try runBatchFromHidden(&cb, a, hidden, 2, 6, &items);
+        defer batched.deinit();
+        for (items, batched.samples, 0..) |item, actual, row| {
+            const singleton_hidden = try cb.fromFloat32Shape(inputs[row * 12 ..][0..10], &.{ 5, 2 });
+            defer cb.free(singleton_hidden);
+            var singleton = try runFromHidden(&cb, a, singleton_hidden, 2, item.sample, item.compiled, item.options, item.head_options);
+            defer singleton.deinit();
+            try std.testing.expectEqualDeep(singleton.samples[0], actual);
+        }
+    }
 }
 
 test "gliner specialty frozen upstream decoder oracle covers greedy thresholds count and Unicode" {
