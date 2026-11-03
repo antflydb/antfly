@@ -54,6 +54,19 @@ measurements, with HTTP/JSON included for Antfly and in-process public API timin
 for PyTorch. They establish the measured batch benefit, not a broad hardware or
 workload speedup claim. GLiGuard performance below remains historical evidence.
 
+The same screening on glowworm's NVIDIA GB10, using strict FP32 CUDA with TF32
+disabled and `PYTORCH_JIT=0` for the reference, measured:
+
+| PII workload | Prepared tokens/item | HTTP, 1 item | HTTP, 8 items | PyTorch CUDA, 8 items |
+| --- | ---: | ---: | ---: | ---: |
+| English, 5 labels | 46 | 7.89 ms | 14.31 ms | 34.56 ms |
+| All 42 labels | 207 | 14.42 ms | 59.55 ms | 113.21 ms |
+
+HTTP throughput rose from 126.8 to 559.1 items/s for English and from 69.3 to
+134.3 items/s for all labels. The upstream probe observed encoder batch eight
+for both workloads. The same single-block, shared-machine and timing-scope
+limitations apply.
+
 ## Backend evidence
 
 The combined implementation supports native CPU, Metal, and CUDA through one
