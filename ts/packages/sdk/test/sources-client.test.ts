@@ -51,6 +51,8 @@ describe("SourcesClient", () => {
     expect(fetcher.mock.calls[0]?.[1]?.body).toBe('{"value":"private-value"}');
     await client.job("a/b");
     expect(fetcher.mock.calls[1]?.[0]).toBe("https://sources.example/v1/jobs/a%2Fb");
+    await client.purgeSource("a/b");
+    expect(fetcher.mock.calls[2]?.[0]).toBe("https://sources.example/v1/sources/a%2Fb?purge=true");
   });
   it.each([
     "http://remote.example",

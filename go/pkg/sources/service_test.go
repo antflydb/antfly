@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/stretchr/testify/require"
+	"io"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -232,6 +233,9 @@ type failedReadConnector struct {
 	err error
 }
 
+func (c *failedReadConnector) OpenMedia(context.Context, Request, Item, MediaRange) (io.ReadCloser, error) {
+	return nil, c.err
+}
 func (c *failedReadConnector) Read(context.Context, Request, Item) ([]byte, error) { return nil, c.err }
 func TestServiceRejectsTamperedAndChangedMedia(t *testing.T) {
 	s, fixture, backend := serviceFixture(t)
@@ -244,10 +248,11 @@ func TestServiceRejectsTamperedAndChangedMedia(t *testing.T) {
 	tampered := ref
 	tampered.URI = ref.URI[:len(ref.URI)-1] + "x"
 	require.Equal(t, 404, fetchService(s, tampered, "GET", "").Code)
-	id := strings.Trim(ref.Version, "\"")
+	parts := strings.Split(ref.URI, "/")
+	id := parts[len(parts)-2]
 	raw, err := os.ReadFile(s.pinPath(id))
 	require.NoError(t, err)
-	var pin mediaPin
+	var pin mediaPinV2
 	require.NoError(t, json.Unmarshal(raw, &pin))
 	pin.Item.Path = "another-object"
 	require.NoError(t, writeJSON(s.pinPath(id), pin, 1<<20))

@@ -48,6 +48,15 @@ pub struct SourceSyncJob {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub code: Option<String>,
+    pub failure: Option<SourceSyncFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceSyncFailure {
+    pub source_id: Option<String>,
+    pub phase: String,
+    pub code: String,
+    pub retryable: bool,
 }
 
 // Deliberately has no Debug implementation: its operator token is private.
@@ -94,11 +103,23 @@ impl SourcesClient {
         path: &[&str],
         body: Option<&Value>,
     ) -> Result<Value, SourceServiceError> {
+        self.request_with_purge(method, path, body, false).await
+    }
+    async fn request_with_purge(
+        &self,
+        method: Method,
+        path: &[&str],
+        body: Option<&Value>,
+        purge: bool,
+    ) -> Result<Value, SourceServiceError> {
         let mut url = self.base.clone();
         url.path_segments_mut()
             .map_err(|_| SourceServiceError::InvalidConfiguration("invalid source service URL"))?
             .pop_if_empty()
             .extend(path);
+        if purge {
+            url.query_pairs_mut().append_pair("purge", "true");
+        }
         let mut request = self.client.request(method, url).bearer_auth(&self.token);
         if let Some(body) = body {
             request = request.json(body);
@@ -156,6 +177,12 @@ impl SourcesClient {
         self.request(Method::DELETE, &["v1", "sources", id], None)
             .await
     }
+    /// Queue durable row deletion, applied by the next sync.
+    pub async fn purge_source(&self, id: &str) -> Result<Value, SourceServiceError> {
+        self.request_with_purge(Method::DELETE, &["v1", "sources", id], None, true)
+            .await
+    }
+
     pub async fn sync(&self, restart: bool) -> Result<SourceSyncJob, SourceServiceError> {
         let value = self
             .request(

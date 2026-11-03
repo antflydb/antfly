@@ -1,0 +1,172 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package sources
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"reflect"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"golang.org/x/oauth2"
+)
+
+type providerClientEntry struct {
+	connector Connector
+	used      uint64
+}
+type providerClientBuild struct {
+	done      chan struct{}
+	connector Connector
+	err       error
+}
+type providerClients struct {
+	mu       sync.Mutex
+	epoch    atomic.Uint64
+	tick     uint64
+	entries  map[string]providerClientEntry
+	building map[string]*providerClientBuild
+	closed   bool
+}
+
+func closeProviderClient(connector Connector) {
+	if closer, ok := connector.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+		return
+	}
+	switch client := connector.(type) {
+	case *GoogleConnector:
+		closeGoogleTransport(client.HTTPClient)
+	case *CollaborationConnector:
+		closeGoogleTransport(client.HTTPClient)
+	}
+}
+func (s *Service) providerConnector(ctx context.Context, connection Connection) (Connector, error) {
+	raw, err := json.Marshal(connection)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(raw)
+	epoch := s.clients.epoch.Load()
+	key := fmt.Sprintf("%d/%x/%s", epoch, reflect.ValueOf(s.factory).Pointer(), hex.EncodeToString(digest[:]))
+	pool := &s.clients
+	pool.mu.Lock()
+	if pool.closed {
+		pool.mu.Unlock()
+		return nil, context.Canceled
+	}
+	if entry, ok := pool.entries[key]; ok {
+		pool.tick++
+		entry.used = pool.tick
+		pool.entries[key] = entry
+		pool.mu.Unlock()
+		return entry.connector, nil
+	}
+	if build, ok := pool.building[key]; ok {
+		pool.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-build.done:
+			return build.connector, build.err
+		}
+	}
+	if pool.building == nil {
+		pool.building = map[string]*providerClientBuild{}
+	}
+	build := &providerClientBuild{done: make(chan struct{})}
+	pool.building[key] = build
+	pool.mu.Unlock()
+	// Token sources retain a service-lifetime context, not the context of the first
+	// request. Refresh itself has a bounded HTTP client; data operations use their
+	// own cancellable deadline. In particular, cancelling one request cannot poison
+	// every later request using the same refreshed Google credential.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableCompression = true
+	credentialContext := context.WithValue(s.ctx, oauth2.HTTPClient, &http.Client{Transport: transport, Timeout: 30 * time.Second})
+	connector, err := s.factory(credentialContext, connection)
+	pool.mu.Lock()
+	delete(pool.building, key)
+	if err == nil && (pool.closed || epoch != pool.epoch.Load()) {
+		err = fmt.Errorf("%w: connection generation changed", ErrInvalidInput)
+	}
+	var retired Connector
+	if err == nil {
+		if pool.entries == nil {
+			pool.entries = map[string]providerClientEntry{}
+		}
+		if len(pool.entries) >= 64 {
+			var oldest string
+			var age uint64 = ^uint64(0)
+			for id, entry := range pool.entries {
+				if entry.used < age {
+					oldest, age = id, entry.used
+				}
+			}
+			retired = pool.entries[oldest].connector
+			delete(pool.entries, oldest)
+		}
+		pool.tick++
+		pool.entries[key] = providerClientEntry{connector: connector, used: pool.tick}
+		build.connector = connector
+	} else if connector != nil {
+		retired = connector
+	}
+	build.err = err
+	close(build.done)
+	pool.mu.Unlock()
+	closeProviderClient(retired)
+	return build.connector, build.err
+}
+func (s *Service) invalidateClients() {
+	pool := &s.clients
+	pool.mu.Lock()
+	pool.epoch.Add(1)
+	entries := pool.entries
+	pool.entries = nil
+	pool.mu.Unlock()
+	for _, entry := range entries {
+		closeProviderClient(entry.connector)
+	}
+}
+func (s *Service) closeClients() {
+	s.clients.mu.Lock()
+	s.clients.closed = true
+	s.clients.mu.Unlock()
+	s.invalidateClients()
+}
+
+func closeGoogleTransport(client *http.Client) {
+	if client == nil {
+		return
+	}
+	var transport http.RoundTripper = client.Transport
+	if wrapped, ok := transport.(*googleCredentialTransport); ok {
+		transport = wrapped.Transport
+	}
+	if oauth, ok := transport.(*oauth2.Transport); ok {
+		transport = oauth.Base
+	}
+	if closer, ok := transport.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+}

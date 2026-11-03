@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"github.com/gofrs/flock"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"os"
@@ -39,8 +40,14 @@ import (
 // Service is a single-operator source companion. Deploy one per credential trust
 // boundary. It reuses Runner and exposes scoped media capabilities to Antfly.
 type Service struct {
+	ctx                       context.Context
+	stop                      context.CancelFunc
+	clients                   providerClients
+	authorities               mediaAuthorities
 	mu                        sync.Mutex
 	profile                   Profile
+	mediaRegistry             map[string]mediaRegistrySource
+	connectionBindings        map[string]string
 	directory, baseURL, token string
 	mediaKey                  []byte
 	factory                   Factory
@@ -64,12 +71,13 @@ type ServiceOptions struct {
 }
 
 type SyncJob struct {
-	Version    int    `json:"version"`
-	ID         string `json:"id"`
-	State      string `json:"state"`
-	StartedAt  int64  `json:"started_at"`
-	FinishedAt int64  `json:"finished_at,omitempty"`
-	Code       string `json:"code,omitempty"`
+	Version    int          `json:"version"`
+	ID         string       `json:"id"`
+	State      string       `json:"state"`
+	StartedAt  int64        `json:"started_at"`
+	FinishedAt int64        `json:"finished_at,omitempty"`
+	Code       string       `json:"code,omitempty"`
+	Failure    *SyncFailure `json:"failure,omitempty"`
 }
 
 func NewService(o ServiceOptions) (*Service, error) {
@@ -80,6 +88,7 @@ func NewService(o ServiceOptions) (*Service, error) {
 		return nil, err
 	}
 	s := &Service{profile: cloneProfile(o.Profile), directory: o.StateDir, baseURL: strings.TrimRight(o.PublicURL, "/"), token: o.AdminToken, mediaKey: bytes.Clone(o.MediaKey), factory: o.Factory, fetchSlots: make(chan struct{}, 4)}
+	s.ctx, s.stop = context.WithCancel(context.Background())
 	if s.factory == nil {
 		s.factory = CredentialFactory(s.resolveSecret)
 	}
@@ -118,6 +127,9 @@ func NewService(o ServiceOptions) (*Service, error) {
 	if s.profile.Sources == nil {
 		s.profile.Sources = []Source{}
 	}
+	if err := s.recoverPurges(); err != nil {
+		return nil, err
+	}
 	// Revoked connections may leave source definitions behind. They remain inert
 	// until reconnected; their durable ownership must survive a restart.
 	validation := cloneProfile(s.profile)
@@ -144,6 +156,10 @@ func NewService(o ServiceOptions) (*Service, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
+	if err := s.recoverMediaAuthorities(); err != nil {
+		return nil, err
+	}
+	s.refreshMediaRegistry()
 	success = true
 	return s, nil
 }
@@ -151,6 +167,22 @@ func (s *Service) profilePath() string { return filepath.Join(s.directory, "prof
 func (s *Service) jobPath() string     { return filepath.Join(s.directory, "job.json") }
 func (s *Service) runnerPath() string  { return filepath.Join(s.directory, "runner") }
 func (s *Service) validateProfile(p Profile) error {
+	// Revocation is a valid persisted state. Validate structure independently
+	// of current runnability so unrelated repairs cannot deadlock each other.
+	p = cloneProfile(p)
+	for name := range p.Connections {
+		if !validConnectionName(name) {
+			return fmt.Errorf("invalid connection name")
+		}
+	}
+	for _, source := range p.Sources {
+		if !validConnectionName(source.Connection) {
+			return fmt.Errorf("invalid source connection name")
+		}
+		if _, ok := p.Connections[source.Connection]; !ok {
+			p.Connections[source.Connection] = Connection{}
+		}
+	}
 	r := Runner{Profile: p, StateDir: s.runnerPath(), CatalogPath: filepath.Join(s.runnerPath(), "catalog.json"), MediaReference: s.pinMedia}
 	if err := r.validate(); err != nil {
 		return err
@@ -174,6 +206,8 @@ func (s *Service) Close() error {
 	if done != nil {
 		<-done
 	}
+	s.stop()
+	s.closeClients()
 	return s.lock.Unlock()
 }
 func serviceJSON(w http.ResponseWriter, status int, value any) {
@@ -224,6 +258,49 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		serviceError(w, 401, "unauthorized")
 		return
 	}
+	// Authentication happens before decoding, but no service lock is held
+	// while a caller sends its request body or a provider builds a client.
+	if r.Method == http.MethodPut || r.Method == http.MethodPost {
+		var raw json.RawMessage
+		if err := serviceDecode(w, r, &raw); err != nil || len(bytes.TrimSpace(raw)) == 0 || bytes.TrimSpace(raw)[0] != '{' {
+			serviceError(w, 400, "invalid_request")
+			return
+		}
+		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/connections/") {
+			var candidate Connection
+			d := json.NewDecoder(bytes.NewReader(raw))
+			d.DisallowUnknownFields()
+			if d.Decode(&candidate) != nil {
+				serviceError(w, 400, "invalid_connection")
+				return
+			}
+			if _, err := s.providerConnector(r.Context(), candidate); err != nil {
+				serviceError(w, 400, "invalid_connection")
+				return
+			}
+		}
+		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/sources/") {
+			var candidate Source
+			if json.Unmarshal(raw, &candidate) == nil && canonicalID(candidate.ID) {
+				var state runState
+				err := loadJSON(filepath.Join(s.runnerPath(), candidate.ID+".json"), &state, 256<<20)
+				if err != nil && !errors.Is(err, os.ErrNotExist) {
+					serviceError(w, 500, "state_read_failed")
+					return
+				}
+				if err == nil && (state.SourceID != candidate.ID || state.Table != candidate.Table) {
+					serviceError(w, 409, "source_destination_immutable")
+					return
+				}
+			}
+		}
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+	}
+	// Serialize state transitions, then send the bounded response after unlocking.
+	output := &controlResponse{header: make(http.Header)}
+	destination := w
+	defer func() { output.flush(destination) }()
+	w = output
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -249,6 +326,12 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := s.validateProfile(s.profile); err != nil {
 			serviceError(w, 400, "invalid_source_profile")
 			return
+		}
+		for _, source := range s.profile.Sources {
+			if _, exists := s.profile.Connections[source.Connection]; !exists {
+				serviceError(w, 400, "source_connection_revoked")
+				return
+			}
 		}
 		profile := cloneProfile(s.profile)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -318,6 +401,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				serviceError(w, 500, "state_write_failed")
 				return
 			}
+			s.invalidateClients()
 			if s.cancel != nil {
 				s.cancel()
 			}
@@ -346,6 +430,8 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.profile = next
+			s.refreshMediaRegistry()
+			s.invalidateClients()
 			if s.cancel != nil {
 				s.cancel()
 			}
@@ -365,10 +451,6 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			serviceError(w, 400, "invalid_connection")
 			return
 		}
-		if _, err := s.factory(r.Context(), connection); err != nil {
-			serviceError(w, 400, "invalid_connection")
-			return
-		}
 		next := cloneProfile(s.profile)
 		next.Connections[name] = connection
 		if err := s.validateProfile(next); err != nil {
@@ -380,6 +462,8 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.profile = next
+		s.refreshMediaRegistry()
+		s.invalidateClients()
 		serviceJSON(w, 200, connection)
 		return
 	}
@@ -403,6 +487,17 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		switch r.Method {
 		case http.MethodPut:
+			queue, err := s.readPurges()
+			if err != nil {
+				serviceError(w, 500, "state_read_failed")
+				return
+			}
+			for _, pending := range queue.Sources {
+				if pending.ID == id {
+					serviceError(w, 409, "source_purge_pending")
+					return
+				}
+			}
 			var source Source
 			if err := serviceDecode(w, r, &source); err != nil || source.ID != id {
 				serviceError(w, 400, "invalid_source")
@@ -411,12 +506,61 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if index < 0 {
 				next.Sources = append(next.Sources, source)
 			} else {
+				if next.Sources[index].Table != source.Table {
+					serviceError(w, 409, "source_destination_immutable")
+					return
+				}
 				next.Sources[index] = source
 			}
 		case http.MethodDelete:
+			if index < 0 && r.URL.Query().Get("purge") == "true" {
+				// A retained source can be explicitly purged after its definition
+				// has already been removed. Durable destination identity is authoritative.
+				queue, err := s.readPurges()
+				if err != nil {
+					serviceError(w, 500, "state_read_failed")
+					return
+				}
+				for _, pending := range queue.Sources {
+					if pending.ID == id {
+						serviceJSON(w, 200, map[string]any{"version": 1, "state": "purge_pending"})
+						return
+					}
+				}
+				var state runState
+				if err := loadJSON(filepath.Join(s.runnerPath(), id+".json"), &state, 256<<20); err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						serviceError(w, 404, "source_not_found")
+					} else {
+						serviceError(w, 500, "state_read_failed")
+					}
+					return
+				}
+				if state.SourceID != id || state.Endpoint != s.profile.Endpoint || state.Table == "" {
+					serviceError(w, 409, "source_destination_mismatch")
+					return
+				}
+				if err := s.queuePurge(Source{ID: id, Table: state.Table}); err != nil {
+					serviceError(w, 500, "state_write_failed")
+					return
+				}
+				serviceJSON(w, 200, map[string]any{"version": 1, "state": "purge_pending"})
+				return
+			}
 			if index < 0 {
 				serviceError(w, 404, "source_not_found")
 				return
+			}
+			purge := r.URL.Query().Get("purge")
+			if purge != "" && purge != "true" && purge != "false" {
+				serviceError(w, 400, "invalid_purge_option")
+				return
+			}
+			if purge == "true" {
+				if err := s.queuePurge(next.Sources[index]); err != nil {
+					serviceError(w, 500, "state_write_failed")
+					return
+				}
 			}
 			next.Sources = append(next.Sources[:index], next.Sources[index+1:]...)
 		default:
@@ -428,10 +572,18 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := writeJSON(s.profilePath(), next, 1<<20); err != nil {
+			if r.Method == http.MethodDelete && r.URL.Query().Get("purge") == "true" {
+				// The durable tombstone already committed. Keep in-memory
+				// authority consistent even if the profile write now fails.
+				s.profile = next
+				s.refreshMediaRegistry()
+			}
 			serviceError(w, 500, "state_write_failed")
 			return
 		}
 		s.profile = next
+		s.refreshMediaRegistry()
+		s.invalidateClients()
 		serviceJSON(w, 200, map[string]any{"version": 1, "state": "configured"})
 		return
 	}
@@ -443,15 +595,22 @@ func (s *Service) run(ctx context.Context, profile Profile, restart bool, done c
 	resolver := func(ctx context.Context, source Source, request Request, item Item) (MediaReference, error) {
 		ref, err := s.pinMedia(ctx, source, request, item)
 		if err == nil {
-			keep[strings.Trim(ref.Version, "\"")+".json"] = true
+			parts := strings.Split(ref.URI, "/")
+			keep[parts[len(parts)-2]+".json"] = true
 		}
 		return ref, err
 	}
-	runner := Runner{Profile: profile, StateDir: s.runnerPath(), Factory: s.factory, Restart: restart, MediaReference: resolver}
-	err := runner.Sync(ctx)
+	runner := Runner{Profile: profile, StateDir: s.runnerPath(), Factory: s.providerConnector, Restart: restart, MediaReference: resolver, MediaInventory: s.publishMediaAuthority}
+	err := s.purgeSources(ctx, profile)
+	if err == nil {
+		err = runner.Sync(ctx)
+	}
 	var cleanupErr error
 	if err == nil {
 		cleanupErr = s.pruneMediaPins(keep)
+		if cleanupErr == nil {
+			cleanupErr = s.pruneMediaDigests(keep)
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -463,6 +622,8 @@ func (s *Service) run(ctx context.Context, profile Profile, restart bool, done c
 	}
 	if err != nil {
 		s.job.State, s.job.Code = "failed", "sync_failed"
+		s.job.Failure = describeSyncFailure(err)
+		slog.Error("source sync failed", "job_id", s.job.ID, "source_id", s.job.Failure.SourceID, "phase", s.job.Failure.Phase, "code", s.job.Failure.Code, "retryable", s.job.Failure.Retryable)
 		if errors.Is(err, context.Canceled) {
 			s.job.State, s.job.Code = "cancelled", "cancelled"
 		}
@@ -472,49 +633,39 @@ func (s *Service) run(ctx context.Context, profile Profile, restart bool, done c
 	}
 }
 
-type mediaPin struct {
-	Source     Source     `json:"source"`
-	Connection Connection `json:"connection"`
-	Item       Item       `json:"item"`
-}
-
 func (s *Service) pinPath(id string) string { return filepath.Join(s.directory, "media", id+".json") }
 func (s *Service) mediaSignature(id string) string {
 	mac := hmac.New(sha256.New, s.mediaKey)
 	_, _ = mac.Write([]byte("antfly-source-media-v1\x00" + id))
 	return hex.EncodeToString(mac.Sum(nil))
 }
-func (s *Service) pinMedia(_ context.Context, source Source, _ Request, item Item) (MediaReference, error) {
-	if item.Size < 1 || item.Size > maxImportSourceObjectBytes {
-		return MediaReference{}, fmt.Errorf("media requires an exact length of 1..32 MiB")
+func (s *Service) pinMedia(ctx context.Context, source Source, request Request, item Item) (MediaReference, error) {
+	if item.Size < 1 {
+		return MediaReference{}, fmt.Errorf("media requires a positive exact length")
 	}
 	if upper, _ := item.Metadata["size_is_upper_bound"].(bool); upper || configString(item.Metadata, "export_mime_type") != "" {
-		return MediaReference{}, fmt.Errorf("media requires a binary object with exact length; Workspace exports use text publication")
+		return MediaReference{}, fmt.Errorf("media requires an original binary object with exact length")
 	}
 	item.ContentRef, item.ObjectIndex = "", 0
 	item.Metadata = cloneSourceMetadata(item.Metadata)
 	delete(item.Metadata, "object_index")
-	source.Alias, source.PermissionTTLSeconds = "", 0
 	s.mu.Lock()
 	connection, exists := s.profile.Connections[source.Connection]
 	s.mu.Unlock()
 	if !exists {
 		return MediaReference{}, fmt.Errorf("media connection revoked")
 	}
-	pin := mediaPin{Source: source, Connection: connection, Item: item}
-	raw, err := json.Marshal(pin)
+	digest, err := s.verifiedMediaDigest(ctx, source, connection, request, item)
 	if err != nil {
 		return MediaReference{}, err
 	}
-	digest := sha256.Sum256(raw)
-	id := hex.EncodeToString(digest[:])
-	if err := os.MkdirAll(filepath.Join(s.directory, "media"), 0700); err != nil {
-		return MediaReference{}, err
-	}
+	pin := mediaPinV2{Version: 2, mediaPinIdentity: mediaPinIdentity{SourceID: source.ID, SourceBinding: sourceMediaBinding(source), Connection: source.Connection, ConnectionBinding: connectionMediaBinding(connection), Item: item}, SHA256: digest, ContentIdentity: s.contentIdentity(connection, item)}
+	id := pinIdentityID(pin.mediaPinIdentity)
+	pin.MAC = s.pinReceiptMAC(pin)
 	if err := writeJSON(s.pinPath(id), pin, 1<<20); err != nil {
 		return MediaReference{}, err
 	}
-	return MediaReference{Type: "source", URI: s.baseURL + "/v1/media/" + id + "/" + s.mediaSignature(id), MIMEType: mediaMIME(item), Version: `"` + id + `"`, VersionKind: "strong_etag", Length: item.Size}, nil
+	return MediaReference{ContentSHA256: digest, Type: "source", URI: s.baseURL + "/v1/media/" + id + "/" + s.mediaSignature(id), MIMEType: mediaMIME(item), Version: `"` + digest + `"`, VersionKind: "strong_etag", Length: item.Size}, nil
 }
 func mediaMIME(item Item) string {
 	typ := configString(item.Metadata, "mime_type")
@@ -526,107 +677,7 @@ func mediaMIME(item Item) string {
 	}
 	return typ
 }
-func (s *Service) serveMedia(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		serviceError(w, 405, "method_not_allowed")
-		return
-	}
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/media/"), "/")
-	if len(parts) != 2 || len(parts[0]) != 64 || len(parts[1]) != 64 {
-		serviceError(w, 404, "media_not_found")
-		return
-	}
-	id := parts[0]
-	if _, err := hex.DecodeString(id); err != nil || !hmac.Equal([]byte(parts[1]), []byte(s.mediaSignature(id))) {
-		serviceError(w, 404, "media_not_found")
-		return
-	}
-	select {
-	case s.fetchSlots <- struct{}{}:
-		defer func() { <-s.fetchSlots }()
-	default:
-		w.Header().Set("Retry-After", "1")
-		serviceError(w, 503, "fetch_busy")
-		return
-	}
-	pin, err := s.loadMediaPin(id)
-	if err != nil {
-		serviceError(w, 410, "media_revoked")
-		return
-	}
-	s.mu.Lock()
-	var source *Source
-	for _, candidate := range s.profile.Sources {
-		candidate.Alias, candidate.PermissionTTLSeconds = "", 0
-		a, _ := json.Marshal(candidate)
-		b, _ := json.Marshal(pin.Source)
-		if bytes.Equal(a, b) {
-			copy := candidate
-			source = &copy
-			break
-		}
-	}
-	connection, exists := s.profile.Connections[pin.Source.Connection]
-	closed := s.closed
-	s.mu.Unlock()
-	currentConnection, _ := json.Marshal(connection)
-	pinnedConnection, _ := json.Marshal(pin.Connection)
-	if closed || source == nil || !exists || !bytes.Equal(currentConnection, pinnedConnection) {
-		serviceError(w, 410, "media_revoked")
-		return
-	}
-	var state runState
-	if err := loadJSON(filepath.Join(s.runnerPath(), source.ID+".json"), &state, 256<<20); err != nil {
-		serviceError(w, 410, "media_revoked")
-		return
-	}
-	selected := false
-	for _, inv := range []*Inventory{state.Pending, state.Published} {
-		if inv == nil {
-			continue
-		}
-		for _, item := range inv.Objects {
-			if item.ID == pin.Item.ID && item.Revision == pin.Item.Revision {
-				selected = true
-				break
-			}
-		}
-	}
-	if !selected {
-		serviceError(w, 410, "media_revoked")
-		return
-	}
-	connector, err := s.factory(r.Context(), connection)
-	if err == nil {
-		connector, err = publicationConnector(connector, *source)
-	}
-	request := Request{SourceNamespace: "job/" + source.ID, Config: source.Config, Mode: ImportModeSource}
-	if err == nil {
-		err = connector.CheckAccess(r.Context(), request, pin.Item)
-	}
-	var data []byte
-	if err == nil {
-		data, err = connector.Read(r.Context(), request, pin.Item)
-	}
-	if err != nil {
-		var changed *RevisionChangedError
-		if errors.As(err, &changed) {
-			serviceError(w, 412, "source_version_changed")
-		} else {
-			serviceError(w, 502, "source_fetch_failed")
-		}
-		return
-	}
-	if int64(len(data)) != pin.Item.Size || len(data) > maxImportSourceObjectBytes {
-		serviceError(w, 502, "source_length_changed")
-		return
-	}
-	w.Header().Set("Content-Type", mediaMIME(pin.Item))
-	w.Header().Set("ETag", `"`+id+`"`)
-	w.Header().Set("Cache-Control", "private, no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	http.ServeContent(w, r, pin.Item.Filename, time.Time{}, bytes.NewReader(data))
-}
+func (s *Service) serveMedia(w http.ResponseWriter, r *http.Request) { s.serveMediaStream(w, r) }
 
 // A successful full sync authorizes retirement. Failed runs keep both the
 // published and pending generations, matching Runner's ownership lifecycle.
@@ -659,26 +710,4 @@ func (s *Service) pruneMediaPins(keep map[string]bool) error {
 			return nil
 		}
 	}
-}
-
-func (s *Service) loadMediaPin(id string) (mediaPin, error) {
-	var pin mediaPin
-	file, err := os.Open(s.pinPath(id))
-	if err != nil {
-		return pin, err
-	}
-	defer file.Close()
-	raw, err := io.ReadAll(io.LimitReader(file, 1<<20+1))
-	if err != nil {
-		return pin, err
-	}
-	if len(raw) > 1<<20 {
-		return pin, fmt.Errorf("media descriptor exceeds budget")
-	}
-	digest := sha256.Sum256(raw)
-	if hex.EncodeToString(digest[:]) != id {
-		return pin, fmt.Errorf("media descriptor integrity failed")
-	}
-	err = json.Unmarshal(raw, &pin)
-	return pin, err
 }

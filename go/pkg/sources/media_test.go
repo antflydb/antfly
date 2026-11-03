@@ -18,6 +18,7 @@ package sources
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"github.com/stretchr/testify/require"
@@ -30,7 +31,7 @@ import (
 func mediaDocument(t *testing.T) Document {
 	t.Helper()
 	item := Item{ID: "s3://job/" + testSourceID + "/docs/photo.jpg", Path: "photo.jpg", URL: "s3://docs/photo.jpg", Revision: "rev-1", SourceKind: ProviderS3, Size: 123}
-	doc, err := NormalizeMedia(testSourceID, item, MediaReference{Type: "source", URI: "https://source.example/v1/media/object/token", MIMEType: "image/jpeg", Version: `"etag"`, VersionKind: "strong_etag", Length: 123}, Permissions{Public: true}, time.Now())
+	doc, err := NormalizeMedia(testSourceID, item, MediaReference{ContentSHA256: fmt.Sprintf("%x", sha256.Sum256([]byte("fixture"))), Type: "source", URI: "https://source.example/v1/media/object/token", MIMEType: "image/jpeg", Version: `"etag"`, VersionKind: "strong_etag", Length: 123}, Permissions{Public: true}, time.Now())
 	require.NoError(t, err)
 	return doc
 }
@@ -38,7 +39,7 @@ func TestMediaNormalizationRejectsAmbiguousOrUnpinnedContent(t *testing.T) {
 	doc := mediaDocument(t)
 	require.Equal(t, 2, doc.Version)
 	require.Empty(t, doc.Content)
-	require.NotContains(t, doc.Metadata, "sha256")
+	require.True(t, validContentSHA(configString(doc.Metadata, "sha256")))
 	cases := map[string]func(*Document){
 		"text masquerading as media": func(d *Document) { d.Content = "binary" },
 		"invented checksum":          func(d *Document) { d.Metadata["sha256"] = "hash" },
@@ -82,7 +83,7 @@ func TestRunnerMediaRetainsOwnershipReadinessAndDeletion(t *testing.T) {
 		require.NoError(t, json.Unmarshal(raw, &doc))
 		require.Equal(t, "media", doc.Kind)
 		require.Equal(t, 2, doc.Version)
-		require.NotContains(t, doc.Metadata, "sha256")
+		require.True(t, validContentSHA(configString(doc.Metadata, "sha256")))
 	}
 	backend.mu.Unlock()
 	require.NoError(t, runner.Sync(t.Context()))

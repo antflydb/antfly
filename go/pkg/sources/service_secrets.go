@@ -64,7 +64,11 @@ func (s *Service) putSecret(key, value string) error {
 	if err := os.MkdirAll(filepath.Join(s.directory, "secrets"), 0700); err != nil {
 		return err
 	}
-	return writeJSON(s.secretPath(key), record, 256<<10)
+	if err := writeJSON(s.secretPath(key), record, 256<<10); err != nil {
+		return err
+	}
+	s.invalidateClients()
+	return nil
 }
 func (s *Service) resolveSecret(ctx context.Context, key string) (string, error) {
 	if err := ctx.Err(); err != nil {

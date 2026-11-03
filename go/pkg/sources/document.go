@@ -98,14 +98,18 @@ func Normalize(sourceID string, item Item, data []byte, permissions Permissions,
 }
 
 // MediaReference is the model-aware chunk source contract. Version is a quoted
-// strong ETag for the immutable bytes served at URI, not a content hash.
+// strong ETag for the immutable bytes served at URI. Service uses the verified
+// original-byte SHA-256; custom fetchers may use another strong representation tag.
 type MediaReference struct {
-	Type        string `json:"type"`
-	URI         string `json:"uri"`
-	MIMEType    string `json:"mime_type"`
-	Version     string `json:"version"`
-	VersionKind string `json:"version_kind"`
-	Length      int64  `json:"length"`
+	// ContentSHA256 is acquisition evidence, stored in the document metadata,
+	// not sent as an extension to the inference source-reference wire contract.
+	ContentSHA256 string `json:"-"`
+	Type          string `json:"type"`
+	URI           string `json:"uri"`
+	MIMEType      string `json:"mime_type"`
+	Version       string `json:"version"`
+	VersionKind   string `json:"version_kind"`
+	Length        int64  `json:"length"`
 }
 
 // NormalizeMedia publishes an explicit media row without claiming that provider
@@ -120,7 +124,10 @@ func NormalizeMedia(sourceID string, item Item, ref MediaReference, permissions 
 		return Document{}, err
 	}
 	doc.Version, doc.Kind, doc.Media = 2, "media", &ref
-	delete(doc.Metadata, "sha256")
+	if !validContentSHA(ref.ContentSHA256) {
+		return Document{}, fmt.Errorf("verified original-byte SHA-256 is required")
+	}
+	doc.Metadata["sha256"] = ref.ContentSHA256
 	if err := validateDocumentContent(doc); err != nil {
 		return Document{}, err
 	}
@@ -135,8 +142,8 @@ func validateDocumentContent(doc Document) error {
 		}
 		return nil
 	}
-	_, hasTextDigest := doc.Metadata["sha256"]
-	if doc.Version != 2 || doc.Kind != "media" || doc.Media == nil || doc.Content != "" || hasTextDigest {
+	hasContentDigest := validContentSHA(configString(doc.Metadata, "sha256"))
+	if doc.Version != 2 || doc.Kind != "media" || doc.Media == nil || doc.Content != "" || !hasContentDigest {
 		return fmt.Errorf("invalid canonical media document")
 	}
 	ref := doc.Media
@@ -144,7 +151,7 @@ func validateDocumentContent(doc Document) error {
 	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" || (u.Scheme != "https" && u.Scheme != "http" && u.Scheme != "s3") || len(ref.URI) > 16384 || strings.ContainsAny(ref.URI, "\x00\r\n") {
 		return fmt.Errorf("invalid media URI")
 	}
-	if ref.Type != "source" || ref.Length < 1 || ref.Length > maxImportSourceObjectBytes || ref.MIMEType == "" || strings.ContainsAny(ref.MIMEType, "\x00\r\n") || len(ref.MIMEType) > 255 || ref.VersionKind != "strong_etag" || len(ref.Version) < 3 || len(ref.Version) > 4096 || ref.Version[0] != '"' || ref.Version[len(ref.Version)-1] != '"' || strings.ContainsAny(ref.Version[1:len(ref.Version)-1], "\"\x00\r\n") {
+	if ref.Type != "source" || ref.Length < 1 || ref.MIMEType == "" || strings.ContainsAny(ref.MIMEType, "\x00\r\n") || len(ref.MIMEType) > 255 || ref.VersionKind != "strong_etag" || len(ref.Version) < 3 || len(ref.Version) > 4096 || ref.Version[0] != '"' || ref.Version[len(ref.Version)-1] != '"' || strings.ContainsAny(ref.Version[1:len(ref.Version)-1], "\"\x00\r\n") {
 		return fmt.Errorf("invalid pinned media reference")
 	}
 	return nil

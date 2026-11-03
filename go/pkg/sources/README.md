@@ -469,10 +469,11 @@ Register a media source with `PUT /v1/sources/{uuid}`:
 
 Drive media sources use `config: {"resource":"drive","folder_id":"..."}`.
 Binary images, PDF, and audio are published without OCR/text extraction. Media
-publication currently supports S3, GCS, and binary Drive objects with exact lengths
-of 1..32 MiB. Workspace document exports and unknown-length objects must use text
-publication. The byte limit matches the portable acquisition engine; this PR does
-not introduce unbounded download or streaming claims.
+publication supports S3, GCS, and binary Drive objects with positive exact lengths.
+Media does not inherit the text importer's 32 MiB limit. Workspace document
+exports and unknown-length objects must use text publication. Initial verification
+streams original bytes through SHA-256 with a 64 KiB buffer and a 30-minute
+per-object deadline; it never buffers the complete object.
 
 Text sources keep their version-1 canonical format. Media rows use version 2,
 `kind: "media"`, empty `content`, and a `media` object matching the model-aware
@@ -490,26 +491,67 @@ chunk API's source-reference contract:
 ```
 
 The canonical source URI, provider revision, permissions, and connection identity
-remain in the canonical document. Configure enrichments to read `grep.media` for
-model-aware chunking, or `grep.media.uri` for URL-based extraction/`remoteMedia`.
+remain in the canonical document. Enrichment `field` selectors read top-level
+fields; use a nested-value template for this canonical envelope. For document
+extraction use `template: "{{grep.media.uri}}"` with the
+`document_extraction` asset producer; the gateway supplies MIME type and a strong
+versioned URL. For URL-based media embeddings use
+`template: "{{remoteMedia url=grep.media.uri}}"`. Model-aware chunking consumes the
+`grep.media` source-reference object through a JSON-producing source template.
+Do not configure the literal field name `grep.media.uri` as a field selector.
 Text-only consumers such as `antfly-grep` should continue selecting text sources.
 Publication readiness proves the canonical row is query-visible; downstream
 embedding/extraction completion is observed through Antfly's normal index status.
+
+A PDF extraction producer for the canonical media envelope uses:
+
+```json
+{
+  "name": "document_units_v1",
+  "kind": "asset",
+  "template": "{{grep.media.uri}}",
+  "content_type": "application/json",
+  "producer_json": "{\"type\":\"document_extraction\",\"config\":{}}"
+}
+```
+
+The opt-in `TestSourceMediaArtifactIntegration` covers real PDF fetching,
+extraction, chunk generation, full-text querying, and credential-free scoped
+purging with foreign-row preservation. Run it against a standalone server whose
+remote-content policy permits the loopback fixture:
+
+```sh
+ANTFLY_SOURCE_TEST_ENDPOINT=http://127.0.0.1:PORT/db/v1 \
+  GOWORK=off GOEXPERIMENT=simd go test -run TestSourceMediaArtifactIntegration
+```
 
 Media URLs are **private bearer capabilities**, not public share links. They
 identify one source/configuration/object revision and contain no provider
 credentials. Every read rechecks the live registry, selected inventory, current
 provider authority, source version, and exact byte length. The companion serves
-strong ETags, `If-Match`, `HEAD`, and byte ranges. It currently acquires one bounded
-complete object per request before serving ranges, with at most four acquisitions
-in flight. Saturation returns `503` and `Retry-After`. It retains no plaintext
-media cache. Signed descriptors survive restart and are pruned after successful
-full syncs. Failed runs keep their pending/published generations for recovery.
+strong content ETags, HTTP conditional requests, `HEAD`, and single/multipart byte
+ranges. HEAD performs a provider authorization/version check without downloading
+the object (S3 uses a one-byte authorization probe). Reads fetch exact ranges in
+at most 1 MiB verified windows, with four active requests and a two-minute request
+deadline. Drive windows pass before/after revision checks before releasing bytes.
+A later provider failure truncates an already started response; clients must
+require the advertised complete length. Saturation returns `503` and
+`Retry-After`.
 
-Listing cannot compute SHA-256 of bytes it has not read. Accordingly media rows
-omit the text normalizer's `metadata.sha256`; provider ETags/checksums remain
-separate metadata. The strong gateway ETag binds the pinned representation and
-is not advertised as a content hash. Text rows retain their verified text digest.
+Provider clients and refreshed token sources are pooled per credential generation
+with a 64-entry bound; rotation/revocation retires idle transports. Membership
+checks use signed sorted compact inventories and a bounded 32 MiB LRU, without
+reading acquisition journals on each request. Pending inventories are reconciled
+once after restart. Signed descriptors survive restart and are pruned after
+successful full syncs. Failed runs keep pending/published generations for recovery.
+
+Media publication computes `metadata.sha256` from verified original bytes.
+Signed receipts bind that digest to provider URI, version, endpoint and exact
+length. Subsequent syncs reuse receipts while rechecking current access. The HTTP
+ETag is this original-byte SHA-256. Provider ETags/checksums remain separate.
+Catalog bindings advertise media document version 2; text consumers skip media
+bindings and continue accepting version-1 text. Older pre-hash media descriptors
+are revoked; resync to issue verified descriptors after upgrading.
 
 ### Shared control protocol and SDKs
 
@@ -542,8 +584,18 @@ secret value behind an unchanged reference uses the new credential on future rea
 an active source are deleted only after an authoritative inventory and successful
 publication. Removing an entire source follows the existing non-destructive
 runner policy: the next sync retires its catalog binding, preserving owned rows
-and state for explicit recovery or operator cleanup. Restored connections can
-resume without losing that ledger.
+and state for recovery. To remove owned rows as well, DELETE with `?purge=true`,
+then start sync. The durable purge queue retires the catalog entry and reconciles
+only the source's exclusive key range and journaled legacy IDs. It needs no
+provider credentials, survives interruption, and prevents reusing the source ID
+until completion. Other sources and foreign rows are preserved. A source UUID's
+destination table is immutable; use a new UUID to move destinations. Restored
+connections can resume without losing their ledger.
+
+Failed job receipts include a safe `failure` object with `source_id`, `phase`,
+`code`, and `retryable`. The same fields are logged without raw provider messages,
+URLs or credentials. Inspect this receipt before retrying; failed and interrupted
+jobs retain their durable acquisition checkpoint.
 
 The TypeScript SDK exports `SourcesClient`, Python exports `SourcesClient`, and
 Rust exports `SourcesClient`/`SourceSyncJob`. Each targets the companion URL and

@@ -86,8 +86,10 @@ class SourcesClient:
     def put_source(self, source: dict[str, Any]) -> dict[str, Any]:
         return self._request("PUT", f"/v1/sources/{quote(source['id'], safe='')}", source)
 
-    def remove_source(self, source_id: str) -> dict[str, Any]:
-        return self._request("DELETE", f"/v1/sources/{quote(source_id, safe='')}")
+    def remove_source(self, source_id: str, *, purge: bool = False) -> dict[str, Any]:
+        """Revoke a source; purge=True queues row deletion for the next sync."""
+        suffix = "?purge=true" if purge else ""
+        return self._request("DELETE", f"/v1/sources/{quote(source_id, safe='')}{suffix}")
 
     def sync(self, *, restart: bool = False) -> dict[str, Any]:
         return self._request("POST", "/v1/sync", {"restart": restart})

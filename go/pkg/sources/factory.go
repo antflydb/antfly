@@ -129,11 +129,18 @@ func CredentialFactory(resolve func(context.Context, string) (string, error)) Fa
 			if endpoint == "" {
 				endpoint = "s3.amazonaws.com"
 			}
-			client, err := minio.New(endpoint, &minio.Options{Creds: credentials.NewStaticV4(access, key, session), Secure: !connection.S3Insecure})
+			transport, err := minio.DefaultTransport(!connection.S3Insecure)
 			if err != nil {
 				return nil, err
 			}
-			return &S3Connector{Client: client}, nil
+			transport.DisableCompression = true
+			client, err := minio.New(endpoint, &minio.Options{Creds: credentials.NewStaticV4(access, key, session), Secure: !connection.S3Insecure, Transport: transport})
+			if err != nil {
+				return nil, err
+			}
+			connector := &S3Connector{Client: client}
+			connector.transport = transport
+			return connector, nil
 		default:
 			return nil, fmt.Errorf("%w: unsupported provider %q", ErrInvalidInput, connection.Provider)
 		}

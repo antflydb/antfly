@@ -93,9 +93,14 @@ paths:
       operationId: removeSource
       description: >-
         Immediately revoke media capabilities. The next sync retires catalog
-        bindings; existing content rows follow Runner's non-destructive source
-        removal policy. Missing objects within an active source are reconciled
-        through scoped merge after an authoritative inventory succeeds.
+        bindings. By default rows and ownership remain for recovery. With
+        purge=true, durably queue deletion of only this source's owned rows;
+        the next sync applies it without provider credentials. Interrupted
+        purges resume on retry. The source ID cannot be reused until purge finishes.
+      parameters:
+        - name: purge
+          in: query
+          schema: {type: boolean, default: false}
       responses:
         '200': {$ref: '#/components/responses/Mutation'}
         default: {$ref: '#/components/responses/Error'}
@@ -269,5 +274,13 @@ components:
         started_at: {type: integer, format: int64}
         finished_at: {type: integer, format: int64}
         code: {type: string}
+        failure:
+          type: object
+          required: [phase, code, retryable]
+          properties:
+            source_id: {type: string, format: uuid}
+            phase: {type: string}
+            code: {type: string}
+            retryable: {type: boolean}
     MediaReference:
       $ref: '../shared/chunking.yaml#/components/schemas/ChunkSourceReference'

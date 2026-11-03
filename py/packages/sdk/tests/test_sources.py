@@ -45,3 +45,16 @@ def test_source_client_does_not_follow_redirects():
 def test_source_client_rejects_unsafe_endpoints(url):
     with pytest.raises(ValueError):
         SourcesClient(url, "token")
+
+
+def test_source_client_queues_explicit_purge():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"version": 1, "state": "configured"})
+
+    with SourcesClient("https://sources.example", "operator-token", transport=httpx.MockTransport(handler)) as client:
+        client.remove_source("a/b", purge=True)
+    assert requests[0].url.raw_path == b"/v1/sources/a%2Fb?purge=true"
+    assert requests[0].method == "DELETE"

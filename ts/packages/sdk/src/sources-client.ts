@@ -45,6 +45,7 @@ export interface SourceSyncJob {
   started_at: number;
   finished_at?: number;
   code?: string;
+  failure?: { source_id?: string; phase: string; code: string; retryable: boolean };
 }
 
 export class SourceServiceError extends Error {
@@ -138,6 +139,16 @@ export class SourcesClient {
   removeSource(id: string, signal?: AbortSignal): Promise<{ version: 1; state: string }> {
     return this.request("DELETE", `/v1/sources/${encodeURIComponent(id)}`, undefined, signal);
   }
+  /** Remove the definition and queue durable row deletion. Call sync() to apply it. */
+  purgeSource(id: string, signal?: AbortSignal): Promise<{ version: 1; state: string }> {
+    return this.request(
+      "DELETE",
+      `/v1/sources/${encodeURIComponent(id)}?purge=true`,
+      undefined,
+      signal
+    );
+  }
+
   sync(options: { restart?: boolean; signal?: AbortSignal } = {}): Promise<SourceSyncJob> {
     return this.request("POST", "/v1/sync", { restart: options.restart ?? false }, options.signal);
   }

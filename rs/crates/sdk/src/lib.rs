@@ -1222,4 +1222,4 @@ mod tests {
 }
 
 pub mod sources;
-pub use sources::{SourceServiceError, SourceSyncJob, SourcesClient};
+pub use sources::{SourceServiceError, SourceSyncFailure, SourceSyncJob, SourcesClient};

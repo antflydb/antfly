@@ -58,6 +58,8 @@ type Source struct {
 	PermissionTTLSeconds int             `json:"permission_ttl_seconds,omitempty"`
 }
 type Runner struct {
+	// MediaInventory publishes a compact authority generation at checkpoint boundaries.
+	MediaInventory        func(context.Context, Source, *Inventory, *Inventory) error
 	MediaReference        func(context.Context, Source, Request, Item) (MediaReference, error)
 	Profile               Profile
 	StateDir, CatalogPath string
@@ -154,6 +156,9 @@ func (r *Runner) Sync(ctx context.Context) error {
 			alias = source.ID
 		}
 		binding := Binding{ID: source.ID, Alias: alias, Table: source.Table, DocumentField: "grep", Filter: SourceFilter(source.ID), Status: "pending"}
+		if source.Publication == "media" {
+			binding.Publication, binding.DocumentVersion = "media", 2
+		}
 		if prior, ok := old[source.ID]; ok && prior.Table == source.Table {
 			binding.Status = prior.Status
 			binding.ValidUntil = prior.ValidUntil
@@ -281,7 +286,13 @@ func sourceConfigurationHash(source Source, connection Connection) (string, erro
 	return hex.EncodeToString(digest[:]), nil
 }
 
-func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection) (int64, string, error) {
+func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection) (started int64, resultRevision string, failure error) {
+	phase := "load_state"
+	defer func() {
+		if failure != nil {
+			failure = &sourceSyncError{sourceID: s.ID, phase: phase, cause: failure}
+		}
+	}()
 	statePath := filepath.Join(r.StateDir, s.ID+".json")
 	identityConnection := connection
 	if connection.Provider == ProviderGoogleWorkspace {
@@ -340,6 +351,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err := replayOwnership(journalPath, request.SourceNamespace, state.Owned); err != nil {
 		return 0, "", err
 	}
+	phase = "connect"
 	connector, err := r.Factory(ctx, connection)
 	if err != nil {
 		return 0, "", err
@@ -349,6 +361,15 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		return 0, "", err
 	}
 	if c, ok := connector.(*CollaborationConnector); ok {
+		// Pool immutable provider transports/token sources, never per-acquisition
+		// cursors, scope caches, or hydration state across logical sources.
+		run := CollaborationConnector{
+			ProviderName: c.ProviderName, HTTPClient: c.HTTPClient, AccessToken: c.AccessToken,
+			Services: c.Services, APIBase: c.APIBase, GmailBase: c.GmailBase, CalendarBase: c.CalendarBase,
+			DriveBase: c.DriveBase, Extractor: c.Extractor, DownloadTransport: c.DownloadTransport,
+			ExtractorVersion: c.ExtractorVersion, accessAuditWindow: c.accessAuditWindow, accessWait: c.accessWait,
+		}
+		c, connector = &run, &run
 		c.Baseline = state.Published
 		if r.Restart {
 			c.Baseline = nil
@@ -365,6 +386,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if r.Restart {
 		state.Pending = nil
 	}
+	phase = "enumerate"
 	if state.Pending == nil {
 		enumerationStarted := time.Now().Unix()
 		inventory, err := connector.Enumerate(ctx, request)
@@ -402,11 +424,17 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		}
 		seenPending[item.ID] = true
 	}
+	phase = "validate_inventory"
 	if err := connector.ValidateInventory(ctx, request, *state.Pending); err != nil {
 		return 0, "", err
 	}
 	if err := writeJSON(statePath, state, 256<<20); err != nil {
 		return 0, "", err
+	}
+	if r.MediaInventory != nil && s.Publication == "media" {
+		if err := r.MediaInventory(ctx, s, state.Pending, state.Published); err != nil {
+			return 0, "", err
+		}
 	}
 	if err := resetOwnershipJournal(journalPath); err != nil {
 		return 0, "", err
@@ -429,6 +457,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		}
 		sort.Strings(legacy)
 	}
+	phase = "publish"
 	selected := map[string]bool{}
 	var total int64
 	for _, item := range state.Pending.Objects {
@@ -440,6 +469,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		item.Metadata["connection_id"] = s.Connection
 		var doc Document
 		if s.Publication == "media" {
+			phase = "verify_media"
 			if err := connector.CheckAccess(ctx, request, item); err != nil {
 				return 0, "", err
 			}
@@ -452,6 +482,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 				return 0, "", err
 			}
 		} else {
+			phase = "read_content"
 			data, err := connector.Read(ctx, request, item)
 			if err != nil {
 				return 0, "", err
@@ -466,6 +497,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 			}
 		}
 
+		phase = "publish"
 		if _, exists := state.Owned[item.ID]; !exists && len(state.Owned) >= maxOwnedSourceObjects {
 			return 0, "", fmt.Errorf("source ownership exceeds budget; complete reconciliation before selecting more items")
 		}
@@ -491,9 +523,11 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		}
 	}
 	sort.Strings(absent)
+	phase = "validate_absence"
 	if err := connector.ValidateAbsentSources(ctx, request, absent); err != nil {
 		return 0, "", err
 	}
+	phase = "reconcile_deletions"
 	if _, err := writer.Finish(ctx); err != nil {
 		return 0, "", err
 	}
@@ -520,6 +554,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	_, isCollaboration := connector.(*CollaborationConnector)
 	_, isDriveMedia := connector.(*driveMediaConnector)
 	if isCollaboration || isDriveMedia {
+		phase = "audit_permissions"
 		ttl := s.PermissionTTLSeconds
 		if ttl == 0 {
 			ttl = 900
@@ -538,12 +573,18 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		// Slow audits must never extend the advertised maximum access age.
 		state.StartedAt = checkedAt.Unix()
 	}
+	phase = "commit_state"
 	state.Published = state.Pending
 	state.Pending = nil
 	state.AcquisitionID = ""
 	state.RecordFormat = 2
 	if err := writeJSON(statePath, state, 256<<20); err != nil {
 		return 0, "", err
+	}
+	if r.MediaInventory != nil && s.Publication == "media" {
+		if err := r.MediaInventory(ctx, s, nil, state.Published); err != nil {
+			return 0, "", err
+		}
 	}
 	if err := resetOwnershipJournal(journalPath); err != nil {
 		return 0, "", err
@@ -635,6 +676,9 @@ func publicationConnector(connector Connector, source Source) (Connector, error)
 		config, err := decodeSourceConfig[CollaborationConfig](source.Config)
 		if err != nil || c.ProviderName != ProviderGoogleWorkspace || config.Resource != "drive" {
 			return nil, fmt.Errorf("media publication supports S3, GCS and Drive sources")
+		}
+		if err := c.Validate(context.Background(), Request{Mode: ImportModeSource, Config: source.Config}); err != nil {
+			return nil, err
 		}
 		return &driveMediaConnector{GoogleConnector: c.drive()}, nil
 	}
