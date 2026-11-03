@@ -129,11 +129,14 @@ chunking, including `/ai/v1/chunk`, and does not discard visual PDF pages or
 model-aware audio/image windows. After changing the policy or upgrading PDF
 extraction, reprocess the affected documents so existing chunks and vectors are
 replaced. A document whose chunks all fall below the threshold publishes an
-empty inventory and retires its previous chunk vectors.
+empty inventory and retires its previous full-text entries and chunk vectors.
 
 Scanned PDFs with an existing invisible OCR text layer retain that layer's
-positions for word and line reconstruction. Antfly does not paint that invisible
-text over the scanned image.
+positions for word and line reconstruction. When visible text and an OCR layer
+overlap, extraction keeps the layers in separate reading orders, retaining both
+transcriptions and their source spans. Non-overlapping headings, body text, and
+footers keep their spatial reading order. Antfly does not paint invisible text
+over the scanned image.
 
 ### 3. Write a Scanned Document
 

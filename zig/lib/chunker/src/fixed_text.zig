@@ -29,7 +29,13 @@ const PositionedSection = struct {
 
 pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig) ![]types.Chunk {
     try cfg.validate();
-    if (text.len == 0) return try alloc.alloc(types.Chunk, 0);
+    // Every chunk is a source slice: if the whole source is ineligible, no
+    // candidate can pass. Avoid loading/tokenizing a model for page scraps.
+    // Invalid UTF-8 cannot prove the valid slices are too short: leave those
+    // inputs to the existing tokenizer and per-candidate validation path.
+    if (text.len == 0 or text.len < cfg.min_chars or
+        (!hasMinimumContent(text, cfg.min_chars) and std.unicode.utf8ValidateSlice(text)))
+        return try alloc.alloc(types.Chunk, 0);
 
     const target_tokens = if (cfg.target_tokens > 0) cfg.target_tokens else 500;
     const overlap_tokens = cfg.overlap_tokens;
@@ -635,4 +641,13 @@ test "fixed text minimum content counts Unicode scalars and ignores whitespace" 
     const legacy = try chunkText(alloc, "C-8", .{});
     defer types.freeChunks(alloc, legacy);
     try std.testing.expectEqual(@as(usize, 1), legacy.len);
+}
+
+test "fixed text minimum content rejects scraps before allocating a tokenizer" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const alloc = failing.allocator();
+    const chunks = try chunkText(alloc, "C-8 \u{3000}\u{3000}\u{3000}\u{3000}\u{3000}", .{ .min_chars = 16 });
+    defer types.freeChunks(alloc, chunks);
+    try std.testing.expectEqual(@as(usize, 0), chunks.len);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
 }

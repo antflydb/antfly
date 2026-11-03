@@ -1642,6 +1642,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                     .text = .{
                         .target_tokens = cfg.defaultedTargetTokens(),
                         .overlap_tokens = cfg.defaultedOverlapTokens(),
+                        .min_chars = cfg.text.min_chars,
                         .separator = cfg.defaultedSeparator(),
                     },
                     .audio = .{
@@ -3886,5 +3887,104 @@ test "native checkpoint route manifest preserves binary upload and export stream
         const resume_request = routeMetadata(.post, prefix ++ "/generate/context/resume");
         try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, resume_request.request_body);
         try std.testing.expect(resume_request.streaming_response);
+    }
+}
+
+test "standalone chunk minimum content survives the real provider ABI" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const io = std.testing.io;
+    var out: ?*anyopaque = null;
+    const handle = try linkedInferenceCreate(&.{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = path.ptr,
+        .data_dir_len = path.len,
+        .models_dir = .init(path),
+        .ml_dir = .init(path),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = 0,
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .{},
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{}"),
+        .executor = .init(&io),
+        .out_handle = &out,
+    });
+    defer linkedInferenceDestroy(handle);
+    const cases = [_]struct { text: []const u8, minimum: u32, count: usize }{
+        .{ .text = "C-8", .minimum = 16, .count = 0 },
+        .{ .text = "replace all six gyroscopes", .minimum = 16, .count = 1 },
+        .{ .text = "C-8", .minimum = 0, .count = 1 },
+    };
+    for (cases) |case| {
+        const request = try std.json.Stringify.valueAlloc(a, ChunkInputRequest{
+            .model = "fixed",
+            .input = .{ .text = case.text },
+            .config = .{ .provider = .antfly, .text = .{ .target_tokens = 128, .min_chars = case.minimum } },
+        }, .{});
+        defer a.free(request);
+        var response: ?*anyopaque = null;
+        var json: inference_bridge.String = undefined;
+        try linkedInferenceInvokeProvider(&.{
+            .abi_version = inference_bridge.abi_version,
+            .handle = handle,
+            .operation = @backingInt(inference_bridge.ProviderOperation.chunk_input),
+            .request_json = .init(request),
+            .deadline_ns = 0,
+            .has_deadline = 0,
+            .out_response_handle = &response,
+            .out_response_json = &json,
+        });
+        defer linkedInferenceDestroyProviderResponse(response.?);
+        var chunks = try std.json.parseFromSlice([]inference_chunker.Chunk, a, json.slice(), .{});
+        defer chunks.deinit();
+        try std.testing.expectEqual(case.count, chunks.value.len);
+        if (case.count != 0) try std.testing.expectEqualStrings(case.text, chunks.value[0].text.?);
+
+        const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+        const direct = try state.node.chunkInputDirect(a, "fixed", .{ .text = case.text }, .{
+            .text = .{ .target_tokens = 128, .min_chars = case.minimum },
+        });
+        defer inference_chunker.types.freeChunks(a, direct);
+        try std.testing.expectEqual(chunks.value.len, direct.len);
+
+        const http_body = try std.json.Stringify.valueAlloc(a, .{
+            .input = case.text,
+            .config = .{ .text = .{ .target_tokens = 128, .min_chars = case.minimum } },
+        }, .{});
+        defer a.free(http_body);
+        var http_request = try httpx.Request.init(a, .POST, "/ai/v1/chunk");
+        defer http_request.deinit();
+        http_request.body = http_body;
+        var ctx = httpx.Context.init(a, io, &http_request);
+        defer ctx.deinit();
+        var http_response = try state.node.chunkText(&ctx);
+        defer http_response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), http_response.status.code);
+        var http_chunks = try std.json.parseFromSlice(std.json.Value, a, http_response.body.?, .{});
+        defer http_chunks.deinit();
+        const data = http_chunks.value.object.get("data").?.array.items;
+        try std.testing.expectEqual(chunks.value.len, data.len);
+        for (chunks.value, direct, data) |abi_chunk, direct_chunk, http_chunk| {
+            try std.testing.expectEqualStrings(abi_chunk.text.?, direct_chunk.text.?);
+            try std.testing.expectEqualStrings(abi_chunk.text.?, http_chunk.object.get("text").?.string);
+            try std.testing.expectEqual(abi_chunk.id, direct_chunk.id);
+            try std.testing.expectEqual(abi_chunk.start_char, direct_chunk.start_char);
+            try std.testing.expectEqual(abi_chunk.end_char, direct_chunk.end_char);
+            try std.testing.expectEqual(@as(i64, abi_chunk.id), http_chunk.object.get("id").?.integer);
+            try std.testing.expectEqual(@as(i64, @intCast(abi_chunk.start_char.?)), http_chunk.object.get("start_char").?.integer);
+            try std.testing.expectEqual(@as(i64, @intCast(abi_chunk.end_char.?)), http_chunk.object.get("end_char").?.integer);
+        }
     }
 }

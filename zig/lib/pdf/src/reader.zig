@@ -1403,6 +1403,7 @@ const LayoutTextRun = struct {
     ascent: f64 = 0,
     descent: f64 = 0,
     paint_order: usize = 0,
+    render_mode: i64 = 0,
     text_show_tracking_gap: ?f64 = null,
     output_span: ?TextOutputSpan = null,
 
@@ -17548,6 +17549,7 @@ fn appendTextRunDecodedString(
                 .ascent = metrics.ascent,
                 .descent = metrics.descent,
                 .paint_order = paint_order,
+                .render_mode = render_mode,
             });
         },
         .analysis, .render => {
@@ -18496,7 +18498,61 @@ fn orderedTextRunIndicesAlloc(alloc: Allocator, runs: anytype) ![]usize {
     return orderedTextRunIndicesCancelableAlloc(alloc, runs, .{});
 }
 
+fn invisibleTextRun(run: anytype) bool {
+    const mode = @mod(run.render_mode, 8);
+    return mode == 3 or mode == 7;
+}
+
+fn textBoundsOverlap(left: TextRunBounds, right: TextRunBounds) bool {
+    const width = @min(left.max_x, right.max_x) - @max(left.min_x, right.min_x);
+    const height = @min(left.max_y, right.max_y) - @max(left.min_y, right.min_y);
+    return width > @min(left.max_x - left.min_x, right.max_x - right.min_x) * 0.5 and
+        height > @min(left.max_y - left.min_y, right.max_y - right.min_y) * 0.5;
+}
+
+/// Only ambiguous, overlapping visible/OCR layers need separate reading orders.
+/// Keep non-overlapping headings, body text and footers in their spatial order.
+/// The same 2048-run ceiling as column repair bounds this optional pair search;
+/// larger pages retain authored order and separate overlapping layer transitions.
+fn hasOverlappingTextLayers(alloc: Allocator, runs: anytype, cancellation: CancellationProbe) !bool {
+    if (runs.len > 2048) return false;
+    var visible = false;
+    var invisible = false;
+    for (runs) |run| {
+        if (run.text.len == 0) continue;
+        if (invisibleTextRun(run)) invisible = true else visible = true;
+    }
+    if (!visible or !invisible) return false;
+    const boxes = try alloc.alloc(TextRunBounds, runs.len);
+    defer alloc.free(boxes);
+    for (runs, boxes) |run, *box| box.* = textRunBounds(run);
+    for (runs, 0..) |left, i| {
+        try cancellation.check();
+        if (left.text.len == 0) continue;
+        for (runs[i + 1 ..], i + 1..) |right, j| {
+            if (right.text.len == 0 or invisibleTextRun(left) == invisibleTextRun(right)) continue;
+            if (textBoundsOverlap(boxes[i], boxes[j])) return true;
+        }
+    }
+    return false;
+}
+
 fn orderedTextRunIndicesCancelableAlloc(alloc: Allocator, runs: anytype, cancellation: CancellationProbe) ![]usize {
+    if (!try hasOverlappingTextLayers(alloc, runs, cancellation))
+        return orderedTextLayerIndicesAlloc(alloc, runs, cancellation, null);
+    // Retain both layers and all their source spans. Never interleave OCR words
+    // into visible lines, or silently discard a differing OCR transcription.
+    const first_layer = for (runs) |run| {
+        if (run.text.len != 0) break invisibleTextRun(run);
+    } else false;
+    const first = try orderedTextLayerIndicesAlloc(alloc, runs, cancellation, first_layer);
+    defer alloc.free(first);
+    const second = try orderedTextLayerIndicesAlloc(alloc, runs, cancellation, !first_layer);
+    defer alloc.free(second);
+    return try std.mem.concat(alloc, usize, &.{ first, second });
+}
+
+fn orderedTextLayerIndicesAlloc(alloc: Allocator, runs: anytype, cancellation: CancellationProbe, invisible: ?bool) ![]usize {
     var original = std.ArrayList(usize).empty;
     defer original.deinit(alloc);
     var ordering_supported = true;
@@ -18504,6 +18560,7 @@ fn orderedTextRunIndicesCancelableAlloc(alloc: Allocator, runs: anytype, cancell
     for (runs, 0..) |run, run_index| {
         if (run_index % 256 == 0) try cancellation.check();
         if (run.text.len == 0) continue;
+        if (invisible) |layer| if (invisibleTextRun(run) != layer) continue;
         try original.append(alloc, run_index);
         if (!textRunHasSupportedOrderingGeometry(run)) {
             ordering_supported = false;
@@ -18605,7 +18662,10 @@ fn reconstructTextFromRunsCancelableAlloc(alloc: Allocator, runs: anytype, cance
         const run = &runs[run_index];
         if (previous_index) |prior_index| {
             const prior = runs[prior_index];
-            if (!textRunsShareLine(prior, run.*)) {
+            const layer_boundary = invisibleTextRun(prior) != invisibleTextRun(run.*) and
+                (textRunForwardGap(prior, run.*) < 0 or
+                    textBoundsOverlap(textRunBounds(prior), textRunBounds(run.*)));
+            if (layer_boundary or !textRunsShareLine(prior, run.*)) {
                 try appendLayoutNewline(alloc, &out, runs, ordered_indices[0..emitted_index]);
             } else if (!std.ascii.isWhitespace(out.items[out.items.len - 1]) and
                 !std.ascii.isWhitespace(run.text[0]))
@@ -32115,4 +32175,62 @@ test "reader NASA SM3A OCR report retains searchable words in both extraction AP
     }
     // OCR runs still observe the caller's working-set bound.
     try std.testing.expectError(error.TextRunLimitExceeded, reader.extractPageTextAnalysisWithRunLimitAlloc(1, 10));
+}
+
+test "reader mixed OCR layers preserve words phrases and nonoverlapping reading order" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { content: []const u8, expected: []const u8 }{
+        .{ .content = "BT /F1 12 Tf 10 50 Td (needle) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET", .expected = "needle\nneedle\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (alpha) Tj 1 0 0 1 60 50 Tm (beta) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (alpha) Tj 1 0 0 1 60 50 Tm (gamma) Tj ET", .expected = "alpha beta\nalpha gamma\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET BT /F1 12 Tf 0 Tr 10 50 Td (visible) Tj ET", .expected = "needle\nvisible\n" },
+        .{ .content = "BT /F1 12 Tf 10 90 Td (Heading) Tj ET BT /F1 12 Tf 3 Tr 10 70 Td (body words) Tj ET BT /F1 12 Tf 0 Tr 10 50 Td (Footer) Tj ET", .expected = "Heading\nbody words\nFooter\n" },
+    };
+    for (cases) |case| {
+        const bytes = try buildTextOrderingTestPdfAlloc(a, case.content);
+        defer a.free(bytes);
+        var reader = try Reader.init(a, bytes);
+        defer reader.deinit();
+        const text = try reader.extractPageTextAlloc(1);
+        defer a.free(text);
+        try std.testing.expectEqualStrings(case.expected, text);
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        try std.testing.expectEqualStrings(text, analysis.text);
+        for (analysis.runs) |run| if (run.output_span) |span| {
+            try std.testing.expectEqualStrings(run.text, text[span.start..span.end]);
+        };
+    }
+}
+
+test "reader mixed OCR layer reconstruction bounds work and remains cancellable" {
+    const a = std.testing.allocator;
+    const runs = try a.alloc(TextRun, 2050);
+    defer a.free(runs);
+    for (runs, 0..) |*run, i| run.* = .{
+        .text = "word",
+        .x = 10,
+        .y = 50,
+        .font_size = 12,
+        .advance_width = 24,
+        .ascent = 10,
+        .descent = 2,
+        .render_mode = if (i % 2 == 0) 0 else 3,
+    };
+    const order = try orderedTextRunIndicesAlloc(a, runs);
+    defer a.free(order);
+    for (order, 0..) |index, i| try std.testing.expectEqual(i, index);
+    const text = try reconstructTextFromRunsAlloc(a, runs);
+    defer a.free(text);
+    try std.testing.expectEqual(@as(usize, runs.len * "word\n".len), text.len);
+    for (runs) |run| {
+        const span = run.output_span.?;
+        try std.testing.expectEqualStrings(run.text, text[span.start..span.end]);
+    }
+    const Cancelled = struct {
+        fn check(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    // Also exercise cancellation in the bounded overlapping-layer search.
+    try std.testing.expectError(error.Canceled, orderedTextRunIndicesCancelableAlloc(a, runs[0..2048], .{ .is_cancelled_fn = Cancelled.check }));
 }
