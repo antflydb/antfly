@@ -26,6 +26,37 @@ const Decoded = local.serverless_query_lake_decoded_cache;
 const A = std.mem.Allocator;
 const Token = @import("antfly_cancellation").CancellationToken;
 const Value = struct { page: tree.NavigationPage };
+/// Borrow an address-stable request's cache context. Text, source navigation
+/// and background warmers use the same decoded leases and bounded range waves.
+/// Neither the context nor its reader authority may outlive the caller.
+pub fn cacheBinding(cached: *const artifacts.CachedRead) pages.ReadCache {
+    const Adapter = struct {
+        fn context(raw: *anyopaque) *const artifacts.CachedRead {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn charge(raw: *anyopaque, bytes: u64) !void {
+            try stores.chargeReadBudget(@ptrCast(@alignCast(raw)), bytes);
+        }
+        fn read(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest: [32]u8, token: Token, remaining: *u64) ![]u8 {
+            try context(raw).context.ensureActive();
+            try token.check();
+            try charge(remaining, length);
+            return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, context(raw).*);
+        }
+        fn decoded(raw: *anyopaque, a: A, store: *stores.ArtifactStore, domain: [32]u8, ref: tree.Ref, token: Token, remaining: *u64) !tree.NavigationPage {
+            try context(raw).context.ensureActive();
+            try token.check();
+            try charge(remaining, ref.bytes);
+            const reader: Reader = .{ .store = store.*, .domain = domain, .cached = context(raw).*, .token = token };
+            return reader.read(a, ref, null);
+        }
+        fn many(raw: *anyopaque, a: A, store: *stores.ArtifactStore, domain: [32]u8, refs: []const tree.Ref, output: []tree.NavigationPage, token: Token, remaining: *u64) !void {
+            const reader: Reader = .{ .store = store.*, .domain = domain, .cached = context(raw).*, .token = token };
+            return reader.many(a, refs, output, .{ .ptr = remaining, .charge = charge });
+        }
+    };
+    return .{ .ptr = @constCast(cached), .read = Adapter.read, .decoded_read = Adapter.decoded, .decoded_many = Adapter.many };
+}
 fn release(owner: *anyopaque, item: *anyopaque) void {
     const lease: Decoded.Lease = .{ .cache = @ptrCast(@alignCast(owner)), .item = @ptrCast(@alignCast(item)) };
     lease.release();
@@ -235,6 +266,14 @@ test "external lake shared navigation leases reuse decoded pages and preserve au
     for (first, second) |left, right| try std.testing.expect(left.entries.ptr == right.entries.ptr);
     try std.testing.expectEqual(traffic, cache.snapshot().provider_reads);
     try std.testing.expectEqual(before - refs[0].bytes - refs[1].bytes - refs[2].bytes, reads);
+    storage.read_cache = cacheBinding(&reader.cached);
+    const batch_read = storage.store().read_many.?;
+    const before_bound = reads;
+    var bound: [3]tree.NavigationPage = undefined;
+    try batch_read.read(batch_read.ptr, a, &refs, &bound);
+    for (&bound) |*value| value.deinit(a);
+    try std.testing.expectEqual(before_bound - refs[0].bytes - refs[1].bytes - refs[2].bytes, reads);
+
     var denied: u64 = 1;
     var rejected: [3]tree.NavigationPage = undefined;
     try std.testing.expectError(error.ArtifactReadBudgetExceeded, reader.many(a, &refs, &rejected, .{ .ptr = &denied, .charge = Charge.charge }));

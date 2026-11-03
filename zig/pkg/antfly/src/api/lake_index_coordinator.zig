@@ -88,6 +88,8 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     defer working.deinit();
     const build_alloc = working.allocator();
     var artifact_reads = @import("lake_index_artifact_recovery.zig").Reads.init(store.artifactStore());
+    artifact_reads.enableWriteCache(build_alloc, 8 * 1024 * 1024);
+    defer artifact_reads.close();
     var handle = artifact_reads.store();
     const published_bytes = publication.buildWithReuse(build_alloc, &handle, pending, source, store.identity, build_context, cancellation, clock, .{ .ptr = &lease, .snapshot = Renewal.snapshot, .save_checkpoint = Renewal.saveCheckpoint, .discard_checkpoint = Renewal.discardCheckpoint }, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = catalog.desiredFingerprint(table), .context = build_context }, .{ .allow_reuse = !repair, .identity_spill_bytes = options.identity_spill_bytes }) catch |reported_error| {
         heartbeat.cancel(io);
