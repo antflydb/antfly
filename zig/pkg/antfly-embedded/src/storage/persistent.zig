@@ -66,6 +66,7 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
 const index_mod = @import("../index.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const segment_mod = @import("../segment.zig");
+const segment_admission = @import("segment_admission.zig");
 const inverted_mod = @import("../section/inverted.zig");
 const introducer_mod = @import("../introducer.zig");
 const roaring = @import("../encoding/roaring.zig");
@@ -1243,6 +1244,7 @@ pub const PersistentIndex = struct {
             }
             try saveNextSegmentId(&txn, index.writer.next_segment_id);
             try txn.put(.meta, meta_rebuild_cursor, self.cursor);
+            if (publication) |*prepared| try index.savePreparedSegmentAdmissions(&txn, prepared);
             try txn.commit();
             if (publication) |*prepared| prepared.publish();
             self.segments.clearRetainingCapacity(); // ownership moved to writer
@@ -1699,15 +1701,35 @@ pub const PersistentIndex = struct {
                 };
                 segment_data.?.madviseAccessPattern();
                 errdefer if (segment_data) |*data| data.deinit(alloc);
-                writer.addSegmentWithIdData(seg_id, segment_data.?) catch |err| {
-                    if (isStaleActiveSegmentDataError(err)) {
-                        segment_data.?.deinit(alloc);
-                        segment_data = null;
-                        try stale_active_ids.append(alloc, seg_id);
-                        continue;
-                    }
-                    return err;
-                };
+                const marker_key = activeSegmentMetaKey(seg_id);
+                const marker = if (segment_data.? == .native) read_txn.get(.meta, &marker_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                } else null;
+                var admission = if (marker) |value| try segment_admission.decode(alloc, value, seg_id, segment_data.?.len()) else null;
+                defer if (admission) |*owned| owned.deinit();
+                if (admission) |*owned| {
+                    // Descriptor and active ID belong to this same catalog
+                    // transaction. Payloads retain independent native range
+                    // leases and authentication. No source pointers are cached.
+                    const reader = segment_mod.SegmentReader.initNativeCatalogAdmission(alloc, segment_data.?.source(), owned.metadata, owned.footer) catch |err| switch (err) {
+                        error.InvalidSegment => return error.InvalidSegmentAdmission,
+                        else => return err,
+                    };
+                    try publishCatalogAdmittedSegment(&writer, seg_id, segment_data.?, reader);
+                } else {
+                    // Ordinary admission consumes data on success and error.
+                    // In particular, stale/corrupt sources are already closed.
+                    const ordinary_data = segment_data.?;
+                    segment_data = null;
+                    writer.addSegmentWithIdData(seg_id, ordinary_data) catch |err| {
+                        if (isStaleActiveSegmentDataError(err)) {
+                            try stale_active_ids.append(alloc, seg_id);
+                            continue;
+                        }
+                        return err;
+                    };
+                }
                 segment_data = null;
 
                 const deletion_bytes = read_txn.get(.deletions, &seg_key) catch |err| switch (err) {
@@ -2338,7 +2360,7 @@ pub const PersistentIndex = struct {
 
         // 4. Persist metadata.
         const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn);
+        try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn, &writer_publication);
         if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
 
         // 5. Every fallible snapshot allocation was staged before catalog
@@ -2518,6 +2540,7 @@ pub const PersistentIndex = struct {
             if (builtin.os.tag != .freestanding) std.log.err("text segment checkpoint publish failed: {s}", .{@errorName(err)});
             return err;
         };
+        try self.savePreparedSegmentAdmissions(&txn, &writer_publication);
         txn.commit() catch |err| {
             if (builtin.os.tag != .freestanding) std.log.err("text segment catalog commit failed: {s}", .{@errorName(err)});
             return err;
@@ -2822,6 +2845,7 @@ pub const PersistentIndex = struct {
             for (owned_doc_keys) |key| alloc.free(key);
             alloc.free(owned_doc_keys);
         }
+        if (writer_publication) |*publication| try dest.savePreparedSegmentAdmissions(&dest_txn, publication);
         try dest_txn.commit();
         if (writer_publication) |*publication| publication.publish();
         writer_published = true;
@@ -3280,6 +3304,7 @@ pub const PersistentIndex = struct {
                 }
             }
         }
+        try self.savePreparedSegmentAdmissions(&txn, &writer_publication);
         try txn.commit();
 
         writer_publication.publish();
@@ -3477,6 +3502,7 @@ pub const PersistentIndex = struct {
 
         try self.saveSegmentRange(&txn, new_seg_id, key_range);
         try self.updateActiveSegments(&txn, new_seg_id, .add);
+        try self.savePreparedSegmentAdmissions(&txn, &writer_publication);
         try txn.commit();
 
         writer_publication.publish();
@@ -3625,6 +3651,7 @@ pub const PersistentIndex = struct {
             try self.saveSegmentRangeWithAllocator(scratch_alloc, &txn, key_range.seg_id, key_range);
             try self.updateActiveSegments(&txn, key_range.seg_id, .add);
         }
+        try self.savePreparedSegmentAdmissions(&txn, &writer_publication);
         try txn.commit();
 
         writer_publication.publish();
@@ -3668,11 +3695,12 @@ pub const PersistentIndex = struct {
         }
 
         try saveNextSegmentId(&txn, self.writer.next_segment_id);
+        try self.savePreparedSegmentAdmissions(&txn, &writer_publication);
         try txn.commit();
         writer_publication.publish();
     }
 
-    fn persistSegment(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8, lsn: u64) !void {
+    fn persistSegment(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8, lsn: u64, publication: *const index_mod.IndexWriter.PreparedSegmentReplacement) !void {
         var key_range = try extractSegmentKeyRange(self.alloc, segment_bytes);
         defer key_range.deinit(self.alloc);
 
@@ -3690,9 +3718,43 @@ pub const PersistentIndex = struct {
         // Update committed_lsn
         const lsn_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, lsn));
         try txn.put(.meta, meta_committed_lsn, &lsn_bytes);
-
+        try self.savePreparedSegmentAdmissions(&txn, publication);
         try txn.commit();
         self.committed_lsn = lsn;
+    }
+
+    /// The caller retains data until publication. Preparation clears a reader
+    /// only after allocating its scratch array, so an earlier failure leaves
+    /// that reader here; later failures clean up the consumed reader internally.
+    fn publishCatalogAdmittedSegment(writer: *index_mod.IndexWriter, id: u64, data: index_mod.SegmentData, reader: segment_mod.SegmentReader) !void {
+        var replacement = [_]index_mod.ReplacementSegmentData{.{ .id = id, .data = data, .prepared_reader = reader }};
+        defer if (replacement[0].prepared_reader) |*unconsumed| unconsumed.deinit();
+        var publication = try writer.prepareSegmentsManyData(&.{}, &replacement);
+        defer publication.abort();
+        publication.publish();
+    }
+
+    /// Navigation and active membership publish atomically. Legacy/oversized
+    /// descriptors retain ordinary source admission. Optional allocation
+    /// pressure may omit acceleration, but storage errors abort publication.
+    fn savePreparedSegmentAdmissions(self: *PersistentIndex, txn: *MainTxn, publication: *const index_mod.IndexWriter.PreparedSegmentReplacement) !void {
+        if (self.segment_files == null or self.segment_files.?.storage.vtable.open_leased_immutable_source == null) return;
+        for (publication.snapshot.segments[publication.carried_count..]) |segment| {
+            if (segment.data != .native) continue;
+            const metadata = segment.reader.admission(self.alloc) catch |err| switch (err) {
+                error.OutOfMemory, error.ResourceBudgetExceeded, error.InvalidSegment => continue,
+                else => return err,
+            };
+            defer metadata.deinit(self.alloc);
+            const footer = try segment_mod.SegmentReader.nativeCatalogFooter(segment.data.source());
+            const encoded = segment_admission.encode(self.alloc, segment.id, metadata, footer) catch |err| switch (err) {
+                error.OutOfMemory => continue,
+                else => return err,
+            } orelse continue;
+            defer self.alloc.free(encoded);
+            const marker_key = activeSegmentMetaKey(segment.id);
+            try txn.put(.meta, &marker_key, encoded);
+        }
     }
 
     fn updateActiveSegments(self: *PersistentIndex, txn: *MainTxn, seg_id: u64, op: enum { add, remove }) !void {
@@ -3738,7 +3800,7 @@ pub const PersistentIndex = struct {
         }};
         var writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
         defer writer_publication.abort();
-        try self.persistSegment(seg_id, segment_bytes, lsn);
+        try self.persistSegment(seg_id, segment_bytes, lsn, &writer_publication);
         writer_publication.publish();
         segment_data = null;
         rollback_segment = false;
@@ -6730,6 +6792,134 @@ test "persistent rebuild page publication scaling benchmark" {
             std.debug.print("rebuild_page_bench docs={} atomic={} publication_ns={} segments={}\n", .{ count, atomic_page, elapsed_ns, count / 256 });
         }
     }
+}
+
+test "persistent segment admission publication allocation failures release consumed and unconsumed readers" {
+    const a = std.testing.allocator;
+    const bytes = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(bytes);
+    var source_reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer source_reader.deinit();
+    const metadata = try source_reader.admission(a);
+    defer metadata.deinit(a);
+    const footer = try segment_mod.SegmentReader.nativeCatalogFooter(.{ .contiguous = bytes });
+    const Run = struct {
+        fn run(alloc: Allocator, input: []const u8, descriptor: segment_mod.SegmentReader.Admission, expected_footer: segment_mod.SegmentReader.NativeCatalogFooter) !void {
+            var writer = try index_mod.IndexWriter.init(alloc);
+            defer writer.deinit();
+            const data = index_mod.SegmentData.fromNative(.{ .contiguous = input });
+            const reader = try segment_mod.SegmentReader.initNativeCatalogAdmission(alloc, data.source(), descriptor, expected_footer);
+            try PersistentIndex.publishCatalogAdmittedSegment(&writer, 17, data, reader);
+            try std.testing.expectEqual(@as(usize, 1), writer.snapshot().segments.len);
+            try std.testing.expectEqual(@as(u64, 17), writer.snapshot().segments[0].id);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{ bytes, metadata, footer });
+}
+
+test "lite persistent segment admission survives merge reopen and aborted catalog publication with legacy fallback" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/segment-admission.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    const options: PersistentIndexOptions = .{
+        .path = "/admitted/index",
+        .io = std.testing.io,
+        .main_backend = .lsm,
+        .main_lsm_storage = storage.storage(),
+        .wal_backend = .lsm,
+        .wal_storage = storage.storage(),
+        .main_no_sync = true,
+        .wal_no_sync = true,
+    };
+    var index = try PersistentIndex.open(a, options);
+    var live = true;
+    defer if (live) index.close();
+    const first = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(first);
+    const second = try buildSimpleSegment(a, "doc:b", "beta");
+    defer a.free(second);
+    try index.indexSegment(first);
+    const Builder = struct {
+        bytes: []const u8,
+        fn build(raw: *anyopaque, sink: *segment_mod.SegmentSink) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try sink.appendSlice(self.bytes);
+        }
+    };
+    var builder = Builder{ .bytes = second };
+    _ = try index.indexSegmentFromSinkBuilder(&builder, Builder.build);
+    try index.syncMain(true);
+    index.close();
+    live = false;
+    index = try PersistentIndex.open(a, options);
+    live = true;
+    for (index.snapshot().segments) |segment| try std.testing.expect(segment.reader.native.?.catalog_admitted);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    {
+        const snapshot = index.acquireSnapshot();
+        defer snapshot.release();
+        const ids = [_]u64{ snapshot.segments[0].id, snapshot.segments[1].id };
+        const merged = try index.prepareMergedSegmentToFile(snapshot, &.{ 0, 1 });
+        try std.testing.expect(try index.replaceSegmentsIfActiveManyPrepared(&ids, merged));
+    }
+    const id = index.snapshot().segments[0].id;
+    const marker_key = activeSegmentMetaKey(id);
+    const descriptor = (try index.readGenerationMetadataAlloc(a, &marker_key)).?;
+    defer a.free(descriptor);
+    try std.testing.expect(descriptor.len > 1);
+    // Navigation may be staged, but an aborted transaction publishes neither
+    // a phantom active ID nor its descriptor.
+    {
+        var txn = try index.beginWriteMainTxn();
+        defer txn.abort();
+        const phantom = activeSegmentMetaKey(id + 123);
+        try txn.put(.meta, &phantom, descriptor);
+    }
+    try index.syncMain(true);
+    index.close();
+    live = false;
+    index = try PersistentIndex.open(a, options);
+    live = true;
+    try std.testing.expectEqual(@as(usize, 1), index.snapshot().segments.len);
+    try std.testing.expect(index.snapshot().segments[0].reader.native.?.catalog_admitted);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    {
+        var txn = try index.beginWriteMainTxn();
+        errdefer txn.abort();
+        try txn.put(.meta, &marker_key, &.{1});
+        try txn.commit();
+    }
+    try index.syncMain(true);
+    index.close();
+    live = false;
+    index = try PersistentIndex.open(a, options);
+    live = true;
+    try std.testing.expect(!index.snapshot().segments[0].reader.native.?.catalog_admitted);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    {
+        var txn = try index.beginWriteMainTxn();
+        errdefer txn.abort();
+        descriptor[descriptor.len - 1] ^= 1;
+        try txn.put(.meta, &marker_key, descriptor);
+        try txn.commit();
+    }
+    try index.syncMain(true);
+    index.close();
+    live = false;
+    // Corrupt rich navigation is an admission failure, not permission to
+    // silently delete an acknowledged index segment from its active set.
+    try std.testing.expectError(error.InvalidSegmentAdmission, PersistentIndex.open(a, options));
 }
 
 test "lite persistent owned publication merge recovery and retained snapshot ownership without mapping" {

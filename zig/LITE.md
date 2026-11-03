@@ -1491,6 +1491,25 @@ new cleanup and drains in-flight I/O before releasing the storage provider;
 late callbacks never dereference that provider. Standalone storage retains its
 existing per-file deletion behavior.
 
+Native text-segment active markers may also carry owned immutable navigation
+and field statistics. The descriptor publishes in the same LSM transaction as
+active membership, so runtime reconstruction can copy admitted navigation
+instead of reparsing every field's source sections. It contains no provider,
+runtime, or decoder pointers. The leased source's footer must match the captured
+footer; AFSM envelope, directory, and lazy payload integrity checks remain in
+force. Corrupt descriptors fail admission without pruning an active segment.
+Legacy one-byte markers retain ordinary source admission, and oversized
+descriptors or optional encoding allocation pressure preserve that fallback.
+Physical compaction preserves these source-content bindings. The marker value
+is internal metadata; this does not change the C ABI or native physical format.
+
+`scripts/bench/lite_segment_admission.py` generates a public multi-field seed
+for matched open and replay-service comparisons using prebuilt libraries in
+separate processes. Each case clones the same immutable database and checks
+acknowledged rows, search, integrity, replay completion, and reopening after
+measurement. This is a short local diagnostic, not original-importer or
+sustained-write qualification.
+
 Coordinated text-index applied watermarks and replay seals sync their durable WAL
 state before publishing coverage. They do not force a new SST generation for
 every bounded replay window. Cache shutdown preserves that WAL, and recovery

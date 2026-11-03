@@ -737,6 +737,7 @@ pub const SegmentReader = struct {
 
     const Native = struct {
         range: RangeSegmentReader,
+        catalog_admitted: bool = false,
         borrowed_navigation: bool = false,
         stored_metadata: [21]u8 = @splat(0),
         identity_mutex: std.atomic.Mutex = .unlocked,
@@ -908,6 +909,55 @@ pub const SegmentReader = struct {
         const validations = try alloc.alloc(std.atomic.Value(u8), blocks);
         for (validations) |*validation| validation.* = .init(integrity_unverified);
         return .{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = metadata.stored_offset, .stored_length = metadata.stored_length, .stored_metadata_length = metadata.stored_metadata_length, .index_offset = metadata.index_offset, .doc_count = metadata.doc_count, .num_fields = @intCast(fields.len), .fields = info, .stored_block_validations = validations };
+    }
+
+    pub const NativeCatalogFooter = [footer_size]u8;
+
+    pub fn nativeCatalogFooter(input_source: SegmentSource) !NativeCatalogFooter {
+        if (input_source.len() < footer_size) return error.InvalidSegment;
+        var footer: NativeCatalogFooter = undefined;
+        try input_source.readInto(input_source.len() - footer_size, &footer);
+        if (!std.mem.eql(u8, footer[52..], &magic)) return error.InvalidMagic;
+        const version = std.mem.readInt(u32, footer[44..48], .big);
+        if (version != 4 and version != segment_version) return error.UnsupportedVersion;
+        return footer;
+    }
+
+    /// Native catalog navigation avoids repeated per-field admission, while
+    /// preserving AFSM envelope, directory and lazy payload authentication.
+    /// The manifest's footer binds it to the currently leased immutable value;
+    /// equal segment IDs and lengths alone are not a sufficient source fence.
+    pub fn initNativeCatalogAdmission(alloc: Allocator, input_source: SegmentSource, metadata: Admission, expected_footer: NativeCatalogFooter) !SegmentReader {
+        try metadata.validate();
+        if (input_source.len() != metadata.bytes) return error.InvalidSegmentAdmission;
+        const footer = try nativeCatalogFooter(input_source);
+        if (!std.mem.eql(u8, &footer, &expected_footer) or
+            std.mem.readInt(u64, footer[0..8], .big) != metadata.doc_count or
+            std.mem.readInt(u64, footer[8..16], .big) != metadata.stored_offset or
+            std.mem.readInt(u64, footer[16..24], .big) != metadata.stored_length or
+            std.mem.readInt(u64, footer[24..32], .big) != metadata.stored_metadata_length or
+            std.mem.readInt(u64, footer[32..40], .big) != metadata.index_offset) return error.InvalidSegmentAdmission;
+        var scratch: [8192]u8 = undefined;
+        if (try input_source.checksum(metadata.index_offset, input_source.len() - 8 - metadata.index_offset, &scratch) != std.mem.readInt(u32, footer[48..52], .big)) return error.CrcMismatch;
+        const version = std.mem.readInt(u32, footer[44..48], .big);
+        var paged: ?*integrity.PagedSource = null;
+        errdefer if (paged) |owner| owner.deinit();
+        if (version == segment_version) {
+            const directory = try integrity.Directory.read(input_source, metadata.index_offset);
+            if (directory.offset < metadata.stored_offset + metadata.stored_length or metadata.index_offset + integrity.descriptor_size > input_source.len() - footer_size) return error.InvalidSegment;
+            paged = try integrity.PagedSource.init(alloc, input_source, directory);
+        } else if (try input_source.checksum(metadata.stored_offset, metadata.stored_metadata_length, &scratch) != std.mem.readInt(u32, footer[40..44], .big)) return error.CrcMismatch;
+        const payload_source = if (paged) |owner| owner.source() else input_source;
+        var stored_header: [21]u8 = @splat(0);
+        const header_length = @min(stored_header.len, metadata.stored_metadata_length);
+        try payload_source.readInto(metadata.stored_offset, stored_header[0..@intCast(header_length)]);
+        if (!std.mem.eql(u8, stored_header[0..@intCast(header_length)], metadata.stored_header[0..@intCast(header_length)])) return error.InvalidSegmentAdmission;
+        const reader = try initAuthenticated(alloc, payload_source, metadata);
+        reader.native.?.catalog_admitted = true;
+        reader.native.?.range.authenticated_source = false;
+        reader.native.?.range.paged_source = paged;
+        paged = null;
+        return reader;
     }
 
     /// The caller owns the immutable source and keeps it alive until reader deinit.

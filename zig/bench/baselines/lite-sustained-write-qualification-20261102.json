@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Not qualified: the unchanged original input-7 importer still fails with LiteReplayBacklogExceeded in both the f280 ReleaseFast reference and the bounded-cleanup Debug candidate. Native, C API, and SDK correctness gates pass. The remaining replay service bottleneck is under local investigation; final matched optimized imports, active-write soaks, Beads factory, and aggregate CI remain.",
+  "status": "Not qualified: prior unchanged input-7 importer runs failed with LiteReplayBacklogExceeded. The ownership-hardened segment-admission candidate passes full persistent/reader, strict C API, SDK and ABI gates; its unchanged-importer diagnostic and final matched optimized qualification remain pending.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -5459,7 +5459,7 @@
         "failed": 0,
         "leaks": 0,
         "exit": 0,
-        "notes": "Three expected host-capability fallbacks emitted MetalDeviceUnavailable error logs during installed-model tests. A strict hermetic rerun excluding installed-model tests is pending; this is not final model qualification."
+        "notes": "Three expected host-capability fallbacks emitted MetalDeviceUnavailable during installed-model tests. The separate strict hermetic rerun passed; this is not final model qualification."
       },
       "manual_replay_budget": {
         "passed": 5,
@@ -5470,7 +5470,17 @@
         "passed": 205,
         "failed": 0
       },
-      "capi_smoke_exports_and_linkage": "passed, 134 public C functions"
+      "capi_smoke_exports_and_linkage": "passed, 134 public C functions",
+      "strict_hermetic_capi_owner": {
+        "passed": 178,
+        "skipped": 3,
+        "failed": 0,
+        "leaks": 0,
+        "unexpected_error_logs": 0,
+        "exit": 0,
+        "scope": "ANTFLY_TEST_FAIL_ON_ERROR_LOGS=1; installed-model tests excluded",
+        "log": ".tools/import-regression/root-cause/pressure-merge-v2-contract-hermetic.log"
+      }
     },
     "intermediate_original_importer_diagnostic": {
       "input_index": 7,
@@ -5497,9 +5507,175 @@
       "base_main": "3b712f22430e7dd22d8c762f2f7d53a047613b68",
       "library_sha256": "89bc80c0ced3b341036ba55356dfd741fd1cd0ccabcccdcd5f6dc9c003fff47e",
       "scope": "Main control plus four GLiNER planning files and a compile-only optional-vtable-field lookup fix. Not pristine main. Debug CAPI and smoke/linkage build completed with exit 0.",
-      "build_log": ".tools/main-control-debug-build-bounded.log"
+      "build_log": ".tools/main-control-debug-build-bounded.log",
+      "input7_diagnostic": {
+        "input_index": 7,
+        "importer_exit_code": -9,
+        "censored": true,
+        "importer_succeeded": false,
+        "summary": null,
+        "seconds": 902.0635127500864,
+        "peak_native_builds": 5,
+        "metrics_enabled": true,
+        "library_sha256": "89bc80c0ced3b341036ba55356dfd741fd1cd0ccabcccdcd5f6dc9c003fff47e",
+        "public_errors": [],
+        "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution."
+      }
     },
     "remaining_design_limit": "The adaptive replay quantum applies between complete journal records; one 1,024-document record remains an indivisible collection/publication boundary and can exceed it. Safe intra-record progress requires publication and recovery design rather than smaller budget constants. The causal contribution to the end-to-end regression remains unproven.",
     "next_investigation": "Late profiling also finds repeated immutable-segment navigation admission during DB/runtime opens. SegmentReader already supports authenticated owned admission metadata; investigate durable segment-bound descriptors instead of borrowed runtime-pointer caching."
+  },
+  "native_catalog_segment_admission": {
+    "status": "Ownership-hardened v7 Debug correctness gates pass; unchanged original-importer diagnostic and final optimized qualification pending.",
+    "design": "Atomically publish bounded owned navigation in native active markers; bind to the currently leased source footer; preserve AFSM envelope/directory/lazy payload integrity. Legacy and optional-encoding allocation fallbacks retain normal source admission. Invalid rich descriptors fail closed without dropping active membership.",
+    "no_sdk_or_c_abi_change": true,
+    "v6_source_manifest": ".tools/import-regression/root-cause/segment-admission-v6-source.json",
+    "v6_debug_library_sha256": "a8620f9319da5f09b4dac17e924b93dbe27284b39d8b5b6ecb6bb1fd68849be4",
+    "v6_correctness": {
+      "focused": {
+        "passed": 5,
+        "failed": 0,
+        "leaks": 0
+      },
+      "persistent": {
+        "passed": 67,
+        "skipped": 1,
+        "failed": 0,
+        "leaks": 0
+      },
+      "sdk_sql_concurrency_catalog": {
+        "passed": 205,
+        "failed": 0
+      },
+      "capi_smoke_exports_linkage": {
+        "passed": true,
+        "public_functions": 134
+      },
+      "provider_reads_32_fields": {
+        "ordinary": 9,
+        "admitted": 6
+      },
+      "strict_hermetic_capi_owner": {
+        "passed": 178,
+        "skipped": 3,
+        "failed": 0,
+        "leaks": 0,
+        "unexpected_error_logs": 0,
+        "exit": 0
+      }
+    },
+    "public_open_abba": {
+      "cases": [
+        {
+          "case": "baseline-a",
+          "library_sha256": "ce35c73231f22ef7e2a34b7c33e61edb9836bb80980971fd9ec586d830be2fb5",
+          "source_sha256": "1f1396704e46fbcd7c6a5aacd00a5f9ee6ae90efca4c24ee00729a956d7f3095",
+          "open_median_seconds": 0.010767749976366758,
+          "peak_native_builds": 2,
+          "integrity_search_acknowledgement_reopen": true
+        },
+        {
+          "case": "candidate-a",
+          "library_sha256": "a8620f9319da5f09b4dac17e924b93dbe27284b39d8b5b6ecb6bb1fd68849be4",
+          "source_sha256": "1f1396704e46fbcd7c6a5aacd00a5f9ee6ae90efca4c24ee00729a956d7f3095",
+          "open_median_seconds": 0.009548687492497265,
+          "peak_native_builds": 2,
+          "integrity_search_acknowledgement_reopen": true
+        },
+        {
+          "case": "candidate-b",
+          "library_sha256": "a8620f9319da5f09b4dac17e924b93dbe27284b39d8b5b6ecb6bb1fd68849be4",
+          "source_sha256": "1f1396704e46fbcd7c6a5aacd00a5f9ee6ae90efca4c24ee00729a956d7f3095",
+          "open_median_seconds": 0.009522082982584834,
+          "peak_native_builds": 2,
+          "integrity_search_acknowledgement_reopen": true
+        },
+        {
+          "case": "baseline-b",
+          "library_sha256": "ce35c73231f22ef7e2a34b7c33e61edb9836bb80980971fd9ec586d830be2fb5",
+          "source_sha256": "1f1396704e46fbcd7c6a5aacd00a5f9ee6ae90efca4c24ee00729a956d7f3095",
+          "open_median_seconds": 0.010844103991985321,
+          "peak_native_builds": 2,
+          "integrity_search_acknowledgement_reopen": true
+        }
+      ],
+      "scope": "12 timed opens after two warmups per process, identical generated 128-row/32-field compacted seed. Two external native builds were active; these are diagnostic open timings, not end-to-end throughput."
+    },
+    "public_replay_service": {
+      "cases": [
+        {
+          "case": "baseline-a",
+          "first_observed_clean_seconds": 6.277123957988806,
+          "library_sha256": "ce35c73231f22ef7e2a34b7c33e61edb9836bb80980971fd9ec586d830be2fb5",
+          "source_sha256": "154871993eccc26f19a783d86eeceb60fa64ba9fff5cce3b2b2663aec4899dc4",
+          "peak_native_builds": 0,
+          "integrity_search_acknowledgement_reopen": true,
+          "status": "diagnostic_completed"
+        },
+        {
+          "case": "candidate-a",
+          "first_observed_clean_seconds": 6.2806349999736995,
+          "library_sha256": "a8620f9319da5f09b4dac17e924b93dbe27284b39d8b5b6ecb6bb1fd68849be4",
+          "source_sha256": "154871993eccc26f19a783d86eeceb60fa64ba9fff5cce3b2b2663aec4899dc4",
+          "peak_native_builds": 0,
+          "integrity_search_acknowledgement_reopen": true,
+          "status": "diagnostic_completed"
+        }
+      ],
+      "scope": "Identical generated 2176-row/32-field pending-replay seed, 25-second service observation; zero native compilers. Both first observed clean at approximately 6.28 seconds; faster opens did not establish replay throughput improvement."
+    },
+    "ownership_hardening": "Add caller cleanup for a prepared reader not yet consumed on scratch-allocation failure; cover the complete admitted publication with an allocation-failure sweep. Ordinary legacy admission consumes source ownership on success/error, so its caller must not close the source twice.",
+    "next": "Run all correctness gates on v7, then unchanged original input 7 without our own compiler/test overlap. Profile runtime reconstruction, preparation, publication waits and mandatory tier merges before selecting further design changes. Wolfspider remains reserved for final optimized qualification.",
+    "v7_debug_artifact": {
+      "base_commit": "2e479b77b3b8af9e8ebe1301cb47ef98fc212500",
+      "revision": "native_catalog_segment_admission_v7",
+      "source_files_sha256": {
+        "zig/pkg/antfly-embedded/src/segment.zig": "9452ea035c0fe9f8e843c84b7d905bfacd8de223ad72c5c38df8e8fe9aa2aeb3",
+        "zig/pkg/antfly-embedded/src/storage/persistent.zig": "b6cea991a73ff7a93b10713002c696c8115ccc4d71a6b0b75e9b83dc70db0d47",
+        "zig/pkg/antfly-embedded/src/storage/segment_admission.zig": "fa3018444e4be1a164b4dec478ff560b70921b2929d5998771abbdb6fb6864b5",
+        "zig/pkg/antfly/build/tests.zig": "fd2919ee072839ce2f21becc6ab820fac98731565a756d36c5e1aecaf9be9f9f"
+      },
+      "library_sha256": "64a5c7a1ed95b17da8b8b4170360eac466915d68a64bbb47b060ee3d739f6ff1",
+      "build_exit": 0,
+      "persistent": {
+        "passed": 68,
+        "skipped": 1,
+        "failed": 0,
+        "leaks": 0
+      },
+      "readers": {
+        "passed": 500,
+        "skipped": 2,
+        "failed": 0,
+        "leaks": 0
+      },
+      "public_exports": 134
+    },
+    "v7_correctness": {
+      "sdk_sql_concurrency_catalog": {
+        "passed": 205,
+        "failed": 0
+      },
+      "capi_smoke_exports_linkage": {
+        "exit": 0,
+        "public_functions": 134
+      },
+      "strict_hermetic_capi_owner": {
+        "passed": 178,
+        "skipped": 3,
+        "failed": 0,
+        "leaks": 0,
+        "unexpected_error_logs": 0,
+        "exit": 0
+      }
+    },
+    "public_benchmark": "scripts/bench/lite_segment_admission.py; freezes the measured library into each fresh case, checks immutable seed identity and exact fixture parameters, and verifies search on every generated field.",
+    "public_benchmark_smoke": {
+      "status": "passed",
+      "fields": 32,
+      "rows": 128,
+      "library_sha256": "64a5c7a1ed95b17da8b8b4170360eac466915d68a64bbb47b060ee3d739f6ff1",
+      "performance_claim": false
+    }
   }
 }

@@ -5907,7 +5907,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const persistent_unit_tests = b.addTest(.{
         .root_module = persistent_test_mod,
-        .filters = &.{"storage.persistent."},
+        .filters = &.{ "storage.persistent.", "storage.segment_admission." },
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
