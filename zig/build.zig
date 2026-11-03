@@ -95,7 +95,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const conformance_fixtures = shared.conformance_fixtures;
     const target = shared.target;
     const optimize = shared.optimize;
-    @import("build_support/architecture_experiments.zig").add(b, target, optimize, shared.production_antfly_imports, shared.inference_graph.inference_linalg_mod);
+    @import("build_support/owner_contract_tests.zig").add(b, target, optimize, shared.production_antfly_imports);
     const memory_tests = b.addTest(.{
         .name = "memory-policy-tests",
         .root_module = b.createModule(.{

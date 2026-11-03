@@ -7,7 +7,7 @@ on:
       step:
         type: choice
         default: memory-test
-        options: [products, compiled-pdf-native-test, compiled-template-pdf-test, opaque-pdf-session-test, opaque-pdf-consumer-compile, runtime-unit-enrichment_compute, memory-test, unit-storage-compile, architecture-probe-test, local-query-contract-test, local-query-owner-test, opaque-query-consumer-compile, opaque-query-owner-test, aggregation-plan-test, query-paging-test, mutation-plan-test, antfly-storage-owner-test, runtime-unit-local_query, runtime-unit-api_kernel, runtime-unit-storage-engine, runtime-unit-inference-core, runtime-archives, antfly]
+        options: [products, compiled-pdf-native-test, compiled-template-pdf-test, opaque-pdf-session-test, opaque-pdf-consumer-compile, runtime-unit-enrichment_compute, memory-test, unit-storage-compile, local-query-contract-test, local-query-owner-test, opaque-query-consumer-compile, opaque-query-owner-test, aggregation-plan-test, query-paging-test, mutation-plan-test, antfly-storage-owner-test, runtime-unit-local_query, runtime-unit-api_kernel, runtime-unit-storage-engine, runtime-unit-inference-core, runtime-archives, antfly]
       optimize:
         type: choice
         default: debug
@@ -243,11 +243,6 @@ jobs:
           BUILD_OPTIMIZE: ${{ inputs.optimize }}
         run: |
           python3 zig/tools/check_pdf_gpu_scene_transport.py --optimize "$BUILD_OPTIMIZE" --report .benchmark-results/compile-costs/pdf-gpu-scene-transport.json
-      - name: Verify architecture provider and consumer cache isolation
-        if: ${{ success() && inputs.step == 'architecture-probe-test' }}
-        run: |
-          python3 zig/tools/check_architecture_probe_cache.py --family index --report .benchmark-results/compile-costs/index-cache.json
-          python3 zig/tools/check_architecture_probe_cache.py --family inference --report .benchmark-results/compile-costs/inference-cache.json
       - name: Verify production query and storage owner cache isolation
         if: ${{ success() && (inputs.step == 'antfly-storage-owner-test' || inputs.step == 'local-query-owner-test') }}
         run: |

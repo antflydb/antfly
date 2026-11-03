@@ -30,7 +30,7 @@ import subprocess
 import sys
 import tempfile
 
-from check_architecture_probe_cache import compile_state, link_children, own
+from cache_overlay import compile_state, link_children, own
 from check_image_owner_cache import construction_sources, run_phase
 
 ZIG = Path(__file__).resolve().parents[1]

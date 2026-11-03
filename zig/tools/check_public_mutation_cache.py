@@ -31,7 +31,7 @@ import subprocess
 import tempfile
 import time
 
-from check_architecture_probe_cache import link_children, own
+from cache_overlay import link_children, own
 
 ZIG = Path(__file__).resolve().parents[1]
 REPO = ZIG.parent

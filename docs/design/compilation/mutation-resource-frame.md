@@ -2,13 +2,12 @@
 
 This is the P5 lifetime inventory and migration design for
 `storage/db/mutation_commit.zig`. It does not accept a compiler optimization.
-The earlier cold merge outlining experiment remains rejected: 137 changed
-lines saved 24,304 archive bytes without a controlled performance result.
+Earlier outlining and diagnostic measurements are summarized in the
+[qualification history](history/production-owners-2026-11-02.md).
 
-The current worker has 67 function-scope cleanup registrations. The source-
-hashed diagnostic inventory in `mutation-resource-audit.json` records their
-positions, 148 function-scope bindings and every lexical fallible/exit site.
-That inventory includes nested sites; it is not a compiler control-flow graph.
+The worker has overlapping request, catalog, locked-state and publication
+lifetimes. Any migration must inventory the current source before changing
+cleanup ownership; a lexical declaration inventory is not a control-flow graph.
 
 ## Lifetime and fence strata
 
@@ -78,42 +77,11 @@ The outer DB error mapping, caller progress marker, replay receipt and exact
 error identity remain authoritative; disposition does not invent a rollback
 or reinterpret an ambiguous store error as a confirmed commit.
 
-A private-overlay negative control disables only the disposition gate. It
-reproduces three observer calls instead of one and swallows the ordered-receipt
-publication error by returning success on the retry. Two tests fail and the
-allocation sweep still passes, confirming these are behavioral regressions
-rather than tests that merely restate the new state machine. Raw nonzero exit
-and diagnostics are retained in `prepared-commit-disposition-negative-debug`.
-
-The focused regression performs real durable `$inc` mutations and returns both
-retry-shaped errors, OOM and cancellation from the committed observer. Each
-must observe the caller's marker, execute once, leave count one and release
-admission so a subsequent write succeeds. Cancellation keeps the existing
-`CommitVisibilityNotSatisfied` outer classification. The allocation-failure sweep additionally checks durable state and released
-admission at each failed preparation allocation. The restart test records the
-original ordered receipt, closes/reopens the DB and replays that entry without
-applying the increment twice. The final Debug qualification passes these three tests plus twelve existing
-row-preparation, admission, allocation and transaction-recovery tests (67/67
-build steps in `prepared-commit-final-debug.log`). This is close/reopen and
-receipt recovery coverage, not a process-kill crash test. Existing production-
-LSM and simulation crash suites remain required for a larger ownership migration.
-
-
-## Diagnostic compiler evidence
-
-Root captured a frozen `7bedd` Debug declaration/pass report in
-`worker-declaration-debug-7bedd.json`. The pinned compiler emitted statistics but
-failed its final archive-link step looking for `antfly-storage-engine_zcu.o`;
-therefore this is diagnostic evidence, not an accepted build or benchmark.
-The worker's declaration reported about 685 ms semantic analysis and 522 ms
-code generation, against module totals of about 74.46 s and 49.04 s. Its
-frontend share is about one percent, despite its large emitted function size.
-
-The LLVM report is module-wide, without per-function attribution. Its pass
-report totals 135.31 s wall time and 91.46 s CPU. Leading wall costs include
-assembly printing (20.28 s), IR translation (17.73 s), debug-value analysis
-(15.12 s), unreachable-block removal (9.32 s) and legalization (8.94 s).
-Those totals do not establish that mutation cleanup dominates LLVM work.
-Consequently this change accepts the independently tested disposition fix and
-records the complete resource-frame design; it does not claim a compiler gain
-or migrate ordinary effect phases without further attribution.
+Regression coverage must perform real durable `$inc` writes and inject
+retry-shaped errors, OOM and cancellation after commit. Each attempt must
+execute once, preserve the caller's progress marker and original error, leave
+the count at one, and release admission for the next write. Check ordered-receipt
+replay across DB close/reopen and preparation allocation failures as well.
+Larger ownership migrations additionally require the existing production-LSM
+and simulation crash suites. Dated passing counts, the failing negative control
+and partial compiler diagnostics are retained in the qualification history.

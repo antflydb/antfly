@@ -35,7 +35,7 @@ import time
 repo = Path(__file__).resolve().parents[2]
 zig = repo / "zig"
 sys.path.insert(0, str(zig / "tools"))
-from check_architecture_probe_cache import link_children, own  # noqa: E402
+from cache_overlay import link_children, own  # noqa: E402
 
 
 def main():

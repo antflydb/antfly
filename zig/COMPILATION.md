@@ -49,14 +49,14 @@ preserves the client object across reader/renderer edits. Routine ownership,
 cancellation, GPU-scene transport and cache checks now default to Debug; use
 `--optimize fast` on the PDF cache/scene tools for final optimized qualification.
 Whole-product size and
-memory qualification remains separate; see the [retained-owner evidence](../docs/design/compilation/history/retained-pdf-owner-2026-11-02.md).
+memory qualification remains separate; see the [retained-owner evidence](../docs/design/compilation/history/production-owners-2026-11-02.md).
 
 ## Image operations and query capabilities
 
 `-Dshared-image-operations=true` routes complete image codec operations and
 retained CPU VP8 sessions through the media owner and enables shared PDF
 sessions. It is opt-in on supported native 64-bit macOS/Linux profiles. The
-[image qualification](../docs/design/compilation/history/image-owner-2026-11-02.md)
+[image qualification](../docs/design/compilation/history/production-owners-2026-11-02.md)
 records source/native equivalence and nine Debug cache phases; combined product
 qualification and final Release size/cost measurements remain separate.
 
@@ -65,20 +65,18 @@ in the storage kernel. The local-query archive dispatches a checked operation
 capability instead of casting a transported private DB layout. This removes one
 private-layout consumer; other engine/lifecycle boundaries remain checked and
 still depend on their private layouts. See the
-[query capability evidence](../docs/design/compilation/history/query-execution-capability-2026-11-02.md).
+[query capability evidence](../docs/design/compilation/history/production-owners-2026-11-02.md).
 
 `-Dshared-lake-execution=true` selects whole lake-index attempts in the serverless
 owner, retaining publication/lease authority in the coordinator. This opt-in
 migration passes combined Debug integration; its production cache qualification
-is recorded in the [lake owner evidence](../docs/design/compilation/history/lake-execution-owner-2026-11-02.md).
+is recorded in the [lake owner evidence](../docs/design/compilation/history/production-owners-2026-11-02.md).
 
-## Compile-cost experiments
+## Compile-cost qualification
 
-The follow-up [operation-owner experiments](../docs/design/compilation/history/operation-owner-probes-2026-11-01.md)
-exercise independent index lifecycle and fused CPU archives, consumer/provider
-cache isolation, a request-only transform plan, shared algebraic validation,
-and additive borrowed document batches. Production archive composition and
-default transports remain unchanged; these results are not a release baseline.
+Standalone index/tensor and Q8 screening experiments were removed after the
+investigation. Accepted decisions, measured limits and pinned detailed evidence
+are in the [qualification summary](../docs/design/compilation/history/production-owners-2026-11-02.md).
 
 The opt-in **Profile Zig compile costs** workflow measures `memory-test`,
 `unit-storage-compile`, or `antfly` on a heavy Linux runner. It retains the exact
@@ -113,7 +111,7 @@ quoting. A cached or very short compilation can have no samples.
 The follow-up implementation shares common/provider/parser test artifacts and
 extracts the full concrete mutation coalescer from DB receivers. Its measured
 scope and verification are recorded in the
-[work reduction record](../docs/design/compilation/history/work-reduction-2026-11-01.md).
+[work reduction record](../docs/design/compilation/history/production-owners-2026-11-02.md).
 
 Inventory the actual compilers reachable from a gate without compiling it:
 
@@ -169,7 +167,7 @@ deployment; no such dependency is introduced by these experiments.
 
 ## Focused plan and caller compilation
 
-The [work-avoidance follow-up](../docs/design/compilation/history/work-avoidance-2026-11-01.md)
+The [work-avoidance follow-up](../docs/design/compilation/history/production-owners-2026-11-02.md)
 adds a separate small build graph, concrete query-window/domain plans and opaque
 compiled query callers. Foreign storage/inference callers use checked caller-only
 transport, so they no longer emit the provider's complete method dispatcher.
@@ -276,7 +274,7 @@ one implementation of each owned subsystem.
 The former combined storage/application layout is retained in repository
 history for comparison; it is no longer a supported build topology.
 
-The [query-owner implementation record](../docs/design/compilation/history/query-owner-redesign-2026-11-01.md)
+The [query-owner implementation record](../docs/design/compilation/history/production-owners-2026-11-02.md)
 describes the completed production split and its verification. The query ABI is
 storage-free; the provider resolves a synchronous native DB borrow only after
 checking its type/layout/compiler descriptor. The storage caller retains its
@@ -890,7 +888,7 @@ still instantiates the disabled backend's destructor; a CLI-only capability
 check still compiles GPU execution when the same runner serves CPU admission. Keep compile-time
 guards at those owners and inspect the emitted production archive. Preserve
 admission-only dry runs before the execution guard. See the
-[production retention investigation](../docs/design/compilation/history/production-retention-2026-11-01.md)
+[production retention investigation](../docs/design/compilation/history/production-owners-2026-11-02.md)
 for the CUDA caller evidence and a rejected mutation outlining experiment.
 
 ### Artifact and duplication budget

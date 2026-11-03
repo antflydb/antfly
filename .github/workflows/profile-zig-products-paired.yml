@@ -25,9 +25,9 @@ on:
         type: string
         default: '[]'
       candidate_args:
-        description: JSON array of additional candidate -Dname=value options
+        description: JSON array of candidate -Dname=value options (empty qualifies production defaults)
         type: string
-        default: '["-Dshared-image-operations=true","-Dshared-lake-execution=true"]'
+        default: '[]'
 
 permissions:
   contents: read

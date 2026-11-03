@@ -30,7 +30,7 @@ import subprocess
 import tempfile
 import time
 
-from check_architecture_probe_cache import link_children, own, compile_state
+from cache_overlay import link_children, own, compile_state
 
 ZIG_ROOT = Path(__file__).resolve().parents[1]
 

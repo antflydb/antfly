@@ -97,6 +97,25 @@ class LiteralSourceOwnership(unittest.TestCase):
                 ):
                     measurement.control_catalog_contents()
 
+    def test_conditional_imports_cannot_retain_a_physical_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            local = root / "pkg/antfly-embedded/src"
+            local.mkdir(parents=True)
+            (local / "source_catalog.zig").write_text(
+                "// header\n" * 16
+                + 'pub const hosted = if (enabled) @import("owner.zig") else struct {};\n'
+                + 'pub const safe = if (enabled) @import("leaf.zig") else struct {};\n'
+            )
+            (local / "owner.zig").write_text(
+                'pub const db = @import("storage/db/db.zig");\n'
+            )
+            (local / "leaf.zig").write_text("")
+            with mock.patch.object(measurement, "ZIG_ROOT", root):
+                rendered = measurement.control_catalog_contents()
+            self.assertNotIn("pub const hosted", rendered)
+            self.assertIn("pub const safe", rendered)
+
     def test_control_catalog_is_current_and_has_no_physical_imports(self):
         local = measurement.ZIG_ROOT / "pkg/antfly-embedded/src"
         catalog = local / "source_catalog_control.zig"
