@@ -2446,8 +2446,12 @@ const PrefixCode = struct {
 
         var lengths = @as([max_vp8l_symbol_count]u8, @splat(0));
         var symbol_index: usize = 0;
-        var previous_nonzero: ?u8 = null;
-        while (symbol_index < max_symbol) {
+        // VP8L max_symbol limits encoded code-length symbols, not expanded
+        // alphabet entries: a single repeat code can fill many entries.
+        // The initial previous length is 8 (lossless bitstream spec 6.2.1).
+        var previous_nonzero: u8 = 8;
+        var codes_read: usize = 0;
+        while (symbol_index < alphabet_size and codes_read < max_symbol) : (codes_read += 1) {
             const code = try code_length_code.readSymbol(reader);
             switch (code) {
                 0...15 => {
@@ -2457,8 +2461,8 @@ const PrefixCode = struct {
                 },
                 16 => {
                     const repeat = 3 + try reader.readBits(2);
-                    const repeated_length = previous_nonzero orelse return error.WebpDecodeFailed;
-                    if (symbol_index + repeat > max_symbol) return error.WebpDecodeFailed;
+                    const repeated_length = previous_nonzero;
+                    if (symbol_index + repeat > alphabet_size) return error.WebpDecodeFailed;
                     for (0..repeat) |_| {
                         lengths[symbol_index] = repeated_length;
                         symbol_index += 1;
@@ -2466,12 +2470,12 @@ const PrefixCode = struct {
                 },
                 17 => {
                     const repeat = 3 + try reader.readBits(3);
-                    if (symbol_index + repeat > max_symbol) return error.WebpDecodeFailed;
+                    if (symbol_index + repeat > alphabet_size) return error.WebpDecodeFailed;
                     symbol_index += repeat;
                 },
                 18 => {
                     const repeat = 11 + try reader.readBits(7);
-                    if (symbol_index + repeat > max_symbol) return error.WebpDecodeFailed;
+                    if (symbol_index + repeat > alphabet_size) return error.WebpDecodeFailed;
                     symbol_index += repeat;
                 },
                 else => return error.WebpDecodeFailed,
@@ -3622,10 +3626,10 @@ fn testWriteNormalPrefixSingleSymbolWithZeroRepeat(writer: *TestBitWriter, alloc
     try writer.writeBits(alloc, 0, 3);
     try writer.writeBits(alloc, 1, 3);
 
-    const max_symbol: u32 = @as(u32, symbol) + 1;
+    // One zero-run symbol plus one literal code length.
     try writer.writeBits(alloc, 1, 1);
-    try writer.writeBits(alloc, 3, 3);
-    try writer.writeBits(alloc, max_symbol - 2, 8);
+    try writer.writeBits(alloc, 0, 3);
+    try writer.writeBits(alloc, 0, 2);
 
     try writer.writeBits(alloc, 1, 1);
     try writer.writeBits(alloc, @as(u32, symbol) - 11, 7);
@@ -5344,6 +5348,23 @@ test "decode vp8l two-symbol simple prefix literal pixels" {
     try std.testing.expectEqualSlices(u8, &second, decoded.rgba[4..8]);
 }
 
+test "decode pillow lossless vp8l with limited repeated code lengths" {
+    const alloc = std.testing.allocator;
+    const fixture = try @import("test_support.zig").readFixtureAlloc(alloc, std.testing.io, "webp/lossless/pillow-normal-prefix-129x97.webp");
+    defer alloc.free(fixture);
+    const decoded = try decodeRgba(alloc, fixture);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(@as(u32, 129), decoded.width);
+    try std.testing.expectEqual(@as(u32, 97), decoded.height);
+    for (0..97) |y| {
+        for (0..129) |x| {
+            const expected = [4]u8{ @intCast((x * 3 + y) % 256), @intCast((x + y * 5) % 256), @intCast((x * 7 + y * 11) % 256), 255 };
+            const offset = (y * 129 + x) * 4;
+            try std.testing.expectEqualSlices(u8, &expected, decoded.rgba[offset..][0..4]);
+        }
+    }
+}
+
 test "decode vp8l normal prefix literal pixel" {
     const alloc = std.testing.allocator;
     const expected = [4]u8{ 0x23, 0x45, 0x67, 0x89 };
@@ -5372,6 +5393,67 @@ test "decode vp8l normal prefix repeat-code lengths" {
     try std.testing.expectEqualSlices(u8, &expected, decoded.rgba);
 }
 
+test "vp8l limited code-length budget counts encoded repeat symbols" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 8, 16 }) |alphabet_size| {
+        var bits = TestBitWriter{};
+        defer bits.deinit(alloc);
+        try bits.writeBits(alloc, 0, 1); // Normal code lengths.
+        try bits.writeBits(alloc, 0, 4); // Four code-length alphabet entries.
+        for ([_]u32{ 1, 0, 0, 1 }) |length| try bits.writeBits(alloc, length, 3); // Symbols 17 and 1.
+        try bits.writeBits(alloc, 1, 1); // Explicit encoded-symbol budget.
+        try bits.writeBits(alloc, 0, 3); // Two budget bits.
+        try bits.writeBits(alloc, 1, 2); // Three encoded symbols.
+        try bits.writeBits(alloc, 0, 1); // Length 1.
+        try bits.writeBits(alloc, 0, 1); // Length 1.
+        try bits.writeBits(alloc, 1, 1); // Repeat zero lengths.
+        try bits.writeBits(alloc, 3, 3); // Six zeros: eight expanded entries.
+        try bits.writeBits(alloc, 1, 1); // Following payload symbol; must not be consumed by the header.
+        var reader = BitReader.init(bits.bytes.items);
+        const code = try PrefixCode.read(&reader, alphabet_size);
+        try std.testing.expectEqual(@as(usize, 2), code.entry_count);
+        try std.testing.expectEqual(@as(u16, 1), try code.readSymbol(&reader));
+    }
+}
+
+test "vp8l repeat code before a literal uses default length eight" {
+    const alloc = std.testing.allocator;
+    var bits = TestBitWriter{};
+    defer bits.deinit(alloc);
+    try bits.writeBits(alloc, 0, 1);
+    try bits.writeBits(alloc, 5, 4); // Nine entries include repeat symbol 16.
+    for (0..8) |_| try bits.writeBits(alloc, 0, 3);
+    try bits.writeBits(alloc, 1, 3); // Singleton code-length tree for symbol 16.
+    try bits.writeBits(alloc, 1, 1);
+    try bits.writeBits(alloc, 2, 3); // Six budget bits.
+    try bits.writeBits(alloc, 41, 6); // 43 encoded repeats.
+    for (0..42) |_| try bits.writeBits(alloc, 3, 2); // 252 entries of length 8.
+    try bits.writeBits(alloc, 1, 2); // Four more entries.
+    try bits.writeBits(alloc, 0x5a, 8);
+    var reader = BitReader.init(bits.bytes.items);
+    const code = try PrefixCode.read(&reader, 256);
+    try std.testing.expectEqual(@as(usize, 256), code.entry_count);
+    try std.testing.expectEqual(@as(u16, 0x5a), try code.readSymbol(&reader));
+}
+
+test "vp8l encoded-symbol budget still rejects alphabet overflow" {
+    const alloc = std.testing.allocator;
+    var bits = TestBitWriter{};
+    defer bits.deinit(alloc);
+    try bits.writeBits(alloc, 0, 1);
+    try bits.writeBits(alloc, 0, 4);
+    for ([_]u32{ 1, 0, 0, 1 }) |length| try bits.writeBits(alloc, length, 3);
+    try bits.writeBits(alloc, 1, 1);
+    try bits.writeBits(alloc, 0, 3);
+    try bits.writeBits(alloc, 1, 2);
+    try bits.writeBits(alloc, 0, 1);
+    try bits.writeBits(alloc, 0, 1);
+    try bits.writeBits(alloc, 1, 1);
+    try bits.writeBits(alloc, 4, 3); // Seven zeros plus two literals exceeds alphabet 8.
+    var reader = BitReader.init(bits.bytes.items);
+    try std.testing.expectError(error.WebpDecodeFailed, PrefixCode.read(&reader, 8));
+}
+
 test "decode vp8l rejects duplicate simple prefix symbols" {
     const alloc = std.testing.allocator;
     var bits = TestBitWriter{};
@@ -5383,7 +5465,7 @@ test "decode vp8l rejects duplicate simple prefix symbols" {
     try std.testing.expectError(error.WebpDecodeFailed, PrefixCode.read(&reader, 256));
 }
 
-test "decode vp8l rejects repeat-code length before previous nonzero length" {
+test "decode vp8l initial repeat-code lengths follow the default length" {
     const alloc = std.testing.allocator;
     var bits = TestBitWriter{};
     defer bits.deinit(alloc);
@@ -5397,7 +5479,8 @@ test "decode vp8l rejects repeat-code length before previous nonzero length" {
     try bits.writeBits(alloc, 1, 2);
 
     var reader = BitReader.init(bits.bytes.items);
-    try std.testing.expectError(error.WebpDecodeFailed, PrefixCode.read(&reader, 256));
+    const code = try PrefixCode.read(&reader, 256);
+    try std.testing.expectEqual(@as(usize, 256), code.entry_count);
 }
 
 test "decode vp8l lz77 backward reference copies previous pixel" {

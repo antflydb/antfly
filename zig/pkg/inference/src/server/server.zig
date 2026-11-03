@@ -38356,7 +38356,31 @@ test "EmbeddingGemma2 grouped image parse failures keep permanent image errors" 
     try std.testing.expect(groupedEmbeddingInputFailure(error.InvalidEmbeddingGroup) == null);
 }
 
+test "EmbeddingGemma2 dense execution aborts preserve lifetime responses" {
+    const allocator = std.testing.allocator;
+    for ([_]anyerror{ error.Timeout, error.Canceled, error.Cancelled }) |cause| {
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/embed");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try embedDenseInputFailureResponse(&ctx, cause);
+        defer response.deinit();
+        var body = try std.json.parseFromSlice(std.json.Value, allocator, response.body.?, .{});
+        defer body.deinit();
+        const timeout = cause == error.Timeout;
+        try std.testing.expectEqual(@as(u16, if (timeout) 504 else 408), response.status.code);
+        try std.testing.expectEqualStrings(if (timeout) "INFERENCE_TIMEOUT" else "INFERENCE_CANCELLED", body.value.object.get("error").?.string);
+        try std.testing.expectEqual(timeout, body.value.object.get("retryable").?.bool);
+    }
+}
+
 fn embedDenseInputFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    // Execution can expire after model acquisition (including the native
+    // broker path). Preserve request lifetime semantics at this boundary too.
+    switch (err) {
+        error.Timeout, error.Canceled, error.Cancelled => return inferenceFailureResponse(ctx, err),
+        else => {},
+    }
     if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     if (isTransientInferenceCapacityError(err)) {
         return modelResourceBusyResponse(ctx);
