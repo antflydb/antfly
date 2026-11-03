@@ -764,6 +764,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL command producer native advisory contention avoids journal churn and hard deadlocks retain earlier grants",
         "SQL command producer native advisory complete overload matrix retains scopes through uncertain delivery",
         "SQL command producer native transaction savepoint projection retains monotone identities across cold rollback and release",
+        "SQL command producer native savepoint publication atomically rewinds SQL and reparents locks through cold lost control replies",
+        "SQL command producer native shared SQL savepoint adapter drains exact control without replaying SQL",
         "durable SQL session rejects duplicate savepoint ids without double freeing overlays",
         "distributed txn session preserves numeric tokens across staging savepoints and durable recovery",
     }) |required| sql_command_producer_audit.addArgs(&.{ "--filter", required });

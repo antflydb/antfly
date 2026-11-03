@@ -1279,3 +1279,294 @@ test "SQL command producer native transaction savepoint projection retains monot
         try std.testing.expectEqual(want, state.current_subtransaction);
     }
 }
+
+const OwnedSavepointPlan = struct {
+    owned: std.json.Parsed(producer.Record),
+    value: producer.SavepointPlan,
+    fn deinit(self: *@This()) void {
+        self.owned.deinit();
+    }
+};
+fn savepointPlan(native: *Native, source: *transactions.DurableSessionStore, txn: [16]u8) !OwnedSavepointPlan {
+    var owned = (try producer.load(source, a, connection)).?;
+    errdefer owned.deinit();
+    return .{ .value = try producer.observeSavepointPlan(a, owned.value, instance, txn, 2, native.nonce(), native.port()), .owned = owned };
+}
+fn attachedTransaction(native: *Native, source: *transactions.DurableSessionStore, registry: *transactions.SessionRegistry, fence: authority.scopes.CommandFence) ![16]u8 {
+    const node: u64 = if (native.standalone) 0 else 9;
+    var live = try connections.load(source, a, connection, "alice", node, 2);
+    defer live.deinit();
+    const txn = id(60);
+    _ = try connections.mutateWithCommand(source, .{ .begin = .{ .id = connection, .expected_revision = live.value.revision, .txn_id = txn } }, "alice", node, 2, &fence);
+    _ = try registry.beginForPrincipalWithSettingsAndId(a, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, node, "alice", &.{}, connection, txn);
+    _ = try connections.mutateWithCommand(source, .{ .bind = .{ .id = connection, .txn_id = txn } }, "alice", node, 2, &fence);
+    return txn;
+}
+fn stageSavepointRow(registry: *transactions.SessionRegistry, txn: [16]u8, key: []const u8) !void {
+    const body = try std.fmt.allocPrint(a, "{{\"table\":\"items\",\"key\":\"{s}\",\"document\":{{\"v\":1}}}}", .{key});
+    defer a.free(body);
+    var parsed = try transactions.parseStageWriteRequest(a, body);
+    defer parsed.deinit(a);
+    _ = (try registry.stage(a, txn, &parsed)).?;
+}
+fn savepointRows(registry: *transactions.SessionRegistry, txn: [16]u8) !usize {
+    const durable = registry.durable orelse return error.MissingDurableSessionStore;
+    var persisted = (try durable.load(txn)).?;
+    defer persisted.deinit(durable.alloc);
+    const pending = persisted.staged orelse return 0;
+    return if (pending.tables.len == 0) 0 else pending.tables[0].batch.writes.len;
+}
+fn coldSavepointControl(metadata: *storage.RaftApplyStore, source: *transactions.DurableSessionStore, registry: *transactions.SessionRegistry, native: *Native, path: []const u8, finishing: bool) !void {
+    for (0..128) |_| {
+        var current = (try producer.load(source, a, connection)).?;
+        const done = current.value.savepoint_control == null and current.value.phase == (if (finishing) producer.Phase.idle else producer.Phase.executing);
+        current.deinit();
+        if (done) return;
+        native.step(source, instance, 2) catch |err| switch (err) {
+            error.MetadataMutationOutcomeUnknown => {},
+            else => return err,
+        };
+        registry.deinit(a);
+        metadata.deinit();
+        metadata.* = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        source.* = transactions.DurableSessionStore.init(a, &metadata.store);
+        registry.* = transactions.SessionRegistry.init(source);
+    }
+    return error.SavepointControlDidNotConverge;
+}
+
+test "SQL command producer native savepoint publication atomically rewinds SQL and reparents locks through cold lost control replies" {
+    const advisory = @import("sql_advisory_execution.zig");
+    const Datum = local.sql_scalar.Datum;
+    const CutFixture = struct {
+        closed: usize = 0,
+        fn open(_: *anyopaque, _: A, _: local.api_table_read_source.RelationalStatementScan) !local.api_table_read_source.RelationalReadView {
+            return error.UnexpectedSnapshotRecapture;
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.closed += 1;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/savepoint-handoff-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var registry = transactions.SessionRegistry.init(&source);
+        defer registry.deinit(a);
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated };
+        try setup(&metadata, &source, standalone, &native);
+        try native.until(&source, .idle, 2);
+        var ticket = try begin(&native, &source, 20);
+        var fence = try execute(&source, ticket);
+        const txn = try attachedTransaction(&native, &source, &registry, fence);
+        var cut_fixture: CutFixture = .{};
+        const retained = try @import("sql_retained_snapshot.zig").Shared.create(a, .{ .ptr = &cut_fixture, .vtable = &.{ .open = CutFixture.open, .close = CutFixture.close } }, &registry.snapshot_retirement);
+        {
+            defer retained.release();
+            try registry.installNativeSqlCut(a, txn, retained);
+        }
+        try stageSavepointRow(&registry, txn, "root");
+        var root = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_xact_lock, &.{Datum.json(.{ .integer = 0 })}, .{ .id = txn, .subtransaction = 0 }, native.nonce());
+        _ = try finishMachine(&native, &root);
+        for (1..3) |ordinal| {
+            var plan = try savepointPlan(&native, &source, txn);
+            defer plan.deinit();
+            const point = (try registry.changeSqlSavepoint(a, txn, if (ordinal == 1) "outer" else "inner", .create, plan.value)).?;
+            try std.testing.expectEqual(@as(u64, @intCast(ordinal)), point.savepoint_id);
+            var lock = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_xact_lock, &.{Datum.json(.{ .integer = @intCast(ordinal) })}, .{ .id = txn, .subtransaction = point.savepoint_id }, native.nonce());
+            _ = try finishMachine(&native, &lock);
+            try stageSavepointRow(&registry, txn, if (ordinal == 1) "outer" else "inner");
+        }
+        var session_lock = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_lock, &.{Datum.json(.{ .integer = 3 })}, null, native.nonce());
+        _ = try finishMachine(&native, &session_lock);
+        try registry.setSqlFailed(a, txn, true);
+        // Both sides of the local publication abort together. Neither an SQL
+        // rewind without an intent nor an intent without its rewind escapes.
+        for ([_]@FieldType(transactions.DurableSessionStore, "fail_savepoint_publication_for_test"){ .session, .source }) |failure| {
+            var plan = try savepointPlan(&native, &source, txn);
+            defer plan.deinit();
+            source.fail_savepoint_publication_for_test = failure;
+            try std.testing.expectError(error.InjectedSessionStoreFailure, registry.changeSqlSavepoint(a, txn, "outer", .rollback, plan.value));
+            source.fail_savepoint_publication_for_test = null;
+            var state = (try registry.getSqlState(a, txn)).?;
+            defer state.deinit(a);
+            try std.testing.expect(state.metadata.failed);
+            try std.testing.expectEqual(@as(u64, 2), state.current_subtransaction);
+            try std.testing.expectEqual(@as(usize, 2), state.savepoints);
+            try std.testing.expectEqual(@as(usize, 3), try savepointRows(&registry, txn));
+            var unchanged = (try producer.load(&source, a, connection)).?;
+            defer unchanged.deinit();
+            try std.testing.expect(unchanged.value.savepoint_control == null and unchanged.value.pending == null);
+            try std.testing.expectError(error.SqlTransactionAborted, registry.nativeSqlCut(a, txn));
+            // This is an ownership assertion on the live test facade, not a
+            // request to execute a read on the intentionally failed session.
+            try std.testing.expect(registry.sessions.get(txn).?.native_sql_cut.? == retained);
+            try std.testing.expectEqual(@as(usize, 0), cut_fixture.closed);
+        }
+        try registry.setSqlFailed(a, txn, false);
+        {
+            var plan = try savepointPlan(&native, &source, txn);
+            defer plan.deinit();
+            _ = (try registry.changeSqlSavepoint(a, txn, "inner", .release, plan.value)).?;
+            try std.testing.expectError(error.SqlConnectionChanged, registry.changeSqlSavepoint(a, txn, "outer", .rollback, plan.value));
+        }
+        // SQL release is durable before native reparenting begins. No public
+        // legacy path may mutate savepoints through this in-flight owner.
+        try std.testing.expectError(error.SqlConnectionBusy, registry.createNamedSavepoint(a, txn, "bypass"));
+        try std.testing.expectError(error.SqlConnectionBusy, registry.rollbackToNamedSavepoint(a, txn, "outer"));
+        try std.testing.expectError(error.SqlConnectionBusy, registry.releaseNamedSavepoint(a, txn, "outer"));
+        {
+            const pinned = try registry.nativeSqlCut(a, txn);
+            defer if (pinned.cut) |cut| cut.release();
+            try std.testing.expect(pinned.locked and pinned.cut.? == retained);
+        }
+        const finishing = replicated;
+        {
+            var current = (try producer.load(&source, a, connection)).?;
+            defer current.deinit();
+            try producer.renew(&source, "alice", current.value, instance, 2000, try native.head(), native.nonce(), 2);
+            // A pending renewal must never admit another SQL effect while
+            // committed savepoint control is still outstanding.
+            try std.testing.expectError(error.SqlConnectionBusy, advisoryFrame(&source, fence).requireExecuting(a, 2));
+        }
+        if (finishing) try finishBody(&native, &source, ticket);
+        native.before = !finishing;
+        native.after = finishing;
+        try coldSavepointControl(&metadata, &source, &registry, &native, path, finishing);
+        try std.testing.expectEqual(@as(usize, 1), cut_fixture.closed);
+        {
+            const cold = try registry.nativeSqlCut(a, txn);
+            try std.testing.expect(cold.locked and cold.cut == null);
+        }
+        {
+            var renewed = (try producer.load(&source, a, connection)).?;
+            defer renewed.deinit();
+            try std.testing.expectEqual(@as(u64, 2000), renewed.value.registration.lease.expires_at_ms);
+        }
+        try std.testing.expectEqual(@as(usize, 3), try savepointRows(&registry, txn));
+        if (finishing) {
+            ticket = try begin(&native, &source, 40);
+            fence = try execute(&source, ticket);
+        }
+        try registry.setSqlFailed(a, txn, true);
+        {
+            var plan = try savepointPlan(&native, &source, txn);
+            defer plan.deinit();
+            _ = (try registry.changeSqlSavepoint(a, txn, "outer", .rollback, plan.value)).?;
+        }
+        // Before any native cleanup, the actual persisted SQL state is already
+        // rewound, while every old native grant is still held conservatively.
+        {
+            var cut = try nativeCut(&native, fence.backend, null);
+            defer cut.deinit();
+            try std.testing.expectEqual(@as(u32, 3), cut.value.owner.?.transaction_resources);
+            var state = (try registry.getSqlState(a, txn)).?;
+            defer state.deinit(a);
+            try std.testing.expect(!state.metadata.failed);
+            try std.testing.expectEqual(@as(u64, 1), state.current_subtransaction);
+            try std.testing.expectEqual(@as(usize, 1), try savepointRows(&registry, txn));
+        }
+        native.after = true;
+        try finishBody(&native, &source, ticket);
+        try coldSavepointControl(&metadata, &source, &registry, &native, path, true);
+        try std.testing.expectEqual(@as(usize, 1), try savepointRows(&registry, txn));
+        var cut = try nativeCut(&native, fence.backend, null);
+        defer cut.deinit();
+        // RELEASE reparented inner grants to outer. ROLLBACK TO outer removes
+        // both sets, preserves root grants and preserves the session lock.
+        try std.testing.expectEqual(@as(u32, 1), cut.value.owner.?.transaction_resources);
+        try std.testing.expectEqual(@as(u32, 2), cut.value.owner.?.resources);
+        try std.testing.expect(cut.value.owner.?.job == null and cut.value.owner.?.waiting == null);
+        try std.testing.expect(std.meta.eql(cut.value.scope.?.transaction.?.id, txn));
+    };
+}
+
+test "SQL command producer native shared SQL savepoint adapter drains exact control without replaying SQL" {
+    const Coordinator = @import("sql_session.zig").Coordinator;
+    const Adapter = @import("sql_session.zig").Adapter;
+    const advisory = @import("sql_advisory_execution.zig");
+    const Datum = local.sql_scalar.Datum;
+    const Forward = struct {
+        native: *Native,
+        source: *transactions.DurableSessionStore,
+        raced: bool = false,
+        fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedStatusRead;
+        }
+        fn catalog(raw: *anyopaque, alloc: A, _: local.api_operation.RequestContext, input: Call) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = try Native.call(self.native, alloc, input);
+            errdefer alloc.free(bytes);
+            if (!self.raced and input == .sql_lock_mutate and input.sql_lock_mutate.operation == .effect and
+                input.sql_lock_mutate.operation.effect.effect.action == .control and input.sql_lock_mutate.operation.effect.effect.action.control == .release_savepoint)
+            {
+                // A real worker wins the local source CAS after this caller's
+                // native publication but before its source acknowledgement.
+                self.raced = true;
+                var current = (try producer.load(self.source, alloc, connection)).?;
+                defer current.deinit();
+                try producer.advance(self.source, alloc, "alice", current.value, instance, 2, self.native.nonce(), self.native.port());
+            }
+            return bytes;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/savepoint-adapter-{any}", .{ tmp.sub_path, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated, .standalone = true, .expiry_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 10000, .database = "default" };
+        try setup(&metadata, &source, true, &native);
+        try native.until(&source, .idle, 2);
+        const ticket = try begin(&native, &source, 60);
+        const fence = try execute(&source, ticket);
+        var runtime = try local.storage_db_selected_root.db.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+        defer runtime.deinit();
+        var forward: Forward = .{ .native = &native, .source = &source };
+        var server = @import("http_server.zig").ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .session_store = &source, .session_maintenance_local_only = true, .deployment_mode = .standalone }, .{ .ptr = &forward, .vtable = &.{ .status = Forward.status, .system_catalog = Forward.catalog } }, null, null);
+        defer server.deinit();
+        server.sql_connection_admission.instance = instance;
+        var user: ?@import("http_server.zig").AuthenticatedIdentity = null;
+        var coordinator: Coordinator = .{ .server = &server, .identity = &user, .context = .{ .sql_command_fence = &fence } };
+        var adapter: Adapter = .{ .alloc = a, .registry = &server.txn_sessions, .node_id = 0, .commit_context = &coordinator, .commit_fn = Coordinator.commit, .rollback_fn = Coordinator.rollback, .savepoint_fn = Coordinator.savepoint, .connection_id = connection, .connection_revision = 1, .command_fence = &fence };
+        const scope: local.sql_session.Scope = .{ .principal = "alice", .database = "default", .namespace = "public" };
+        const txn = (try adapter.owner().vtable.begin(&adapter, scope, .{ .isolation = .read_committed })).id;
+        try adapter.owner().vtable.savepoint(&adapter, scope, txn, "outer");
+        for (1..3) |ordinal| {
+            if (ordinal == 2) try adapter.owner().vtable.savepoint(&adapter, scope, txn, "inner");
+            var lock = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_xact_lock, &.{Datum.json(.{ .integer = @intCast(ordinal) })}, .{ .id = txn, .subtransaction = @intCast(ordinal) }, native.nonce());
+            _ = try finishMachine(&native, &lock);
+        }
+        native.after = true;
+        try adapter.owner().vtable.release(&adapter, scope, txn, "inner");
+        try std.testing.expect(forward.raced);
+        {
+            var renewed = (try producer.load(&source, a, connection)).?;
+            defer renewed.deinit();
+            try std.testing.expect(renewed.value.registration.lease.expires_at_ms > native.expiry_ms);
+        }
+        native.before = true;
+        try adapter.owner().vtable.rollback_to(&adapter, scope, txn, "outer");
+        const before_missing = native.calls;
+        try std.testing.expectError(error.SqlSavepointNotFound, adapter.owner().vtable.release(&adapter, scope, txn, "inner"));
+        try std.testing.expectEqual(before_missing, native.calls);
+        var state = (try server.txn_sessions.getSqlState(a, txn)).?;
+        defer state.deinit(a);
+        try std.testing.expectEqual(@as(u64, 1), state.current_subtransaction);
+        try std.testing.expectEqual(@as(usize, 1), state.savepoints);
+        var cut = try nativeCut(&native, fence.backend, null);
+        defer cut.deinit();
+        try std.testing.expectEqual(@as(u32, 0), cut.value.owner.?.transaction_resources);
+        try std.testing.expect(cut.value.owner.?.job == null);
+        try finishBody(&native, &source, ticket);
+        try native.until(&source, .idle, 2);
+    }
+}

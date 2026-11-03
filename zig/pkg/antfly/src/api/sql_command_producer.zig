@@ -23,6 +23,9 @@ const connections = @import("sql_connection_record.zig");
 const transactions = @import("transactions.zig");
 const Call = @import("../system_catalog/server_call.zig").Call;
 const A = std.mem.Allocator;
+const native_group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+pub const execution_lease_ms: u64 = 60000;
+pub const renew_before_ms: u64 = execution_lease_ms / 3;
 pub const Id = [16]u8;
 const prefix = "\x00sql-command-producer-v1/";
 const work_prefix = "\x00sql-command-producer-work-v1/";
@@ -48,11 +51,13 @@ pub const Record = struct {
     next_command: u64 = 1,
     ticket: ?Ticket = null,
     pending: ?authority.Request = null,
+    /// SQL savepoint metadata is already durable. Resume native control only.
+    savepoint_control: ?authority.scopes.ledger.Effect = null,
     recovery: bool = false,
     failure: ?authority.outcomes.Rejection = null,
 
     pub fn validate(self: Record, a: A) !void {
-        try self.registration.validate(.{ .home = .metadata, .group = 1, .incarnation = self.registration.lease.backend.incarnation });
+        try self.registration.validate(.{ .home = .metadata, .group = native_group, .incarnation = self.registration.lease.backend.incarnation });
         try self.actor.validate();
         if (self.revision == 0 or self.next_command == 0 or zero(self.instance) or self.principal.len > 4096 or !std.unicode.utf8ValidateSlice(self.principal) or
             !std.mem.eql(u8, &self.registration.lease.principal, &try authority.principalDigest(a, self.actor.session_user))) return error.InvalidSqlConnection;
@@ -64,6 +69,16 @@ pub const Record = struct {
             .registering, .idle, .retired => if (self.ticket != null) return error.InvalidSqlConnection,
             .beginning, .ready, .executing, .finishing => if (self.ticket == null) return error.InvalidSqlConnection,
             .fencing, .closing => {},
+        }
+        if (self.savepoint_control) |effect| {
+            try effect.validate();
+            if (!effect.backend.eql(self.registration.lease.backend) or self.ticket == null or self.pending == null or
+                (self.phase != .executing and self.phase != .finishing) or effect.action != .control) return error.InvalidSqlConnection;
+            switch (effect.action.control) {
+                .rollback => |value| if (value.first_aborted == 0) return error.InvalidSqlConnection,
+                .release_savepoint => {},
+                else => return error.InvalidSqlConnection,
+            }
         }
         if (self.failure != null and !self.recovery) return error.InvalidSqlConnection;
         if (self.phase == .retired and (!self.recovery or self.pending != null)) return error.InvalidSqlConnection;
@@ -79,9 +94,13 @@ pub const Record = struct {
                 .register => |registration| if (self.phase != .registering or !std.meta.eql(registration, self.registration)) return error.InvalidSqlConnection,
                 .begin => |command| if (self.phase != .beginning or !std.meta.eql(command, self.ticket.?.command)) return error.InvalidSqlConnection,
                 .finish => |command| if (self.phase != .finishing or !std.meta.eql(command, self.ticket.?.command)) return error.InvalidSqlConnection,
-                .cancel, .step => |input| if (self.phase != .finishing or !std.meta.eql(input.command, self.ticket.?.command)) return error.InvalidSqlConnection,
+                .effect => |input| if (self.savepoint_control == null or !std.meta.eql(input.effect, self.savepoint_control.?) or !std.meta.eql(input.command, self.ticket.?.command)) return error.InvalidSqlConnection,
+                .cancel, .step => |input| {
+                    if (!std.meta.eql(input.command, self.ticket.?.command)) return error.InvalidSqlConnection;
+                    if (self.phase != .finishing and (self.phase != .executing or self.savepoint_control == null or !std.meta.eql(input.effect, self.savepoint_control.?))) return error.InvalidSqlConnection;
+                },
                 .fence => if (self.phase != .fencing) return error.InvalidSqlConnection,
-                .renew => |renewal| if ((self.phase != .idle and self.phase != .ready and self.phase != .executing) or renewal.expected_expiry != self.registration.lease.expires_at_ms or renewal.expires_at_ms <= renewal.expected_expiry) return error.InvalidSqlConnection,
+                .renew => |renewal| if ((self.phase != .idle and self.phase != .ready and self.phase != .executing and !(self.phase == .finishing and self.savepoint_control != null)) or renewal.expected_expiry != self.registration.lease.expires_at_ms or renewal.expires_at_ms <= renewal.expected_expiry) return error.InvalidSqlConnection,
                 .release => if (self.phase != .closing) return error.InvalidSqlConnection,
                 .close_step => if (self.phase != .closing) return error.InvalidSqlConnection,
                 else => return error.InvalidSqlConnection,
@@ -107,6 +126,62 @@ fn key(comptime start: []const u8, id: [32]u8) [start.len + 32]u8 {
     @memcpy(result[start.len..], &id);
     return result;
 }
+/// Read-only native observation captured by the executing savepoint owner.
+/// Only the existing source writer can publish it with SQL session metadata.
+pub const SavepointPlan = struct {
+    prior: Record,
+    head: u64,
+    next_effect: u64,
+    nonce: Id,
+    now_ms: u64,
+    transaction: ?Id,
+};
+pub fn observeSavepointPlan(a: A, prior: Record, instance: Id, transaction: Id, now_ms: u64, nonce: Id, port: Port) !SavepointPlan {
+    try prior.validate(a);
+    if (prior.phase != .executing or prior.pending != null or prior.recovery or prior.savepoint_control != null or
+        prior.registration.lease.expires_at_ms <= now_ms or !std.mem.eql(u8, &prior.instance, &instance)) return error.SqlConnectionBusy;
+    var observed = try port.snapshot(a, prior);
+    defer observed.deinit();
+    const scope = observed.value.scope orelse return error.SqlConnectionNotFound;
+    const owner = observed.value.owner orelse return error.InvalidSqlBackendResponse;
+    if (scope.state != .active or scope.releasing or scope.registration.lease.expires_at_ms <= now_ms or
+        !std.meta.eql(scope.command, @as(?authority.scopes.Command, prior.ticket.?.command)) or owner.state != .active or owner.waiting != null or owner.job != null) return error.SqlConnectionBusy;
+    if (scope.transaction) |bound| if (bound.decision != null or !std.mem.eql(u8, &bound.id, &transaction)) return error.InvalidLockScope;
+    return .{ .prior = prior, .head = observed.value.head, .next_effect = owner.next_effect, .nonce = nonce, .now_ms = now_ms, .transaction = if (scope.transaction) |bound| bound.id else null };
+}
+
+pub fn stageSavepointTxn(a: A, txn: anytype, plan: SavepointPlan, connection: [32]u8, transaction: Id, control: ?authority.scopes.ledger.Control) !void {
+    try plan.prior.validate(a);
+    const prior = plan.prior;
+    if (prior.phase != .executing or prior.pending != null or prior.recovery or prior.savepoint_control != null or
+        !std.mem.eql(u8, &prior.registration.connection, &connection) or prior.registration.lease.expires_at_ms <= plan.now_ms or zero(plan.nonce)) return error.SqlConnectionBusy;
+    if (plan.transaction) |bound| if (!std.mem.eql(u8, &bound, &transaction)) return error.InvalidLockScope;
+    var live = (try readTxn(a, txn, connection)) orelse return error.SqlConnectionNotFound;
+    defer live.deinit();
+    if (live.value.revision != prior.revision or !std.mem.eql(u8, &try digest(a, live.value), &try digest(a, prior))) return error.SqlConnectionChanged;
+    var attached = try connections.loadTxn(txn, a, &connection);
+    defer attached.deinit();
+    try attached.value.requireOwner(&connection, prior.principal, prior.registration.lease.node, 0);
+    if (attached.value.state != .active or !std.meta.eql(attached.value.active_txn, @as(?Id, transaction))) return error.SqlTransactionNotActive;
+    if (control) |action| {
+        switch (action) {
+            .rollback => |value| if (value.first_aborted == 0 or !std.mem.eql(u8, &value.transaction, &transaction)) return error.InvalidLockScope,
+            .release_savepoint => |value| if (!std.mem.eql(u8, &value.transaction, &transaction)) return error.InvalidLockScope,
+            else => return error.InvalidLockScope,
+        }
+        // A scope without a transaction binding has no transaction grants.
+        // The local SQL publication still requires the exact source CAS above.
+        if (plan.transaction == null) return;
+        const effect: authority.scopes.ledger.Effect = .{ .backend = prior.registration.lease.backend, .sequence = plan.next_effect, .nonce = plan.nonce, .action = .{ .control = action } };
+        try effect.validate();
+        var next = prior;
+        next.savepoint_control = effect;
+        next.pending = next.controlRequest(plan.head, plan.nonce, .{ .effect = .{ .command = prior.ticket.?.command, .effect = effect } });
+        next.revision = std.math.add(u64, prior.revision, 1) catch return error.SqlProgramLimitExceeded;
+        try putTxn(a, txn, next);
+    }
+}
+
 pub fn readTxn(a: A, txn: anytype, id: [32]u8) !?std.json.Parsed(Record) {
     const raw = txn.get(&key(prefix, id)) catch |err| switch (err) {
         error.NotFound => return null,
@@ -164,7 +239,7 @@ pub fn requireCommandTxn(a: A, txn: anytype, id: [32]u8, fence: ?*const authorit
     defer owned.deinit();
     const value = owned.value;
     if (value.phase == .retired) return error.SqlConnectionNotFound;
-    if (value.phase != .executing or value.recovery or value.registration.lease.expires_at_ms <= now_ms) return error.SqlConnectionBusy;
+    if (value.phase != .executing or value.recovery or value.savepoint_control != null or value.registration.lease.expires_at_ms <= now_ms) return error.SqlConnectionBusy;
     const supplied = (fence orelse return error.SqlConnectionBusy).*;
     try supplied.validate();
     if (!std.meta.eql(value.fence(), supplied)) return error.SqlConnectionBusy;
@@ -383,15 +458,19 @@ pub fn take(store: *transactions.DurableSessionStore, principal: []const u8, pri
 }
 pub fn finish(store: *transactions.DurableSessionStore, principal: []const u8, prior: Record, instance: Id, ticket: Ticket, head: u64, nonce: Id) !void {
     try prior.validate(store.alloc);
-    if (!std.mem.eql(u8, &instance, &ticket.instance) or prior.pending != null or prior.phase != .executing or prior.recovery or !std.meta.eql(prior.ticket, @as(?Ticket, ticket))) return error.SqlConnectionBusy;
+    if (!std.mem.eql(u8, &instance, &ticket.instance) or (prior.pending != null and prior.savepoint_control == null) or prior.phase != .executing or prior.recovery or !std.meta.eql(prior.ticket, @as(?Ticket, ticket))) return error.SqlConnectionBusy;
     var next = prior;
     next.phase = .finishing;
-    next.pending = next.controlRequest(head, nonce, .{ .finish = ticket.command });
+    // A renewal may already have escaped. Preserve its exact expiry proof
+    // across cancellation; the worker drains it before the saved control.
+    next.pending = if (prior.pending != null and prior.pending.?.operation == .renew) prior.pending else next.controlRequest(head, nonce, .{ .finish = ticket.command });
     try replace(store, principal, prior, next);
 }
 pub fn renew(store: *transactions.DurableSessionStore, principal: []const u8, prior: Record, instance: Id, expires_at_ms: u64, head: u64, nonce: Id, now_ms: u64) !void {
     try prior.validate(store.alloc);
-    if (prior.pending != null or prior.recovery or (prior.phase != .idle and prior.phase != .ready and prior.phase != .executing) or
+    // Replacing a control admission never replaces its immutable effect.
+    // Its native receipt/job remains the authority after renewal completes.
+    if ((prior.pending != null and (prior.savepoint_control == null or (prior.pending.?.operation != .effect and prior.pending.?.operation != .step))) or prior.recovery or (prior.phase != .idle and prior.phase != .ready and prior.phase != .executing) or
         !std.mem.eql(u8, &prior.instance, &instance) or now_ms >= prior.registration.lease.expires_at_ms or expires_at_ms <= prior.registration.lease.expires_at_ms) return error.SqlConnectionBusy;
     var next = prior;
     next.pending = next.controlRequest(head, nonce, .{ .renew = .{ .expected_expiry = prior.registration.lease.expires_at_ms, .expires_at_ms = expires_at_ms, .observed_at_ms = now_ms } });
@@ -416,14 +495,14 @@ pub const Port = struct {
     ptr: *anyopaque,
     call: *const fn (*anyopaque, A, Call) anyerror![]u8,
     fn snapshot(self: Port, a: A, value: Record) !std.json.Parsed(authority.Snapshot) {
-        const bytes = try self.call(self.ptr, a, .{ .sql_lock_read = .{ .incarnation = value.registration.lease.backend.incarnation, .standalone = value.registration.standalone, .actor = value.actor, .database = value.registration.lease.database, .backend = value.registration.lease.backend } });
+        const bytes = try self.call(self.ptr, a, .{ .sql_lock_read = .{ .incarnation = value.registration.lease.backend.incarnation, .standalone = value.registration.standalone, .actor = value.actor, .database = value.registration.lease.database, .backend = value.registration.lease.backend, .effect = value.savepoint_control } });
         defer a.free(bytes);
         if (bytes.len > max_bytes) return error.InvalidSqlBackendResponse;
         var parsed = try std.json.parseFromSlice(authority.Snapshot, a, bytes, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
         if (!std.mem.eql(u8, &parsed.value.incarnation, &value.registration.lease.backend.incarnation) or parsed.value.standalone != value.registration.standalone) return error.CatalogGenerationChanged;
         if (parsed.value.scope) |scope| {
-            try scope.validate(.{ .home = .metadata, .group = 1, .incarnation = parsed.value.incarnation });
+            try scope.validate(.{ .home = .metadata, .group = native_group, .incarnation = parsed.value.incarnation });
             if (!sameRegistration(scope.registration, value.registration)) return error.InvalidSqlBackendResponse;
             if (scope.registration.lease.expires_at_ms < value.registration.lease.expires_at_ms) return error.InvalidSqlBackendResponse;
             if (scope.registration.lease.expires_at_ms != value.registration.lease.expires_at_ms and !value.recovery) {
@@ -435,7 +514,7 @@ pub const Port = struct {
             // observed expiry changes no backend identity and cannot strand
             // the source's unconditional fence behind a stale local lease.
             const owner = parsed.value.owner orelse return error.InvalidSqlBackendResponse;
-            try owner.validate(.{ .home = .metadata, .group = 1, .incarnation = parsed.value.incarnation });
+            try owner.validate(.{ .home = .metadata, .group = native_group, .incarnation = parsed.value.incarnation });
             if (!std.meta.eql(owner.lease, scope.registration.lease)) return error.InvalidSqlBackendResponse;
         } else if (parsed.value.owner != null) return error.InvalidSqlBackendResponse;
         if (parsed.value.next_work != null) return error.InvalidSqlBackendResponse;
@@ -495,11 +574,13 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
         next.recovery = prior.recovery or scope.registration.lease.expires_at_ms <= now_ms;
         if (scope.state == .retired) {
             next.phase = .retired;
+            next.savepoint_control = null;
             next.recovery = true;
             next.ticket = null;
             next.pending = null;
         } else if (scope.state == .fenced) {
             next.phase = .closing;
+            next.savepoint_control = null;
             next.recovery = true;
             // Each successful quantum gets a fresh admission; replaying an
             // earlier journal result must never count as another close step.
@@ -509,13 +590,14 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
             next.pending = next.controlRequest(cut.head, nonce, if (scope.transaction) |transaction| .{ .release = transaction } else .close_step);
         } else if (next.recovery) {
             next.phase = .fencing;
+            next.savepoint_control = null;
             if (prior.phase == .fencing and prior.pending != null and !expired(prior.pending.?, cut.head)) if (try port.deliver(a, prior.pending.?)) |failure| {
                 if (next.failure == null) next.failure = failure;
             };
             next.pending = next.controlRequest(cut.head, nonce, .{ .fence = .close });
         } else if (prior.pending != null and prior.pending.?.operation == .renew) {
             if (scope.registration.lease.expires_at_ms == prior.pending.?.operation.renew.expires_at_ms) {
-                next.pending = null;
+                next.pending = if (prior.savepoint_control) |effect| next.controlRequest(cut.head, nonce, .{ .effect = .{ .command = prior.ticket.?.command, .effect = effect } }) else null;
             } else if (expired(prior.pending.?, cut.head)) {
                 next.pending = next.controlRequest(cut.head, nonce, prior.pending.?.operation);
             } else {
@@ -526,6 +608,34 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
                 }
                 return;
             }
+        } else if (prior.savepoint_control) |effect| {
+            if (!std.meta.eql(scope.command, @as(?authority.scopes.Command, prior.ticket.?.command))) return error.InvalidSqlBackendResponse;
+            const owner = cut.owner orelse return error.InvalidSqlBackendResponse;
+            if (cut.receipt) |receipt| {
+                try receipt.requireFor(.{ .home = .metadata, .group = native_group, .incarnation = cut.incarnation }, effect);
+                if (receipt.outcome == .completed) {
+                    next.savepoint_control = null;
+                    next.pending = if (prior.phase == .finishing) next.controlRequest(cut.head, nonce, .{ .finish = prior.ticket.?.command }) else null;
+                    try replace(store, principal, prior, next);
+                    return;
+                }
+                if (receipt.outcome != .pending) return error.InvalidSqlBackendResponse;
+            }
+            if (owner.next_effect != effect.sequence or owner.waiting != null) return error.InvalidSqlBackendResponse;
+            if (owner.job) |job| if (!std.meta.eql(job.effect, effect)) return error.InvalidSqlBackendResponse;
+            const operation: @FieldType(authority.Request, "operation") = if (owner.job != null)
+                .{ .step = .{ .command = prior.ticket.?.command, .effect = effect } }
+            else
+                .{ .effect = .{ .command = prior.ticket.?.command, .effect = effect } };
+            if (std.meta.eql(prior.pending.?.operation, operation) and !expired(prior.pending.?, cut.head)) {
+                if (try port.deliver(a, prior.pending.?)) |failure| {
+                    if (failure != .CatalogPublicationProofPending) {
+                        next.failure = failure;
+                        next.recovery = true;
+                    }
+                }
+            }
+            next.pending = next.controlRequest(cut.head, nonce, operation);
         } else switch (prior.phase) {
             .registering => {
                 next.phase = .idle;

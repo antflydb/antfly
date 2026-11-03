@@ -47,6 +47,55 @@ pub const Coordinator = struct {
         if (result.outcome != .aborted) return error.SqlTransactionOutcomeUnknown;
     }
 
+    /// Publish SQL metadata and native control intent together. Recovery only
+    /// drains native control; it never evaluates this SQL operation again.
+    pub fn savepoint(ptr: *anyopaque, scope: sql.Scope, id: sql.Id, name: []const u8, action: transactions.SessionRegistry.SqlSavepointAction) !void {
+        const self: *Coordinator = @ptrCast(@alignCast(ptr));
+        try self.context.ensureActive();
+        const fence = self.context.sql_command_fence orelse return error.SqlConnectionBusy;
+        const store = self.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+        var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
+        defer state.deinit(self.server.alloc);
+        const connection = state.connection_id orelse return error.SqlConnectionNotFound;
+        const producer = @import("sql_command_producer.zig");
+        const io = self.server.embedding_provider_runtime.io;
+        const instance = try self.server.sql_connection_admission.executionInstance(io);
+        const frame: @import("sql_advisory_execution.zig").Frame = .{ .source = store, .connection = connection, .principal = scope.principal, .instance = instance, .fence = fence.*, .actor = try @import("sql_authorization_recovery.zig").actor(self.server, self.identity.*) };
+        try frame.requireExecuting(self.server.alloc, platform_time.realtimeNs() / std.time.ns_per_ms);
+        var owned = (try producer.load(store, self.server.alloc, connection)) orelse return error.SqlConnectionNotFound;
+        defer owned.deinit();
+        var native: producer.NativePort = .{ .server = self.server, .context = self.context };
+        var nonce: [16]u8 = undefined;
+        try io.randomSecure(&nonce);
+        var plan = try producer.observeSavepointPlan(self.server.alloc, owned.value, instance, id, platform_time.realtimeNs() / std.time.ns_per_ms, nonce, native.port());
+        try self.context.ensureActive();
+        plan.now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+        _ = (try self.server.txn_sessions.changeSqlSavepoint(self.server.alloc, id, name, action, plan)) orelse return error.SqlSavepointNotFound;
+        var quanta: u8 = 0;
+        while (true) {
+            try self.context.ensureActive();
+            var current = (try producer.load(store, self.server.alloc, connection)) orelse return error.SqlConnectionNotFound;
+            defer current.deinit();
+            if (current.value.recovery or current.value.phase != .executing or !std.meta.eql(current.value.ticket, owned.value.ticket)) return error.SqlConnectionBusy;
+            if (current.value.savepoint_control == null) return;
+            try io.randomSecure(&nonce);
+            const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+            if (current.value.pending.?.operation != .renew and current.value.registration.lease.expires_at_ms > now_ms and current.value.registration.lease.expires_at_ms - now_ms <= producer.renew_before_ms) {
+                try producer.renew(store, scope.principal, current.value, instance, now_ms +| producer.execution_lease_ms, current.value.pending.?.admission.head, nonce, now_ms);
+            } else producer.advance(store, self.server.alloc, scope.principal, current.value, instance, now_ms, nonce, native.port()) catch |err| switch (err) {
+                // A concurrent worker may publish the next control quantum.
+                // Reload that exact intent; never re-run SQL publication.
+                error.MetadataMutationOutcomeUnknown, error.SqlConnectionChanged => {},
+                else => return err,
+            };
+            quanta += 1;
+            if (quanta == 8) {
+                try io.sleep(.fromMilliseconds(1), .awake);
+                quanta = 0;
+            }
+        }
+    }
+
     pub fn commit(ptr: *anyopaque, _: sql.Scope, id: sql.Id) !sql.CommitResult {
         const self: *Coordinator = @ptrCast(@alignCast(ptr));
         const server = self.server;
@@ -161,6 +210,7 @@ pub const Adapter = struct {
     commit_context: *anyopaque,
     commit_fn: *const fn (*anyopaque, sql.Scope, sql.Id) anyerror!sql.CommitResult,
     rollback_fn: ?*const fn (*anyopaque, sql.Scope, sql.Id) anyerror!void = null,
+    savepoint_fn: ?*const fn (*anyopaque, sql.Scope, sql.Id, []const u8, transactions.SessionRegistry.SqlSavepointAction) anyerror!void = null,
     supports_range_guards: bool = false,
     connection_id: ?[32]u8 = null,
     connection_revision: ?u64 = null,
@@ -294,6 +344,7 @@ pub const Adapter = struct {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
+        if (self.savepoint_fn) |callback| return callback(self.commit_context, scope, id, name, .create);
         _ = (try self.registry.createNamedSavepoint(self.alloc, id, name)) orelse return error.SqlTransactionNotActive;
     }
 
@@ -301,6 +352,7 @@ pub const Adapter = struct {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
+        if (self.savepoint_fn) |callback| return callback(self.commit_context, scope, id, name, .rollback);
         _ = (try self.registry.rollbackToNamedSavepoint(self.alloc, id, name)) orelse return error.SqlSavepointNotFound;
     }
 
@@ -308,6 +360,7 @@ pub const Adapter = struct {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
+        if (self.savepoint_fn) |callback| return callback(self.commit_context, scope, id, name, .release);
         _ = (try self.registry.releaseNamedSavepoint(self.alloc, id, name)) orelse return error.SqlSavepointNotFound;
     }
 

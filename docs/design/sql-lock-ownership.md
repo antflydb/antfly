@@ -7,8 +7,9 @@ journal described here is not yet activation of the unresolved SQL cases.
 Current status (2026-11-03): the native ledger, durable command-source permits,
 shared prepared-decision integration and independent prepared lock home are
 implemented and qualified. The ordered scalar/type layer and native advisory
-execution owner are also implemented. Public HTTP/pgwire source activation and
-row/table participant enrollment remain open. The sections below retain earlier
+execution owner are also implemented. SQL savepoint metadata and native advisory
+control now share an atomic source publication. Public HTTP/pgwire source
+activation and row/table participant enrollment remain open. The sections below retain earlier
 qualification records; the final sections describe the current implementation.
 
 ## Native resource contract
@@ -798,8 +799,8 @@ outcome lookup. These are operation-count checks, not latency benchmark claims.
 Public activation still requires durable HTTP/pgwire connection enrollment,
 lease renewal tied to live execution and transactions, command ownership across
 portal suspension, implicit transaction ownership for transaction-scoped calls,
-and atomic savepoint metadata/control handoffs. Row/table
-participant enrollment remains separate. These unfinished boundaries prevent
+and distributed row/table participant enrollment and savepoint propagation.
+The metadata-home advisory savepoint handoff is implemented below. These unfinished boundaries prevent
 closing the original advisory cases; counts remain **912 implemented, 138
 rejected, 449 superseded and 87 unresolved**.
 
@@ -818,3 +819,66 @@ and **52 selected test executions**, including nine native LSM campaigns, all 18
 metadata prepared-transaction tests and all 16 transaction-lifecycle tests. There
 were no skips, failures or leaks. This recheck includes the stricter savepoint
 decoder and the derived active-subtransaction projection.
+
+
+## Atomic savepoint publication before native cleanup
+
+The shared SQL control adapter publishes savepoints through the existing source
+owner when a native command fence is present. CREATE preserves the existing
+monotone savepoint IDs. RELEASE and ROLLBACK TO prepare the ordinary SQL session
+postimage, including staged rows, settings, failure state and read observations.
+The local writer compares both the current durable session bytes and the exact
+executing source record. It atomically commits that SQL postimage with one
+immutable native control intent in the source outbox.
+
+Native control runs after that commit. This order can conservatively retain old
+locks across a crash; it cannot release a lock before its SQL rewind is durable.
+The worker completes the recorded effect without re-evaluating a savepoint name
+or replaying SQL. RELEASE reparents child transaction grants to the remaining
+parent ID. ROLLBACK TO removes grants acquired at the target savepoint or in its
+descendants, while preserving earlier root grants and session ownership. Each native quantum
+uses the existing indexed ledger and publishes independently. Receipts bind to
+the full system metadata group ID, incarnation and immutable effect.
+
+An outstanding intent blocks further connection mutations and advisory effects.
+Older registry savepoint entry points cannot bypass this gate. Exact source or
+session conflicts abort the complete local publication. Failed persistence on
+either side of the session/outbox write leaves both old records intact. The
+foreground driver can lose its source CAS to the background worker after native
+acceptance; it reloads that exact intent and continues control delivery without
+repeating SQL publication.
+
+Live retained-read capabilities remain outside durable encoding. Refreshing the
+session for publication preserves a live capability only when its transaction,
+owner, scope and immutable read characteristics match. Savepoint operations do
+not drop that capability, including on failed publication. A cold reopen retains
+the durable chosen-snapshot marker without recreating the capability; subsequent
+reads keep the existing restart requirement. Snapshot closure still follows the
+registry's deferred retirement mechanism.
+
+A live foreground cleanup renews its native lease cooperatively before expiry.
+The immutable intent survives replacement of its control admission by renewal.
+Cancellation can move the command to finishing while that exact renewal remains
+in flight; recovery adopts its proven expiry before completing the saved control.
+A renewal does not admit another advisory effect through the unfinished intent.
+The source's existing irreversible fencing and decision-gated retirement remain
+the abandonment path. This does not implement generic execution/idle-transaction
+heartbeats or public connection enrollment.
+
+Qualification uses real LSM/WAL and local/Raft metadata application in both
+standalone and clustered realms. It exercises failed local publication, stale
+source plans, blocked bypass paths, lease renewal, lost control replies, command
+completion and cold reopen between quanta. The shared SQL adapter also exercises
+a worker winning the acknowledgement CAS after native acceptance. Independent
+mounted transaction-control and isolation gates protect the existing SQL paths.
+No original advisory disposition is closed by this internal lifecycle cohort;
+public ingress ownership remains required.
+
+The final Debug qualification passed **102/102 build steps**: all **34
+source/controller tests**, the mounted original transaction-control campaign,
+and all **seven transaction-characteristics/capability tests**. There were no
+skips, failures or leaks. The **42 native-result/retained-read tests** also passed
+against the reviewed production changes. Socket-based gates ran with local bind
+access rather than accepting sandbox skips. Inventory integrity and Apache/control
+catalog audits pass; the original dispositions remain **912 implemented, 138
+rejected, 449 superseded and 87 unresolved**.

@@ -1207,6 +1207,7 @@ pub const DurableSessionStore = struct {
     registration_recovery_before: ?u64 = null,
     registration_locks: [64]std.atomic.Mutex = @splat(.unlocked),
     fail_writes_for_test: bool = false,
+    fail_savepoint_publication_for_test: ?enum { session, source } = null,
     fail_lease_transition_after_session_write_for_test: bool = false,
 
     fn writeSerialization(self: *const DurableSessionStore) backend_erased.WriteSerialization {
@@ -1297,6 +1298,73 @@ pub const DurableSessionStore = struct {
                 try txn.commit();
             },
         }
+    }
+
+    const SavepointSnapshot = struct { value: Session, digest: [32]u8 };
+    fn savepointSnapshot(self: *DurableSessionStore, alloc: std.mem.Allocator, id: db_mod.types.TxnId) !?SavepointSnapshot {
+        return switch (self.backend) {
+            .docstore => |store| blk: {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                break :blk try readSavepointSnapshot(alloc, &txn, id);
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                break :blk try readSavepointSnapshot(alloc, &txn, id);
+            },
+        };
+    }
+    fn readSavepointSnapshot(alloc: std.mem.Allocator, txn: anytype, id: db_mod.types.TxnId) !?SavepointSnapshot {
+        const key = try makeSessionKey(alloc, id);
+        defer alloc.free(key);
+        const bytes = txn.get(key) catch |err| return if (err == error.NotFound) null else err;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+        return .{ .value = try decodeSessionRecord(alloc, id, bytes), .digest = digest };
+    }
+    fn saveSavepoint(self: *DurableSessionStore, session: Session, expected: ?[32]u8, plan: ?@import("sql_command_producer.zig").SavepointPlan, control: ?@import("antfly_local_sources").storage_pessimistic_lock_authority.ledger.Control, max_record_bytes: ?usize) !void {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
+        if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
+        const key = try makeSessionKey(self.alloc, session.txn_id);
+        defer self.alloc.free(key);
+        const value = try encodeSessionRecord(self.alloc, session);
+        defer self.alloc.free(value);
+        if (max_record_bytes) |limit| if (value.len > limit) return error.SessionRecordTooLarge;
+        switch (self.backend) {
+            .docstore => |store| {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                try self.saveSavepointTxn(&txn, key, value, session, expected, plan, control);
+                try txn.commit();
+            },
+            .runtime => |store| {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                try self.saveSavepointTxn(&txn, key, value, session, expected, plan, control);
+                try txn.commit();
+            },
+        }
+    }
+    fn saveSavepointTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, bytes: []const u8, session: Session, expected: ?[32]u8, plan: ?@import("sql_command_producer.zig").SavepointPlan, control: ?@import("antfly_local_sources").storage_pessimistic_lock_authority.ledger.Control) !void {
+        if (expected) |want| {
+            const previous = txn.get(key) catch |err| return if (err == error.NotFound) error.SqlTransactionNotActive else err;
+            var actual: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(previous, &actual, .{});
+            if (!std.mem.eql(u8, &actual, &want)) return error.SqlWriteConflict;
+        }
+        if (plan) |publication| {
+            if (session.connection_id == null or session.owner_node_id != publication.prior.registration.lease.node or
+                !std.mem.eql(u8, session.principal orelse "", publication.prior.principal)) return error.SqlConnectionNotFound;
+        } else if (session.connection_id) |connection| {
+            try @import("sql_command_producer.zig").requireCommandTxn(self.alloc, txn, connection, null, 0);
+        }
+        try self.putSessionAndExpiryTxn(txn, key, bytes, session);
+        if (self.fail_savepoint_publication_for_test == .session) return error.InjectedSessionStoreFailure;
+        if (plan) |publication| try @import("sql_command_producer.zig").stageSavepointTxn(self.alloc, txn, publication, session.connection_id.?, session.txn_id, control);
+        if (self.fail_savepoint_publication_for_test == .source) return error.InjectedSessionStoreFailure;
     }
 
     /// Atomically publishes a session owner and its fencing lease in the same
@@ -3826,21 +3894,57 @@ pub const SessionRegistry = struct {
     }
 
     pub fn createSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SavepointInfo {
-        return self.createSavepointNamed(alloc, txn_id, null);
+        return self.createSavepointNamed(alloc, txn_id, null, null);
     }
 
     pub fn createNamedSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: []const u8) !?SavepointInfo {
         if (name.len == 0 or name.len > 63) return error.InvalidSavepointName;
-        return self.createSavepointNamed(alloc, txn_id, name);
+        return self.createSavepointNamed(alloc, txn_id, name, null);
     }
 
-    fn createSavepointNamed(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: ?[]const u8) !?SavepointInfo {
+    pub const SqlSavepointAction = enum { create, rollback, release };
+    pub fn changeSqlSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: []const u8, action: SqlSavepointAction, plan: @import("sql_command_producer.zig").SavepointPlan) !?SavepointInfo {
+        if (name.len == 0 or name.len > 63) return error.InvalidSavepointName;
+        return switch (action) {
+            .create => self.createSavepointNamed(alloc, txn_id, name, plan),
+            .rollback => self.changeSavepoint(alloc, txn_id, .{ .name = name }, false, plan),
+            .release => self.changeSavepoint(alloc, txn_id, .{ .name = name }, true, plan),
+        };
+    }
+    fn refreshSavepointCandidate(self: *SessionRegistry, alloc: std.mem.Allocator, candidate: *Session, plan: ?@import("sql_command_producer.zig").SavepointPlan) !?[32]u8 {
+        if (plan == null) return null;
+        const durable = self.durable orelse return error.SqlConnectionUnavailable;
+        var latest = (try durable.savepointSnapshot(alloc, candidate.txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer latest.value.deinit(alloc);
+        // Durable metadata never carries a live retained-read capability. A
+        // matching live facade must preserve its already-chosen cut, rather
+        // than silently losing it or recapturing after a savepoint mutation.
+        if (candidate.native_sql_cut) |cut| {
+            const old_sql = candidate.sql orelse return error.SqlWriteConflict;
+            const fresh_sql = latest.value.sql orelse return error.SqlWriteConflict;
+            if (candidate.owner_node_id != latest.value.owner_node_id or candidate.begin_timestamp != latest.value.begin_timestamp or
+                !std.meta.eql(candidate.connection_id, latest.value.connection_id) or
+                !std.mem.eql(u8, candidate.principal orelse "", latest.value.principal orelse "") or
+                !old_sql.characteristics_locked or !fresh_sql.characteristics_locked or old_sql.isolation != fresh_sql.isolation or
+                old_sql.mode != fresh_sql.mode or old_sql.accepted_lake_reads != fresh_sql.accepted_lake_reads or
+                !std.mem.eql(u8, old_sql.database, fresh_sql.database) or !std.mem.eql(u8, old_sql.namespace, fresh_sql.namespace)) return error.SqlWriteConflict;
+            latest.value.native_sql_cut = cut.retain();
+        }
+        candidate.deinit(alloc);
+        candidate.* = latest.value;
+        return latest.digest;
+    }
+    fn persistSavepoint(self: *SessionRegistry, session: Session, expected: ?[32]u8, plan: ?@import("sql_command_producer.zig").SavepointPlan, control: ?@import("antfly_local_sources").storage_pessimistic_lock_authority.ledger.Control) !void {
+        if (self.durable) |durable| try durable.saveSavepoint(session, expected, plan, control, self.max_record_bytes) else if (plan != null) return error.SqlConnectionUnavailable;
+    }
+    fn createSavepointNamed(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: ?[]const u8, plan: ?@import("sql_command_producer.zig").SavepointPlan) !?SavepointInfo {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
-        if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
+        const expected = try self.refreshSavepointCandidate(alloc, &candidate, plan);
+        if (candidate.commit_body_digest != null or candidate.external_preparation != null or candidate.terminal_commit != null or candidate.terminal_abort) return error.TransactionCommitSealed;
         if (self.max_savepoints) |limit| {
             if (candidate.savepoints.count() >= limit) return error.SavepointLimitExceeded;
         }
@@ -3869,7 +3973,7 @@ pub const SessionRegistry = struct {
         savepoint_inserted = true;
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistSavepoint(candidate, expected, plan, null);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
@@ -3878,28 +3982,29 @@ pub const SessionRegistry = struct {
     }
 
     pub fn rollbackToSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, savepoint_id: u64) !?SavepointInfo {
-        return self.changeSavepoint(alloc, txn_id, .{ .id = savepoint_id }, false);
+        return self.changeSavepoint(alloc, txn_id, .{ .id = savepoint_id }, false, null);
     }
 
     pub fn releaseSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, savepoint_id: u64) !?SavepointInfo {
-        return self.changeSavepoint(alloc, txn_id, .{ .id = savepoint_id }, true);
+        return self.changeSavepoint(alloc, txn_id, .{ .id = savepoint_id }, true, null);
     }
 
     pub fn rollbackToNamedSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: []const u8) !?SavepointInfo {
-        return self.changeSavepoint(alloc, txn_id, .{ .name = name }, false);
+        return self.changeSavepoint(alloc, txn_id, .{ .name = name }, false, null);
     }
 
     pub fn releaseNamedSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: []const u8) !?SavepointInfo {
-        return self.changeSavepoint(alloc, txn_id, .{ .name = name }, true);
+        return self.changeSavepoint(alloc, txn_id, .{ .name = name }, true, null);
     }
 
-    fn changeSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, target: union(enum) { id: u64, name: []const u8 }, release: bool) !?SavepointInfo {
+    fn changeSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, target: union(enum) { id: u64, name: []const u8 }, release: bool, plan: ?@import("sql_command_producer.zig").SavepointPlan) !?SavepointInfo {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
-        if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
+        const expected = try self.refreshSavepointCandidate(alloc, &candidate, plan);
+        if (candidate.commit_body_digest != null or candidate.external_preparation != null or candidate.terminal_commit != null or candidate.terminal_abort) return error.TransactionCommitSealed;
         const savepoint_id = switch (target) {
             .id => |id| id,
             .name => |name| blk: {
@@ -3962,7 +4067,10 @@ pub const SessionRegistry = struct {
         }
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
-        try self.persistLocked(candidate);
+        try self.persistSavepoint(candidate, expected, plan, if (release)
+            .{ .release_savepoint = .{ .transaction = txn_id, .first_child = savepoint_id, .parent = candidate.current_subtransaction } }
+        else
+            .{ .rollback = .{ .transaction = txn_id, .first_aborted = savepoint_id } });
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
