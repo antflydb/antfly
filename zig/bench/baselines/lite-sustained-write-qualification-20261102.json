@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Local correctness gates green at 985c49c1b2, production runtime 101aa00910: 756 native, 282 physical C API, 87 consumer/lifecycle, 24 generation/posting tests, plus 209 SDK tests against the identical Debug library. Optimized frozen-input, original-importer contention and sustained qualification on wolfspider are next. The earlier unchanged-importer Debug failure remains unresolved evidence; #1431 stays open.",
+  "status": "Not qualified: optimized isolated input 7 passes, but full corpus fails on input 8 with replay-capacity exhaustion. Local input-accounting fix has focused Debug coverage; integration and renewed candidate qualification are pending.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "101aa00910f48f98f0529871b77d10f49fc38ba9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -7114,5 +7114,71 @@
     "interpretation": "Control documents are not synonymous with pending replay: this category also includes identity, TTL/reverse-index, metadata and derived records. The transaction figure covers the actual __txn_* prefix families. These aggregates do not explain the original approximately 430 MB compact-size difference; matched settled before/after family and physical-header accounting is still required.",
     "generation_publication_errors_in_saved_import_logs": 0,
     "qualification_policy": "Family census runs only on quiescent files before and after compaction, with identical read-only parsing for every revision; exports contain numeric aggregates and hashes only."
+  },
+  "comment_followup_optimized_qualification_20261103": {
+    "source_commit": "477f6258811f6f17fc5b0e61f057524a263c4b65",
+    "runtime_commit": "101aa00910f48f98f0529871b77d10f49fc38ba9",
+    "mode": "ReleaseFast",
+    "library_sha256": "cada43229906f9493d36a908da87631d0bcff92680b4d5fb85d42f84df34f1f4",
+    "whole_candidate_build_exit_code": 0,
+    "c_smoke_linkage_and_134_exports": "passed",
+    "isolated_input7": {
+      "seconds": 246.7610875829123,
+      "successful": true,
+      "known_busy_backlog_commit_errors": 0,
+      "integrity_valid": true,
+      "file_bytes": 3244572672,
+      "live_bytes": 2081965645,
+      "replay_bytes_after_close": 16487028,
+      "replay_records_after_close": 299,
+      "index_catchup_complete": false
+    },
+    "full_corpus": {
+      "completed_inputs": 7,
+      "failed_input_ordinal": 8,
+      "failed_input_index": 7,
+      "total_import_seconds": 309.5580644598231,
+      "successful": false,
+      "public_errors": [
+        "LiteReplayBacklogExceeded",
+        "ANTFLY_BUSY"
+      ],
+      "integrity_valid": true,
+      "file_bytes": 3705217024,
+      "live_bytes": 2373948568,
+      "replay_bytes_after_close": 16791251,
+      "replay_records_after_close": 1112
+    },
+    "frozen_input_tree_sha256": "1a54a15e5b957c39807adb41b321bafa74ca2177124238a42c9247b70953f276",
+    "inputs_unchanged": true,
+    "native_compilation_overlap": false,
+    "baseline_policy": "User requires reuse of existing baseline artifacts AND completed measurements; do not recompile or rerun them for subsequent candidates. Cancelled control prefixes are not performance evidence.",
+    "cached_main_reference": {
+      "source_commit": "f2b3baaee1cb508005451843c17fa07f2e069d4b",
+      "library_sha256": "e2e2df564c1dde5f9450f08b50049229fc3e8076e2a5bae37b05794ac24215e7",
+      "same_original_importer_and_15_input_ids": true,
+      "complete_import_seconds": [
+        350.99988396000117,
+        370.599523501005
+      ]
+    },
+    "remaining_qualification": "Full corpus, equivalent settled accounting, original-importer contention, large retained graph, and active-write soaks remain incomplete. Aggregate CI requires non-draft PR and human approval; factory belongs to Beads.",
+    "interpretation": "An isolated successful import does not prove index catch-up or progress with retained data. Fair process ordering does not explain the single-process failure. Wolfspider measurements stopped; debugging is local."
+  },
+  "local_input_accounting_followup_20261103": {
+    "finding": "For each source string or object key, aliasesInput scanned every projected text field: O(source nodes times text fields), visible in the local replay stack sample.",
+    "change": "Build sorted address ranges with prefix maximum ends once per estimate, then query exact containment in logarithmic work. Small and non-alias inputs remain allocation-free; wide scratch failures propagate before publication and scratch uses the text-construction budget.",
+    "semantic_scope": "Allocation ownership accounting only; no language, tokenizer, stemming, source value, or index field changes.",
+    "validation": {
+      "standalone_range_tests": 2,
+      "focused_input_and_split_budget_tests": 4,
+      "failed": 0,
+      "leaked": 0,
+      "wide_lookup_bound": "4096 ranges, 8192 queries, no more than 13 probes per query",
+      "integration": "pending"
+    },
+    "local_replay_diagnosis": "Existing Debug library and retained snapshot clones only. Local host had concurrent native builds, so wall times are not qualified performance measurements.",
+    "no_index_hypothesis": "Simple no-index table returned all credits without explicit idle, ruling out unconditional no-index credit stranding.",
+    "causality": "The quadratic accounting path is confirmed. Fixing it is not yet evidence that the full-corpus capacity failure is resolved."
   }
 }
