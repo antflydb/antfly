@@ -3186,6 +3186,29 @@ pub const PersistentIndex = struct {
         return prepared;
     }
 
+    /// The expensive construction and key-range scan have already completed
+    /// privately. Reserve the logical ID only in the current runtime, then
+    /// share the staged native value root instead of copying its payload.
+    pub fn prepareLinkedMergeSegment(self: *PersistentIndex, staging_alloc: Allocator, native_store: *@import("lite/docstore.zig").Store, construction: *@import("lite/artifact_source.zig").Construction, range: *SegmentKeyRange) ![]PreparedMergeSegment {
+        const files = self.segment_files orelse return error.Unsupported;
+        const id = self.reserveSegmentId();
+        const path = try files.pathAlloc(id);
+        defer files.allocator.free(path);
+        try construction.link(native_store, path);
+        errdefer self.deleteSegmentFile(id);
+        var data = index_mod.SegmentData.fromNative(try native_store.openArtifactSource(path));
+        errdefer data.deinit(self.alloc);
+        const prepared = try staging_alloc.alloc(PreparedMergeSegment, 1);
+        prepared[0] = .{ .id = id, .data = data, .key_range = range.*, .staging_alloc = staging_alloc };
+        prepared[0].key_range.seg_id = id;
+        range.* = .{ .seg_id = 0, .min_doc_key = &.{}, .max_doc_key = &.{} };
+        return prepared;
+    }
+
+    pub fn privateMergeKeyRange(allocator: Allocator, source: segment_mod.SegmentSource, canceled: *const std.atomic.Value(bool)) !SegmentKeyRange {
+        return extractSegmentDataKeyRangeWithCancellation(allocator, index_mod.SegmentData.fromNative(source), canceled);
+    }
+
     pub fn replaceSegmentsIfActiveManyPrepared(self: *PersistentIndex, old_seg_ids: []const u64, prepared_segments: []PreparedMergeSegment) !bool {
         return try self.replaceSegmentsIfActiveManyPreparedWithDeletes(old_seg_ids, prepared_segments, null);
     }
@@ -4032,6 +4055,11 @@ fn extractSegmentKeyRange(alloc: Allocator, segment_bytes: []const u8) !SegmentK
 }
 
 fn extractSegmentDataKeyRange(alloc: Allocator, data: index_mod.SegmentData) !SegmentKeyRange {
+    return extractSegmentDataKeyRangeWithCancellation(alloc, data, null);
+}
+
+fn extractSegmentDataKeyRangeWithCancellation(alloc: Allocator, data: index_mod.SegmentData, canceled: ?*const std.atomic.Value(bool)) !SegmentKeyRange {
+    if (canceled) |flag| if (flag.load(.acquire)) return error.Canceled;
     var reader = try data.initReader(alloc);
     defer reader.deinit();
 
@@ -4057,6 +4085,7 @@ fn extractSegmentDataKeyRange(alloc: Allocator, data: index_mod.SegmentData) !Se
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
     for (0..reader.doc_count) |doc_idx| {
+        if (canceled) |flag| if (flag.load(.acquire)) return error.Canceled;
         identity_scratch.reset();
         const stored = .{ .id = (try reader.storedIdScoped(identity_scratch.allocator(), @intCast(doc_idx))) orelse continue };
         if (min_key == null or std.mem.order(u8, stored.id, min_key.?) == .lt) {

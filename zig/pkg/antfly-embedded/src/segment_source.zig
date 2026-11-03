@@ -138,6 +138,9 @@ pub const Source = union(enum) {
         /// protects all source operations until its matching release.
         acquire_use: ?*const fn (*anyopaque) bool = null,
         release_use: ?*const fn (*anyopaque) void = null,
+        /// Stable only while the source owns its immutable backing. Native
+        /// leases include inode and value-root identity, preventing page ABA.
+        immutable_identity: ?[32]u8 = null,
         enable_idle_expiry: ?*const fn (*anyopaque) void = null,
     };
 

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Not qualified: prior unchanged input-7 importer runs failed with LiteReplayBacklogExceeded. The ownership-hardened segment-admission candidate passes full persistent/reader, strict C API, SDK and ABI gates; its unchanged-importer diagnostic and final matched optimized qualification remain pending.",
+  "status": "Not qualified: the unchanged original importer failed with LiteReplayBacklogExceeded after 751.557 seconds on the ownership-hardened Debug candidate, with zero native builds. Local diagnosis reproduced required tier merges blocking replay-credit return for over eight seconds. Final optimized qualification is held while separating merge preparation from replay service.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -5526,7 +5526,7 @@
     "next_investigation": "Late profiling also finds repeated immutable-segment navigation admission during DB/runtime opens. SegmentReader already supports authenticated owned admission metadata; investigate durable segment-bound descriptors instead of borrowed runtime-pointer caching."
   },
   "native_catalog_segment_admission": {
-    "status": "Ownership-hardened v7 Debug correctness gates pass; unchanged original-importer diagnostic and final optimized qualification pending.",
+    "status": "Correctness gates pass, but quiet unchanged-importer input 7 failed. This optimization does not resolve issue #1431.",
     "design": "Atomically publish bounded owned navigation in native active markers; bind to the currently leased source footer; preserve AFSM envelope/directory/lazy payload integrity. Legacy and optional-encoding allocation fallbacks retain normal source admission. Invalid rich descriptors fail closed without dropping active membership.",
     "no_sdk_or_c_abi_change": true,
     "v6_source_manifest": ".tools/import-regression/root-cause/segment-admission-v6-source.json",
@@ -5676,6 +5676,248 @@
       "rows": 128,
       "library_sha256": "64a5c7a1ed95b17da8b8b4170360eac466915d68a64bbb47b060ee3d739f6ff1",
       "performance_claim": false
+    },
+    "original_importer_v7": {
+      "input_index": 7,
+      "importer_exit_code": 1,
+      "censored": false,
+      "importer_succeeded": false,
+      "summary": [
+        0,
+        0,
+        1
+      ],
+      "seconds": 751.5571073329775,
+      "peak_native_builds": 0,
+      "metrics_enabled": true,
+      "library_sha256": "64a5c7a1ed95b17da8b8b4170360eac466915d68a64bbb47b060ee3d739f6ff1",
+      "public_errors": [
+        "LiteReplayBacklogExceeded"
+      ],
+      "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution."
     }
+  },
+  "mandatory_merge_lane_stall": {
+    "runtime_commit": "9b45f9b8a3e540e3fad561c3a1ad3c7e5666b4e3",
+    "library_sha256": "64a5c7a1ed95b17da8b8b4170360eac466915d68a64bbb47b060ee3d739f6ff1",
+    "original_importer": {
+      "input_index": 7,
+      "importer_exit_code": 1,
+      "censored": false,
+      "importer_succeeded": false,
+      "summary": [
+        0,
+        0,
+        1
+      ],
+      "seconds": 751.5571073329775,
+      "peak_native_builds": 0,
+      "metrics_enabled": true,
+      "library_sha256": "64a5c7a1ed95b17da8b8b4170360eac466915d68a64bbb47b060ee3d739f6ff1",
+      "public_errors": [
+        "LiteReplayBacklogExceeded"
+      ],
+      "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution."
+    },
+    "partial_primary_validation": {
+      "tables": 45,
+      "rows": 156712,
+      "scan_complete": true,
+      "integrity_valid": true,
+      "scope": "Consistency of the incomplete import, not proof of complete original-input ingestion."
+    },
+    "stopped_drain": {
+      "seconds": 60,
+      "peak_native_builds": 0,
+      "samples": [
+        {
+          "seconds": 1.0830117389559746e-06,
+          "replay_bytes": 16555223,
+          "source_turns": 1,
+          "replay_ns": 0,
+          "artifacts_ns": 0,
+          "enrichment_applied": 52,
+          "full_text_applied": 52,
+          "text_segments": 32
+        },
+        {
+          "seconds": 5.010043542017229,
+          "replay_bytes": 16305043,
+          "source_turns": 8,
+          "replay_ns": 160958000,
+          "artifacts_ns": 234279000,
+          "enrichment_applied": 53,
+          "full_text_applied": 53,
+          "text_segments": 33
+        },
+        {
+          "seconds": 10.020077708060853,
+          "replay_bytes": 16305043,
+          "source_turns": 8,
+          "replay_ns": 160958000,
+          "artifacts_ns": 234279000,
+          "enrichment_applied": 53,
+          "full_text_applied": 53,
+          "text_segments": 33
+        },
+        {
+          "seconds": 15.030102833057754,
+          "replay_bytes": 16305043,
+          "source_turns": 9,
+          "replay_ns": 2698877000,
+          "artifacts_ns": 8884186000,
+          "enrichment_applied": 54,
+          "full_text_applied": 53,
+          "text_segments": 24
+        },
+        {
+          "seconds": 20.040152667090297,
+          "replay_bytes": 15804683,
+          "source_turns": 13,
+          "replay_ns": 8777084000,
+          "artifacts_ns": 8896354000,
+          "enrichment_applied": 55,
+          "full_text_applied": 55,
+          "text_segments": 26
+        },
+        {
+          "seconds": 25.05018316709902,
+          "replay_bytes": 15554503,
+          "source_turns": 14,
+          "replay_ns": 11915722000,
+          "artifacts_ns": 8901661000,
+          "enrichment_applied": 57,
+          "full_text_applied": 56,
+          "text_segments": 27
+        },
+        {
+          "seconds": 30.059618000057526,
+          "replay_bytes": 15054143,
+          "source_turns": 18,
+          "replay_ns": 16434075000,
+          "artifacts_ns": 8915004000,
+          "enrichment_applied": 59,
+          "full_text_applied": 58,
+          "text_segments": 29
+        },
+        {
+          "seconds": 35.069643958006054,
+          "replay_bytes": 14553783,
+          "source_turns": 21,
+          "replay_ns": 20834249000,
+          "artifacts_ns": 8928252000,
+          "enrichment_applied": 61,
+          "full_text_applied": 60,
+          "text_segments": 31
+        },
+        {
+          "seconds": 40.079677917063236,
+          "replay_bytes": 14303603,
+          "source_turns": 21,
+          "replay_ns": 20834249000,
+          "artifacts_ns": 8928252000,
+          "enrichment_applied": 61,
+          "full_text_applied": 61,
+          "text_segments": 32
+        },
+        {
+          "seconds": 45.08620579203125,
+          "replay_bytes": 14303603,
+          "source_turns": 21,
+          "replay_ns": 20834249000,
+          "artifacts_ns": 8928252000,
+          "enrichment_applied": 61,
+          "full_text_applied": 61,
+          "text_segments": 32
+        },
+        {
+          "seconds": 50.09624620806426,
+          "replay_bytes": 14053423,
+          "source_turns": 24,
+          "replay_ns": 24407857000,
+          "artifacts_ns": 17957634000,
+          "enrichment_applied": 63,
+          "full_text_applied": 62,
+          "text_segments": 24
+        },
+        {
+          "seconds": 55.10407724999823,
+          "replay_bytes": 13553063,
+          "source_turns": 28,
+          "replay_ns": 28755330000,
+          "artifacts_ns": 17971558000,
+          "enrichment_applied": 65,
+          "full_text_applied": 64,
+          "text_segments": 26
+        }
+      ],
+      "scope": "Clone of the failed input-7 database; no producers; selected-namespace status polls every five seconds; continuous sampling at ten-millisecond intervals. Diagnostic only."
+    },
+    "finding": "Required merges still run synchronously in the replay maintenance lane. At 33 segments a merge occupied about 8.65 seconds, with replay-credit return stopped across the sampled interval. Two merges consumed about 18 seconds of artifact time in this sixty-second drain. This exceeds the unchanged importer five-second capacity-wait budget. It establishes a timeout mechanism, not the entire end-to-end slowdown.",
+    "design_in_progress": [
+      "Prepare immutable merge inputs and output on an owned asynchronous task, independently of the replay lane. Retain only task/input/provider ownership, never a whole primary epoch.",
+      "Stage completed output in bounded native artifact-lease appends; reuse existing locked-marker/orphan cleanup and preserve exact retry semantics.",
+      "Activate the staged value by sharing its native root, assigning logical segment IDs only at publication.",
+      "Revalidate namespace/index identity, source membership and current deletion state before publication; preserve newer appends and reconcile deletes without resurrecting documents.",
+      "Drain task ownership before shutdown or structural retirement; bound outstanding merge tasks and staged bytes."
+    ],
+    "next_validation": "Native staging/rollback/retry/orphan tests, active replay during blocked merge preparation, overwrite/delete/redefinition/shutdown races, then unchanged-importer diagnostics and final optimized qualification. Wolfspider remains untouched beyond a read-only readiness check."
+  },
+  "independent_native_text_merge": {
+    "status": "Implemented; focused correctness passes. Current end-to-end and optimized qualification pending.",
+    "source_base": "9b45f9b8a3e540e3fad561c3a1ad3c7e5666b4e3",
+    "design": [
+      "One owned immutable merge worker per file, no primary epoch held during construction.",
+      "Private seekable output with cancellation and task resource accounting; independent reader caches and artifact use leases.",
+      "Bounded native lease appends alternate with replay and in-place reclamation, preserving verified allocator state across wrapper refresh.",
+      "Final activation shares the value root and reserves IDs in the current runtime; validates inode, recovered catalog, immutable inputs, current deletions, and newly appended segments.",
+      "Ready-result publication precedes replay capacity retries. Dropped namespaces discard results instead of stranding them.",
+      "Shutdown cancels and joins the private worker; resource failures retain smaller-plan hints across runtime replacement.",
+      "Separate artifact lease group commits preserve logical metadata identities beside ordinary writes."
+    ],
+    "focused_validation": {
+      "command": "capi-contract-test lite-native-test -Doptimize=debug -j1, asynchronous merge / allocator proof / artifact construction / mixed lease group filters; allow-empty-test-filter only for independent target discovery",
+      "exit_code": 0,
+      "capi": {
+        "passed": 29,
+        "skipped": 0,
+        "failed": 0,
+        "leaked": 0
+      },
+      "native": {
+        "passed": 4,
+        "skipped": 0,
+        "failed": 0,
+        "leaked": 0
+      },
+      "log": ".tools/import-regression/root-cause/async-text-merge-v7-focused.log",
+      "inode_replacement_repetitions": {
+        "passed": 10,
+        "failed": 0
+      },
+      "private_merge_with_allocation_failures": {
+        "passed": 1,
+        "failed": 0,
+        "log": ".tools/import-regression/root-cause/private-merge-v3-focused.log"
+      },
+      "reporting_tests": {
+        "passed": 32,
+        "skipped": 1,
+        "skip_reason": "Optional native accounting fixture requires an explicit library."
+      }
+    },
+    "test_fixture_corrections": [
+      "Explicitly enable the runtime in the test-only producer capacity override; builtin test defaults otherwise omit it.",
+      "Suppress automatic Store maintenance in low-level orphan/inode fixtures which directly inspect NativeFile.",
+      "The idle reader marker observed during Connection acquisition was its scoped RegistrationBatch anchor, not a leaked primary snapshot; inspect from an independent admitted native writer."
+    ],
+    "sdk_compatibility": "No C ABI, request, or error-shape change. New background_publications JSON metrics are additive; preparation overlaps replay and is not additive wall time.",
+    "remaining": [
+      "Broad native/reader/persistent/C API and SDK gates on this implementation.",
+      "Quiet matched stopped-snapshot service diagnosis, then unchanged original importer input 7 with the original five-second timeout.",
+      "Matched optimized original importer contention and frozen corpus, equivalent settling/accounting, active page reuse, and ten-minute active-write qualification on wolfspider.",
+      "Human aggregate CI and Beads-owned full factory remain external."
+    ],
+    "issue1431_resolved": false
   }
 }

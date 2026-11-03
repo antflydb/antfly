@@ -1504,6 +1504,9 @@ pub const Store = struct {
     maintenance_wake: std.Io.Event = .unset,
     maintenance_cancel: maintenance.CancelToken = .{},
     maintenance_running: bool = false,
+    /// An owner is staging immutable output on this inode. Reuse/retirement
+    /// must continue, but an automatic rewrite would discard that construction.
+    defer_background_vacuum: bool = false,
     generation_workspace_active: bool = false,
     maintenance_start_suppressed: bool = false,
     test_maintenance_hook: if (@import("builtin").is_test) ?MaintenanceTestHook else void = if (@import("builtin").is_test) null else {},
@@ -1771,17 +1774,22 @@ pub const Store = struct {
         // Refresh first; a late lease cannot protect an already reused root.
         const admission = try self.acquireIndexReadAdmission();
         defer if (admission) |held| held.leave(held.ptr);
+        return (try self.artifactRegistry()).open(key);
+    }
+
+    pub fn beginArtifactConstruction(self: *Store) !artifact_source.Construction {
+        const admission = try self.acquireIndexReadAdmission();
+        defer if (admission) |held| held.leave(held.ptr);
+        return (try self.artifactRegistry()).beginConstruction();
+    }
+
+    fn artifactRegistry(self: *Store) !*artifact_source.Registry {
         lockStore(self);
-        const registry = self.artifact_registry orelse blk: {
-            const created = artifact_source.Registry.create(self.allocator, self) catch |err| {
-                self.mutex.unlock();
-                return err;
-            };
-            self.artifact_registry = created;
-            break :blk created;
-        };
-        self.mutex.unlock();
-        return registry.open(key);
+        defer self.mutex.unlock();
+        if (self.artifact_registry) |registry| return registry;
+        const created = try artifact_source.Registry.create(self.allocator, self);
+        self.artifact_registry = created;
+        return created;
     }
 
     pub fn recordArtifactSourceOpen(self: *Store, reused: bool) void {
@@ -2177,7 +2185,7 @@ pub const Store = struct {
                 self.maintenance_policy.status.last_error = null;
             }
         }
-        if (!self.maintenance_policy.options.enabled) return;
+        if (!self.maintenance_policy.options.enabled or self.defer_background_vacuum) return;
         var guard: ShrinkGuard = .{ .file = &self.file, .parent = cancel };
         var guard_token: maintenance.CancelToken = .{ .observer = .{ .ptr = &guard, .check = ShrinkGuard.check } };
         const shrink_cancel: ?*const maintenance.CancelToken = if (cooperative) &guard_token else cancel;
@@ -2947,7 +2955,15 @@ pub const Store = struct {
         const head = self.commit_head.?;
         var tail = head;
         var count: usize = 1;
-        while (count < 64) : (count += 1) tail = tail.next orelse break;
+        while (count < 64) : (count += 1) {
+            const next = tail.next orelse break;
+            // Lease bookkeeping must retain its own admission/durability
+            // semantics even when ordinary writes arrive concurrently. Mixing
+            // it into a normal transaction changes the logical metadata
+            // generation and invalidates unrelated detached constructions.
+            if (next.artifact_lease != head.artifact_lease) break;
+            tail = next;
+        }
         self.commit_head = tail.next;
         if (self.commit_head == null) self.commit_tail = null;
         tail.next = null;
@@ -6068,6 +6084,80 @@ test "lite publication mutex reserves queued owners before a writer can reacquir
         try std.testing.expect(mutex.tryLock());
         mutex.unlock();
     }
+}
+
+test "lite artifact lease groups preserve metadata identities beside queued primary mutations" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "artifact-primary-groups.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const metadata = store.file.activeCheckpoint().logical.metadata;
+    const Request = struct {
+        store: *Store,
+        key: []const u8,
+        artifact: bool = false,
+        result: anyerror!void = {},
+        fn apply(raw: *anyopaque, file: *native.NativeFile) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.artifact) try file.putCatalogRecord(self.key, "leased") else try file.putDocument(self.key, "acknowledged");
+        }
+        fn run(self: *@This()) void {
+            self.result = if (self.artifact) self.store.submitArtifactLeaseMutation(self, apply) else self.store.submitMutation(self, apply);
+        }
+        fn waitQueued(owner: *Store, expected: usize) !void {
+            for (0..1000) |_| {
+                owner.commit_mutex.lockUncancelable(owner.file.runtime());
+                var count: usize = 0;
+                var node = owner.commit_head;
+                while (node) |item| : (node = item.next) count += 1;
+                const ready = owner.commit_draining and count == expected;
+                owner.commit_mutex.unlock(owner.file.runtime());
+                if (ready) return;
+                try owner.file.runtime().sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.MutationQueueDidNotReachExpectedState;
+        }
+    };
+    var requests = [_]Request{
+        .{ .store = &store, .key = "primary-one" },
+        .{ .store = &store, .key = "\x00AFLEASE/0123456789abcdef0123456789abcdef", .artifact = true },
+        .{ .store = &store, .key = "primary-two" },
+    };
+    var threads: [3]std.Thread = undefined;
+    var started: usize = 0;
+    var locked = true;
+    store.mutex.lock();
+    defer {
+        if (locked) store.mutex.unlock();
+        for (threads[0..started]) |thread| thread.join();
+    }
+    threads[0] = try std.Thread.spawn(.{}, Request.run, .{&requests[0]});
+    started = 1;
+    try Request.waitQueued(&store, 0);
+    threads[1] = try std.Thread.spawn(.{}, Request.run, .{&requests[1]});
+    started = 2;
+    try Request.waitQueued(&store, 1);
+    threads[2] = try std.Thread.spawn(.{}, Request.run, .{&requests[2]});
+    started = 3;
+    try Request.waitQueued(&store, 2);
+    store.mutex.unlock();
+    locked = false;
+    for (threads) |thread| thread.join();
+    started = 0;
+    for (requests) |request| try request.result;
+    try std.testing.expectEqualSlices(u8, &metadata, &store.file.activeCheckpoint().logical.metadata);
+    for ([_][]const u8{ "primary-one", "primary-two" }) |key| {
+        const value = (try store.file.getDocumentAlloc(a, key)).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("acknowledged", value);
+    }
+    try std.testing.expect((try store.file.check()).valid);
 }
 
 test "lite online vacuum publishes while group-commit mutations keep landing" {

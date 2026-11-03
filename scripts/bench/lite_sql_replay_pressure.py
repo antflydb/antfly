@@ -122,7 +122,7 @@ def run(args):
                 root.sql(f'CREATE TABLE "{name}" (text TEXT)')
             tables = [stack.enter_context(root.open_table(name)) for name in names]
             for table in tables:
-                if not any(
+                if not args.no_text_index and not any(
                     index["kind"] == "full_text" for index in table.stats()["indexes"]
                 ):
                     table.add_index({"name": "text", "type": "full_text"})
@@ -131,11 +131,12 @@ def run(args):
             report["sql_prepare_seconds"] = 0.0
             report["sql_commit_seconds"] = 0.0
             report["transactions"] = []
+            report["sql_blocks"] = []
             for transaction in range(args.transactions):
                 began = time.monotonic()
                 with closing(root.sql_session()) as session:
                     session.execute("BEGIN")
-                    for name, keys in zip(names, expected):
+                    for table_number, (name, keys) in enumerate(zip(names, expected)):
                         selected = keys[
                             transaction * args.rows : (transaction + 1) * args.rows
                         ]
@@ -146,13 +147,27 @@ def run(args):
                                 for key in block
                                 for item in (key, row_text(text, key))
                             ]
-                            session.execute(
+                            statement = (
                                 f'INSERT INTO "{name}" (_id, text) VALUES '
                                 + ",".join(
                                     f"(${2 * row + 1},${2 * row + 2})"
                                     for row in range(len(block))
-                                ),
-                                parameters,
+                                )
+                            )
+                            if args.on_conflict:
+                                statement += " ON CONFLICT (_id) DO UPDATE SET text = EXCLUDED.text"
+                            block_started = time.monotonic()
+                            session.execute(statement, parameters)
+                            report["sql_blocks"].append(
+                                {
+                                    "transaction": transaction,
+                                    "table": name,
+                                    "preceding_rows_in_table": start,
+                                    "transaction_prior_rows": table_number * args.rows
+                                    + start,
+                                    "rows": len(block),
+                                    "seconds": time.monotonic() - block_started,
+                                }
                             )
                     preparation = time.monotonic() - began
                     report["sql_prepare_seconds"] += preparation
@@ -298,6 +313,16 @@ if __name__ == "__main__":
     parser.add_argument("--followup-rows", type=int, default=128)
     parser.add_argument("--busy-timeout", type=float, default=5)
     parser.add_argument("--no-sync", action="store_true")
+    parser.add_argument(
+        "--on-conflict",
+        action="store_true",
+        help="Exercise incremental SQL conflict-owner resolution",
+    )
+    parser.add_argument(
+        "--no-text-index",
+        action="store_true",
+        help="Isolate transaction staging from text replay",
+    )
     parser.add_argument("--require-no-busy", action="store_true")
     args = parser.parse_args()
     if (

@@ -1378,7 +1378,7 @@ proof. Mutations still require allocator admission.
 
 Full-text catch-up treats `CapacityUnavailable` and `CapacityObservationStale` as
 recoverable admission failures, with bounded backoff and persisted progress after
-successful retry. Owners that drive replay without optional workers run synchronous
+successful retry. Manual runtimes without a native path owner run synchronous
 merges when text-publication admission is blocked. A reduction in the blocked
 segment or heap-byte dimension renews their no-progress wait budget; unrelated or
 stale work does not. Total merge time remains visible in backpressure telemetry.
@@ -1397,8 +1397,8 @@ their existing retry behavior. SQL retains its committed-pending outcome.
 
 Native revision-7 background turns separate source-derived replay from immutable
 artifact maintenance. After the replay window and its source-dependent lifecycle
-work, the owner releases its primary snapshot before running at most one text
-merge and one LSM maintenance slice on captured index inputs. Owned LSM
+work, the owner releases its primary snapshot before running one LSM maintenance
+slice and admitting immutable text-merge construction. Owned LSM
 continuations can survive primary-only changes after validating their logical
 identities; changed inputs open a fresh runtime. Immutable inputs retain their
 own range leases. Artifact catalog reads first acquire short owner/path admission, validate
@@ -1520,14 +1520,35 @@ Native WAL synchronization uses the storage durability barrier directly. It must
 not implement fsync by appending an empty logical value, which would unnecessarily
 publish an index generation and invalidate unrelated detached inputs.
 
-Artifact maintenance runs one LSM slice per turn. An unfinished runtime retains
-its optional text-merge debt during replay pressure. A complete tier merge can
-take much longer than a replay scheduling quantum, so pressured turns merge only
-indexes at their configured producer resume threshold; ordinary tier merges
-resume when file-wide replay pressure subsides. Retirement and LSM maintenance
-continue during pressure, and producer assistance still enforces the configured
-segment and heap-byte admission bounds. Deferred policy merges remain scheduled
-and keep their idle continuation rather than disappearing from maintenance.
+Artifact maintenance runs one LSM slice per turn. Native text merges use one
+independent construction job per file, retaining its immutable inputs and task
+resource reservation until publication or cancellation. Its worker binds separate
+reader caches and builds private seekable scratch; it never writes a native
+catalog or reserves a logical segment ID. Replay, retirement and reclamation
+continue while construction runs. Native replay yields immediately when text
+producer capacity is unavailable, allowing the owner to return to merge staging.
+
+Completed output is appended in bounded transactions to an unpublished native
+artifact lease. A locked marker owns construction across Store refresh and makes
+crash leftovers eligible for the existing orphan sweep. Repeating an ambiguously
+successful append compares the exact bytes at the expected offset before
+accepting it. Final publication assigns an ID from the current runtime and shares
+the completed value root into its segment catalog name without copying the
+payload again. Admission rechecks inode, catalog/recovery state and each active
+input's immutable backing identity; current tombstones are reconciled through
+source-to-output provenance, and newer appended segments remain active. Changed
+DDL or replaced inputs cancel the result. Shutdown cancels and joins construction
+before releasing its readers or owning runtime. Failed resource admissions retain
+smaller-plan hints across runtime refresh; a successful merge restores normal
+planning. Automatic vacuum waits for construction, while in-place retirement and
+page reuse continue. An explicit peer replacement invalidates the construction.
+
+Background publication statistics separate merge preparation, native staging and
+final publication time, along with started/applied/discarded jobs and staged bytes.
+Preparation overlaps ordinary replay; its duration is not additive wall time.
+Artifact lease commits are kept separate from queued ordinary mutations so that
+physical bookkeeping preserves logical metadata identities.
+
 An unfinished artifact runtime retains
 only its owned immutable index inputs and continuations. It resumes after primary
 commits only when the inode and nonzero logical catalog/index identities match;

@@ -1440,6 +1440,62 @@ test "lite coordinator publication cancellation never performs fallible notifica
     try std.testing.expect((try file.check()).valid);
 }
 
+test "lite artifact construction appends idempotently and activates shared roots atomically" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "artifact-construction.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    const key = NativeFile.artifact_lease_key_prefix ++ "0123456789abcdef0123456789abcdef";
+    const first: [131072]u8 = @splat('a');
+    const second: [65536]u8 = @splat('b');
+    const metadata_identity = file.activeCheckpoint().logical.metadata;
+    const index_identity = file.activeCheckpoint().logical.indexes;
+    try std.testing.expectError(error.InvalidArtifactLeaseMutation, file.appendArtifactConstruction(key, 0, &first));
+    try file.beginArtifactLeaseTransaction();
+    try file.appendArtifactConstruction(key, 0, &first);
+    try file.commitTransaction();
+    // A lost successful response can retry the same bytes without duplicating
+    // them. A different request at that offset must not be mistaken for it.
+    try file.beginArtifactLeaseTransaction();
+    try file.appendArtifactConstruction(key, 0, &first);
+    try std.testing.expectError(error.StaleArtifactConstruction, file.appendArtifactConstruction(key, 0, &second));
+    try file.appendArtifactConstruction(key, first.len, &second);
+    try file.commitTransaction();
+    try std.testing.expectEqualSlices(u8, &metadata_identity, &file.activeCheckpoint().logical.metadata);
+    try std.testing.expectEqualSlices(u8, &index_identity, &file.activeCheckpoint().logical.indexes);
+    var staged = try file.openArtifactLeaseValue(a, key, file.activeCheckpoint());
+    defer staged.deinit(a);
+    try std.testing.expectEqual(@as(usize, first.len + second.len), staged.length);
+    try std.testing.expect(staged.root != 0);
+    var bytes: [8]u8 = undefined;
+    try file.readIndexValueInto(staged, first.len - 4, &bytes, file.activeCheckpoint());
+    try std.testing.expectEqualStrings("aaaabbbb", &bytes);
+    try file.beginTransaction();
+    try file.linkArtifactConstruction(key, "never-published", staged.length);
+    file.abortTransaction();
+    try std.testing.expectError(error.FileNotFound, file.openIndexValue(a, "never-published", file.activeCheckpoint()));
+    try file.beginTransaction();
+    try file.linkArtifactConstruction(key, "published", staged.length);
+    try file.putDocument("publication-marker", "same transaction");
+    try file.commitTransaction();
+    var published = try file.openIndexValue(a, "published", file.activeCheckpoint());
+    defer published.deinit(a);
+    try std.testing.expectEqual(staged.root, published.root);
+    try std.testing.expectEqual(staged.length, published.length);
+    try file.beginTransaction();
+    try std.testing.expectError(error.PathAlreadyExists, file.linkArtifactConstruction(key, "published", staged.length));
+    file.abortTransaction();
+    try file.beginArtifactLeaseTransaction();
+    try file.deleteCatalogRecord(key);
+    try file.commitTransaction();
+    try file.readIndexValueInto(published, first.len - 4, &bytes, file.activeCheckpoint());
+    try std.testing.expectEqualStrings("aaaabbbb", &bytes);
+    try std.testing.expect((try file.check()).valid);
+}
+
 test "lite allocator v4 long keys shared values incremental deletion and vacuum" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -6676,6 +6732,66 @@ pub const NativeFile = struct {
         try self.appendCatalogRecordForRoot(.index, key, suffix);
     }
 
+    pub const maximum_artifact_construction_step = 4 * 1024 * 1024;
+
+    fn requireArtifactLeaseKey(key: []const u8) !void {
+        if (!std.mem.startsWith(u8, key, artifact_lease_key_prefix) or key.len != artifact_lease_key_prefix.len + 32)
+            return error.InvalidArtifactLease;
+        for (key[artifact_lease_key_prefix.len..]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidArtifactLease;
+    }
+
+    /// Build an unpublished value behind a locked artifact marker. Each
+    /// committed append is bounded and leaves ordinary index identities alone.
+    /// Repeating an ambiguously committed chunk verifies its bytes instead of
+    /// appending it twice. The caller owns the marker and its inode fence.
+    pub fn appendArtifactConstruction(self: *NativeFile, key: []const u8, expected_offset: usize, suffix: []const u8) !void {
+        if (self.read_only) return error.ReadOnly;
+        try requireArtifactLeaseKey(key);
+        if (self.transaction_header == null) return error.InvalidArtifactLeaseMutation;
+        if (suffix.len == 0 or suffix.len > maximum_artifact_construction_step) return error.InvalidArgument;
+        const end = std.math.add(usize, expected_offset, suffix.len) catch return error.RecordTooLarge;
+        if (end > std.math.maxInt(u32)) return error.RecordTooLarge;
+        const checkpoint = try self.materializeTransactionCheckpoint();
+        var value = self.openArtifactLeaseValue(self.allocator, key, checkpoint) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (expected_offset != 0) return error.StaleArtifactConstruction;
+                return self.putCatalogRecord(key, suffix);
+            },
+            else => return err,
+        };
+        defer value.deinit(self.allocator);
+        if (value.length == end) {
+            var scratch: [8192]u8 = undefined;
+            var offset: usize = 0;
+            while (offset < suffix.len) {
+                const count = @min(scratch.len, suffix.len - offset);
+                try self.readIndexValueInto(value, expected_offset + offset, scratch[0..count], checkpoint);
+                if (!std.mem.eql(u8, scratch[0..count], suffix[offset..][0..count])) return error.StaleArtifactConstruction;
+                offset += count;
+            }
+            return;
+        }
+        if (value.length != expected_offset) return error.StaleArtifactConstruction;
+        try self.appendCatalogRecordForRoot(.metadata, key, suffix);
+    }
+
+    /// Activate already staged bytes by sharing their value root. The lease
+    /// remains live until a normal artifact reader owns the published value.
+    /// The caller owns index publication admission and unpublished-file cleanup.
+    /// Active-segment membership and ID advancement subsequently commit together
+    /// in the index catalog; they must never reference an unlinked value.
+    pub fn linkArtifactConstruction(self: *NativeFile, lease_key: []const u8, index_key: []const u8, expected_length: usize) !void {
+        if (self.read_only) return error.ReadOnly;
+        try requireArtifactLeaseKey(lease_key);
+        if (self.transaction_header == null or self.artifact_lease_transaction) return error.InvalidArtifactLeaseMutation;
+        const checkpoint = try self.materializeTransactionCheckpoint();
+        var value = try self.openArtifactLeaseValue(self.allocator, lease_key, checkpoint);
+        defer value.deinit(self.allocator);
+        if (value.length != expected_length) return error.StaleArtifactConstruction;
+        if (try self.lookupCatalogPage(checkpoint, .index, index_key) != null) return error.PathAlreadyExists;
+        try self.putIndexCatalogBatch(&.{.{ .key = index_key, .value = value.inline_bytes, .external_value_root_page = value.root, .external_value_len = value.length }});
+    }
+
     pub fn deleteIndexCatalogRecord(self: *NativeFile, key: []const u8) !void {
         try self.putIndexCatalogBatch(&.{.{ .key = key, .is_delete = true }});
     }
@@ -7317,7 +7433,16 @@ pub const NativeFile = struct {
     /// Resolve an immutable artifact once. A generation/checkpoint pin must
     /// outlive this descriptor; only small inline values require owned bytes.
     pub fn openIndexValue(self: *NativeFile, allocator: Allocator, key: []const u8, checkpoint: CheckpointSlot) !IndexValue {
-        const page_id = (try self.lookupCatalogPage(checkpoint, .index, key)) orelse return error.FileNotFound;
+        return self.openCatalogValueForRoot(allocator, .index, key, checkpoint);
+    }
+
+    pub fn openArtifactLeaseValue(self: *NativeFile, allocator: Allocator, key: []const u8, checkpoint: CheckpointSlot) !IndexValue {
+        try requireArtifactLeaseKey(key);
+        return self.openCatalogValueForRoot(allocator, .metadata, key, checkpoint);
+    }
+
+    fn openCatalogValueForRoot(self: *NativeFile, allocator: Allocator, root: CatalogRoot, key: []const u8, checkpoint: CheckpointSlot) !IndexValue {
+        const page_id = (try self.lookupCatalogPage(checkpoint, root, key)) orelse return error.FileNotFound;
         var reader: ValuePageReader = undefined;
         reader.init();
         defer reader.deinit(self);

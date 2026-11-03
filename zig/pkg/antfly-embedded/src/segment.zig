@@ -1104,6 +1104,12 @@ pub const SegmentReader = struct {
         return if (self.native) |native| native.range.source else .{ .contiguous = self.data };
     }
 
+    /// Immutable backing, before this reader's mutable page-validation cache.
+    /// A detached worker binds its own reader cache and retains a use lease.
+    pub fn immutableSource(self: *const SegmentReader) SegmentSource {
+        return if (self.native) |native| if (native.range.paged_source) |paged| paged.original else native.range.source else self.source();
+    }
+
     fn storedMetadata(self: *const SegmentReader) []const u8 {
         return if (self.native) |native| &native.stored_metadata else self.data[@intCast(self.stored_offset)..][0..@intCast(self.stored_metadata_length)];
     }
@@ -2856,6 +2862,223 @@ pub const MergeOptions = struct {
     scratch: ?MergeScratchOptions = null,
     index_sort: []const SegmentIndexSortField = &.{},
 };
+
+/// Private merge output has no catalog name or reserved logical segment ID.
+/// Callers retain their input owners through deinit; use leases additionally
+/// prevent idle expiry while the output awaits publication or cancellation.
+pub const PrivateMergeResult = struct {
+    allocator: Allocator,
+    run: ?*@import("postings_run.zig").Run = null,
+    source_map: ?MergeSourceMap = null,
+    input_uses: std.ArrayListUnmanaged(SegmentSource) = .empty,
+
+    pub fn deinit(self: *PrivateMergeResult) void {
+        if (self.source_map) |*map| map.deinit();
+        if (self.run) |run| run.deinit();
+        for (self.input_uses.items) |source| source.releaseUse();
+        self.input_uses.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+const PrivateMergeControl = struct {
+    io: std.Io,
+    canceled: ?*const std.atomic.Value(bool),
+    fn check(self: @This()) !void {
+        if (self.canceled) |flag| if (flag.load(.acquire)) return error.Canceled;
+        try self.io.checkCancel();
+    }
+};
+
+const PrivateMergeSource = struct {
+    source: SegmentSource,
+    control: PrivateMergeControl,
+    fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var position: usize = 0;
+        while (position < output.len) {
+            try self.control.check();
+            const count = @min(@as(usize, 65536), output.len - position);
+            try self.source.readInto(offset + position, output[position..][0..count]);
+            position += count;
+        }
+    }
+    fn close(_: *anyopaque) void {}
+    fn view(self: *@This()) SegmentSource {
+        return .{ .ranges = .{ .ptr = self, .length = self.source.len(), .read_into = read, .close = close, .resource_manager = self.source.resourceManager() } };
+    }
+};
+
+const PrivateMergeSink = struct {
+    inner: SegmentSink,
+    run: *@import("postings_run.zig").Run,
+    control: PrivateMergeControl,
+    limit: usize,
+    const vtable: SegmentSink.VTable = .{ .len = len, .append_slice = append, .append_byte = byte, .append_ntimes = repeat, .write_at = write, .crc32_prefix = prefix, .crc32_range = range, .resident_bytes = resident };
+    fn cast(raw: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw));
+    }
+    fn len(raw: *anyopaque) usize {
+        return cast(raw).inner.len();
+    }
+    fn resident(raw: *anyopaque) usize {
+        return cast(raw).inner.residentBytes();
+    }
+    fn append(raw: *anyopaque, bytes: []const u8) !void {
+        const self = cast(raw);
+        if (bytes.len > self.limit -| self.inner.len()) return error.MergeOutputTooLarge;
+        var position: usize = 0;
+        while (position < bytes.len) {
+            try self.control.check();
+            const count = @min(@as(usize, 65536), bytes.len - position);
+            try self.inner.appendSlice(bytes[position..][0..count]);
+            position += count;
+        }
+    }
+    fn byte(raw: *anyopaque, value: u8) !void {
+        try append(raw, &.{value});
+    }
+    fn repeat(raw: *anyopaque, value: u8, count: usize) !void {
+        const self = cast(raw);
+        if (count > self.limit -| self.inner.len()) return error.MergeOutputTooLarge;
+        var remaining = count;
+        while (remaining != 0) {
+            try self.control.check();
+            const take = @min(@as(usize, 65536), remaining);
+            try self.inner.appendNTimes(value, take);
+            remaining -= take;
+        }
+    }
+    fn write(raw: *anyopaque, offset: usize, bytes: []const u8) !void {
+        const self = cast(raw);
+        try self.control.check();
+        try self.inner.writeAt(offset, bytes);
+    }
+    fn prefix(raw: *anyopaque, count: usize) !u32 {
+        return range(raw, 0, count);
+    }
+    fn range(raw: *anyopaque, offset: usize, count: usize) !u32 {
+        const self = cast(raw);
+        var crc = std.hash.Crc32.init();
+        var buffer: [16384]u8 = undefined;
+        var position: usize = 0;
+        while (position < count) {
+            try self.control.check();
+            const take = @min(buffer.len, count - position);
+            try self.run.readActiveRange(offset + position, buffer[0..take]);
+            crc.update(buffer[0..take]);
+            position += take;
+        }
+        return crc.final();
+    }
+};
+
+/// Merge only immutable inputs into private seekable scratch. Neither the
+/// native catalog nor an IndexWriter is accessed here, so an owner may keep
+/// replaying newer records while this preparation runs on a separate task.
+pub fn preparePrivateMerge(alloc: Allocator, inputs: []const MergeInput, scratch: MergeScratchOptions, canceled: ?*const std.atomic.Value(bool), maximum_output_bytes: usize) !PrivateMergeResult {
+    const control: PrivateMergeControl = .{ .io = scratch.io, .canceled = canceled };
+    try control.check();
+    var result: PrivateMergeResult = .{ .allocator = alloc };
+    errdefer result.deinit();
+    try result.input_uses.ensureTotalCapacity(alloc, inputs.len);
+    const sources = try alloc.alloc(PrivateMergeSource, inputs.len);
+    defer alloc.free(sources);
+    const readers = try alloc.alloc(SegmentReader, inputs.len);
+    defer alloc.free(readers);
+    var reader_count: usize = 0;
+    defer for (readers[0..reader_count]) |*reader| reader.deinit();
+    const bound = try alloc.alloc(MergeInput, inputs.len);
+    defer alloc.free(bound);
+    const counts = try alloc.alloc(u32, inputs.len);
+    defer alloc.free(counts);
+    for (inputs, 0..) |input, i| {
+        const backing = input.reader.immutableSource();
+        if (!backing.acquireUse()) return error.EnrichmentWaitCanceled;
+        result.input_uses.appendAssumeCapacity(backing);
+        sources[i] = .{ .source = backing, .control = control };
+        readers[i] = input.reader.bindSource(alloc, sources[i].view()) catch |err| switch (err) {
+            error.InvalidSegment => try SegmentReader.initSource(alloc, sources[i].view()),
+            else => return err,
+        };
+        reader_count += 1;
+        bound[i] = .{ .reader = &readers[i], .deleted = input.deleted };
+        counts[i] = input.reader.doc_count;
+    }
+    result.source_map = try MergeSourceMap.init(alloc, counts);
+    const index_sort = try commonIndexSortForMergeInputsAlloc(alloc, bound);
+    defer freeIndexSortFields(alloc, index_sort);
+    const run = try @import("postings_run.zig").Run.createWithResources(alloc, scratch.io, scratch.directory, scratch.resource_manager);
+    result.run = run;
+    var wrapping: PrivateMergeSink = .{ .inner = run.sink(), .run = run, .control = control, .limit = maximum_output_bytes };
+    var sink: SegmentSink = .{ .ptr = &wrapping, .vtable = &PrivateMergeSink.vtable };
+    writeMergedSegmentToSinkWithOptions(alloc, &sink, bound, .{ .index_sort = index_sort, .source_map = &result.source_map.?, .scratch = scratch }) catch |err| switch (err) {
+        error.EmptySegment => {
+            run.deinit();
+            result.run = null;
+            result.source_map.?.deinit();
+            result.source_map = null;
+            return result;
+        },
+        else => return err,
+    };
+    var live: u32 = 0;
+    for (inputs) |input| live += input.reader.doc_count - if (input.deleted) |deleted| @as(u32, @intCast(deleted.cardinality())) else @as(u32, 0);
+    try result.source_map.?.finishOutput(live);
+    try run.seal(0);
+    try control.check();
+    return result;
+}
+
+test "private merge preserves surviving documents and provenance without publication" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    var first = SegmentWriter.init(a);
+    defer first.deinit();
+    try first.addStoredDoc("deleted", "{}");
+    try first.addStoredDoc("first", "{\"n\":1}");
+    var second = SegmentWriter.init(a);
+    defer second.deinit();
+    try second.addStoredDoc("second", "{\"n\":2}");
+    const first_bytes = try first.build();
+    defer a.free(first_bytes);
+    const second_bytes = try second.build();
+    defer a.free(second_bytes);
+    var first_reader = try SegmentReader.init(a, first_bytes);
+    defer first_reader.deinit();
+    var second_reader = try SegmentReader.init(a, second_bytes);
+    defer second_reader.deinit();
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.add(0);
+    const inputs = [_]MergeInput{ .{ .reader = &first_reader, .deleted = deleted }, .{ .reader = &second_reader } };
+    const scratch: MergeScratchOptions = .{ .io = std.testing.io, .directory = directory };
+    var result = try preparePrivateMerge(a, &inputs, scratch, null, 1024 * 1024);
+    defer result.deinit();
+    var reader = try SegmentReader.initSource(a, (try result.run.?.view()).source);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u32, 2), reader.doc_count);
+    var identities = std.heap.ArenaAllocator.init(a);
+    defer identities.deinit();
+    try std.testing.expectEqualStrings("first", (try reader.storedIdScoped(identities.allocator(), 0)).?);
+    try std.testing.expectEqualStrings("second", (try reader.storedIdScoped(identities.allocator(), 1)).?);
+    try std.testing.expect(result.source_map.?.lookup(0, 0) == null);
+    try std.testing.expectEqual(@as(u32, 0), result.source_map.?.lookup(0, 1).?.doc);
+    try std.testing.expectEqual(@as(u32, 1), result.source_map.?.lookup(1, 0).?.doc);
+    var canceled: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectError(error.Canceled, preparePrivateMerge(a, &inputs, scratch, &canceled, 1024 * 1024));
+    try std.testing.expectError(error.MergeOutputTooLarge, preparePrivateMerge(a, &inputs, scratch, null, 8));
+    const Harness = struct {
+        fn run(alloc: Allocator, merge_inputs: []const MergeInput, options: MergeScratchOptions) !void {
+            var result_with_faults = try preparePrivateMerge(alloc, merge_inputs, options, null, 1024 * 1024);
+            defer result_with_faults.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{ &inputs, scratch });
+}
 
 const MergeDocRef = struct {
     input_idx: usize,

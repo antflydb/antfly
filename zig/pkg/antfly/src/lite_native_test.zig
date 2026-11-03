@@ -19,6 +19,7 @@ test {
     _ = @import("antfly_local_sources").storage_lite_backend;
     _ = @import("antfly_local_sources").storage_lite_conformance_test;
     _ = @import("antfly_local_sources").storage_lite_docstore;
+    _ = @import("antfly_local_sources").storage_lite_artifact_source;
     _ = @import("antfly_local_sources").storage_lite_index_storage;
     _ = @import("antfly_local_sources").storage_lite_native;
     _ = @import("antfly_local_sources").storage_lite_benchmark;

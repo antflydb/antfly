@@ -34363,11 +34363,11 @@ pub const DB = struct {
             if (state.replay_retirement.watermark != 0) try truncateReplaySequenceAsync(self.async_context, state.replay_retirement.watermark);
             return state.replay_retirement.runnable;
         }
-        if (phase == .artifacts or phase == .pressure_artifacts) {
+        if (phase == .artifacts or phase == .pressure_artifacts or phase == .index_storage) {
             // No primary snapshot may enclose this work. Captured SST/segment
             // inputs own immutable leases, and Native index-catalog reads join
             // their owner's short validated admission before taking a read pin.
-            const merged = blk: {
+            const merged = if (phase == .index_storage) @as(u64, 0) else blk: {
                 var snapshot_replay = try self.acquireSnapshotReplayMutation();
                 defer snapshot_replay.release();
                 try self.lockApplyForPortableRuntime();

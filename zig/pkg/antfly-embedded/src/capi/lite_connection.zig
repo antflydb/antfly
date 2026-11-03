@@ -43,6 +43,81 @@ const ProducerLease = @FieldType(@FieldType(EnrichmentRuntime, "ownership"), "le
 const NativeStore = std.meta.Child(std.meta.Child(@FieldType(std.meta.Child(@FieldType(h.Handle, "owned_lite_backend")), "native_docstore")));
 const WriterAdmission = std.meta.Child(@FieldType(NativeStore, "writer_admission"));
 const PublicationScope = @typeInfo(std.meta.Child(@FieldType(WriterAdmission, "enter"))).@"fn".param_types[1].?;
+const IndexManager = @import("../storage/db/catalog/index_manager.zig").IndexManager;
+const segment_mod = @import("../segment.zig");
+const persistent_mod = @import("../storage/persistent.zig");
+const artifact_source = @import("../storage/lite/artifact_source.zig");
+var test_pause_private_merge: std.atomic.Value(bool) = .init(false);
+var test_private_merge_entered: std.atomic.Value(bool) = .init(false);
+var test_private_merge_budget_failures: std.atomic.Value(u32) = .init(0);
+
+/// One immutable construction per file. The old runtime owns input readers and
+/// resource accounting, but no primary epoch or catalog read pin spans the job.
+/// Its worker never accesses mutable DB, scheduler, catalog, or logical IDs.
+const PendingTextMerge = struct {
+    owner: *Owner,
+    root: *h.Handle,
+    database: *h.db_mod.DB,
+    arena: std.heap.ArenaAllocator,
+    catalog: PublicationCatalog,
+    name: []const u8,
+    task: IndexManager.TextMergeTask,
+    config_hash: u64,
+    input_uses: std.ArrayListUnmanaged(segment_mod.SegmentSource) = .empty,
+    thread: ?std.Thread = null,
+    canceled: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+    result: ?segment_mod.PrivateMergeResult = null,
+    key_range: ?persistent_mod.SegmentKeyRange = null,
+    construction: ?artifact_source.Construction = null,
+    ready: bool = false,
+    applied: bool = false,
+    elapsed_ns: u64 = 0,
+
+    fn run(self: *@This()) void {
+        self.prepare() catch |err| {
+            self.failure = err;
+        };
+        self.done.store(true, .release);
+        self.owner.wake.set(h.handleLockIo());
+    }
+
+    fn prepare(self: *@This()) !void {
+        const started = @import("antfly_platform").time.monotonicNs();
+        defer self.elapsed_ns = @import("antfly_platform").time.monotonicNs() -| started;
+        if (comptime h.builtin.is_test) {
+            test_private_merge_entered.store(true, .release);
+            while (test_pause_private_merge.load(.acquire)) {
+                if (self.canceled.load(.acquire)) return error.Canceled;
+                try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+            }
+            if (test_private_merge_budget_failures.swap(0, .acq_rel) != 0) return error.ResourceBudgetExceeded;
+        }
+        var result = try IndexManager.executePrivateTextMergeTask(&self.task, &self.canceled);
+        errdefer result.deinit();
+        if (result.run) |output| {
+            self.key_range = try persistent_mod.PersistentIndex.privateMergeKeyRange(self.task.mergeAllocator(), (try output.sealedView()).source, &self.canceled);
+        }
+        if (self.canceled.load(.acquire)) return error.Canceled;
+        self.result = result;
+    }
+
+    fn deinit(self: *@This(), close_root: bool) void {
+        self.canceled.store(true, .release);
+        if (self.thread) |thread| thread.join();
+        if (self.construction) |*construction| construction.deinit();
+        if (self.key_range) |*range| range.deinit(self.task.mergeAllocator());
+        if (self.result) |*result| result.deinit();
+        for (self.input_uses.items) |source| source.releaseUse();
+        self.input_uses.deinit(alloc);
+        self.database.core.index_manager.cancelTextMergeTask(&self.task);
+        self.task.deinit(alloc);
+        self.arena.deinit();
+        if (close_root) Owner.closeMaintenanceSnapshot(self.root);
+        alloc.destroy(self);
+    }
+};
 
 /// Owned logical fingerprints need no turn-wide catalog pin. New metadata
 /// records persist their content digest, so even large catalogs can be checked
@@ -812,6 +887,9 @@ pub const Owner = struct {
         database_pending: bool = false,
         artifact_pending: bool = false,
         next_artifact_ns: i96 = 0,
+        // Performance hints, never publication authority. Bound historical
+        // configs; fresh runtimes retain the last failed plan's smaller width.
+        text_merge_caps: std.AutoHashMapUnmanaged(u64, u32) = .empty,
         serviced_sequence: u64 = 0,
         next_database_audit_ns: i96 = 0,
         shadow_next: bool = true,
@@ -856,6 +934,7 @@ pub const Owner = struct {
     // waiter and its deadline timer, and is shared by compatible connections.
     path_lock_io: std.Io.Threaded,
     test_maintenance_wait_ns: if (h.builtin.is_test) ?i96 else void = if (h.builtin.is_test) null else {},
+    test_text_merge_segment_limit: if (h.builtin.is_test) ?u64 else void = if (h.builtin.is_test) null else {},
     stopping: std.atomic.Value(bool) = .init(false),
     // One graph walk per owner. Admission waits without the foreground gate;
     // the worker only try-locks under that gate and yields to an active proof.
@@ -889,6 +968,8 @@ pub const Owner = struct {
     current: ?*h.Handle = null,
     retired: std.ArrayList(*h.Handle) = .empty,
     maintenance_snapshot: ?*h.Handle = null,
+    pending_text_merge: ?*PendingTextMerge = null,
+    maintenance_last_merge_stage: bool = false,
     // Only immutable index/cache state survives between bounded artifact slices.
     // No primary read epoch or borrowed catalog proof is retained here.
     maintenance_retained_logical: ?native.LogicalGenerations = null,
@@ -914,6 +995,15 @@ pub const Owner = struct {
         maintenance_proof_ns: u64 = 0,
         maintenance_replay_ns: u64 = 0,
         maintenance_artifacts_ns: u64 = 0,
+        // Preparation overlaps replay; do not mix it into actor phase time.
+        text_merge_jobs_started: u64 = 0,
+        text_merge_jobs_applied: u64 = 0,
+        text_merge_jobs_discarded: u64 = 0,
+        text_merge_in_flight: bool = false,
+        text_merge_prepare_ns: u64 = 0,
+        text_merge_staging_ns: u64 = 0,
+        text_merge_staged_bytes: u64 = 0,
+        text_merge_publication_ns: u64 = 0,
         maintenance_storage_ns: u64 = 0,
         retirement_work_pages: usize = 128,
         replay_budget_table_id: u64 = 0,
@@ -991,6 +1081,7 @@ pub const Owner = struct {
         // to a detached maintenance capture. No foreground operation may
         // silently continue through a different, apparently clean wrapper.
         if (self.maintenance_snapshot) |snapshot| if (needsOutcomeReconciliation(snapshot)) return error.OutcomeUnknown;
+        if (self.pending_text_merge) |pending| if (needsOutcomeReconciliation(pending.root)) return error.OutcomeUnknown;
         var known_maintenance: ?*h.Handle = null;
         if (self.current) |current| {
             if (current.lite_scheduling_owner == null) try self.bindGroupSourceState(current);
@@ -1005,6 +1096,7 @@ pub const Owner = struct {
             if (current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) {
                 if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+                try self.takeAvailableAllocator(file);
                 return current;
             }
             if (current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and
@@ -1015,6 +1107,7 @@ pub const Owner = struct {
                 // for every immutable input while foreground traffic waits.
                 try current.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(probe.header);
                 if (self.maintenance_snapshot) |snapshot| try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+                try self.takeAvailableAllocator(file);
                 if (self.options.profile == .native and self.options.open_mode == .writer and !file.free_pages_verified)
                     _ = try file.inheritAllocatorCertificate();
                 return current;
@@ -1023,6 +1116,10 @@ pub const Owner = struct {
                 const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
                 if (std.meta.eql(probe.header, captured.header) and
                     (try probe.file.stat(probe.runtime())).inode == (try captured.file.stat(captured.runtime())).inode) known_maintenance = snapshot;
+            }
+            if (self.pending_text_merge) |pending| {
+                const captured = &pending.root.owned_lite_backend.?.native_docstore.?.file;
+                if (std.meta.eql(probe.header, captured.header) and probe_inode == (try captured.file.stat(captured.runtime())).inode) known_maintenance = pending.root;
             }
         }
         var options = self.options;
@@ -1037,13 +1134,14 @@ pub const Owner = struct {
         if (self.options.profile == .native and self.options.open_mode == .writer) {
             certified = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             certified.?.allocator_cancel_token = &self.verification_cancel;
-            if (self.current) |previous| {
+            try self.takeAvailableAllocator(&certified.?);
+            if (certified.?.ledger == null) if (self.current) |previous| {
                 // Only an idle serving wrapper can donate. Active cursors,
                 // detached work and proof readers retain independent caches.
                 if (previous.query_borrows == 0 and previous.maintenance_references == 0 and
                     previous.allocator_verification_references == 0 and previous.sql_cursors.count() == 0)
                     _ = try certified.?.takeAllocatorRebaseBase(&previous.owned_lite_backend.?.native_docstore.?.file);
-            }
+            };
             if (try certified.?.inheritAllocatorCertificate()) {
                 options.allocator_verification_owner = &certified.?;
                 options.allocator_state_donor = &certified.?;
@@ -1679,6 +1777,33 @@ pub const Owner = struct {
         return self.refreshMaintenanceSnapshotAt(foreground, capture, null);
     }
 
+    /// Caller owns the path gate and writer lease. Mutable allocator state is
+    /// moved from a quiescent wrapper, including the retained merge owner. The
+    /// merge thread only reads independently leased immutable artifact sources.
+    fn takeAvailableAllocator(self: *Owner, file: *native.NativeFile) !void {
+        const donors = [_]?*h.Handle{ self.maintenance_snapshot, if (self.pending_text_merge) |pending| pending.root else null, self.current };
+        for (donors) |maybe_owner| if (maybe_owner) |owner| {
+            if (&owner.owned_lite_backend.?.native_docstore.?.file == file and
+                (owner.query_borrows != 0 or owner.maintenance_references != 0 or owner.allocator_verification_references != 0 or owner.sql_cursors.count() != 0)) return;
+        };
+        for (donors) |maybe_donor| if (maybe_donor) |donor| {
+            if (donor.query_borrows != 0 or donor.maintenance_references != 0 or donor.allocator_verification_references != 0 or donor.sql_cursors.count() != 0) continue;
+            if (try file.takeVerifiedAllocator(&donor.owned_lite_backend.?.native_docstore.?.file)) return;
+        };
+        var inherited_base = false;
+        if (file.ledger == null) for (donors) |maybe_donor| {
+            const donor = maybe_donor orelse continue;
+            if (donor.query_borrows != 0 or donor.maintenance_references != 0 or donor.allocator_verification_references != 0 or donor.sql_cursors.count() != 0) continue;
+            if (try file.takeAllocatorRebaseBase(&donor.owned_lite_backend.?.native_docstore.?.file)) {
+                inherited_base = true;
+                break;
+            }
+        };
+        // Preserve an explicit proof request when no cache was inherited.
+        // In particular, never reset a recipient whose detached proof is live.
+        if (inherited_base) _ = try file.inheritAllocatorCertificate();
+    }
+
     /// Physical service can capture a newer file tip without opening a serving
     /// DB. The optional authority is borrowed under path admission and may
     /// donate only its exact verified allocator cache, never logical runtimes.
@@ -1727,6 +1852,9 @@ pub const Owner = struct {
         options.artifact_reader_fence = false;
         options.allocator_verification_owner = file;
         if (physical_tip != null) options.allocator_state_donor = file;
+        if (physical_tip == null and foreground.query_borrows == 0 and foreground.maintenance_references == 0 and
+            foreground.allocator_verification_references == 0 and foreground.sql_cursors.count() == 0 and file.free_pages_verified)
+            options.allocator_state_donor = file;
         // This owner gate and background-turn lease make the previous detached
         // cache quiescent. Authenticate its rebase before opening indexes can
         // publish leases; mutable allocator state is moved, never shared.
@@ -1882,6 +2010,185 @@ pub const Owner = struct {
         }
     }
 
+    fn beginPendingTextMerge(self: *Owner, root: *h.Handle, database: *h.db_mod.DB, name: []const u8, catalog: *const PublicationCatalog, minimum_segments: u64) !bool {
+        if (self.pending_text_merge != null) return false;
+        self.gate.mutex.lockUncancelable(h.handleLockIo());
+        if (self.maintenance_schedules.get(.{ .table_id = database.core.identity_namespace.table_id, .incarnation = database.root_incarnation })) |schedule| {
+            for (database.core.index_manager.text_indexes.items) |*entry| {
+                if (schedule.text_merge_caps.get(h.db_mod.types.indexConfigHash(entry.config))) |cap| entry.merge_segment_cap.store(cap, .release);
+            }
+        }
+        self.gate.mutex.unlock(h.handleLockIo());
+        try database.lockApplyForPortableRuntime();
+        var task = database.core.index_manager.beginTextMergeTaskAboveSegmentCount(minimum_segments) catch |err| {
+            database.core.unlockApply();
+            return err;
+        } orelse {
+            database.core.unlockApply();
+            return false;
+        };
+        // Fresh runtimes reconstruct deletion deltas from the current active
+        // inputs at publication; do not keep scheduler registrations borrowed.
+        database.core.index_manager.cancelTextMergeTask(&task);
+        database.core.unlockApply();
+        var task_owned = true;
+        errdefer if (task_owned) task.deinit(alloc);
+        const pending = try alloc.create(PendingTextMerge);
+        pending.* = .{ .owner = self, .root = root, .database = database, .arena = .init(alloc), .catalog = catalog.*, .name = undefined, .task = task, .config_hash = h.db_mod.types.indexConfigHash(database.core.index_manager.textIndexEntry(task.index_name).?.config) };
+        task_owned = false;
+        errdefer pending.deinit(false);
+        const owned = pending.arena.allocator();
+        pending.name = try owned.dupe(u8, name);
+        for (&pending.catalog.paths, catalog.paths) |*path, original| path.* = try owned.dupe(u8, original);
+        try pending.input_uses.ensureTotalCapacity(alloc, task.source.len);
+        for (task.merge_indices) |index| {
+            const source = task.snapshot.segments[index].reader.immutableSource();
+            if (source != .ranges or source.ranges.immutable_identity == null) return error.Unsupported;
+            if (!source.acquireUse()) return error.EnrichmentWaitCanceled;
+            pending.input_uses.appendAssumeCapacity(source);
+        }
+        self.gate.mutex.lockUncancelable(h.handleLockIo());
+        const retained = self.retainMaintenanceTurnAssumeLocked();
+        self.gate.mutex.unlock(h.handleLockIo());
+        if (!try retained) return error.EnrichmentWaitCanceled;
+        errdefer {
+            self.gate.mutex.lockUncancelable(h.handleLockIo());
+            self.releaseMaintenanceTurnAssumeLocked();
+            self.gate.mutex.unlock(h.handleLockIo());
+        }
+        pending.thread = try std.Thread.spawn(.{}, PendingTextMerge.run, .{pending});
+        self.gate.mutex.lockUncancelable(h.handleLockIo());
+        self.pending_text_merge = pending;
+        self.publication_stats.text_merge_jobs_started +|= 1;
+        self.publication_stats.text_merge_in_flight = true;
+        self.gate.mutex.unlock(h.handleLockIo());
+        return true;
+    }
+
+    fn adjustTextMergeCap(self: *Owner, pending: *PendingTextMerge, failed: bool) !void {
+        self.gate.mutex.lockUncancelable(h.handleLockIo());
+        defer self.gate.mutex.unlock(h.handleLockIo());
+        const schedule = self.maintenance_schedules.getPtr(.{ .table_id = pending.database.core.identity_namespace.table_id, .incarnation = pending.database.root_incarnation }) orelse return;
+        if (failed) {
+            if (schedule.text_merge_caps.count() >= 64) schedule.text_merge_caps.clearRetainingCapacity();
+            try schedule.text_merge_caps.put(alloc, pending.config_hash, @intCast(@max(2, pending.task.source.len / 2)));
+        } else _ = schedule.text_merge_caps.remove(pending.config_hash);
+    }
+
+    fn discardPendingTextMerge(self: *Owner) void {
+        const io = h.handleLockIo();
+        self.gate.mutex.lockUncancelable(io);
+        const pending = self.pending_text_merge orelse {
+            self.gate.mutex.unlock(io);
+            return;
+        };
+        self.pending_text_merge = null;
+        self.publication_stats.text_merge_in_flight = false;
+        if (pending.done.load(.acquire)) self.publication_stats.text_merge_prepare_ns +|= pending.elapsed_ns;
+        if (pending.applied) self.publication_stats.text_merge_jobs_applied +|= 1 else self.publication_stats.text_merge_jobs_discarded +|= 1;
+        self.releaseMaintenanceTurnAssumeLocked();
+        self.maintenance_storage_pending = true;
+        self.gate.mutex.unlock(io);
+        // Foreground refresh cannot borrow this owner or ledger any longer.
+        // Drain and release large resources outside the foreground gate.
+        pending.deinit(true);
+    }
+
+    /// One bounded lease append alternates with replay/physical service. The
+    /// private output read stays outside admission. Only this construction's
+    /// native value is changed; no stale DB/index cache is consulted.
+    fn stagePendingTextMerge(self: *Owner, pending: *PendingTextMerge) !void {
+        const started = @import("antfly_platform").time.monotonicNs();
+        if (pending.failure) |err| return err;
+        const result = &pending.result.?;
+        if (result.run == null) {
+            pending.ready = true;
+            return;
+        }
+        // This is only an optimistic inode check. Reading an unfenced native
+        // header here could race a foreground header write; actual checkpoint
+        // reads and all publication validation follow path admission below.
+        const tip = try std.Io.Dir.cwd().openFile(h.handleLockIo(), self.path, .{ .mode = .read_only });
+        defer tip.close(h.handleLockIo());
+        if ((try tip.stat(h.handleLockIo())).inode != pending.catalog.inode) return error.EnrichmentSourceChanged;
+        const run = result.run.?;
+        const offset = if (pending.construction) |construction| construction.length else 0;
+        var bytes: [1024 * 1024]u8 = undefined;
+        const count = @min(bytes.len, run.len() - offset);
+        try (try run.sealedView()).source.readInto(offset, bytes[0..count]);
+        const store = pending.root.owned_lite_backend.?.native_docstore.?;
+        pending.root.maintenance_owner = self;
+        store.writer_admission = .{ .ptr = pending.root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
+        defer {
+            store.writer_admission = null;
+            pending.root.maintenance_owner = null;
+        }
+        try enterMaintenanceWriter(pending.root, .allocator_service);
+        defer leaveMaintenanceWriter(pending.root);
+        try self.takeAvailableAllocator(&store.file);
+        try pending.catalog.verifyNative(&store.file);
+        if (!store.file.free_pages_verified) return error.EnrichmentWaitCanceled;
+        if (pending.construction == null) pending.construction = try store.beginArtifactConstruction();
+        try pending.construction.?.append(store, bytes[0..count]);
+        self.publication_stats.text_merge_staged_bytes +|= count;
+        self.publication_stats.text_merge_staging_ns +|= @import("antfly_platform").time.monotonicNs() -| started;
+        if (pending.construction.?.length == run.len()) {
+            try pending.construction.?.seal(run.len());
+            pending.ready = true;
+        }
+    }
+
+    fn finishPendingTextMerge(self: *Owner, root: *h.Handle, database: *h.db_mod.DB, name: []const u8) !bool {
+        const pending = self.pending_text_merge orelse return false;
+        if (!pending.done.load(.acquire) or !pending.ready or !std.mem.eql(u8, pending.name, name)) return false;
+        const started = @import("antfly_platform").time.monotonicNs();
+        defer {
+            self.gate.mutex.lockUncancelable(h.handleLockIo());
+            self.publication_stats.text_merge_publication_ns +|= @import("antfly_platform").time.monotonicNs() -| started;
+            self.gate.mutex.unlock(h.handleLockIo());
+        }
+        // Only admission owns the current file cut. Reject DDL/replacement
+        // before linking any output to a logical segment name.
+        try enterMaintenanceWriter(root, .index);
+        pending.catalog.verifyNative(&root.owned_lite_backend.?.native_docstore.?.file) catch |err| {
+            leaveMaintenanceWriter(root);
+            return err;
+        };
+        leaveMaintenanceWriter(root);
+        try database.lockApplyForPortableRuntime();
+        const adopted = database.core.index_manager.adoptDetachedTextMergeTask(&pending.task) catch |err| {
+            database.core.unlockApply();
+            return err;
+        };
+        database.core.unlockApply();
+        if (!adopted) return error.EnrichmentSourceChanged;
+        defer database.core.index_manager.cancelTextMergeTask(&pending.task);
+        const task_alloc = pending.task.mergeAllocator();
+        var publication: IndexManager.TextMergeResult = .{
+            .owned_alloc = task_alloc,
+            .source_map = pending.result.?.source_map,
+            .publication_lookup_built = true,
+            .elapsed_ns = pending.elapsed_ns,
+        };
+        pending.result.?.source_map = null;
+        defer publication.deinit(alloc);
+        if (pending.construction) |*construction| {
+            const entry = database.core.index_manager.textIndexEntry(pending.task.index_name) orelse return error.EnrichmentSourceChanged;
+            publication.prepared_segments = try entry.persistent.prepareLinkedMergeSegment(task_alloc, root.owned_lite_backend.?.native_docstore.?, construction, &pending.key_range.?);
+            publication.prepared_owner = &entry.persistent;
+            pending.key_range = null;
+        }
+        // Resolve private provenance off the database-wide apply lock. Final
+        // publication validates the source identities and deletion counters.
+        try IndexManager.prepareTextMergeTaskPublicationLookup(&pending.task, &publication);
+        try database.lockApplyForPortableRuntime();
+        defer database.core.unlockApply();
+        const applied = try database.core.index_manager.finishTextMergeTask(&pending.task, &publication);
+        pending.applied = applied;
+        if (applied) try self.adjustTextMergeCap(pending, false);
+        return true;
+    }
+
     /// Captures one table under the connection fence. The pinned runtime owns
     /// all provider/catalog state while computation runs outside that fence.
     /// Every short publication revalidates its inode and checkpoint.
@@ -1908,6 +2215,31 @@ pub const Owner = struct {
             self.releaseMaintenanceTurnAssumeLocked();
             self.gate.mutex.unlock(turn_io);
         }
+        if (self.pending_text_merge) |pending| {
+            if (pending.done.load(.acquire) and !pending.ready and !self.maintenance_last_merge_stage) {
+                self.maintenance_last_merge_stage = true;
+                self.stagePendingTextMerge(pending) catch |err| switch (err) {
+                    error.EnrichmentWaitCanceled, error.FileBusy, error.WouldBlock => self.maintenance_turn_deferred = true,
+                    else => {
+                        if (needsOutcomeReconciliation(pending.root)) return err;
+                        if (err == error.ResourceBudgetExceeded or err == error.MergeOutputTooLarge) try self.adjustTextMergeCap(pending, true);
+                        self.discardPendingTextMerge();
+                        return err;
+                    },
+                };
+                if (self.pending_text_merge) |active| if (active.ready) {
+                    self.gate.mutex.lockUncancelable(turn_io);
+                    if (self.maintenance_schedules.getPtr(.{ .table_id = active.database.core.identity_namespace.table_id, .incarnation = active.database.root_incarnation })) |schedule| {
+                        schedule.artifact_pending = true;
+                        schedule.next_artifact_ns = 0;
+                    }
+                    self.runnable_sources.notify(turn_io, .{ .table_id = active.database.core.identity_namespace.table_id, .incarnation = active.database.root_incarnation });
+                    self.gate.mutex.unlock(turn_io);
+                };
+                return true;
+            }
+        }
+        self.maintenance_last_merge_stage = false;
         if (self.options.profile == .native and self.reader_coordinator.hasArtifactReleases())
             self.maintenance_storage_pending = true;
         if (self.options.profile == .native and self.maintenance_storage_pending and !self.maintenance_last_storage) {
@@ -1959,6 +2291,20 @@ pub const Owner = struct {
         }
         try @import("sql_commit.zig").recover(foreground);
         try @import("sql_ddl.zig").recover(foreground);
+        // A ready result can outlive its namespace. Validate before selection
+        // so a dropped table cannot strand its job forever. Publish ready
+        // merges before source retries which may need their segment capacity.
+        const publish_ready_merge = if (self.pending_text_merge) |active| active.ready else false;
+        if (publish_ready_merge) {
+            self.pending_text_merge.?.catalog.verifyNative(foreground_file) catch |err| {
+                lease.close();
+                lease_held = false;
+                self.gate.mutex.unlock(io);
+                gate_locked = false;
+                self.discardPendingTextMerge();
+                return err;
+            };
+        }
         // Catalog identities suffice for rotation and dropped-table pruning.
         // Opening every runtime here makes each bounded turn O(all indexes),
         // delaying the next group lease observation behind unrelated opens.
@@ -1966,8 +2312,8 @@ pub const Owner = struct {
         // Priority tickets are immutable hints. Resolve them against this
         // admitted catalog; dropped/recreated namespaces cannot borrow state
         // from the incarnation that originally queued the ticket.
-        var priority_name: ?[]const u8 = null;
-        if (self.runnable_sources.choose(io)) |key| {
+        var priority_name: ?[]const u8 = if (publish_ready_merge) self.pending_text_merge.?.name else null;
+        if (!publish_ready_merge) if (self.runnable_sources.choose(io)) |key| {
             if (self.maintenance_schedules.get(key)) |schedule| {
                 if (schedule.name) |name| {
                     const live_id = if (std.mem.eql(u8, name, "default")) foreground.db.core.identity_namespace.table_id else foreground.embedded_table_records.get(name);
@@ -1979,7 +2325,7 @@ pub const Owner = struct {
                     }
                 }
             }
-        }
+        };
         const audit = priority_name == null;
         if (audit) {
             self.publication_stats.maintenance_audit_turns +|= 1;
@@ -1995,6 +2341,7 @@ pub const Owner = struct {
                     alloc.destroy(state);
                 }
                 if (entry.value_ptr.name) |name| alloc.free(name);
+                entry.value_ptr.text_merge_caps.deinit(alloc);
                 self.maintenance_schedules.removeByPtr(entry.key_ptr);
             };
         } else self.publication_stats.maintenance_priority_turns +|= 1;
@@ -2065,7 +2412,7 @@ pub const Owner = struct {
         // bounded control page on the live coordinator, where the connection
         // and path fences already serialize journal/cursor publication. Never
         // run providers or construct replacement generations under this gate.
-        if (self.options.open_mode == .writer and schedule.source_recovery_next and now >= schedule.next_source_recovery_ns) {
+        if (!publish_ready_merge and self.options.open_mode == .writer and schedule.source_recovery_next and now >= schedule.next_source_recovery_ns) {
             const recovered = try database.repairRecoverableStartupIndexFailures(alloc, 1, .{ .source_replay_only = true });
             // A completed source cursor may still await an idle vector
             // certificate. Keep detached maintenance eligible to publish it;
@@ -2086,7 +2433,7 @@ pub const Owner = struct {
         // Group fan-in is bounded control work on the current coordinator.
         // Alternate it with detached provider replay per namespace so a busy
         // root or a long backfill cannot starve a child or its consumers.
-        if (self.options.open_mode == .writer and schedule.group_source_next and
+        if (!publish_ready_merge and self.options.open_mode == .writer and schedule.group_source_next and
             now >= schedule.next_group_source_ns)
         {
             // Group queues can advance through cursor/lease observations
@@ -2103,7 +2450,7 @@ pub const Owner = struct {
         }
         schedule.group_source_next = true;
         var ttl_more = false;
-        if (now >= schedule.next_ttl_ns) {
+        if (!publish_ready_merge and now >= schedule.next_ttl_ns) {
             // Each namespace owns its cleanup cadence. Failure still consumes
             // this slot and propagates for authority reconciliation; bounded
             // successful pages yield briefly without delaying other tables.
@@ -2126,12 +2473,12 @@ pub const Owner = struct {
         }
         self.maintenance_round_ttl_pending = self.maintenance_round_ttl_pending or ttl_more;
         if (namespace_pending or schedule.database_pending) self.maintenance_pending = true;
-        const run_source = if (self.options.profile == .native)
+        const run_source = !publish_ready_merge and if (self.options.profile == .native)
             namespace_pending or schedule.database_pending or entry_sequence != schedule.serviced_sequence or
                 database.core.nextDerivedSequence() != entry_sequence or now >= schedule.next_database_audit_ns
         else
             self.maintenance_pending;
-        const run_database = run_source or (schedule.artifact_pending and now >= schedule.next_artifact_ns);
+        const run_database = publish_ready_merge or run_source or (schedule.artifact_pending and now >= schedule.next_artifact_ns);
         const captured_artifact_pending = schedule.artifact_pending;
         if (run_source) schedule.database_pending = true;
         if (run_database) {
@@ -2139,15 +2486,8 @@ pub const Owner = struct {
             self.publication_stats.maintenance_database_turns +|= 1;
             if (run_source) self.publication_stats.maintenance_source_turns +|= 1 else self.publication_stats.maintenance_artifact_only_turns +|= 1;
         } else self.publication_stats.maintenance_idle_namespace_turns +|= 1;
-        const replay_debt = try foreground_file.replayAdmission();
-        const replay_urgent = if (replay_debt) |debt|
-            debt.records >= debt.limits.records / 2 or debt.bytes >= debt.limits.bytes / 2
-        else
-            false;
-        // Artifact IO and retirement still progress during replay pressure, but
-        // optional tier merges must not monopolize this same consumer lane.
-        // Pressure turns merge indexes needing producer headroom; ordinary
-        // policy merges resume once the durable replay backlog subsides.
+        // Immutable text construction runs independently of the replay actor;
+        // publication and native staging remain bounded maintenance slices.
 
         var turn_arena = std.heap.ArenaAllocator.init(alloc);
         defer turn_arena.deinit();
@@ -2210,6 +2550,25 @@ pub const Owner = struct {
         const store = root.owned_lite_backend.?.native_docstore.?;
         store.file.replay_consumer_admission = true;
         const split_index_work = independent and store.file.header.indexed_reclamation;
+        if (split_index_work) {
+            if (comptime h.builtin.is_test) if (self.test_text_merge_segment_limit) |limit| {
+                if (database.text_merge_runtime == null) try database.initOptionalTextMergeRuntime(.{
+                    .enabled = true,
+                    .max_pending_segments = limit,
+                    .max_pending_bytes = 0,
+                    .manual_producer_assistance = true,
+                    .defer_producer_to_owner = true,
+                });
+            };
+            if (database.text_merge_runtime) |runtime| {
+                runtime.config.defer_producer_to_owner = true;
+                if (comptime h.builtin.is_test) if (self.test_text_merge_segment_limit) |limit| {
+                    runtime.config.enabled = true;
+                    runtime.config.max_pending_segments = limit;
+                    runtime.config.max_pending_bytes = 0;
+                };
+            }
+        }
         defer store.primary_reads_require_admission = false;
         const foreground_header = foreground.owned_lite_backend.?.native_docstore.?.file.header;
         const maintenance_entry_header = store.file.header;
@@ -2295,7 +2654,7 @@ pub const Owner = struct {
             };
             artifact_more = retirement_more;
             pending = pending or retirement_more;
-            const more = database.runBackgroundTurnWithCancellation(cancellation, if (replay_urgent) .pressure_artifacts else .artifacts) catch |err| blk: {
+            const more = database.runBackgroundTurnWithCancellation(cancellation, .index_storage) catch |err| blk: {
                 maintenance_error = err;
                 maintenance_error_phase = .artifacts;
                 break :blk true;
@@ -2303,6 +2662,29 @@ pub const Owner = struct {
             artifact_more = artifact_more or more;
             pending = pending or more;
             retain_artifact_runtime = more and maintenance_error == null;
+            if (maintenance_error == null) {
+                const completed = self.finishPendingTextMerge(root, database, publication_name) catch |err| failed: {
+                    if (err == error.ResourceBudgetExceeded or err == error.MergeOutputTooLarge) {
+                        if (self.pending_text_merge) |active| self.adjustTextMergeCap(active, true) catch {};
+                    }
+                    self.discardPendingTextMerge();
+                    maintenance_error = err;
+                    maintenance_error_phase = .artifacts;
+                    break :failed false;
+                };
+                if (completed) self.discardPendingTextMerge();
+                if (self.pending_text_merge == null and maintenance_error == null) {
+                    const started = self.beginPendingTextMerge(root, database, publication_name, &catalog.?, 0) catch |err| failed: {
+                        maintenance_error = err;
+                        maintenance_error_phase = .artifacts;
+                        break :failed false;
+                    };
+                    artifact_more = artifact_more or started;
+                }
+                if (self.pending_text_merge) |active| {
+                    if (std.mem.eql(u8, active.name, publication_name)) artifact_more = true;
+                }
+            }
             if (!retirement_more) {
                 if (database.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay| {
                     artifact_delay_ns = delay;
@@ -2319,13 +2701,17 @@ pub const Owner = struct {
             }
         }
         root.maintenance_publication = null;
+        // A retained immutable owner must not borrow a scheduling entry which
+        // a later dropped-namespace audit may destroy before this DB closes.
+        if (independent) database.borrowed_group_source_state = null;
         // No detached computation/publication can use the catalog now. Drop
         // its checkpoint pin before physical service, which otherwise retains
         // an obsolete reader fence throughout its own reuse/vacuum attempt.
         if (catalog) |*proof| proof.deinit();
         catalog = null;
         const retained_logical: ?native.LogicalGenerations = if (retain_artifact_runtime) store.file.activeCheckpoint().logical else null;
-        if (independent and root.db_live and !retain_artifact_runtime) {
+        const merge_owns_root = if (self.pending_text_merge) |active| active.root == root else false;
+        if (independent and root.db_live and !retain_artifact_runtime and !merge_owns_root) {
             // End the input fences before reclamation. Keeping them in an
             // idle runtime would needlessly prevent in-place page service.
             @import("tables.zig").closeAll(root);
@@ -2338,6 +2724,8 @@ pub const Owner = struct {
         const artifacts_finished = @import("antfly_platform").time.monotonicNs();
         const artifact_failed = maintenance_error != null;
         if (comptime h.builtin.is_test) if (self.test_before_storage_service) |hook| hook.notify(hook.ptr, root);
+        store.defer_background_vacuum = self.pending_text_merge != null;
+        defer store.defer_background_vacuum = false;
         store.maintainBackgroundOnce(&self.verification_cancel) catch |err| {
             if (maintenance_error == null) {
                 maintenance_error = err;
@@ -2357,6 +2745,11 @@ pub const Owner = struct {
         self.publication_stats.maintenance_artifacts_ns +|= artifacts_finished -| replay_finished;
         self.publication_stats.maintenance_storage_ns +|= @import("antfly_platform").time.monotonicNs() -| artifacts_finished;
         self.maintenance_retained_logical = retained_logical;
+        if (merge_owns_root) {
+            std.debug.assert(self.maintenance_snapshot == root);
+            self.maintenance_snapshot = null;
+            self.maintenance_retained_logical = null;
+        }
         if (maintenance_error) |err| {
             self.noteMaintenanceFailure(err, publication.identity.table_id, maintenance_error_phase);
         } else self.publication_stats.last_maintenance_error = null;
@@ -2368,7 +2761,7 @@ pub const Owner = struct {
             // Foreground table admission can grow the map while this turn is
             // detached. Reacquire its entry after taking the gate again.
             if (self.maintenance_schedules.getPtr(.{ .table_id = publication.identity.table_id, .incarnation = publication.incarnation })) |completed| {
-                completed.database_pending = source_more;
+                if (!publish_ready_merge) completed.database_pending = source_more;
                 completed.artifact_pending = artifact_more or artifact_failed;
                 completed.next_artifact_ns = std.Io.Clock.awake.now(io).nanoseconds + artifact_delay_ns;
                 if (source_completed) {
@@ -2456,6 +2849,7 @@ pub const Owner = struct {
                 if (!try tip.takeVerifiedAllocator(previous)) _ = try tip.takeAllocatorRebaseBase(previous);
             }
         }
+        try self.takeAvailableAllocator(&tip);
         // Certificate validation reuses the detached ledger/digest. It does not
         // construct DBs, open index leases, or run source/provider maintenance.
         // A genuinely unchecked tip still yields to the ordinary proof lane.
@@ -2483,6 +2877,8 @@ pub const Owner = struct {
         self.gate.mutex.unlock(io);
         gate_locked = false;
         const service_started = @import("antfly_platform").time.monotonicNs();
+        store.defer_background_vacuum = self.pending_text_merge != null;
+        defer store.defer_background_vacuum = false;
         const result = store.maintainBackgroundOnce(&self.verification_cancel);
         self.gate.mutex.lockUncancelable(io);
         gate_locked = true;
@@ -2541,7 +2937,7 @@ pub const Owner = struct {
         // through path leases, marker scans and the foreground gate at zero delay.
         if (!self.allocator_proof_mutex.tryLock()) return 100;
         self.allocator_proof_mutex.unlock(h.handleLockIo());
-        return if (self.runnable_sources.pending(h.handleLockIo()) or self.maintenance_storage_pending or self.maintenance_table_cursor != 0) 0 else if (pending) 100 else 1000;
+        return if (self.runnable_sources.pending(h.handleLockIo()) or self.maintenance_storage_pending or self.maintenance_table_cursor != 0) 0 else if (pending or self.pending_text_merge != null) 100 else 1000;
     }
 
     pub fn maintenanceWaitMillisForTest(self: *Owner, pending: bool) i64 {
@@ -2627,6 +3023,7 @@ pub const Owner = struct {
                 alloc.destroy(state);
             }
             if (schedule.name) |name| alloc.free(name);
+            schedule.text_merge_caps.deinit(alloc);
         }
         self.maintenance_schedules.deinit(alloc);
         self.runnable_sources.deinit(alloc);
@@ -2688,7 +3085,9 @@ pub const Owner = struct {
 
     fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
-        self.certifyAllocatorOnClose() catch |err| {
+        const uncertain_merge = if (self.pending_text_merge) |pending| needsOutcomeReconciliation(pending.root) else false;
+        self.discardPendingTextMerge();
+        if (!uncertain_merge) self.certifyAllocatorOnClose() catch |err| {
             // Failure only loses the optimization; the previous checkpoint
             // remains recoverable and the next owner uses ordinary proof.
             std.log.warn("native Lite allocator certificate deferred: {s}", .{@errorName(err)});
@@ -4536,6 +4935,270 @@ const AdmissionFollowupFixture = struct {
         }
     }
 };
+
+fn seedPausedPrivateMerge(fixture: *AdmissionFollowupFixture) !*PendingTextMerge {
+    return seedPausedPrivateMergeInTable(fixture, null);
+}
+
+fn seedPausedPrivateMergeInTable(fixture: *AdmissionFollowupFixture, table_name: ?[]const u8) !*PendingTextMerge {
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    if (table_name == null) try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    const owner = fixture.connection.owner;
+    {
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const root = try owner.refresh();
+        const database = if (table_name) |name| blk: {
+            try @import("tables.zig").create(root, name, "{}", false);
+            const child = try @import("tables.zig").get(root, name);
+            try child.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+            break :blk child;
+        } else &root.db;
+        const entry = database.core.index_manager.textIndexEntry("text").?;
+        for (0..12) |i| {
+            var id: [32]u8 = undefined;
+            var writer = segment_mod.SegmentWriter.init(std.testing.allocator);
+            defer writer.deinit();
+            try writer.addStoredDoc(try std.fmt.bufPrint(&id, "private-{d}", .{i}), "{}");
+            const bytes = try writer.build();
+            defer std.testing.allocator.free(bytes);
+            try entry.persistent.indexSegment(bytes);
+        }
+        entry.compaction_pending.store(true, .release);
+    }
+    test_private_merge_entered.store(false, .release);
+    test_pause_private_merge.store(true, .release);
+    errdefer test_pause_private_merge.store(false, .release);
+    for (0..64) |_| {
+        owner.maintenance_pending = true;
+        _ = try owner.maintenanceTurn();
+        if (owner.pending_text_merge != null) break;
+    }
+    const pending = owner.pending_text_merge orelse return error.PrivateMergeWasNotScheduled;
+    for (0..1000) |_| {
+        if (test_private_merge_entered.load(.acquire)) break;
+        try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(test_private_merge_entered.load(.acquire));
+    try std.testing.expect(owner.maintenance_snapshot != pending.root);
+    try std.testing.expect(!pending.done.load(.acquire));
+    return pending;
+}
+
+test "capi native asynchronous text merge preserves newer segments and deletion races while replay advances" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("private-merge-replay-and-deletes", 5000, .batch);
+    defer fixture.deinit();
+    defer test_pause_private_merge.store(false, .release);
+    const pending = try seedPausedPrivateMerge(&fixture);
+    const owner = fixture.connection.owner;
+    defer owner.test_text_merge_segment_limit = null;
+    var selected_id: ?[]u8 = null;
+    for (pending.task.merge_indices) |index| {
+        selected_id = try pending.task.snapshot.segments[index].reader.storedIdAlloc(std.testing.allocator, 0);
+        if (selected_id != null) break;
+    }
+    const deleted_id = selected_id orelse return error.StoredMergeFixtureMissing;
+    defer std.testing.allocator.free(deleted_id);
+    const sources_before = owner.publication_stats.maintenance_source_turns;
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&output);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice("{\"inserts\":{\"new-source-during-merge\":{\"text\":\"new primary source\"}},\"sync_level\":\"write\"}"), &output));
+    for (0..32) |_| {
+        _ = try owner.maintenanceTurn();
+        if (owner.publication_stats.maintenance_source_turns > sources_before) break;
+    }
+    try std.testing.expect(owner.publication_stats.maintenance_source_turns > sources_before);
+    try std.testing.expect(owner.pending_text_merge == pending);
+    {
+        // A Connection lease starts an epoch-sharing batch. Inspect outside
+        // that batch so the probe itself cannot create the observed frontier.
+        const io = h.handleLockIo();
+        owner.gate.mutex.lockUncancelable(io);
+        defer owner.gate.mutex.unlock(io);
+        var lease = try native.lockWriterPathWithIo(alloc, io, fixture.path);
+        defer lease.close();
+        var peer = try native.NativeFile.openWithIo(alloc, io, fixture.path, .{ .externally_locked = true, .no_sync = true });
+        defer peer.close();
+        peer.reader_coordinator = owner.reader_coordinator;
+        try peer.inheritAllocatorVerification(&owner.current.?.owned_lite_backend.?.native_docstore.?.file);
+        if (!peer.free_pages_verified) _ = try peer.inheritAllocatorCertificate();
+        peer.allocator_certificate_on_commit = true;
+        const epochs = try @import("../storage/lite/reader_epochs.zig").scan(alloc, io, fixture.path, peer.header.reader_epoch_namespace, (try peer.file.stat(io)).inode);
+        try std.testing.expect(epochs.data == null);
+        const reused_before = (try peer.allocatorStats()).?.reused_pages;
+        const physical_value: [8192]u8 = @splat('v');
+        for (0..64) |_| try peer.putDocument("private-merge-physical-reuse", &physical_value);
+        try std.testing.expect((try peer.allocatorStats()).?.reused_pages > reused_before);
+    }
+    var expected_live: u32 = 0;
+    var appended_id: u64 = 0;
+    {
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const current = try owner.refresh();
+        const entry = current.db.core.index_manager.textIndexEntry("text").?;
+        expected_live = entry.persistent.snapshot().liveDocCount();
+        try std.testing.expect(try entry.persistent.deleteById(deleted_id));
+        var writer = segment_mod.SegmentWriter.init(std.testing.allocator);
+        defer writer.deinit();
+        try writer.addStoredDoc("appended-during-merge", "{}");
+        const bytes = try writer.build();
+        defer std.testing.allocator.free(bytes);
+        try entry.persistent.indexSegment(bytes);
+        const snapshot = entry.persistent.snapshot();
+        appended_id = snapshot.segments[snapshot.segments.len - 1].id;
+        try std.testing.expectEqual(expected_live, snapshot.liveDocCount());
+        owner.test_text_merge_segment_limit = snapshot.segments.len;
+    }
+    api.antfly_buffer_free_zero(&output);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(fixture.id, .fromSlice("{\"inserts\":{\"blocked-source-during-merge\":{\"text\":\"capacity must return before this can replay\"}},\"sync_level\":\"write\"}"), &output));
+    // At the current segment limit this new record cannot publish. A ready
+    // merge must take an artifact-only turn before replay retries its capacity.
+    for (0..8) |_| _ = try owner.maintenanceTurn();
+    {
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const current = try owner.refresh();
+        try std.testing.expectEqual(owner.test_text_merge_segment_limit.?, current.db.core.index_manager.textIndexEntry("text").?.persistent.snapshot().segments.len);
+    }
+    test_pause_private_merge.store(false, .release);
+    for (0..1000) |_| {
+        _ = try owner.maintenanceTurn();
+        if (owner.pending_text_merge == null) break;
+        try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(owner.pending_text_merge == null);
+    for (0..32) |_| _ = try owner.maintenanceTurn();
+    var lease = try fixture.connection.acquire();
+    defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    defer lease.close();
+    const current = try owner.refresh();
+    const snapshot = current.db.core.index_manager.textIndexEntry("text").?.persistent.snapshot();
+    try std.testing.expectEqual(expected_live + 1, snapshot.liveDocCount());
+    var appended_present = false;
+    for (snapshot.segments) |segment| if (segment.id == appended_id) {
+        appended_present = true;
+    };
+    try std.testing.expect(appended_present);
+    try std.testing.expect(owner.publication_stats.text_merge_jobs_applied != 0);
+    try std.testing.expect(owner.publication_stats.text_merge_prepare_ns != 0);
+    try std.testing.expect(owner.publication_stats.text_merge_staged_bytes != 0);
+    try std.testing.expect((try current.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+}
+
+test "capi native asynchronous text merge retires a ready result when its namespace is dropped" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("private-merge-drop-ready-namespace", 5000, .batch);
+    defer fixture.deinit();
+    defer test_pause_private_merge.store(false, .release);
+    const pending = try seedPausedPrivateMergeInTable(&fixture, "merge_scope");
+    const owner = fixture.connection.owner;
+    try std.testing.expectEqualStrings("merge_scope", pending.name);
+    test_pause_private_merge.store(false, .release);
+    for (0..1000) |_| {
+        _ = try owner.maintenanceTurn();
+        if (owner.pending_text_merge == pending and pending.ready) break;
+        try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(owner.pending_text_merge == pending and pending.ready);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, @import("tables.zig").antfly_db_drop_table(fixture.id, .fromSlice("merge_scope")));
+    var rejected = false;
+    for (0..8) |_| {
+        _ = owner.maintenanceTurn() catch |err| failed: {
+            if (err != error.EnrichmentSourceChanged) return err;
+            rejected = true;
+            break :failed true;
+        };
+        if (rejected) break;
+    }
+    try std.testing.expect(rejected);
+    try std.testing.expect(owner.pending_text_merge == null);
+    try std.testing.expect(!owner.publication_stats.text_merge_in_flight);
+    try fixture.expectWritten(.batch, true);
+}
+
+test "capi native asynchronous text merge rejects DDL and drains canceled construction on close" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Scenario = enum { close, create, delete };
+    for ([_]Scenario{ .close, .create, .delete }) |scenario| {
+        var fixture = try AdmissionFollowupFixture.init("private-merge-lifecycle", 5000, .batch);
+        var closed = false;
+        defer if (!closed) fixture.deinit();
+        defer test_pause_private_merge.store(false, .release);
+        _ = try seedPausedPrivateMerge(&fixture);
+        if (scenario == .close) {
+            const started = @import("antfly_platform").time.monotonicNs();
+            fixture.deinit();
+            closed = true;
+            try std.testing.expect(@import("antfly_platform").time.monotonicNs() -| started < 5 * std.time.ns_per_s);
+        } else {
+            if (scenario == .create) {
+                try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"unrelated\",\"type\":\"full_text\"}")));
+            } else {
+                var deleted = false;
+                try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_delete_index(fixture.id, .fromSlice("text"), &deleted));
+                try std.testing.expect(deleted);
+            }
+            test_pause_private_merge.store(false, .release);
+            var rejected = false;
+            for (0..1000) |_| {
+                _ = fixture.connection.owner.maintenanceTurn() catch |err| failed: {
+                    if (err != error.EnrichmentSourceChanged) return err;
+                    rejected = true;
+                    break :failed true;
+                };
+                if (rejected) break;
+                try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expect(rejected);
+            try std.testing.expect(fixture.connection.owner.pending_text_merge == null);
+            try fixture.expectWritten(.batch, true);
+        }
+    }
+}
+
+test "capi native asynchronous text merge preserves resource retry hints across fresh runtimes and yields producer admission" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("private-merge-budget-retry", 5000, .batch);
+    defer fixture.deinit();
+    defer test_pause_private_merge.store(false, .release);
+    defer test_private_merge_budget_failures.store(0, .release);
+    const pending = try seedPausedPrivateMerge(&fixture);
+    const attempted = pending.task.source.len;
+    // The actor must yield immediately; waiting or assisting here would block
+    // the very lane which stages the independent construction's result.
+    try pending.database.initOptionalTextMergeRuntime(.{ .enabled = true, .max_pending_segments = 1, .max_pending_bytes = 0, .manual_producer_assistance = true, .defer_producer_to_owner = true });
+    const started = @import("antfly_platform").time.monotonicNs();
+    try std.testing.expectError(error.EnrichmentWaitCanceled, pending.database.text_merge_runtime.?.acquireProducerPermit("text", 1, 0));
+    try std.testing.expect(@import("antfly_platform").time.monotonicNs() -| started < std.time.ns_per_s);
+    test_private_merge_budget_failures.store(1, .release);
+    test_pause_private_merge.store(false, .release);
+    const owner = fixture.connection.owner;
+    var rejected = false;
+    for (0..1000) |_| {
+        _ = owner.maintenanceTurn() catch |err| failed: {
+            if (err != error.ResourceBudgetExceeded) return err;
+            rejected = true;
+            break :failed true;
+        };
+        if (rejected) break;
+        try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(rejected);
+    try std.testing.expect(owner.pending_text_merge == null);
+    test_pause_private_merge.store(true, .release);
+    for (0..64) |_| {
+        owner.maintenance_pending = true;
+        _ = try owner.maintenanceTurn();
+        if (owner.pending_text_merge != null) break;
+    }
+    const retry = owner.pending_text_merge orelse return error.PrivateMergeRetryWasNotScheduled;
+    try std.testing.expect(retry.task.source.len <= @max(2, attempted / 2));
+}
 
 const AdmissionFollowupProbe = struct {
     connection: *Connection,

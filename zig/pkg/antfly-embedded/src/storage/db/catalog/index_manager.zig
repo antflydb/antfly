@@ -2013,7 +2013,7 @@ pub const IndexManager = struct {
             self.* = undefined;
         }
 
-        fn mergeAllocator(self: *const TextMergeTask) Allocator {
+        pub fn mergeAllocator(self: *const TextMergeTask) Allocator {
             return self.deletion_state.budget.allocator();
         }
 
@@ -20759,7 +20759,6 @@ pub const IndexManager = struct {
     /// unless an individual index approaches its producer admission bound.
     /// Deferred policy merges retain their pending bit for ordinary service.
     pub fn runTextMergeSchedulerAboveSegmentCount(self: *IndexManager, max_steps: usize, minimum_segments: u64) !usize {
-        if (comptime builtin.is_test) if (test_before_text_merge_step) |hook| if (hook.manager == self) try hook.notify(hook.ptr);
         var completed: usize = 0;
         while (completed < max_steps) {
             var task = (try self.beginTextMergeTaskAboveSegmentCount(minimum_segments)) orelse break;
@@ -25517,7 +25516,8 @@ pub const IndexManager = struct {
         return self.beginTextMergeTaskAboveSegmentCount(0);
     }
 
-    fn beginTextMergeTaskAboveSegmentCount(self: *IndexManager, minimum_segments: u64) !?TextMergeTask {
+    pub fn beginTextMergeTaskAboveSegmentCount(self: *IndexManager, minimum_segments: u64) !?TextMergeTask {
+        if (comptime builtin.is_test) if (test_before_text_merge_step) |hook| if (hook.manager == self) try hook.notify(hook.ptr);
         const now_ns = platform_time.monotonicNs();
         self.text_merge_scheduler.pruneExpiredQuarantines(self.alloc, now_ns);
         _ = self.textMergeStats();
@@ -25563,6 +25563,64 @@ pub const IndexManager = struct {
             }
         }
         return null;
+    }
+
+    /// Reattach a detached immutable merge to the current runtime. Source IDs
+    /// alone do not establish identity: a namespace may have been recreated.
+    /// Reconstruct deletion deltas from the current snapshot, preserving newer
+    /// appended segments and every tombstone committed during construction.
+    pub fn adoptDetachedTextMergeTask(self: *IndexManager, task: *const TextMergeTask) !bool {
+        const entry = self.textIndexEntry(task.index_name) orelse return false;
+        if (!entry.apply_mutex.tryLock()) return error.IndexApplyBusy;
+        defer entry.apply_mutex.unlock();
+        const current = entry.persistent.acquireSnapshot();
+        defer current.release();
+        for (task.source, task.merge_indices, task.deletion_state.deltas) |source, source_idx, *delta| {
+            const segment = findSegmentById(current, source.id) orelse return false;
+            const original = &task.snapshot.segments[source_idx];
+            const expected = original.reader.immutableSource();
+            const actual = segment.reader.immutableSource();
+            if (expected != .ranges or actual != .ranges or expected.ranges.immutable_identity == null or
+                !std.meta.eql(expected.ranges.immutable_identity, actual.ranges.immutable_identity) or
+                original.reader.doc_count != segment.reader.doc_count) return false;
+            delta.bitmap.deinit();
+            delta.* = TextMergeDeletionDelta.init(task.mergeAllocator());
+            var deleted = try segment.cloneDeleted(task.mergeAllocator());
+            defer if (deleted) |*bitmap| bitmap.deinit();
+            if (source.deleted) |frozen| {
+                var frozen_iterator = frozen.iterator();
+                while (frozen_iterator.next()) |doc| {
+                    if (deleted == null or !deleted.?.contains(doc)) return false;
+                }
+            }
+            if (deleted) |bitmap| {
+                var iterator = bitmap.iterator();
+                while (iterator.next()) |doc| {
+                    if (source.deleted) |frozen| if (frozen.contains(doc)) continue;
+                    try delta.bitmap.add(doc);
+                    delta.count += 1;
+                }
+            }
+        }
+        task.deletion_state.valid = true;
+        try entry.attachMergeDeletionState(self.alloc, task.deletion_state);
+        errdefer entry.detachMergeDeletionState(task.deletion_state);
+        try self.text_merge_scheduler.registerSource(self.alloc, task.index_name, task.source, task.deletion_state);
+        return true;
+    }
+
+    pub fn executePrivateTextMergeTask(task: *const TextMergeTask, canceled: *const std.atomic.Value(bool)) !segment_mod.PrivateMergeResult {
+        const task_alloc = task.mergeAllocator();
+        const inputs = try task_alloc.alloc(segment_mod.MergeInput, task.source.len);
+        defer task_alloc.free(inputs);
+        for (task.source, task.merge_indices, inputs) |source, source_idx, *input| {
+            input.* = .{ .reader = &task.snapshot.segments[source_idx].reader, .deleted = source.deleted };
+        }
+        return segment_mod.preparePrivateMerge(task_alloc, inputs, .{
+            .io = task.persistent.io orelse return error.Unsupported,
+            .directory = task.persistent.privateScratchDirectory(".") orelse return error.Unsupported,
+            .resource_manager = task.persistent.writer.resource_manager,
+        }, canceled, std.math.maxInt(u32)) catch |err| task.deletion_state.allocationError(err);
     }
 
     pub fn executeTextMergeTask(alloc: Allocator, task: *const TextMergeTask) !TextMergeResult {

@@ -43,6 +43,9 @@ pub const Config = struct {
     /// producer capacity. Productive merges renew their no-progress budget;
     /// the total elapsed work is still included in backpressure telemetry.
     manual_producer_assistance: bool = false,
+    /// A native path owner runs immutable construction independently. Its
+    /// replay actor must yield rather than wait for itself to free capacity.
+    defer_producer_to_owner: bool = false,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
 };
 
@@ -828,6 +831,10 @@ const PlatformTextMergeRuntime = struct {
             // blocked on the shared byte budget. A segment-blocked producer on
             // index A must not stall independent index B.
             if (self.hasEarlierProducerAdmissionConflict(&waiter)) {
+                if (self.config.defer_producer_to_owner) {
+                    self.mutex.unlock(io);
+                    return error.EnrichmentWaitCanceled;
+                }
                 if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
                 if (!recorded_wait) {
                     self.backpressure_events += 1;
@@ -920,6 +927,10 @@ const PlatformTextMergeRuntime = struct {
                 self.mutex.unlock(io);
                 self.recordBackpressureTerminal(.merge_failed);
                 return error.TextMergeBackpressureUnavailable;
+            }
+            if (self.config.defer_producer_to_owner) {
+                self.mutex.unlock(io);
+                return error.EnrichmentWaitCanceled;
             }
             if (!waiter.enqueued) self.enqueueProducerAdmissionWaiter(&waiter);
             // The shared byte dimension imposes cross-index FIFO whenever it

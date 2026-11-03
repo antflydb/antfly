@@ -293,6 +293,34 @@ pub const Registry = struct {
         return std.Io.Dir.cwd().createFile(runtime, path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
     }
 
+    pub fn beginConstruction(self: *Registry) !Construction {
+        const owner = self.beginCallback() orelse return error.ReadOnly;
+        defer self.endCallback();
+        if (owner.read_only) return error.ReadOnly;
+        const runtime = self.io();
+        const a = self.allocator;
+        owner.generation_lock.lockSharedUncancelable(owner.file.runtime());
+        defer owner.generation_lock.unlockShared(owner.file.runtime());
+        const inode = (try owner.file.file.stat(owner.file.runtime())).inode;
+        var random: [16]u8 = undefined;
+        try runtime.randomSecure(&random);
+        const id = std.fmt.bytesToHex(random, .lower);
+        const key = try std.mem.concat(a, u8, &.{ key_prefix, &id });
+        errdefer a.free(key);
+        const marker_name = try std.mem.concat(a, u8, &.{ marker_prefix, &id });
+        defer a.free(marker_name);
+        const path = try std.fs.path.join(a, &.{ std.fs.path.dirname(self.path) orelse ".", marker_name });
+        errdefer a.free(path);
+        const marker = try self.createMarker(path);
+        errdefer {
+            marker.close(runtime);
+            std.Io.Dir.cwd().deleteFile(runtime, path) catch {};
+        }
+        const ticket = if (self.coordinator) |coordinator| try coordinator.reserveArtifactRelease(inode, key) else null;
+        _ = self.references.fetchAdd(1, .monotonic);
+        return .{ .registry = self, .key = key, .marker_path = path, .marker = marker, .inode = inode, .release_ticket = ticket };
+    }
+
     fn findPooled(self: *Registry, owner: *docs.Store, key: []const u8) !?*State {
         if (!owner.artifactPoolLookupAllowed()) return null;
         // The pin lasts only for lookup. A hit already owns a durable value
@@ -375,6 +403,13 @@ pub const Registry = struct {
             .resource_manager = owner.resource_manager,
             .artifact_key = artifact_key,
         };
+        var identity_digest = std.crypto.hash.sha2.Sha256.init(.{});
+        identity_digest.update("antfly native immutable artifact v1");
+        identity_digest.update(std.mem.asBytes(&captured_inode));
+        identity_digest.update(std.mem.asBytes(&state.value.root));
+        identity_digest.update(std.mem.asBytes(&state.value.length));
+        identity_digest.update(state.value.inline_bytes);
+        state.immutable_identity = identity_digest.finalResult();
         state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visitUncached, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, 160 * 1024);
         self.mutex.lockUncancelable(runtime);
         state.next = self.first;
@@ -401,6 +436,147 @@ pub const Registry = struct {
     }
 };
 
+/// A bounded unpublished native value. Its locked marker, release hint, and
+/// registry reference outlive Store refresh. Appends use the current admitted
+/// Store and are idempotent after an ambiguous successful publication.
+pub const Construction = struct {
+    registry: ?*Registry,
+    key: []u8,
+    marker_path: []u8,
+    marker: std.Io.File,
+    inode: u64,
+    release_ticket: ?*native.ReaderCoordinator.ArtifactRelease,
+    length: usize = 0,
+    sealed: bool = false,
+
+    pub fn append(self: *Construction, owner: *docs.Store, bytes: []const u8) !void {
+        if (self.registry == null or self.sealed) return error.InvalidArtifactConstructionState;
+        const Request = struct {
+            construction: *Construction,
+            bytes: []const u8,
+            fn apply(raw: *anyopaque, file: *native.NativeFile) !void {
+                const request: *@This() = @ptrCast(@alignCast(raw));
+                const building = request.construction;
+                if ((try file.file.stat(file.runtime())).inode != building.inode) return error.StaleArtifactConstruction;
+                try file.appendArtifactConstruction(building.key, building.length, request.bytes);
+            }
+        };
+        var request: Request = .{ .construction = self, .bytes = bytes };
+        try owner.submitArtifactLeaseMutation(&request, Request.apply);
+        self.length += bytes.len;
+    }
+
+    pub fn seal(self: *Construction, expected_length: usize) !void {
+        if (self.registry == null or expected_length == 0 or self.length != expected_length) return error.InvalidArtifactConstructionState;
+        self.sealed = true;
+    }
+
+    pub fn link(self: *Construction, owner: *docs.Store, path: []const u8) !void {
+        if (self.registry == null or !self.sealed) return error.InvalidArtifactConstructionState;
+        const Request = struct {
+            construction: *const Construction,
+            path: []const u8,
+            fn apply(raw: *anyopaque, file: *native.NativeFile) !void {
+                const request: *@This() = @ptrCast(@alignCast(raw));
+                const building = request.construction;
+                if ((try file.file.stat(file.runtime())).inode != building.inode) return error.StaleArtifactConstruction;
+                try file.linkArtifactConstruction(building.key, request.path, building.length);
+            }
+        };
+        var request: Request = .{ .construction = self, .path = path };
+        try owner.submitIndexMutation(&request, Request.apply, true);
+    }
+
+    pub fn deinit(self: *Construction) void {
+        const registry = self.registry orelse return;
+        self.registry = null;
+        self.marker.close(registry.io());
+        std.Io.Dir.cwd().deleteFile(registry.io(), self.marker_path) catch {};
+        if (self.release_ticket) |ticket| {
+            registry.coordinator.?.enqueueArtifactReleases(ticket);
+            self.release_ticket = null;
+        }
+        registry.allocator.free(self.key);
+        registry.allocator.free(self.marker_path);
+        registry.release();
+    }
+};
+
+test "lite artifact construction survives Store refresh and releases orphan ownership after close" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/construction.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    // This fixture services orphan records explicitly through the NativeFile.
+    store.maintenance_start_suppressed = true;
+    var store_live = true;
+    defer if (store_live) store.close();
+    var construction = try store.beginArtifactConstruction();
+    defer construction.deinit();
+    const lease_key = try a.dupe(u8, construction.key);
+    defer a.free(lease_key);
+    const first: [131072]u8 = @splat('a');
+    const second: [65536]u8 = @splat('b');
+    try construction.append(&store, &first);
+    store.close();
+    store_live = false;
+    store = try docs.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    store.maintenance_start_suppressed = true;
+    store_live = true;
+    var sweep: SweepCursor = .{};
+    try std.testing.expectEqual(@as(usize, 0), try cleanupOrphans(&store.file, &sweep));
+    try construction.append(&store, &second);
+    try construction.seal(first.len + second.len);
+    try std.testing.expectError(error.InvalidArtifactConstructionState, construction.append(&store, "late"));
+    try construction.link(&store, "/index/activated");
+    var source = try store.openArtifactSource("/index/activated");
+    var source_live = true;
+    defer if (source_live) source.close();
+    store.close();
+    store_live = false;
+    // Closing construction after its original Store is gone only closes its
+    // marker and queues a preallocated hint; it must never call that Store.
+    construction.deinit();
+    store = try docs.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    store.maintenance_start_suppressed = true;
+    store_live = true;
+    sweep = .{};
+    _ = try cleanupOrphans(&store.file, &sweep);
+    try std.testing.expect((try store.file.getCatalogRecordAlloc(a, lease_key)) == null);
+    try store.file.deleteIndexCatalogRecord("/index/activated");
+    var got: [8]u8 = undefined;
+    try source.readInto(first.len - 4, &got);
+    try std.testing.expectEqualStrings("aaaabbbb", &got);
+    try std.testing.expect((try store.file.check()).valid);
+    source.close();
+    source_live = false;
+    sweep = .{};
+    _ = try cleanupOrphans(&store.file, &sweep);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite artifact construction rejects publication on a replacement inode" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/construction-replace.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    store.maintenance_start_suppressed = true;
+    defer store.close();
+    var construction = try store.beginArtifactConstruction();
+    defer construction.deinit();
+    try construction.append(&store, "staged");
+    _ = try store.vacuum();
+    try std.testing.expectError(error.StaleArtifactConstruction, construction.append(&store, "refused"));
+    try construction.seal("staged".len);
+    try std.testing.expectError(error.StaleArtifactConstruction, construction.link(&store, "/index/never"));
+    try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(a, "/index/never")) == null);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
 const Capture = struct {
     allocator: Allocator,
     key: []const u8,
@@ -421,6 +597,7 @@ const Capture = struct {
 };
 
 const State = struct {
+    immutable_identity: [32]u8 = undefined,
     registry: *Registry,
     artifact_key: []u8,
     reader: native.NativeFile,
@@ -446,7 +623,7 @@ const State = struct {
     resource_manager: ?*@import("../resource_manager.zig").ResourceManager = null,
 
     fn source(self: *State) Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.value.length, .read_into = read, .visit_range = visit, .checksum = checksum, .read_authenticated = authenticate, .close = close, .retained_bytes = retainedBytes, .resource_manager = self.resource_manager, .acquire_use = acquireUse, .release_use = releaseUse, .enable_idle_expiry = enableIdleExpiry } };
+        return .{ .ranges = .{ .ptr = self, .length = self.value.length, .read_into = read, .visit_range = visit, .checksum = checksum, .read_authenticated = authenticate, .close = close, .retained_bytes = retainedBytes, .resource_manager = self.resource_manager, .acquire_use = acquireUse, .release_use = releaseUse, .enable_idle_expiry = enableIdleExpiry, .immutable_identity = self.immutable_identity } };
     }
 
     fn closeResources(self: *State) void {
