@@ -192,6 +192,66 @@ profiles with the exact integer 9007199254740993; its JSON bigint representation
 is compared losslessly. Test preparation creates the dense index in the source
 fixture with normal runtimes, while native calls exercise the retained reads.
 
+## Final retained-read cache qualification
+
+The six-phase retained-read matrix covers initial/warm compilation, actual
+private Reader/QueryReadLease/DocumentRows field insertions and a shared Reader
+Request field. It requires the actual API kernel, storage kernel and independent
+native client archives to remain cached for private edits, while the physical
+engine and source fixture rebuild and the engine archive hash changes. Shared
+request edits must rebuild all five participants. Every phase must execute all
+five retained-read fixtures and finish its complete build summary.
+
+The first committed-candidate attempt,
+`retained-read-production-debug-cache.json`, is **cache-invalid**, not a source
+or ABI failure: the shared main cache's o/h/global trees disappeared during the
+build and the inference dependency could not open its emitted object. All five
+observed compiler artifacts built, but the dependency failure prevented fixture
+execution and no phase was accepted. The raw log and exact source-only tar are
+retained; no eviction time or deleting process was identified by that attempt.
+
+The identical-program retry adds active leases across the main/global/overlay
+cache roots and output/argument directories. Markers pulse every five seconds;
+each poll checks root identity and marker presence. Loss invalidates the matrix
+and terminates only its owned build group, with cache state/file listings and
+compiler arguments preserved before overlay cleanup. Eight qualification-tool
+regressions cover attribution, exact test counts, source/archive exclusion and
+actual eviction/owned-process termination. The retry's source hash map confirms
+all 4,776 program/construction inputs and 214 repository inputs match the first
+attempt; only the two qualification Python files differ.
+
+The protected final receipt is
+`.benchmark-results/compile-costs/retained-read-production-debug-cache-retry1.json`:
+**all six phases pass**, each with 88/88 build steps, five passing fixtures and
+zero leaks. Initial compilation builds all five participants; warm compilation
+caches all five. Each actual private Reader, QueryReadLease and DocumentRows
+field edit preserves all three client archive caches, rebuilds the physical
+engine/source fixture and produces a distinct engine archive SHA. The shared
+Reader Request field rebuilds all five participants. No lease was lost or cache
+eviction detected in this accepted run.
+
+The exact hardened runner and compressed source-only snapshot are retained as
+`retained-read-production-debug-cache-retry1.runner.py` and
+`retained-read-production-debug-cache-retry1.sources.tar.gz` beside the receipt.
+The snapshot contains 4,880 authored/construction/tool inputs, 214 repository
+inputs and its manifest, with no caches/build artifacts. Its 40,790,723-byte
+archive SHA is
+`9eda600b7eb33d04e0b75e6f59fca091eddb310538367eae9a5f5740ea28a356`.
+The recorded program baseline is commit `619d435205`; qualification hardening
+was subsequently committed as `26151fa366`. The retained program-identity
+sidecar proves the retry's program and construction inputs match the original
+candidate. Compiler response files and module-root inventories are retained in
+`retained-read-production-retry1-compiler-args/` and
+`retained-read-production-retry1-module-profiles.json`: actual API/kernel/native
+clients select the client backend without a SourceTypes module, while the source
+fixture selects the physical backend/provider. Private relative-import
+exclusion is established by the real field/cache phases, not solely that
+module inventory.
+
+All isolated overlay caches and this run's active lease markers were removed
+after acceptance. These Debug checks establish ownership and cache isolation;
+they do not measure serving performance or whole-product Release improvements.
+
 ## Remaining private boundaries
 
 StatementReadFence still transports two SnapshotAdmission.CaptureLease values
