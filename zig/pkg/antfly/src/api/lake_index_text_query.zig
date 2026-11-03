@@ -881,7 +881,7 @@ const Execution = struct {
         self.ordinal_live_rows.backing = self.result_allocator;
         var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
         defer scratch.deinit();
-        var row = try identities.physicalRow(scratch.allocator(), &self.ordinal_live_rows, self.store.artifactStore(), .{ .cache = &self.server.lake_read_cache, .scope = self.domain, .context = self.context }, doc, self.source.inventory.source_id, self.source.inventory.snapshot_id);
+        var row = try identities.physicalRow(scratch.allocator(), &self.ordinal_live_rows, self.store.artifactStore(), .{ .cache = &self.server.lake_read_cache, .scope = self.store.cache_identity, .context = self.context }, doc, self.source.inventory.source_id, self.source.inventory.snapshot_id);
         row.external.identity_version = self.source.inventory.row_identity_version;
         return try local.storage_rowsource_identity.allocId(a, row);
     }
@@ -4221,6 +4221,42 @@ test "external lake stored highlights read authenticated native source without P
     var invalid: types.SearchResult = .{ .alloc = a, .hits = &invalid_hits, .total_hits = 1, .graph_results = &.{} };
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, owner.attachHighlights(a, .{ .full_text = query, .highlight = .{ .fields = &.{"body"} }, .include_stored = false }, &invalid));
     try std.testing.expectEqual(@as(usize, 0), invalid_hits[0].highlights.len);
+    {
+        // Exercise the public native-doc projection through a lazy manifest.
+        // Its durable domain survives rotation; decoded residency must not.
+        const stores = @import("../serverless/artifacts/store.zig");
+        const group: corpus.FileGroup = .{ .file = root.file_groups[0].file, .segments = root.file_groups[0].segments, .rows = &.{.{ .group = 0, .high = 0, .lower = 0, .base = 0, .count = 2 }} };
+        const bytes = try std.json.Stringify.valueAlloc(ca, group, .{});
+        var manifest = try artifacts.putScoped(try stores.UploadScope.forPublication(root.domain, 1, std.testing.io), bytes, .none);
+        defer manifest.deinit(a);
+        const original_identity = owner.text_identities.get(@intFromPtr(snapshot)).?;
+        defer owner.text_identities.put(ca, @intFromPtr(snapshot), original_identity) catch unreachable;
+        try owner.text_identities.put(ca, @intFromPtr(snapshot), .{ .offsets = &.{ 0, 2 }, .spans = &.{.{ .file = file.file_id, .span = .{ .lower = 0, .upper = 2, .rows = &.{}, .expected_rows = 2, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = manifest.artifact_id, .checksum = manifest.checksum, .byte_len = manifest.byte_len } } }} });
+        const projected = (try Execution.publicDocNum(&owner, a, snapshot, 0)).?;
+        defer a.free(projected);
+        try std.testing.expectEqualStrings(id, projected);
+        owner.ordinal_live_rows.deinit(owner.result_allocator);
+        const Denied = struct {
+            fn get(_: *anyopaque, _: A, _: []const u8, _: []const u8, _: @import("objectstore").GetOptions) anyerror!@import("objectstore").GetResult {
+                return error.AccessDenied;
+            }
+        };
+        const previous_client = store.implementation.client;
+        defer store.implementation.client = previous_client;
+        var denied = previous_client.vtable.*;
+        denied.get_object = Denied.get;
+        store.implementation.client.vtable = &denied;
+        // Same-credential reader churn still shares verified metadata.
+        const shared = (try Execution.publicDocNum(&owner, a, snapshot, 0)).?;
+        defer a.free(shared);
+        try std.testing.expectEqualStrings(id, shared);
+        owner.ordinal_live_rows.deinit(owner.result_allocator);
+        const previous_scope = store.cache_identity;
+        defer store.cache_identity = previous_scope;
+        store.cache_identity[0] ^= 1;
+        // A rotated principal cannot inherit the preceding credential's lease.
+        try std.testing.expectError(error.AccessDenied, Execution.publicDocNum(&owner, a, snapshot, 0));
+    }
     owner.context.deadline_ns = 0;
     try std.testing.expectError(error.DeadlineExceeded, owner.attachHighlights(a, .{ .full_text = query, .highlight = .{ .fields = &.{"body"} }, .include_stored = false }, &grouped));
     owner.highlight_locations.clearRetainingCapacity();
