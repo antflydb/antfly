@@ -33452,12 +33452,13 @@ $L__BB120_2:
 	.param .u64 termite_gliner_gru_combine_f32_param_2,
 	.param .u64 termite_gliner_gru_combine_f32_param_3,
 	.param .u32 termite_gliner_gru_combine_f32_param_4,
-	.param .u32 termite_gliner_gru_combine_f32_param_5
+	.param .u32 termite_gliner_gru_combine_f32_param_5,
+	.param .u32 termite_gliner_gru_combine_f32_param_6
 )
 {
-	.reg .pred 	%p<4>;
-	.reg .f32 	%f<67>;
-	.reg .b32 	%r<17>;
+	.reg .pred 	%p<5>;
+	.reg .f32 	%f<68>;
+	.reg .b32 	%r<18>;
 	.reg .b64 	%rd<21>;
 
 
@@ -33465,23 +33466,24 @@ $L__BB120_2:
 	ld.param.u64 	%rd2, [termite_gliner_gru_combine_f32_param_1];
 	ld.param.u64 	%rd3, [termite_gliner_gru_combine_f32_param_2];
 	ld.param.u64 	%rd4, [termite_gliner_gru_combine_f32_param_3];
-	ld.param.u32 	%r3, [termite_gliner_gru_combine_f32_param_4];
+	ld.param.u32 	%r4, [termite_gliner_gru_combine_f32_param_4];
 	ld.param.u32 	%r2, [termite_gliner_gru_combine_f32_param_5];
-	mov.u32 	%r4, %ntid.x;
-	mov.u32 	%r5, %ctaid.x;
-	mov.u32 	%r6, %tid.x;
-	mad.lo.s32 	%r1, %r5, %r4, %r6;
-	mul.lo.s32 	%r7, %r2, %r3;
-	setp.ge.u32 	%p1, %r1, %r7;
+	ld.param.u32 	%r3, [termite_gliner_gru_combine_f32_param_6];
+	mov.u32 	%r5, %ntid.x;
+	mov.u32 	%r6, %ctaid.x;
+	mov.u32 	%r7, %tid.x;
+	mad.lo.s32 	%r1, %r6, %r5, %r7;
+	mul.lo.s32 	%r8, %r2, %r4;
+	setp.ge.u32 	%p1, %r1, %r8;
 	@%p1 bra 	$L__BB121_2;
 
 	cvta.to.global.u64 	%rd5, %rd4;
 	cvta.to.global.u64 	%rd6, %rd3;
 	cvta.to.global.u64 	%rd7, %rd2;
-	rem.u32 	%r8, %r1, %r2;
-	sub.s32 	%r9, %r1, %r8;
-	mad.lo.s32 	%r10, %r9, 3, %r8;
-	mul.wide.u32 	%rd8, %r10, 4;
+	rem.u32 	%r9, %r1, %r2;
+	sub.s32 	%r10, %r1, %r9;
+	mad.lo.s32 	%r11, %r10, 3, %r9;
+	mul.wide.u32 	%rd8, %r11, 4;
 	add.s64 	%rd9, %rd6, %rd8;
 	add.s64 	%rd10, %rd5, %rd8;
 	ld.global.f32 	%f1, [%rd10];
@@ -33501,15 +33503,15 @@ $L__BB120_2:
 	fma.rn.f32 	%f15, %f4, %f14, %f13;
 	mov.f32 	%f16, 0f32A57060;
 	fma.rn.f32 	%f17, %f4, %f16, %f15;
-	mov.b32 	%r11, %f11;
-	shl.b32 	%r12, %r11, 23;
-	mov.b32 	%f18, %r12;
+	mov.b32 	%r12, %f11;
+	shl.b32 	%r13, %r12, 23;
+	mov.b32 	%f18, %r13;
 	ex2.approx.ftz.f32 	%f19, %f17;
 	fma.rn.f32 	%f20, %f19, %f18, 0f3F800000;
 	mov.f32 	%f21, 0f3F800000;
 	rcp.rn.f32 	%f22, %f20;
-	add.s32 	%r13, %r10, %r2;
-	mul.wide.u32 	%rd11, %r13, 4;
+	add.s32 	%r14, %r11, %r2;
+	mul.wide.u32 	%rd11, %r14, 4;
 	add.s64 	%rd12, %rd6, %rd11;
 	add.s64 	%rd13, %rd5, %rd11;
 	ld.global.f32 	%f23, [%rd13];
@@ -33523,14 +33525,14 @@ $L__BB120_2:
 	neg.f32 	%f31, %f30;
 	fma.rn.f32 	%f32, %f26, %f14, %f31;
 	fma.rn.f32 	%f33, %f26, %f16, %f32;
-	mov.b32 	%r14, %f29;
-	shl.b32 	%r15, %r14, 23;
-	mov.b32 	%f34, %r15;
+	mov.b32 	%r15, %f29;
+	shl.b32 	%r16, %r15, 23;
+	mov.b32 	%f34, %r16;
 	ex2.approx.ftz.f32 	%f35, %f33;
 	fma.rn.f32 	%f36, %f35, %f34, 0f3F800000;
 	rcp.rn.f32 	%f37, %f36;
-	add.s32 	%r16, %r13, %r2;
-	mul.wide.u32 	%rd14, %r16, 4;
+	add.s32 	%r17, %r14, %r2;
+	mul.wide.u32 	%rd14, %r17, 4;
 	add.s64 	%rd15, %rd6, %rd14;
 	add.s64 	%rd16, %rd5, %rd14;
 	ld.global.f32 	%f38, [%rd16];
@@ -33566,9 +33568,11 @@ $L__BB120_2:
 	mul.f32 	%f64, %f37, %f63;
 	fma.rn.f32 	%f65, %f62, %f61, %f64;
 	add.f32 	%f66, %f63, %f65;
+	setp.eq.s32 	%p4, %r3, 0;
+	selp.f32 	%f67, %f65, %f66, %p4;
 	cvta.to.global.u64 	%rd19, %rd1;
 	add.s64 	%rd20, %rd19, %rd17;
-	st.global.f32 	[%rd20], %f66;
+	st.global.f32 	[%rd20], %f67;
 
 $L__BB121_2:
 	ret;
@@ -290541,11 +290545,12 @@ $L__BB377_28:
 
 $L__BB377_30:
 	bar.sync 	0;
+	ld.shared.f32 	%f9, [_ZZ35termite_deberta_attention_fused_f32E10reductions];
+	bar.sync 	0;
 	mov.f32 	%f142, 0f00000000;
 	@%p17 bra 	$L__BB377_36;
 
 	mov.f32 	%f142, 0f00000000;
-	ld.shared.f32 	%f9, [_ZZ35termite_deberta_attention_fused_f32E10reductions];
 	mov.u32 	%r83, _ZZ35termite_deberta_attention_fused_f32E13probabilities;
 	mov.u32 	%r106, %r5;
 

@@ -94,6 +94,7 @@ zig-out/
 
 # Local inference benchmark inputs, outputs, and runtime lock directories
 /.benchmark-assets/
+/.specialty-artifacts/
 /.benchmark-results/
 /zig/group-*/
 

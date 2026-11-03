@@ -2388,7 +2388,8 @@ extern "C" __global__ void termite_gliner_gru_combine_f32(
     const float* gi,
     const float* gh,
     unsigned int rows,
-    unsigned int dim
+    unsigned int dim,
+    unsigned int add_residual
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int count = rows * dim;
@@ -2401,7 +2402,7 @@ extern "C" __global__ void termite_gliner_gru_combine_f32(
     float n = tanhf(gi[gate_base + dim * 2u] + r * gh[gate_base + dim * 2u]);
     float h0 = label_embeddings[idx];
     float h1 = (1.0f - z) * n + z * h0;
-    dst[idx] = h1 + h0;
+    dst[idx] = add_residual ? h1 + h0 : h1;
 }
 
 extern "C" __global__ void termite_concat_lastdim_f32(
@@ -23772,6 +23773,10 @@ extern "C" __global__ void termite_deberta_attention_fused_f32(
         __syncthreads();
     }
     const float max_score = reductions[0];
+    // Every warp must consume the maximum before thread 0 reuses this
+    // shared location for its denominator partial. Ragged/long rows can
+    // otherwise observe the partial sum as their maximum.
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += kThreads) {
