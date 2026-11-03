@@ -4380,7 +4380,7 @@ const PageWriteBatch = struct {
         // would multiply memory traffic while holding publication admission.
         while (slot > 0 and self.page_ids[slot - 1] > page_id) : (slot -= 1) {}
         if (slot > 0 and self.page_ids[slot - 1] == page_id)
-            return self.page(slot - 1);
+            return self.pageBytes(slot - 1);
         if (self.used + size > self.buffer.len) {
             // Drain only the earliest contiguous run. Keep the later run in
             // the window so an unfinished packed page can still join it.
@@ -4400,10 +4400,10 @@ const PageWriteBatch = struct {
         self.buffer_slots[slot] = storage_slot;
         self.occupied |= @as(u16, 1) << storage_slot;
         self.used += size;
-        return self.page(slot);
+        return self.pageBytes(slot);
     }
 
-    fn page(self: *PageWriteBatch, index: usize) []u8 {
+    fn pageBytes(self: *PageWriteBatch, index: usize) []u8 {
         const size: usize = self.file.header.page_size;
         const offset = @as(usize, self.buffer_slots[index]) * size;
         return self.buffer[offset..][0..size];
@@ -4449,7 +4449,7 @@ const PageWriteBatch = struct {
             const bytes = if (ordered)
                 self.buffer[@as(usize, self.buffer_slots[start]) * size ..][0..length]
             else blk: {
-                for (start..end) |index| @memcpy(gathered[(index - start) * size ..][0..size], self.page(index));
+                for (start..end) |index| @memcpy(gathered[(index - start) * size ..][0..size], self.pageBytes(index));
                 if (builtin.is_test) _ = file.test_page_batch_copy_bytes.fetchAdd(@intCast(length), .monotonic);
                 break :blk gathered[0..length];
             };
@@ -4471,7 +4471,7 @@ const PageWriteBatch = struct {
             start = end;
         }
         for (self.page_ids[0..count], 0..) |page_id, i| {
-            file.cacheWrittenPage(page_id, self.page(i), self.options);
+            file.cacheWrittenPage(page_id, self.pageBytes(i), self.options);
             self.occupied &= ~(@as(u16, 1) << @intCast(self.buffer_slots[i]));
         }
         const remaining = self.used - count * size;
