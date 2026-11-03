@@ -189,8 +189,22 @@ and throughput were not remeasured for this native admission change.
 ### Complete native pipeline and HTTP qualification
 
 Real-weight native Debug execution now covers the encoder, shared head and
-decoder together at 4096 body words (4105 prompt tokens), and at four full-word
-windows (16440 logical prompt tokens). Both checks passed without skips. With
+decoder together at 4096 body words (4105 prompt tokens), at four full-word
+windows (16440 logical prompt tokens), and at 16381 of 16384 encoded tokens in
+one window. All six selected checks passed without skips, including projection
+parity, allocation-failure cleanup and pinned all-task parity. The three learned
+cases share the serving path's unchanged 512 MiB live-heap bound; their measured
+peaks were 186167928, 384021726 and 517336416 bytes respectively.
+
+The encoded-token HTTP check initially exposed a real native heap refusal.
+Native DeBERTa now projects unique relative-position buckets for long inputs,
+expands their results into the existing attention layout, and releases content
+and relative projections after synchronous attention. Attention output is freed
+after its output projection, before the FFN. This removes overlapping phase
+lifetimes without increasing the request heap or the model/work limits. Device
+backends retain their command-frame lifetimes.
+
+With
 the pinned base model installed, select them separately from the more expensive
 encoded-token boundary:
 
