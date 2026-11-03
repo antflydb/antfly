@@ -18595,21 +18595,36 @@ fn textRunsNeedTrackRepair(runs: anytype, indices: []const usize) bool {
 
 const TextTrackRun = struct {
     bounds: TextRunBounds,
-    collides: bool = false,
-    track: usize = 0,
+    cohort: usize = 0,
     next: ?usize = null,
 };
 const TextTrack = struct {
     invisible: bool,
     blocked: bool = false,
-    width: f64 = 0,
     head: ?usize = null,
     tail: ?usize = null,
 };
 
-/// Color only actual collisions into independent tracks. Non-overlapping words
-/// fill the primary sentence, even when their render mode differs. Every run
-/// is emitted once; additional tracks retain alternate transcriptions/spans.
+const TextSourceKey = struct {
+    object: ?usize,
+    invisible: bool,
+};
+fn textSourceKey(run: anytype) TextSourceKey {
+    return .{ .object = run.text_object_id, .invisible = invisibleTextRun(run) };
+}
+const TextSourceCohort = struct {
+    head: usize,
+    tail: usize,
+    linked: bool = false,
+    track: ?usize = null,
+    first_spatial: usize = std.math.maxInt(usize),
+    last_spatial: usize = 0,
+};
+
+/// Color source cohorts into independent tracks. Once a text object is tied
+/// to an overlapping transcription, all its words retain that membership.
+/// Unanchored words trigger an authored-object fallback rather than a guessed
+/// sentence. Every run is emitted once with its original span.
 /// Pair discovery and coloring are O(n^2), bounded by the layout run ceiling;
 /// linked output lists make emission O(n), even for many coincident copies.
 fn appendTextRegionTracks(
@@ -18618,9 +18633,8 @@ fn appendTextRegionTracks(
     runs: anytype,
     regions: []const TextLayerRegion,
     head: ?usize,
-    metrics: TextLayoutMetrics,
     info: []TextTrackRun,
-    tracks: []TextTrack,
+    track_scratch: *?[]TextTrack,
     cancellation: CancellationProbe,
     break_before: ?[]bool,
 ) !void {
@@ -18632,30 +18646,74 @@ fn appendTextRegionTracks(
     const authored = try alloc.dupe(usize, spatial.items);
     defer alloc.free(authored);
     std.mem.sort(usize, authored, {}, std.sort.asc(usize));
-    for (authored) |index| info[index] = .{ .bounds = textRunBounds(runs[index]) };
+    var sources = std.AutoHashMap(TextSourceKey, usize).init(alloc);
+    defer sources.deinit();
+    var cohorts = std.ArrayList(TextSourceCohort).empty;
+    defer cohorts.deinit(alloc);
+    for (authored) |index| {
+        const entry = try sources.getOrPut(textSourceKey(runs[index]));
+        if (!entry.found_existing) {
+            entry.value_ptr.* = cohorts.items.len;
+            try cohorts.append(alloc, .{ .head = index, .tail = index });
+        } else {
+            const source = &cohorts.items[entry.value_ptr.*];
+            info[source.tail].next = index;
+            source.tail = index;
+        }
+        info[index] = .{ .bounds = textRunBounds(runs[index]), .cohort = entry.value_ptr.* };
+    }
+    for (spatial.items, 0..) |index, position| {
+        const source = &cohorts.items[info[index].cohort];
+        source.first_spatial = @min(source.first_spatial, position);
+        source.last_spatial = @max(source.last_spatial, position);
+    }
     for (authored, 0..) |left, i| {
         try cancellation.check();
         for (authored[i + 1 ..]) |right| {
             if (independentTextCopies(runs[left], runs[right]) and textBoundsOverlap(info[left].bounds, info[right].bounds)) {
-                info[left].collides = true;
-                info[right].collides = true;
+                cohorts.items[info[left].cohort].linked = true;
+                cohorts.items[info[right].cohort].linked = true;
             }
         }
     }
+    const ambiguous = for (cohorts.items) |cohort| {
+        if (!cohort.linked) break true;
+    } else false;
+    if (ambiguous) {
+        // Geometry cannot establish which transcription owns an unanchored
+        // word. Preserve complete authored objects instead of guessing a
+        // synthesized sentence. This also handles interleaved Form content.
+        for (cohorts.items) |cohort| {
+            try cancellation.check();
+            if (break_before) |flags| flags[cohort.head] = true;
+            cursor = cohort.head;
+            while (cursor) |index| : (cursor = info[index].next) try out.append(alloc, index);
+        }
+        return;
+    }
+    if (track_scratch.* == null) track_scratch.* = try alloc.alloc(TextTrack, runs.len);
+    const tracks = track_scratch.*.?;
     var count: usize = 0;
-    var has_complementary_words = false;
-    for (authored, 0..) |index, i| {
+    for (cohorts.items) |*cohort| {
         try cancellation.check();
-        if (!info[index].collides) {
-            has_complementary_words = true;
-            continue;
-        }
         for (tracks[0..count]) |*track| track.blocked = false;
-        for (authored[0..i]) |prior| {
-            if (info[prior].collides and independentTextCopies(runs[prior], runs[index]) and
-                textBoundsOverlap(info[prior].bounds, info[index].bounds)) tracks[info[prior].track].blocked = true;
+        // Disjoint glyph boxes can still interleave an authored phrase. Those
+        // source cohorts must not share a track just because the words moved.
+        for (cohorts.items) |prior| {
+            const assigned = prior.track orelse continue;
+            if (cohort.first_spatial < prior.last_spatial and prior.first_spatial < cohort.last_spatial)
+                tracks[assigned].blocked = true;
         }
-        const invisible = invisibleTextRun(runs[index]);
+        var member: ?usize = cohort.head;
+        while (member) |index| : (member = info[index].next) {
+            // Each run scans previously colored cohorts once: O(n^2) in total.
+            for (authored) |prior| {
+                const assigned = cohorts.items[info[prior].cohort].track orelse continue;
+                if (independentTextCopies(runs[prior], runs[index]) and
+                    textBoundsOverlap(info[prior].bounds, info[index].bounds)) tracks[assigned].blocked = true;
+            }
+        }
+        const invisible = invisibleTextRun(runs[cohort.head]);
         const selected = for (tracks[0..count], 0..) |track, t| {
             if (track.invisible == invisible and !track.blocked) break t;
         } else blk: {
@@ -18663,28 +18721,20 @@ fn appendTextRegionTracks(
             count += 1;
             break :blk count - 1;
         };
-        info[index].track = selected;
-        tracks[selected].width += info[index].bounds.max_x - info[index].bounds.min_x;
+        cohort.track = selected;
     }
     std.debug.assert(count > 0);
-    var primary: usize = 0;
-    if (has_complementary_words) {
-        // A longer overlapping run can contain missing words as well as the
-        // duplicated suffix. Keep that coverage in the complete sentence.
-        for (tracks[0..count], 0..) |track, t| {
-            if (track.width > tracks[primary].width + metrics.median_height * 0.5) primary = t;
-        }
-    }
+    // Cohort links are no longer needed; reuse them for the output lists.
+    for (spatial.items) |index| info[index].next = null;
     for (spatial.items) |index| {
-        const track = if (info[index].collides) info[index].track else primary;
+        const track = cohorts.items[info[index].cohort].track.?;
         if (tracks[track].tail) |tail| info[tail].next = index else tracks[track].head = index;
         tracks[track].tail = index;
     }
-    // Emit the primary first, then alternates in stable authored track order.
-    for (0..count) |ordinal| {
-        const t = if (ordinal == 0) primary else if (ordinal <= primary) ordinal - 1 else ordinal;
+    // Emit tracks in stable authored order.
+    for (0..count) |t| {
         cursor = tracks[t].head;
-        if (ordinal != 0) if (break_before) |flags| {
+        if (t != 0) if (break_before) |flags| {
             flags[cursor.?] = true;
         };
         while (cursor) |index| : (cursor = info[index].next) try out.append(alloc, index);
@@ -18708,6 +18758,31 @@ fn appendTextLayerRegions(
 ) !void {
     if (runs.len > 2048) return appendOriginalTextRunIndices(alloc, out, indices);
     if (!textRunsNeedTrackRepair(runs, indices)) return appendOriginalTextRunIndices(alloc, out, indices);
+
+    const anchored = try alloc.alloc(bool, runs.len);
+    defer alloc.free(anchored);
+    @memset(anchored, false);
+    var anchored_sources = std.AutoHashMap(TextSourceKey, usize).init(alloc);
+    defer anchored_sources.deinit();
+    for (lines) |line| {
+        for (line.run_indices.items, 0..) |left, i| {
+            try cancellation.check();
+            const left_bounds = textRunBounds(runs[left]);
+            for (line.run_indices.items[i + 1 ..]) |right| {
+                const right_bounds = textRunBounds(runs[right]);
+                if (right_bounds.min_x >= left_bounds.max_x) break;
+                if (!independentTextCopies(runs[left], runs[right]) or !textBoundsOverlap(left_bounds, right_bounds)) continue;
+                for ([_]usize{ left, right }) |index| {
+                    if (!anchored[index] and runs[index].text_object_id != null)
+                        try anchored_sources.put(textSourceKey(runs[index]), std.math.maxInt(usize));
+                    anchored[index] = true;
+                }
+            }
+        }
+    }
+    for (indices) |index| {
+        if (runs[index].text_object_id != null and anchored_sources.contains(textSourceKey(runs[index]))) anchored[index] = true;
+    }
 
     var regions = std.ArrayList(TextLayerRegion).empty;
     defer regions.deinit(alloc);
@@ -18734,20 +18809,9 @@ fn appendTextLayerRegions(
             for (region_indices) |index| {
                 if (invisibleTextRun(runs[index])) has_invisible = true else has_visible = true;
             }
-            const overlapping = detect: {
-                for (region_indices, 0..) |left, i| {
-                    try cancellation.check();
-                    const left_bounds = textRunBounds(runs[left]);
-                    for (region_indices[i + 1 ..]) |right| {
-                        // X-sorted bounds let non-overlapping words stop early.
-                        const right_bounds = textRunBounds(runs[right]);
-                        if (right_bounds.min_x >= left_bounds.max_x) break;
-                        if (independentTextCopies(runs[left], runs[right]) and
-                            textBoundsOverlap(left_bounds, right_bounds)) break :detect true;
-                    }
-                }
-                break :detect false;
-            };
+            const overlapping = for (region_indices) |index| {
+                if (anchored[index]) break true;
+            } else false;
             if ((has_visible and has_invisible) or overlapping) {
                 if (overlapping) overlapping_members += region_indices.len;
                 for (region_indices) |index| membership[index] = regions.items.len;
@@ -18773,6 +18837,21 @@ fn appendTextLayerRegions(
                 .parent = first_region,
             };
             for (line.run_indices.items) |index| membership[index] = first_region;
+        }
+    }
+    // Source membership spans line and gap boundaries. Joining only the
+    // colliding words would strand the rest of that authored transcription.
+    for (indices) |index| {
+        if (!anchored[index] or runs[index].text_object_id == null) continue;
+        const first = anchored_sources.getPtr(textSourceKey(runs[index])).?;
+        const region = membership[index];
+        std.debug.assert(region != std.math.maxInt(usize));
+        if (first.* == std.math.maxInt(usize)) {
+            first.* = region;
+        } else {
+            const root = textLayerRegionRoot(regions.items, first.*);
+            const other = textLayerRegionRoot(regions.items, region);
+            regions.items[other].parent = root;
         }
     }
     // Join adjacent overlapping lines into a transcription region. A header
@@ -18817,8 +18896,7 @@ fn appendTextLayerRegions(
         root.emitted = true;
         if (root.overlapping) {
             if (track_runs == null) track_runs = try alloc.alloc(TextTrackRun, runs.len);
-            if (tracks == null) tracks = try alloc.alloc(TextTrack, runs.len);
-            try appendTextRegionTracks(alloc, out, runs, regions.items, root.head, metrics, track_runs.?, tracks.?, cancellation, break_before);
+            try appendTextRegionTracks(alloc, out, runs, regions.items, root.head, track_runs.?, &tracks, cancellation, break_before);
         } else {
             // Complementary OCR words belong in their geometric sentence.
             try out.appendSlice(alloc, root.indices);
@@ -32464,10 +32542,17 @@ test "reader NASA SM3A OCR report retains searchable words in both extraction AP
 test "reader mixed OCR layers preserve words phrases and nonoverlapping reading order" {
     const a = std.testing.allocator;
     const cases = [_]struct { content: []const u8, expected: []const u8 }{
+        .{ .content = "BT /F1 12 Tf 10 50 Td (The) Tj ET BT /F1 12 Tf 40 50 Td (cat) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (The) Tj ET BT /F1 12 Tf 3 Tr 70 50 Td (dog) Tj ET", .expected = "The\ncat\nThe\ndog\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (The ) Tj 1 0 0 1 40 50 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (The ) Tj 1 0 0 1 70 50 Tm (dog) Tj ET", .expected = "The cat\nThe dog\n" },
+        .{ .content = "BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (The ) Tj 1 0 0 1 40 50 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (The ) Tj 1 0 0 1 70 50 Tm (dog) Tj ET", .expected = "The cat\nThe dog\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (The) Tj 1 0 0 1 40 50 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (The) Tj 1 0 0 1 200 50 Tm (dog) Tj ET", .expected = "The cat\nThe dog\n" },
+        .{ .content = "BT /F1 12 Tf 10 90 Td (The) Tj 1 0 0 1 10 70 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 10 90 Td (The) Tj 1 0 0 1 10 50 Tm (dog) Tj ET", .expected = "The\ncat\nThe\ndog\n" },
+        .{ .content = "BT /F1 12 Tf 10 50 Td (replace) Tj ET BT /F1 12 Tf 110 50 Td (gyroscopes) Tj ET BT /F1 12 Tf 3 Tr 55 50 Td (all six gyroscopes) Tj ET", .expected = "replace\ngyroscopes\nall six gyroscopes\n" },
+        .{ .content = "BT /F1 12 Tf 10 50 Td (The) Tj 1 0 0 1 80 50 Tm (cat) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (The) Tj 1 0 0 1 80 50 Tm (dog) Tj ET BT /F1 12 Tf 3 Tr 40 50 Td (very) Tj ET", .expected = "The cat\nThe dog\nvery\n" },
         .{ .content = "BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (First name) Tj 1 0 0 1 200 90 Tm (Alice Smith) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Home city) Tj 1 0 0 1 200 70 Tm (Paris France) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Job title) Tj 1 0 0 1 200 50 Tm (Chief Engineer) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (First name) Tj 1 0 0 1 200 90 Tm (Alice Smith) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Home city) Tj 1 0 0 1 200 70 Tm (Paris France) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Job title) Tj 1 0 0 1 200 50 Tm (Chief Engineer) Tj ET ", .expected = "First name Alice Smith\nFirst name Alice Smith\nHome city Paris France\nHome city Paris France\nJob title Chief Engineer\nJob title Chief Engineer\n" },
         .{ .content = "BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (Left prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Left prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Left prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 90 Tm (Right prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 70 Tm (Right prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 50 Tm (Right prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 90 Tm (Left prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 70 Tm (Left prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 10 50 Tm (Left prose three) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 90 Tm (Right prose one) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 70 Tm (Right prose two) Tj ET BT /F1 10 Tf 3 Tr 1 0 0 1 200 50 Tm (Right prose three) Tj ET ", .expected = "Left prose one\nLeft prose two\nLeft prose three\nLeft prose one\nLeft prose two\nLeft prose three\nRight prose one\nRight prose two\nRight prose three\nRight prose one\nRight prose two\nRight prose three\n" },
-        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (replace) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 55 50 Tm (all) Tj 1 0 0 1 80 50 Tm (six) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET", .expected = "replace all six gyroscopes\ngyroscopes\n" },
-        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (replace) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 55 50 Tm (all six gyroscopes) Tj ET", .expected = "replace all six gyroscopes\ngyroscopes\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (replace) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 55 50 Tm (all) Tj 1 0 0 1 80 50 Tm (six) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET", .expected = "replace gyroscopes\nall six gyroscopes\n" },
+        .{ .content = "BT /F1 12 Tf 1 0 0 1 10 50 Tm (replace) Tj 1 0 0 1 110 50 Tm (gyroscopes) Tj ET BT /F1 12 Tf 3 Tr 1 0 0 1 55 50 Tm (all six gyroscopes) Tj ET", .expected = "replace gyroscopes\nall six gyroscopes\n" },
         .{ .content = "BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET", .expected = "needle\nneedle\n" },
         .{ .content = "BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET BT /F1 12 Tf 3 Tr 10 50 Td (needle) Tj ET", .expected = "needle\nneedle\nneedle\n" },
         .{ .content = "BT /F1 12 Tf 3 Tr 1 0 0 1 10 50 Tm (f) Tj 1 0 0 1 11 50 Tm (i) Tj ET", .expected = "fi\n" },
@@ -32544,7 +32629,7 @@ test "reader transcription tracks release every partial allocation" {
             };
             const text = try reconstructTextFromRunsAlloc(a, &runs);
             defer a.free(text);
-            try std.testing.expectEqualStrings("replace all six gyroscopes\ngyroscopes\n", text);
+            try std.testing.expectEqualStrings("replace gyroscopes\nall six gyroscopes\n", text);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
@@ -32572,4 +32657,26 @@ test "reader invisible copy boundaries survive the dense page fallback" {
         const span = run.output_span.?;
         try std.testing.expectEqualStrings(run.text, text[span.start..span.end]);
     }
+}
+
+test "reader ambiguous overlap keeps interleaved text objects coherent" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var runs = [_]TextRun{
+                .{ .text = "The", .x = 10, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 0 },
+                .{ .text = "very", .x = 40, .y = 50, .font_size = 12, .advance_width = 24, .ascent = 10, .descent = 2, .text_object_id = 1, .render_mode = 3 },
+                .{ .text = "cat", .x = 80, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 0 },
+                .{ .text = "The", .x = 10, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 2, .render_mode = 3 },
+                .{ .text = "dog", .x = 80, .y = 50, .font_size = 12, .advance_width = 18, .ascent = 10, .descent = 2, .text_object_id = 2, .render_mode = 3 },
+            };
+            const text = try reconstructTextFromRunsAlloc(a, &runs);
+            defer a.free(text);
+            try std.testing.expectEqualStrings("The cat\nvery\nThe dog\n", text);
+            for (runs) |source_run| {
+                const span = source_run.output_span.?;
+                try std.testing.expectEqualStrings(source_run.text, text[span.start..span.end]);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
