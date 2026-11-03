@@ -76,6 +76,10 @@ def summarize(report):
 
 
 def plan(args):
+    harness = {
+        name: fingerprint(Path(__file__).with_name(name))
+        for name in ("poc.py", "remote_performance.py")
+    }
     fixture = [
         {
             "path": str(p.relative_to(args.filesystem_source)),
@@ -184,6 +188,7 @@ def plan(args):
                         {
                             "name": name,
                             "binary_sha256": digest,
+                            "harness_sha256": harness,
                             "fixture": fixture,
                             "fixture_root": str(args.filesystem_source.resolve()),
                             "provider": provider,
@@ -233,6 +238,9 @@ def execute(cells, root):
             if recipe.exists() and json.loads(recipe.read_text()) != cell:
                 raise ValueError("Refusing changed matrix cell: " + cell["name"])
             write_json(recipe, cell)
+            for name, digest in cell["harness_sha256"].items():
+                if fingerprint(Path(__file__).with_name(name)) != digest:
+                    raise ValueError("Harness changed after planning: " + name)
             for item in cell["fixture"]:
                 source = Path(cell["fixture_root"]) / item["path"]
                 if fingerprint(source) != item["sha256"]:

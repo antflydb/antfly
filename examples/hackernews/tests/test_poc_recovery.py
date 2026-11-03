@@ -125,6 +125,16 @@ class ConstructionRecoveryTests(unittest.TestCase):
         self.assertEqual(polls, [0, 1, 2, 3])
         self.assertEqual(observed["transient_failures"]["Timeout"]["observations"], 2)
 
+    def test_interrupted_legacy_build_recovers_under_original_deadline(self):
+        for reason in ("Canceled", "Cancelled"):
+            failed = {"status": {"readiness": {"state": "failed"}, "error": reason}}
+            ready = {"status": {"readiness": {"queryable": True}}}
+            result, observed, _ = self.run_sequence([failed, ready])
+            self.assertEqual(result, ready)
+            self.assertEqual(observed["transient_failures"][reason]["observations"], 1)
+            with self.assertRaisesRegex(RuntimeError, "build deadline"):
+                self.run_sequence([failed], deadline=3)
+
     def test_repeated_timeout_does_not_extend_deadline(self):
         failed = {
             "status": {"readiness": {"state": "failed"}, "error": "DeadlineExceeded"}

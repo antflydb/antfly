@@ -148,6 +148,8 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
                 "false",
                 "--models-dir",
                 str(tmp_path / "models"),
+                "--process-memory-budget-mb",
+                "4096",
             ],
             stdout=log,
             stderr=log,

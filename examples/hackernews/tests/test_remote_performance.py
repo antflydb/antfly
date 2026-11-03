@@ -18,6 +18,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
     "hn_remote_performance",
@@ -54,6 +55,9 @@ class RemotePerformanceTests(unittest.TestCase):
             )
             cells = matrix.plan(args)
             self.assertEqual(len(cells), 16)
+            self.assertEqual(
+                set(cells[0]["harness_sha256"]), {"poc.py", "remote_performance.py"}
+            )
             self.assertEqual(len({cell["state"] for cell in cells}), 16)
             self.assertEqual(
                 [cell["name"] for cell in cells[:2]],
@@ -80,6 +84,22 @@ class RemotePerformanceTests(unittest.TestCase):
             args.binary.append(args.binary[0])
             with self.assertRaisesRegex(ValueError, "Duplicate"):
                 matrix.plan(args)
+
+    def test_changed_harness_never_launches_a_resume_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cell = {
+                "name": "changed",
+                "state": str(root / "changed"),
+                "harness_sha256": {"poc.py": "wrong-digest"},
+            }
+            with patch.object(matrix.subprocess, "Popen") as launch:
+                with self.assertRaisesRegex(
+                    ValueError, "Harness changed after planning"
+                ):
+                    matrix.execute([cell], root)
+                launch.assert_not_called()
+            self.assertFalse((root / "matrix.lock").exists())
 
     def test_distribution_keeps_a_first_repeat_outlier(self):
         samples = [3926.98, 11.7, 9.59, 7.46, 6.61, 6.36, 6.22, 5.97, 6.88, 6.51]

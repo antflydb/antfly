@@ -40,7 +40,7 @@ explicitly when comparing. A reused publication must not be relabeled as if its
 source-storage setting had changed.
 
 `remote_performance.py` gives each binary/provider/source-storage/cycle its own
-publication and state. It fingerprints the binary and local Parquet fixture,
+publication and state. It fingerprints both harness scripts, the binary and local Parquet fixture,
 rejects changed recipes on resume, retains all timing samples and checks top
 HN IDs/scores across cells. It only reads an existing export; it does not launch
 BigQuery jobs, VMs, IAM changes or a hosted deployment. GCS runs write artifacts
@@ -145,3 +145,10 @@ reported as transparent compatibility with existing retained lake cursors.
 
 The matrix does not qualify full-archive capacity, Cloud control-plane setup,
 production SLOs or upgrades. Those remain explicit release/deployment checks.
+
+Shutdown can interrupt a newer Iceberg index publication while accepted reads
+continue through the prior publication and WAL overlay. The coordinator already
+retries the interrupted attempt. Readiness reports cancellation/deadline/timeout
+interruptions as pending publication, retaining the error for diagnostics;
+integrity and admission failures remain failed. A pending attempt never grants
+queryability without an independent serving proof.

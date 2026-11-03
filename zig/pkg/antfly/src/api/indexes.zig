@@ -743,6 +743,13 @@ pub fn encodeIndexList(
     return try out.toOwnedSlice(alloc);
 }
 
+fn isInterruptedLakeBuild(reason: []const u8) bool {
+    inline for (.{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout" }) |name| {
+        if (std.mem.eql(u8, reason, name)) return true;
+    }
+    return false;
+}
+
 /// Remote readiness is catalog owned. Empty native shard indexes cannot prove
 /// external coverage. Queryability is supplied only by a serving proof.
 pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, index_name: []const u8, config: std.json.Value, queryable: bool) ![]u8 {
@@ -775,13 +782,17 @@ pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_m
         break :published null;
     } else null;
     const serving_ready = queryable and published != null;
+    // Reconciliation retries interrupted attempts after their durable backoff.
+    // Shutdown/deadline cancellation is pending work, not a terminal load
+    // failure. Queryability still requires the independent serving proof.
+    const terminal_failure = if (failure) |value| !isInterruptedLakeBuild(value.reason) else false;
     const readiness: indexes_openapi.IndexReadinessStatus = .{
-        .state = if (serving_ready) .ready else if (failure != null) .failed else .pending,
+        .state = if (serving_ready) .ready else if (terminal_failure) .failed else .pending,
         .queryable = serving_ready,
         .complete = serving_ready,
         .target_revision = if (state.value.generation > 0) state.value.generation else null,
         .published_revision = published,
-        .pending_reasons = if (serving_ready) &.{} else if (failure != null) &.{.load_failure} else &.{.publication},
+        .pending_reasons = if (serving_ready) &.{} else if (terminal_failure) &.{.load_failure} else &.{.publication},
     };
     const status = try std.json.Stringify.valueAlloc(alloc, .{
         .index_type = indexTypeName(inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata),
@@ -11193,4 +11204,28 @@ test "resolver curation HTTP hides destination namespace metadata from index res
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
     try std.testing.expect(parsed.value.object.contains("default"));
+}
+
+test "external lake native interrupted publication is pending while integrity and admission failures remain terminal" {
+    const a = std.testing.allocator;
+    const lake = @import("antfly_local_sources").metadata_lake_index_catalog;
+    var config = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"full_text\"}", .{});
+    defer config.deinit();
+    var table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "events", .indexes_json = "{\"body_text\":{\"type\":\"full_text\"}}" };
+    const desired = lake.desiredFingerprint(table);
+    for ([_][]const u8{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "ArtifactIntegrityMismatch", "SqlProgramLimitExceeded" }, 0..) |reason, i| {
+        const catalog_json = try lake.encode(a, .{ .generation = 1, .failure = .{ .generation = 1, .desired = desired, .reason = reason, .retry_at_ms = 1000 } });
+        defer a.free(catalog_json);
+        table.lake_index_catalog_json = catalog_json;
+        const bytes = try encodeLakeIndexResource(a, table, "body_text", config.value, false);
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer parsed.deinit();
+        const status = parsed.value.object.get("status").?;
+        const readiness = status.object.get("readiness").?;
+        try std.testing.expectEqualStrings(if (i < 4) "pending" else "failed", readiness.object.get("state").?.string);
+        try std.testing.expect(!readiness.object.get("queryable").?.bool);
+        try std.testing.expectEqualStrings(if (i < 4) "publication" else "load_failure", readiness.object.get("pending_reasons").?.array.items[0].string);
+        try std.testing.expectEqualStrings(reason, status.object.get("error").?.string);
+    }
 }
