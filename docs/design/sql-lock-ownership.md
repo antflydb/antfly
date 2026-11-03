@@ -4,10 +4,10 @@ This is an implementation record for explicit SQL locking. The PostgreSQL 18
 conflict matrices and lifetime rules are the semantic reference. The native
 journal described here is not yet activation of the unresolved SQL cases.
 
-Current status (2026-11-02): the native ledger, durable command-source permits,
+Current status (2026-11-03): the native ledger, durable command-source permits,
 shared prepared-decision integration and independent prepared lock home are
-implemented and qualified. The ordered scalar/type layer is also implemented.
-Public HTTP/pgwire source activation, the native advisory effect provider and
+implemented and qualified. The ordered scalar/type layer and native advisory
+execution owner are also implemented. Public HTTP/pgwire source activation and
 row/table participant enrollment remain open. The sections below retain earlier
 qualification records; the final sections describe the current implementation.
 
@@ -707,8 +707,9 @@ PostgreSQL behavior. The independent scalar/void oracle supplements the existing
 lock lifetime and wait oracles; it does not substitute for native/public ownership
 qualification.
 
-The public HTTP/pgwire durable source lifecycle and native advisory provider are
-still required before closing `sql-0089`–`sql-0091`. This scalar/type cohort earns
+The public HTTP/pgwire durable source lifecycle is still required before closing
+`sql-0089`–`sql-0091`; the native provider is qualified in the following section.
+This scalar/type cohort earns
 no original-case credits. The immutable original inventory remains **912
 implemented, 138 rejected, 449 superseded and 87 unresolved**.
 
@@ -733,3 +734,87 @@ the listed layers, not the still-unfinished public lock activation.
 The final affected Debug recheck passed **93/93 steps**, including all **42
 native-result** and **seven durable sequence** tests, without skips, failures or
 leaks, after the coercion and recursive-type review fixes.
+
+
+## Native advisory execution and bounded wait traffic
+
+`api/sql_advisory_execution.zig` binds an ordered scalar occurrence to one immutable
+native ledger effect. Its frame owns the authenticated connection, execution
+instance, durable command ticket, database and backend incarnation. It validates
+both the durable executing source and authenticated native scope before issuing
+a mutation. Prepared programs retain no execution authority. The production
+adapter supplies the provider only when ingress has supplied a command fence.
+
+All eleven advisory functions use the same native graph and receipt journal,
+including both key spaces, shared/exclusive modes, reentrance, transaction scope
+and bounded session unlock-all. Integer pairs are range checked before delivery.
+Transaction effects bind the existing transaction ID, then use the durable
+savepoint identity rather than nesting depth. The session registry derives that
+identity during existing savepoint clone/decode and mutation work, so hot statement
+admission reads it in constant time without scanning the map. Recovery rejects
+zero identities and identities outside the existing durable allocation counter.
+Failed savepoint persistence leaves the published projection intact. Retained
+pgwire reads refresh the projection when resumed. No second subtransaction counter
+or persistent format is introduced.
+
+A fresh uncontended effect performs one native observation and one mutation.
+The accepting transaction publishes its exact effect receipt with the ordinary
+command outcome, eliminating a guaranteed-empty outcome lookup and a follow-up
+receipt read. Only uncertain requests use exact prior-outcome observation and
+redelivery. An immutable effect can outlive replacement of its bounded journal
+admission, and a lost bind reply is reconciled against the bound native scope.
+No uncertainty path reruns the SQL occurrence or fabricates compensation unlocks.
+
+Queued acquisitions retain an authenticated resource stamp containing its digest,
+generation and revision. An unchanged stamp suppresses another apply and journal
+entry; a changed resource is replanned using the actual current graph. Generation
+prevents an equal revision on a recreated resource from looking unchanged. Reads
+remain bounded polls with cancellation checks and cooperative `std.Io` backoff;
+this is not a push notification or long-poll implementation. Control jobs advance
+one indexed quantum per mutation and yield cooperatively. Native hard deadlock
+receipts report SQLSTATE 40P01 without releasing earlier session grants or
+advertising automatic statement replay as safe.
+
+Returned or cancelled SQL bodies can leave a queued acquisition or an unlock-all
+job. Durable command completion now cancels the exact abandoned waiter or
+finishes one control quantum at a time before completing the native command.
+Every cleanup request remains in the existing source outbox and survives a cold
+restart or a lost reply. Cleanup preserves earlier session grants and transaction
+grants; transaction decisions remain owned by the existing 2PC controller.
+
+Capability 156 protects exact effect replies and resource stamps on native lock
+reads and writes. Unrelated catalog outcomes keep their existing field shape.
+Gate tests check older capability rejection before native records are created,
+then activate monotonically before running current-decoder lock operations.
+
+The native source campaign now covers all overloads with uncertainty on both
+sides of acceptance, the real scalar-to-native transaction boundary, hard
+cycles, wakeup after release, cold completion of abandoned waiters/control jobs,
+and monotone savepoint projection through cold rollback and release. The wait
+traffic test proves 64 unchanged polls append zero commands or journal entries;
+the uncontended test asserts exactly one read and one mutation with no prior
+outcome lookup. These are operation-count checks, not latency benchmark claims.
+
+Public activation still requires durable HTTP/pgwire connection enrollment,
+lease renewal tied to live execution and transactions, command ownership across
+portal suspension, implicit transaction ownership for transaction-scoped calls,
+and atomic savepoint metadata/control handoffs. Row/table
+participant enrollment remains separate. These unfinished boundaries prevent
+closing the original advisory cases; counts remain **912 implemented, 138
+rejected, 449 superseded and 87 unresolved**.
+
+
+After the savepoint and retained-read review fixes, the affected Debug source and
+public-result gates passed **70/70 build steps**, including **32 source/controller
+and session-recovery tests** and **42 native-result/retained-read tests**, with no
+skips, failures or leaks. The earlier combined authority qualification passed
+**93/93 steps**, including the command-fence, metadata prepared-transaction and
+transaction-lifecycle gates. Generation, formatting, original-inventory integrity,
+Apache boundaries and the generated control-catalog check pass. These results do
+not qualify the unfinished public source activation or earn original-case credits.
+
+The final post-review transaction/authority recheck passed **102/102 build steps**
+and **52 selected test executions**, including nine native LSM campaigns, all 18
+metadata prepared-transaction tests and all 16 transaction-lifecycle tests. There
+were no skips, failures or leaks. This recheck includes the stricter savepoint
+decoder and the derived active-subtransaction projection.

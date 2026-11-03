@@ -63,19 +63,36 @@ pub const Notice = struct {
     }
 };
 
+pub const LockEffect = struct {
+    receipt: @import("antfly_local_sources").storage_pessimistic_lock_authority.ledger.Receipt,
+    wait_resource: ?@import("antfly_local_sources").storage_pessimistic_lock_authority.ledger.ResourceStamp = null,
+    pub fn validate(self: LockEffect) !void {
+        if (self.receipt.sequence == 0 or self.receipt.sequence == std.math.maxInt(u64) or std.mem.allEqual(u8, &self.receipt.nonce, 0) or std.mem.allEqual(u8, &self.receipt.digest, 0)) return error.InvalidSequenceOutcome;
+        if (self.wait_resource) |stamp| {
+            if (self.receipt.outcome != .pending) return error.InvalidSequenceOutcome;
+            try stamp.validate();
+        }
+    }
+};
 pub const Result = struct {
     revision: u64,
     identity: ?Identity,
     removed: usize,
     cascade_notice: ?Notice = null,
     no_op: bool = false,
+    lock_effect: ?LockEffect = null,
     pub fn jsonStringify(self: Result, writer: anytype) !void {
+        if (self.lock_effect) |effect| return writer.write(.{ .revision = self.revision, .identity = self.identity, .removed = self.removed, .cascade_notice = self.cascade_notice, .lock_effect = effect });
         if (self.no_op) return writer.write(.{ .revision = self.revision, .identity = self.identity, .removed = self.removed, .cascade_notice = self.cascade_notice, .no_op = true });
         // New type-only no-op results are protected by decoder capability 111.
         // Existing callable/sequence frames keep their exact field shape.
         try writer.write(.{ .revision = self.revision, .identity = self.identity, .removed = self.removed, .cascade_notice = self.cascade_notice });
     }
     pub fn validate(self: Result) !void {
+        if (self.lock_effect) |effect| {
+            if (self.identity != null or self.removed != 0 or self.cascade_notice != null or self.no_op) return error.InvalidSequenceOutcome;
+            try effect.validate();
+        }
         if (self.no_op and (self.removed != 0 or self.cascade_notice != null)) return error.InvalidSequenceOutcome;
         if (self.cascade_notice) |notice| {
             if (self.removed != 1) return error.InvalidSequenceOutcome;

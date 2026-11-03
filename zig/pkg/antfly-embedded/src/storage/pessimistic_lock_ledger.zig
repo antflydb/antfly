@@ -238,6 +238,28 @@ fn encode(a: A, value: anytype) ![]u8 {
     @memcpy(result[body.len..], &hash);
     return result;
 }
+/// Bounded observation only. The metadata caller must independently authorize
+/// the waiting backend before exposing this stamp. Generation prevents ABA when
+/// an empty resource is removed and recreated with a restarted revision.
+pub const ResourceStamp = struct {
+    resource: [32]u8,
+    generation: [32]u8,
+    revision: u64,
+    pub fn validate(self: ResourceStamp) !void {
+        if (self.revision == 0 or std.mem.allEqual(u8, &self.resource, 0) or std.mem.allEqual(u8, &self.generation, 0)) return error.InvalidLockRecord;
+    }
+};
+pub fn readResourceStamp(backing: A, txn: anytype, ns: Namespace, resource: [32]u8) !?ResourceStamp {
+    try ns.validate();
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    var buffer: [256]u8 = undefined;
+    const bytes = (try optional(txn, try key(&buffer, ns, .resource, .{ .incarnation = ns.incarnation, .id = @splat(1), .fence = 1 }, resource, 0))) orelse return null;
+    const value = try decode(Resource, arena.allocator(), bytes);
+    try value.validate();
+    if (!std.mem.eql(u8, &value.digest, &resource)) return error.InvalidLockRecord;
+    return .{ .resource = resource, .generation = value.generation, .revision = value.revision };
+}
 pub fn readOwner(backing: A, txn: anytype, ns: Namespace, backend: locks.Backend) !?Owner {
     try ns.validate();
     try backend.validate();

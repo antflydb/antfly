@@ -168,7 +168,7 @@ const std = @import("std");
 // unreleased SQL profile reserves floors above 78; historical notes above
 // describe its development sequence before this rebasing. Published transition
 // tag 81 remains SQL completion references; private SQL tags begin at 82.
-pub const current_version: u16 = 155;
+pub const current_version: u16 = 156;
 pub const sql_prepared_lock_handoff_version: u16 = 155;
 /// The unreleased combined catalog profile also decodes trigger-return contracts.
 /// Keep new declarations above the older scalar-only routine capability floor.
@@ -178,7 +178,8 @@ pub const sql_native_index_namespace_version: u16 = 151;
 /// Private session decisions and standalone ownership share native recovery.
 pub const sql_connection_transactions_version: u16 = 152;
 /// Native lock scopes bind command authority and external-decision admission.
-pub const sql_lock_authority_version: u16 = 153;
+// Exact effect replies and ABA-safe wait-resource revisions.
+pub const sql_lock_authority_version: u16 = 156;
 /// Guarded catalog/counter identities retain outcomes before checking command liveness.
 pub const sql_command_fence_version: u16 = 154;
 /// Public catalog-operation recovery binds an immutable logical target label.

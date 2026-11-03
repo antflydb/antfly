@@ -734,7 +734,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response" } });
     const sql_command_producer_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = &.{ "SQL command producer native", "HTTP connection", "HTTP sequence sessions", "SQL connection admission" },
+        .filters = &.{ "SQL command producer native", "HTTP connection", "HTTP sequence sessions", "SQL connection admission", "durable SQL session rejects duplicate savepoint ids", "distributed txn session preserves numeric tokens" },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 28 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -757,6 +757,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL command producer native retired sources preserve independent connection begin and terminal reconciliation",
         "SQL command producer native scoped COMMIT survives every metadata delivery boundary and cold adoption",
         "SQL command producer native scoped rollback retains its durable abort and releases only transaction locks",
+        "SQL command producer native advisory effect delivery is exact across cold lost replies and key spaces",
+        "SQL command producer native completion cancels abandoned waiter across cold replies preserving prior session grants",
+        "SQL command producer native advisory SQL pipeline uses real receipts and bound transaction scope",
+        "SQL command producer native completion finishes abandoned unlock all quanta without releasing transaction grants",
+        "SQL command producer native advisory contention avoids journal churn and hard deadlocks retain earlier grants",
+        "SQL command producer native advisory complete overload matrix retains scopes through uncertain delivery",
+        "SQL command producer native transaction savepoint projection retains monotone identities across cold rollback and release",
+        "durable SQL session rejects duplicate savepoint ids without double freeing overlays",
+        "distributed txn session preserves numeric tokens across staging savepoints and durable recovery",
     }) |required| sql_command_producer_audit.addArgs(&.{ "--filter", required });
     sql_command_producer_audit.addArg("--inventory");
     sql_command_producer_audit.addFileArg2(sql_command_producer_inventory.captureStdErr(.{}), .{ .make_absolute = true });

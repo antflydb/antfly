@@ -79,6 +79,7 @@ pub const Record = struct {
                 .register => |registration| if (self.phase != .registering or !std.meta.eql(registration, self.registration)) return error.InvalidSqlConnection,
                 .begin => |command| if (self.phase != .beginning or !std.meta.eql(command, self.ticket.?.command)) return error.InvalidSqlConnection,
                 .finish => |command| if (self.phase != .finishing or !std.meta.eql(command, self.ticket.?.command)) return error.InvalidSqlConnection,
+                .cancel, .step => |input| if (self.phase != .finishing or !std.meta.eql(input.command, self.ticket.?.command)) return error.InvalidSqlConnection,
                 .fence => if (self.phase != .fencing) return error.InvalidSqlConnection,
                 .renew => |renewal| if ((self.phase != .idle and self.phase != .ready and self.phase != .executing) or renewal.expected_expiry != self.registration.lease.expires_at_ms or renewal.expires_at_ms <= renewal.expected_expiry) return error.InvalidSqlConnection,
                 .release => if (self.phase != .closing) return error.InvalidSqlConnection,
@@ -440,7 +441,17 @@ pub const Port = struct {
         if (parsed.value.next_work != null) return error.InvalidSqlBackendResponse;
         return parsed;
     }
-    fn deliver(self: Port, a: A, request: authority.Request) !?authority.outcomes.Rejection {
+    pub fn submit(self: Port, a: A, request: authority.Request) !authority.outcomes.Result {
+        const bytes = try self.call(self.ptr, a, .{ .sql_lock_mutate = request });
+        defer a.free(bytes);
+        if (bytes.len > authority.outcomes.max_record_bytes) return error.InvalidSqlBackendResponse;
+        var parsed = try std.json.parseFromSlice(?authority.outcomes.Outcome, a, bytes, .{});
+        defer parsed.deinit();
+        const result = try (parsed.value orelse return error.MetadataMutationOutcomeUnknown).result();
+        try result.validate();
+        return result;
+    }
+    pub fn deliver(self: Port, a: A, request: authority.Request) !?authority.outcomes.Rejection {
         const observed = try self.call(self.ptr, a, .{ .sql_lock_outcome = request });
         defer a.free(observed);
         if (observed.len > authority.outcomes.max_record_bytes) return error.InvalidSqlBackendResponse;
@@ -545,8 +556,37 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
                     // A terminal SQL receipt can precede bounded transaction
                     // lock cleanup. Wait for the existing decision controller;
                     // finishing may not fence the backend's session grants.
-                    if (scope.releasing or (scope.transaction != null and scope.transaction.?.decision != null) or
-                        (cut.owner != null and (cut.owner.?.job != null or cut.owner.?.waiting != null))) return;
+                    if (scope.releasing or (scope.transaction != null and scope.transaction.?.decision != null)) return;
+                    if (!std.meta.eql(scope.command, @as(?authority.scopes.Command, prior.ticket.?.command))) return error.InvalidSqlBackendResponse;
+                    // Completion owns abandoned effect cleanup, not SQL replay.
+                    // Each observation stages/delivers at most one exact native
+                    // waiter cancellation or bounded control quantum. Earlier
+                    // session grants survive cancellation of this command.
+                    const owner = cut.owner orelse return error.InvalidSqlBackendResponse;
+                    const cleanup: ?@FieldType(authority.Request, "operation") = if (owner.waiting) |waiting|
+                        .{ .cancel = .{ .command = prior.ticket.?.command, .effect = waiting } }
+                    else if (owner.job) |job|
+                        .{ .step = .{ .command = prior.ticket.?.command, .effect = job.effect } }
+                    else
+                        null;
+                    if (cleanup) |operation| {
+                        if (std.meta.eql(prior.pending.?.operation, operation) and !expired(prior.pending.?, cut.head)) {
+                            if (try port.deliver(a, prior.pending.?)) |failure| {
+                                if (failure != .CatalogPublicationProofPending) {
+                                    next.failure = failure;
+                                    next.recovery = true;
+                                }
+                            }
+                        }
+                        next.pending = next.controlRequest(cut.head, nonce, operation);
+                        try replace(store, principal, prior, next);
+                        return;
+                    }
+                    if (prior.pending.?.operation != .finish) {
+                        next.pending = next.controlRequest(cut.head, nonce, .{ .finish = prior.ticket.?.command });
+                        try replace(store, principal, prior, next);
+                        return;
+                    }
                     if (expired(prior.pending.?, cut.head)) {
                         next.pending = next.controlRequest(cut.head, nonce, prior.pending.?.operation);
                         try replace(store, principal, prior, next);

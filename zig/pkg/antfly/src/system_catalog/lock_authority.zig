@@ -224,10 +224,11 @@ pub const Context = struct {
         try found.identity.session.?.requireRealm(self.standalone);
     }
 };
-pub fn apply(a: A, txn: anytype, group: u64, request: Request) !void {
+pub fn apply(a: A, txn: anytype, group: u64, request: Request) !?outcomes.LockEffect {
     try request.validate();
     const ns: scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
     const context: Context = .{ .a = a, .actor = request.actor, .database = request.database, .standalone = request.standalone, .maintenance = request.operation == .close_step or request.operation == .release or request.operation == .release_unadmitted or request.operation == .fence, .unadmitted = if (request.operation == .release_unadmitted) request.operation.release_unadmitted else null };
+    var receipt: ?scopes.ledger.Receipt = null;
     switch (request.operation) {
         .register => |value| try scopes.register(a, txn, ns, value, context),
         .begin => |command| _ = try scopes.begin(a, txn, ns, request.backend, command, context),
@@ -237,11 +238,17 @@ pub fn apply(a: A, txn: anytype, group: u64, request: Request) !void {
         .release_unadmitted => |original| _ = try scopes.releaseTransaction(a, txn, ns, request.backend, .{ .id = original.operation.admit.identity.txn_id }, context),
         .renew => |value| try scopes.renew(a, txn, ns, request.backend, value.expected_expiry, value.expires_at_ms, context),
         .fence => |reason| try scopes.fence(a, txn, ns, request.backend, reason, context),
-        .effect => |value| _ = try scopes.applyEffect(a, txn, ns, request.backend, value.command, value.effect, context),
-        .cancel => |value| _ = try scopes.cancelEffect(a, txn, ns, request.backend, value.command, value.effect, context),
-        .step => |value| _ = try scopes.advanceEffect(a, txn, ns, request.backend, value.command, value.effect, context),
+        .effect => |value| receipt = try scopes.applyEffect(a, txn, ns, request.backend, value.command, value.effect, context),
+        .cancel => |value| receipt = try scopes.cancelEffect(a, txn, ns, request.backend, value.command, value.effect, context),
+        .step => |value| receipt = try scopes.advanceEffect(a, txn, ns, request.backend, value.command, value.effect, context),
         .close_step => _ = try scopes.closeStep(a, txn, ns, request.backend, context),
     }
+    const result = receipt orelse return null;
+    const effect = switch (request.operation) {
+        .effect, .cancel, .step => |value| value.effect,
+        else => unreachable,
+    };
+    return .{ .receipt = result, .wait_resource = if (result.outcome == .pending and effect.action == .acquire) (try scopes.ledger.readResourceStamp(a, txn, ns, effect.action.resource())) orelse return error.InvalidLockRecord else null };
 }
 
 pub fn scopePrefixForGroup(buffer: []u8, group: u64) ![]const u8 {
@@ -287,6 +294,7 @@ pub const Snapshot = struct {
     owner: ?scopes.ledger.Owner,
     next_work: ?scopes.Work,
     receipt: ?scopes.ledger.Receipt = null,
+    wait_resource: ?scopes.ledger.ResourceStamp = null,
 };
 
 pub const Observer = struct {

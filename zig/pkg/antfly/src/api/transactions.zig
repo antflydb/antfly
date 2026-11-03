@@ -1119,6 +1119,9 @@ pub const Session = struct {
     setting_active: SettingEntries = .empty,
     setting_committed: SettingEntries = .empty,
     next_savepoint_id: u64 = 1,
+    /// Derived from existing savepoint identities during clone/decode and
+    /// maintained by savepoint mutations. Never encoded as another counter.
+    current_subtransaction: u64 = 0,
     savepoints: std.AutoHashMapUnmanaged(u64, Savepoint) = .empty,
 
     pub fn info(self: Session) SessionInfo {
@@ -1184,6 +1187,7 @@ pub const Session = struct {
         var it = self.savepoints.iterator();
         while (it.next()) |entry| {
             out.savepoints.putAssumeCapacity(entry.key_ptr.*, try entry.value_ptr.clone(alloc));
+            out.current_subtransaction = @max(out.current_subtransaction, entry.key_ptr.*);
         }
         return out;
     }
@@ -2570,6 +2574,8 @@ pub const SessionRegistry = struct {
         terminal_abort: bool = false,
         terminal_abort_reason: ?CommitConflictReason = null,
         savepoints: usize,
+        /// Existing monotone savepoint identity; zero is the transaction root.
+        current_subtransaction: u64 = 0,
 
         pub fn deinit(self: *SqlState, alloc: std.mem.Allocator) void {
             self.sequence_state.deinit(alloc);
@@ -2588,6 +2594,7 @@ pub const SessionRegistry = struct {
             const metadata = existing.sql orelse return null;
             var result: SqlState = .{ .metadata = try metadata.clone(alloc), .begin_timestamp = existing.begin_timestamp, .connection_id = existing.connection_id, .owner_node_id = existing.owner_node_id, .execution_started = existing.commit_execution_started, .terminal = if (existing.terminal_commit) |terminal| terminal.status else null, .terminal_repair_required = if (existing.terminal_commit) |terminal| terminal.repair_required else false, .terminal_prepare = existing.external_preparation_prepared, .terminal_abort = existing.terminal_abort, .terminal_abort_reason = existing.terminal_abort_reason, .savepoints = existing.savepoints.count() };
             errdefer result.deinit(alloc);
+            result.current_subtransaction = existing.current_subtransaction;
             result.sequence_epoch = existing.sequence_epoch;
             result.sequence_state = try existing.sequence_state.clone(alloc);
             result.setting_active = try cloneSettingEntries(alloc, existing.setting_active.items);
@@ -2600,6 +2607,7 @@ pub const SessionRegistry = struct {
         const metadata = loaded.sql orelse return null;
         var result: SqlState = .{ .metadata = try metadata.clone(alloc), .begin_timestamp = loaded.begin_timestamp, .connection_id = loaded.connection_id, .owner_node_id = loaded.owner_node_id, .execution_started = loaded.commit_execution_started, .terminal = if (loaded.terminal_commit) |terminal| terminal.status else null, .terminal_repair_required = if (loaded.terminal_commit) |terminal| terminal.repair_required else false, .terminal_prepare = loaded.external_preparation_prepared, .terminal_abort = loaded.terminal_abort, .terminal_abort_reason = loaded.terminal_abort_reason, .savepoints = loaded.savepoints.count() };
         errdefer result.deinit(alloc);
+        result.current_subtransaction = loaded.current_subtransaction;
         result.sequence_epoch = loaded.sequence_epoch;
         result.sequence_state = try loaded.sequence_state.clone(alloc);
         result.setting_active = try cloneSettingEntries(alloc, loaded.setting_active.items);
@@ -3399,6 +3407,7 @@ pub const SessionRegistry = struct {
         while (points.next()) |point| point.deinit(a);
         candidate.savepoints.deinit(a);
         candidate.savepoints = .empty;
+        candidate.current_subtransaction = 0;
     }
 
     pub fn recordExternalPreparationReceipt(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, receipt: @import("../system_catalog/prepared_transactions.zig").Receipt) !?void {
@@ -3856,6 +3865,7 @@ pub const SessionRegistry = struct {
         new_savepoint.setting_active = try cloneSettingEntries(alloc, candidate.setting_active.items);
         new_savepoint.setting_committed = try cloneSettingEntries(alloc, candidate.setting_committed.items);
         try candidate.savepoints.put(alloc, savepoint_id, new_savepoint);
+        candidate.current_subtransaction = savepoint_id;
         savepoint_inserted = true;
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
@@ -3939,8 +3949,13 @@ pub const SessionRegistry = struct {
         // Gather ids before mutation so hash-map iteration cannot be invalidated.
         var removed_ids = std.ArrayList(u64).empty;
         defer removed_ids.deinit(alloc);
+        candidate.current_subtransaction = 0;
         var points = candidate.savepoints.keyIterator();
-        while (points.next()) |id| if (id.* > savepoint_id or (release and id.* == savepoint_id)) try removed_ids.append(alloc, id.*);
+        while (points.next()) |id| {
+            if (id.* > savepoint_id or (release and id.* == savepoint_id)) {
+                try removed_ids.append(alloc, id.*);
+            } else candidate.current_subtransaction = @max(candidate.current_subtransaction, id.*);
+        }
         for (removed_ids.items) |id| {
             var removed = candidate.savepoints.fetchRemove(id).?.value;
             removed.deinit(alloc);
@@ -6991,6 +7006,7 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
     }
     if (obj.get("setting_active")) |value| session.setting_active = try decodeSettingEntries(alloc, value);
     if (obj.get("setting_committed")) |value| session.setting_committed = try decodeSettingEntries(alloc, value);
+    if (session.next_savepoint_id == 0) return error.InvalidTransactionSessionRecord;
     const savepoints_value = obj.get("savepoints") orelse return error.InvalidTransactionSessionRecord;
     const savepoints = switch (savepoints_value) {
         .array => |arr| arr,
@@ -7006,7 +7022,8 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             .number_string => |text| try recordNumber(text),
             else => return error.InvalidTransactionSessionRecord,
         };
-        if (session.savepoints.contains(id)) return error.InvalidTransactionSessionRecord;
+        if (id == 0 or id >= session.next_savepoint_id or session.savepoints.contains(id)) return error.InvalidTransactionSessionRecord;
+        session.current_subtransaction = @max(session.current_subtransaction, id);
         const snapshot = try parseStoredCommitValue(alloc, entry_obj.get("snapshot") orelse return error.InvalidTransactionSessionRecord);
         var owned_snapshot = snapshot;
         var transferred = false;
@@ -8344,6 +8361,19 @@ test "durable SQL session rejects duplicate savepoint ids without double freeing
     const invalid = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
     defer alloc.free(invalid);
     try std.testing.expectError(error.InvalidTransactionSessionRecord, decodeSessionRecord(alloc, info.txn_id, invalid));
+    for ([_]std.json.Value{ .{ .integer = 0 }, .{ .integer = 3 }, .{ .number_string = "18446744073709551615" } }) |bad_id| {
+        try points[1].object.put(parsed.arena.allocator(), "id", bad_id);
+        const malformed = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        defer alloc.free(malformed);
+        try std.testing.expectError(error.InvalidTransactionSessionRecord, decodeSessionRecord(alloc, info.txn_id, malformed));
+    }
+    try points[1].object.put(parsed.arena.allocator(), "id", .{ .integer = 2 });
+    for ([_]i64{ 0, 2 }) |bad_next| {
+        try parsed.value.object.put(parsed.arena.allocator(), "next_savepoint_id", .{ .integer = bad_next });
+        const malformed = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        defer alloc.free(malformed);
+        try std.testing.expectError(error.InvalidTransactionSessionRecord, decodeSessionRecord(alloc, info.txn_id, malformed));
+    }
 }
 
 test "durable SQL session rejects malformed connection id without leaking principal" {
@@ -8855,6 +8885,7 @@ test "distributed txn session preserves numeric tokens across staging savepoints
     try std.testing.expectEqualStrings(row, staged.tables[0].batch.writes[0].value);
     try upsertReadSnapshot(alloc, &session.read_snapshots, .{ .table_name = "docs", .key = "a", .version = 44, .document_json = row });
     try session.savepoints.put(alloc, 1, .{ .id = 1, .name = try alloc.dupe(u8, "before_update"), .snapshot = try staged.clone(alloc), .read_snapshots = try cloneReadSnapshotMap(alloc, session.read_snapshots) });
+    session.next_savepoint_id = 2;
     const bytes = try encodeSessionRecord(alloc, session);
     defer alloc.free(bytes);
     var restored = try decodeSessionRecord(alloc, session.txn_id, bytes);

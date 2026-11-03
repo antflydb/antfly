@@ -141,6 +141,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlTriggerReturnValueRequired => .{ .code = "42P13", .message = "RETURN in a trigger function requires a row value or NULL." },
         error.SqlInvalidTableDefinition => .{ .code = "42P16", .message = "A stored column cannot have pseudo-type void." },
         error.SqlArrayTypeNotFound => .{ .code = "42704", .message = "There is no SQL array type for the requested element type." },
+        error.SqlDeadlockDetected => .{ .code = "40P01", .message = "Deadlock detected while waiting for a SQL lock.", .hint = "Roll back the transaction and retry its complete operation." },
         error.AdvisoryProviderUnavailable => .{ .code = "55000", .message = "Advisory functions require a connection with native SQL lock ownership.", .hint = "Use a PostgreSQL connection or an HTTP SQL connection handle." },
         error.SqlTriggerContextRequired => .{ .code = "0A000", .message = "Trigger functions can only be called in a trigger context." },
         error.SqlTriggerReturnedNoValue => .{ .code = "2F005", .message = "Control reached the end of a trigger function without RETURN." },

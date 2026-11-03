@@ -44,6 +44,8 @@ const Native = struct {
     before: bool = false,
     after: bool = false,
     calls: usize = 0,
+    outcome_reads: usize = 0,
+    scope_reads: usize = 0,
     failure: ?enum { admit, prepare, commit, handoff, ack } = null,
     fail_before: bool = false,
     block_cancel: bool = false,
@@ -92,8 +94,14 @@ const Native = struct {
                 if (lose) return error.MetadataMutationOutcomeUnknown;
                 break :blk try self.metadata.sqlPreparedOutcome(alloc, group, request);
             },
-            .sql_lock_read => |query| self.metadata.sqlLockRead(alloc, group, query, .{ .setting_admin = true }),
-            .sql_lock_outcome => |request| self.metadata.sqlLockOutcome(alloc, group, request),
+            .sql_lock_read => |query| blk: {
+                self.scope_reads += 1;
+                break :blk self.metadata.sqlLockRead(alloc, group, query, .{ .setting_admin = true });
+            },
+            .sql_lock_outcome => |request| blk: {
+                self.outcome_reads += 1;
+                break :blk self.metadata.sqlLockOutcome(alloc, group, request);
+            },
             .sql_lock_mutate => |request| blk: {
                 self.calls += 1;
                 self.previous = self.last;
@@ -798,5 +806,476 @@ test "SQL command producer native scoped rollback retains its durable abort and 
         // Source admission advances only after the native decision released
         // the command. It must preserve the backend and its session grants.
         try native.until(&durable, .idle, 3);
+    }
+}
+
+fn advisoryFrame(source: *transactions.DurableSessionStore, fence: authority.scopes.CommandFence) @import("sql_advisory_execution.zig").Frame {
+    return .{ .source = source, .connection = connection, .principal = "alice", .instance = instance, .fence = fence, .actor = actor };
+}
+fn finishBody(native: *Native, source: *transactions.DurableSessionStore, ticket: producer.Ticket) !void {
+    var owned = (try producer.load(source, a, connection)).?;
+    defer owned.deinit();
+    try producer.finish(source, "alice", owned.value, instance, ticket, try native.head(), native.nonce());
+}
+fn finishMachine(native: *Native, machine: *@import("sql_advisory_execution.zig").Machine) !local.sql_scalar.Datum {
+    for (0..128) |_| {
+        const progress = machine.step(a, native.port(), 2, native.nonce()) catch |err| switch (err) {
+            error.MetadataMutationOutcomeUnknown => continue,
+            else => return err,
+        };
+        if (progress == .complete) return machine.value.?;
+    }
+    return error.AdvisoryMachineDidNotConverge;
+}
+fn nativeCut(native: *Native, backend: authority.locks.Backend, effect: ?authority.scopes.ledger.Effect) !std.json.Parsed(authority.Snapshot) {
+    const bytes = try Native.call(native, a, .{ .sql_lock_read = .{ .incarnation = backend.incarnation, .standalone = native.standalone, .actor = actor, .database = 1, .backend = backend, .effect = effect } });
+    defer a.free(bytes);
+    return std.json.parseFromSlice(authority.Snapshot, a, bytes, .{ .allocate = .alloc_always });
+}
+
+test "SQL command producer native advisory effect delivery is exact across cold lost replies and key spaces" {
+    const advisory = @import("sql_advisory_execution.zig");
+    const Datum = local.sql_scalar.Datum;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/advisory-driver-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated };
+        try setup(&metadata, &source, standalone, &native);
+        try native.until(&source, .idle, 2);
+        const ticket = try begin(&native, &source, 20);
+        const fence = try execute(&source, ticket);
+        var acquire = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_try_advisory_lock, &.{Datum.json(.{ .integer = -42 })}, null, native.nonce());
+        native.after = true;
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, acquire.step(a, native.port(), 2, native.nonce()));
+        const exact = acquire.effect.?;
+        metadata.deinit();
+        metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        source = transactions.DurableSessionStore.init(a, &metadata.store);
+        try std.testing.expect((try finishMachine(&native, &acquire)).value.bool);
+        try std.testing.expect(std.meta.eql(exact, acquire.effect.?));
+        const issued = native.calls;
+        try std.testing.expectEqual(advisory.Machine.Progress.complete, try acquire.step(a, native.port(), 2, native.nonce()));
+        try std.testing.expectEqual(issued, native.calls);
+        var unlock = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_unlock, &.{Datum.json(.{ .integer = -42 })}, null, native.nonce());
+        try std.testing.expect((try finishMachine(&native, &unlock)).value.bool);
+        var again = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_unlock, &.{Datum.json(.{ .integer = -42 })}, null, native.nonce());
+        try std.testing.expect(!(try finishMachine(&native, &again)).value.bool);
+        var pair = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_lock_shared, &.{ Datum.json(.{ .integer = -1 }), Datum.json(.{ .integer = -42 }) }, null, native.nonce());
+        try std.testing.expect((try finishMachine(&native, &pair)).isVoid());
+        try finishBody(&native, &source, ticket);
+        try native.until(&source, .idle, 2);
+        // A stale SQL execution cannot issue another grant after its native
+        // command has completed, even when the exact backend remains alive.
+        var stale = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_lock, &.{Datum.json(.{ .integer = 99 })}, null, native.nonce());
+        try std.testing.expectError(error.SqlConnectionBusy, stale.step(a, native.port(), 2, native.nonce()));
+        var cut = try nativeCut(&native, fence.backend, pair.effect);
+        defer cut.deinit();
+        try std.testing.expectEqual(@as(u32, 1), cut.value.owner.?.resources);
+        try std.testing.expectEqual(authority.scopes.ledger.Outcome.granted, cut.value.receipt.?.outcome);
+    };
+}
+
+test "SQL command producer native completion cancels abandoned waiter across cold replies preserving prior session grants" {
+    const advisory = @import("sql_advisory_execution.zig");
+    const Datum = local.sql_scalar.Datum;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/advisory-finish-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated };
+        try setup(&metadata, &source, standalone, &native);
+        try native.until(&source, .idle, 2);
+        const ticket = try begin(&native, &source, 20);
+        const fence = try execute(&source, ticket);
+        var owned = (try producer.load(&source, a, connection)).?;
+        const baseline = owned.value;
+        var holder = baseline;
+        holder.registration.connection = @splat('b');
+        holder.registration.lease.backend.id = id(50);
+        holder.registration.nonce = id(51);
+        const holder_command: authority.scopes.Command = .{ .sequence = 1, .nonce = id(52), .executor = id(53) };
+        try native.submit(holder, .{ .register = holder.registration });
+        try native.submit(holder, .{ .begin = holder_command });
+        const held_resource = try authority.locks.advisoryResource(fence.backend.incarnation, 1, .{ .single = 42 });
+        try native.submit(holder, .{ .effect = .{ .command = holder_command, .effect = .{ .backend = holder.registration.lease.backend, .sequence = 1, .nonce = id(54), .action = .{ .try_acquire = .{ .resource = held_resource, .mode = .{ .advisory = .exclusive }, .scope = .session } } } } });
+        owned.deinit();
+        var prior = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_lock, &.{Datum.json(.{ .integer = 13 })}, null, native.nonce());
+        _ = try finishMachine(&native, &prior);
+        var queued = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_lock, &.{Datum.json(.{ .integer = 42 })}, null, native.nonce());
+        _ = try queued.step(a, native.port(), 2, native.nonce());
+        {
+            var cut = try nativeCut(&native, fence.backend, queued.effect);
+            defer cut.deinit();
+            try std.testing.expect(cut.value.owner.?.waiting != null);
+        }
+        try finishBody(&native, &source, ticket);
+        // Lose one completion-control reply after native publication. Reopen
+        // between every quantum; only native control, never SQL, resumes.
+        native.after = true;
+        for (0..32) |_| {
+            if (try phase(&source) == .idle) break;
+            native.step(&source, instance, 2) catch |err| switch (err) {
+                error.MetadataMutationOutcomeUnknown => {},
+                else => return err,
+            };
+            metadata.deinit();
+            metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+            source = transactions.DurableSessionStore.init(a, &metadata.store);
+        }
+        try std.testing.expectEqual(producer.Phase.idle, try phase(&source));
+        var cut = try nativeCut(&native, fence.backend, queued.effect);
+        defer cut.deinit();
+        try std.testing.expectEqual(authority.scopes.ledger.Outcome.cancelled, cut.value.receipt.?.outcome);
+        try std.testing.expectEqual(@as(u32, 1), cut.value.owner.?.resources);
+        try std.testing.expect(cut.value.owner.?.waiting == null and cut.value.owner.?.job == null);
+        try std.testing.expectEqual(@as(@TypeOf(cut.value.scope.?.state), .active), cut.value.scope.?.state);
+        try std.testing.expect(std.meta.eql(@as(?authority.scopes.Command, ticket.command), cut.value.scope.?.completed));
+    };
+}
+
+test "SQL command producer native advisory SQL pipeline uses real receipts and bound transaction scope" {
+    const advisory = @import("sql_advisory_execution.zig");
+    const Hooks = struct {
+        native: *Native,
+        binds: usize = 0,
+        transactions: usize = 0,
+        pauses: usize = 0,
+        checks: usize = 0,
+        fn call(raw: *anyopaque, allocator: A, input: Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (input == .sql_lock_mutate) switch (input.sql_lock_mutate.operation) {
+                .bind => self.binds += 1,
+                .effect => |effect| switch (effect.effect.action) {
+                    .acquire, .try_acquire => |acquire| if (acquire.scope == .transaction) {
+                        try std.testing.expectEqual(@as(u64, 7), acquire.scope.transaction.subtransaction);
+                        self.transactions += 1;
+                    },
+                    else => {},
+                },
+                else => {},
+            };
+            return Native.call(self.native, allocator, input);
+        }
+        fn now(_: *anyopaque) u64 {
+            return 2;
+        }
+        fn nonce(raw: *anyopaque) ![16]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.native.nonce();
+        }
+        fn active(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks > 1024) return error.AdvisoryMachineDidNotConverge;
+        }
+        fn pause(raw: *anyopaque, _: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pauses += 1;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/advisory-sql-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated };
+        try setup(&metadata, &source, standalone, &native);
+        try native.until(&source, .idle, 2);
+        const ticket = try begin(&native, &source, 20);
+        const fence = try execute(&source, ticket);
+        var hooks: Hooks = .{ .native = &native };
+        var owner: advisory.Owner = .{
+            .frame = advisoryFrame(&source, fence),
+            .port = .{ .ptr = &hooks, .call = Hooks.call },
+            .runtime = .{ .ptr = &hooks, .now_ms = Hooks.now, .nonce = Hooks.nonce, .active = Hooks.active, .pause = Hooks.pause },
+            .transaction = .{ .id = id(60), .subtransaction = 7 },
+        };
+        const backend: local.sql_catalog.Backend = .{ .ptr = &hooks, .advisory_provider = owner.provider(), .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = Hooks.checkpoint } };
+        var compiled = try local.sql_compiler.compile(a, "SELECT pg_try_advisory_xact_lock(42) AS x, pg_advisory_lock(13) AS s, pg_advisory_unlock(999) AS u, pg_advisory_unlock_all() AS a", .{});
+        defer compiled.deinit();
+        native.after = true; // Lose the exact transaction-bind reply.
+        var result = try local.sql_runtime.execute(a, backend, &compiled, &.{}, .{ .native_result = true });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), hooks.binds);
+        try std.testing.expectEqual(@as(usize, 1), hooks.transactions);
+        try std.testing.expect(hooks.pauses > 0);
+        const row = result.output.native_rows.?[0];
+        try std.testing.expect(row[0].value.bool and row[1].isVoid() and !row[2].value.bool and row[3].isVoid());
+        var cut = try nativeCut(&native, fence.backend, null);
+        defer cut.deinit();
+        try std.testing.expectEqual(@as(u32, 1), cut.value.owner.?.resources);
+        try std.testing.expectEqual(@as(u32, 1), cut.value.owner.?.transaction_resources);
+        try std.testing.expectEqualSlices(u8, &id(60), &cut.value.scope.?.transaction.?.id);
+        try finishBody(&native, &source, ticket);
+        try native.until(&source, .idle, 2);
+    };
+}
+
+test "SQL command producer native completion finishes abandoned unlock all quanta without releasing transaction grants" {
+    const advisory = @import("sql_advisory_execution.zig");
+    const Datum = local.sql_scalar.Datum;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/advisory-unlock-all-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated };
+        try setup(&metadata, &source, standalone, &native);
+        try native.until(&source, .idle, 2);
+        const ticket = try begin(&native, &source, 20);
+        const fence = try execute(&source, ticket);
+        for (1..5) |key_| {
+            var acquire = try advisory.Machine.init(advisoryFrame(&source, fence), if (key_ == 4) .pg_advisory_xact_lock else .pg_advisory_lock, &.{Datum.json(.{ .integer = @intCast(key_) })}, .{ .id = id(60), .subtransaction = 7 }, native.nonce());
+            _ = try finishMachine(&native, &acquire);
+        }
+        var release = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_unlock_all, &.{}, null, native.nonce());
+        _ = try release.step(a, native.port(), 2, native.nonce());
+        {
+            var cut = try nativeCut(&native, fence.backend, release.effect);
+            defer cut.deinit();
+            try std.testing.expect(cut.value.owner.?.job != null);
+        }
+        try finishBody(&native, &source, ticket);
+        native.after = true;
+        for (0..64) |_| {
+            if (try phase(&source) == .idle) break;
+            native.step(&source, instance, 2) catch |err| switch (err) {
+                error.MetadataMutationOutcomeUnknown => {},
+                else => return err,
+            };
+            metadata.deinit();
+            metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+            source = transactions.DurableSessionStore.init(a, &metadata.store);
+        }
+        try std.testing.expectEqual(producer.Phase.idle, try phase(&source));
+        var cut = try nativeCut(&native, fence.backend, release.effect);
+        defer cut.deinit();
+        try std.testing.expectEqual(authority.scopes.ledger.Outcome.completed, cut.value.receipt.?.outcome);
+        try std.testing.expectEqual(@as(u32, 1), cut.value.owner.?.resources);
+        try std.testing.expectEqual(@as(u32, 1), cut.value.owner.?.transaction_resources);
+        try std.testing.expect(cut.value.owner.?.job == null and cut.value.owner.?.waiting == null);
+    };
+}
+
+// These helpers use the same durable connection and producer contracts for a
+// second SQL executor; the lock graph remains the actual metadata graph.
+fn driveConnection(native: *Native, source: *transactions.DurableSessionStore, key: [32]u8, want: producer.Phase) !void {
+    for (0..128) |_| {
+        var owned = (try producer.load(source, a, key)).?;
+        defer owned.deinit();
+        if (owned.value.phase == want) return;
+        try producer.advance(source, a, "alice", owned.value, instance, 2, native.nonce(), native.port());
+    }
+    return error.CommandProducerDidNotConverge;
+}
+fn beginConnection(native: *Native, source: *transactions.DurableSessionStore, key: [32]u8) !@import("sql_advisory_execution.zig").Frame {
+    var owned = (try producer.load(source, a, key)).?;
+    const ticket = try producer.begin(source, "alice", owned.value, instance, .{ .sequence = owned.value.next_command, .nonce = native.nonce(), .executor = native.nonce() }, @splat(8), try native.head(), native.nonce(), 2);
+    owned.deinit();
+    try driveConnection(native, source, key, .ready);
+    owned = (try producer.load(source, a, key)).?;
+    defer owned.deinit();
+    const fence = try producer.take(source, "alice", owned.value, instance, ticket, 2);
+    return .{ .source = source, .connection = key, .principal = "alice", .instance = instance, .fence = fence, .actor = actor };
+}
+
+test "SQL command producer native advisory contention avoids journal churn and hard deadlocks retain earlier grants" {
+    const advisory = @import("sql_advisory_execution.zig");
+    const Datum = local.sql_scalar.Datum;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/advisory-deadlock-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated };
+        try setup(&metadata, &source, standalone, &native);
+        try native.until(&source, .idle, 2);
+        const key_b: [32]u8 = @splat('b');
+        {
+            var owned = (try producer.load(&source, a, connection)).?;
+            defer owned.deinit();
+            var registration = owned.value.registration;
+            registration.connection = key_b;
+            registration.lease.backend.id = id(50);
+            registration.nonce = native.nonce();
+            _ = try connections.mutate(&source, .{ .create = .{ .id = key_b, .principal = "alice", .owner_node_id = registration.lease.node, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", registration.lease.node, 1);
+            try producer.create(&source, "alice", registration, actor, instance, try native.head(), native.nonce(), 1);
+        }
+        try driveConnection(&native, &source, key_b, .idle);
+        const frame_a = try beginConnection(&native, &source, connection);
+        var frame_b = try beginConnection(&native, &source, key_b);
+        var first = try advisory.Machine.init(frame_a, .pg_advisory_lock, &.{Datum.json(.{ .integer = 1 })}, null, native.nonce());
+        const before_apply = native.calls;
+        const before_outcome = native.outcome_reads;
+        const before_read = native.scope_reads;
+        try std.testing.expectEqual(advisory.Machine.Progress.complete, try first.step(a, native.port(), 2, native.nonce()));
+        // An uncontended grant returns its exact receipt in the accepting RPC:
+        // one observation, one apply, no guaranteed-empty outcome lookup.
+        try std.testing.expectEqual(before_apply + 1, native.calls);
+        try std.testing.expectEqual(before_read + 1, native.scope_reads);
+        try std.testing.expectEqual(before_outcome, native.outcome_reads);
+        var second = try advisory.Machine.init(frame_b, .pg_advisory_lock, &.{Datum.json(.{ .integer = 2 })}, null, native.nonce());
+        _ = try finishMachine(&native, &second);
+        var waiter = try advisory.Machine.init(frame_a, .pg_advisory_lock, &.{Datum.json(.{ .integer = 2 })}, null, native.nonce());
+        try std.testing.expectEqual(advisory.Machine.Progress.waiting, try waiter.step(a, native.port(), 2, native.nonce()));
+        const queued_head = try native.head();
+        const queued_applies = native.calls;
+        for (0..64) |_| try std.testing.expectEqual(advisory.Machine.Progress.waiting, try waiter.step(a, native.port(), 2, native.nonce()));
+        try std.testing.expectEqual(queued_applies, native.calls);
+        try std.testing.expectEqual(queued_head, try native.head());
+        var cycle = try advisory.Machine.init(frame_b, .pg_advisory_lock, &.{Datum.json(.{ .integer = 1 })}, null, native.nonce());
+        try std.testing.expectError(error.SqlDeadlockDetected, finishMachine(&native, &cycle));
+        {
+            var cut = try nativeCut(&native, frame_b.fence.backend, cycle.effect);
+            defer cut.deinit();
+            try std.testing.expectEqual(authority.scopes.ledger.Outcome.deadlocked, cut.value.receipt.?.outcome);
+            try std.testing.expectEqual(@as(u32, 1), cut.value.owner.?.resources);
+            try std.testing.expect(cut.value.owner.?.waiting == null);
+        }
+        // Failed statement completion preserves session locks; a subsequent
+        // command releases the conflict and the original waiter wakes.
+        {
+            var owned = (try producer.load(&source, a, key_b)).?;
+            defer owned.deinit();
+            try producer.finish(&source, "alice", owned.value, instance, owned.value.ticket.?, try native.head(), native.nonce());
+        }
+        try driveConnection(&native, &source, key_b, .idle);
+        frame_b = try beginConnection(&native, &source, key_b);
+        var unlock = try advisory.Machine.init(frame_b, .pg_advisory_unlock, &.{Datum.json(.{ .integer = 2 })}, null, native.nonce());
+        try std.testing.expect((try finishMachine(&native, &unlock)).value.bool);
+        try std.testing.expect((try finishMachine(&native, &waiter)).isVoid());
+        var cut = try nativeCut(&native, frame_a.fence.backend, waiter.effect);
+        defer cut.deinit();
+        try std.testing.expectEqual(@as(u32, 2), cut.value.owner.?.resources);
+        try std.testing.expectEqual(authority.scopes.ledger.Outcome.granted, cut.value.receipt.?.outcome);
+    };
+}
+
+test "SQL command producer native advisory complete overload matrix retains scopes through uncertain delivery" {
+    const advisory = @import("sql_advisory_execution.zig");
+    const Datum = local.sql_scalar.Datum;
+    const functions = [_]local.sql_advisory_effects.Function{
+        .pg_advisory_lock,          .pg_advisory_lock_shared,
+        .pg_try_advisory_lock,      .pg_try_advisory_lock_shared,
+        .pg_advisory_unlock,        .pg_advisory_unlock_shared,
+        .pg_advisory_xact_lock,     .pg_advisory_xact_lock_shared,
+        .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared,
+        .pg_advisory_unlock_all,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/advisory-overloads-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated };
+        try setup(&metadata, &source, standalone, &native);
+        try native.until(&source, .idle, 2);
+        const ticket = try begin(&native, &source, 20);
+        const frame = advisoryFrame(&source, try execute(&source, ticket));
+        for (functions, 0..) |function, ordinal| for (1..3) |arity| {
+            if (function == .pg_advisory_unlock_all and arity == 2) continue;
+            const args = [_]Datum{ Datum.json(.{ .integer = -2147483648 }), Datum.json(.{ .integer = @intCast(ordinal) }) };
+            // Separate resources for each overload/function; two-int keys and
+            // bigint keys intentionally share numeric inputs without aliasing.
+            const single = [_]Datum{Datum.json(.{ .integer = std.math.minInt(i64) + @as(i64, @intCast(ordinal)) })};
+            const actual: []const Datum = if (function == .pg_advisory_unlock_all) &.{} else if (arity == 1) &single else &args;
+            if (function.unlocks()) {
+                var held = try advisory.Machine.init(frame, if (function.shared()) .pg_advisory_lock_shared else .pg_advisory_lock, actual, null, native.nonce());
+                _ = try finishMachine(&native, &held);
+            }
+            var machine = try advisory.Machine.init(frame, function, actual, .{ .id = id(60), .subtransaction = 7 }, native.nonce());
+            // Alternate uncertainty before and after native acceptance. The
+            // exact effect remains stable; SQL is never evaluated again.
+            native.before = arity == 1;
+            native.after = arity == 2;
+            const value = try finishMachine(&native, &machine);
+            if (function.booleanResult()) try std.testing.expect(value.value.bool) else try std.testing.expect(value.isVoid());
+            if (function.unlocks()) {
+                var empty = try advisory.Machine.init(frame, function, actual, null, native.nonce());
+                try std.testing.expect(!(try finishMachine(&native, &empty)).value.bool);
+            }
+        };
+        var cut = try nativeCut(&native, frame.fence.backend, null);
+        defer cut.deinit();
+        try std.testing.expectEqual(@as(u32, 8), cut.value.owner.?.transaction_resources);
+        try std.testing.expectEqual(@as(u32, 8), cut.value.owner.?.resources);
+        try std.testing.expect(cut.value.owner.?.job == null and cut.value.owner.?.waiting == null);
+        const writes = native.calls;
+        var wrong_txn = try advisory.Machine.init(frame, .pg_advisory_xact_lock, &.{Datum.json(.{ .integer = 99 })}, .{ .id = id(61), .subtransaction = 0 }, native.nonce());
+        try std.testing.expectError(error.InvalidLockScope, wrong_txn.step(a, native.port(), 2, native.nonce()));
+        try std.testing.expectError(error.SqlNumericOutOfRange, advisory.Machine.init(frame, .pg_advisory_lock, &.{ Datum.json(.{ .integer = 2147483648 }), Datum.json(.{ .integer = 0 }) }, null, native.nonce()));
+        try std.testing.expectError(error.SqlTypeMismatch, advisory.Machine.init(frame, .pg_advisory_lock, &.{Datum.voidValue()}, null, native.nonce()));
+        try std.testing.expectError(error.SqlTransactionNotActive, advisory.Machine.init(frame, .pg_advisory_xact_lock, &.{Datum.json(.{ .integer = 1 })}, null, native.nonce()));
+        try std.testing.expectEqual(writes, native.calls);
+    };
+}
+
+test "SQL command producer native transaction savepoint projection retains monotone identities across cold rollback and release" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/advisory-savepoints", .{tmp.sub_path});
+    defer a.free(path);
+    var txn_id: [16]u8 = undefined;
+    const expected = [_]u64{ 0, 1, 2, 1, 3, 1, 0, 4 };
+    for (expected, 0..) |want, pass| {
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var registry = transactions.SessionRegistry.init(&source);
+        defer registry.deinit(a);
+        if (pass == 0) {
+            txn_id = (try registry.beginForPrincipal(a, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 9, "alice")).txn_id;
+        } else {
+            // Exercise the cold projection before a mutation loads the session
+            // into the facade, then verify its hot projection after mutation.
+            var prior = (try registry.getSqlState(a, txn_id)).?;
+            defer prior.deinit(a);
+            try std.testing.expectEqual(expected[pass - 1], prior.current_subtransaction);
+            if (pass == 3 or pass == 4 or pass == 5) {
+                source.fail_writes_for_test = true;
+                switch (pass) {
+                    3 => try std.testing.expectError(error.InjectedSessionStoreFailure, registry.rollbackToSavepoint(a, txn_id, 1)),
+                    4 => try std.testing.expectError(error.InjectedSessionStoreFailure, registry.createNamedSavepoint(a, txn_id, "failed")),
+                    5 => try std.testing.expectError(error.InjectedSessionStoreFailure, registry.releaseNamedSavepoint(a, txn_id, "point")),
+                    else => unreachable,
+                }
+                source.fail_writes_for_test = false;
+                var unchanged = (try registry.getSqlState(a, txn_id)).?;
+                defer unchanged.deinit(a);
+                try std.testing.expectEqual(expected[pass - 1], unchanged.current_subtransaction);
+            }
+            switch (pass) {
+                1, 2, 4, 7 => _ = (try registry.createNamedSavepoint(a, txn_id, "point")).?,
+                3 => _ = (try registry.rollbackToSavepoint(a, txn_id, 1)).?,
+                5 => _ = (try registry.releaseNamedSavepoint(a, txn_id, "point")).?,
+                6 => _ = (try registry.releaseSavepoint(a, txn_id, 1)).?,
+                else => unreachable,
+            }
+        }
+        var state = (try registry.getSqlState(a, txn_id)).?;
+        defer state.deinit(a);
+        try std.testing.expectEqual(want, state.current_subtransaction);
     }
 }

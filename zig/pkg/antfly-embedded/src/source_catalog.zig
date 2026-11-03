@@ -228,6 +228,7 @@ pub const sql_scalar = @import("sql/scalar.zig");
 pub const sql_object_name = @import("sql/object_name.zig");
 pub const sql_sequence_session = @import("sql/sequence_session.zig");
 pub const sql_sequence_effects = @import("sql/sequence_effects.zig");
+pub const sql_advisory_effects = @import("sql/advisory_effects.zig");
 pub const sql_document_patch = @import("sql/json_document_patch.zig");
 pub const sql_temporal_value = @import("sql/temporal_value.zig");
 pub const sql_range_value = @import("sql/range_value.zig");

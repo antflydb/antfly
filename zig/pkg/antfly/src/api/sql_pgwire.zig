@@ -565,6 +565,7 @@ const OwnedRead = struct {
             }
             self.native_adapter.accepted_lake_repeatable = self.native_adapter.lake_visibility == .accepted and (state.metadata.isolation != .serializable or state.metadata.mode == .read_only);
             self.native_adapter.active_transaction = id;
+            self.native_adapter.active_subtransaction = state.current_subtransaction;
             self.native_adapter.staged = &self.staged;
             if (state.metadata.isolation != .read_committed) {
                 self.native_cut = try self.native_adapter.pinTransactionSnapshot(id);
@@ -727,6 +728,7 @@ const OwnedRead = struct {
             var state = (try self.adapter.server.txn_sessions.getSqlState(self.adapter.server.alloc, id)) orelse return error.SqlTransactionNotActive;
             defer state.deinit(self.adapter.server.alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionNotActive;
+            self.native_adapter.active_subtransaction = state.current_subtransaction;
         }
         var fresh = try self.authority.credential.identity(alloc);
         defer fresh.deinit(alloc);

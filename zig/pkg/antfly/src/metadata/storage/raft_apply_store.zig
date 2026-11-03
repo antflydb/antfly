@@ -40597,8 +40597,12 @@ pub const RaftApplyStore = struct {
         const outcomes: SqlLocks.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
         const owner = if (backend) |id| try SqlLocks.scopes.ledger.readOwner(a, &txn, ns, id) else null;
         const receipt = if (query.effect != null and scope != null) try SqlLocks.scopes.ledger.observe(a, &txn, ns, query.effect.?, SqlLocks.Observer{ .registration = scope.?.registration }) else null;
+        const wait_resource = if (query.effect != null and receipt != null and receipt.?.outcome == .pending and query.effect.?.action == .acquire)
+            (try SqlLocks.scopes.ledger.readResourceStamp(a, &txn, ns, query.effect.?.action.resource())) orelse return error.InvalidCatalogRecord
+        else
+            null;
         try context.ensureActive();
-        return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .incarnation = incarnation, .standalone = standalone, .head = try outcomes.head(a), .scope = scope, .owner = owner, .next_work = work, .receipt = receipt }, .{});
+        return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .incarnation = incarnation, .standalone = standalone, .head = try outcomes.head(a), .scope = scope, .owner = owner, .next_work = work, .receipt = receipt, .wait_resource = wait_resource }, .{});
     }
     fn applySqlLockScopeTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, bytes: []const u8) !void {
         if (bytes.len > SqlLocks.max_bytes) return error.CatalogCommandTooLarge;
@@ -40624,7 +40628,7 @@ pub const RaftApplyStore = struct {
                 var journal = command_journal.Journal.init(self.alloc, txn);
                 defer journal.deinit();
                 try journal.attach();
-                SqlLocks.apply(a, txn, group, request) catch |err| {
+                const effect_result = SqlLocks.apply(a, txn, group, request) catch |err| {
                     try journal.rollback();
                     const mapped = SqlLocks.semanticError(err);
                     const rejection = SqlLocks.outcomes.Outcome.fromError(mapped) orelse return mapped;
@@ -40633,7 +40637,7 @@ pub const RaftApplyStore = struct {
                 };
                 try journal.accept();
                 const meta = try system_catalog_storage.readMeta(a, txn, group);
-                try outcomes.append(a, ordinal, request.admission, hash, .{ .success = .{ .revision = meta.revision, .identity = null, .removed = 0 } });
+                try outcomes.append(a, ordinal, request.admission, hash, .{ .success = .{ .revision = meta.revision, .identity = null, .removed = 0, .lock_effect = effect_result } });
             },
         }
     }
@@ -68018,6 +68022,7 @@ test "SQL prepared transaction native lock scope atomically seals private admiss
                 if (standalone) try store.replaceStandaloneCatalog(T.group, try store.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
                 try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = L.decoder_version - 1, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
                 try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, Helper.scope(&store, a, backend, standalone, 40, .{ .register = registration }));
+                try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.sqlLockRead(a, T.group, .{ .incarnation = backend.incarnation, .standalone = standalone, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database = 1, .backend = backend }, .{ .setting_admin = true }));
                 var early_admission = T.admission(identity);
                 early_admission.standalone = standalone;
                 early_admission.admission.head = try Helper.head(&store, a);
@@ -68164,15 +68169,20 @@ test "SQL command fence guards native catalog and counter effects through cold r
                 if (pass == 0) {
                     try store.applyStandaloneCommand(T.group, .{ .initialize_metadata_incarnation = T.seed });
                     if (standalone) try store.replaceStandaloneCatalog(T.group, try store.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
-                    try Helper.activation(&store, a, topology_protocol.sql_lock_authority_version);
+                    // Prove the command-fence admission barrier before any
+                    // newer native lock decoder is activated. Protocol
+                    // activation is monotone; later lock formats may exceed
+                    // the original command-fence floor.
+                    try Helper.activation(&store, a, topology_protocol.sql_command_fence_version - 1);
                     try store.applyStandaloneCommand(T.group, .{ .upsert_table = .{ .table_id = 17, .name = "owner_rows" } });
                     try adoptRelationWriterForTest(&store, a, T.group);
                     _ = try publishLiveRelationRootWithCoverageForTest(&store, a, T.group, .constraint_names);
+                    create = .{ .admission = .{ .nonce = @splat(50), .head = try store.sqlSequenceAdmissionHead(T.group), .command_fence = fence }, .target = .{ .table = "scoped_counter" }, .namespace_id = system_catalog.default_namespace_id, .incarnation = backend.incarnation, .operation = .{ .create = .{ .options = .{} } } };
+                    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.sqlSequencePreflight(a, T.group, create));
+                    try Helper.activation(&store, a, topology_protocol.current_version);
                     try Helper.scope(&store, a, backend, standalone, 40, .{ .register = .{ .lease = .{ .backend = backend, .database = 1, .node = if (standalone) 0 else 9, .principal = fence.principal, .expires_at_ms = 1000 }, .connection = @splat('2'), .nonce = @splat(5), .standalone = standalone } });
                     try Helper.scope(&store, a, backend, standalone, 41, .{ .begin = frame });
                     create = .{ .admission = .{ .nonce = @splat(50), .head = try store.sqlSequenceAdmissionHead(T.group), .command_fence = fence }, .target = .{ .table = "scoped_counter" }, .namespace_id = system_catalog.default_namespace_id, .incarnation = backend.incarnation, .operation = .{ .create = .{ .options = .{} } } };
-                    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.sqlSequencePreflight(a, T.group, create));
-                    try Helper.activation(&store, a, topology_protocol.sql_command_fence_version);
                     {
                         var txn = try store.store.beginReadTxn();
                         defer txn.abort();
@@ -68938,6 +68948,15 @@ test "SQL prepared transaction named lock participant survives bounded cold hand
                 try store.applyStandaloneCommand(T.group, .{ .initialize_metadata_incarnation = T.seed });
                 if (standalone) try store.replaceStandaloneCatalog(T.group, try store.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
                 try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = if (mode == .commit) topology_protocol.sql_prepared_lock_handoff_version - 1 else topology_protocol.current_version, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+                if (mode == .commit) {
+                    var early = T.admission(identity);
+                    early.standalone = standalone;
+                    early.admission.head = (try Helper.read(&store, a, identity)).head;
+                    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.prepareSqlPreparedTransaction(a, T.group, early));
+                    try store.applyStandaloneCommand(T.group, .{ .apply_sql_prepared_transaction = try std.json.Stringify.valueAlloc(a, early, .{}) });
+                    try std.testing.expectEqual(@as(usize, 0), (try Helper.read(&store, a, identity)).records.len);
+                    try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+                }
                 const registration: L.scopes.Registration = .{ .lease = .{ .backend = source, .database = 1, .node = identity.session.?.owner_node_id, .principal = try L.principalDigest(a, .bootstrap), .expires_at_ms = 1000 }, .connection = identity.session.?.connection_id.?, .nonce = @splat(5), .standalone = standalone };
                 try Helper.scope(&store, a, identity, source, 10, .{ .register = registration });
                 try Helper.scope(&store, a, identity, source, 11, .{ .begin = frame });
@@ -68952,12 +68971,6 @@ test "SQL prepared transaction named lock participant survives bounded cold hand
                 var admission = T.admission(identity);
                 admission.standalone = standalone;
                 admission.admission.head = (try Helper.read(&store, a, identity)).head;
-                if (mode == .commit) {
-                    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.prepareSqlPreparedTransaction(a, T.group, admission));
-                    try store.applyStandaloneCommand(T.group, .{ .apply_sql_prepared_transaction = try std.json.Stringify.valueAlloc(a, admission, .{}) });
-                    try std.testing.expectEqual(@as(usize, 0), (try Helper.read(&store, a, identity)).records.len);
-                    try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
-                }
                 if (mode == .reject_mixed) {
                     try Helper.scope(&store, a, identity, source, 29, .{ .effect = .{ .command = frame, .effect = .{ .backend = source, .sequence = 5, .nonce = @splat(29), .action = .{ .try_acquire = .{ .resource = @splat(20), .mode = .{ .advisory = .exclusive }, .scope = .session } } } } });
                     admission.admission.head = (try Helper.read(&store, a, identity)).head;
