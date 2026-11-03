@@ -206,8 +206,8 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     };
     var private = context;
     private.setting_admin = true;
-    const result_bytes = try server.source.systemCatalog(a, private, .{ .sql_view_mutate = .{ .expected_revision = snapshot.revision, .mutation = change } });
-    const result = try std.json.parseFromSliceLeaky(views.MutationResult, a, result_bytes, .{});
-    if (result.revision != snapshot.revision + 1 or result.identity == null) return error.MetadataMutationOutcomeUnknown;
-    return .{};
+    var reply = try @import("sql_ordinary_catalog.zig").submitView(server, identity, private, allocators, .{ .expected_revision = snapshot.revision, .mutation = change });
+    defer reply.deinit(allocators.result);
+    if (reply.unknown) return .{ .mutation_outcome = null, .catalog_receipt = reply.takeReceipt() };
+    return .{ .catalog_receipt = reply.takeReceipt() };
 }

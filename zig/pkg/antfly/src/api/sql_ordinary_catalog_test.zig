@@ -139,7 +139,7 @@ const Source = struct {
         };
     }
     fn server(self: *@This()) http.ApiHttpServer {
-        return http.ApiHttpServer.init(a, .{ .imported_runtime_io = .{ .api = std.testing.io } }, .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = call, .supports_query_definitions = true } }, null, null);
+        return http.ApiHttpServer.init(a, .{ .imported_runtime_io = .{ .api = std.testing.io } }, .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = call, .supports_query_definitions = true, .supports_sql_views = true } }, null, null);
     }
     fn scope(self: *@This(), alloc: A, fence: L.scopes.CommandFence, nonce: u64, operation: @FieldType(L.Request, "operation")) !void {
         const request: L.Request = .{ .admission = .{ .nonce = id(nonce), .head = (try self.store.systemCatalogMeta(alloc, group)).sequence_outcome_head orelse 0 }, .incarnation = fence.backend.incarnation, .standalone = false, .database = 1, .actor = .{ .session_user = .bootstrap, .credential = "" }, .backend = fence.backend, .operation = operation };
@@ -346,4 +346,119 @@ test "SQL catalog ordinary uncertain nonsend becomes definite rejection only aft
     try std.testing.expectEqual(.rejected, after_fence.state);
     try std.testing.expectEqual(@as(usize, 1), source.attempts);
     try std.testing.expectEqual(@as(usize, 0), source.applied);
+}
+
+test "SQL catalog ordinary view lifecycle retains exact lost replies dependency closure and cold recovery" {
+    const Lost = struct {
+        fn run(source: *Source, server: *http.ApiHttpServer, alloc: A, context: Context, sql: []const u8) !catalog.DdlOutcome {
+            source.lose = .after;
+            return executeSql(server, alloc, context, sql);
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/views-{s}", .{ tmp.sub_path, if (replicated) "raft" else "local" });
+        var store = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        var source: Source = .{ .store = &store, .replicated = replicated };
+        const fence = try source.setup(alloc);
+        var server = source.server();
+        defer server.deinit();
+        source.lose = .after;
+        // Ordinary public connections retain outcomes before scope enrollment.
+        const unscoped = try Lost.run(&source, &server, alloc, .{}, "CREATE VIEW unscoped_view AS SELECT 0::BIGINT AS id");
+        try std.testing.expectEqual(.committed, unscoped.catalog_receipt.?.state);
+        _ = try Lost.run(&source, &server, alloc, .{}, "DROP VIEW unscoped_view");
+        const context: Context = .{ .sql_command_fence = &fence };
+        const first = try Lost.run(&source, &server, alloc, context, "CREATE VIEW retained_view AS SELECT 1::BIGINT AS id");
+        const original = first.catalog_receipt.?;
+        try std.testing.expectEqual(.view, original.kind);
+        try std.testing.expectEqual(.committed, original.state);
+        try std.testing.expectEqual(@as(?u64, 1), original.generation);
+        _ = try Lost.run(&source, &server, alloc, context, "CREATE VIEW retained_child AS SELECT id FROM retained_view");
+        const replacement = try Lost.run(&source, &server, alloc, context, "CREATE OR REPLACE VIEW retained_view AS SELECT 2::BIGINT AS id");
+        try std.testing.expectEqual(original.object_id, replacement.catalog_receipt.?.object_id);
+        try std.testing.expectEqual(@as(?u64, 2), replacement.catalog_receipt.?.generation);
+        const renamed = try Lost.run(&source, &server, alloc, context, "ALTER VIEW retained_view RENAME TO renamed_view");
+        try std.testing.expectEqual(original.object_id, renamed.catalog_receipt.?.object_id);
+        try std.testing.expectEqual(@as(?u64, 2), renamed.catalog_receipt.?.generation);
+        const before_restrict = try store.systemCatalogMeta(alloc, group);
+        try std.testing.expectError(error.SqlDependentObjectsExist, Lost.run(&source, &server, alloc, context, "DROP VIEW renamed_view"));
+        const after_restrict = try store.systemCatalogMeta(alloc, group);
+        try std.testing.expectEqual(before_restrict.revision, after_restrict.revision);
+        const dropped = try Lost.run(&source, &server, alloc, context, "DROP VIEW renamed_view CASCADE");
+        try std.testing.expectEqual(.committed, dropped.catalog_receipt.?.state);
+        try std.testing.expectEqual(@as(?u64, null), dropped.catalog_receipt.?.object_id);
+        const selected = try store.resolveSystemCatalogIdentitiesWithContext(alloc, group, .{ .sql_sources = &.{ .{ .name = .{ .table = "renamed_view" } }, .{ .name = .{ .table = "retained_child" } } }, .include_query_definitions = true }, .{});
+        defer selected.deinit(alloc);
+        try std.testing.expect(selected.sql_sources[0] == null and selected.sql_sources[1] == null);
+        source.hide = true;
+        const uncertain = try Lost.run(&source, &server, alloc, context, "CREATE VIEW retained_view AS SELECT 3::BIGINT AS id");
+        try std.testing.expectEqual(.unknown, uncertain.catalog_receipt.?.state);
+        const attempts = source.attempts;
+        store.deinit();
+        store = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        source.hide = false;
+        try source.scope(alloc, fence, 90, .{ .fence = .close });
+        const recovered = (try ordinary.recoverIfOrdinary(&server, null, .{}, alloc, uncertain.catalog_receipt.?.recovery_token)).?;
+        try std.testing.expectEqual(.committed, recovered.state);
+        try std.testing.expect(recovered.object_id != original.object_id);
+        try std.testing.expectEqual(.committed, (try ordinary.recoverIfOrdinary(&server, null, .{}, alloc, original.recovery_token)).?.state);
+        try std.testing.expectEqual(original.object_id, (try ordinary.recoverIfOrdinary(&server, null, .{}, alloc, original.recovery_token)).?.object_id);
+        try std.testing.expectEqual(attempts, source.attempts);
+    }
+}
+
+test "SQL catalog ordinary view post effect failures abort publication and journal together" {
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try storage.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/view-abort", .{tmp.sub_path}) });
+    defer store.deinit();
+    var source: Source = .{ .store = &store };
+    const fence = try source.setup(alloc);
+    var server = source.server();
+    defer server.deinit();
+    const before = try store.systemCatalogMeta(alloc, group);
+    for ([_]anyerror{ error.CatalogGenerationChanged, error.InjectedCatalogWriteFailure }) |fault| {
+        store.sql_catalog_post_effect_error = fault;
+        const outcome = try executeSql(&server, alloc, .{ .sql_command_fence = &fence }, "CREATE VIEW aborted_view AS SELECT 1::BIGINT AS id");
+        try std.testing.expectEqual(.unknown, outcome.catalog_receipt.?.state);
+        try std.testing.expectEqualDeep(before, try store.systemCatalogMeta(alloc, group));
+        const selected = try store.resolveSystemCatalogIdentitiesWithContext(alloc, group, .{ .sql_sources = &.{.{ .name = .{ .table = "aborted_view" } }}, .include_query_definitions = true }, .{});
+        defer selected.deinit(alloc);
+        try std.testing.expect(selected.sql_sources[0] == null);
+        try std.testing.expectEqual(.unknown, (try ordinary.recoverIfOrdinary(&server, null, .{}, alloc, outcome.catalog_receipt.?.recovery_token)).?.state);
+    }
+}
+
+test "SQL catalog ordinary view outcome decoder preserves object generations and rejects impossible completions" {
+    var request: native.Observation = .{ .admission = .{ .request = .{ .nonce = @splat(1), .head = 0 }, .incarnation = @splat(2) }, .target = .{ .kind = .view, .action = .create, .database = "default", .namespace = "public", .name = "v", .table_id = 0 }, .expected_revision = 7, .digest = @splat(3) };
+    const T = struct {
+        fn decoded(observation: native.Observation, result: native.outcomes.Result) !?native.Outcome {
+            const bytes = try std.json.Stringify.valueAlloc(a, native.Outcome{ .success = result }, .{});
+            defer a.free(bytes);
+            return ordinary.decodeOutcome(a, bytes, observation);
+        }
+    };
+    var result: native.outcomes.Result = .{ .revision = 8, .identity = .{ .id = 4, .generation = 3 }, .removed = 0 };
+    try std.testing.expect((try T.decoded(request, result)) != null);
+    result.revision = 9;
+    try std.testing.expect((try T.decoded(request, result)) == null);
+    result = .{ .revision = 7, .identity = null, .removed = 0, .no_op = true };
+    try std.testing.expect((try T.decoded(request, result)) == null);
+    request.target.action = .drop;
+    try std.testing.expect((try T.decoded(request, result)) != null);
+    result.identity = .{ .id = 4, .generation = 3 };
+    try std.testing.expect((try T.decoded(request, result)) == null);
+    result = .{ .revision = 8, .identity = null, .removed = 2 };
+    try std.testing.expect((try T.decoded(request, result)) == null);
+    result.removed = 1;
+    try std.testing.expect((try T.decoded(request, result)) != null);
 }

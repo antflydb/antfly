@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: ongoing SQL catalog lifecycle qualification, merged with `origin/main`
-at `1bb04dd0b9` (2026-10-27). This is an implementation and qualification
+at `24486f5f30` (2026-11-03). This is an implementation and qualification
 backlog, not a completion claim. PostgreSQL is the SQL standard and independent
 oracle.
 
@@ -18369,3 +18369,47 @@ This is an integration checkpoint, not an original-case closure. The 87 original
 unresolved cases, including 64 DDL/catalog cases, remain unchanged. Automatic
 connection enrollment stays guarded until the remaining schema/view/FK and
 other mutation families share the command admission contract.
+
+
+### View definitions share native command outcomes
+
+Public ordinary and scoped view CREATE, CREATE OR REPLACE, RENAME and DROP now
+prepare one immutable native view command and retain its exact result in the
+shared catalog journal. The complete definition, expected revision, native
+incarnation, authorization labels and optional command fence participate in its
+digest. Custom command serialization preserves both the view intent and journal
+admission. Recovery remains read-only after unrelated writes, name reuse,
+executor retirement and cold reopen.
+
+The existing dependency validator and publisher run once per native apply.
+An explicit first-effect marker distinguishes semantic admission refusals from
+errors after provisional writes. The latter abort dependency edges, source
+identity bootstrap, catalog publication and journal append together; they cannot
+be converted into a retained rejection. The legacy native receiving path uses
+the same effect boundary. CASCADE retains the existing bounded dependency closure
+and physical backing retirement machinery; the public receipt identifies the
+requested operation rather than returning an unbounded list of dropped objects.
+
+This extends shared lifecycle infrastructure without claiming closure of any
+additional original parity case. Automatic connection enrollment still needs the
+remaining schema, annotation and table lifecycle guards. The original inventory remains
+912 implemented, 138 rejected, 449 superseded and 87 unresolved.
+
+
+The regenerated view receipt contract passes the full TypeScript SDK suite
+(617 passed, one existing intentional skip), 109 Python SQL tests, the Go SDK
+suite and all 19 Rust SDK tests. The independent inventory and source/control
+catalog audits pass. These client and lifecycle checks do not change original
+parity dispositions.
+
+
+The final combined Debug qualification passes **144/144 build steps**, including
+eight audited public recovery/fault/decoder contracts, eleven native fence
+contracts, three decoder contracts and the real standalone startup/cold-reopen
+campaign. The mounted relational and document view campaigns and all fifteen
+view-domain/catalog contracts pass. The materialized contract now verifies that
+an error after backing retirement rolls back the physical owner, catalog and
+journal together; exact replay retains the original successful drop outcome.
+There are no skips, failures or leaks in these Debug gates. `make generate`,
+`make fmt`, inventory, source/control catalog, Apache-boundary and staged license
+checks pass. Original case counts remain unchanged.

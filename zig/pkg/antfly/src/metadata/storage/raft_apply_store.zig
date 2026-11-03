@@ -27310,9 +27310,13 @@ pub const RaftApplyStore = struct {
             };
         }
         if (command.sql_view != null) {
-            _ = self.applySqlViewLifecycleTxn(txn, group_id, command, true) catch |err| switch (err) {
-                error.SqlWrongObjectType, error.CatalogGenerationChanged, error.CatalogAlreadyExists, error.CatalogNotFound, error.SqlDependentObjectsExist, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.TableTopologyProtocolUpgradeRequired, error.CatalogOccupancyNotReady, error.CatalogPublicationProofPending, error.SqlViewCycle, error.SqlProgramLimitExceeded, error.TableTransitionActive => return,
-                else => return err,
+            var effects_started = false;
+            _ = self.applySqlViewLifecycleWithEffectsTxn(txn, group_id, command, true, &effects_started) catch |err| {
+                if (effects_started) return err;
+                switch (err) {
+                    error.SqlWrongObjectType, error.CatalogGenerationChanged, error.CatalogAlreadyExists, error.CatalogNotFound, error.SqlDependentObjectsExist, error.SqlViewColumnRename, error.SqlViewColumnTypeChanged, error.SqlViewColumnDropped, error.TableTopologyProtocolUpgradeRequired, error.CatalogOccupancyNotReady, error.CatalogPublicationProofPending, error.SqlViewCycle, error.SqlProgramLimitExceeded, error.TableTransitionActive => return,
+                    else => return err,
+                }
             };
             return;
         }
@@ -27443,7 +27447,7 @@ pub const RaftApplyStore = struct {
             .append => |ordinal| {
                 // Semantic refusals precede logical effects. From this point,
                 // every error aborts the transaction, regardless of its error tag.
-                const result = try self.applyOrdinarySystemCatalogTxn(txn, group, bytes, command);
+                const result = if (command.sql_view != null) try self.applyJournaledSqlViewTxn(txn, group, command) else try self.applyOrdinarySystemCatalogTxn(txn, group, bytes, command);
                 if (builtin.is_test) if (self.sql_catalog_post_effect_error) |err| {
                     self.sql_catalog_post_effect_error = null;
                     return err;
@@ -27451,6 +27455,16 @@ pub const RaftApplyStore = struct {
                 try journal.append(a, ordinal, admission.request, digest, result);
             },
         }
+    }
+
+    fn applyJournaledSqlViewTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !sql_catalog_mutations.Outcome {
+        var effects_started = false;
+        const result = self.applySqlViewLifecycleWithEffectsTxn(txn, group, command, true, &effects_started) catch |err| {
+            if (!effects_started) if (sql_catalog_mutations.Outcome.fromError(err)) |outcome| return outcome;
+            return err;
+        };
+        const dropped = command.sql_view.?.operation == .drop and result.removed != 0;
+        return .{ .success = .{ .revision = result.revision, .identity = if (!dropped) if (result.identity) |identity| .{ .id = identity.id, .generation = identity.generation } else null else null, .removed = @intFromBool(dropped), .no_op = result.revision == command.expected_revision } };
     }
 
     pub fn sqlCatalogOutcome(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, request: sql_catalog_mutations.Observation) ![]u8 {
@@ -42260,6 +42274,7 @@ pub const RaftApplyStore = struct {
         expected: ?SqlViewIdentity = null,
         dry_run: bool = false,
         command_hash: ?[32]u8 = null,
+        effects_started: ?*bool = null,
     };
 
     /// The caller owns the containing catalog transaction and admission
@@ -42377,6 +42392,7 @@ pub const RaftApplyStore = struct {
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
         if (request.command_hash) |value| hash = value;
+        if (request.effects_started) |started| started.* = true;
         try self.writeSqlViewAuxTxn(txn, group, aux);
         try self.applySystemCatalogDeltaTxn(a, txn, group, .{ .upserts = &upserts, .removes = &.{}, .next_id = next_id }, meta, hash);
         self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group });
@@ -42389,6 +42405,10 @@ pub const RaftApplyStore = struct {
     /// read-only, including listeners; replay writes only after the complete
     /// bounded dependency closure and all reverse edges have been verified.
     fn applySqlViewLifecycleTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand, apply: bool) !sql_views.MutationResult {
+        return self.applySqlViewLifecycleWithEffectsTxn(txn, group, command, apply, null);
+    }
+
+    fn applySqlViewLifecycleWithEffectsTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand, apply: bool, effects_started: ?*bool) !sql_views.MutationResult {
         const request = command.sql_view orelse return error.InvalidCatalogMutation;
         try request.validate();
         if (command.version != 2 or command.topology != null or command.placement_update != null or
@@ -42421,6 +42441,7 @@ pub const RaftApplyStore = struct {
                 .expected = input.expected,
                 .dry_run = !apply,
                 .command_hash = hash,
+                .effects_started = effects_started,
             });
             return .{ .revision = command.expected_revision + 1, .identity = identity };
         }
@@ -42464,6 +42485,7 @@ pub const RaftApplyStore = struct {
             var renamed = resource.value;
             renamed.name = name;
             if (apply) {
+                if (effects_started) |started| started.* = true;
                 // applyDelta removes an old name before installing its new
                 // spelling; dependencies retain durable IDs unchanged.
                 var removes = [_]system_catalog.Resource{resource.value};
@@ -42537,6 +42559,7 @@ pub const RaftApplyStore = struct {
         // by a verified forward definition in this same closure.
         for (incoming.items) |key| if (!edge_set.contains(key)) return error.InvalidSqlViewRecord;
         if (apply) {
+            if (effects_started) |started| started.* = true;
             // Retire physical owners and their placements in the same metadata
             // transaction as the verified dependency closure. Existing native
             // reader leases and table cleanup own the eventual file deletion.
@@ -64760,11 +64783,38 @@ test "SQL view catalog materialized hidden generation atomically publishes empty
     try std.testing.expectEqual(restore_staging.State.published, (try store.loadRestoreStagingProgress(a, group, refresh_plan.id)).?.state);
     try std.testing.expect((try store.getTable(a, group, 41)) == null);
     try verifyRelationRecoveryForTest(&store, a, group);
+    const journal_activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.sql_catalog_journal_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+    defer a.free(journal_activation);
+    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = journal_activation });
     const before = try store.systemCatalogMeta(a, group);
-    const drop = sql_views.command(.{ .expected_revision = before.revision, .mutation = .{ .target = .{ .table = "mv" }, .operation = .{ .drop = .{ .expected = .{ .id = 42, .generation = 1 }, .materialized = true } } } });
+    var drop = sql_views.command(.{ .expected_revision = before.revision, .mutation = .{ .target = .{ .table = "mv" }, .operation = .{ .drop = .{ .expected = .{ .id = 42, .generation = 1 }, .materialized = true } } } });
+    const cut = try store.systemCatalogAdmission(a, group, drop.mutation);
+    drop.sql_catalog_admission = .{ .request = .{ .nonce = @splat(77), .head = cut.meta.sequence_outcome_head orelse 0 }, .incarnation = cut.incarnation };
+    const observed = try sql_catalog_mutations.observation(a, drop);
     const bytes = try std.json.Stringify.valueAlloc(a, drop, .{});
     defer a.free(bytes);
+    // Backing retirement and every logical/dependency write share the outcome
+    // transaction. A post-effect semantic-looking error must abort all of it.
+    store.sql_catalog_post_effect_error = error.CatalogGenerationChanged;
+    try std.testing.expectError(error.CatalogGenerationChanged, store.applyStandaloneCommand(group, .{ .apply_system_catalog = bytes }));
+    try std.testing.expectEqualDeep(before, try store.systemCatalogMeta(a, group));
+    const retained_backing = (try store.getTable(a, group, 43)) orelse return error.TestExpectedMaterializedBacking;
+    defer metadata_table_manager.freeTable(a, retained_backing);
+    const absent_outcome = try store.sqlCatalogOutcome(a, group, observed);
+    defer a.free(absent_outcome);
+    try std.testing.expectEqualStrings("null", absent_outcome);
+    try verifyRelationRecoveryForTest(&store, a, group);
     try store.applyStandaloneCommand(group, .{ .apply_system_catalog = bytes });
+    const committed_outcome = try store.sqlCatalogOutcome(a, group, observed);
+    defer a.free(committed_outcome);
+    var parsed_outcome = try std.json.parseFromSlice(?sql_catalog_mutations.Outcome, a, committed_outcome, .{});
+    defer parsed_outcome.deinit();
+    const committed = try parsed_outcome.value.?.result();
+    try std.testing.expectEqual(@as(usize, 1), committed.removed);
+    try std.testing.expect(committed.identity == null);
+    const after = try store.systemCatalogMeta(a, group);
+    try store.applyStandaloneCommand(group, .{ .apply_system_catalog = bytes });
+    try std.testing.expectEqualDeep(after, try store.systemCatalogMeta(a, group));
     try std.testing.expect((try store.getTable(a, group, 41)) == null);
     try std.testing.expect((try store.getTable(a, group, 43)) == null);
     const missing = try store.resolveSystemCatalogIdentities(a, group, .{ .sql_sources = &.{.{ .view_id = 42 }} });

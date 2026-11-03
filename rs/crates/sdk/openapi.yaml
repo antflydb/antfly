@@ -23107,6 +23107,7 @@ components:
         - namespace
         - tablespace
         - query_source
+        - view
       description: Catalog object affected by an exact recoverable operation.
     SQLCatalogOperationKind:
       type: string

@@ -7417,7 +7417,7 @@ export interface components {
          * @description Catalog object affected by an exact recoverable operation.
          * @enum {string}
          */
-        SQLCatalogObjectKind: "sequence" | "function" | "procedure" | "operator" | "aggregate" | "cast" | "type" | "authorization" | "table" | "index" | "database" | "namespace" | "tablespace" | "query_source";
+        SQLCatalogObjectKind: "sequence" | "function" | "procedure" | "operator" | "aggregate" | "cast" | "type" | "authorization" | "table" | "index" | "database" | "namespace" | "tablespace" | "query_source" | "view";
         /** @enum {string} */
         SQLCatalogOperationKind: "create" | "alter" | "rename" | "drop";
         /**

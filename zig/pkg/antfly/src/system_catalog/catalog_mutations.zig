@@ -23,6 +23,7 @@ pub const Preparation = struct {
     request: @import("antfly_local_sources").system_catalog_domain.Request,
     nonce: [16]u8,
     command_fence: ?@import("command_fence.zig").Fence = null,
+    view: ?@import("views.zig").Request = null,
 };
 pub const Admission = struct {
     request: outcomes.Admission,
@@ -44,7 +45,7 @@ pub const Target = struct {
     pub fn validateLabels(self: @This()) !void {
         const domain = @import("antfly_local_sources").system_catalog_domain;
         switch (self.kind) {
-            .table, .database, .namespace, .tablespace, .query_source => {},
+            .table, .database, .namespace, .tablespace, .query_source, .view => {},
             else => return error.InvalidCatalogMutation,
         }
         try domain.validateResourceName(self.kind, self.name);
@@ -70,7 +71,7 @@ pub const Observation = struct {
     }
 };
 const Command = @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand;
-fn hash(_: A, tag: []const u8, value: anytype) ![32]u8 {
+fn hash(tag: []const u8, value: anytype) ![32]u8 {
     var state = std.crypto.hash.sha2.Sha256.init(.{});
     state.update(tag);
     var buffer: [4096]u8 = undefined;
@@ -84,30 +85,54 @@ fn hash(_: A, tag: []const u8, value: anytype) ![32]u8 {
 
 pub fn validate(command: Command) !void {
     switch (command.mutation.kind) {
-        .table, .database, .namespace, .tablespace, .query_source => {},
+        .table, .database, .namespace, .tablespace, .query_source, .view => {},
         // These have their own typed native journals and preparation proofs.
         else => return error.InvalidCatalogMutation,
     }
     try (command.sql_catalog_admission orelse return error.InvalidCatalogMutation).validate();
-    if (command.sql_native_index != null or command.sql_authorization != null or command.sql_type != null or command.sql_cast != null or command.sql_routine != null or command.sql_sequence != null or command.sql_view != null) return error.InvalidCatalogMutation;
+    if (command.sql_native_index != null or command.sql_authorization != null or command.sql_type != null or command.sql_cast != null or command.sql_routine != null or command.sql_sequence != null) return error.InvalidCatalogMutation;
     if (command.version != 1 and command.version != 2 and command.version != 3 and command.version != Command.creation_sources_version) return error.InvalidCatalogMutation;
     try command.validateCreationSources();
+    if (command.sql_view) |view| {
+        try view.validate();
+        const expected = @import("views.zig").command(.{ .expected_revision = command.expected_revision, .mutation = view });
+        if (!std.mem.eql(u8, &try hash("antfly:sql-catalog-intent:v1", command.mutation), &try hash("antfly:sql-catalog-intent:v1", expected.mutation)) or command.version != 2 or command.topology != null or command.placement_update != null or command.column_sequences.len != 0 or command.constraint_name_admission != null or command.mutation.table_id != 0 or command.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
+    } else if (command.mutation.kind == .view) return error.InvalidCatalogMutation;
 }
-pub fn observation(a: A, command: Command) !Observation {
+pub fn observation(_: A, command: Command) !Observation {
     try validate(command);
-    const result: Observation = .{ .admission = command.sql_catalog_admission.?, .target = .{ .kind = command.mutation.kind, .action = command.mutation.action, .database = command.mutation.database, .namespace = command.mutation.namespace, .name = command.mutation.name, .table_id = if (command.mutation.kind == .table) command.mutation.table_id else 0 }, .expected_revision = command.expected_revision, .digest = try hash(a, "antfly:sql-catalog-command:v1", command) };
+    const result: Observation = .{ .admission = command.sql_catalog_admission.?, .target = .{ .kind = command.mutation.kind, .action = command.mutation.action, .database = command.mutation.database, .namespace = command.mutation.namespace, .name = command.mutation.name, .table_id = if (command.mutation.kind == .table) command.mutation.table_id else 0 }, .expected_revision = command.expected_revision, .digest = try hash("antfly:sql-catalog-command:v1", command) };
     try result.validate();
     return result;
 }
-pub fn matchesIntent(a: A, prepared: @import("antfly_local_sources").system_catalog_domain.Mutation, requested: @import("antfly_local_sources").system_catalog_domain.Mutation) !bool {
+pub fn matchesIntent(_: A, prepared: @import("antfly_local_sources").system_catalog_domain.Mutation, requested: @import("antfly_local_sources").system_catalog_domain.Mutation) !bool {
     var logical = prepared;
     logical.table_id = requested.table_id;
     logical.storage_name = requested.storage_name;
-    return std.mem.eql(u8, &try hash(a, "antfly:sql-catalog-intent:v1", logical), &try hash(a, "antfly:sql-catalog-intent:v1", requested));
+    return std.mem.eql(u8, &try hash("antfly:sql-catalog-intent:v1", logical), &try hash("antfly:sql-catalog-intent:v1", requested));
 }
-pub fn boundDigest(a: A, request: Observation) ![32]u8 {
+pub fn matchesViewIntent(_: A, prepared: ?@import("views.zig").Mutation, requested: ?@import("views.zig").Mutation) !bool {
+    return std.mem.eql(u8, &try hash("antfly:sql-view-intent:v1", prepared), &try hash("antfly:sql-view-intent:v1", requested));
+}
+/// One read cut binds the immutable view intent to the native journal head.
+/// Publication repeats all semantic checks against its expected revision.
+pub fn prepareView(alloc: A, store: anytype, group: u64, request: Preparation) ![]u8 {
+    const view = request.view orelse return error.InvalidCatalogMutation;
+    const cut = try store.systemCatalogAdmission(alloc, group, request.request.mutation);
+    if (cut.meta.revision != view.expected_revision) return error.CatalogGenerationChanged;
+    var command = @import("views.zig").command(view);
+    if (!try matchesIntent(alloc, command.mutation, request.request.mutation)) return error.InvalidCatalogMutation;
+    command.sql_catalog_admission = .{ .request = .{ .nonce = request.nonce, .head = cut.meta.sequence_outcome_head orelse 0, .command_fence = request.command_fence }, .incarnation = cut.incarnation };
+    try validate(command);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    errdefer alloc.free(bytes);
+    if (bytes.len > @import("antfly_local_sources").system_catalog_domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    return bytes;
+}
+
+pub fn boundDigest(_: A, request: Observation) ![32]u8 {
     try request.validate();
-    return hash(a, "antfly:sql-catalog-outcome:v1", request);
+    return hash("antfly:sql-catalog-outcome:v1", request);
 }
 
 test "SQL command fence catalog identity binds the whole prepared command without duplicating intent" {
@@ -166,4 +191,40 @@ test "SQL command fence catalog hashing streams large canonical definitions with
     var invalid = command;
     invalid.mutation.source_json = too_large;
     try std.testing.expectError(error.CatalogCommandTooLarge, observation(std.testing.failing_allocator, invalid));
+}
+
+test "SQL command fence view journal serialization binds definitions and rejects mixed envelopes" {
+    const a = std.testing.allocator;
+    var command = @import("views.zig").command(.{ .expected_revision = 7, .mutation = .{ .target = .{ .table = "retained" }, .operation = .{ .publish = .{ .definition = .{
+        .format = 1,
+        .query = "SELECT 1::BIGINT AS id",
+        .owner = .auth_disabled,
+        .security = .invoker,
+        .security_barrier = true,
+        .catalog_revision = null,
+        .setting_epoch = null,
+        .columns = &.{.{ .name = "id", .type = .integer, .element_type = .int64 }},
+        .sources = &.{},
+    } } } } });
+    command.sql_catalog_admission = .{ .request = .{ .nonce = @splat(1), .head = 0 }, .incarnation = @splat(2) };
+    const original = try observation(std.testing.failing_allocator, command);
+    const bytes = try std.json.Stringify.valueAlloc(a, command, .{});
+    defer a.free(bytes);
+    var decoded = try std.json.parseFromSlice(Command, a, bytes, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(original, try observation(std.testing.failing_allocator, decoded.value));
+    try std.testing.expect(decoded.value.sql_view != null);
+    var altered = command;
+    altered.sql_view.?.operation.publish.definition.query = "SELECT 2::BIGINT AS id";
+    try std.testing.expect(!try matchesViewIntent(std.testing.failing_allocator, command.sql_view, altered.sql_view));
+    try std.testing.expect(!std.mem.eql(u8, &original.digest, &(try observation(std.testing.failing_allocator, altered)).digest));
+    altered = command;
+    altered.mutation.name = "substituted";
+    try std.testing.expectError(error.InvalidCatalogMutation, observation(a, altered));
+    altered = command;
+    altered.mutation.table_id = 8;
+    try std.testing.expectError(error.InvalidCatalogMutation, observation(a, altered));
+    altered = command;
+    altered.sql_view = null;
+    try std.testing.expectError(error.InvalidCatalogMutation, observation(a, altered));
 }

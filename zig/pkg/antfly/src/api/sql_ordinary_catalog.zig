@@ -29,6 +29,7 @@ pub const Token = struct { version: u8 = 11, kind: common.Receipt.Kind, request:
 fn kind(target: native.Target) common.Receipt.Kind {
     return switch (target.kind) {
         .table => .table,
+        .view => .view,
         .database => .database,
         .namespace => .namespace,
         .tablespace => .tablespace,
@@ -81,9 +82,11 @@ pub fn decodeOutcome(a: A, bytes: []const u8, request: native.Observation) ?nati
     if (outcome == .success) {
         const result = outcome.success;
         result.validate() catch return null;
-        if (result.revision != request.expected_revision + 1 or result.removed != @intFromBool(request.target.action == .drop) or result.no_op or result.lock_effect != null or result.cascade_notice != null) return null;
-        if ((request.target.action == .drop or request.target.kind == .table) != (result.identity == null)) return null;
-        if (result.identity) |identity| if (identity.generation != result.revision) return null;
+        const noop = request.target.kind == .view and request.target.action == .drop and result.no_op;
+        if (noop and result.identity != null) return null;
+        if (result.revision != request.expected_revision + @as(u64, if (noop) 0 else 1) or result.removed != @intFromBool(request.target.action == .drop and !noop) or (result.no_op and !noop) or result.lock_effect != null or result.cascade_notice != null) return null;
+        if (!noop and (request.target.action == .drop or request.target.kind == .table) != (result.identity == null)) return null;
+        if (result.identity) |identity| if (request.target.kind != .view and identity.generation != result.revision) return null;
     }
     return outcome;
 }
@@ -148,7 +151,13 @@ pub const Reply = struct {
     }
 };
 pub fn submit(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, allocators: local.sql_catalog.DdlAllocators, request: domain.Request) !Reply {
-    if (context.sql_command_fence == null) return .{ .legacy = try server.source.systemCatalog(allocators.result, context, .{ .mutate = request }) };
+    return submitIntent(server, identity, context, allocators, request, null);
+}
+pub fn submitView(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, allocators: local.sql_catalog.DdlAllocators, view: @import("../system_catalog/views.zig").Request) !Reply {
+    return submitIntent(server, identity, context, allocators, .{ .mutation = @import("../system_catalog/views.zig").command(view).mutation }, view);
+}
+fn submitIntent(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, allocators: local.sql_catalog.DdlAllocators, request: domain.Request, view: ?@import("../system_catalog/views.zig").Request) !Reply {
+    if (context.sql_command_fence == null and view == null) return .{ .legacy = try server.source.systemCatalog(allocators.result, context, .{ .mutate = request }) };
     var region: std.heap.ArenaAllocator = .init(allocators.scratch);
     defer region.deinit();
     const scratch = region.allocator();
@@ -158,11 +167,14 @@ pub fn submit(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity
     const io = server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
-    const bytes = try server.source.systemCatalog(scratch, private, .{ .sql_catalog_prepare = .{ .request = request, .nonce = nonce, .command_fence = context.sql_command_fence.?.* } });
+    const command_fence = if (context.sql_command_fence) |fence| @as(?@import("../system_catalog/command_fence.zig").Fence, fence.*) else null;
+    const bytes = try server.source.systemCatalog(scratch, private, .{ .sql_catalog_prepare = .{ .request = request, .nonce = nonce, .command_fence = command_fence, .view = view } });
     const command = try std.json.parseFromSliceLeaky(Command, scratch, bytes, .{});
     const observation = try native.observation(scratch, command);
+    if (view) |requested| if (observation.expected_revision != requested.expected_revision) return error.InvalidCatalogMutation;
     // A faulty/foreign preparer cannot redirect permission or recovery labels.
-    if (!try native.matchesIntent(scratch, command.mutation, request.mutation) or !std.mem.eql(u8, &observation.admission.request.nonce, &nonce) or !std.meta.eql(observation.admission.request.command_fence, @as(?@import("../system_catalog/command_fence.zig").Fence, context.sql_command_fence.?.*))) return error.InvalidCatalogMutation;
+    if (!try native.matchesViewIntent(scratch, command.sql_view, if (view) |value| value.mutation else null)) return error.InvalidCatalogMutation;
+    if (!try native.matchesIntent(scratch, command.mutation, request.mutation) or !std.mem.eql(u8, &observation.admission.request.nonce, &nonce) or !std.meta.eql(observation.admission.request.command_fence, command_fence)) return error.InvalidCatalogMutation;
     if (request.physical_name) |name| if (!std.mem.eql(u8, name, command.mutation.storage_name)) return error.InvalidCatalogMutation;
     try authorize(server, identity, scratch, observation.target);
     var receipt = try newReceipt(allocators.result, scratch, observation);

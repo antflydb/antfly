@@ -12904,6 +12904,7 @@ pub const SQLCatalogObjectKind = enum {
     namespace,
     tablespace,
     query_source,
+    view,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -12921,6 +12922,7 @@ pub const SQLCatalogObjectKind = enum {
             .namespace => "namespace",
             .tablespace => "tablespace",
             .query_source => "query_source",
+            .view => "view",
         };
         try jw.write(s);
     }
@@ -12945,6 +12947,7 @@ pub const SQLCatalogObjectKind = enum {
             .{ "namespace", .namespace },
             .{ "tablespace", .tablespace },
             .{ "query_source", .query_source },
+            .{ "view", .view },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

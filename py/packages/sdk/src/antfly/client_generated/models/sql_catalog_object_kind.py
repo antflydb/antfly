@@ -16,6 +16,7 @@ class SQLCatalogObjectKind(StrEnum):
     TABLE = "table"
     TABLESPACE = "tablespace"
     TYPE = "type"
+    VIEW = "view"
 
     def __str__(self) -> str:
         return str(self.value)
