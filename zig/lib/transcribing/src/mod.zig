@@ -73,6 +73,10 @@ pub const Config = struct {
     capability_revision: ?[]const u8 = null,
     /// Runtime-resolved Antfly capability; ignored by third-party providers.
     framed_attachments: bool = false,
+    /// Provider-declared hard total-token ceiling for one recognition call.
+    /// Document reading charges this entire allowance when usage is unavailable.
+    /// Set from the selected deployment/model's limits, never from file size.
+    max_total_tokens: ?u64 = null,
     base_url: ?[]const u8 = null,
     url: ?[]const u8 = null,
     api_url: ?[]const u8 = null,
@@ -109,6 +113,17 @@ pub const Config = struct {
             self.framed_attachments or self.use_enhanced != null or self.enable_automatic_punctuation != null or (self.diarization orelse false))
             return error.UnsupportedAppleTranscriptionOptions;
         if (self.max_download_bytes) |limit| if (limit > default_max_download_bytes) return error.AppleNativeInputTooLarge;
+    }
+
+    /// Endpoint actually used by each adapter, including provider defaults.
+    pub fn effectiveEndpoint(self: Config) ?[]const u8 {
+        return switch (self.provider) {
+            .openai => self.base_url orelse "https://api.openai.com/v1",
+            .vertex => self.base_url orelse "https://speech.googleapis.com/v2",
+            .cloudflare => self.base_url orelse self.url,
+            .antfly => self.resolvedUrl() orelse "http://127.0.0.1:8080",
+            .apple => null,
+        };
     }
 
     pub fn resolvedUrl(self: Config) ?[]const u8 {
@@ -718,7 +733,7 @@ const AntflyTranscriberState = struct {
         const state = try alloc.create(AntflyTranscriberState);
         errdefer alloc.destroy(state);
 
-        const api_url = try alloc.dupe(u8, cfg.resolvedUrl() orelse "http://127.0.0.1:8080");
+        const api_url = try alloc.dupe(u8, cfg.effectiveEndpoint().?);
         errdefer alloc.free(api_url);
         const model = try alloc.dupe(u8, model_name);
         errdefer alloc.free(model);
@@ -1091,7 +1106,7 @@ const CloudflareTranscriberState = struct {
             .model = self.cfg.model.?,
             .api_key = self.cfg.bearer_token orelse self.cfg.api_key orelse return error.MissingCloudflareCredentials,
             .gateway_id = self.cfg.gateway_id,
-            .url = self.cfg.base_url orelse self.cfg.url,
+            .url = self.cfg.effectiveEndpoint(),
         }, payload, .{
             .max_response_bytes = self.cfg.max_response_bytes orelse httpx.types.default_max_body_size,
             .timeout_ms = try control.remainingTimeoutMs(),
@@ -1181,7 +1196,7 @@ const OpenAiTranscriberState = struct {
             .alloc = alloc,
             .options = options,
             .http = http,
-            .base_url = try alloc.dupe(u8, cfg.base_url orelse "https://api.openai.com/v1"),
+            .base_url = try alloc.dupe(u8, cfg.effectiveEndpoint().?),
             .model = try alloc.dupe(u8, cfg.model orelse "whisper-1"),
             .language_code = try dupOpt(alloc, cfg.language_code),
             .max_response_bytes = cfg.max_response_bytes,
@@ -1333,7 +1348,7 @@ const VertexTranscriberState = struct {
             .alloc = alloc,
             .options = options,
             .http = http,
-            .base_url = try alloc.dupe(u8, cfg.base_url orelse "https://speech.googleapis.com/v2"),
+            .base_url = try alloc.dupe(u8, cfg.effectiveEndpoint().?),
             .project_id = if (cfg.project_id) |value| try alloc.dupe(u8, value) else (try vertexProjectIdFromConfigAlloc(alloc, cfg.credentials_path) orelse return error.InvalidTranscribingConfig),
             .location = try alloc.dupe(u8, cfg.location orelse "global"),
             .model = try alloc.dupe(u8, cfg.model orelse "latest_long"),

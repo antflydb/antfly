@@ -17194,6 +17194,8 @@ export interface components {
          */
         STTConfig: (components["schemas"]["CloudflareSTTConfig"] | components["schemas"]["OpenAISTTConfig"] | components["schemas"]["VertexSTTConfig"] | components["schemas"]["AntflySTTConfig"] | components["schemas"]["AppleSTTConfig"]) & {
             provider: components["schemas"]["STTProvider"];
+            /** @description Provider-declared hard per-call token bound. Required for hosted document reading when measurements are unavailable; the full allowance is charged against the document budget, never as measured usage. */
+            max_total_tokens?: number;
         };
         /** @description Transcribes audio units. */
         DocumentExtractionTranscriptionConfig: {
@@ -23882,7 +23884,7 @@ export interface components {
             }[];
             /** @description Name of model used for reading */
             model: string;
-            /** @description Measured token usage, or null when the selected provider does not report it. */
+            /** @description Token measurements and any explicit unmeasured document allowances, or null when neither is available. */
             usage?: components["schemas"]["InferenceGenerateUsage"] | null;
             /** @description Observed execution path. Omitted by older compatible servers. */
             execution?: components["schemas"]["InferenceBatchExecutionReport"];
@@ -24877,8 +24879,10 @@ export interface components {
             prompt_tokens: number;
             /** @description Number of tokens in the completion */
             completion_tokens: number;
-            /** @description Total tokens used (prompt + completion) */
+            /** @description Total token budget consumed (measured prompt and completion tokens plus unmeasured allowances). */
             total_tokens: number;
+            /** @description Conservative provider-declared token allowance spent on document calls without measurements. Included in total_tokens; not measured or billable usage. */
+            unmeasured_tokens?: number;
             /** @description Cumulative logical child invocations for a document run. */
             model_calls?: number;
             /** @description Physical child operation invocations, separate from logical composite calls. */

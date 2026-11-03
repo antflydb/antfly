@@ -3215,8 +3215,10 @@ pub const GenerateUsage = struct {
     prompt_tokens: i64,
     /// Number of tokens in the completion
     completion_tokens: i64,
-    /// Total tokens used (prompt + completion)
+    /// Total token budget consumed (measured prompt and completion tokens plus unmeasured allowances).
     total_tokens: i64,
+    /// Conservative provider-declared token allowance spent on document calls without measurements. Included in total_tokens; not measured or billable usage.
+    unmeasured_tokens: ?i64 = null,
     /// Cumulative logical child invocations for a document run.
     model_calls: ?i64 = null,
     /// Physical child operation invocations, separate from logical composite calls.
@@ -3237,6 +3239,7 @@ pub const GenerateUsage = struct {
         .{ "prompt_tokens", "prompt_tokens", false },
         .{ "completion_tokens", "completion_tokens", false },
         .{ "total_tokens", "total_tokens", false },
+        .{ "unmeasured_tokens", "unmeasured_tokens", true },
         .{ "model_calls", "model_calls", true },
         .{ "physical_model_calls", "physical_model_calls", true },
         .{ "rendered_pixels", "rendered_pixels", true },
@@ -3262,6 +3265,10 @@ pub const GenerateUsage = struct {
         try jw.write(self.completion_tokens);
         try jw.objectField("total_tokens");
         try jw.write(self.total_tokens);
+        if (self.unmeasured_tokens) |value| {
+            try jw.objectField("unmeasured_tokens");
+            try jw.write(value);
+        }
         if (self.model_calls) |value| {
             try jw.objectField("model_calls");
             try jw.write(value);
@@ -4405,7 +4412,7 @@ pub const ReadResponse = struct {
     events: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
     /// Name of model used for reading
     model: []const u8,
-    /// Measured token usage, or null when the selected provider does not report it.
+    /// Token measurements and any explicit unmeasured document allowances, or null when neither is available.
     usage: ?GenerateUsage,
     /// Observed execution path. Omitted by older compatible servers.
     execution: ?BatchExecutionReport = null,

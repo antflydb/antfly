@@ -136,7 +136,8 @@ pub const AudioSegment = struct {
     speaker: ?[]const u8 = null,
 };
 pub const AudioMetadata = struct {
-    duration_ms: u64,
+    /// Null when the recognizer cannot measure the recording duration.
+    duration_ms: ?u64 = null,
     language: ?[]const u8 = null,
     language_source: enum { forced, detected, unknown } = .unknown,
     /// Null means temporal alignment was not requested or is unavailable.

@@ -26,7 +26,7 @@ const image = @import("antfly_image");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
 const V = std.json.Value;
-const adapter_version = "antfly-documents-v8";
+const adapter_version = "antfly-documents-v9";
 const durable = @import("durable.zig");
 
 pub const ReadRequest = struct {
@@ -502,9 +502,9 @@ pub fn Service(comptime Node: type) type {
             const PlanPin = struct { key: Key, definition: c.Definition };
             var plans = std.ArrayList(PlanPin).empty;
             for (graph.plans.items) |plan| try plans.append(a, .{ .key = plan.key, .definition = plan.definition });
-            const ModelPin = struct { binding: c.Binding, identity: durable.Digest, max_total_tokens: u64 };
+            const ModelPin = struct { binding: c.Binding, identity: durable.Digest, max_total_tokens: u64, token_usage: @FieldType(c.Snapshot, "token_usage") };
             var models = std.ArrayList(ModelPin).empty;
-            for (graph.snapshots.items) |model| try models.append(a, .{ .binding = model.binding, .identity = model.identity, .max_total_tokens = model.max_total_tokens });
+            for (graph.snapshots.items) |model| try models.append(a, .{ .binding = model.binding, .identity = model.identity, .max_total_tokens = model.max_total_tokens, .token_usage = model.token_usage });
             try durable.pin(session, a, .{ .root = key, .definition = definition, .children = plans.items, .limits = run.limits }, models.items, adapter_version);
             const record = try session.store.loadAt(a, session.lease.run_id, session.lease.owner, durable.now(null));
             run.limits.max_model_calls = @min(run.limits.max_model_calls, @as(usize, @intCast(record.limits.calls)));
@@ -745,7 +745,7 @@ pub fn Service(comptime Node: type) type {
         fn verifyBinding(self: *const Self, a: A, binding: c.Binding) !c.Snapshot {
             const pinned = self.graph.snapshot(binding) orelse return error.DocumentCapabilityMismatch;
             const current = try self.node.documentResolveBinding(a, binding);
-            if (!std.mem.eql(u8, pinned.path, current.path) or !std.mem.eql(u8, &pinned.identity, &current.identity)) return error.DocumentModelRevisionMismatch;
+            if (!std.mem.eql(u8, pinned.path, current.path) or !std.mem.eql(u8, &pinned.identity, &current.identity) or pinned.max_total_tokens != current.max_total_tokens or pinned.token_usage != current.token_usage) return error.DocumentModelRevisionMismatch;
             return pinned;
         }
 
@@ -825,7 +825,7 @@ pub fn Service(comptime Node: type) type {
                     const candidate = try readImpl(ctx.raw, work, ctx.binding, ctx.page, ctx.bbox, ctx.run);
                     const usage = durable.delta(ctx.run.usage, ctx.before);
                     const bytes = try std.json.Stringify.valueAlloc(work, CachedCandidate{ .candidate = candidate, .usage = usage, .costs = try ctx.costs.costs.snapshot(work), .included_raster = ctx.included_raster }, .{});
-                    return .{ .bytes = bytes, .actual = durable.leafCharge(usage, bytes.len, 1) };
+                    return .{ .bytes = bytes, .actual = durable.leafCharge(usage, bytes.len, 1), .tokens_measured = usage.unmeasured_tokens == 0 };
                 }
             };
             const saved = run.durable_stage;
@@ -880,6 +880,10 @@ pub fn Service(comptime Node: type) type {
                 const pinned = try self.verifyBinding(a, binding);
                 var permit = try run.acquire(ioFor(self.node, self.control), false);
                 defer permit.deinit();
+                // A hosted recognizer without token measurements must declare
+                // a provider-backed ceiling. Spend it before any provider I/O;
+                // this also enforces nested/shared budgets without durability.
+                if (pinned.token_usage == .unavailable) try run.unmeasuredTokens(pinned.max_total_tokens);
                 run.physicalCall();
                 // Generation releases transient buffers throughout decoding.
                 // Using the page arena would retain every logical free and
@@ -891,7 +895,11 @@ pub fn Service(comptime Node: type) type {
                     if (result.audio_json) |json| work.free(json);
                 };
                 _ = try self.verifyBinding(a, binding);
-                try run.tokens(result.prompt_tokens, result.completion_tokens);
+                const input_tokens: ?usize = result.prompt_tokens;
+                const output_tokens: ?usize = result.completion_tokens;
+                if (pinned.token_usage == .measured) {
+                    try run.tokens(input_tokens orelse return error.InvalidDocumentModelResult, output_tokens orelse return error.InvalidDocumentModelResult);
+                } else if (input_tokens != null or output_tokens != null) return error.InvalidDocumentModelResult;
                 const silent_audio = if (@hasField(@TypeOf(result), "silent_audio")) result.silent_audio else false;
                 const unresolved = if (@hasField(@TypeOf(result), "unresolved")) result.unresolved else false;
                 // Backend buffers are freed when this call returns. Metadata
@@ -1066,7 +1074,7 @@ pub fn Service(comptime Node: type) type {
                     const action = try decideImpl(ctx.raw, work, ctx.binding, ctx.observation, ctx.run);
                     const usage = durable.delta(ctx.run.usage, before);
                     const bytes = try std.json.Stringify.valueAlloc(work, CachedDecision{ .action = action, .usage = usage, .costs = try capture.costs.snapshot(work) }, .{});
-                    return .{ .bytes = bytes, .actual = durable.leafCharge(usage, bytes.len, 1) };
+                    return .{ .bytes = bytes, .actual = durable.leafCharge(usage, bytes.len, 1), .tokens_measured = usage.unmeasured_tokens == 0 };
                 }
             };
             const saved_stage = run.durable_stage;
@@ -1362,7 +1370,7 @@ pub fn Service(comptime Node: type) type {
                     const result = try extractionLeafImpl(ctx.node, work, ctx.binding, ctx.graph, ctx.input, ctx.schema, ctx.version, ctx.options, ctx.control, ctx.run);
                     const usage = durable.delta(ctx.run.usage, before);
                     const bytes = try std.json.Stringify.valueAlloc(work, CachedExtraction{ .value = result.value, .output_bytes = result.output_bytes, .usage = usage, .costs = try capture.costs.snapshot(work), .version = ctx.version.effective }, .{});
-                    return .{ .bytes = bytes, .actual = durable.leafCharge(usage, bytes.len, 1) };
+                    return .{ .bytes = bytes, .actual = durable.leafCharge(usage, bytes.len, 1), .tokens_measured = usage.unmeasured_tokens == 0 };
                 }
             };
             const tokens = if (binding.provider == .cloudflare) binding.max_total_tokens orelse return error.UnsupportedMediaTokenBudget else (graph.snapshot(binding) orelse return error.DocumentCapabilityMismatch).max_total_tokens;
@@ -1399,7 +1407,7 @@ pub fn Service(comptime Node: type) type {
                 const canonical = extracting.Input{ .id = if (cf.field(input, "id")) |id| try cf.text(id) else null, .content_json = try std.json.Stringify.valueAlloc(work, cf.string(content), .{}) };
                 const pinned = graph.snapshot(binding) orelse return error.DocumentCapabilityMismatch;
                 const current = try node.documentResolveBinding(work, binding);
-                if (!std.mem.eql(u8, pinned.path, current.path) or !std.mem.eql(u8, &pinned.identity, &current.identity)) return error.DocumentModelRevisionMismatch;
+                if (!std.mem.eql(u8, pinned.path, current.path) or !std.mem.eql(u8, &pinned.identity, &current.identity) or pinned.max_total_tokens != current.max_total_tokens or pinned.token_usage != current.token_usage) return error.DocumentModelRevisionMismatch;
                 var response = try node.extractDirectWithControl(work, binding.model, .{
                     .inputs = &.{canonical},
                     .schema_json = try std.json.Stringify.valueAlloc(work, schema, .{}),
@@ -3471,6 +3479,7 @@ test "document durable raster checkpoints preserve picture-heavy slide costs acr
 }
 
 const AudioPlanTestNode = struct {
+    hosted: bool = false,
     reject_features: bool = false,
     silent: bool = false,
     transient_work: bool = false,
@@ -3510,14 +3519,14 @@ const AudioPlanTestNode = struct {
         }, .{});
         return null;
     }
-    fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
-        return .{ .binding = binding, .path = binding.model, .identity = durable.hash(binding.model) };
+    fn documentResolveBinding(self: *@This(), _: A, binding: c.Binding) !c.Snapshot {
+        return .{ .binding = binding, .path = binding.model, .identity = durable.hash(binding.model), .max_total_tokens = if (self.hosted) 100 else 131072, .token_usage = if (self.hosted) .unavailable else .measured };
     }
     fn documentDownload(self: *@This(), a: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
         self.downloads += 1;
         return .{ .data = try @import("../pipelines/audio.zig").wav.encodeMono(a, &.{ 0, 0 }, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 }) };
     }
-    pub fn documentReadAudio(self: *@This(), a: A, model: []const u8, bytes: []const u8, _: ?[]const u8, _: ?i64, options: c.AudioReadOptions, control: Control) !struct { text: []const u8, prompt_tokens: usize, completion_tokens: usize, truncated: bool, silent_audio: bool, unresolved: bool, audio_json: ?[]const u8 = null } {
+    pub fn documentReadAudio(self: *@This(), a: A, model: []const u8, bytes: []const u8, _: ?[]const u8, _: ?i64, options: c.AudioReadOptions, control: Control) !struct { text: []const u8, prompt_tokens: ?usize, completion_tokens: ?usize, truncated: bool, silent_audio: bool, unresolved: bool, audio_json: ?[]const u8 = null } {
         try control.check();
         if (self.transient_work) {
             for (0..16) |_| {
@@ -3529,8 +3538,8 @@ const AudioPlanTestNode = struct {
         try std.testing.expectEqualStrings("RIFF", bytes[0..4]);
         self.reads += 1;
         const truncated = self.incomplete or (self.repair and std.mem.eql(u8, model, "gemma4-fast"));
-        const audio_json = if ((options.timestamps orelse false) or (options.diarization orelse false)) try a.dupe(u8, "{\"duration_ms\":90000,\"language\":\"en\",\"language_source\":\"forced\",\"segments\":[{\"text\":\"Alice spoke.\",\"text_start\":0,\"text_end\":12,\"start_ms\":65000,\"end_ms\":66000,\"speaker\":\"SPEAKER_00\"}],\"speakers\":[\"SPEAKER_00\"]}") else null;
-        return .{ .unresolved = self.unresolved, .audio_json = audio_json, .text = try a.dupe(u8, if (self.silent) "" else if (truncated) "Alice" else "Alice spoke."), .prompt_tokens = if (self.silent) 0 else 10, .completion_tokens = if (self.silent) 0 else 3, .truncated = if (self.silent) false else truncated, .silent_audio = self.silent };
+        const audio_json = if (self.hosted) try a.dupe(u8, "{\"duration_ms\":null,\"language\":null,\"language_source\":\"unknown\",\"segments\":null,\"speakers\":null}") else if ((options.timestamps orelse false) or (options.diarization orelse false)) try a.dupe(u8, "{\"duration_ms\":90000,\"language\":\"en\",\"language_source\":\"forced\",\"segments\":[{\"text\":\"Alice spoke.\",\"text_start\":0,\"text_end\":12,\"start_ms\":65000,\"end_ms\":66000,\"speaker\":\"SPEAKER_00\"}],\"speakers\":[\"SPEAKER_00\"]}") else null;
+        return .{ .unresolved = self.unresolved, .audio_json = audio_json, .text = try a.dupe(u8, if (self.silent) "" else if (truncated) "Alice" else "Alice spoke."), .prompt_tokens = if (self.hosted) null else if (self.silent) 0 else 10, .completion_tokens = if (self.hosted) null else if (self.silent) 0 else 3, .truncated = if (self.silent) false else truncated, .silent_audio = self.silent };
     }
     fn extractDirectWithControl(self: *@This(), a: A, _: []const u8, request: @import("antfly_extracting").Request, _: Control) !@import("antfly_extracting").Response {
         self.extracts += 1;
@@ -3673,4 +3682,72 @@ test "document audio temporal evidence survives nested reads and retained extrac
     node.retained = bytes;
     _ = try Service(AudioPlanTestNode).extractJson(&node, a, "{\"model\":\"audio-extract\",\"schema_version\":2,\"schema\":{\"entities\":[\"person\"]},\"read_artifact\":\"retained-audio\"}", .{});
     try std.testing.expectEqual(@as(usize, 1), node.reads);
+}
+
+test "document audio hosted allowances cover refinement verification and durable replay" {
+    const a = std.testing.allocator;
+    const runs = readers.document_runs;
+    const request = "{\"model\":\"parent\",\"audio\":\"data:audio/wav;base64,Zml4dHVyZQ==\"}";
+    var limited = AudioPlanTestNode{ .hosted = true, .repair = true, .budget = 250 };
+    try std.testing.expectError(error.DocumentTokenLimitExceeded, Service(AudioPlanTestNode).readJson(&limited, a, request, .{}));
+    // Recognition and refinement spend 100 each; verification is refused
+    // before dispatch, even without a durable reservation.
+    try std.testing.expectEqual(@as(usize, 2), limited.reads);
+
+    var memory = readers.testing.Store{ .a = a };
+    defer memory.deinit();
+    const store = memory.interface();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const identity: runs.Identity = .{ .request = durable.hash(request), .sources = @splat(0), .definition = @splat(0), .models = @splat(0), .runtime = @splat(0) };
+    try store.create(.{ .run_id = "hosted", .owner = "alice", .identity = identity, .prepared = false, .limits = .{ .calls = 16, .tokens = 300, .source_bytes = 67108864 + request.len, .output_bytes = 268435456 }, .inputs = &.{} });
+    const lease = try store.claim(work, "hosted", "alice", identity, durable.now(null), 30000);
+    _ = try store.installRequest(work, lease, @splat(9), .{ .source_bytes = request.len }, request, durable.now(null));
+    var node = AudioPlanTestNode{ .hosted = true, .repair = true, .budget = 300 };
+    var used: runs.Charge = undefined;
+    var meter = runs.DispatchMeter{ .limit = 300 };
+    {
+        var session = try runs.Session.init(a, store, lease, identity, .{ .now_fn = durable.now }, 4096, 33554432);
+        defer session.deinit();
+        session.io = io_impl.io();
+        session.meter = &meter;
+        const output = try Service(AudioPlanTestNode).readJson(&node, a, request, .{ .document_session = &session });
+        defer a.free(output);
+        const result = try std.json.parseFromSliceLeaky(V, work, output, .{});
+        const usage = result.object.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 300), usage.get("total_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 300), usage.get("unmeasured_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 0), usage.get("prompt_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 0), usage.get("completion_tokens").?.integer);
+        try std.testing.expectEqual(@as(usize, 3), node.reads);
+        used = (try store.load(work, "hosted", "alice")).used;
+        try std.testing.expectEqual(@as(u64, 300), used.tokens);
+        try std.testing.expectEqual(@as(u64, 300), meter.used);
+        try std.testing.expect(!meter.known);
+    }
+    try store.yieldLease(work, lease, durable.now(null));
+    const pinned = try store.load(work, "hosted", "alice");
+    const next = try store.claim(work, "hosted", "alice", pinned.identity, durable.now(null), 30000);
+    var resumed = try runs.Session.init(a, store, next, pinned.identity, .{ .now_fn = durable.now }, 4096, 33554432);
+    defer resumed.deinit();
+    resumed.io = io_impl.io();
+    var replay_meter = runs.DispatchMeter{ .limit = 300 };
+    resumed.meter = &replay_meter;
+    // Overlapping parent/leaf checkpoints cannot charge one physical call
+    // again or make an old charge disappear.
+    {
+        const output = try Service(AudioPlanTestNode).readJson(&node, a, request, .{ .document_session = &resumed });
+        defer a.free(output);
+        const result = try std.json.parseFromSliceLeaky(V, work, output, .{});
+        const usage = result.object.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 300), usage.get("total_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 300), usage.get("unmeasured_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 0), usage.get("physical_model_calls").?.integer);
+        try std.testing.expectEqual(@as(usize, 3), node.reads);
+        try std.testing.expectEqual(used, (try store.load(work, "hosted", "alice")).used);
+        try std.testing.expectEqual(@as(u64, 0), replay_meter.used);
+    }
 }

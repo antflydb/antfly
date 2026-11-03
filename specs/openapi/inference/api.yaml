@@ -3165,7 +3165,7 @@ components:
           allOf:
             - $ref: '#/components/schemas/GenerateUsage'
           nullable: true
-          description: Measured token usage, or null when the selected provider does not report it.
+          description: Token measurements and any explicit unmeasured document allowances, or null when neither is available.
         execution:
           $ref: '#/components/schemas/BatchExecutionReport'
           description: Observed execution path. Omitted by older compatible servers.
@@ -4820,7 +4820,11 @@ components:
           description: Number of tokens in the completion
         total_tokens:
           type: integer
-          description: Total tokens used (prompt + completion)
+          description: Total token budget consumed (measured prompt and completion tokens plus unmeasured allowances).
+        unmeasured_tokens:
+          type: integer
+          minimum: 0
+          description: Conservative provider-declared token allowance spent on document calls without measurements. Included in total_tokens; not measured or billable usage.
         model_calls:
           type: integer
           minimum: 0

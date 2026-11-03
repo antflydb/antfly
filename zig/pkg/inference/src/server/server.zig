@@ -20762,11 +20762,13 @@ pub const Node = struct {
             // Physical model identity excludes credentials and request defaults:
             // two aliases for one recognizer cannot act as independent verifiers.
             var identity: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ .provider = cfg.provider, .model = cfg.model, .endpoint = cfg.resolvedUrl(), .account = cfg.account_id, .project = cfg.project_id, .location = cfg.location }, .{}), &identity, .{});
+            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ .provider = cfg.provider, .model = cfg.model, .endpoint = cfg.effectiveEndpoint(), .gateway = cfg.gateway_id, .account = cfg.account_id, .project = cfg.project_id, .location = cfg.location }, .{}), &identity, .{});
             if (binding.model_identity) |expected| {
                 if (!std.mem.eql(u8, expected, &std.fmt.bytesToHex(identity, .lower))) return error.DocumentModelRevisionMismatch;
             }
-            return .{ .remote = cfg.provider != .apple, .binding = binding, .path = binding.model, .identity = identity };
+            const token_ceiling = cfg.max_total_tokens orelse binding.max_total_tokens orelse return error.UnsupportedMediaTokenBudget;
+            if (token_ceiling == 0) return error.UnsupportedMediaTokenBudget;
+            return .{ .remote = cfg.provider != .apple, .binding = binding, .path = binding.model, .identity = identity, .max_total_tokens = token_ceiling, .token_usage = .unavailable };
         }
         if (std.mem.eql(u8, binding.model, "antfly/native-document") and binding.operation == .read and binding.input == .image) return .{ .binding = binding, .path = binding.model, .identity = @splat(0) };
         var owned_io: ?std.Io.Threaded = null;
@@ -21016,8 +21018,8 @@ pub const Node = struct {
     const AudioMetadata = @import("antfly_documents").types.AudioMetadata;
     const AudioReadOutput = struct {
         text: []const u8,
-        prompt_tokens: usize = 0,
-        completion_tokens: usize = 0,
+        prompt_tokens: ?usize = 0,
+        completion_tokens: ?usize = 0,
         truncated: bool = false,
         unresolved: bool = false,
         silent_audio: bool = false,
@@ -21080,6 +21082,8 @@ pub const Node = struct {
         errdefer a.free(text);
         return .{
             .text = text,
+            .prompt_tokens = null,
+            .completion_tokens = null,
             .truncated = if (row.status) |status| std.mem.eql(u8, status, "truncated") else false,
             .unresolved = if (row.status) |status| std.mem.eql(u8, status, "unresolved") else text.len == 0,
             .audio_json = try std.json.Stringify.valueAlloc(a, row.audio.?, .{}),
@@ -48072,8 +48076,8 @@ test "hosted audio document sources composition and retained artifacts share orc
         \\{"text":"hello","language":"french","duration":90,"segments":[{"text":"hello","start":65,"end":66}]}
     };
     var upstream = try httpx.TestServer.start(a, io, &.{
-        .{ .method = .POST, .path = "/audio/transcriptions", .assert_request = Check.request, .respond = reply },
-        .{ .method = .POST, .path = "/audio/transcriptions", .assert_request = Check.request, .respond = reply },
+        .{ .method = .POST, .path = "/audio/transcriptions", .assert_request = Check.request, .respond = reply, .max_uses = 1 },
+        .{ .method = .POST, .path = "/audio/transcriptions", .respond = .{ .body = "{\"text\":\"hello\"}" } },
     });
     defer upstream.deinit();
     var failure: ?anyerror = null;
@@ -48093,11 +48097,14 @@ test "hosted audio document sources composition and retained artifacts share orc
     try tmp.dir.createDirPath(io, "readers/test/composed");
     try tmp.dir.writeFile(io, .{ .sub_path = "readers/test/composed/config.json", .data = "{}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "readers/test/composed/document_agent.json", .data =
-        \\{"allow_remote":true,"models":[{"name":"speech","model":"transcribers/meeting","operation":"read","input":"audio"}],"read":{"reader":"speech"}}
+        \\{"allow_remote":true,"models":[{"name":"speech","model":"transcribers/text-only","operation":"read","input":"audio"}],"read":{"reader":"speech"}}
     });
     const models = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(models);
-    const configs = [_]transcribing_api.NamedConfig{.{ .name = "meeting", .config = .{ .provider = .openai, .model = "whisper-1", .base_url = upstream.baseUrl(), .api_key = "fixture", .language_code = "fr", .timestamps = true } }};
+    const configs = [_]transcribing_api.NamedConfig{
+        .{ .name = "meeting", .config = .{ .provider = .openai, .model = "whisper-1", .base_url = upstream.baseUrl(), .max_total_tokens = 100, .api_key = "fixture", .language_code = "fr", .timestamps = true } },
+        .{ .name = "text-only", .config = .{ .provider = .openai, .model = "whisper-1", .base_url = upstream.baseUrl(), .max_total_tokens = 100, .api_key = "fixture", .timestamps = false } },
+    };
     var node = try Node.init(a, .{ .models_dir = models, .audio_readers = &configs });
     defer node.deinit();
     try node.attachIo(io);
@@ -48119,8 +48126,21 @@ test "hosted audio document sources composition and retained artifacts share orc
         try std.testing.expectEqualStrings("complete", row.get("status").?.string);
         try std.testing.expectEqualStrings("hello", row.get("text").?.string);
         const metadata = row.get("audio").?.object;
-        try std.testing.expectEqualStrings("fr", metadata.get("language").?.string);
-        try std.testing.expectEqual(@as(i64, 65000), metadata.get("segments").?.array.items[0].object.get("start_ms").?.integer);
+        if (std.mem.eql(u8, model, "test/composed")) {
+            try std.testing.expect(metadata.get("duration_ms").? == .null);
+            try std.testing.expect(metadata.get("language").? == .null);
+            try std.testing.expectEqualStrings("unknown", metadata.get("language_source").?.string);
+            try std.testing.expect(metadata.get("segments").? == .null);
+            try std.testing.expect(metadata.get("speakers").? == .null);
+        } else {
+            try std.testing.expectEqualStrings("fr", metadata.get("language").?.string);
+            try std.testing.expectEqual(@as(i64, 65000), metadata.get("segments").?.array.items[0].object.get("start_ms").?.integer);
+        }
+        const usage = parsed.object.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, 100), usage.get("unmeasured_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 100), usage.get("total_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 0), usage.get("prompt_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 0), usage.get("completion_tokens").?.integer);
         const handle = parsed.object.get("document").?.object.get("artifact_id").?.string;
         const retained = try node.readDocumentArtifact(a, handle);
         defer a.free(retained);
@@ -48130,6 +48150,90 @@ test "hosted audio document sources composition and retained artifacts share orc
     try group.await(io);
     if (failure) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+}
+
+test "hosted audio document durable resume pins the effective OpenAI endpoint" {
+    const a = std.testing.allocator;
+    const runs = readers_api.document_runs;
+    const durable = @import("../documents/durable.zig");
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var upstream = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/audio/transcriptions", .respond = .{ .body = "{\"text\":\"hello\"}" } }});
+    defer upstream.deinit();
+    var failure: ?anyerror = null;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    const Serve = struct {
+        fn run(server: *httpx.TestServer, err: *?anyerror) std.Io.Cancelable!void {
+            server.handleOne() catch |problem| {
+                err.* = problem;
+            };
+        }
+    };
+    try group.concurrent(io, Serve.run, .{ &upstream, &failure });
+    var configs = [_]transcribing_api.NamedConfig{.{ .name = "speech", .config = .{ .provider = .openai, .base_url = upstream.baseUrl(), .model = "whisper-1", .api_key = "fixture", .timestamps = false } }};
+    var node = try Node.init(a, .{ .audio_readers = &configs });
+    defer node.deinit();
+    try node.attachIo(io);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const binding = document_contract.Binding{ .name = "speech", .model = "transcribers/speech", .operation = .read, .input = .audio };
+    try std.testing.expectError(error.UnsupportedMediaTokenBudget, node.documentResolveBinding(work, binding));
+    configs[0].config.max_total_tokens = 0;
+    try std.testing.expectError(error.UnsupportedMediaTokenBudget, node.documentResolveBinding(work, binding));
+    configs[0].config.max_total_tokens = 100;
+    const original = try node.documentResolveBinding(work, binding);
+    var pinned_binding = binding;
+    const original_hex = std.fmt.bytesToHex(original.identity, .lower);
+    pinned_binding.model_identity = &original_hex;
+    // OpenAI ignores url/api_url; only base_url controls its destination.
+    configs[0].config.url = "https://unused.example/v1";
+    _ = try node.documentResolveBinding(work, pinned_binding);
+    const request = "{\"model\":\"transcribers/speech\",\"audio\":\"data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQIAAAAAAA==\"}";
+    var memory = readers_api.testing.Store{ .a = a };
+    defer memory.deinit();
+    const store = memory.interface();
+    const identity: runs.Identity = .{ .request = durable.hash(request), .sources = @splat(0), .definition = @splat(0), .models = @splat(0), .runtime = @splat(0) };
+    try store.create(.{ .run_id = "endpoint", .owner = "alice", .identity = identity, .prepared = false, .limits = .{ .calls = 4, .tokens = 200, .source_bytes = 134217728 + request.len, .output_bytes = 268435456 }, .inputs = &.{} });
+    const lease = try store.claim(work, "endpoint", "alice", identity, durable.now(null), 30000);
+    _ = try store.installRequest(work, lease, @splat(9), .{ .source_bytes = request.len }, request, durable.now(null));
+    {
+        var session = try runs.Session.init(a, store, lease, identity, .{ .now_fn = durable.now }, 4096, 33554432);
+        defer session.deinit();
+        session.io = io;
+        const output = try node.readDocumentsJsonWithControl(a, request, .{ .io = io, .document_session = &session });
+        defer a.free(output);
+        const result = try std.json.parseFromSliceLeaky(std.json.Value, work, output, .{});
+        try std.testing.expectEqual(@as(i64, 100), result.object.get("usage").?.object.get("unmeasured_tokens").?.integer);
+    }
+    try group.await(io);
+    if (failure) |err| return err;
+    try store.yieldLease(work, lease, durable.now(null));
+    const record = try store.load(work, "endpoint", "alice");
+    try std.testing.expectEqual(@as(u64, 100), record.used.tokens);
+    const next = try store.claim(work, "endpoint", "alice", record.identity, durable.now(null), 30000);
+    {
+        var resumed = try runs.Session.init(a, store, next, record.identity, .{ .now_fn = durable.now }, 4096, 33554432);
+        defer resumed.deinit();
+        resumed.io = io;
+        const output = try node.readDocumentsJsonWithControl(a, request, .{ .io = io, .document_session = &resumed });
+        defer a.free(output);
+        const result = try std.json.parseFromSliceLeaky(std.json.Value, work, output, .{});
+        try std.testing.expectEqual(@as(i64, 100), result.object.get("usage").?.object.get("unmeasured_tokens").?.integer);
+        try std.testing.expectEqual(@as(i64, 0), result.object.get("usage").?.object.get("physical_model_calls").?.integer);
+        try std.testing.expectEqual(record.used, (try store.load(work, "endpoint", "alice")).used);
+    }
+    configs[0].config.base_url = "http://127.0.0.1:1/changed-backend";
+    try std.testing.expectError(error.DocumentModelRevisionMismatch, node.documentResolveBinding(work, pinned_binding));
+    {
+        var resumed = try runs.Session.init(a, store, next, record.identity, .{ .now_fn = durable.now }, 4096, 33554432);
+        defer resumed.deinit();
+        resumed.io = io;
+        try std.testing.expectError(error.DocumentModelRevisionMismatch, node.readDocumentsJsonWithControl(a, request, .{ .io = io, .document_session = &resumed }));
+        try std.testing.expectEqual(record.used, (try store.load(work, "endpoint", "alice")).used);
+    }
 }
 
 test "LightOnOCR3 configured reader batching separates public request bounds from scheduler rows" {

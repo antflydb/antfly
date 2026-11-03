@@ -414,6 +414,17 @@ IDs and temporal evidence. Composed readers bind `transcribers/<name>` with
 `input: audio`; hosted network calls require `allow_remote: true` throughout
 the composition. Provider credentials stay in deployment configuration.
 
+Hosted recognition does not currently provide token measurements. Configure
+`max_total_tokens` on each hosted transcriber (or its document binding) using the
+provider/deployment's hard per-call token bound. A missing or zero bound rejects
+reading before provider I/O. Each call spends that full allowance against the
+shared document budget, including refinement and verification. Responses report
+this capacity as `usage.unmeasured_tokens`; `usage.total_tokens` includes it,
+while `prompt_tokens` and `completion_tokens` contain only measurements. This is
+budget accounting, not a billing estimate. Durable checkpoints preserve and
+restore these charges once without invoking the provider again. Unknown duration
+remains `audio.duration_ms: null`.
+
 Synthesis uses existing `text_to_speech` configs. OpenAI supports its configured
 speech formats; Vertex supports MP3, WAV and Ogg Opus; ElevenLabs currently
 supports MP3 at normal speed. Unsupported formats and S3-output options fail

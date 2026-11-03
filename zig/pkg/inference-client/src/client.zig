@@ -361,7 +361,7 @@ test "audio read returns the transcript and owns it after the response is freed"
     // been freed, which is the whole point of taking ownership of it.
     const transcription = &result.?;
     try std.testing.expectEqualStrings("hello there", transcription.text());
-    const segments = transcription.audio().?.segments.?;
+    const segments = transcription.audio().?.segments.valueOrNull().?;
     try std.testing.expectEqual(@as(usize, 1), segments.len);
-    try std.testing.expectEqualStrings("SPEAKER_00", segments[0].speaker.?);
+    try std.testing.expectEqualStrings("SPEAKER_00", segments[0].speaker.valueOrNull().?);
 }

@@ -424,6 +424,8 @@ pub const STTConfig = struct {
     timestamps: ?bool = null,
     /// Explicitly permit preparing and installing the selected Speech assets.
     download_assets: ?bool = null,
+    /// Provider-declared hard per-call token bound. Required for hosted document reading when measurements are unavailable; the full allowance is charged against the document budget, never as measured usage.
+    max_total_tokens: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -443,6 +445,7 @@ pub const STTConfig = struct {
         .{ "api_url", "api_url", true },
         .{ "timestamps", "timestamps", true },
         .{ "download_assets", "download_assets", true },
+        .{ "max_total_tokens", "max_total_tokens", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -517,6 +520,10 @@ pub const STTConfig = struct {
         }
         if (self.download_assets) |value| {
             try jw.objectField("download_assets");
+            try jw.write(value);
+        }
+        if (self.max_total_tokens) |value| {
+            try jw.objectField("max_total_tokens");
             try jw.write(value);
         }
         try jw.endObject();

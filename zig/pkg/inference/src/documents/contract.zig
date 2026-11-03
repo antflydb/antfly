@@ -43,7 +43,7 @@ pub const Binding = struct {
     max_total_tokens: ?u64 = null,
 };
 /// Captured before inference. Paths never appear in public run metadata.
-pub const Snapshot = struct { remote: bool = false, binding: Binding, path: []const u8, identity: [32]u8, max_total_tokens: u64 = 131072 };
+pub const Snapshot = struct { remote: bool = false, binding: Binding, path: []const u8, identity: [32]u8, max_total_tokens: u64 = 131072, token_usage: enum { measured, unavailable } = .measured };
 pub const Limits = struct {
     max_sources: usize = 64,
     max_pages: usize = 1024,
@@ -244,6 +244,9 @@ pub const Page = @import("antfly_documents").types.Page;
 pub const Usage = struct {
     prompt_tokens: u64 = 0,
     completion_tokens: u64 = 0,
+    /// Conservative capacity spent on calls without provider token measurements.
+    /// Kept separate from prompt/completion counts; never bill as measured usage.
+    unmeasured_tokens: u64 = 0,
     total_tokens: u64 = 0,
     model_calls: usize = 0,
     physical_model_calls: usize = 0,
@@ -484,7 +487,9 @@ pub const Run = struct {
                 var usage = ctx.logical;
                 usage.prompt_tokens = delta.prompt_tokens;
                 usage.completion_tokens = delta.completion_tokens;
+                usage.unmeasured_tokens = delta.unmeasured_tokens;
                 usage.total_tokens = std.math.add(u64, delta.prompt_tokens, delta.completion_tokens) catch return error.InvalidDocumentCheckpoint;
+                usage.total_tokens = std.math.add(u64, usage.total_tokens, delta.unmeasured_tokens) catch return error.InvalidDocumentCheckpoint;
                 usage.rendered_pixels = delta.rendered_pixels;
                 try ctx.run.applyReplayUsage(usage);
             }
@@ -502,8 +507,18 @@ pub const Run = struct {
         self.usage.physical_model_calls += 1;
     }
     pub fn tokens(self: *Run, input: u64, output_tokens: u64) !void {
+        return self.chargeTokens(input, output_tokens, 0);
+    }
+    /// Spend the provider-declared allowance before dispatch. Unknown usage
+    /// cannot refund this capacity, including on synchronous sibling calls.
+    pub fn unmeasuredTokens(self: *Run, upper: u64) !void {
+        if (upper == 0) return error.UnsupportedMediaTokenBudget;
+        return self.chargeTokens(0, 0, upper);
+    }
+    fn chargeTokens(self: *Run, input: u64, output_tokens: u64, unmeasured: u64) !void {
         try self.control.check();
-        const count = std.math.add(u64, input, output_tokens) catch return error.DocumentTokenLimitExceeded;
+        const measured = std.math.add(u64, input, output_tokens) catch return error.DocumentTokenLimitExceeded;
+        const count = std.math.add(u64, measured, unmeasured) catch return error.DocumentTokenLimitExceeded;
         if (count > self.limits.max_total_tokens -| self.usage.total_tokens) return error.DocumentTokenLimitExceeded;
         if (self.shared) |shared| {
             shared.lock();
@@ -513,18 +528,21 @@ pub const Run = struct {
             if (self.scope) |scope| {
                 scope.add("prompt_tokens", input);
                 scope.add("completion_tokens", output_tokens);
+                scope.add("unmeasured_tokens", unmeasured);
                 scope.add("total_tokens", count);
             }
             shared.usage.prompt_tokens += input;
             shared.usage.completion_tokens += output_tokens;
+            shared.usage.unmeasured_tokens += unmeasured;
             shared.usage.total_tokens += count;
         }
         self.usage.prompt_tokens += input;
         self.usage.completion_tokens += output_tokens;
+        self.usage.unmeasured_tokens += unmeasured;
         self.usage.total_tokens += count;
         if (self.durable) |session| {
             const key = self.durable_stage orelse return error.InvalidDocumentCheckpoint;
-            try self.touchCost(try session.measureModelTokens(key, input, output_tokens));
+            try self.touchCost(try session.measure(session.modelCostKey(key), .{ .prompt_tokens = input, .completion_tokens = output_tokens, .unmeasured_tokens = unmeasured }));
         }
     }
     pub fn abandonPixels(self: *Run) void {
@@ -837,4 +855,22 @@ test "document audio bindings reject incompatible refinement and visual speciali
     try std.testing.expectError(error.DocumentCapabilityMismatch, definition.validate());
     definition.read = .{ .reader = "speech" };
     try definition.validate();
+}
+
+test "document shared unknown token allowances spend capacity before sibling dispatch" {
+    var shared = SharedAccounting{ .limits = .{ .max_total_tokens = 250 }, .usage = .{}, .event_count = 0 };
+    var scope = ScopeAccounting{ .limits = .{ .max_total_tokens = 200 }, .usage = .{} };
+    var left = Run{ .limits = shared.limits, .shared = &shared, .scope = &scope };
+    defer left.deinit();
+    var right = Run{ .limits = shared.limits, .shared = &shared, .scope = &scope };
+    defer right.deinit();
+    try left.unmeasuredTokens(100);
+    try right.unmeasuredTokens(100);
+    try std.testing.expectError(error.DocumentTokenLimitExceeded, right.unmeasuredTokens(100));
+    try std.testing.expectEqual(@as(u64, 200), shared.usage.total_tokens);
+    try std.testing.expectEqual(@as(u64, 200), shared.usage.unmeasured_tokens);
+    try std.testing.expectEqual(@as(u64, 0), shared.usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u64, 0), shared.usage.completion_tokens);
+    try std.testing.expectEqual(@as(u64, 200), scope.usage.unmeasured_tokens);
+    try std.testing.expectError(error.UnsupportedMediaTokenBudget, left.unmeasuredTokens(0));
 }

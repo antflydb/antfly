@@ -32,8 +32,8 @@ class InferenceReadResponse:
             handle.
         events (list[InferenceReadResponseEventsItem] | Unset): Bounded progress and audit events. These contain model
             names and source IDs, never credentials.
-        usage (InferenceGenerateUsage | None | Unset): Measured token usage, or null when the selected provider does not
-            report it.
+        usage (InferenceGenerateUsage | None | Unset): Token measurements and any explicit unmeasured document
+            allowances, or null when neither is available.
         execution (InferenceBatchExecutionReport | Unset): Observed executor behavior, not a capability prediction.
     """
 
