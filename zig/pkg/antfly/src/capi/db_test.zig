@@ -754,6 +754,19 @@ fn MaintenancePhaseDriver(comptime Owner: type) type {
     };
 }
 
+fn drainOwnerMaintenance(owner: anytype) !void {
+    const io = shared.handleLockIo();
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + 10 * std.time.ns_per_s;
+    while (true) {
+        const immediate = try owner.maintenanceTurnForTest();
+        if (!immediate and !owner.maintenanceContinuationPendingForTest()) return;
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return error.TestMaintenanceDidNotSettle;
+        // A false turn can still own a timed LSM retry or private merge. Drive
+        // that continuation before asserting that idle polling opens nothing.
+        if (!immediate) try io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
 test "storage-owner reverse callbacks preserve semantic error identity" {
     try std.testing.expectError(
         error.WouldBlock,
@@ -7286,7 +7299,7 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
         // No notification: an external owner must discover ordinary index
         // replay debt after reopen, without relying on a generated producer.
     }
-    for (0..64) |_| if (!try owner.maintenanceTurnForTest()) break;
+    try drainOwnerMaintenance(owner);
     try std.testing.expect(owner.test_runtime_snapshot_opens > opens);
     const after_work = owner.test_runtime_snapshot_opens;
     for (0..8) |_| _ = try owner.maintenanceTurnForTest();

@@ -791,12 +791,16 @@ pub const HandleGuard = struct {
     // Cancellation after backoff can return registry pins without API locks.
     access_held: bool = true,
     connection: ?*@import("lite_connection.zig").Connection = null,
+    connection_mutex_held: bool = false,
     path_lease: ?lite_backend.native.PathWriterLock = null,
     connection_gate_held: bool = false,
     entry_error: ?capi.ErrorCode = null,
     entry_sequence: u64 = 0,
     pinned_store_readonly: ?bool = null,
     suspended_query_root: ?*Handle = null,
+    /// Unspent admission time survives suspension; active computation is not
+    /// charged. Resuming the same public call must not create a new budget.
+    remaining_admission_ns: ?i96 = null,
 
     /// Keep registry references and the provider snapshot alive, releasing both
     /// process and file locks while inference runs on an owned request plan.
@@ -818,6 +822,7 @@ pub const HandleGuard = struct {
         self.connection_gate_held = false;
         connection.gate.mutex.unlock(handleLockIo());
         connection.mutex.unlock(handleLockIo());
+        self.connection_mutex_held = false;
     }
 
     pub fn resumeQuery(self: *HandleGuard, ptr: ?*anyopaque) bool {
@@ -826,7 +831,12 @@ pub const HandleGuard = struct {
     pub fn resumeAccess(self: *HandleGuard, ptr: ?*anyopaque, access: HandleAccess) bool {
         if (self.suspended_query_root == null) return true;
         // Original registry references keep the connection/owner alive.
-        const next = enterHandle(ptr, access) orelse return false;
+        const entry = HandleEntry.capture(ptr) orelse return false;
+        const deadline: ?i96 = if (self.remaining_admission_ns) |remaining|
+            std.Io.Clock.awake.now(handleLockIo()).nanoseconds + remaining
+        else
+            null;
+        const next = enterWithAdmissionRetryDeadline(entry, ptr, access, if (access == .read) .read_only else .mutation, false, deadline) orelse return false;
         const connection = self.connection.?;
         if (!next.connection_gate_held) connection.gate.mutex.lockUncancelable(handleLockIo());
         self.suspended_query_root.?.query_borrows -= 1;
@@ -882,7 +892,7 @@ pub const HandleGuard = struct {
                 owned.close();
             }
             if (self.connection_gate_held) connection.gate.mutex.unlock(io);
-            connection.mutex.unlock(io);
+            if (self.connection_mutex_held) connection.mutex.unlock(io);
             return;
         }
         switch (self.access) {
@@ -965,7 +975,7 @@ fn enterWithAdmissionRetryDeadline(initial: HandleEntry, ptr: ?*anyopaque, acces
     // the exported operation has not executed yet.
     while (guard.entry_error == .busy) {
         const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
-        if (remaining <= 0) return guard;
+        if (remaining <= 0) return finishAdmissionBudget(guard, deadline);
         guard.leaveWithRegistry(!retain_entry);
         const delay = std.Io.Duration.fromNanoseconds(@min(backoff, remaining));
         const slept = if (comptime builtin.is_test) blk: {
@@ -983,7 +993,13 @@ fn enterWithAdmissionRetryDeadline(initial: HandleEntry, ptr: ?*anyopaque, acces
         if (guard.entry_error == null) capi.clearLastError();
         backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
     }
-    return guard;
+    return finishAdmissionBudget(guard, deadline);
+}
+
+fn finishAdmissionBudget(guard: HandleGuard, deadline_ns: i96) HandleGuard {
+    var result = guard;
+    result.remaining_admission_ns = @max(0, deadline_ns - std.Io.Clock.awake.now(handleLockIo()).nanoseconds);
+    return result;
 }
 
 /// Cursor continuation uses a previously pinned immutable generation.
@@ -1041,14 +1057,19 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
     const lock_handle = entry.lock_handle;
     const parent_slot = entry.parent_slot;
     if (lock_handle.lite_connection) |connection| {
-        connection.mutex.lockUncancelable(handleLockIo());
         var guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = access, .connection = connection };
-        connection.admission_deadline_ns = deadline;
+        const io = handleLockIo();
+        const effective_deadline = deadline orelse (std.Io.Clock.awake.now(io).nanoseconds + @as(i96, connection.options.busy_timeout_ms) * std.time.ns_per_ms);
+        if (pinned) connection.mutex.lockUncancelable(io) else connection.mutex.lockUntil(io, effective_deadline) catch |err| {
+            guard.entry_error = capi.mapError(err);
+            return guard;
+        };
+        guard.connection_mutex_held = true;
+        connection.admission_deadline_ns = if (pinned) null else effective_deadline;
         defer connection.admission_deadline_ns = null;
-        // An attempt already in progress may spend time queued locally or
-        // proving the allocator. Its first lease try must still be allowed;
-        // only contention waits consult the deadline. The retry loop checks
-        // expiry before starting a new attempt after backoff.
+        // Local waits have consumed this same deadline. A detached proof may
+        // still finish late and take an uncontended lease on its stable tip;
+        // contention waits cannot receive a fresh budget after it returns.
         if (!pinned) {
             guard.path_lease = connection.acquire() catch |err| {
                 guard.entry_error = capi.mapError(err);
@@ -5183,6 +5204,7 @@ pub fn pendingWorkStatsJson(handle: *Handle) !capi.Buffer {
     var output = try pendingNamespaceStatsValue(a, handle.database());
     const context = handle.lite_connection_context orelse if (handle.parent_handle) |parent| parent.lite_connection_context else null;
     if (context) |connection| {
+        connection.owner.updatePathLeaseStatistics();
         connection.owner.publication_stats.replay_backlog = try connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file.replayAdmission();
         const stats = try std.json.Stringify.valueAlloc(a, connection.owner.publication_stats, .{});
         try output.object.put(a, "background_publications", try std.json.parseFromSliceLeaky(std.json.Value, a, stats, .{}));

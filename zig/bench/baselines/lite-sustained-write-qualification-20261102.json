@@ -4665,7 +4665,7 @@
     "original_207_library_sha256": "ef3c87e963330323b13a99973fc1268d697226c0212fdbdba0a3edcb82c97b7b",
     "factory_owner": "Beads task; user explicitly left full agent factory qualification to that task.",
     "qualification_controller": "Final controller includes original 207 and integrated main controls. Contention includes repeated status_only opens and a persistent SQL reader, with actual successful reads while writers are active.",
-    "fairness_scope": "No explicit FIFO protocol has been implemented across processes. Fair queue/deadline work should be isolated and qualified separately; these single-process runs recorded zero maintenance queue timeouts."
+    "fairness_scope": "User explicitly requested including helpful fairness/deadline/commit-outcome proposals in this PR. Bounded OFD-backed queue primitives and real-process checks pass; database/API integration and final performance qualification remain pending."
   },
   "final_d759_attempt": {
     "source_commit": "d75999ee48c3956f8dbe516194950e61d8b58447",
@@ -4889,7 +4889,7 @@
       "seconds": 36.04872883402277
     }
   },
-  "priority": "Complete the default consumer correctness gate, then use matched optimized final qualification to establish the remaining throughput behavior. Preserve the unchanged original importer and five-second wait. Treat cross-process fairness as a separate protocol change; the current single-process failure is not evidence for that cause.",
+  "priority": "Implement and validate the helpful #1431 fair-admission, shared-budget and commit-disposition proposals in this same PR, as requested. Keep the original importer unchanged and reserve wolfspider for final optimized qualification.",
   "issue1431_candidate_debug_first": {
     "source_commit": "e63c0a4ca8d077ec4c4e129b4c21791a1d290068",
     "runtime_source_commit": "3b417dd180adadd11619a8c275fb512f09cfe7f5",
@@ -6683,7 +6683,17 @@
         "fixed_focused_passed": 2,
         "fixed_focused_failed": 0,
         "fixed_focused_leaked": 0,
-        "scope": "Composed coverage: the earlier full consumer command failed on two fixture expectations. Both corrected regressions passed in a separate command; the complete default consumer gate has not yet been repeated."
+        "scope": "Composed coverage: the earlier full consumer command failed on two fixture expectations. Both corrected regressions passed in a separate command; the complete default consumer gate has not yet been repeated.",
+        "latest_full_run": {
+          "source_commit": "1ac5bb6d866b55db38815602af5be7af7e223dc8",
+          "passed": 86,
+          "failed": 1,
+          "skipped": 0,
+          "leaked": 0,
+          "unexpected_error_logs": 0,
+          "failure": "Idle runtime fixture observed one delayed runtime open after treating no-immediate-work as complete settlement. Explicit continuation draining is under focused validation.",
+          "log": ".tools/import-regression/root-cause/empty-merge-complete-capi-gate.log"
+        }
       },
       "sdk": {
         "passed": 205,
@@ -6822,5 +6832,50 @@
       "Matched optimized final-host corpus, original contention, active verified page reuse, accounting and ten-minute active-write gates.",
       "Human-triggered aggregate CI and Beads-owned full factory."
     ]
+  },
+  "fair_writer_admission": {
+    "status": "Implemented primitives and initial database/API wiring; focused integration gate pending. Commit-disposition audit/changes and final qualification remain outstanding.",
+    "design": "docs/design/lite-writer-admission.md",
+    "coordination_file_bytes": 8256,
+    "maximum_live_tickets": 1024,
+    "mechanism": [
+      "Kernel-owned OFD range locks, bounded slot metadata and a short enrollment guard before the existing safety flock.",
+      "Guarded re-evaluation after abandonment or slot reuse; reader cohorts stop behind an earlier writer.",
+      "Nonblocking range operations with cancellable bounded waits; safety flock closes before ticket ownership.",
+      "Allocation-free local FIFO cancellation and remaining admission budget across suspended-call resumes.",
+      "Per-process path acquisition/hold telemetry with maxima and logarithmic hold histogram."
+    ],
+    "primitive_validation": {
+      "range_lock_native_tests": 2,
+      "local_mutex_tests": 4,
+      "queue_tests": 7,
+      "combined_queue_safety_tests": 2,
+      "real_process_tests": 6,
+      "real_process_cases": [
+        "immediate holder reentry FIFO",
+        "death of a queued middle waiter",
+        "death of consecutive active holders",
+        "middle-waiter expiry",
+        "shared readers around an intervening writer",
+        "queued-head death behind a legacy flock holder"
+      ],
+      "linux_x86_64_cross_compile": "passed; no Linux execution yet",
+      "complete_component_command_exit_code": 0,
+      "logs": [
+        ".tools/import-regression/root-cause/file-range-lock-unit-r2.log",
+        ".tools/import-regression/root-cause/admission-mutex-unit-r2.log",
+        ".tools/import-regression/root-cause/writer-queue-unit-r3.log",
+        ".tools/import-regression/root-cause/path-admission-unit-r2.log",
+        ".tools/import-regression/root-cause/file-range-lock-linux-cross-check.log",
+        ".tools/import-regression/root-cause/writer-admission-complete-primitives.log"
+      ]
+    },
+    "remaining": [
+      "Focused database/API ownership and deadline regressions, including the earlier idle-continuation failure.",
+      "Audit and preserve COMMIT applied/not-applied/unknown disposition and reconciliation tokens through every fault boundary and SDK wrapper.",
+      "Model/aggregate CI and complete native/C API/SDK gates on final source.",
+      "Unchanged importer and controlled optimized throughput, contention, storage and exact logical validation on wolfspider."
+    ],
+    "issue1431_resolved": false
   }
 }

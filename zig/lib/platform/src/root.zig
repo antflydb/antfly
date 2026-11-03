@@ -19,6 +19,7 @@ pub const clock = @import("clock.zig");
 pub const env = @import("env.zig");
 pub const entropy = @import("entropy.zig");
 pub const filesystem = @import("filesystem.zig");
+pub const file_range_lock = @import("file_range_lock.zig");
 pub const inference_process_supervisor = @import("inference_process_supervisor.zig");
 pub const one_shot_process = @import("one_shot_process.zig");
 pub const process = @import("process.zig");

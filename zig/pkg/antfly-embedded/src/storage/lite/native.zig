@@ -3660,10 +3660,15 @@ pub const OpenOptions = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
+pub const PathLeaseStats = @import("path_admission.zig").Stats;
 pub const PathWriterLock = struct {
     io_impl: std.Io.Threaded,
     borrowed_io: ?std.Io = null,
     file: std.Io.File,
+    ticket: ?@import("writer_queue.zig").Ticket = null,
+    admission_ns: u64 = 0,
+    acquired_ns: i96 = 0,
+    stats: ?*PathLeaseStats = null,
     /// Admission owns this scope. Closing/yielding the kernel lease drops all
     /// idle anchors; escaped readers retain independent marker references.
     reader_registration_batch: ?ReaderCoordinator.RegistrationBatch = null,
@@ -3671,15 +3676,14 @@ pub const PathWriterLock = struct {
     pub fn close(self: *PathWriterLock) void {
         if (self.reader_registration_batch) |batch| batch.end();
         const io = self.borrowed_io orelse self.io_impl.io();
-        self.file.close(io);
+        var held: LockFile = .{ .file = self.file, .ticket = self.ticket, .admission_ns = self.admission_ns, .acquired_ns = self.acquired_ns, .stats = self.stats };
+        held.close(io);
         if (self.borrowed_io == null) self.io_impl.deinit();
         self.* = undefined;
     }
 };
 
-const LockFile = struct {
-    file: std.Io.File,
-};
+const LockFile = @import("path_admission.zig").Lease;
 
 pub const CreateOptions = struct {
     indexed_reclamation: bool = false,
@@ -4664,6 +4668,7 @@ pub const NativeFile = struct {
     path: []u8,
     file: std.Io.File,
     writer_lock_file: ?std.Io.File = null,
+    writer_queue_ticket: ?@import("writer_queue.zig").Ticket = null,
     /// The embedded connection layer holds the path lease around complete calls.
     externally_locked: bool = false,
     reader_coordinator: ?*ReaderCoordinator = null,
@@ -4812,12 +4817,11 @@ pub const NativeFile = struct {
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
 
-        var writer_lock_file: ?std.Io.File = null;
+        var writer_lock: ?LockFile = null;
         if (!opts.read_only and !opts.externally_locked) {
-            const writer_lock = try acquireWriterLock(allocator, io, path);
-            writer_lock_file = writer_lock.file;
+            writer_lock = try acquireWriterLock(allocator, io, path);
         }
-        errdefer if (writer_lock_file) |lock_file| lock_file.close(io);
+        errdefer if (writer_lock) |*held| held.close(io);
 
         const opened_file = try openDataFile(io, path, if (opts.read_only) (if (opts.internal_reader or opts.externally_locked) .internal_reader else .reader) else .writer, opts.wait_for_reader_lock);
         const file = opened_file.file;
@@ -4835,7 +4839,8 @@ pub const NativeFile = struct {
             .borrowed_io = borrowed_io,
             .path = owned_path,
             .file = file,
-            .writer_lock_file = writer_lock_file,
+            .writer_lock_file = if (writer_lock) |held| held.file else null,
+            .writer_queue_ticket = if (writer_lock) |held| held.ticket else null,
             .externally_locked = opts.externally_locked,
             .reader_coordinator = opts.reader_coordinator,
             .header = header,
@@ -4902,9 +4907,9 @@ pub const NativeFile = struct {
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
 
-        const writer_lock = try acquireWriterLock(allocator, io, path);
+        var writer_lock = try acquireWriterLock(allocator, io, path);
         var writer_lock_file = writer_lock.file;
-        errdefer writer_lock_file.close(io);
+        errdefer writer_lock.close(io);
         if (writer_lock_marker.len > 0) {
             try writer_lock_file.writePositionalAll(io, writer_lock_marker, 0);
             try writer_lock_file.setLength(io, writer_lock_marker.len);
@@ -4974,6 +4979,7 @@ pub const NativeFile = struct {
             .path = owned_path,
             .file = file,
             .writer_lock_file = writer_lock_file,
+            .writer_queue_ticket = writer_lock.ticket,
             .header = initialized_header,
             .read_only = false,
             .no_sync = no_sync,
@@ -4988,6 +4994,8 @@ pub const NativeFile = struct {
     pub fn releaseWriterOwnership(self: *NativeFile) void {
         if (self.writer_lock_file) |file| file.close(self.runtime());
         self.writer_lock_file = null;
+        if (self.writer_queue_ticket) |*ticket| ticket.close(self.runtime());
+        self.writer_queue_ticket = null;
         self.externally_locked = true;
     }
 
@@ -5034,6 +5042,7 @@ pub const NativeFile = struct {
         if (self.writer_lock_file) |lock_file| {
             lock_file.close(io);
         }
+        if (self.writer_queue_ticket) |*ticket| ticket.close(io);
         self.file.close(io);
         self.allocator.free(self.path);
         if (self.borrowed_io == null) self.io_impl.deinit();
@@ -12363,8 +12372,8 @@ fn setCatalogRootPage(slot: *CheckpointSlot, root: CatalogRoot, page_id: u64) vo
 }
 
 pub fn create(io: std.Io, path: []const u8) !void {
-    var writer_lock_file = (try acquireWriterLock(std.heap.page_allocator, io, path)).file;
-    defer writer_lock_file.close(io);
+    var writer_lock = try acquireWriterLock(std.heap.page_allocator, io, path);
+    defer writer_lock.close(io);
 
     var encoded: [header_size]u8 = undefined;
     encodeHeader(&encoded, .{});
@@ -12404,24 +12413,25 @@ pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
     var io_impl = threaded_io_limits.initService(allocator);
     errdefer io_impl.deinit();
 
-    const file = (try acquireWriterLock(allocator, io_impl.io(), path)).file;
-    errdefer file.close(io_impl.io());
+    var held = try acquireWriterLock(allocator, io_impl.io(), path);
+    errdefer held.close(io_impl.io());
 
     return .{
         .io_impl = io_impl,
-        .file = file,
+        .file = held.file,
+        .ticket = held.ticket,
+        .admission_ns = held.admission_ns,
+        .acquired_ns = held.acquired_ns,
     };
 }
 
 /// Acquires the same cross-process writer lock through a caller-owned std.Io.
 pub fn lockWriterPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
-    const file = (try acquireWriterLock(allocator, io, path)).file;
-    errdefer file.close(io);
-    return .{
-        .io_impl = undefined,
-        .borrowed_io = io,
-        .file = file,
-    };
+    return borrowedPathLock(io, try acquireWriterLock(allocator, io, path));
+}
+
+fn borrowedPathLock(io: std.Io, held: LockFile) PathWriterLock {
+    return .{ .io_impl = undefined, .borrowed_io = io, .file = held.file, .ticket = held.ticket, .admission_ns = held.admission_ns, .acquired_ns = if (held.acquired_ns == 0) std.Io.Clock.awake.now(io).nanoseconds else held.acquired_ns };
 }
 
 /// Wait in the operating system's lock queue rather than racing short unlock
@@ -12433,19 +12443,19 @@ pub fn waitPathLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, wr
     const file = try std.Io.Dir.cwd().openFile(io, lock_path, .{
         .mode = if (writer) .read_write else .read_only,
     });
-    const held = try @import("path_lock_wait.zig").lockUntil(file, io, if (writer) .exclusive else .shared, deadline_ns);
-    return .{ .io_impl = undefined, .borrowed_io = io, .file = held };
+    const held = try @import("path_admission.zig").lock(allocator, io, file, lock_path, if (writer) .exclusive else .shared, deadline_ns);
+    return borrowedPathLock(io, held);
 }
 
 /// Read-only embedded calls coordinate with commits without reserving a writer.
 pub fn lockReaderPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
     const lock_path = try writerLockPathAlloc(allocator, io, path);
     defer allocator.free(lock_path);
-    const file = std.Io.Dir.cwd().openFile(io, lock_path, .{
+    const held = if (std.Io.Dir.cwd().openFile(io, lock_path, .{
         .mode = .read_only,
-        .lock = .shared,
-        .lock_nonblocking = true,
-    }) catch |err| switch (err) {
+    })) |file|
+        try @import("path_admission.zig").lock(allocator, io, file, lock_path, .shared, null)
+    else |err| switch (err) {
         error.FileNotFound => blk: {
             // A distributed snapshot may have no sidecar and live on read-only
             // media. Every sidecar creator must exclude fallback inode readers,
@@ -12471,32 +12481,29 @@ pub fn lockReaderPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
             // A writer may have installed the sidecar before our inode fence.
             if (std.Io.Dir.cwd().openFile(io, lock_path, .{
                 .mode = .read_only,
-                .lock = .shared,
-                .lock_nonblocking = true,
-            })) |existing| break :blk existing else |open_err| {
+            })) |existing| break :blk try @import("path_admission.zig").lock(allocator, io, existing, lock_path, .shared, null) else |open_err| {
                 if (open_err != error.FileNotFound) return open_err;
             }
             if (!exclusive_inode) {
                 keep_data = true;
-                break :blk data;
+                break :blk LockFile{ .file = data };
             }
-            break :blk std.Io.Dir.cwd().createFile(io, lock_path, .{
+            const installed = std.Io.Dir.cwd().createFile(io, lock_path, .{
                 .read = true,
                 .truncate = false,
-                .lock = .shared,
-                .lock_nonblocking = true,
             }) catch |create_err| switch (create_err) {
                 error.AccessDenied, error.ReadOnlyFileSystem => {
                     try data.lock(io, .shared);
                     keep_data = true;
-                    break :blk data;
+                    break :blk LockFile{ .file = data };
                 },
                 else => return create_err,
             };
+            break :blk try @import("path_admission.zig").lock(allocator, io, installed, lock_path, .shared, null);
         },
         else => return err,
     };
-    return .{ .io_impl = undefined, .borrowed_io = io, .file = file };
+    return borrowedPathLock(io, held);
 }
 
 fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode, wait_for_reader_lock: bool) !LockFile {
@@ -12514,6 +12521,56 @@ fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode, wait_for_read
         else => return err,
     };
     return .{ .file = file };
+}
+
+test "lite writer path queue survives native creation read cohorts and ownership transfer" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/queue.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    try create(io, path);
+    {
+        var writer = try lockWriterPathWithIo(a, io, path);
+        defer writer.close();
+        if (@import("antfly_platform").file_range_lock.supported) try std.testing.expect(writer.ticket != null);
+        try std.testing.expectError(error.WouldBlock, lockReaderPathWithIo(a, io, path));
+        try std.testing.expectError(error.WouldBlock, lockWriterPathWithIo(a, io, path));
+    }
+    {
+        var first = try lockReaderPathWithIo(a, io, path);
+        defer first.close();
+        var second = try lockReaderPathWithIo(a, io, path);
+        defer second.close();
+        try std.testing.expectError(error.WouldBlock, lockWriterPathWithIo(a, io, path));
+    }
+    var native_file = try NativeFile.openWithIo(a, io, path, .{});
+    defer native_file.close();
+    if (@import("antfly_platform").file_range_lock.supported) try std.testing.expect(native_file.writer_queue_ticket != null);
+    native_file.releaseWriterOwnership();
+    try std.testing.expect(native_file.writer_queue_ticket == null);
+    var after = try lockWriterPathWithIo(a, io, path);
+    defer after.close();
+}
+
+test "lite writer path failed native open releases both safety and queue ownership" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/invalid.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    const invalid = try std.Io.Dir.cwd().createFile(io, path, .{});
+    try invalid.writePositionalAll(io, "incomplete native header", 0);
+    invalid.close(io);
+    if (NativeFile.openWithIo(a, io, path, .{})) |opened| {
+        var unexpected = opened;
+        unexpected.close();
+        return error.TestExpectedOpenFailure;
+    } else |_| {}
+    var after = try lockWriterPathWithIo(a, io, path);
+    defer after.close();
 }
 
 const CreateDataFileOptions = struct {
@@ -12534,9 +12591,7 @@ fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !LockFi
     defer allocator.free(lock_path);
     if (std.Io.Dir.cwd().openFile(io, lock_path, .{
         .mode = .read_write,
-        .lock = .exclusive,
-        .lock_nonblocking = true,
-    })) |existing| return .{ .file = existing } else |err| {
+    })) |existing| return @import("path_admission.zig").lock(allocator, io, existing, lock_path, .exclusive, null) else |err| {
         if (err != error.FileNotFound) return err;
     }
     // Readers of sidecar-free snapshots hold this inode shared. Exclude them
@@ -12554,13 +12609,11 @@ fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !LockFi
     const file = std.Io.Dir.cwd().createFile(io, lock_path, .{
         .read = true,
         .truncate = false,
-        .lock = .exclusive,
-        .lock_nonblocking = true,
     }) catch |err| switch (err) {
         error.FileLocksUnsupported => return error.FileLocksUnsupported,
         else => return err,
     };
-    return .{ .file = file };
+    return @import("path_admission.zig").lock(allocator, io, file, lock_path, .exclusive, null);
 }
 
 fn writerLockPathAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![]u8 {

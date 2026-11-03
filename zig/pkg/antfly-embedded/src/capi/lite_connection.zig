@@ -663,35 +663,7 @@ pub const PreparedPublication = struct {
 
 // Foreign threads can immediately reenter after a read. Ticket ordering keeps
 // a stream of short reads from starving queued writers and maintenance.
-const QueuedMutex = struct {
-    state: std.Io.Mutex = .init,
-    ready: @import("antfly_platform").sync.BroadcastCondition = .init,
-    next: u64 = 0,
-    serving: u64 = 0,
-
-    pub fn lockUncancelable(self: *QueuedMutex, io: std.Io) void {
-        self.state.lockUncancelable(io);
-        defer self.state.unlock(io);
-        const ticket = self.next;
-        self.next +%= 1;
-        while (ticket != self.serving) self.ready.waitUncancelable(io, &self.state);
-    }
-
-    pub fn tryLock(self: *QueuedMutex) bool {
-        if (!self.state.tryLock()) return false;
-        defer self.state.unlock(h.handleLockIo());
-        if (self.next != self.serving) return false;
-        self.next +%= 1;
-        return true;
-    }
-
-    pub fn unlock(self: *QueuedMutex, io: std.Io) void {
-        self.state.lockUncancelable(io);
-        self.serving +%= 1;
-        self.ready.broadcast(io);
-        self.state.unlock(io);
-    }
-};
+const QueuedMutex = @import("admission_mutex.zig").QueuedMutex(h.handleLockIo);
 
 fn acquireMaintenanceCapture(gate: *QueuedMutex, misses: *u8) bool {
     if (!gate.tryLock()) {
@@ -751,6 +723,7 @@ const PathGate = struct {
     sql_preparation: @import("sql.zig").PreparationAdmission = .{},
     references: usize = 1,
     owners: std.ArrayList(*Owner) = .empty,
+    lease_stats: native.PathLeaseStats = .{},
 };
 var registry_mutex: std.Io.Mutex = .init;
 var gates: std.StringHashMapUnmanaged(*PathGate) = .empty;
@@ -1060,6 +1033,7 @@ pub const Owner = struct {
         mutation_admission_ns: u64 = 0,
         mutation_admission_max_ns: u64 = 0,
         mutation_admission_log2_ns: [64]u64 = @splat(0),
+        path_leases: native.PathLeaseStats.Snapshot = .{},
         last_maintenance_error: ?[]const u8 = null,
         // Successful work in another namespace clears the current error, but
         // must not erase the evidence behind the cumulative failure count.
@@ -1412,6 +1386,7 @@ pub const Owner = struct {
     /// releases idle anchors before another process can publish.
     fn withReadRegistrationBatch(self: *Owner, lease: native.PathWriterLock) native.PathWriterLock {
         var held = lease;
+        held.stats = &self.gate.lease_stats;
         if (self.options.reader_coordinator) |coordinator| {
             std.debug.assert(held.reader_registration_batch == null);
             held.reader_registration_batch = coordinator.beginRegistrationBatch();
@@ -2903,6 +2878,18 @@ pub const Owner = struct {
         return self.maintenanceTurn();
     }
 
+    pub fn maintenanceContinuationPendingForTest(self: *Owner) bool {
+        std.debug.assert(h.builtin.is_test);
+        const io = h.handleLockIo();
+        self.gate.mutex.lockUncancelable(io);
+        defer self.gate.mutex.unlock(io);
+        if (self.pending_text_merge != null or self.maintenance_storage_pending or self.maintenance_pending or
+            self.maintenance_table_cursor != 0 or self.runnable_sources.pending(io)) return true;
+        var schedules = self.maintenance_schedules.valueIterator();
+        while (schedules.next()) |schedule| if (schedule.database_pending or schedule.artifact_pending) return true;
+        return false;
+    }
+
     fn maintenanceLoop(self: *Owner) void {
         const io = h.handleLockIo();
         var next_wait_ms: i64 = 1000;
@@ -3098,12 +3085,19 @@ pub const Owner = struct {
 
     fn logQualificationSummary(self: *Owner) void {
         if (!qualificationMetricsEnabled()) return;
+        self.updatePathLeaseStatistics();
         const p = &self.publication_stats;
         // Numeric/enum diagnostics only: no path, SQL, model or document data.
         // Preparation overlaps actor service; durations are not additive.
         std.log.info("antfly_bench_native_owner source_turns={d} capture_ns={d} replay_ns={d} artifacts_ns={d} storage_ns={d} runtime_refreshes={d} maintenance_errors={d} maintenance_timeouts={d} merge_started={d} merge_applied={d} merge_discarded={d} merge_prepare_ns={d} merge_staging_ns={d} merge_staged_bytes={d} merge_publication_ns={d} sql_overlay_hits={d} sql_overlay_rebuilds={d} sql_overlay_rebuild_entries={d} sql_overlay_evictions={d} sql_staged_statements={d} replay_waits={d} replay_refused_prepare_ns={d} last_failure={s}", .{ p.maintenance_source_turns, p.maintenance_capture_ns, p.maintenance_replay_ns, p.maintenance_artifacts_ns, p.maintenance_storage_ns, p.serving_runtime_refreshes, p.maintenance_errors, p.maintenance_queue_timeouts, p.text_merge_jobs_started, p.text_merge_jobs_applied, p.text_merge_jobs_discarded, p.text_merge_prepare_ns, p.text_merge_staging_ns, p.text_merge_staged_bytes, p.text_merge_publication_ns, p.sql_constraint_overlay_hits, p.sql_constraint_overlay_rebuilds, p.sql_constraint_overlay_rebuild_entries, p.sql_constraint_overlay_evictions, p.sql_constraint_staged_statements, p.replay_backpressure_waits, p.replay_refused_preparation_ns, p.last_maintenance_failure orelse "none" });
         const f = p.maintenance_failures;
         std.log.info("antfly_bench_native_owner_failures capture={d} source={d} retirement={d} artifacts={d} storage={d}", .{ f.capture, f.source, f.retirement, f.artifacts, f.storage });
+        const leases = p.path_leases;
+        std.log.info("antfly_bench_native_path_leases leases={d} admission_ns={d} admission_max_ns={d} hold_ns={d} hold_max_ns={d}", .{ leases.leases, leases.admission_ns, leases.admission_max_ns, leases.hold_ns, leases.hold_max_ns });
+    }
+
+    pub fn updatePathLeaseStatistics(self: *Owner) void {
+        self.publication_stats.path_leases = self.gate.lease_stats.snapshot();
     }
 
     fn deinit(self: *Owner) void {
@@ -3181,7 +3175,10 @@ pub const Connection = struct {
 
     pub fn acquire(self: *Connection) !native.PathWriterLock {
         const io = h.handleLockIo();
-        self.gate.mutex.lockUncancelable(io);
+        if (self.admission_deadline_ns) |deadline|
+            try self.gate.mutex.lockUntil(io, deadline)
+        else
+            self.gate.mutex.lockUncancelable(io);
         errdefer self.gate.mutex.unlock(io);
         return self.acquirePathLeaseAssumeLocked();
     }
@@ -3494,6 +3491,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
                 native.lockReaderPathWithIo(alloc, io, gate.path);
             if (attempt) |held| {
                 var lease = held;
+                lease.stats = &gate.lease_stats;
                 defer lease.close();
                 if (owner.refresh()) |_| {} else |err| switch (err) {
                     // A peer proving an unverified tip owns index opening.
@@ -5879,39 +5877,74 @@ test "capi native allocator proof cancelled backoff does not reenter admission" 
     }
 }
 
-test "capi native allocator proof initial admission survives a long local queue wait" {
+test "capi native allocator proof initial admission honors the local wait budget" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     const io = h.handleLockIo();
-    var fixture = try AdmissionFollowupFixture.init("queued-stable-proof", 1000, .batch);
+    var fixture = try AdmissionFollowupFixture.init("queued-stable-proof", 50, .batch);
     defer fixture.deinit();
     const Writer = struct {
         fixture: *AdmissionFollowupFixture,
         result: h.capi.ErrorCode = .busy,
+        done: std.Io.Event = .unset,
         fn run(self: *@This()) void {
             self.result = self.fixture.call(.batch);
+            self.done.set(h.handleLockIo());
         }
     };
-    var writer: Writer = .{ .fixture = &fixture };
-    const mutex = &fixture.connection.mutex;
-    mutex.lockUncancelable(io);
-    const thread = std.Thread.spawn(.{}, Writer.run, .{&writer}) catch |err| {
+    for ([_]*QueuedMutex{ &fixture.connection.mutex, &fixture.connection.gate.mutex }) |mutex| {
+        var writer: Writer = .{ .fixture = &fixture };
+        mutex.lockUncancelable(io);
+        const thread = std.Thread.spawn(.{}, Writer.run, .{&writer}) catch |err| {
+            mutex.unlock(io);
+            return err;
+        };
+        // Expiry must finish while the preceding call still owns its mutex.
+        // Both the per-connection lane and the shared path lane consume the
+        // public call's budget, without unlocking somebody else's admission.
+        const finished_while_held = if (writer.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } })) |_| true else |_| false;
         mutex.unlock(io);
-        return err;
-    };
-    // Observe an actual queued ticket: the writer has already calculated its
-    // admission deadline before it parks behind this connection's API call.
-    while (true) {
-        mutex.state.lockUncancelable(io);
-        const queued = mutex.next == mutex.serving +% 2;
-        mutex.state.unlock(io);
-        if (queued) break;
-        io.sleep(.fromMilliseconds(1), .awake) catch {};
+        thread.join();
+        try std.testing.expect(finished_while_held);
+        try std.testing.expectEqual(h.capi.ErrorCode.busy, writer.result);
+        try fixture.expectWritten(.batch, false);
     }
-    io.sleep(.fromMilliseconds(1001), .awake) catch {};
-    mutex.unlock(io);
-    thread.join();
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, writer.result);
-    try fixture.expectWritten(.batch, true);
+}
+
+test "capi native allocator proof suspended call preserves its unspent admission budget" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const io = h.handleLockIo();
+    var fixture = try AdmissionFollowupFixture.init("resumed-budget", 1000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    var guard = api.enterHandle(fixture.id, .read).?;
+    defer guard.leave();
+    try std.testing.expect(guard.entry_error == null);
+    // Model the remaining balance after earlier admission waits. Independent
+    // computation may outlast this balance without consuming another wait.
+    const balance: i96 = 50 * std.time.ns_per_ms;
+    guard.remaining_admission_ns = balance;
+    guard.suspendQuery();
+    try io.sleep(.fromMilliseconds(100), .awake);
+    var held: ?native.PathWriterLock = try native.lockWriterPathWithIo(alloc, io, fixture.path);
+    defer if (held) |*lease| lease.close();
+    const Probe = struct {
+        connection: *Connection,
+        held: *?native.PathWriterLock,
+        remaining: ?i96 = null,
+        fn busy(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.remaining = self.connection.admission_deadline_ns.? - std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
+            self.held.*.?.close();
+            self.held.* = null;
+        }
+    };
+    var probe: Probe = .{ .connection = fixture.connection, .held = &held };
+    fixture.connection.test_path_lease_busy = .{ .ptr = &probe, .notify = Probe.busy };
+    defer fixture.connection.test_path_lease_busy = null;
+    try std.testing.expect(guard.resumeQuery(fixture.id));
+    try std.testing.expect(guard.entry_error == null);
+    try std.testing.expect(probe.remaining != null and probe.remaining.? > 0 and probe.remaining.? <= balance);
+    try std.testing.expect(guard.remaining_admission_ns != null and guard.remaining_admission_ns.? <= balance);
 }
 
 test "capi native allocator proof issue1431 committed transform visibility timeout is not Busy" {
