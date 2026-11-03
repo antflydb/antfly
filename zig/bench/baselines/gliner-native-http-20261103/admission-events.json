@@ -1,0 +1,17 @@
+[
+  {
+    "source": ".tools/qualification/server-native-heap-fixed-comparison.log",
+    "admission_events": [
+      "{\"ts\":\"+2026-11-03T23:23:49Z\",\"level\":\"warn\",\"scope\":\"default\",\"msg\":\"inference live-memory admission denied requested_bytes=536870912 pending_bytes=1073741824 capacity_bytes=1546188226 basis=shared_epoch\"}",
+      "{\"ts\":\"+2026-11-03T23:23:49Z\",\"level\":\"warn\",\"scope\":\"default\",\"msg\":\"inference run admission denied pressure=live_host denied_count=1 request_count=1 admitted_host_bytes=1948302734 admitted_backend_bytes=0 admitted_kv_bytes=0 admitted_scratch_bytes=1073741824\"}",
+      "{\"ts\":\"+2026-11-03T23:23:49Z\",\"level\":\"warn\",\"scope\":\"default\",\"msg\":\"inference run admission request index=0 backend=cpu host_bytes=536870912 backend_bytes=0 kv_bytes=0 scratch_bytes=536870912 host_limit_bytes=8589934592 backend_limit_bytes=0 combined_limit_bytes=8589934592 kv_limit_bytes=2147483648 scratch_limit_bytes=4294967296\"}",
+      "{\"ts\":\"+2026-11-03T23:35:31Z\",\"level\":\"warn\",\"scope\":\"default\",\"msg\":\"inference live-memory admission denied requested_bytes=536870912 pending_bytes=1610612736 capacity_bytes=1932735283 basis=shared_epoch\"}",
+      "{\"ts\":\"+2026-11-03T23:35:31Z\",\"level\":\"warn\",\"scope\":\"default\",\"msg\":\"inference run admission denied pressure=live_host denied_count=3 request_count=1 admitted_host_bytes=2485173646 admitted_backend_bytes=0 admitted_kv_bytes=0 admitted_scratch_bytes=1610612736\"}",
+      "{\"ts\":\"+2026-11-03T23:35:31Z\",\"level\":\"warn\",\"scope\":\"default\",\"msg\":\"inference run admission request index=0 backend=cpu host_bytes=536870912 backend_bytes=0 kv_bytes=0 scratch_bytes=536870912 host_limit_bytes=8589934592 backend_limit_bytes=0 combined_limit_bytes=8589934592 kv_limit_bytes=2147483648 scratch_limit_bytes=4294967296\"}"
+    ]
+  },
+  {
+    "source": "../qualify-gliner-http-local-baseline/.tools/qualification/server-native-heap-fixed-comparison.log",
+    "admission_events": []
+  }
+]

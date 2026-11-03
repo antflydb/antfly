@@ -14,33 +14,190 @@
 # limitations under the License.
 
 import json
+import io
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 import benchmark_linux_cpu_http as bench
+import qualify_context_http as capacity
 
 
 class ContractTests(unittest.TestCase):
+    def test_admission_failure_records_endpoint_and_bounded_error_body(self):
+        error = HTTPError(
+            "http://localhost/extract",
+            503,
+            "busy",
+            {},
+            io.BytesIO(b'{"reason":"live_host"}'),
+        )
+        with patch.object(bench, "urlopen", side_effect=error):
+            with self.assertRaisesRegex(
+                ValueError, "localhost/extract: HTTP 503: .*live_host"
+            ):
+                bench.receive(
+                    "http://localhost", {"path": "/extract", "request": {}}, 10
+                )
+
+    def test_capacity_campaign_fills_exact_boundary_and_rejects_inexact_usage(self):
+        word = "configuration_visibility_maintenance_acknowledgement "
+        exact = word * 1819 + "the " * 3
+        counts = {word: 19, word * 2: 28, "the ": 11, exact: 16384}
+        with tempfile.TemporaryDirectory() as directory:
+            for fail in (False, True):
+                output = Path(directory) / f"{fail}.json"
+
+                def execute(_, text, __):
+                    return {
+                        "output": {
+                            "usage": {
+                                "prompt_tokens": counts[text]
+                                - (1 if fail and text == exact else 0)
+                            }
+                        }
+                    }
+
+                arguments = [
+                    "qualify_context_http",
+                    "--endpoint",
+                    "http://localhost/extract",
+                    "--output",
+                    str(output),
+                ]
+                with (
+                    patch.object(sys, "argv", arguments),
+                    patch.object(capacity, "execute", side_effect=execute),
+                ):
+                    if fail:
+                        with self.assertRaisesRegex(
+                            ValueError, "encoded-token boundary"
+                        ):
+                            capacity.main()
+                    else:
+                        capacity.main()
+                report = json.loads(output.read_text())
+                self.assertEqual(report["status"], "failed" if fail else "complete")
+                self.assertEqual(report["source_words"], 1822)
+                self.assertEqual(report["filler_words"], 3)
+
+    def test_capacity_check_rejects_split_windows_and_invalid_source_spans(self):
+        class Response(io.BytesIO):
+            status = 200
+
+        good = {
+            "data": [
+                {
+                    "long_document": {"window_count": 1},
+                    "entities": [{"start": 0, "end": 3, "text": "abc"}],
+                }
+            ],
+            "usage": {"prompt_tokens": 27, "completion_tokens": 0, "total_tokens": 27},
+        }
+        with patch.object(
+            capacity, "urlopen", return_value=Response(json.dumps(good).encode())
+        ):
+            result = capacity.execute("http://localhost/extract", "abc", 10)
+        self.assertEqual(result["output"], good)
+        changed = json.loads(json.dumps(good))
+        changed["usage"]["total_tokens"] = 28
+        with patch.object(
+            capacity, "urlopen", return_value=Response(json.dumps(changed).encode())
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "inconsistent extraction token usage"
+            ):
+                capacity.execute("http://localhost/extract", "abc", 10)
+        for split, text in ((True, "abc"), (False, "wrong")):
+            changed = json.loads(json.dumps(good))
+            changed["data"][0]["long_document"]["window_count"] = 2 if split else 1
+            changed["data"][0]["entities"][0]["text"] = text
+            with patch.object(
+                capacity, "urlopen", return_value=Response(json.dumps(changed).encode())
+            ):
+                with self.assertRaises(ValueError):
+                    capacity.execute("http://localhost/extract", "abc", 10)
+
+    def test_burst_ends_at_response_completion_not_after_validation(self):
+        response = {"duration_ns": 1, "response_completed_ns": 150, "raw": b"{}"}
+        with (
+            patch.object(bench, "receive", return_value=response),
+            patch.object(bench.time, "perf_counter_ns", side_effect=[100, 1000]),
+        ):
+            result = bench.request_round(
+                "http://localhost", {"expected": {}, "confidence_tolerance": 0}, 10, 4
+            )
+        self.assertEqual(result["duration_ns"], 50)
+
+    def test_no_parsing_or_validation_until_every_response_is_captured(self):
+        entered = threading.Barrier(4, timeout=5)
+        captured = 0
+        lock = threading.Lock()
+
+        def receive(*_):
+            nonlocal captured
+            entered.wait()
+            with lock:
+                captured += 1
+            return {
+                "duration_ns": 1,
+                "response_completed_ns": time.perf_counter_ns(),
+                "raw": b'{"ok":true}',
+            }
+
+        real_parse = bench.strict_json
+
+        def parse(raw):
+            self.assertEqual(captured, 4)
+            return real_parse(raw)
+
+        with (
+            patch.object(bench, "receive", side_effect=receive),
+            patch.object(bench, "strict_json", side_effect=parse) as parsed,
+        ):
+            result = bench.request_round(
+                "http://localhost",
+                {"expected": {"ok": True}, "confidence_tolerance": 0},
+                10,
+                4,
+            )
+        self.assertEqual(parsed.call_count, 4)
+        self.assertEqual(len(result["requests"]), 4)
+
     def test_concurrent_round_overlaps_clients_and_checks_every_result(self):
         entered = threading.Barrier(4, timeout=5)
 
         def checked_request(*_):
             entered.wait()
-            return {"duration_ns": 1, "output": {"ok": True}}
+            return {
+                "duration_ns": 1,
+                "response_completed_ns": time.perf_counter_ns(),
+                "raw": b'{"ok":true}',
+            }
 
-        with patch.object(bench, "request", side_effect=checked_request):
-            result = bench.request_round("http://localhost", {}, 10, 4)
+        case = {"expected": {"ok": True}, "confidence_tolerance": 0}
+        with patch.object(bench, "receive", side_effect=checked_request):
+            result = bench.request_round("http://localhost", case, 10, 4)
         self.assertEqual(len(result["requests"]), 4)
         self.assertGreater(result["duration_ns"], 0)
-        with patch.object(bench, "request", side_effect=ValueError("mismatch")):
-            with self.assertRaisesRegex(ValueError, "mismatch"):
-                bench.request_round("http://localhost", {}, 10, 4)
+        with patch.object(
+            bench,
+            "receive",
+            return_value={
+                "duration_ns": 1,
+                "response_completed_ns": time.perf_counter_ns(),
+                "raw": b'{"ok":false}',
+            },
+        ):
+            with self.assertRaisesRegex(ValueError, "value differs"):
+                bench.request_round("http://localhost", case, 10, 4)
 
     def test_numeric_tolerance_does_not_hide_decision_or_offset_changes(self):
         expected = {"label": "refund", "start": 2, "confidence": 0.8}

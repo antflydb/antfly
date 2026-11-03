@@ -1225,6 +1225,24 @@ fn learnedFullContext(comptime backend: enum { native, metal, cuda }, comptime e
     defer a.free(tokenizer_bytes);
     const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
     defer tok.tokenizer().deinitTokenizer();
+    const BoundedAllocator = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
+    const FailureProbe = struct {
+        last: ?BoundedAllocator.AllocationFailure = null,
+        fn record(raw: ?*anyopaque, failure: BoundedAllocator.AllocationFailure) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.last = failure;
+        }
+    };
+    var heap_failure = FailureProbe{};
+    // Native execution shares the serving request's fixed live-heap bound.
+    // Model/tokenizer residency is owned separately by the session.
+    var native_heap = BoundedAllocator{ .backing = a, .limit = 512 * 1024 * 1024, .failure_context = &heap_failure, .allocation_failed = FailureProbe.record };
+    const execution_allocator = if (backend == .native) native_heap.allocator() else a;
+    defer if (backend == .native) {
+        if (heap_failure.last) |failure| std.debug.print("native serving heap failure: {any}\n", .{failure});
+        std.debug.print("native serving heap: peak={} limit={} live={}\n", .{ native_heap.peak, native_heap.limit, native_heap.live });
+        std.debug.assert(native_heap.live == 0);
+    };
     const source_words = (config.max_len - 1) * (if (grouped) @as(usize, 4) else 1);
     const text = try a.alloc(u8, source_words * 4);
     defer a.free(text);
@@ -1254,11 +1272,11 @@ fn learnedFullContext(comptime backend: enum { native, metal, cuda }, comptime e
     defer watchdog.destroy();
     try watchdog.start(std.testing.io);
     const control = Control{ .hard_cancellation = watchdog.boundary(), .deadline_ns = @import("antfly_platform").time.monotonicNs() + (if (backend == .native) @as(u64, 900) else 180) * std.time.ns_per_s };
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    var managed = try factory.getManagedComputeBackend(session, execution_allocator, null, control);
     defer managed.deinit();
     if (extent != .tokens) {
-        const response = try executeQualified(&managed.backend, a, &config, tok.tokenizer(), &request, .{ .identity = identity, .control = control });
-        defer a.free(response);
+        const response = try executeQualified(&managed.backend, execution_allocator, &config, tok.tokenizer(), &request, .{ .identity = identity, .control = control });
+        defer execution_allocator.free(response);
         const parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
         defer parsed.deinit();
         const root = parsed.value.object;
@@ -1290,8 +1308,8 @@ fn learnedFullContext(comptime backend: enum { native, metal, cuda }, comptime e
     const dense_tokens = dense.sequence_length;
     dense.deinit();
     try std.testing.expect(dense_tokens > 16000 and dense_tokens <= capacity);
-    const dense_response = try executeQualified(&managed.backend, a, &config, tok.tokenizer(), &request, .{ .identity = identity, .control = control });
-    defer a.free(dense_response);
+    const dense_response = try executeQualified(&managed.backend, execution_allocator, &config, tok.tokenizer(), &request, .{ .identity = identity, .control = control });
+    defer execution_allocator.free(dense_response);
     const dense_parsed = try std.json.parseFromSlice(std.json.Value, a, dense_response, .{});
     defer dense_parsed.deinit();
     const dense_root = dense_parsed.value.object;
