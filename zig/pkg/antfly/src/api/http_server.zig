@@ -17405,6 +17405,8 @@ pub const ApiHttpServer = struct {
             error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
             error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => {
@@ -17424,6 +17426,8 @@ pub const ApiHttpServer = struct {
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => {
@@ -17479,6 +17483,8 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.ModelNotFound => return error.ModelNotFound,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
@@ -17503,6 +17509,8 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.ModelNotFound => return error.ModelNotFound,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.InvalidCreateTableRequest => return error.InvalidIndexRequest,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
@@ -18111,6 +18119,11 @@ pub const ApiHttpServer = struct {
                 .inference_api_key = self.cfg.inference_api_key,
             },
         ) catch |err| switch (err) {
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
+            error.ModelNotFound => return error.ModelNotFound,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
             error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
@@ -18131,7 +18144,12 @@ pub const ApiHttpServer = struct {
                 .inference_api_key = self.cfg.inference_api_key,
             },
         ) catch |err| switch (err) {
-            error.ModelNotFound, error.EmbeddingProbeUnavailable, error.InvalidCreateTableRequest, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
+            error.InvalidCreateTableRequest, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
+            error.ModelNotFound => return error.ModelNotFound,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
             error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
@@ -18154,6 +18172,11 @@ pub const ApiHttpServer = struct {
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
+            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
+            error.ModelNotFound => return error.ModelNotFound,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
             error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,

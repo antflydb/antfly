@@ -719,7 +719,7 @@ pub const Provider = struct {
         if (!resp.ok()) {
             logEmbedFailure("sparse", url, resp.status.code, resp.body);
             if (isCapabilityStaleResponse(resp)) return error.InferenceCapabilitiesStale;
-            return mapEmbedStatus(resp.status.code);
+            return mapEmbedResponse(alloc, resp.status.code, resp.body);
         }
 
         const body = resp.body orelse return error.EmptyResponse;
@@ -823,7 +823,7 @@ pub const Provider = struct {
             logEmbedFailure("dense", url, resp.status.code, resp.body);
             if (isCapabilityStaleResponse(resp)) return error.InferenceCapabilitiesStale;
             if (isInferenceAdmissionDenied(resp)) return error.QueueFull;
-            return mapEmbedStatus(resp.status.code);
+            return mapEmbedResponse(alloc, resp.status.code, resp.body);
         }
 
         const body = resp.body orelse return error.EmptyResponse;
@@ -1038,6 +1038,27 @@ pub const Provider = struct {
         .rerank = &rerankImpl,
     };
 };
+
+// Interpret only Antfly's explicit resource envelope. Bare HTTP 503/507 and
+// malformed bodies retain ordinary provider-failure accounting.
+fn mapEmbedResponse(alloc: std.mem.Allocator, status: u16, body: ?[]const u8) anyerror {
+    if (body) |bytes| {
+        if (bytes.len > 4096) return mapEmbedStatus(status);
+        const parsed = std.json.parseFromSlice(struct {
+            @"error": []const u8 = "",
+            retryable: ?bool = null,
+        }, alloc, bytes, .{ .ignore_unknown_fields = true }) catch return mapEmbedStatus(status);
+        defer parsed.deinit();
+        const code = parsed.value.@"error";
+        if (status == 503 and parsed.value.retryable == true and std.mem.eql(u8, code, "MODEL_RESOURCE_BUSY"))
+            return error.EmbedAdmissionRefused;
+        if (parsed.value.retryable != true) {
+            if (status == 400 and std.mem.eql(u8, code, "MODEL_RESOURCE_LIMIT")) return error.ResourceLimitExceeded;
+            if (status == 507 and std.mem.eql(u8, code, "MEMORY_BUDGET_EXCEEDED")) return error.MemoryBudgetExceeded;
+        }
+    }
+    return mapEmbedStatus(status);
+}
 
 fn mapEmbedStatus(status: u16) anyerror {
     return switch (status) {
@@ -1836,4 +1857,17 @@ test "antfly embed treats service unavailability as transient" {
     group.await(io) catch {};
 
     try std.testing.expectEqual(error.EmbedTransientFailure, result_err);
+}
+
+test "embedding HTTP preserves admission and permanent resource identities" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(error.EmbedAdmissionRefused, mapEmbedResponse(a, 503, "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true}"));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, mapEmbedResponse(a, 400, "{\"error\":\"MODEL_RESOURCE_LIMIT\",\"retryable\":false}"));
+    // Older inference servers omitted retryable for permanent model limits.
+    try std.testing.expectEqual(error.ResourceLimitExceeded, mapEmbedResponse(a, 400, "{\"error\":\"MODEL_RESOURCE_LIMIT\"}"));
+    try std.testing.expectEqual(error.MemoryBudgetExceeded, mapEmbedResponse(a, 507, "{\"error\":\"MEMORY_BUDGET_EXCEEDED\",\"retryable\":false}"));
+    for ([_]?[]const u8{ null, "", "unavailable", "{}", "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":false}", "{\"error\":\"OTHER_FAILURE\",\"retryable\":true}" }) |body| {
+        try std.testing.expectEqual(error.EmbedTransientFailure, mapEmbedResponse(a, 503, body));
+        try std.testing.expectEqual(error.EmbedTransientFailure, mapEmbedResponse(a, 507, body));
+    }
 }

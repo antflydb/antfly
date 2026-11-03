@@ -15,12 +15,14 @@
 
 const std = @import("std");
 const graph = @import("graph_request_diagnostics.zig");
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const reranking = @import("antfly_reranking");
 
 /// Owns structured diagnostics produced while executing one public query.
 /// Storage lives on the request stack so reused worker threads and nested
 /// internal queries cannot leak details between requests.
 pub const Context = struct {
+    validation: query_contract.ValidationDiagnosticStorage = .{},
     graph: graph.Context = .{},
     reranker_candidate_limit: reranking.CandidateLimitDiagnosticStorage = .{},
 };
@@ -28,11 +30,13 @@ pub const Context = struct {
 /// Binds request-owned diagnostic storage for synchronous query execution.
 /// Bindings are stackable and restore the caller when an internal query exits.
 pub const Scope = struct {
+    validation: query_contract.ValidationDiagnosticBinding,
     graph: graph.Scope,
     reranker_candidate_limit: reranking.CandidateLimitDiagnosticBinding,
 
     pub fn init(context: *Context) Scope {
         return .{
+            .validation = query_contract.bindValidationDiagnostic(&context.validation),
             .graph = graph.Scope.init(&context.graph),
             .reranker_candidate_limit = reranking.bindCandidateLimitDiagnostic(&context.reranker_candidate_limit),
         };
@@ -41,10 +45,12 @@ pub const Scope = struct {
     pub fn deinit(self: Scope) void {
         self.reranker_candidate_limit.deinit();
         self.graph.deinit();
+        self.validation.deinit();
     }
 };
 
 pub fn reset() void {
+    query_contract.resetValidationDiagnostic();
     graph.reset();
     reranking.resetCandidateLimitDiagnostic();
 }

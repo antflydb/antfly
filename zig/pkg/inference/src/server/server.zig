@@ -3153,7 +3153,8 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
         }),
         error.ResourceLimitExceeded => ctx.status(400).json(.{
             .@"error" = "MODEL_RESOURCE_LIMIT",
-            .message = "model resource plan exceeds the configured inference budget",
+            .message = "model resource plan exceeds the configured inference budget; inspect admission logs for requested bytes and host, backend, combined, KV and scratch limits",
+            .retryable = false,
         }),
         error.ModelArtifactsChanging,
         error.IncompleteManagedDownload,
@@ -3191,7 +3192,8 @@ fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
         }),
         error.ResourceLimitExceeded => ctx.status(400).json(.{
             .@"error" = "MODEL_RESOURCE_LIMIT",
-            .message = "request resource plan exceeds the configured inference budget",
+            .message = "request resource plan exceeds the configured inference budget; inspect admission logs for requested bytes and host, backend, combined, KV and scratch limits",
+            .retryable = false,
         }),
         error.ProcessIsolationRequired => ctx.status(503).json(.{
             .@"error" = "PROCESS_ISOLATION_REQUIRED",

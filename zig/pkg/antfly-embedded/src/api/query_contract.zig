@@ -14,6 +14,42 @@
 // limitations under the License.
 
 const std = @import("std");
+
+/// Literal-only validation details, owned by the public request. Bindings are
+/// stackable so nested calls and reused executor threads cannot leak failures.
+pub const ValidationDiagnostic = struct {
+    pointer: []const u8,
+    message: []const u8,
+};
+pub const ValidationDiagnosticStorage = struct {
+    diagnostic: ?ValidationDiagnostic = null,
+};
+threadlocal var validation_diagnostic_storage: ?*ValidationDiagnosticStorage = null;
+pub const ValidationDiagnosticBinding = struct {
+    previous: ?*ValidationDiagnosticStorage,
+    pub fn deinit(self: @This()) void {
+        validation_diagnostic_storage = self.previous;
+    }
+};
+pub fn bindValidationDiagnostic(storage: *ValidationDiagnosticStorage) ValidationDiagnosticBinding {
+    const previous = validation_diagnostic_storage;
+    validation_diagnostic_storage = storage;
+    return .{ .previous = previous };
+}
+pub fn resetValidationDiagnostic() void {
+    if (validation_diagnostic_storage) |storage| storage.diagnostic = null;
+}
+pub fn takeValidationDiagnostic() ?ValidationDiagnostic {
+    const storage = validation_diagnostic_storage orelse return null;
+    const diagnostic = storage.diagnostic;
+    storage.diagnostic = null;
+    return diagnostic;
+}
+fn invalidQueryField(comptime pointer: []const u8, comptime message: []const u8) error{InvalidQueryRequest} {
+    if (validation_diagnostic_storage) |storage| storage.diagnostic = .{ .pointer = pointer, .message = message };
+    return error.InvalidQueryRequest;
+}
+
 const relationship_filter = @import("../graph/relationship_filter.zig");
 const builtin = @import("builtin");
 const ant_json = @import("antfly-json");
@@ -12753,7 +12789,7 @@ fn applyPublicHierarchyControls(
                             return error.InvalidQueryRequest;
                         }
                     }
-                    if (!fields_set) return error.InvalidQueryRequest;
+                    if (!fields_set) return invalidQueryField("/hierarchy/group_by/matches/fields", "fields is required when hierarchy.group_by.matches is configured; use an explicit field array (which may be empty)");
                 } else {
                     return error.InvalidQueryRequest;
                 }
@@ -12844,7 +12880,7 @@ fn applyPublicHierarchyControls(
                 !std.mem.eql(u8, req.order_by[1].field, "_id") or
                 req.order_by[1].desc)
             {
-                return error.InvalidQueryRequest;
+                return invalidQueryField("/order_by", "hierarchy.children requires order_by with _hierarchy.position ascending followed by _id ascending");
             }
             if (req.search_after.len > 0 and
                 (req.search_after.len != 2 or req.search_after[0] != .string or req.search_after[1] != .string))
@@ -20674,4 +20710,25 @@ test "api query contract source only column delivery keeps payload outside metad
     try std.testing.expect(counter.bytes > body.len);
     try std.testing.expectEqual(@as(?usize, counter.bytes), response.delivered_bytes);
     try std.testing.expect(hits[0].column_source == null);
+}
+
+test "hierarchy validation diagnostics name required fields and stay request scoped" {
+    const a = std.testing.allocator;
+    var outer: ValidationDiagnosticStorage = .{};
+    const outer_binding = bindValidationDiagnostic(&outer);
+    defer outer_binding.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs",
+        \\{"fields":[],"hierarchy":{"group_by":{"level":"source","matches":{}}}}
+    ));
+    var inner: ValidationDiagnosticStorage = .{};
+    const inner_binding = bindValidationDiagnostic(&inner);
+    try std.testing.expect(takeValidationDiagnostic() == null);
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs",
+        \\{"fields":[],"hierarchy":{"children":{"parent":{"level":"source","id":"doc"},"level":"unit"}}}
+    ));
+    try std.testing.expectEqualStrings("/order_by", takeValidationDiagnostic().?.pointer);
+    try std.testing.expect(takeValidationDiagnostic() == null);
+    inner_binding.deinit();
+    try std.testing.expectEqualStrings("/hierarchy/group_by/matches/fields", takeValidationDiagnostic().?.pointer);
+    try std.testing.expect(takeValidationDiagnostic() == null);
 }

@@ -64,6 +64,9 @@ pub const RuntimeStatus = struct {
     /// Failures attributed to retry_failure_fingerprint. Kept separate from
     /// the no-progress supervisor count so per-request isolation remains fair.
     retry_failure_count: u32 = 0,
+    /// Admission waits for the same fingerprint survive worker/process restart
+    /// without spending the provider-failure budget.
+    admission_wait_count: u32 = 0,
     /// Inclusive source-sequence interval containing terminal request debt
     /// observed since the last applied boundary. Synchronous barriers use it
     /// to return committed_repair_required for the affected write range.
@@ -317,6 +320,15 @@ pub fn loadRuntimeStatus(alloc: Allocator, store: anytype, scope: []const u8) !R
         null;
     var status = try decodeRuntimeStatus(raw, retry_count_raw);
     status.output_counts = output_counts;
+    // Separate, hash-bound sidecar keeps older status/aux records readable on
+    // rollback. An older writer changes the primary hash, invalidating it.
+    const admission_key = try std.mem.concat(alloc, u8, &.{ runtime_status_prefix, scope, ":admission" });
+    defer alloc.free(admission_key);
+    const admission = txn.get(admission_key) catch |err| if (err == error.NotFound) null else return err;
+    if (admission) |bytes| {
+        if (bytes.len == 12 and std.mem.readInt(u64, bytes[0..8], .little) == std.hash.Wyhash.hash(0x454e525354415455, raw))
+            status.admission_wait_count = std.mem.readInt(u32, bytes[8..12], .little);
+    }
     const detail_key = try std.mem.concat(alloc, u8, &.{ runtime_status_prefix, scope, ":error" });
     defer alloc.free(detail_key);
     const detail = txn.get(detail_key) catch |err| switch (err) {
@@ -408,6 +420,12 @@ pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatu
     errdefer txn.abort();
     try txn.put(key, &buf);
     try txn.put(retry_count_key, &retry_count_buf);
+    const admission_key = try std.mem.concat(std.heap.page_allocator, u8, &.{ runtime_status_prefix, scope, ":admission" });
+    defer std.heap.page_allocator.free(admission_key);
+    var admission: [12]u8 = undefined;
+    std.mem.writeInt(u64, admission[0..8], std.hash.Wyhash.hash(0x454e525354415455, &buf), .little);
+    std.mem.writeInt(u32, admission[8..12], status.admission_wait_count, .little);
+    try txn.put(admission_key, &admission);
     const detail_key = try std.mem.concat(std.heap.page_allocator, u8, &.{ runtime_status_prefix, scope, ":error" });
     defer std.heap.page_allocator.free(detail_key);
     var detail: [264]u8 = undefined;
@@ -692,4 +710,34 @@ test "enrichment runtime status reads transient extended development record" {
     const loaded = try decodeRuntimeStatus(&raw, null);
     try std.testing.expectEqual(@as(u32, 5), loaded.consecutive_retry_count);
     try std.testing.expectEqual(@as(u32, 2), loaded.retry_failure_count);
+}
+
+test "admission wait budget survives reopen and ignores stale rollback sidecars" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer store.deinit();
+    const status: RuntimeStatus = .{
+        .target_sequence = 10,
+        .retry_failure_fingerprint = 42,
+        .retry_failure_count = 0,
+        .admission_wait_count = 15,
+        .retrying = true,
+    };
+    try saveRuntimeStatus(store, "admission-test", status);
+    const loaded = try loadRuntimeStatus(std.testing.allocator, store, "admission-test");
+    try std.testing.expectEqual(@as(u32, 15), loaded.admission_wait_count);
+    try std.testing.expectEqual(@as(u32, 0), loaded.retry_failure_count);
+    // Simulate an older writer replacing only the legacy primary record.
+    const key = try runtimeStatusKey(std.testing.allocator, "admission-test");
+    defer std.testing.allocator.free(key);
+    var txn = try store.beginWrite();
+    errdefer txn.abort();
+    var newer = status;
+    newer.retry_failure_fingerprint = 43;
+    const raw = encodeRuntimeStatus(newer);
+    try txn.put(key, &raw);
+    try txn.commit();
+    const rolled_back = try loadRuntimeStatus(std.testing.allocator, store, "admission-test");
+    try std.testing.expectEqual(@as(u32, 0), rolled_back.admission_wait_count);
 }

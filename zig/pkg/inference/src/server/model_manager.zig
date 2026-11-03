@@ -4618,6 +4618,8 @@ pub const ModelManager = struct {
 
     pub const MemoryAdmissionDiagnostic = struct {
         pressure: []const u8 = "none",
+        error_code: []const u8 = "",
+        retryable: bool = false,
         denied_count: u64 = 0,
         last_denied_ns: u64 = 0,
         request_count: u64 = 0,
@@ -4630,7 +4632,11 @@ pub const ModelManager = struct {
         host_limit_bytes: u64 = 0,
         backend_limit_bytes: u64 = 0,
         combined_limit_bytes: u64 = 0,
+        kv_limit_bytes: u64 = 0,
+        scratch_limit_bytes: u64 = 0,
         available_memory_bytes: u64 = 0,
+        shared_host_limit_bytes: u64 = 0,
+        shared_unified_limit_bytes: u64 = 0,
     };
 
     const LoadedModelMap = std.StringHashMapUnmanaged(*LoadedModel);
@@ -5956,6 +5962,11 @@ pub const ModelManager = struct {
         const limits = self.physicalRunLimits(backend_class, requested_limits);
         self.tightenUnifiedDeviceAdmission();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
+        const requests = [_]runtime.tier.memory.AdmissionRequest{.{
+            .backend_class = backend_class,
+            .limits = limits,
+            .amounts = amounts,
+        }};
         return self.admissionController().tryAcquireWithPressure(
             backend_class,
             limits,
@@ -5975,22 +5986,23 @@ pub const ModelManager = struct {
                         &pressure,
                     )) |lease| return lease else |retry_err| switch (retry_err) {
                         error.ResourceTemporarilyUnavailable => {},
-                        else => return retry_err,
+                        else => {
+                            self.logRunAdmissionDenied(retry_err, pressure, &requests);
+                            return retry_err;
+                        },
                     }
                     if (!self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
                     )) {
-                        const denied_request = [_]runtime.tier.memory.AdmissionRequest{.{
-                            .backend_class = backend_class,
-                            .limits = limits,
-                            .amounts = amounts,
-                        }};
-                        self.logRunAdmissionDenied(pressure, &denied_request);
+                        self.logRunAdmissionDenied(error.ResourceTemporarilyUnavailable, pressure, &requests);
                         return error.ResourceTemporarilyUnavailable;
                     }
                 }
             },
-            else => return first_err,
+            else => {
+                self.logRunAdmissionDenied(first_err, pressure, &requests);
+                return first_err;
+            },
         };
     }
 
@@ -6021,17 +6033,23 @@ pub const ModelManager = struct {
                         return lease
                     else |retry_err| switch (retry_err) {
                         error.ResourceTemporarilyUnavailable => {},
-                        else => return retry_err,
+                        else => {
+                            self.logRunAdmissionDenied(retry_err, pressure, requests);
+                            return retry_err;
+                        },
                     }
                     if (!self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
                     )) {
-                        self.logRunAdmissionDenied(pressure, requests);
+                        self.logRunAdmissionDenied(error.ResourceTemporarilyUnavailable, pressure, requests);
                         return error.ResourceTemporarilyUnavailable;
                     }
                 }
             },
-            else => return first_err,
+            else => {
+                self.logRunAdmissionDenied(first_err, pressure, requests);
+                return first_err;
+            },
         };
     }
 
@@ -6040,11 +6058,18 @@ pub const ModelManager = struct {
     /// live-memory pressure. Artifact paths and request contents are excluded.
     fn logRunAdmissionDenied(
         self: *ModelManager,
+        err: anyerror,
         pressure: ?runtime.tier.memory.AdmissionPressure,
         requests: []const runtime.tier.memory.AdmissionRequest,
     ) void {
+        if (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable) return;
         const admitted = self.admissionController().snapshot();
+        const shared_limits = self.admissionController().sharedLimitsSnapshot();
         var diagnostic: MemoryAdmissionDiagnostic = .{
+            .shared_host_limit_bytes = shared_limits.host_limit_bytes,
+            .shared_unified_limit_bytes = shared_limits.unified_limit_bytes,
+            .error_code = @errorName(err),
+            .retryable = err == error.ResourceTemporarilyUnavailable,
             .pressure = if (pressure) |value| @tagName(std.meta.activeTag(value)) else "unknown",
             .last_denied_ns = platform.time.monotonicNs(),
             .request_count = requests.len,
@@ -6061,6 +6086,8 @@ pub const ModelManager = struct {
             diagnostic.host_limit_bytes = requests[0].limits.host_limit_bytes;
             diagnostic.backend_limit_bytes = requests[0].limits.backend_limit_bytes;
             diagnostic.combined_limit_bytes = requests[0].limits.combined_limit_bytes;
+            diagnostic.kv_limit_bytes = requests[0].limits.kv_limit_bytes;
+            diagnostic.scratch_limit_bytes = requests[0].limits.scratch_limit_bytes;
         }
         if (!builtin.is_test) if (runtime.tier.memory.currentSystemMemoryInfoForLimit(self.process_memory_limit_bytes, self.process_memory_limit_provenance)) |info| {
             diagnostic.available_memory_bytes = info.available_bytes orelse 0;
@@ -6072,8 +6099,10 @@ pub const ModelManager = struct {
         self.admission_diagnostic_mutex.unlock();
         if (!should_log or builtin.is_test) return;
         std.log.warn(
-            "inference run admission denied pressure={s} denied_count={d} request_count={d} admitted_host_bytes={d} admitted_backend_bytes={d} admitted_kv_bytes={d} admitted_scratch_bytes={d}",
+            "inference run admission denied error={s} retryable={} pressure={s} denied_count={d} request_count={d} admitted_host_bytes={d} admitted_backend_bytes={d} admitted_kv_bytes={d} admitted_scratch_bytes={d} shared_host_limit_bytes={d} shared_unified_limit_bytes={d}",
             .{
+                @errorName(err),
+                diagnostic.retryable,
                 if (pressure) |value| @tagName(std.meta.activeTag(value)) else "unknown",
                 diagnostic.denied_count,
                 requests.len,
@@ -6081,6 +6110,8 @@ pub const ModelManager = struct {
                 admitted.backendTotalBytes(),
                 admitted.kvTotalBytes(),
                 admitted.scratchTotalBytes(),
+                shared_limits.host_limit_bytes,
+                shared_limits.unified_limit_bytes,
             },
         );
         for (requests, 0..) |request, index| {
@@ -15727,4 +15758,21 @@ test "explicit load policy resolves global model and call precedence before any 
     try std.testing.expectEqual(@as(u32, 20480), explicit.cache_policy.a4b_request.?.memory_budget_mb);
     const override = manager.resolveModelLoadPolicy("model", .{ .a4b_request = .{ .memory_budget_mb = 24576 } });
     try std.testing.expectEqual(@as(u32, 24576), override.cache_policy.a4b_request.?.memory_budget_mb);
+}
+
+test "permanent memory admission failures retain estimates and release reservations" {
+    const memory = runtime.tier.memory;
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    const limits = memory.Limits{ .host_limit_bytes = 100, .scratch_limit_bytes = 20 };
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireAmountsWithEviction(.cpu, limits, .{ .host_scratch_bytes = 30 }));
+    const denied = manager.memoryAdmissionDiagnostic();
+    try std.testing.expectEqualStrings("ResourceLimitExceeded", denied.error_code);
+    try std.testing.expect(!denied.retryable);
+    try std.testing.expectEqual(@as(u64, 30), denied.requested_scratch_bytes);
+    try std.testing.expectEqual(@as(u64, 20), denied.scratch_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 1), denied.denied_count);
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireRequestsWithEviction(&.{.{ .backend_class = .cpu, .limits = limits, .amounts = .{ .host_scratch_bytes = 30 } }}));
+    try std.testing.expectEqual(@as(u64, 2), manager.memoryAdmissionDiagnostic().denied_count);
 }
