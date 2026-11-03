@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import io
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
@@ -25,9 +26,47 @@ import unittest
 from unittest.mock import patch
 
 import benchmark_linux_cpu_http as bench
+import qualify_context_http as capacity
 
 
 class ContractTests(unittest.TestCase):
+    def test_capacity_check_rejects_split_windows_and_invalid_source_spans(self):
+        class Response(io.BytesIO):
+            status = 200
+
+        good = {
+            "data": [
+                {
+                    "long_document": {"window_count": 1},
+                    "entities": [{"start": 0, "end": 3, "text": "abc"}],
+                }
+            ],
+            "usage": {"prompt_tokens": 27},
+        }
+        with patch.object(
+            capacity, "urlopen", return_value=Response(json.dumps(good).encode())
+        ):
+            result = capacity.execute("http://localhost/extract", "abc", 10)
+        self.assertEqual(result["output"], good)
+        for split, text in ((True, "abc"), (False, "wrong")):
+            changed = json.loads(json.dumps(good))
+            changed["data"][0]["long_document"]["window_count"] = 2 if split else 1
+            changed["data"][0]["entities"][0]["text"] = text
+            with patch.object(
+                capacity, "urlopen", return_value=Response(json.dumps(changed).encode())
+            ):
+                with self.assertRaises(ValueError):
+                    capacity.execute("http://localhost/extract", "abc", 10)
+
+    def test_burst_ends_at_response_completion_not_after_validation(self):
+        response = {"duration_ns": 1, "response_completed_ns": 150, "output": {}}
+        with (
+            patch.object(bench, "request", return_value=response),
+            patch.object(bench.time, "perf_counter_ns", side_effect=[100, 1000]),
+        ):
+            result = bench.request_round("http://localhost", {}, 10, 4)
+        self.assertEqual(result["duration_ns"], 50)
+
     def test_concurrent_round_overlaps_clients_and_checks_every_result(self):
         entered = threading.Barrier(4, timeout=5)
 

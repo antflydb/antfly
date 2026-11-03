@@ -28,6 +28,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
 import math
+import os
 import sys
 import time
 import threading
@@ -206,7 +207,12 @@ def main():
             reference_pairs = []
             for pair in range(args.pairs):
                 order = list(arms) if pair % 2 == 0 else list(reversed(arms))
-                row = {"case_id": case["id"], "pair": pair, "order": order}
+                row = {
+                    "case_id": case["id"],
+                    "pair": pair,
+                    "order": order,
+                    "host_load_average": list(os.getloadavg()),
+                }
                 for arm in order:
                     row[arm] = request_round(
                         arms[arm], case, args.timeout, args.concurrency
