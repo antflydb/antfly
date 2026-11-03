@@ -40,7 +40,14 @@ word budget. Changing width moves window boundaries, so fitting checks candidate
 without assuming token counts are monotonic. The requested ceiling is prepared
 once when it fits; otherwise at most 4,096 candidate widths use indexed source
 geometry, without retokenizing the document for each candidate. Fitting preserves
-overlap/global offsets and never silently truncates input. Physical window groups shrink independently
+overlap/global offsets and never silently truncates input. A synthetic terminal period can also exceed
+the encoded-fragment byte limit; this window-dependent refusal participates in
+fitting. The invariant schema prompt is validated before fitting costs are
+indexed. Exhausting candidate widths preserves the original processor refusal.
+The [fragment-fitting follow-up receipt](../../../../bench/baselines/gliner-fragment-fitting-20261103.json)
+records 62 passing Debug checks, including the pinned tokenizer at the default
+fragment limit, cache reuse and allocation-failure cleanup.
+Physical window groups shrink independently
 when aggregate batch work or memory limits require it. Workspace planning and
 execution use the same preparation and group admission paths.
 

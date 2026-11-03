@@ -1807,3 +1807,95 @@ test "boundary end-to-end CUDA benchmark measures complete warm requests" {
     }
     std.debug.print("e2e_bench total_without_ns={} total_with_ns={} equal_responses=true\n", .{ totals[0], totals[1] });
 }
+
+fn exerciseFragmentFitting(a: Allocator) !void {
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"probe","schema":{"entities":["x"]},"options":{"long_document":{"mode":"window","window_words":6,"overlap_words":0}},"inputs":[{"content":"a b c d https://xxxx e f g"}]}
+    , .{});
+    defer request.deinit();
+    var tok = QualificationGeometryTest.TokenizerProbe{ .one_token_words = true };
+    const config = QualificationGeometryTest.config();
+    var identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+    identity.backbone = config.backbone;
+    var store = PreparationStore.init(a);
+    defer store.deinit();
+    const options = long_executor.Options{ .preparations = &store, .identity = identity, .processor = .{ .max_fragment_bytes = 12 } };
+    var receiver = PreparationReuseTest.Receiver{};
+    const first = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+
+    request.items[0].options.long_document.window_words = 4;
+    const fitting = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(fitting.window_count, first.window_count);
+    try std.testing.expectEqual(fitting.prompt_tokens, first.prompt_tokens);
+    request.items[0].options.long_document.window_words = 6;
+    const before = tok.calls;
+    const cached = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(first.prompt_tokens, cached.prompt_tokens);
+    try std.testing.expectEqual(before, tok.calls);
+    // A source word that already exceeds the cap cannot be fixed by fitting.
+    request.items[0].text = "a b c d https://xxxxx e f g";
+    const invalid = long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+    if (invalid) |_| return error.TestUnexpectedResult else |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(@as(anyerror, error.BoundaryFragmentLimitExceeded), err);
+    }
+}
+
+test "boundary qualification fragment fitting respects the default cap with pinned base tokenizer" {
+    const a = std.testing.allocator;
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(path);
+    const bytes = try @import("../util/c_file.zig").readFile(a, path);
+    defer a.free(bytes);
+    const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, bytes);
+    defer tok.tokenizer().deinitTokenizer();
+    var url = std.ArrayListUnmanaged(u8).empty;
+    defer url.deinit(a);
+    try url.appendSlice(a, "https://");
+    while (url.items.len + "configuration".len <= 65536) try url.appendSlice(a, "configuration");
+    while (url.items.len < 65536) try url.append(a, 'x');
+    const text = try std.fmt.allocPrint(a, "a b c d {s} e f g", .{url.items});
+    defer a.free(text);
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "probe", .schema = .{ .entities = .{"x"} }, .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 6), .overlap_words = @as(usize, 0) } }, .inputs = .{.{ .content = text }} }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    var config = QualificationGeometryTest.config();
+    config.encoder.vocab_size = @intCast(tok.tokenizer().vocabSize());
+    var identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+    identity.backbone = config.backbone;
+    const options = long_executor.Options{ .identity = identity };
+    var receiver = PreparationReuseTest.Receiver{};
+    const fitted = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+
+    request.items[0].options.long_document.window_words = 4;
+    const accepted = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(accepted.window_count, fitted.window_count);
+    try std.testing.expectEqual(accepted.prompt_tokens, fitted.prompt_tokens);
+    try std.testing.expectEqual(@as(usize, 5083), fitted.prompt_tokens);
+}
+
+test "boundary qualification fragment fitting preserves valid partitions" {
+    try exerciseFragmentFitting(std.testing.allocator);
+}
+
+test "boundary qualification fragment fitting releases every failed allocation" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseFragmentFitting, .{});
+}
+
+test "boundary qualification fragment fitting rejects invalid schema before source indexing" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"probe","schema":{"entities":["oversized_entity_label"]},"options":{"long_document":{"mode":"window","window_words":6,"overlap_words":0}},"inputs":[{"content":"a b c d https://xxxx e f g"}]}
+    , .{});
+    defer request.deinit();
+    var tok = QualificationGeometryTest.TokenizerProbe{ .one_token_words = true };
+    const config = QualificationGeometryTest.config();
+    var identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+    identity.backbone = config.backbone;
+    var receiver = PreparationReuseTest.Receiver{};
+    try std.testing.expectError(error.BoundaryFragmentLimitExceeded, long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], .{ .identity = identity, .processor = .{ .max_fragment_bytes = 12 } }, &receiver));
+    // Only two bounded schema attempts: initial window, then empty prefix.
+    try std.testing.expect(tok.calls < 32);
+}

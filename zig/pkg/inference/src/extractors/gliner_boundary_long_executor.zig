@@ -688,16 +688,16 @@ fn fitTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, conf
     var initial = try prepareDocument(backend, allocator, config, item, options);
     var initial_live = true;
     defer if (initial_live) initial.deinit();
-    if (try tokenizedDocumentFits(allocator, tokenizer, item, &initial)) {
-        initial_live = false;
-        return initial;
-    }
+    const initial_refusal = switch (try prepareTokenizedWindows(allocator, tokenizer, item, &initial)) {
+        .fits => {
+            initial_live = false;
+            return initial;
+        },
+        .capacity_refusal => |err| err,
+    };
     // Width changes repartition the document: fitting is NOT monotonic. Index
     // exact independent word costs once, then inspect every candidate width
     // using prefix sums and the same source geometry used by final execution.
-    const windows = @import("antfly_extracting").text_processing.windows;
-    var geometry = try windows.GeometryIndex.init(allocator, item.text, initial.document.words, planning.word_splitter, if (options.control) |*control| .{ .ptr = control, .check_fn = fittingCheckpoint } else null);
-    defer geometry.deinit();
     const process = initial.process_options;
     var prefix_options = process;
     prefix_options.max_sequence_tokens = std.math.maxInt(i32);
@@ -708,6 +708,11 @@ fn fitTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, conf
     const period_word = empty_sample.words[empty_sample.words.len - 1];
     const period_cost = period_word.input_end - period_word.input_start;
     const prompt_cost = empty_sample.input_ids.len - period_cost;
+    // The empty prompt validates invariant schema fragments before indexing
+    // source words. A bad schema cannot become valid by changing boundaries.
+    const windows = @import("antfly_extracting").text_processing.windows;
+    var geometry = try windows.GeometryIndex.init(allocator, item.text, initial.document.words, planning.word_splitter, if (options.control) |*control| .{ .ptr = control, .check_fn = fittingCheckpoint } else null);
+    defer geometry.deinit();
     const ranges = initial.document.words;
     const sums = try allocator.alloc(usize, ranges.len + 1);
     defer allocator.free(sums);
@@ -736,7 +741,6 @@ fn fitTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, conf
     const minimum = planning.overlap_words + 1;
     // Wider one-window plans have the same rejected prompt as the ceiling.
     var width = @min(planning.max_window_body_words, ranges.len + @intFromBool(geometry.full_terminal));
-    var refusal: anyerror = error.BoundarySequenceLimitExceeded;
     while (width > minimum) {
         width -= 1;
         try check(options);
@@ -751,7 +755,6 @@ fn fitTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, conf
             .max_window_scan_bytes = trial.max_window_scan_bytes,
         }) catch |err| {
             if (err == error.LongDocumentWindowLimitExceeded or err == error.InvalidLongDocumentLimits or err == error.LongDocumentWorkLimitExceeded) {
-                refusal = err;
                 continue;
             }
             return err;
@@ -773,26 +776,34 @@ fn fitTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, conf
         initial_live = false;
         var result = try prepareDocument(backend, allocator, config, item, options);
         errdefer result.deinit();
-        if (!try tokenizedDocumentFits(allocator, tokenizer, item, &result)) return error.BoundarySequenceLimitExceeded;
+        switch (try prepareTokenizedWindows(allocator, tokenizer, item, &result)) {
+            .fits => {},
+            .capacity_refusal => |err| return err,
+        }
         return result;
     }
-    return refusal;
+    return initial_refusal;
 }
 
-fn tokenizedDocumentFits(allocator: Allocator, tokenizer: Tokenizer, item: *const wire.Item, planned: *PreparedDocument) !bool {
+const WindowFit = union(enum) { fits, capacity_refusal: anyerror };
+
+fn prepareTokenizedWindows(allocator: Allocator, tokenizer: Tokenizer, item: *const wire.Item, planned: *PreparedDocument) !WindowFit {
     const cache = try PreparedCache.create(allocator, planned.document.windows.len, planned.options.limits.max_prepared_bytes);
     var retained = false;
     defer if (!retained) cache.deinit();
     for (planned.document.windows, 0..) |window, i| {
         cache.batches[i] = processor.prepare(cache.budget.allocator(), tokenizer, &.{.{ .text = try planned.document.windowText(window.index), .schema = &item.compiled }}, planned.process_options) catch |err| {
-            if (err == error.BoundarySequenceLimitExceeded) return false;
+            // A synthetic terminal period can make only this partition's
+            // final fragment too large, even when its source word is valid.
+            if (err == error.BoundarySequenceLimitExceeded or err == error.BoundaryFragmentLimitExceeded)
+                return .{ .capacity_refusal = err };
             return evidenceAllocationError(cache.terminal, err);
         };
         cache.initialized += 1;
     }
     planned.cache = cache;
     retained = true;
-    return true;
+    return .fits;
 }
 
 /// Plan the same physical group for workspace admission and execution. Group
