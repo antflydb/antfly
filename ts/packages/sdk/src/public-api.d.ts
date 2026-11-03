@@ -17583,6 +17583,56 @@ export interface components {
          * @enum {string}
          */
         DistanceMetric: "l2_squared" | "inner_product" | "cosine";
+        /**
+         * @description Dense vector index algorithm (dense only). "hbc" (default) keeps quantized codes plus full-precision rerank data. "leann" keeps only a pruned proximity graph and compact RaBitQ codes and recomputes exact distances for a few candidates per query, re-embedding them (see leann.vector_storage) or reading their stored embedding, trading query-time work for index size. LEANN indexes do not yet support shard splits or native index backups.
+         * @default hbc
+         * @enum {string}
+         */
+        DenseIndexAlgorithm: "hbc" | "leann";
+        /** @description Tuning for algorithm=leann dense indexes. All fields are optional. */
+        LeannIndexConfig: {
+            /**
+             * @description Graph degree cap M. Most nodes keep M/5 neighbors after pruning; hubs keep up to M.
+             * @default 30
+             */
+            max_degree?: number;
+            /**
+             * @description Compact code used to steer the graph walk. "rabitq" (default) carries error bounds, so only candidates that can still reach the top k are recomputed. "pq" follows the LEANN paper's fixed rerank ratio; prefer it only for very low dimensions (below about 64).
+             * @default rabitq
+             * @enum {string}
+             */
+            quantizer?: "rabitq" | "pq";
+            /**
+             * @description Whether document embeddings stay stored after the graph covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few candidates per query from the document's field or template through the index's embedder, so the index stores about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external vectors, chunked indexes, indexes fed by other enrichments, and the pq quantizer.
+             * @enum {string}
+             */
+            vector_storage?: "transient" | "persistent";
+            /**
+             * @description Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for pq).
+             * @default 0
+             */
+            search_ef?: number;
+            /**
+             * Format: float
+             * @description Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates and loses fewer true neighbors.
+             * @default 1
+             */
+            bound_scale?: number;
+            /**
+             * @description Candidates recomputed per batch. 0 uses k.
+             * @default 0
+             */
+            batch_size?: number;
+        };
+        /**
+         * @description How an HBC dense index with quantization_bits above 1 uses its extended codes (not
+         *     allowed with algorithm=leann).
+         *     near_cutoff scores with 1-bit codes and rescores only candidates that could still
+         *     enter the result candidates; all rescores every scanned vector.
+         * @default near_cutoff
+         * @enum {string}
+         */
+        QuantizationRefine: "near_cutoff" | "all";
         /** @description Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted. */
         IndexExecutionConfig: {
             /** @description Chunk producer batching for shorthand-created chunk enrichments. */
@@ -17590,7 +17640,7 @@ export interface components {
             /** @description Embedding producer batching for shorthand-created embedding enrichments. */
             embedding?: components["schemas"]["ExecutionPolicy"];
         };
-        /** @description Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense HBC vector index. For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected. */
+        /** @description Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index; `algorithm` selects HBC (default) or LEANN. For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected. */
         EmbeddingsIndexConfig: {
             publication_policy?: components["schemas"]["IndexPublicationPolicy"];
             /** @description Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field. */
@@ -17624,8 +17674,23 @@ export interface components {
              */
             template?: string;
             distance_metric?: components["schemas"]["DistanceMetric"];
+            algorithm?: components["schemas"]["DenseIndexAlgorithm"];
+            /** @description LEANN tuning (dense only; requires algorithm=leann). */
+            leann?: components["schemas"]["LeannIndexConfig"];
             /** @description Whether to use in-memory only storage (dense only) */
             mem_only?: boolean;
+            /**
+             * @description RaBitQ bits per dimension for dense indexes (dense only). Fixed when the index is created.
+             *     HBC (default 1): larger values also store extended RaBitQ codes and use them to rescore
+             *     candidates, which improves recall and reduces exact reranking at the cost of index size
+             *     (about dims * bits / 8 extra bytes per vector). Values above 1 enable a random rotation
+             *     of vectors.
+             *     LEANN (default 4 with the rabitq quantizer; pq allows only 1): more bits tighten the
+             *     error bounds, so fewer candidates get exact distances (about 15x fewer at 4 bits than 1
+             *     on NYTimes-256), and codes take bits / 8 bytes per dimension.
+             */
+            quantization_bits?: number;
+            quantization_refine?: components["schemas"]["QuantizationRefine"];
             /** @description Configuration for the embeddings plugin (managed indexes only; not allowed when external=true) */
             embedder?: components["schemas"]["IndexEmbedderConfig"];
             /** @description Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing. */
@@ -18930,6 +18995,8 @@ export interface components {
             readonly source_artifact_name?: string;
             template?: string;
             distance_metric?: components["schemas"]["DistanceMetric"];
+            algorithm?: components["schemas"]["DenseIndexAlgorithm"];
+            leann?: components["schemas"]["LeannIndexConfig"];
             mem_only?: boolean;
             embedder?: components["schemas"]["CreatedProviderConfig"];
             chunker?: components["schemas"]["ChunkerConfig"];

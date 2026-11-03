@@ -102,6 +102,16 @@ pub const HBCConfig = struct {
     rerank_policy: RerankPolicy = .always,
     quantizer_seed: u64 = 42,
     use_random_ortho_trans: bool = false,
+    /// RaBitQ bits per dimension. Above 1, every quantized set also carries
+    /// extended RaBitQ codes (`antfly_vector.rabitq_ex`) and leaf scoring
+    /// refines 1-bit estimates with them (`quantization_refine`). Extended
+    /// codes assume `use_random_ortho_trans`.
+    quantization_bits: u8 = 1,
+    quantization_refine: QuantizationRefine = .near_cutoff,
+    /// `near_cutoff` rescores a candidate when its 1-bit estimate minus this
+    /// many 1-bit error bounds could still enter the heap. The 1-bit bound
+    /// is roughly 1.3 standard deviations, so small values miss neighbors.
+    quantization_refine_margin: f32 = 2,
     bulk_build_algo: BulkBuildAlgo = .hilbert_seeded,
     prefer_key_local_leaf_splits: bool = false,
     key_local_leaf_split_penalty: f32 = 1.10,
@@ -123,6 +133,16 @@ pub const HBCConfig = struct {
     flat_exact_min_postings: usize = 1024,
     flat_centroid_block_size: usize = 8192,
     flat_centroid_probe_count: usize = 0,
+};
+
+/// How leaf scoring uses extended codes when `quantization_bits > 1`.
+pub const QuantizationRefine = enum {
+    /// Score with 1-bit codes, then rescore with extended codes only the
+    /// candidates whose 1-bit lower bound could still enter the candidate
+    /// heap. Fixes admission at a fraction of the cost of scoring all.
+    near_cutoff,
+    /// Score every member with extended codes.
+    all,
 };
 
 pub const StorageBackend = enum {

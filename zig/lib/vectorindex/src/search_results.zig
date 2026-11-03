@@ -535,6 +535,15 @@ pub const ApproxSearchResults = struct {
         }.lessThan);
     }
 
+    /// Largest lower bound (distance - error bound) a new candidate can have
+    /// and still change the heap: infinite until it holds `k` items, then the
+    /// worst member's upper bound.
+    pub fn admissionCutoff(self: *const ApproxSearchResults) f32 {
+        if (self.items.items.len < self.k) return std.math.inf(f32);
+        const worst = self.items.items[0];
+        return worst.distance + worst.error_bound;
+    }
+
     pub fn isFull(self: *const ApproxSearchResults) bool {
         return self.items.items.len >= self.k;
     }
