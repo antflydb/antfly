@@ -806,6 +806,17 @@ pub fn maxQualifiedWindowTokens(identity: bundle.Identity, backend: Backend) ?us
     return maximum;
 }
 
+/// Prefer the smallest reviewed context that supports the complete request's
+/// feature union and item count. The larger legacy context has different
+/// document, window and lower-token bounds; borrowing it can discard the
+/// composition profile on an early window and then reject a short final one.
+/// This is only a preparation ceiling. The unchanged Gate still requires one
+/// coherent profile to cover every actual geometry before model execution.
+pub fn preferredQualifiedWindowTokens(identity: bundle.Identity, backend: Backend, required: Features, request_items: usize) ?usize {
+    const candidates = start(identity, backend, required) catch return null;
+    return candidates.preferredWindowTokens(request_items);
+}
+
 /// Coarse closed gate only. True would still require an exact live-session
 /// lookup; it must never authorize a listing that has no consumed identity.
 pub fn publishedProfiles() []const Entry {
@@ -867,6 +878,18 @@ pub const Candidates = enum(CandidateMask) {
     /// a rejected request. This mutates no global state and allocates nothing.
     pub fn narrow(self: *Candidates, observed: LengthContract) QualificationError!void {
         return narrowEntries(production_entries, self, observed);
+    }
+
+    pub fn preferredWindowTokens(self: Candidates, request_items: usize) ?usize {
+        var minimum: ?usize = null;
+        for (production_entries, 0..) |entry, index| {
+            if (@backingInt(self) & (@as(CandidateMask, 1) << @intCast(index)) == 0 or
+                !entry.features.contains(.long_document) or
+                !entry.lengths.request_items.contains(Range.exact(@intCast(request_items)))) continue;
+            const limit = std.math.cast(usize, entry.lengths.padded_sequence_tokens.max) orelse continue;
+            minimum = @min(minimum orelse limit, limit);
+        }
+        return minimum;
     }
 };
 
@@ -986,6 +1009,34 @@ fn testLengths() LengthContract {
         .window_words = .{ .min = 1, .max = 128 },
         .padded_sequence_tokens = .{ .min = 16, .max = 512 },
     };
+}
+
+test "boundary qualification window preparation keeps compatible profiles coherent" {
+    const features = Features.initMany(&.{ .entities, .long_document, .word_whitespace, .decoder_auto });
+    try std.testing.expectEqual(@as(?usize, 1024), preferredQualifiedWindowTokens(fastino_gliner25_base_v1, .metal, features, 1));
+    try std.testing.expectEqual(@as(?usize, 1024), preferredQualifiedWindowTokens(fastino_gliner25_base_v1, .native, features, 1));
+    // The one-item composition row cannot be borrowed by a batched request.
+    try std.testing.expectEqual(@as(?usize, null), preferredQualifiedWindowTokens(fastino_gliner25_base_v1, .metal, features, 2));
+    try std.testing.expectEqual(@as(?usize, null), preferredQualifiedWindowTokens(fastino_gliner25_base_v1, .native, features, 2));
+    // An artifact without a composition profile retains its reviewed legacy
+    // path. Unsupported features cannot borrow another profile's permission.
+    try std.testing.expectEqual(@as(?usize, 5708), preferredQualifiedWindowTokens(fastino_gliner25_base_v1_fp16_encoder, .metal, features, 1));
+    var unsupported = features;
+    unsupported.insert(.entity_attributes);
+    try std.testing.expectEqual(@as(?usize, null), preferredQualifiedWindowTokens(fastino_gliner25_base_v1, .metal, unsupported, 1));
+    var changed = fastino_gliner25_base_v1;
+    changed.weight.sha256[0] = if (changed.weight.sha256[0] == '0') '1' else '0';
+    try std.testing.expectEqual(@as(?usize, null), preferredQualifiedWindowTokens(changed, .metal, features, 1));
+
+    var candidates = try start(fastino_gliner25_base_v1, .metal, features);
+    var observed = composed_window_lengths;
+    observed.document_bytes = Range.exact(190000);
+    observed.padded_sequence_tokens = Range.exact(900);
+    try candidates.narrow(observed);
+    try std.testing.expectEqual(@as(?usize, 1024), candidates.preferredWindowTokens(1));
+    observed.padded_sequence_tokens = Range.exact(1025);
+    try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, candidates.narrow(observed));
+    try std.testing.expectEqual(@as(?usize, null), candidates.preferredWindowTokens(1));
 }
 
 fn testEntry() Entry {

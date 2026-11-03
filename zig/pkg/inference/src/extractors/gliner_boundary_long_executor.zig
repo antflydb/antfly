@@ -56,6 +56,9 @@ pub const Limits = struct {
 };
 pub const Options = struct {
     identity: artifact.Identity,
+    /// Complete-request preparation ceiling, shared by workspace planning,
+    /// qualification and execution. It grants no inference permission.
+    preparation_sequence_limit: ?usize = null,
     processor: processor.Options = .{},
     engine: engine.Options = .{},
     device: device_request.Limits = .{},
@@ -557,8 +560,9 @@ fn prepareTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, 
         .cuda => policy.maxQualifiedWindowTokens(options.identity, .cuda),
         else => null,
     };
-    if (!composed and qualified_context == null) return prepareDocument(backend, allocator, config, item, options);
-    const context_limit = if (composed) @min(@as(usize, 1024), qualified_context orelse 1024) else qualified_context.?;
+    if (!composed and qualified_context == null and options.preparation_sequence_limit == null) return prepareDocument(backend, allocator, config, item, options);
+    var context_limit = if (composed) @min(@as(usize, 1024), qualified_context orelse 1024) else qualified_context orelse options.preparation_sequence_limit.?;
+    if (options.preparation_sequence_limit) |limit| context_limit = @min(context_limit, limit);
     options.processor.max_sequence_tokens = @min(options.processor.max_sequence_tokens, context_limit);
     options.processor.max_batch_tokens = @max(options.processor.max_batch_tokens, options.processor.max_sequence_tokens);
     options.limits.plan.max_window_body_words = @min(options.limits.plan.max_window_body_words, context_limit);
@@ -628,6 +632,10 @@ pub fn planGeometry(backend: compute.BackendKind, allocator: Allocator, config: 
     if (backend != .native and backend != .wasm and (backend != .metal and backend != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     var quiet = supplied;
     quiet.observer = null;
+    if (comptime @hasDecl(@TypeOf(receiver.*), "preferredWindowTokens")) {
+        if (receiver.preferredWindowTokens()) |limit|
+            quiet.preparation_sequence_limit = @min(quiet.preparation_sequence_limit orelse limit, limit);
+    }
     var planned = try prepareTokenizedDocument(backend, allocator, config, tokenizer, item, quiet);
     defer planned.document.deinit();
     const used = try admitWindows(backend, allocator, config, tokenizer, item, &planned, receiver);
@@ -658,7 +666,10 @@ pub fn planGeometry(backend: compute.BackendKind, allocator: Allocator, config: 
 pub fn executeQualified(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options, gate: *qualification.Gate) !Result {
     if (cb.kind() != .native and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     if (cb.kind() == .metal and cb.decoderRuntimeHasActiveFrame()) return error.GlinerBoundaryExternalFrame;
-    return executeChecked(cb, allocator, config, tokenizer, item, supplied, gate);
+    var options = supplied;
+    if (gate.preferredWindowTokens()) |limit|
+        options.preparation_sequence_limit = @min(options.preparation_sequence_limit orelse limit, limit);
+    return executeChecked(cb, allocator, config, tokenizer, item, options, gate);
 }
 
 fn execute(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options) !Result {
