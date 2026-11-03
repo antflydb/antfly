@@ -1618,6 +1618,27 @@ and rejects duplicate, missing or null keys. Fixture-specific clock/path
 normalization must remain explicit in the caller. Missing fields and explicit
 nulls remain distinct; reports retain hashes rather than private fixture values.
 
+The original importer in issue #1431 still declares local graph extractors when
+run with `--no-semantic`; that flag only disables embeddings. Before measuring,
+run `scripts/bench/lite_extractor_preflight.py --library <library> --directory
+<fresh-directory>` for every tested library. It checks standalone extraction,
+database producer publication, index catch-up, integrity and reopening using
+public synthetic text. The required model is `fastino/gliner2.5-base-v1`; missing
+models fail the gate rather than skip it. Explicit database drains must enable
+`local_runtime=True` and generated replay so they can service those producers.
+
+Issue #1431 qualification includes the full unchanged-importer corpus against
+both current main and the original pinned reference, plus three original
+importer writers at the original five-second native Busy timeout. Exercise a
+concurrent status reader that repeatedly opens, reads status and closes, as well
+as a persistent logical reader. Require every writer to progress, distinguish
+committed outcomes from retryable refusals, and verify all acknowledged data,
+derived catch-up, search visibility and reopen integrity. Compare retained
+document, index and control bytes after equivalent settling and compaction;
+physical file size alone cannot explain a live-payload regression. Verify reuse
+of available capacity during active writes to cover the related #1362 append
+behavior. Preserve failed controls and incomplete qualification explicitly.
+
 Sustained-write qualification must measure progress and storage while writers
 remain active. `scripts/bench/lite_contention.py native --require-sustained`
 requires at least ten minutes of churn, acknowledged-write and integrity checks,

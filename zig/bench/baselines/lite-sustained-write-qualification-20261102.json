@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Not qualified: known Debug failures fixed; current-main correctness, SDK/model/ABI, active replay/backfill, unchanged fourth-input primary/integrity/semantic verification and embedded Beads component smoke pass. Final-host optimized qualification, full factory and aggregate CI remain.",
+  "status": "Not qualified: current Debug correctness, replay/backfill, original fourth-input semantic checks and Beads/Gas City components pass. First final-host attempt stopped on a missing GLiNER model. Corrected local extractor preflight passes; final-host rerun, full factory (Beads-owned) and aggregate CI remain.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -4649,5 +4649,53 @@
       }
     }
   },
-  "runtime_commit_scope": "Top-level runtime/base commits identify historical optimized qualification only; newer Debug candidates and immutable artifact hashes are recorded under valid_snapshot_local_diagnosis."
+  "runtime_commit_scope": "Top-level runtime/base commits identify historical optimized qualification only; newer Debug candidates and immutable artifact hashes are recorded under valid_snapshot_local_diagnosis.",
+  "issue_1431_acceptance": {
+    "issue": "https://github.com/antflydb/antfly/issues/1431",
+    "status": "open; all gates required, no claim of resolution",
+    "gates": [
+      "All 15 frozen inputs with the unchanged original importer, against integrated main and original 207 reference, matched model availability and quiet host.",
+      "Three original-importer writers at five-second native Busy timeout all progress alongside repeated status opens and persistent logical reads; no reader failures or starvation.",
+      "No unknown or retryable already-committed outcome; verify exact-once acknowledged writes and reopen integrity.",
+      "Derived capacity pressure yields/retries and every namespace actually catches up; verify search visibility.",
+      "Verified reusable capacity is reused rather than appended (#1362), with bounded active-write storage growth.",
+      "Attribute retained bytes by actual document/index/control families and compare equivalent settled and compacted states."
+    ],
+    "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
+    "original_207_library_sha256": "ef3c87e963330323b13a99973fc1268d697226c0212fdbdba0a3edcb82c97b7b",
+    "factory_owner": "Beads task; user explicitly left full agent factory qualification to that task."
+  },
+  "final_d759_attempt": {
+    "source_commit": "d75999ee48c3956f8dbe516194950e61d8b58447",
+    "runtime_source_commit": "806695b4fbeb391aad4c9fb6dd4d6c2d016d212d",
+    "control_commit": "f2b3baaee1cb508005451843c17fa07f2e069d4b",
+    "status": "Stopped during full imports; not qualified. No later contention or soak phases ran.",
+    "candidate_release_library_sha256": "5958d662af90a97f08ce370b8957303f167913e900e02464d9cbe93a8aecb5a5",
+    "control_release_library_sha256": "e2e2df564c1dde5f9450f08b50049229fc3e8076e2a5bae37b05794ac24215e7",
+    "candidate_completed_inputs": 7,
+    "candidate_failed_input_index": 7,
+    "candidate_failure": "ModelNotFound; no Busy token in failed importer log. Private log was classified using public source error identifiers only.",
+    "control_imported_inputs": 15,
+    "control_settling_failure": "EnrichmentWorkerFailed",
+    "setup_cause": "Original --no-semantic leaves configured GLiNER graph extractors enabled, but final host lacked fastino/gliner2.5-base-v1.",
+    "setup_correction": "Installed and SHA-verified seven public model assets (782713622 bytes). Explicit settling opens now enable local runtime and generated replay.",
+    "partial_timing_policy": "Retained as failed-environment evidence, not final performance comparisons.",
+    "rebuild_policy": "No native code changed for the setup correction; reuse immutable optimized artifacts after extractor preflight passes."
+  },
+  "extractor_qualification_preflight": {
+    "script": "scripts/bench/lite_extractor_preflight.py",
+    "local_debug": {
+      "passed": true,
+      "model": "fastino/gliner2.5-base-v1",
+      "library_sha256": "865453e86d373a1ed72a40866591965b5bc6d245e14e69736356f43d93f46e57",
+      "standalone_entities_verified": true,
+      "database_processed_requests": 1,
+      "database_errors": 0,
+      "graph_coverage_produced": 1,
+      "index_catchup_integrity_reopen": true,
+      "seconds": 20.579830540926196
+    },
+    "earlier_probe_failure": "InferenceInvocationMemoryUnavailable was caused by a synthetic preflight omitting local_runtime=True; corrected preflight passes. Not attributed to a native runtime defect.",
+    "scope": "Public synthetic extraction, actual database graph producer and coverage, replay catch-up, integrity and reopen. Required before corpus qualification for every library."
+  }
 }
