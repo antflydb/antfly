@@ -816,7 +816,6 @@ pub const Owner = struct {
         next_database_audit_ns: i96 = 0,
         shadow_next: bool = true,
         startup_replay_pending: bool = true,
-        replay_turns_since_artifacts: u8 = 0,
         source_recovery_next: bool = true,
         group_source_next: bool = true,
         // Separately allocated: table admission can grow the schedule map
@@ -2145,10 +2144,10 @@ pub const Owner = struct {
             debt.records >= debt.limits.records / 2 or debt.bytes >= debt.limits.bytes / 2
         else
             false;
-        // Reserve source service under pressure without starving artifacts.
-        // Physical retirement still receives its bounded turn every cycle.
-        const artifact_due = !replay_urgent or schedule.replay_turns_since_artifacts >= 3;
-        schedule.replay_turns_since_artifacts = if (artifact_due) 0 else schedule.replay_turns_since_artifacts + 1;
+        // Artifact IO and retirement still progress during replay pressure, but
+        // optional tier merges must not monopolize this same consumer lane.
+        // Pressure turns merge indexes needing producer headroom; ordinary
+        // policy merges resume once the durable replay backlog subsides.
 
         var turn_arena = std.heap.ArenaAllocator.init(alloc);
         defer turn_arena.deinit();
@@ -2296,11 +2295,11 @@ pub const Owner = struct {
             };
             artifact_more = retirement_more;
             pending = pending or retirement_more;
-            const more = if (artifact_due) database.runBackgroundTurnWithCancellation(cancellation, .artifacts) catch |err| blk: {
+            const more = database.runBackgroundTurnWithCancellation(cancellation, if (replay_urgent) .pressure_artifacts else .artifacts) catch |err| blk: {
                 maintenance_error = err;
                 maintenance_error_phase = .artifacts;
                 break :blk true;
-            } else database.core.index_manager.lsmMaintenanceScore() != 0;
+            };
             artifact_more = artifact_more or more;
             pending = pending or more;
             retain_artifact_runtime = more and maintenance_error == null;

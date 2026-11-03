@@ -20752,10 +20752,17 @@ pub const IndexManager = struct {
     }
 
     pub fn runTextMergeScheduler(self: *IndexManager, max_steps: usize) !usize {
+        return self.runTextMergeSchedulerAboveSegmentCount(max_steps, 0);
+    }
+
+    /// Replay-pressure turns reserve the shared maintenance lane for consumers
+    /// unless an individual index approaches its producer admission bound.
+    /// Deferred policy merges retain their pending bit for ordinary service.
+    pub fn runTextMergeSchedulerAboveSegmentCount(self: *IndexManager, max_steps: usize, minimum_segments: u64) !usize {
         if (comptime builtin.is_test) if (test_before_text_merge_step) |hook| if (hook.manager == self) try hook.notify(hook.ptr);
         var completed: usize = 0;
         while (completed < max_steps) {
-            var task = (try self.beginTextMergeTask()) orelse break;
+            var task = (try self.beginTextMergeTaskAboveSegmentCount(minimum_segments)) orelse break;
             defer task.deinit(self.alloc);
             errdefer self.cancelTextMergeTask(&task);
             var result = executeTextMergeTask(self.alloc, &task) catch |err| switch (err) {
@@ -25507,6 +25514,10 @@ pub const IndexManager = struct {
     }
 
     pub fn beginTextMergeTask(self: *IndexManager) !?TextMergeTask {
+        return self.beginTextMergeTaskAboveSegmentCount(0);
+    }
+
+    fn beginTextMergeTaskAboveSegmentCount(self: *IndexManager, minimum_segments: u64) !?TextMergeTask {
         const now_ns = platform_time.monotonicNs();
         self.text_merge_scheduler.pruneExpiredQuarantines(self.alloc, now_ns);
         _ = self.textMergeStats();
@@ -25518,6 +25529,12 @@ pub const IndexManager = struct {
         while (attempts < self.text_indexes.items.len) : (attempts += 1) {
             const idx = self.text_merge_scheduler.select(self.text_indexes.items) orelse return null;
             const entry = &self.text_indexes.items[idx];
+            if (minimum_segments != 0) {
+                const snapshot = entry.persistent.acquireSnapshot();
+                const segment_count = snapshot.segments.len;
+                snapshot.release();
+                if (segment_count < minimum_segments) continue;
+            }
             const has_in_flight = self.text_merge_scheduler.indexHasInFlight(entry.config.name);
             const maybe_task = self.beginTextMergeTaskForEntry(entry) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => {
@@ -50603,6 +50620,61 @@ test "graph artifact rebuild lease drains scheduler pins and excludes new snapsh
     while (!pending.acquired.load(.acquire)) @import("antfly_platform").time.yieldNow();
     try std.testing.expect(!manager.catalog_mutex.tryLockShared());
     pending.release.store(true, .release);
+}
+
+test "text replay pressure defers optional merges per index without losing headroom or idle debt" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try IndexManager.initWithOptions(a, path, .{});
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{
+        .{ .name = "optional", .kind = .full_text, .config_json = "{\"field\":\"title\"}" },
+        .{ .name = "headroom", .kind = .full_text, .config_json = "{\"field\":\"title\"}" },
+    });
+    const options: IndexBatchOptions = .{ .compact_text = false, .compact_text_segment_threshold = 2, .defer_text_compaction = true };
+    for (0..33) |i| {
+        var key: [32]u8 = undefined;
+        const write = types.BatchWrite{ .key = try std.fmt.bufPrint(&key, "doc:{d}", .{i}), .value = "{\"title\":\"replay headroom canary\"}" };
+        try store.putBatch(&.{.{ .key = write.key, .value = write.value }}, &.{});
+        if (i < 12) try manager.indexTextBatchByNameWithOptions(&store, "optional", &.{write}, options);
+        try manager.indexTextBatchByNameWithOptions(&store, "headroom", &.{write}, options);
+    }
+    const optional = manager.textIndexEntry("optional").?;
+    const headroom = manager.textIndexEntry("headroom").?;
+    try std.testing.expectEqual(@as(usize, 12), optional.persistent.snapshot().segments.len);
+    try std.testing.expectEqual(@as(usize, 33), headroom.persistent.snapshot().segments.len);
+    // Aggregate fan-out exceeds 34, but neither individual index does.
+    try std.testing.expectEqual(@as(usize, 0), try manager.runTextMergeSchedulerAboveSegmentCount(1, 34));
+    try std.testing.expect(optional.compaction_pending.load(.acquire));
+    try std.testing.expect(headroom.compaction_pending.load(.acquire));
+    // An optional index selected first cannot hide a pressured peer.
+    {
+        var task = (try manager.beginTextMergeTaskAboveSegmentCount(32)) orelse return error.MissingPressureMerge;
+        defer task.deinit(a);
+        defer manager.cancelTextMergeTask(&task);
+        try std.testing.expectEqualStrings("headroom", task.index_name);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try manager.runTextMergeSchedulerAboveSegmentCount(1, 32));
+    try std.testing.expect(headroom.persistent.snapshot().segments.len < 33);
+    try std.testing.expectEqual(@as(usize, 12), optional.persistent.snapshot().segments.len);
+    try std.testing.expect(optional.compaction_pending.load(.acquire));
+    // Once replay pressure ends the ordinary tier policy still drains both.
+    try manager.drainScheduledTextMerges();
+    try std.testing.expect(optional.persistent.snapshot().segments.len <= default_text_merge_max_segments_per_tier);
+    try std.testing.expect(headroom.persistent.snapshot().segments.len <= default_text_merge_max_segments_per_tier);
+    for ([_]*IndexManager.TextIndex{ optional, headroom }, [_]u64{ 12, 33 }) |entry, expected| {
+        const snapshot = entry.persistent.acquireSnapshot();
+        defer snapshot.release();
+        var documents: u64 = 0;
+        for (snapshot.segments) |segment| documents += segment.reader.doc_count;
+        try std.testing.expectEqual(expected, documents);
+    }
 }
 
 test "text force drain schedules policy misses above the tier target" {

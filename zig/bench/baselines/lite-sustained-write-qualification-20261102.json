@@ -5426,5 +5426,80 @@
       "conclusion": "No measurable replay-rate improvement from deferred batched cleanup on this stopped snapshot. Full-text preparation accounts for about 8.8 of 10.1 seconds across 4,096 documents in both runs."
     },
     "remaining_evidence": "Three live samples on a further 50-second stopped-snapshot candidate run show segment preparation dominated by analysis/postings work in two windows and synchronous text merge in the third. These phases remain investigation targets, not a complete causal attribution of end-to-end regression."
+  },
+  "replay_pressure_merge_scheduling": {
+    "base_commit": "b0c3fe32aa65b9cc0b04db49fb42f4c8c352ec5f",
+    "debug_artifact": {
+      "base_commit": "b0c3fe32aa65b9cc0b04db49fb42f4c8c352ec5f",
+      "library_sha256": "ce35c73231f22ef7e2a34b7c33e61edb9836bb80980971fd9ec586d830be2fb5",
+      "build_targets": "capi capi-smoke index-manager-test -Dtest-filter=text replay pressure -Doptimize=debug",
+      "build_exit": 0,
+      "new_regression": {
+        "passed": 1,
+        "failed": 0,
+        "leaks": 0
+      },
+      "source_files_sha256": {
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "891a7f2435499c05fe5fc051dbf7dd7c9365116fca86175fe26940170b8548d1",
+        "zig/pkg/antfly-embedded/src/storage/db/catalog/index_manager.zig": "7a2cfdb855203e9c2b429cc845b5abfff50c8d3c622bf52ff776c19cbd7f8759",
+        "zig/pkg/antfly-embedded/src/storage/db/db.zig": "e83be8b1743f0fbc6ae01408f5460a38eb297f8eb9fd87c3c78202ee049a0f1c",
+        "zig/pkg/antfly-embedded/src/storage/db/types.zig": "c07000fc8a29f4c08e5ef469f3c77df1080567c1e8284f32009e86992751bc12"
+      }
+    },
+    "design": "Continue LSM and retirement service under replay pressure; defer optional tier merges unless an individual index reaches its configured producer resume threshold. Preserve pending merge debt for ordinary idle service. Producer-assisted capacity merges remain unchanged.",
+    "validation": {
+      "per_index_pressure_and_idle_regression": {
+        "passed": 1,
+        "failed": 0,
+        "leaks": 0
+      },
+      "capi_owner": {
+        "passed": 182,
+        "skipped": 3,
+        "failed": 0,
+        "leaks": 0,
+        "exit": 0,
+        "notes": "Three expected host-capability fallbacks emitted MetalDeviceUnavailable error logs during installed-model tests. A strict hermetic rerun excluding installed-model tests is pending; this is not final model qualification."
+      },
+      "manual_replay_budget": {
+        "passed": 5,
+        "failed": 0,
+        "leaks": 0
+      },
+      "sdk_sql_concurrency_catalog": {
+        "passed": 205,
+        "failed": 0
+      },
+      "capi_smoke_exports_and_linkage": "passed, 134 public C functions"
+    },
+    "intermediate_original_importer_diagnostic": {
+      "input_index": 7,
+      "importer_exit_code": 1,
+      "censored": false,
+      "importer_succeeded": false,
+      "summary": [
+        0,
+        0,
+        1
+      ],
+      "seconds": 591.3097292499151,
+      "peak_native_builds": 7,
+      "metrics_enabled": true,
+      "library_sha256": "ffc99e3f80bd95f27e2803d4e74591b9c3a4d672daa93fcf4b36455a8123bbac",
+      "public_errors": [
+        "LiteReplayBacklogExceeded"
+      ],
+      "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution.",
+      "artifact_note": "Intermediate production-equivalent CAPI artifact before fixing a test-only KVPair type error; not a fully tested candidate. Seven overlapping native builds. It still failed; no throughput claim."
+    },
+    "matched_main_control": {
+      "commit": "6b6b758a5788d773a91f4581b9e5e6dadcd5ab58",
+      "base_main": "3b712f22430e7dd22d8c762f2f7d53a047613b68",
+      "library_sha256": "89bc80c0ced3b341036ba55356dfd741fd1cd0ccabcccdcd5f6dc9c003fff47e",
+      "scope": "Main control plus four GLiNER planning files and a compile-only optional-vtable-field lookup fix. Not pristine main. Debug CAPI and smoke/linkage build completed with exit 0.",
+      "build_log": ".tools/main-control-debug-build-bounded.log"
+    },
+    "remaining_design_limit": "The adaptive replay quantum applies between complete journal records; one 1,024-document record remains an indivisible collection/publication boundary and can exceed it. Safe intra-record progress requires publication and recovery design rather than smaller budget constants. The causal contribution to the end-to-end regression remains unproven.",
+    "next_investigation": "Late profiling also finds repeated immutable-segment navigation admission during DB/runtime opens. SegmentReader already supports authenticated owned admission metadata; investigate durable segment-bound descriptors instead of borrowed runtime-pointer caching."
   }
 }

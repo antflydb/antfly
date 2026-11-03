@@ -1502,6 +1502,14 @@ not implement fsync by appending an empty logical value, which would unnecessari
 publish an index generation and invalidate unrelated detached inputs.
 
 Artifact maintenance runs one LSM slice per turn. An unfinished runtime retains
+its optional text-merge debt during replay pressure. A complete tier merge can
+take much longer than a replay scheduling quantum, so pressured turns merge only
+indexes at their configured producer resume threshold; ordinary tier merges
+resume when file-wide replay pressure subsides. Retirement and LSM maintenance
+continue during pressure, and producer assistance still enforces the configured
+segment and heap-byte admission bounds. Deferred policy merges remain scheduled
+and keep their idle continuation rather than disappearing from maintenance.
+An unfinished artifact runtime retains
 only its owned immutable index inputs and continuations. It resumes after primary
 commits only when the inode and nonzero logical catalog/index identities match;
 changed inputs open a fresh runtime. Source read epochs and catalog proofs are

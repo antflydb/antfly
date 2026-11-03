@@ -34363,7 +34363,7 @@ pub const DB = struct {
             if (state.replay_retirement.watermark != 0) try truncateReplaySequenceAsync(self.async_context, state.replay_retirement.watermark);
             return state.replay_retirement.runnable;
         }
-        if (phase == .artifacts) {
+        if (phase == .artifacts or phase == .pressure_artifacts) {
             // No primary snapshot may enclose this work. Captured SST/segment
             // inputs own immutable leases, and Native index-catalog reads join
             // their owner's short validated admission before taking a read pin.
@@ -34372,7 +34372,15 @@ pub const DB = struct {
                 defer snapshot_replay.release();
                 try self.lockApplyForPortableRuntime();
                 defer self.core.unlockApply();
-                break :blk try self.core.index_manager.runTextMergeScheduler(1);
+                // A complete merge is not a scheduling quantum: even one can
+                // monopolize replay service beyond a producer's wait budget.
+                // Under durable replay pressure run only merges needed for
+                // producer headroom. Ordinary idle turns retain the tier policy.
+                const minimum_segments = if (phase == .pressure_artifacts) if (self.text_merge_runtime) |runtime|
+                    @max(2, @min(runtime.config.resume_pending_segments, runtime.config.max_pending_segments))
+                else
+                    @as(u64, 2) else @as(u64, 0);
+                break :blk try self.core.index_manager.runTextMergeSchedulerAboveSegmentCount(1, minimum_segments);
             };
             try ensureSnapshotActive(cancellation);
             // One slice per turn. The Lite owner retains this runtime's owned
@@ -34385,7 +34393,8 @@ pub const DB = struct {
             // Otherwise each fresh runtime's local cleanup schedules another
             // replay turn even though its durable inputs are already settled.
             self.core.index_manager.refreshLsmMaintenanceDebtHint();
-            return merged != 0 or self.core.index_manager.lsmMaintenanceScore() != 0;
+            return merged != 0 or self.core.index_manager.lsmMaintenanceScore() != 0 or
+                (phase == .pressure_artifacts and self.core.index_manager.textMergeStatsSnapshot().pending_indexes != 0);
         }
         if (phase == .shadow) {
             if (self.hasConfiguredResolvers()) {
