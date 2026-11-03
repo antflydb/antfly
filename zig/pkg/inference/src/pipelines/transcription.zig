@@ -315,7 +315,7 @@ pub const TranscriptionPipeline = struct {
         var chosen: ?Attempt = null;
         defer if (chosen) |*attempt| attempt.deinit(allocator);
         for (temperatures, 0..) |temperature, attempt_index| {
-            if (attempt_index > 0 and !self.config.temperature_fallback) break;
+            if (attempt_index > 0 and (!self.config.temperature_fallback or self.output_token_budget.remaining == 0)) break;
             var attempt = try self.decodeAttempt(encoder_outputs[0], enc_seq_len, enc_mask, prompt_prefix, temperature, attempt_index, &timing);
             errdefer attempt.deinit(allocator);
             const needs_fallback = attempt.compression_ratio > self.config.compression_ratio_threshold or
@@ -382,7 +382,7 @@ pub const TranscriptionPipeline = struct {
             .compression_ratio = attempt.compression_ratio,
             .temperature = attempt.temperature,
             .silent = silent,
-            .truncated = !silent and !attempt.completed,
+            .truncated = !attempt.completed and (!silent or self.output_token_budget.remaining == 0),
             .output_tokens = self.output_token_budget.consumed - consumed_before,
         };
     }
@@ -499,7 +499,7 @@ pub const TranscriptionPipeline = struct {
             }
 
             const generated_position = dec_len;
-            if (generated_position >= prompt_end) try self.output_token_budget.check();
+            if (generated_position >= prompt_end and self.output_token_budget.remaining == 0) break;
             if (self.execution_control) |control| try control.update(.executing, @intCast(generated_position), @intCast(self.config.max_length));
             const step_started = platform.time.monotonicNs();
             const dynamic_language_slot = forced_index < forced.len and
@@ -658,7 +658,7 @@ pub const TranscriptionPipeline = struct {
             // itself while the host runs one step ahead. Anything the
             // backend declines leaves the loop on the synchronous path.
             if (native_decoder) |*decoder| {
-                if (temperature == 0 and step_stats != null and generated_position == prompt_end and dec_len < max_len) {
+                if (temperature == 0 and step_stats != null and generated_position == prompt_end and dec_len < max_len and self.output_token_budget.remaining != 0) {
                     if (try self.decodePipelined(decoder, dec_ids, &dec_len, &generated, &suppress_scratch, rules, rules_active, &logprob_sum, timing)) {
                         completed = true;
                         break;
@@ -666,8 +666,6 @@ pub const TranscriptionPipeline = struct {
                 }
             }
         }
-
-        if (!completed) try self.output_token_budget.check();
 
         // The reference divides by the token count plus the EOT that ended it.
         const avg_logprob: f32 = @floatCast(logprob_sum / @as(f64, @floatFromInt(generated.items.len + 1)));
@@ -799,7 +797,6 @@ pub const TranscriptionPipeline = struct {
                 // Either the length limit or a backend that could not
                 // encode the lookahead; the cache is consistent with
                 // `dec_len` either way.
-                try self.output_token_budget.check();
                 return false;
             }
             try decoder.submit();

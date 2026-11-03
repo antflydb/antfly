@@ -31,6 +31,9 @@ to require CUDA explicitly. To isolate mixed-precision differences, set
 bundled attention fallback. Both switches are diagnostic comparisons, not changes
 to transcription semantics.
 
+The HTTP benchmark uses the unified `/ai/v1/read` endpoint with `audio_options`
+and requires complete recognition before recording latency or WER.
+
 For an end-to-end comparison, start Antfly with
 `ANTFLY_INFERENCE_REQUIRED_BACKEND=cuda` and
 `ANTFLY_INFERENCE_PREFERRED_BACKEND=cuda` on localhost port 18081. Use a models

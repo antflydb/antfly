@@ -184,6 +184,10 @@ pub const Source = struct {
             const expected = audio.detectFormatFromMime(normalized.media_type).?;
             if (audio.detectFormat(bytes) != expected) return error.DocumentMediaTypeMismatch;
             if (!audio.canDecodeFormat(expected)) return error.UnsupportedDocumentFormat;
+            // Pins and published run identities use the container's canonical
+            // MIME, including when a durable attachment resumes without its
+            // original transport declaration (for example audio/x-wav).
+            normalized.media_type = try audioMime(bytes);
             result = .{ .input = normalized, .bytes = bytes, .fingerprint = fingerprint, .parsed = .audio };
         } else if (std.mem.startsWith(u8, normalized.media_type, "image/")) {
             const expected = image.inferenceFormatForMimeEssence(normalized.media_type) orelse return error.UnsupportedDocumentFormat;

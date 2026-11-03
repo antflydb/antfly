@@ -203,7 +203,13 @@ pub fn transcribeLong(
         try prefix.appendSlice(allocator, initial_tokens);
         if (options.condition_on_previous) try prefix.appendSlice(allocator, previous_tokens);
 
-        var result: transcription.TranscribeResult = try transcriber.transcribePcmConditioned(window_samples, sample_rate, prefix.items);
+        var result: transcription.TranscribeResult = transcriber.transcribePcmConditioned(window_samples, sample_rate, prefix.items) catch |err| switch (err) {
+            error.InferenceOutputTokensExceeded => {
+                truncated = true;
+                break;
+            },
+            else => return err,
+        };
         defer result.deinit();
         timing.add(result.timing);
         truncated = truncated or result.truncated;
@@ -301,10 +307,12 @@ const FakeTranscriber = struct {
     }
 
     pub fn transcribePcmConditioned(self: *FakeTranscriber, samples: []const f32, sample_rate: u32, prefix: []const i32) !transcription.TranscribeResult {
+        try self.output_budget.check();
         if (self.calls < self.prefix_lens.len) self.prefix_lens[self.calls] = prefix.len;
         self.calls += 1;
         // Three text tokens and EOS, just as the real pipeline charges output.
-        for (0..4) |_| try self.output_budget.consume();
+        var produced: usize = 0;
+        while (produced < 4 and self.output_budget.remaining != 0) : (produced += 1) try self.output_budget.consume();
         const seconds = samples.len / sample_rate;
         const text = if (self.empty_result) try self.allocator.dupe(u8, "") else try std.fmt.allocPrint(self.allocator, "{s}{d}({d}s)", .{ self.text, self.calls, seconds });
         errdefer self.allocator.free(text);
@@ -324,9 +332,9 @@ const FakeTranscriber = struct {
             .allocator = self.allocator,
             .segments = segments,
             .tokens = tokens,
-            .output_tokens = 4,
+            .output_tokens = produced,
             .silent = self.silent_result,
-            .truncated = self.truncated_result,
+            .truncated = self.truncated_result or produced < 4,
         };
     }
 };
@@ -499,13 +507,23 @@ test "long transcription drops empty window text" {
     try std.testing.expect(result.language == null);
 }
 
-test "long transcription shares output ceiling across windows and rejects partial success" {
+test "long transcription shares output ceiling across windows and reports truncation" {
     const a = std.testing.allocator;
     const samples = try a.alloc(f32, 16000 * 40);
     defer a.free(samples);
     @memset(samples, 0.1);
     var limited = FakeTranscriber{ .allocator = a, .output_budget = .{ .remaining = 6 } };
-    try std.testing.expectError(error.InferenceOutputTokensExceeded, transcribeLong(a, &limited, samples, 16000, .{ .skip_silent_windows = false }));
+    var partial = try transcribeLong(a, &limited, samples, 16000, .{ .skip_silent_windows = false });
+    defer partial.deinit();
+    try std.testing.expect(partial.truncated);
+    try std.testing.expectEqual(@as(usize, 6), partial.output_tokens);
+    try std.testing.expect(partial.text.len > 0);
+    var boundary = FakeTranscriber{ .allocator = a, .output_budget = .{ .remaining = 4 } };
+    var boundary_result = try transcribeLong(a, &boundary, samples, 16000, .{});
+    defer boundary_result.deinit();
+    try std.testing.expect(boundary_result.truncated);
+    try std.testing.expectEqual(@as(usize, 4), boundary_result.output_tokens);
+    try std.testing.expectEqual(@as(usize, 1), boundary.calls);
     try std.testing.expectEqual(@as(usize, 2), limited.calls);
     var exact = FakeTranscriber{ .allocator = a, .output_budget = .{ .remaining = 8 } };
     var result = try transcribeLong(a, &exact, samples, 16000, .{ .skip_silent_windows = false });

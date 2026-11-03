@@ -9672,7 +9672,7 @@ pub const Node = struct {
             if (definition != null or std.mem.eql(u8, model_name, "antfly/native-document")) {
                 var probe = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
                 const control = self.bindExecutionControl(null, .{ .deadline_ns = deadline_ns, .ptr = &probe, .check_fn = BorrowedReadControl.check });
-                const result = try self.documentOperationJson(allocator, model_name, control, .read, request);
+                const result = try self.documentOperationJson(allocator, model_name, control, .read, .{ .images = request });
                 defer allocator.free(result);
                 if (request.max_response_bytes) |limit| if (result.len > limit) return error.ResponseTooLarge;
                 const batch = try readers_api.documentBatchResult(allocator, result);
@@ -20675,7 +20675,7 @@ pub const Node = struct {
         }
     }
 
-    fn documentOperationJson(self: *Node, output: std.mem.Allocator, json: []const u8, supplied: InferenceExecutionControl, operation: enum { read, extract }, encoded: ?readers_api.EncodedRequest) ![]u8 {
+    fn documentOperationJson(self: *Node, output: std.mem.Allocator, json: []const u8, supplied: InferenceExecutionControl, operation: enum { read, extract }, encoded: ?document_service.Attachments) ![]u8 {
         const Admission = struct {
             fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
                 const node: *Node = @ptrCast(@alignCast(raw));
@@ -20688,7 +20688,10 @@ pub const Node = struct {
         const a = bounded.allocator();
         const control = self.bindExecutionControl(null, supplied);
         const result = (switch (operation) {
-            .read => if (encoded) |request| document_service.Service(Node).readEncodedJson(self, a, json, request, control) else document_service.Service(Node).readJson(self, a, json, control),
+            .read => if (encoded) |request| switch (request) {
+                .images => |images| document_service.Service(Node).readEncodedJson(self, a, json, images, control),
+                .audio => document_service.Service(Node).readAttachedJson(self, a, json, control, request),
+            } else document_service.Service(Node).readJson(self, a, json, control),
             .extract => document_service.Service(Node).extractJson(self, a, json, control),
         }) catch |err| {
             if (err == error.OutOfMemory) {
@@ -20698,7 +20701,7 @@ pub const Node = struct {
             return err;
         };
         defer a.free(result);
-        if (operation == .read and encoded == null) {
+        if (operation == .read and (encoded == null or encoded.? == .audio)) {
             const request = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
             const retain = cloudflare_provider.field(request, "retain_artifact");
             if (retain != null and retain.? == .bool and retain.?.bool) {
@@ -20796,8 +20799,7 @@ pub const Node = struct {
             if (binding.operation != .read or binding.input != .audio) return error.DocumentCapabilityMismatch;
             // Physical model identity excludes credentials and request defaults:
             // two aliases for one recognizer cannot act as independent verifiers.
-            var identity: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ .provider = cfg.provider, .model = cfg.model, .endpoint = cfg.effectiveEndpoint(), .gateway = cfg.gateway_id, .account = cfg.account_id, .project = cfg.project_id, .location = cfg.location }, .{}), &identity, .{});
+            const identity = try cfg.modelIdentity(a);
             if (binding.model_identity) |expected| {
                 if (!std.mem.eql(u8, expected, &std.fmt.bytesToHex(identity, .lower))) return error.DocumentModelRevisionMismatch;
             }
@@ -20828,11 +20830,11 @@ pub const Node = struct {
         }
         const context_tokens: u64 = @intCast(manifest.maxTextSequenceLength());
         const token_ceiling = switch (binding.operation) {
-            .read => if (binding.input == .audio and manifest.model_type == .transcriber) @max(context_tokens +| max_read_tokens, @as(u64, @intCast(self.config.chunking_limits.max_working_bytes / 4 / 16000 / 22 + 1)) *| (448 * 6)) else context_tokens +| max_read_tokens,
+            .read => if (binding.input == .audio and manifest.model_type == .transcriber) @as(u64, @intCast((try resolvedInferenceExecutorContract(self, "transcribe", &manifest)).batch.max_output_tokens_per_item orelse std.math.maxInt(usize))) else context_tokens +| max_read_tokens,
             .decide => @max(context_tokens *| 8, 8192),
             .extract => @max(context_tokens *| 8 +| 1024, (@import("../extractors/gliner_boundary_long_executor.zig").Limits{}).max_total_encoded_tokens),
         };
-        return .{ .binding = binding, .path = path, .identity = identity, .max_total_tokens = token_ceiling };
+        return .{ .binding = binding, .path = path, .identity = identity, .max_total_tokens = token_ceiling, .adjustable_output_budget = binding.operation == .read and binding.input == .audio and manifest.model_type == .transcriber };
     }
 
     pub fn documentTaskLimits(self: *Node, a: std.mem.Allocator, name: []const u8, is_read: bool) !?document_contract.Limits {
@@ -21143,7 +21145,7 @@ pub const Node = struct {
             .options = options,
             .speaker_revision = speaker_revision,
             .provider = if (cfg) |hosted| hosted.provider else null,
-            .model = if (cfg) |hosted| hosted.model else null,
+            .model = if (cfg) |hosted| hosted.effectiveModel() else null,
             .endpoint = if (cfg) |hosted| hosted.effectiveEndpoint() else null,
             .punctuation = if (cfg) |hosted| hosted.enable_automatic_punctuation else null,
             .enhanced = if (cfg) |hosted| hosted.use_enhanced else null,
@@ -21291,13 +21293,7 @@ pub const Node = struct {
             if (metadata.value == .object) if (metadata.value.object.get("audio")) |audio| {
                 if (audio != .string or envelope.attachments.len != 1 or !std.mem.eql(u8, audio.string, "attachment:0")) return ctx.status(400).json(.{ .@"error" = "InvalidAudioAttachment" });
                 const attachment = envelope.attachments[0];
-                const encoded = try ctx.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(attachment.data.len));
-                defer ctx.allocator.free(encoded);
-                _ = std.base64.standard.Encoder.encode(encoded, attachment.data);
-                try metadata.value.object.put(metadata.arena.allocator(), "audio", .{ .string = try std.fmt.allocPrint(metadata.arena.allocator(), "data:{s};base64,{s}", .{ attachment.mime_type, encoded }) });
-                const raw = try std.json.Stringify.valueAlloc(ctx.allocator, metadata.value, .{});
-                defer ctx.allocator.free(raw);
-                const result = self.readDocumentsJsonWithControl(ctx.allocator, raw, httpInferenceExecutionControl(self, ctx)) catch |err| return documentFailureResponse(ctx, err);
+                const result = self.documentOperationJson(ctx.allocator, envelope.metadata, httpInferenceExecutionControl(self, ctx), .read, .{ .audio = .{ .bytes = attachment.data, .mime_type = attachment.mime_type } }) catch |err| return documentFailureResponse(ctx, err);
                 defer ctx.allocator.free(result);
                 _ = ctx.response.body(result);
                 try ctx.setHeader("content-type", "application/json");
@@ -21879,6 +21875,9 @@ pub const Node = struct {
                     .audio_context = audio_context,
                 },
             );
+            if (control.audio_output_token_limit) |limit| {
+                result.output_token_budget.remaining = @min(result.output_token_budget.remaining orelse limit, limit);
+            }
             result.execution_control = control;
             result.batch_dispatch = self.node.tensorBatchDispatch(.transcribe);
             return result;
@@ -48086,6 +48085,10 @@ test "Whisper HTTP pipelines inherit narrowed output policy and preserve typed f
     var whisper = Node.WhisperRuntime{ .node = &node, .allocator = a, .prompt_cache = &cache, .manifest = .{ .allocator = a, .model_type = .transcriber, .inputs = &inputs, .capabilities = &capabilities } };
     var pipeline = try whisper.pipeline(null, 1024, .{}, false, .full);
     try std.testing.expectEqual(@as(?usize, 32), pipeline.output_token_budget.remaining);
+    const document_pipeline = try whisper.pipeline(null, 1024, .{ .audio_output_token_limit = 7 }, false, .full);
+    try std.testing.expectEqual(@as(?usize, 7), document_pipeline.output_token_budget.remaining);
+    const larger_document = try whisper.pipeline(null, 1024, .{ .audio_output_token_limit = 100 }, false, .full);
+    try std.testing.expectEqual(@as(?usize, 32), larger_document.output_token_budget.remaining);
     pipeline.output_token_budget.remaining = 0;
     try std.testing.expectError(error.InferenceOutputTokensExceeded, pipeline.transcribePcmConditioned(&.{0.1}, 16000, &.{}));
     var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
@@ -48608,4 +48611,45 @@ test "fixed chunk request validates minimum content without changing defaults" {
     try std.testing.expectError(error.InvalidChunkMinChars, applyFixedChunkConfig(&config, .{ .text = .{ .min_chars = 1000001 } }));
     try applyFixedChunkConfig(&config, .{ .text = .{ .min_chars = 0 } });
     try std.testing.expectEqual(@as(usize, 0), config.text.min_chars);
+}
+
+test "hosted audio document identity canonicalizes default model aliases" {
+    const a = std.testing.allocator;
+    var configs = [_]transcribing_api.NamedConfig{
+        .{ .name = "implicit", .config = .{ .provider = .openai, .max_total_tokens = 100 } },
+        .{ .name = "explicit", .config = .{ .provider = .openai, .model = "whisper-1", .max_total_tokens = 100, .api_key = "different-credential", .location = "ignored-location", .project_id = "ignored-project" } },
+    };
+    var node = try Node.init(a, .{ .audio_readers = &configs });
+    defer node.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const implicit = try node.documentResolveBinding(work, .{ .name = "reader", .model = "transcribers/implicit", .operation = .read, .input = .audio });
+    const explicit = try node.documentResolveBinding(work, .{ .name = "verifier", .model = "transcribers/explicit", .operation = .read, .input = .audio });
+    try std.testing.expectEqual(implicit.identity, explicit.identity);
+    const first = try node.documentResolveAudioExecution(work, "transcribers/implicit", .{}, .{});
+    const second = try node.documentResolveAudioExecution(work, "transcribers/explicit", .{}, .{});
+    try std.testing.expectEqual(first.identity, second.identity);
+}
+
+test "document audio framed payload is borrowed without proportional context allocations" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    const payload = try a.alloc(u8, 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 0);
+    const envelope = try voiceTestEnvelope(a, "{\"model\":\"missing\",\"audio\":\"attachment:0\"}", "audio/wav", payload);
+    defer a.free(envelope);
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
+    defer request.deinit();
+    try request.setBody(envelope);
+    try request.setHeader("Content-Type", httpx.attachment_envelope.content_type);
+    var budget = BoundedRequestAllocator{ .backing = a, .limit = 65536 };
+    var ctx = httpx.Context.init(budget.allocator(), std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.readImages(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), response.status.code);
+    try std.testing.expect(budget.peak < 65536);
 }

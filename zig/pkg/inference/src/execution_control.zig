@@ -130,6 +130,8 @@ pub const InferenceExecutionControl = struct {
     http_request_admitted: bool = false,
     /// Trusted document orchestration pin; never decoded from public input.
     audio_execution: ?@import("documents/audio.zig").ExecutionSnapshot = null,
+    /// Trusted document allowance, consumed by every Whisper decode attempt.
+    audio_output_token_limit: ?usize = null,
     document_store: @import("antfly_runtime_abi").document_abi.View = .{},
     document_session: ?*@import("antfly_document_runs").Session = null,
     document_dispatch_meter: ?*@import("antfly_document_runs").DispatchMeter = null,

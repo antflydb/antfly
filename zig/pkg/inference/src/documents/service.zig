@@ -26,8 +26,28 @@ const image = @import("antfly_image");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
 const V = std.json.Value;
-const adapter_version = "antfly-documents-v10";
+const adapter_version = "antfly-documents-v11";
 const durable = @import("durable.zig");
+
+/// Payloads are borrowed for the complete synchronous operation. Durable runs
+/// persist these exact bytes before leaf dispatch, just like downloaded sources.
+pub const Attachments = union(enum) {
+    images: readers.EncodedRequest,
+    audio: struct { bytes: []const u8, mime_type: []const u8 },
+
+    fn bytes(self: @This(), index: usize) []const u8 {
+        return switch (self) {
+            .images => |request| request.images[index].bytes,
+            .audio => |value| value.bytes,
+        };
+    }
+    fn pageNumber(self: @This(), index: usize) ?u32 {
+        return switch (self) {
+            .images => |request| request.images[index].page_number,
+            .audio => null,
+        };
+    }
+};
 
 pub const ReadRequest = struct {
     model: []const u8,
@@ -236,17 +256,21 @@ pub fn Service(comptime Node: type) type {
         }
 
         pub fn readJson(node: *Node, backing: A, bytes: []const u8, supplied: Control) ![]u8 {
+            return readAttachedJson(node, backing, bytes, supplied, null);
+        }
+
+        pub fn readAttachedJson(node: *Node, backing: A, bytes: []const u8, supplied: Control, attached: ?Attachments) ![]u8 {
             if (supplied.document_store.configured() and supplied.document_session == null) {
                 const runtime = try durable.Runtime.create(backing, ioFor(node, supplied) orelse return error.DocumentStorageNotConfigured, bytes, supplied);
                 defer runtime.deinit();
                 var control = supplied;
                 control.document_session = &runtime.session;
-                const result = try readJsonWithRun(node, backing, bytes, control, null, null, null, .read);
+                const result = try readJsonWithRun(node, backing, bytes, control, null, null, attached, .read);
                 errdefer backing.free(result);
                 try runtime.finish(result);
                 return result;
             }
-            return readJsonWithRun(node, backing, bytes, supplied, null, null, null, .read);
+            return readJsonWithRun(node, backing, bytes, supplied, null, null, attached, .read);
         }
 
         pub fn readEncodedJson(node: *Node, backing: A, model: []const u8, request: readers.EncodedRequest, control: Control) ![]u8 {
@@ -261,7 +285,7 @@ pub fn Service(comptime Node: type) type {
                 .media_type = encoded.mime_type,
             };
             const bytes = try std.json.Stringify.valueAlloc(a, ReadRequest{ .model = model, .documents = inputs, .prompt = request.prompt, .max_tokens = request.max_tokens }, .{ .emit_null_optional_fields = false });
-            return readJsonWithRun(node, backing, bytes, control, null, null, request, .read);
+            return readJsonWithRun(node, backing, bytes, control, null, null, .{ .images = request }, .read);
         }
 
         fn validateAudioGraph(node: *Node, a: A, definition: c.Definition, graph: *Graph, requested: c.AudioReadOptions, prompt: ?[]const u8, max_tokens: ?i64, control: Control, depth: usize) !void {
@@ -290,7 +314,7 @@ pub fn Service(comptime Node: type) type {
             }
         }
 
-        fn readJsonWithRun(node: *Node, backing: A, bytes: []const u8, supplied: Control, shared: ?*c.Run, snapshot: ?*Graph, attached: ?readers.EncodedRequest, definition_operation: c.Operation) ![]u8 {
+        fn readJsonWithRun(node: *Node, backing: A, bytes: []const u8, supplied: Control, shared: ?*c.Run, snapshot: ?*Graph, attached: ?Attachments, definition_operation: c.Operation) ![]u8 {
             try supplied.check();
             var arena = std.heap.ArenaAllocator.init(backing);
             defer arena.deinit();
@@ -298,7 +322,17 @@ pub fn Service(comptime Node: type) type {
             const request = try std.json.parseFromSliceLeaky(ReadRequest, a, bytes, .{ .duplicate_field_behavior = .@"error" });
             const forms = @as(usize, @intFromBool(request.images != null)) + @intFromBool(request.documents != null) + @intFromBool(request.audio != null);
             if (forms != 1 or std.mem.trim(u8, request.model, " \t\r\n").len == 0) return error.InvalidDocumentSource;
-            const audio_input = if (request.audio) |value| try sources.audioInput(a, value) else null;
+            const audio_input = if (request.audio) |value| blk: {
+                if (attached) |payload| if (payload == .audio) {
+                    if (!std.mem.eql(u8, value, "attachment:0") or !sources.isAudioMediaType(payload.audio.mime_type)) return error.InvalidDocumentSource;
+                    break :blk sources.Input{ .id = "audio-0", .url = "antfly:borrowed-audio", .media_type = "" };
+                };
+                // On resume the source stage supplies the persisted payload.
+                // A missing stage still fails through the download policy.
+                if (supplied.document_session != null and std.mem.eql(u8, value, "attachment:0")) break :blk sources.Input{ .id = "audio-0", .url = "antfly:borrowed-audio", .media_type = "" };
+                break :blk try sources.audioInput(a, value);
+            } else null;
+            if (attached) |payload| if (payload == .audio and request.audio == null) return error.InvalidDocumentSource;
             if (request.audio_options != null and request.images != null) return error.UnsupportedAudioReadCapability;
             if (request.max_tokens) |tokens| if (tokens < 1 or tokens > readers.max_output_tokens) return error.InvalidMaxTokens;
             const key = Key{ .name = request.model, .operation = definition_operation };
@@ -384,9 +418,12 @@ pub fn Service(comptime Node: type) type {
                 source_limits.max_source_bytes = run.limits.max_source_bytes -| run.source_bytes;
                 const source_bytes = if (pinned_sources) |refs|
                     try run.durable.?.store.read(source_alloc, refs[source_index], source_limits.max_source_bytes)
-                else if (attached) |attachments| attachments.images[source_index].bytes else (try node.documentDownload(source_alloc, input.url, source_limits.max_source_bytes, control)).data;
+                else if (attached) |attachments| attachments.bytes(source_index) else (try node.documentDownload(source_alloc, input.url, source_limits.max_source_bytes, control)).data;
                 if (source_bytes.len > source_limits.max_source_bytes) return error.DocumentSourceLimitExceeded;
                 run.source_bytes += source_bytes.len;
+                if (attached) |payload| if (payload == .audio) {
+                    input.media_type = payload.audio.mime_type;
+                };
                 if (input.media_type.len == 0) input.media_type = if (request.audio != null) try sources.audioMime(source_bytes) else image.inferenceMimeEssenceForFormat(image.detectFormat(source_bytes)) orelse return error.UnsupportedDocumentFormat;
                 var source = sources.Source.init(source_alloc, input, source_bytes, source_limits, run.control) catch |err| {
                     try run.control.check();
@@ -394,7 +431,7 @@ pub fn Service(comptime Node: type) type {
                 };
                 defer source.deinit();
                 inputs.items[source_index].media_type = source.input.media_type;
-                try fingerprints.append(a, .{ .id = input.id, .sha256 = try a.dupe(u8, &source.fingerprint), .page_number = if (attached) |attachments| attachments.images[source_index].page_number else null });
+                try fingerprints.append(a, .{ .id = input.id, .sha256 = try a.dupe(u8, &source.fingerprint), .page_number = if (attached) |attachments| attachments.pageNumber(source_index) else null });
                 const count = try source.pageCount();
                 // Sources freeze their shared PDF index before workers borrow
                 // it; every page owns mutable decode/render state and scratch.
@@ -422,7 +459,7 @@ pub fn Service(comptime Node: type) type {
                             .number = number,
                             .request = request,
                             .control = control,
-                            .original_number = if (attached) |attachments| attachments.images[source_index].page_number else null,
+                            .original_number = if (attached) |attachments| attachments.pageNumber(source_index) else null,
                             .fork = width > 1,
                         };
                         filled += 1;
@@ -506,9 +543,14 @@ pub fn Service(comptime Node: type) type {
             const SourceOptions = struct { id: []const u8, media_type: []const u8, pages: ?[]const usize, include_notes: bool, include_hidden: bool, quadrilateral: ?[4][2]f64 };
             const source_options = try a.alloc(SourceOptions, inputs.items.len);
             for (source_options, inputs.items) |*options, input| options.* = .{ .id = input.id, .media_type = input.media_type, .pages = input.pages, .include_notes = input.include_notes, .include_hidden = input.include_hidden, .quadrilateral = input.quadrilateral };
+            // Deployment decoder ceilings affect truncation even when the
+            // physical model and requested document limits stay unchanged.
+            const ModelLimit = struct { model: []const u8, operation: c.Operation, max_total_tokens: u64, token_usage: @FieldType(c.Snapshot, "token_usage"), adjustable_output_budget: bool };
+            const model_limits = try a.alloc(ModelLimit, graph.snapshots.items.len);
+            for (model_limits, graph.snapshots.items) |*limit, pinned| limit.* = .{ .model = pinned.binding.model, .operation = pinned.binding.operation, .max_total_tokens = pinned.max_total_tokens, .token_usage = pinned.token_usage, .adjustable_output_budget = pinned.adjustable_output_budget };
             const runtime_version = @import("build_info").version();
             var run_digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ .definition = std.fmt.bytesToHex(definition_digest, .lower), .sources = fingerprints.items, .models = models.items, .options = source_options, .prompt = request.prompt, .max_tokens = request.max_tokens, .audio_options = request.audio_options, .audio_executions = graph.audio_pins.items, .limits = run.limits, .adapter_version = adapter_version, .runtime_version = runtime_version }, .{}), &run_digest, .{});
+            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ .definition = std.fmt.bytesToHex(definition_digest, .lower), .sources = fingerprints.items, .models = models.items, .model_limits = model_limits, .options = source_options, .prompt = request.prompt, .max_tokens = request.max_tokens, .audio_options = request.audio_options, .audio_executions = graph.audio_pins.items, .limits = run.limits, .adapter_version = adapter_version, .runtime_version = runtime_version }, .{}), &run_digest, .{});
             try run.emit(.{ .phase = .complete, .source_id = "", .page_number = 0, .status = status });
             try response.raw("],\"document\":");
             try response.value(.{ .version = @as(u32, 1), .status = status, .sources = fingerprints.items, .definition_sha256 = @as([]const u8, &std.fmt.bytesToHex(definition_digest, .lower)), .run_sha256 = @as([]const u8, &std.fmt.bytesToHex(run_digest, .lower)), .runtime_version = runtime_version, .models = models.items, .adapter_version = adapter_version });
@@ -527,9 +569,9 @@ pub fn Service(comptime Node: type) type {
             const PlanPin = struct { key: Key, definition: c.Definition };
             var plans = std.ArrayList(PlanPin).empty;
             for (graph.plans.items) |plan| try plans.append(a, .{ .key = plan.key, .definition = plan.definition });
-            const ModelPin = struct { binding: c.Binding, identity: durable.Digest, max_total_tokens: u64, token_usage: @FieldType(c.Snapshot, "token_usage") };
+            const ModelPin = struct { binding: c.Binding, identity: durable.Digest, max_total_tokens: u64, token_usage: @FieldType(c.Snapshot, "token_usage"), adjustable_output_budget: bool };
             var models = std.ArrayList(ModelPin).empty;
-            for (graph.snapshots.items) |model| try models.append(a, .{ .binding = model.binding, .identity = model.identity, .max_total_tokens = model.max_total_tokens, .token_usage = model.token_usage });
+            for (graph.snapshots.items) |model| try models.append(a, .{ .binding = model.binding, .identity = model.identity, .max_total_tokens = model.max_total_tokens, .token_usage = model.token_usage, .adjustable_output_budget = model.adjustable_output_budget });
             try durable.pin(session, a, .{ .root = key, .definition = definition, .children = plans.items, .limits = run.limits }, .{ .models = models.items, .audio_executions = graph.audio_pins.items }, adapter_version);
             const record = try session.store.loadAt(a, session.lease.run_id, session.lease.owner, durable.now(null));
             run.limits.max_model_calls = @min(run.limits.max_model_calls, @as(usize, @intCast(record.limits.calls)));
@@ -546,7 +588,7 @@ pub fn Service(comptime Node: type) type {
             const capacity = run.limits.max_model_calls *| 3 +| run.limits.max_pages *| 3 +| run.limits.max_sources +| 512 +| @as(usize, @intCast(@min(10000, run.limits.max_total_pixels / 1_000_000)));
             try session.ensureCapacity(@min(100000, capacity));
         }
-        fn prepareDurableSources(node: *Node, a: A, backing: A, inputs: []const sources.Input, attached: ?readers.EncodedRequest, control: Control, run: *c.Run) ![]const durable.Ref {
+        fn prepareDurableSources(node: *Node, a: A, backing: A, inputs: []const sources.Input, attached: ?Attachments, control: Control, run: *c.Run) ![]const durable.Ref {
             const session = run.durable.?;
             const refs = try a.alloc(durable.Ref, inputs.len);
             var consumed: usize = 0;
@@ -567,7 +609,7 @@ pub fn Service(comptime Node: type) type {
                     }
                 };
                 const remaining = run.limits.max_source_bytes -| consumed;
-                _ = try session.execute(scratch.allocator(), key, .{ .source_bytes = remaining }, remaining, Context{ .node = node, .input = input, .attached = if (attached) |media| media.images[index].bytes else null, .control = control, .max_bytes = remaining }, Context.invoke);
+                _ = try session.execute(scratch.allocator(), key, .{ .source_bytes = remaining }, remaining, Context{ .node = node, .input = input, .attached = if (attached) |media| media.bytes(index) else null, .control = control, .max_bytes = remaining }, Context.invoke);
                 refs[index] = try session.reference(a, key);
                 consumed += refs[index].bytes;
             }
@@ -770,7 +812,7 @@ pub fn Service(comptime Node: type) type {
         fn verifyBinding(self: *const Self, a: A, binding: c.Binding) !c.Snapshot {
             const pinned = self.graph.snapshot(binding) orelse return error.DocumentCapabilityMismatch;
             const current = try self.node.documentResolveBinding(a, binding);
-            if (!std.mem.eql(u8, pinned.path, current.path) or !std.mem.eql(u8, &pinned.identity, &current.identity) or pinned.max_total_tokens != current.max_total_tokens or pinned.token_usage != current.token_usage) return error.DocumentModelRevisionMismatch;
+            if (!std.mem.eql(u8, pinned.path, current.path) or !std.mem.eql(u8, &pinned.identity, &current.identity) or pinned.max_total_tokens != current.max_total_tokens or pinned.token_usage != current.token_usage or pinned.adjustable_output_budget != current.adjustable_output_budget) return error.DocumentModelRevisionMismatch;
             return pinned;
         }
 
@@ -781,10 +823,11 @@ pub fn Service(comptime Node: type) type {
         }
 
         const CachedCandidate = struct { candidate: executor.Candidate, usage: c.Usage, costs: []const c.costs.Receipt, included_raster: bool };
-        fn tokenUpper(self: *const Self, binding: c.Binding) !u64 {
+        fn tokenUpper(self: *const Self, binding: c.Binding, run: *c.Run) !u64 {
             if (std.mem.eql(u8, binding.model, "antfly/native-document")) return 0;
             if (binding.provider == .cloudflare) return binding.max_total_tokens orelse error.UnsupportedMediaTokenBudget;
-            return (self.graph.snapshot(binding) orelse return error.DocumentCapabilityMismatch).max_total_tokens;
+            const pinned = self.graph.snapshot(binding) orelse return error.DocumentCapabilityMismatch;
+            return if (pinned.adjustable_output_budget) @min(pinned.max_total_tokens, run.remainingTokens()) else pinned.max_total_tokens;
         }
         fn ensureRendered(self: *Self, run: *c.Run) !void {
             if (self.rendered != null) {
@@ -856,7 +899,7 @@ pub fn Service(comptime Node: type) type {
             const saved = run.durable_stage;
             run.durable_stage = key;
             defer run.durable_stage = saved;
-            const value = try session.execute(a, key, .{ .calls = 1, .tokens = try self.tokenUpper(binding), .output_bytes = max_bytes }, max_bytes, Context{ .raw = raw, .binding = binding, .page = page_index, .bbox = bbox, .run = run, .before = before, .included_raster = included_raster, .costs = &capture }, Context.invoke);
+            const value = try session.execute(a, key, .{ .calls = 1, .tokens = try self.tokenUpper(binding, run), .output_bytes = max_bytes }, max_bytes, Context{ .raw = raw, .binding = binding, .page = page_index, .bbox = bbox, .run = run, .before = before, .included_raster = included_raster, .costs = &capture }, Context.invoke);
             const decoded = try std.json.parseFromSliceLeaky(CachedCandidate, a, value.bytes, .{ .allocate = .alloc_always, .parse_numbers = false });
             if (value.replayed) try durable.restore(run, decoded.usage, decoded.costs, false);
             return decoded.candidate;
@@ -909,13 +952,17 @@ pub fn Service(comptime Node: type) type {
                 // a provider-backed ceiling. Spend it before any provider I/O;
                 // this also enforces nested/shared budgets without durability.
                 if (pinned.token_usage == .unavailable) try run.unmeasuredTokens(pinned.max_total_tokens);
-                run.physicalCall();
                 // Generation releases transient buffers throughout decoding.
                 // Using the page arena would retain every logical free and
                 // exhaust the document ceiling even for a short recording.
                 const work = run.work_allocator orelse self.work_allocator;
                 const options = self.audio_options.withDefaults(binding.audio_options);
                 var control = self.control;
+                if (pinned.adjustable_output_budget) {
+                    const allowance = @min(pinned.max_total_tokens, run.remainingTokens());
+                    if (allowance == 0) return error.DocumentTokenLimitExceeded;
+                    control.audio_output_token_limit = std.math.cast(usize, allowance) orelse std.math.maxInt(usize);
+                }
                 if (@hasDecl(Node, "documentResolveAudioExecution")) {
                     const key = try audioKey(a, pinned.path, options);
                     for (self.graph.audio_pins.items) |pin| if (std.mem.eql(u8, &pin.key, &key)) {
@@ -924,6 +971,7 @@ pub fn Service(comptime Node: type) type {
                     };
                     if (control.audio_execution == null) return error.DocumentModelRevisionMismatch;
                 }
+                run.physicalCall();
                 const result = if (@hasDecl(Node, "documentReadAudio")) try self.node.documentReadAudio(work, pinned.path, self.source.bytes, self.prompt, self.max_tokens, options, control) else return error.DocumentCapabilityMismatch;
                 defer work.free(result.text);
                 defer if (@hasField(@TypeOf(result), "audio_json")) {
@@ -1115,7 +1163,7 @@ pub fn Service(comptime Node: type) type {
             const saved_stage = run.durable_stage;
             run.durable_stage = key;
             defer run.durable_stage = saved_stage;
-            const value = try session.execute(a, key, .{ .calls = 1, .tokens = try self.tokenUpper(binding), .output_bytes = 4096 }, 4096, Context{ .raw = raw, .binding = binding, .observation = observation, .run = run }, Context.invoke);
+            const value = try session.execute(a, key, .{ .calls = 1, .tokens = try self.tokenUpper(binding, run), .output_bytes = 4096 }, 4096, Context{ .raw = raw, .binding = binding, .observation = observation, .run = run }, Context.invoke);
             const cached = try std.json.parseFromSliceLeaky(CachedDecision, a, value.bytes, .{});
             if (value.replayed) try durable.restore(run, cached.usage, cached.costs, false);
             return cached.action;
@@ -1442,7 +1490,7 @@ pub fn Service(comptime Node: type) type {
                 const canonical = extracting.Input{ .id = if (cf.field(input, "id")) |id| try cf.text(id) else null, .content_json = try std.json.Stringify.valueAlloc(work, cf.string(content), .{}) };
                 const pinned = graph.snapshot(binding) orelse return error.DocumentCapabilityMismatch;
                 const current = try node.documentResolveBinding(work, binding);
-                if (!std.mem.eql(u8, pinned.path, current.path) or !std.mem.eql(u8, &pinned.identity, &current.identity) or pinned.max_total_tokens != current.max_total_tokens or pinned.token_usage != current.token_usage) return error.DocumentModelRevisionMismatch;
+                if (!std.mem.eql(u8, pinned.path, current.path) or !std.mem.eql(u8, &pinned.identity, &current.identity) or pinned.max_total_tokens != current.max_total_tokens or pinned.token_usage != current.token_usage or pinned.adjustable_output_budget != current.adjustable_output_budget) return error.DocumentModelRevisionMismatch;
                 var response = try node.extractDirectWithControl(work, binding.model, .{
                     .inputs = &.{canonical},
                     .schema_json = try std.json.Stringify.valueAlloc(work, schema, .{}),
@@ -3521,6 +3569,9 @@ test "document durable raster checkpoints preserve picture-heavy slide costs acr
 
 const AudioPlanTestNode = struct {
     hosted: bool = false,
+    adjustable: bool = false,
+    adjustable_limit: u64 = std.math.maxInt(u64),
+    expected_allowance: ?usize = null,
     reject_features: bool = false,
     silent: bool = false,
     transient_work: bool = false,
@@ -3568,7 +3619,7 @@ const AudioPlanTestNode = struct {
         return null;
     }
     fn documentResolveBinding(self: *@This(), _: A, binding: c.Binding) !c.Snapshot {
-        return .{ .binding = binding, .path = binding.model, .identity = durable.hash(binding.model), .max_total_tokens = if (self.hosted) 100 else 131072, .token_usage = if (self.hosted) .unavailable else .measured };
+        return .{ .binding = binding, .path = binding.model, .identity = durable.hash(binding.model), .max_total_tokens = if (self.adjustable) self.adjustable_limit else if (self.hosted) 100 else 131072, .token_usage = if (self.hosted) .unavailable else .measured, .adjustable_output_budget = self.adjustable };
     }
     fn documentDownload(self: *@This(), a: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
         self.downloads += 1;
@@ -3576,6 +3627,10 @@ const AudioPlanTestNode = struct {
     }
     pub fn documentReadAudio(self: *@This(), a: A, model: []const u8, bytes: []const u8, _: ?[]const u8, _: ?i64, options: c.AudioReadOptions, control: Control) !struct { text: []const u8, prompt_tokens: ?usize, completion_tokens: ?usize, truncated: bool, silent_audio: bool, unresolved: bool, audio_json: ?[]const u8 = null } {
         try control.check();
+        if (self.expected_allowance) |expected| {
+            try std.testing.expectEqual(expected, control.audio_output_token_limit);
+            self.expected_allowance = expected -| 13;
+        }
         const pin = control.audio_execution orelse return error.DocumentModelRevisionMismatch;
         const current = try self.documentResolveAudioExecution(a, model, options, control);
         if (!std.mem.eql(u8, &pin.identity, &current.identity)) return error.DocumentModelRevisionMismatch;
@@ -3815,4 +3870,70 @@ test "document audio options distinguish published run identities" {
     var t = try std.json.parseFromSlice(V, a, timed, .{});
     defer t.deinit();
     try std.testing.expect(!std.mem.eql(u8, p.value.object.get("document").?.object.get("run_sha256").?.string, t.value.object.get("document").?.object.get("run_sha256").?.string));
+}
+
+test "document audio adjustable decoder uses remaining budget and borrowed attachments resume without downloads" {
+    const a = std.testing.allocator;
+    const runs = readers.document_runs;
+    var memory = readers.testing.Store{ .a = a };
+    defer memory.deinit();
+    const store = memory.interface();
+    const request = "{\"model\":\"parent\",\"audio\":\"attachment:0\"}";
+    const identity: runs.Identity = .{ .request = durable.hash(request), .sources = @splat(0), .definition = @splat(0), .models = @splat(0), .runtime = @splat(0) };
+    try store.create(.{ .run_id = "borrowed-audio", .owner = "alice", .identity = identity, .prepared = false, .limits = .{ .calls = 4, .tokens = 1_000_000, .source_bytes = 134217728 + request.len, .output_bytes = 268435456 }, .inputs = &.{} });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const lease = try store.claim(work, "borrowed-audio", "alice", identity, durable.now(null), 30000);
+    _ = try store.installRequest(work, lease, @splat(9), .{ .source_bytes = request.len }, request, durable.now(null));
+    const wav = try @import("../pipelines/audio.zig").wav.encodeMono(a, &.{ 0, 0 }, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 });
+    defer a.free(wav);
+    var node = AudioPlanTestNode{ .adjustable = true, .expected_allowance = 1_000_000 };
+    var run_identity: []const u8 = undefined;
+    {
+        var session = try runs.Session.init(a, store, lease, identity, .{ .now_fn = durable.now }, 4096, 33554432);
+        defer session.deinit();
+        const output = try Service(AudioPlanTestNode).readAttachedJson(&node, a, request, .{ .document_session = &session }, .{ .audio = .{ .bytes = wav, .mime_type = "audio/x-wav" } });
+        defer a.free(output);
+        const result = try std.json.parseFromSliceLeaky(V, work, output, .{});
+        run_identity = result.object.get("document").?.object.get("run_sha256").?.string;
+        try std.testing.expectEqualStrings("complete", result.object.get("data").?.array.items[0].object.get("status").?.string);
+        try std.testing.expectEqual(@as(usize, 1), node.reads);
+        try std.testing.expectEqual(@as(usize, 0), node.downloads);
+    }
+    try store.yieldLease(work, lease, durable.now(null));
+    const pinned = try store.load(work, "borrowed-audio", "alice");
+    const next = try store.claim(work, "borrowed-audio", "alice", pinned.identity, durable.now(null), 30000);
+    var resumed = try runs.Session.init(a, store, next, pinned.identity, .{ .now_fn = durable.now }, 4096, 33554432);
+    defer resumed.deinit();
+    const replay = try Service(AudioPlanTestNode).readJson(&node, a, request, .{ .document_session = &resumed });
+    defer a.free(replay);
+    const replayed = try std.json.parseFromSliceLeaky(V, work, replay, .{});
+    try std.testing.expectEqualStrings(run_identity, replayed.object.get("document").?.object.get("run_sha256").?.string);
+    try std.testing.expectEqual(@as(usize, 1), node.reads);
+    try std.testing.expectEqual(@as(usize, 0), node.downloads);
+}
+
+test "document audio adjustable decoder follows nested remaining tokens" {
+    const a = std.testing.allocator;
+    var node = AudioPlanTestNode{ .adjustable = true, .repair = true, .budget = 39, .expected_allowance = 39 };
+    const output = try Service(AudioPlanTestNode).readJson(&node, a, "{\"model\":\"parent\",\"audio\":\"AAAA\"}", .{});
+    defer a.free(output);
+    try std.testing.expectEqual(@as(usize, 3), node.reads);
+}
+
+test "document audio run identity includes deployment decoder ceilings" {
+    const a = std.testing.allocator;
+    var node = AudioPlanTestNode{ .adjustable = true, .adjustable_limit = 100 };
+    const request = "{\"model\":\"parent\",\"audio\":\"AAAA\"}";
+    const first = try Service(AudioPlanTestNode).readJson(&node, a, request, .{});
+    defer a.free(first);
+    node.adjustable_limit = 200;
+    const second = try Service(AudioPlanTestNode).readJson(&node, a, request, .{});
+    defer a.free(second);
+    var one = try std.json.parseFromSlice(V, a, first, .{});
+    defer one.deinit();
+    var two = try std.json.parseFromSlice(V, a, second, .{});
+    defer two.deinit();
+    try std.testing.expect(!std.mem.eql(u8, one.value.object.get("document").?.object.get("run_sha256").?.string, two.value.object.get("document").?.object.get("run_sha256").?.string));
 }

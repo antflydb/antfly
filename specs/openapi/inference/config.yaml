@@ -468,7 +468,7 @@ components:
       required: [duration_ms]
       description: Recognition evidence for the audio track only. Video frames are not captioned. Absent segments and speakers make no alignment or speaker claim.
       properties:
-        duration_ms: {type: integer, format: int64, nullable: true, minimum: 0, description: Decoded recording duration in milliseconds. Null when a remote recognition provider does not report duration.}
+        duration_ms: {type: integer, format: int64, nullable: true, x-go-type: "*int64", minimum: 0, description: Decoded recording duration in milliseconds. Null when a remote recognition provider does not report duration.}
         language: {type: string, nullable: true}
         language_source: {type: string, enum: [forced, detected, unknown]}
         segments:
@@ -608,6 +608,7 @@ components:
           allOf:
             - $ref: '#/components/schemas/AudioReadMetadata'
           nullable: true
+          x-go-type-skip-optional-pointer: false
         source_id:
           type: string
           description: Original document source ID.

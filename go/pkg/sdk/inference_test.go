@@ -1544,3 +1544,39 @@ func TestClient_ReadAudioPreservesRecognitionOptionsAndTemporalEvidence(t *testi
 	assert.Equal(t, int64(5), result.Data[0].Audio.Segments[0].TextEnd)
 	assert.EqualValues(t, "truncated", result.Data[0].Status)
 }
+
+func TestAudioReadUnknownDurationRoundTrip(t *testing.T) {
+	for _, duration := range []string{"null", "0", "90000"} {
+		t.Run(duration, func(t *testing.T) {
+			var metadata oapi.InferenceAudioReadMetadata
+			require.NoError(t, json.Unmarshal([]byte(`{"duration_ms":`+duration+`}`), &metadata))
+			if duration == "null" {
+				require.Nil(t, metadata.DurationMs)
+			} else {
+				require.NotNil(t, metadata.DurationMs)
+			}
+			encoded, err := json.Marshal(metadata)
+			require.NoError(t, err)
+			assert.JSONEq(t, `{"duration_ms":`+duration+`}`, string(encoded))
+		})
+	}
+}
+
+func TestAudioReadMetadataPresenceRoundTrip(t *testing.T) {
+	for _, audio := range []string{"null", `{"duration_ms":null}`, `{"duration_ms":0}`} {
+		t.Run(audio, func(t *testing.T) {
+			var item oapi.InferenceReadResult
+			require.NoError(t, json.Unmarshal([]byte(`{"audio":`+audio+`}`), &item))
+			if audio == "null" {
+				require.Nil(t, item.Audio)
+				return
+			}
+			require.NotNil(t, item.Audio)
+			encoded, err := json.Marshal(item)
+			require.NoError(t, err)
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(encoded, &fields))
+			assert.JSONEq(t, audio, string(fields["audio"]))
+		})
+	}
+}

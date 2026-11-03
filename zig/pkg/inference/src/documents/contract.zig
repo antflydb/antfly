@@ -43,7 +43,17 @@ pub const Binding = struct {
     max_total_tokens: ?u64 = null,
 };
 /// Captured before inference. Paths never appear in public run metadata.
-pub const Snapshot = struct { remote: bool = false, binding: Binding, path: []const u8, identity: [32]u8, max_total_tokens: u64 = 131072, token_usage: enum { measured, unavailable } = .measured };
+pub const Snapshot = struct {
+    remote: bool = false,
+    binding: Binding,
+    path: []const u8,
+    identity: [32]u8,
+    max_total_tokens: u64 = 131072,
+    token_usage: enum { measured, unavailable } = .measured,
+    /// Native decoder can enforce an aggregate output ceiling across windows
+    /// and retries. Other backends retain their conservative fixed reservation.
+    adjustable_output_budget: bool = false,
+};
 pub const Limits = struct {
     max_sources: usize = 64,
     max_pages: usize = 1024,
@@ -415,6 +425,16 @@ pub const Run = struct {
             if (self.scope) |scope| scope.add("model_calls", 1);
         }
         self.usage.model_calls += 1;
+    }
+    pub fn remainingTokens(self: *const Run) u64 {
+        const local = self.limits.max_total_tokens -| self.usage.total_tokens;
+        if (self.shared) |shared| {
+            shared.lock();
+            defer shared.mutex.unlock();
+            const scoped = if (self.scope) |scope| scope.remaining("total_tokens", "max_total_tokens") else local;
+            return @min(local, scoped, shared.limits.max_total_tokens -| shared.usage.total_tokens);
+        }
+        return local;
     }
     pub fn remainingCalls(self: *const Run) usize {
         // Semantic replay still traverses committed calls when the durable

@@ -115,6 +115,45 @@ pub const Config = struct {
         if (self.max_download_bytes) |limit| if (limit > default_max_download_bytes) return error.AppleNativeInputTooLarge;
     }
 
+    /// Model sent to the provider. Identity and adapter dispatch must use the
+    /// same defaults so explicit and implicit aliases cannot verify each other.
+    pub fn effectiveModel(self: Config) ?[]const u8 {
+        return self.model orelse switch (self.provider) {
+            .openai => "whisper-1",
+            .vertex => "latest_long",
+            else => null,
+        };
+    }
+
+    pub fn effectiveLocation(self: Config) ?[]const u8 {
+        return if (self.provider == .vertex) self.location orelse "global" else null;
+    }
+
+    pub fn effectiveProjectId(self: Config, alloc: Allocator) !?[]const u8 {
+        if (self.provider != .vertex) return null;
+        return if (self.project_id) |value| try alloc.dupe(u8, value) else try vertexProjectIdFromConfigAlloc(alloc, self.credentials_path);
+    }
+
+    /// Only routing fields consumed by the adapter may distinguish physical
+    /// recognizers. Credentials and ignored provider options never do.
+    pub fn modelIdentity(self: Config, alloc: Allocator) ![32]u8 {
+        const project = try self.effectiveProjectId(alloc);
+        defer if (project) |value| alloc.free(value);
+        const bytes = try std.json.Stringify.valueAlloc(alloc, .{
+            .provider = self.provider,
+            .model = self.effectiveModel(),
+            .endpoint = self.effectiveEndpoint(),
+            .account = if (self.provider == .cloudflare) self.account_id else null,
+            .gateway = if (self.provider == .cloudflare) self.gateway_id else null,
+            .project = project,
+            .location = self.effectiveLocation(),
+        }, .{});
+        defer alloc.free(bytes);
+        var identity: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &identity, .{});
+        return identity;
+    }
+
     /// Endpoint actually used by each adapter, including provider defaults.
     pub fn effectiveEndpoint(self: Config) ?[]const u8 {
         return switch (self.provider) {
@@ -915,7 +954,7 @@ pub fn validateReadOptions(cfg: Config, options: inference_api.AudioReadOptions)
     if (cfg.provider == .antfly) return;
     if ((options.diarization orelse false) and cfg.provider != .vertex) return error.UnsupportedAudioReadCapability;
     if ((options.timestamps orelse false) and cfg.provider == .openai and
-        !std.mem.eql(u8, std.mem.trim(u8, cfg.model orelse "whisper-1", " \t\r\n"), "whisper-1")) return error.UnsupportedAudioReadCapability;
+        !std.mem.eql(u8, std.mem.trim(u8, cfg.effectiveModel().?, " \t\r\n"), "whisper-1")) return error.UnsupportedAudioReadCapability;
 }
 
 /// A hosted recognizer participates in read through the same STT adapter used
@@ -1197,7 +1236,7 @@ const OpenAiTranscriberState = struct {
             .options = options,
             .http = http,
             .base_url = try alloc.dupe(u8, cfg.effectiveEndpoint().?),
-            .model = try alloc.dupe(u8, cfg.model orelse "whisper-1"),
+            .model = try alloc.dupe(u8, cfg.effectiveModel().?),
             .language_code = try dupOpt(alloc, cfg.language_code),
             .max_response_bytes = cfg.max_response_bytes,
             .max_download_bytes = cfg.max_download_bytes,
@@ -1349,9 +1388,9 @@ const VertexTranscriberState = struct {
             .options = options,
             .http = http,
             .base_url = try alloc.dupe(u8, cfg.effectiveEndpoint().?),
-            .project_id = if (cfg.project_id) |value| try alloc.dupe(u8, value) else (try vertexProjectIdFromConfigAlloc(alloc, cfg.credentials_path) orelse return error.InvalidTranscribingConfig),
-            .location = try alloc.dupe(u8, cfg.location orelse "global"),
-            .model = try alloc.dupe(u8, cfg.model orelse "latest_long"),
+            .project_id = try cfg.effectiveProjectId(alloc) orelse return error.InvalidTranscribingConfig,
+            .location = try alloc.dupe(u8, cfg.effectiveLocation().?),
+            .model = try alloc.dupe(u8, cfg.effectiveModel().?),
             .language_code = try alloc.dupe(u8, cfg.language_code orelse "en-US"),
             .enable_automatic_punctuation = cfg.enable_automatic_punctuation,
             .max_response_bytes = cfg.max_response_bytes,
@@ -2566,4 +2605,18 @@ test "audio read normalized base64 transport obeys source limits and rejects non
     defer content.deinit(a);
     try std.testing.expectEqualStrings("fake", content.data);
     try std.testing.expectError(error.InvalidDataUri, resolveAudioContentAlloc(a, "data:image/png;base64,ZmFrZQ==", 4));
+}
+
+test "transcription effective model uses the provider adapter defaults" {
+    try std.testing.expectEqualStrings("whisper-1", (Config{ .provider = .openai }).effectiveModel().?);
+    try std.testing.expectEqualStrings("latest_long", (Config{ .provider = .vertex }).effectiveModel().?);
+    try std.testing.expectEqualStrings("custom", (Config{ .provider = .openai, .model = "custom" }).effectiveModel().?);
+    try std.testing.expect((Config{ .provider = .apple }).effectiveModel() == null);
+}
+
+test "transcription physical identity resolves Vertex resource defaults" {
+    const a = std.testing.allocator;
+    const implicit = Config{ .provider = .vertex, .project_id = "project" };
+    const explicit = Config{ .provider = .vertex, .project_id = "project", .location = "global", .model = "latest_long", .api_key = "different-credential" };
+    try std.testing.expectEqual(try implicit.modelIdentity(a), try explicit.modelIdentity(a));
 }
