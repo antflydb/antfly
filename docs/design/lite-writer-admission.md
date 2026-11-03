@@ -156,6 +156,9 @@ exercise immediate holder reentry, death while queued and while holding a turn,
 middle-waiter timeout, read cohorts, and interoperability with a legacy flock
 holder. Database/API tests must also cover ownership transfer, failed opens,
 allocator proof completion, local-lane timeouts, and suspended-call budgets.
+`antfly-generation-publication-test` independently exercises the control wrapper
+and posting-store publication/recovery contracts. Native adapter and queued-group
+regressions remain in `lite-native-test`.
 
 Final qualification uses the unchanged importer and its original timeout, matched
 optimized controls, contended writers with status/logical readers, acknowledged

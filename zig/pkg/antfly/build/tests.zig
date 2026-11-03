@@ -3408,6 +3408,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const lib_storage_test_step = b.step("antfly-storage-test", "Run local and server storage tests");
+    // Keep control publication's fault/retry contract independently runnable
+    // without unrelated server and format-upgrade qualification.
+    const generation_publication_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "storage.generation_publication.", "storage.posting_segment_store." },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-generation-publication-test", "Verify generation-control decisions, posting recovery and retry ownership")
+        .dependOn(&addFilteredTestRunArtifact(b, generation_publication_tests).step);
     const graph_ttl_migration_tests = b.addTest(.{
         .name = "graph-ttl-migration-tests",
         .root_module = antfly_test_mod,
