@@ -996,6 +996,9 @@ pub const Owner = struct {
         generated_refused: u64 = 0,
         storage_guard_validations: u64 = 0,
         serving_runtime_refreshes: u64 = 0,
+        /// Full replacement attempts, including allocator admission and index
+        /// opens. In-place checkpoint checks are excluded.
+        serving_runtime_refresh_ns: u64 = 0,
         replay_backlog: ?native.replay_admission.State = null,
         replay_backpressure_waits: u64 = 0,
         replay_refused_preparation_ns: u64 = 0,
@@ -1105,6 +1108,8 @@ pub const Owner = struct {
                 if (std.meta.eql(probe.header, captured.header) and probe_inode == (try captured.file.stat(captured.runtime())).inode) known_maintenance = pending.root;
             }
         }
+        const refresh_started_ns = @import("antfly_platform").time.monotonicNs();
+        defer self.publication_stats.serving_runtime_refresh_ns +|= @import("antfly_platform").time.monotonicNs() -| refresh_started_ns;
         var options = self.options;
         options.externally_locked = true;
         if (known_maintenance orelse self.current) |verified| options.allocator_verification_owner = &verified.owned_lite_backend.?.native_docstore.?.file;
@@ -1125,7 +1130,11 @@ pub const Owner = struct {
                     previous.allocator_verification_references == 0 and previous.sql_cursors.count() == 0)
                     _ = try certified.?.takeAllocatorRebaseBase(&previous.owned_lite_backend.?.native_docstore.?.file);
             };
-            if (try certified.?.inheritAllocatorCertificate()) {
+            // Cache handoff already authenticates the exact inode/checkpoint;
+            // rebasing additionally checks the current certificate. Repeating
+            // certificate admission here discards that cache's Merkle digest
+            // and hashes the complete ledger under every runtime refresh.
+            if (certified.?.free_pages_verified or try certified.?.inheritAllocatorCertificate()) {
                 options.allocator_verification_owner = &certified.?;
                 options.allocator_state_donor = &certified.?;
             } else if (certified.?.header.indexed_reclamation and !try self.unindexedRuntimeOpen(&certified.?)) {
@@ -3135,6 +3144,7 @@ pub const Owner = struct {
         // Preparation overlaps actor service; durations are not additive.
         std.log.info("antfly_bench_native_owner source_turns={d} capture_ns={d} replay_ns={d} artifacts_ns={d} storage_ns={d} runtime_refreshes={d} maintenance_errors={d} maintenance_timeouts={d} merge_started={d} merge_applied={d} merge_discarded={d} merge_prepare_ns={d} merge_staging_ns={d} merge_staged_bytes={d} merge_publication_ns={d} sql_overlay_hits={d} sql_overlay_rebuilds={d} sql_overlay_rebuild_entries={d} sql_overlay_evictions={d} sql_staged_statements={d} replay_waits={d} replay_refused_prepare_ns={d} last_failure={s}", .{ p.maintenance_source_turns, p.maintenance_capture_ns, p.maintenance_replay_ns, p.maintenance_artifacts_ns, p.maintenance_storage_ns, p.serving_runtime_refreshes, p.maintenance_errors, p.maintenance_queue_timeouts, p.text_merge_jobs_started, p.text_merge_jobs_applied, p.text_merge_jobs_discarded, p.text_merge_prepare_ns, p.text_merge_staging_ns, p.text_merge_staged_bytes, p.text_merge_publication_ns, p.sql_constraint_overlay_hits, p.sql_constraint_overlay_rebuilds, p.sql_constraint_overlay_rebuild_entries, p.sql_constraint_overlay_evictions, p.sql_constraint_staged_statements, p.replay_backpressure_waits, p.replay_refused_preparation_ns, p.last_maintenance_failure orelse "none" });
         const f = p.maintenance_failures;
+        std.log.info("antfly_bench_native_service refresh_ns={d} replay_publication_overhead_ns={d} index_admission_ns={d} metadata_admission_ns={d} publication_hold_ns={d}", .{ p.serving_runtime_refresh_ns, p.replay_publication_overhead_ns, p.replay_index_admission_ns, p.replay_metadata_admission_ns, p.publication_hold_ns });
         std.log.info("antfly_bench_native_owner_failures capture={d} source={d} retirement={d} artifacts={d} storage={d}", .{ f.capture, f.source, f.retirement, f.artifacts, f.storage });
         const leases = p.path_leases;
         std.log.info("antfly_bench_native_path_leases leases={d} admission_ns={d} admission_max_ns={d} hold_ns={d} hold_max_ns={d}", .{ leases.leases, leases.admission_ns, leases.admission_max_ns, leases.hold_ns, leases.hold_max_ns });
@@ -7640,6 +7650,40 @@ test "capi native replay publication retains primary epoch after preparing text 
     }
     try std.testing.expect(probe.publications != 0);
     try std.testing.expect(!probe.missing_epoch);
+}
+
+test "capi native allocator proof verified replacement preserves the checked digest cache" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("verified-replacement-digest", 1000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    var lease = try fixture.connection.acquire();
+    defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    defer lease.close();
+    const owner = fixture.connection.owner;
+    const previous = owner.current.?;
+    // A quiescent maintenance owner has already authenticated this exact tip.
+    // Changing metadata forces serving-runtime replacement; its cache can move
+    // under the path lease without repeating allocator-wide admission work.
+    const snapshot = try owner.refreshMaintenanceSnapshot(previous, .storage);
+    const file = &snapshot.owned_lite_backend.?.native_docstore.?.file;
+    try file.putCatalogRecord("runtime-affecting-metadata", "checked publication");
+    try std.testing.expect(file.free_pages_verified);
+    try std.testing.expect(try file.certifyAllocator());
+    const ledger = file.ledger.?;
+    const rebuilds = file.allocator_work.digest_rebuilds;
+    const loads = file.allocator_work.full_loads;
+    const digest_work = ledger.digestWork();
+    const current = try owner.refresh();
+    const adopted = &current.owned_lite_backend.?.native_docstore.?.file;
+    try std.testing.expect(current != previous);
+    try std.testing.expect(adopted.free_pages_verified);
+    try std.testing.expect(adopted.ledger != null);
+    try std.testing.expectEqual(ledger, adopted.ledger.?);
+    try std.testing.expectEqual(loads, adopted.allocator_work.full_loads);
+    try std.testing.expectEqual(rebuilds, adopted.allocator_work.digest_rebuilds);
+    try std.testing.expectEqual(digest_work, ledger.digestWork());
+    try std.testing.expect((try adopted.check()).valid);
 }
 
 test "capi native allocator proof storage-only foreign tip avoids runtime refresh" {

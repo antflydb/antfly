@@ -7152,7 +7152,7 @@
     "frozen_input_tree_sha256": "1a54a15e5b957c39807adb41b321bafa74ca2177124238a42c9247b70953f276",
     "inputs_unchanged": true,
     "native_compilation_overlap": false,
-    "baseline_policy": "User requires reuse of existing baseline artifacts AND completed measurements; do not recompile or rerun them for subsequent candidates. Cancelled control prefixes are not performance evidence.",
+    "baseline_policy": "Reuse immutable hash-verified reference binaries AND completed observations. No repeated reference builds or executions for subsequent candidates.",
     "cached_main_reference": {
       "source_commit": "f2b3baaee1cb508005451843c17fa07f2e069d4b",
       "library_sha256": "e2e2df564c1dde5f9450f08b50049229fc3e8076e2a5bae37b05794ac24215e7",
@@ -7175,10 +7175,98 @@
       "failed": 0,
       "leaked": 0,
       "wide_lookup_bound": "4096 ranges, 8192 queries, no more than 13 probes per query",
-      "integration": "pending"
+      "integration": {
+        "source_commit": "cde20c990e2a62922fb2db7d1169c077cb7e52a6",
+        "mode": "Debug",
+        "whole_build_exit_code": 0,
+        "library_sha256": "7a5d4561e197d5831735b78995ba39fc0f86e032bc5e50a0fc3535c6c7acc354",
+        "physical_capi_passed": 282,
+        "physical_capi_skipped": 3,
+        "consumer_capi_passed": 87,
+        "failed": 0,
+        "leaked": 0,
+        "process_admission_tests": 6,
+        "public_exports": 134,
+        "c_linkage": "passed"
+      }
     },
     "local_replay_diagnosis": "Existing Debug library and retained snapshot clones only. Local host had concurrent native builds, so wall times are not qualified performance measurements.",
     "no_index_hypothesis": "Simple no-index table returned all credits without explicit idle, ruling out unconditional no-index credit stranding.",
-    "causality": "The quadratic accounting path is confirmed. Fixing it is not yet evidence that the full-corpus capacity failure is resolved."
+    "causality": "The quadratic accounting path is confirmed. Fixing it is not yet evidence that the full-corpus capacity failure is resolved.",
+    "populated_diagnostic": {
+      "seed_sha256": "2002c183a24efebf17a7bc1d1a0e90658d5b7c9270857b874a7b0528e43fc8d1",
+      "seed_replay_bytes": 10746124,
+      "seed_replay_records": 268,
+      "seed_namespaces": 45,
+      "interrupted_attempt": {
+        "qualification": false,
+        "completed": false,
+        "public_busy_observed": false,
+        "after_replay_bytes": 14863203,
+        "after_replay_records": 339,
+        "after_integrity_valid": true,
+        "reason": "Debugger attachment coincided with invalid parent completion monitoring and SIGKILL; excluded from success/performance claims."
+      },
+      "unattached_attempt": {
+        "source_commit": "cde20c990e2a62922fb2db7d1169c077cb7e52a6",
+        "mode": "Debug",
+        "completed": true,
+        "importer_succeeded": false,
+        "censored": false,
+        "public_error": "LiteReplayBacklogExceeded",
+        "successful_imports": 0,
+        "failed_imports": 1,
+        "seconds": 543.5149513329379,
+        "concurrent_native_builds_peak": 18,
+        "file_bytes": 2931273728,
+        "durable_replay_bytes": 16727202,
+        "durable_replay_records": 366,
+        "reference_execution": false,
+        "qualification": false,
+        "interpretation": "The accounting fix alone does not resolve the populated-corpus refusal. Shared-host Debug elapsed time is diagnostic only."
+      }
+    },
+    "architectural_confidence": "Not established for the remaining full-corpus failure. Writer fairness, replay preparation, publication waiting, and multi-consumer credit retirement must be distinguished. Confirmed local cost fixes do not prove sustained end-to-end progress."
+  },
+  "verified_allocator_handoff_followup_20261103": {
+    "finding": "Owner.refresh invokes certificate admission after receiving an already verified allocator cache; the admission rebuilds the entire Merkle fingerprint under the writer lease.",
+    "reproduction": {
+      "before_fix_failed": true,
+      "expected_digest_rebuilds": 0,
+      "observed_digest_rebuilds": 1,
+      "ledger_pointer_preserved": true,
+      "additional_full_loads": 0,
+      "failed": 1,
+      "leaked": 0
+    },
+    "fix": "Use the verification established by the exact inode/header cache transfer or authenticated rebase. Run certificate validation only when that transfer has not established verification. Explicit certificate checks retain their independent rebuild and corruption tests.",
+    "validation": {
+      "mode": "Debug",
+      "whole_owner_build_exit_code": 0,
+      "targeted_contracts": 4,
+      "passed": 4,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "cases": [
+        "verified replacement retains its exact ledger and digest without load/rebuild",
+        "live peer certificate",
+        "foreign lease checkpoint adoption",
+        "storage-only foreign tip followed by logical refresh"
+      ],
+      "source_state": "Follow-up runtime changes; full library and original-importer run pending."
+    },
+    "attribution": {
+      "local_source": "cde20c990e2a62922fb2db7d1169c077cb7e52a6",
+      "runtime_refreshes": 265,
+      "path_leases": 2241,
+      "path_admission_ns": 346886621,
+      "path_hold_ns": 511836591954,
+      "maximum_path_hold_ns": 4640259333,
+      "maintenance_queue_timeouts": 0,
+      "scope": "Single unchanged original importer, populated seed, Debug, concurrent compilation. Diagnostic attribution only, not release latency or throughput."
+    },
+    "additional_diagnostics": "Expose cumulative full-refresh elapsed time and existing publication timing counters; metrics-only refusal logs contain numeric byte/record footprints and the consumer flag, never paths or payloads.",
+    "remaining_causality": "This proves redundant allocator-wide work. Its fraction of the optimized end-to-end slowdown, the complete replay service bottleneck and the required scheduling change remain unproven."
   }
 }

@@ -8385,6 +8385,8 @@ pub const NativeFile = struct {
                     .inode = (try self.file.stat(self.runtime())).inode,
                     .metadata = self.activeCheckpoint().logical.metadata,
                 };
+                if (@import("../dense_perf_experiments.zig").enabled("ANTFLY_BENCH_METRICS"))
+                    std.log.info("antfly_bench_replay_refusal bytes_before={d} bytes_after={d} records_before={d} records_after={d} byte_limit={d} record_limit={d} consumer={any}", .{ before.bytes, after.bytes, before.records, after.records, limits.bytes, limits.records, self.replay_consumer_admission });
                 return err;
             }
         };
