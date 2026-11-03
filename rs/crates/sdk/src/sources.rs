@@ -48,6 +48,8 @@ pub struct SourceSyncJob {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub code: Option<String>,
+    pub operation: Option<String>,
+    pub purged_source_count: Option<usize>,
     pub failure: Option<SourceSyncFailure>,
 }
 
@@ -194,6 +196,19 @@ impl SourcesClient {
         serde_json::from_value(value)
             .map_err(|_| SourceServiceError::InvalidConfiguration("invalid source job response"))
     }
+    /// Apply durable purge intents independently of ingestion credentials.
+    pub async fn run_purges(&self) -> Result<SourceSyncJob, SourceServiceError> {
+        let value = self
+            .request(
+                Method::POST,
+                &["v1", "sync"],
+                Some(&json!({"purge_only":true})),
+            )
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|_| SourceServiceError::InvalidConfiguration("invalid job receipt"))
+    }
+
     pub async fn current_job(&self) -> Result<SourceSyncJob, SourceServiceError> {
         let value = self.request(Method::GET, &["v1", "jobs"], None).await?;
         serde_json::from_value(value)
@@ -232,5 +247,10 @@ mod tests {
         let job: SourceSyncJob = serde_json::from_value(json!({"version":1,"id":"job","state":"interrupted","started_at":1,"code":"service_restarted"})).unwrap();
         assert_eq!(job.state, "interrupted");
         assert!(job.finished_at.is_none());
+        assert!(job.operation.is_none());
+        assert!(job.purged_source_count.is_none());
+        let purge: SourceSyncJob = serde_json::from_value(json!({"version":1,"id":"purge","state":"completed","started_at":1,"operation":"purge","purged_source_count":2})).unwrap();
+        assert_eq!(purge.operation.as_deref(), Some("purge"));
+        assert_eq!(purge.purged_source_count, Some(2));
     }
 }

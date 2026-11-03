@@ -58,6 +58,9 @@ type Source struct {
 	PermissionTTLSeconds int             `json:"permission_ttl_seconds,omitempty"`
 }
 type Runner struct {
+	// Only Service's resolver opts in: checkMediaAccess proves current access
+	// and revision, including any policy imposed by an injected connector.
+	mediaReferenceAuthorizes bool
 	// MediaInventory publishes a compact authority generation at checkpoint boundaries.
 	MediaInventory        func(context.Context, Source, *Inventory, *Inventory) error
 	MediaReference        func(context.Context, Source, Request, Item) (MediaReference, error)
@@ -85,6 +88,12 @@ func (r *Runner) Sync(ctx context.Context) error {
 	if err := r.validate(); err != nil {
 		return err
 	}
+	return r.withStateLock(ctx, func() error { return r.syncLocked(ctx) })
+}
+
+// withStateLock serializes every mutation of a Runner's database ownership and
+// checkpoint files, including purge. Callbacks must not reacquire this lock.
+func (r *Runner) withStateLock(ctx context.Context, work func() error) error {
 	if err := os.MkdirAll(r.StateDir, 0700); err != nil {
 		return err
 	}
@@ -97,6 +106,10 @@ func (r *Runner) Sync(ctx context.Context) error {
 		return fmt.Errorf("source state is locked")
 	}
 	defer lock.Unlock()
+	return work()
+}
+
+func (r *Runner) syncLocked(ctx context.Context) error {
 	catalogTable := r.Profile.CatalogTable
 	if catalogTable == "" {
 		catalogTable = DefaultCatalogTable
@@ -470,8 +483,10 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		var doc Document
 		if s.Publication == "media" {
 			phase = "verify_media"
-			if err := connector.CheckAccess(ctx, request, item); err != nil {
-				return 0, "", err
+			if !r.mediaReferenceAuthorizes {
+				if err := connector.CheckAccess(ctx, request, item); err != nil {
+					return 0, "", err
+				}
 			}
 			ref, err := r.MediaReference(ctx, s, request, item)
 			if err != nil {
@@ -686,6 +701,21 @@ func publicationConnector(connector Connector, source Source) (Connector, error)
 }
 
 type driveMediaConnector struct{ *GoogleConnector }
+
+// A materialized text snapshot remains usable after Drive changes. A media
+// reference does not: both acquisition and publication audits must prove that
+// the pinned revision can still be fetched, including when a digest is cached.
+func (c *driveMediaConnector) ValidateInventory(ctx context.Context, request Request, inventory Inventory) error {
+	if err := c.ValidateCachedSnapshot(ctx, request, inventory); err != nil {
+		return err
+	}
+	for _, item := range inventory.Objects {
+		if err := c.CheckMedia(ctx, request, item); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func (c *driveMediaConnector) Enumerate(ctx context.Context, request Request) (Inventory, error) {
 	inventory, err := c.GoogleConnector.Enumerate(ctx, request)

@@ -48,6 +48,31 @@ type MediaConnector interface {
 	OpenMedia(context.Context, Request, Item, MediaRange) (io.ReadCloser, error)
 }
 
+// StableMediaConnector promises the entire returned range is fenced to one
+// provider version before its first byte. It permits one open response across
+// bounded windows. Mutable Drive representations deliberately do not opt in.
+type StableMediaConnector interface {
+	MediaConnector
+	StableMediaRanges() bool
+}
+
+func (*S3Connector) StableMediaRanges() bool       { return true }
+func (c *GoogleConnector) StableMediaRanges() bool { return c.ProviderName == ProviderGCS }
+
+// Check injected policy as well as streaming authority. Exact native types
+// already combine these checks; an embedding wrapper may override CheckAccess
+// while promoting the native CheckMedia method.
+func checkMediaAccess(ctx context.Context, connector Connector, media MediaConnector, request Request, item Item) error {
+	switch connector.(type) {
+	case *S3Connector, *GoogleConnector, *driveMediaConnector:
+	default:
+		if err := connector.CheckAccess(ctx, request, item); err != nil {
+			return err
+		}
+	}
+	return media.CheckMedia(ctx, request, item)
+}
+
 type mediaBody struct {
 	body      io.ReadCloser
 	remaining int64
@@ -143,18 +168,18 @@ func (c *S3Connector) OpenMedia(ctx context.Context, r Request, item Item, span 
 }
 
 func (c *GoogleConnector) CheckMedia(ctx context.Context, r Request, item Item) error {
-	if err := c.CheckAccess(ctx, r, item); err != nil {
-		return mediaProviderError(err)
+	if c.ProviderName != ProviderGoogleDrive {
+		return mediaProviderError(c.CheckAccess(ctx, r, item))
 	}
-	if c.ProviderName == ProviderGoogleDrive {
-		client, err := c.client(ctx, r)
-		if err != nil {
-			return err
-		}
-		return c.checkDriveRevision(ctx, client, configString(item.Metadata, "file_id"), item.Revision)
+	client, err := c.client(ctx, r)
+	if err != nil {
+		return err
 	}
-	return nil
+	// The same pinned token/metadata response proves content permission and
+	// revision. Do not add a second metadata GET just to check its version.
+	return mediaProviderError(c.checkDriveContentAccess(ctx, client, configString(item.Metadata, "file_id"), item.Revision))
 }
+
 func (c *GoogleConnector) OpenMedia(ctx context.Context, r Request, item Item, span MediaRange) (io.ReadCloser, error) {
 	if err := span.validate(item.Size); err != nil {
 		return nil, err
@@ -194,7 +219,9 @@ func (c *GoogleConnector) OpenMedia(ctx context.Context, r Request, item Item, s
 	if ranged {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", span.Offset, span.Offset+span.Length-1))
 	}
-	response, err := client.Do(req)
+	streamClient := *client
+	streamClient.Timeout = 0 // Streaming is bounded by the caller's operation deadline.
+	response, err := streamClient.Do(req)
 	if err != nil {
 		return nil, googleRequestError(err)
 	}

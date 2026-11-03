@@ -53,6 +53,9 @@ describe("SourcesClient", () => {
     expect(fetcher.mock.calls[1]?.[0]).toBe("https://sources.example/v1/jobs/a%2Fb");
     await client.purgeSource("a/b");
     expect(fetcher.mock.calls[2]?.[0]).toBe("https://sources.example/v1/sources/a%2Fb?purge=true");
+    await client.runPurges();
+    expect(fetcher.mock.calls[3]?.[0]).toBe("https://sources.example/v1/sync");
+    expect(fetcher.mock.calls[3]?.[1]?.body).toBe('{"purge_only":true}');
   });
   it.each([
     "http://remote.example",

@@ -30,14 +30,16 @@ import (
 const mediaReadWindow = 1 << 20
 
 type mediaSeeker struct {
-	ctx          context.Context
-	connector    MediaConnector
-	request      Request
-	item         Item
-	ranges       []MediaRange
-	offset       int64
-	buffer       []byte
-	bufferOffset int64
+	ctx                     context.Context
+	connector               MediaConnector
+	request                 Request
+	item                    Item
+	ranges                  []MediaRange
+	offset                  int64
+	buffer                  []byte
+	bufferOffset            int64
+	body                    io.ReadCloser
+	streamOffset, streamEnd int64
 }
 
 func (r *mediaSeeker) Seek(offset int64, whence int) (int64, error) {
@@ -71,16 +73,37 @@ func (r *mediaSeeker) Read(out []byte) (int, error) {
 		r.offset += int64(n)
 		return n, nil
 	}
-	length := min(int64(mediaReadWindow), r.item.Size-r.offset)
+	end := r.item.Size
 	for _, span := range r.ranges {
 		if r.offset >= span.Offset && r.offset < span.Offset+span.Length {
-			length = min(length, span.Offset+span.Length-r.offset)
+			end = span.Offset + span.Length
 			break
 		}
 	}
-	body, err := r.connector.OpenMedia(r.ctx, r.request, r.item, MediaRange{r.offset, length})
-	if err != nil {
-		return 0, mediaProviderError(err)
+	length := min(int64(mediaReadWindow), end-r.offset)
+	stable := false
+	if connector, ok := r.connector.(StableMediaConnector); ok {
+		stable = connector.StableMediaRanges()
+	}
+	var body io.ReadCloser
+	if stable && r.body != nil && r.streamOffset == r.offset && r.streamEnd >= r.offset+length {
+		body = r.body
+	} else {
+		_ = r.Close()
+		requested := length
+		if stable {
+			requested = end - r.offset
+		}
+		opened, err := r.connector.OpenMedia(r.ctx, r.request, r.item, MediaRange{r.offset, requested})
+		if err != nil {
+			return 0, mediaProviderError(err)
+		}
+		body = opened
+		if stable {
+			r.body = body
+			r.streamOffset = r.offset
+			r.streamEnd = r.offset + requested
+		}
 	}
 	if cap(r.buffer) < int(length) {
 		r.buffer = make([]byte, length)
@@ -88,7 +111,15 @@ func (r *mediaSeeker) Read(out []byte) (int, error) {
 		r.buffer = r.buffer[:length]
 	}
 	_, readErr := io.ReadFull(body, r.buffer)
-	closeErr := body.Close()
+	var closeErr error
+	if stable {
+		r.streamOffset += length
+		if readErr != nil || r.streamOffset == r.streamEnd {
+			closeErr = r.Close()
+		}
+	} else {
+		closeErr = body.Close()
+	}
 	if readErr != nil {
 		return 0, readErr
 	}
@@ -103,6 +134,14 @@ func (r *mediaSeeker) Read(out []byte) (int, error) {
 	n := copy(out, r.buffer)
 	r.offset += int64(n)
 	return n, nil
+}
+func (r *mediaSeeker) Close() error {
+	if r.body == nil {
+		return nil
+	}
+	body := r.body
+	r.body = nil
+	return body.Close()
 }
 func (s *Service) serveMediaStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -141,7 +180,7 @@ func (s *Service) serveMediaStream(w http.ResponseWriter, r *http.Request) {
 	source := entry.source
 	connection, exists := s.profile.Connections[pin.Connection]
 	binding := s.connectionBindings[pin.Connection]
-	epoch := s.clients.epoch.Load()
+	generation := s.clientGeneration(connection)
 	closed := s.closed
 	s.mu.Unlock()
 	if closed || !found || !exists || entry.binding != pin.SourceBinding || binding != pin.ConnectionBinding {
@@ -167,7 +206,7 @@ func (s *Service) serveMediaStream(w http.ResponseWriter, r *http.Request) {
 	}
 	request := Request{SourceNamespace: "job/" + source.ID, Config: source.Config, Mode: ImportModeSource}
 	if err == nil {
-		err = media.CheckMedia(ctx, request, pin.Item)
+		err = checkMediaAccess(ctx, connector, media, request, pin.Item)
 	}
 	if err != nil {
 		serveMediaError(w, mediaProviderError(err))
@@ -177,7 +216,7 @@ func (s *Service) serveMediaStream(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	current, live := s.mediaRegistry[pin.SourceID]
 	_, connected := s.profile.Connections[pin.Connection]
-	revoked := s.closed || !live || !connected || current.binding != pin.SourceBinding || s.connectionBindings[pin.Connection] != pin.ConnectionBinding || epoch != s.clients.epoch.Load()
+	revoked := s.closed || !live || !connected || current.binding != pin.SourceBinding || s.connectionBindings[pin.Connection] != pin.ConnectionBinding || generation != s.clientGeneration(connection)
 	s.mu.Unlock()
 	if revoked {
 		serviceError(w, 410, "media_revoked")
@@ -208,6 +247,7 @@ func (s *Service) serveMediaStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	seeker := &mediaSeeker{ctx: ctx, connector: media, request: request, item: pin.Item, ranges: spans}
+	defer seeker.Close()
 	// Validate the first bounded window before committing HTTP success headers.
 	// Conditional responses and HEAD must not fetch the object body.
 	if r.Method == http.MethodGet {

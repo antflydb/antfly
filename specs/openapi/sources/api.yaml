@@ -112,7 +112,10 @@ paths:
         Concurrent sync returns 409. Restart discards a failed pinned selection,
         retaining ownership. A service restart marks unfinished jobs interrupted;
         POST again to resume through Runner's durable checkpoints. Only the most
-        recent job receipt is retained. Ambiguous submission must be resolved by
+        recent job receipt is retained. purge_only runs deletion independently
+        of ingestion credentials. Full sync drains pending purges before
+        validating acquisition connections; purged_source_count reports completed
+        deletions even if subsequent acquisition fails. Ambiguous submission must be resolved by
         reading the current job at GET /v1/jobs before resubmitting.
       requestBody:
         required: true
@@ -123,6 +126,7 @@ paths:
               additionalProperties: false
               properties:
                 restart: {type: boolean, default: false}
+                purge_only: {type: boolean, default: false}
       responses:
         '202':
           description: Accepted; poll Location.
@@ -274,6 +278,8 @@ components:
         started_at: {type: integer, format: int64}
         finished_at: {type: integer, format: int64}
         code: {type: string}
+        operation: {type: string, enum: [sync, purge]}
+        purged_source_count: {type: integer, minimum: 0}
         failure:
           type: object
           required: [phase, code, retryable]

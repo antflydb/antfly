@@ -120,9 +120,14 @@ func TestSourceMediaArtifactIntegration(t *testing.T) {
 		return json.Unmarshal(raw, &result) == nil && len(result.Responses) > 0 && len(result.Responses[0].Hits.Hits) > 0
 	}, 60*time.Second, 250*time.Millisecond)
 	require.NoError(t, publisher.Batch(t.Context(), table, map[string]any{"foreign": map[string]any{"title": "preserve"}}, nil))
+	suspended := source
+	suspended.ID = "22222222-2222-4222-8222-222222222222"
+	suspended.Alias = "suspended"
+	suspended.Connection = "suspended"
+	require.Equal(t, 200, serviceCall(s, "PUT", "/v1/sources/"+suspended.ID, suspended).Code)
 	require.Equal(t, 200, serviceCall(s, "DELETE", "/v1/connections/docs", nil).Code)
 	require.Equal(t, 200, serviceCall(s, "DELETE", "/v1/sources/"+source.ID+"?purge=true", nil).Code)
-	response = serviceCall(s, "POST", "/v1/sync", map[string]any{})
+	response = serviceCall(s, "POST", "/v1/sync", map[string]any{"purge_only": true})
 	require.Equal(t, 202, response.Code, response.Body.String())
 	job = SyncJob{}
 	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &job))
@@ -132,6 +137,10 @@ func TestSourceMediaArtifactIntegration(t *testing.T) {
 		return job.State != "running"
 	}, 90*time.Second, 100*time.Millisecond)
 	require.Equal(t, "completed", job.State, job)
+	require.Equal(t, "purge", job.Operation)
+	require.Equal(t, 1, job.PurgedSourceCount)
+	require.Len(t, s.profile.Sources, 1)
+
 	require.NoError(t, WaitForAbsent(t.Context(), publisher.Query, table, []string{key}))
 	foreign, err := publisher.Query(t.Context(), table, []byte(`{"query":{"doc_id":{"ids":["foreign"]}},"fields":["title"],"limit":1}`))
 	require.NoError(t, err)

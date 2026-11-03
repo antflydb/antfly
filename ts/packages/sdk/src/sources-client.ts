@@ -45,6 +45,8 @@ export interface SourceSyncJob {
   started_at: number;
   finished_at?: number;
   code?: string;
+  operation?: "sync" | "purge";
+  purged_source_count?: number;
   failure?: { source_id?: string; phase: string; code: string; retryable: boolean };
 }
 
@@ -151,6 +153,10 @@ export class SourcesClient {
 
   sync(options: { restart?: boolean; signal?: AbortSignal } = {}): Promise<SourceSyncJob> {
     return this.request("POST", "/v1/sync", { restart: options.restart ?? false }, options.signal);
+  }
+  /** Apply durable purge intents independently of ingestion credentials. */
+  runPurges(signal?: AbortSignal): Promise<SourceSyncJob> {
+    return this.request("POST", "/v1/sync", { purge_only: true }, signal);
   }
   currentJob(signal?: AbortSignal): Promise<SourceSyncJob> {
     return this.request("GET", "/v1/jobs", undefined, signal);

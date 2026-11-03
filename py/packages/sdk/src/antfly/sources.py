@@ -94,6 +94,10 @@ class SourcesClient:
     def sync(self, *, restart: bool = False) -> dict[str, Any]:
         return self._request("POST", "/v1/sync", {"restart": restart})
 
+    def run_purges(self) -> dict[str, Any]:
+        """Apply durable purge intents independently of ingestion credentials."""
+        return self._request("POST", "/v1/sync", {"purge_only": True})
+
     def current_job(self) -> dict[str, Any]:
         return self._request("GET", "/v1/jobs")
 

@@ -74,10 +74,6 @@ func (s *Service) verifiedMediaDigest(ctx context.Context, source Source, connec
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 	key := s.contentIdentity(connection, item)
-	var receipt contentReceipt
-	if loadJSON(s.digestPath(key), &receipt, 4096) == nil && receipt.Version == 1 && receipt.Identity == key && validContentSHA(receipt.SHA256) && hmac.Equal([]byte(receipt.MAC), []byte(s.receiptMAC(receipt))) {
-		return receipt.SHA256, nil
-	}
 	connector, err := s.providerConnector(ctx, connection)
 	if err != nil {
 		return "", err
@@ -89,6 +85,13 @@ func (s *Service) verifiedMediaDigest(ctx context.Context, source Source, connec
 	media, ok := connector.(MediaConnector)
 	if !ok {
 		return "", fmt.Errorf("%w: provider does not support streaming media", ErrInvalidInput)
+	}
+	if err := checkMediaAccess(ctx, connector, media, request, item); err != nil {
+		return "", mediaProviderError(err)
+	}
+	var receipt contentReceipt
+	if loadJSON(s.digestPath(key), &receipt, 4096) == nil && receipt.Version == 1 && receipt.Identity == key && validContentSHA(receipt.SHA256) && hmac.Equal([]byte(receipt.MAC), []byte(s.receiptMAC(receipt))) {
+		return receipt.SHA256, nil
 	}
 	body, err := media.OpenMedia(ctx, request, item, MediaRange{0, item.Size})
 	if err != nil {

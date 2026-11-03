@@ -31,8 +31,9 @@ import (
 )
 
 type providerClientEntry struct {
-	connector Connector
-	used      uint64
+	connector  Connector
+	connection Connection
+	used       uint64
 }
 type providerClientBuild struct {
 	done      chan struct{}
@@ -46,6 +47,7 @@ type providerClients struct {
 	entries  map[string]providerClientEntry
 	building map[string]*providerClientBuild
 	closed   bool
+	secrets  map[string]uint64
 }
 
 func closeProviderClient(connector Connector) {
@@ -66,8 +68,8 @@ func (s *Service) providerConnector(ctx context.Context, connection Connection) 
 		return nil, err
 	}
 	digest := sha256.Sum256(raw)
-	epoch := s.clients.epoch.Load()
-	key := fmt.Sprintf("%d/%x/%s", epoch, reflect.ValueOf(s.factory).Pointer(), hex.EncodeToString(digest[:]))
+	generation := s.clientGeneration(connection)
+	key := fmt.Sprintf("%s/%x/%s", generation, reflect.ValueOf(s.factory).Pointer(), hex.EncodeToString(digest[:]))
 	pool := &s.clients
 	pool.mu.Lock()
 	if pool.closed {
@@ -106,7 +108,7 @@ func (s *Service) providerConnector(ctx context.Context, connection Connection) 
 	connector, err := s.factory(credentialContext, connection)
 	pool.mu.Lock()
 	delete(pool.building, key)
-	if err == nil && (pool.closed || epoch != pool.epoch.Load()) {
+	if err == nil && (pool.closed || generation != s.clientGenerationLocked(connection)) {
 		err = fmt.Errorf("%w: connection generation changed", ErrInvalidInput)
 	}
 	var retired Connector
@@ -126,7 +128,7 @@ func (s *Service) providerConnector(ctx context.Context, connection Connection) 
 			delete(pool.entries, oldest)
 		}
 		pool.tick++
-		pool.entries[key] = providerClientEntry{connector: connector, used: pool.tick}
+		pool.entries[key] = providerClientEntry{connector: connector, connection: connection, used: pool.tick}
 		build.connector = connector
 	} else if connector != nil {
 		retired = connector
@@ -168,5 +170,63 @@ func closeGoogleTransport(client *http.Client) {
 	}
 	if closer, ok := transport.(interface{ CloseIdleConnections() }); ok {
 		closer.CloseIdleConnections()
+	}
+}
+
+// Called under the pool mutex. Credential generations depend only on secrets
+// referenced by this connection, so unrelated registration cannot revoke reads.
+func (s *Service) clientGenerationLocked(connection Connection) string {
+	versions := make(map[string]uint64, len(connection.SecretRefs))
+	for _, key := range connection.SecretRefs {
+		versions[key] = s.clients.secrets[key]
+	}
+	raw, _ := json.Marshal(struct {
+		Epoch   uint64
+		Secrets map[string]uint64
+	}{s.clients.epoch.Load(), versions})
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+func (s *Service) clientGeneration(connection Connection) string {
+	s.clients.mu.Lock()
+	defer s.clients.mu.Unlock()
+	return s.clientGenerationLocked(connection)
+}
+func (s *Service) invalidateSecret(key string) {
+	pool := &s.clients
+	pool.mu.Lock()
+	if pool.secrets == nil {
+		pool.secrets = map[string]uint64{}
+	}
+	pool.secrets[key]++
+	retired := []Connector{}
+	for id, entry := range pool.entries {
+		for _, ref := range entry.connection.SecretRefs {
+			if ref == key {
+				retired = append(retired, entry.connector)
+				delete(pool.entries, id)
+				break
+			}
+		}
+	}
+	pool.mu.Unlock()
+	for _, connector := range retired {
+		closeProviderClient(connector)
+	}
+}
+func (s *Service) retireConnection(connection Connection) {
+	identity := connectionMediaBinding(connection)
+	pool := &s.clients
+	pool.mu.Lock()
+	retired := []Connector{}
+	for id, entry := range pool.entries {
+		if connectionMediaBinding(entry.connection) == identity {
+			retired = append(retired, entry.connector)
+			delete(pool.entries, id)
+		}
+	}
+	pool.mu.Unlock()
+	for _, connector := range retired {
+		closeProviderClient(connector)
 	}
 }

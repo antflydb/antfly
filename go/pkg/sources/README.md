@@ -531,15 +531,20 @@ credentials. Every read rechecks the live registry, selected inventory, current
 provider authority, source version, and exact byte length. The companion serves
 strong content ETags, HTTP conditional requests, `HEAD`, and single/multipart byte
 ranges. HEAD performs a provider authorization/version check without downloading
-the object (S3 uses a one-byte authorization probe). Reads fetch exact ranges in
-at most 1 MiB verified windows, with four active requests and a two-minute request
-deadline. Drive windows pass before/after revision checks before releasing bytes.
+the object (S3 uses a one-byte authorization probe). S3 and GCS keep one provider
+response open per contiguous requested range while buffering at most 1 MiB.
+Drive fetches bounded windows and passes before/after revision checks before
+releasing bytes. There are four active requests and a two-minute request deadline.
+Google streaming responses use this operation deadline rather than the metadata
+client's 60-second timeout; initial hash verification allows 30 minutes.
 A later provider failure truncates an already started response; clients must
 require the advertised complete length. Saturation returns `503` and
 `Retry-After`.
 
 Provider clients and refreshed token sources are pooled per credential generation
-with a 64-entry bound; rotation/revocation retires idle transports. Membership
+with a 64-entry bound; rotation/revocation retires idle transports. Generations
+track only the secrets referenced by a connection, so unrelated source,
+connection, or secret changes do not revoke valid in-flight reads. Membership
 checks use signed sorted compact inventories and a bounded 32 MiB LRU, without
 reading acquisition journals on each request. Pending inventories are reconciled
 once after restart. Signed descriptors survive restart and are pruned after
@@ -547,7 +552,9 @@ successful full syncs. Failed runs keep pending/published generations for recove
 
 Media publication computes `metadata.sha256` from verified original bytes.
 Signed receipts bind that digest to provider URI, version, endpoint and exact
-length. Subsequent syncs reuse receipts while rechecking current access. The HTTP
+length. Subsequent syncs reuse receipts while rechecking current access and pinned
+revision, including resumed Drive selections. Identical signed descriptors are
+reused without replacement or fsync. The HTTP
 ETag is this original-byte SHA-256. Provider ETags/checksums remain separate.
 Catalog bindings advertise media document version 2; text consumers skip media
 bindings and continue accepting version-1 text. Older pre-hash media descriptors
@@ -566,6 +573,7 @@ separate from the joined database OpenAPI and its generated clients.
 | Put/revoke a named connection | `PUT/DELETE /v1/connections/{name}` |
 | Put/remove a source | `PUT/DELETE /v1/sources/{uuid}` |
 | Start/resume sync | `POST /v1/sync` with `{"restart":false}` |
+| Execute queued purges independently | `POST /v1/sync` with `{"purge_only":true}` |
 | Inspect latest job after ambiguous submission | `GET /v1/jobs` |
 | Poll/cancel a job | `GET/DELETE /v1/jobs/{id}` |
 
@@ -577,6 +585,15 @@ the interrupted receipt and submit sync again to resume durable work. Use
 `restart: true` only to discard a failed pinned selection, retaining ownership.
 Do not blindly retry an ambiguous POST: inspect the current receipt first.
 
+Job receipts identify their `operation` (`sync` or `purge`) and report
+`purged_source_count`. Use `SourcesClient.runPurges()` (TypeScript) or
+`run_purges()` (Python/Rust) to complete queued deletion without acquiring
+other sources. Purge jobs survive unrelated credential revocation. A full sync
+also drains committed purge intents before validating acquisition connections;
+its receipt reports completed purges even if subsequent acquisition fails.
+One runner-state lock covers purge and sync, preventing concurrent CLI/library
+writers from racing database deletion or checkpoint removal.
+
 Connection/secret revocation is allowed during sync, cancels that job, and blocks
 future acquisition. Requests already acquiring bytes may finish. Changing connection transport/reference settings or removing/changing a source
 also invalidates old capabilities; sync republishes their replacements. Rotating a
@@ -585,7 +602,7 @@ an active source are deleted only after an authoritative inventory and successfu
 publication. Removing an entire source follows the existing non-destructive
 runner policy: the next sync retires its catalog binding, preserving owned rows
 and state for recovery. To remove owned rows as well, DELETE with `?purge=true`,
-then start sync. The durable purge queue retires the catalog entry and reconciles
+then run a purge-only job or start sync. The durable purge queue retires the catalog entry and reconciles
 only the source's exclusive key range and journaled legacy IDs. It needs no
 provider credentials, survives interruption, and prevents reusing the source ID
 until completion. Other sources and foreign rows are preserved. A source UUID's

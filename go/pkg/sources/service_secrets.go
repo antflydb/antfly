@@ -67,7 +67,7 @@ func (s *Service) putSecret(key, value string) error {
 	if err := writeJSON(s.secretPath(key), record, 256<<10); err != nil {
 		return err
 	}
-	s.invalidateClients()
+	s.invalidateSecret(key)
 	return nil
 }
 func (s *Service) resolveSecret(ctx context.Context, key string) (string, error) {

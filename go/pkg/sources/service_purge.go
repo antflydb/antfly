@@ -82,6 +82,10 @@ func (s *Service) queuePurge(source Source) error {
 	return writeJSON(s.purgePath(), queue, 1<<20)
 }
 func (s *Service) purgeSources(ctx context.Context, profile Profile) error {
+	runner := Runner{StateDir: s.runnerPath()}
+	return runner.withStateLock(ctx, func() error { return s.purgeSourcesLocked(ctx, profile) })
+}
+func (s *Service) purgeSourcesLocked(ctx context.Context, profile Profile) error {
 	queue, err := s.readPurges()
 	if err != nil {
 		return err

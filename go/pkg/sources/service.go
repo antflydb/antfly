@@ -71,13 +71,15 @@ type ServiceOptions struct {
 }
 
 type SyncJob struct {
-	Version    int          `json:"version"`
-	ID         string       `json:"id"`
-	State      string       `json:"state"`
-	StartedAt  int64        `json:"started_at"`
-	FinishedAt int64        `json:"finished_at,omitempty"`
-	Code       string       `json:"code,omitempty"`
-	Failure    *SyncFailure `json:"failure,omitempty"`
+	Version           int          `json:"version"`
+	Operation         string       `json:"operation,omitempty"`
+	PurgedSourceCount int          `json:"purged_source_count,omitempty"`
+	ID                string       `json:"id"`
+	State             string       `json:"state"`
+	StartedAt         int64        `json:"started_at"`
+	FinishedAt        int64        `json:"finished_at,omitempty"`
+	Code              string       `json:"code,omitempty"`
+	Failure           *SyncFailure `json:"failure,omitempty"`
 }
 
 func NewService(o ServiceOptions) (*Service, error) {
@@ -317,7 +319,8 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var input struct {
-			Restart bool `json:"restart"`
+			Restart   bool `json:"restart"`
+			PurgeOnly bool `json:"purge_only"`
 		}
 		if err := serviceDecode(w, r, &input); err != nil {
 			serviceError(w, 400, "invalid_request")
@@ -327,22 +330,33 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			serviceError(w, 400, "invalid_source_profile")
 			return
 		}
-		for _, source := range s.profile.Sources {
-			if _, exists := s.profile.Connections[source.Connection]; !exists {
-				serviceError(w, 400, "source_connection_revoked")
-				return
+		queue, err := s.readPurges()
+		if err != nil {
+			serviceError(w, 500, "state_read_failed")
+			return
+		}
+		if !input.PurgeOnly && len(queue.Sources) == 0 {
+			for _, source := range s.profile.Sources {
+				if _, exists := s.profile.Connections[source.Connection]; !exists {
+					serviceError(w, 400, "source_connection_revoked")
+					return
+				}
 			}
 		}
 		profile := cloneProfile(s.profile)
 		ctx, cancel := context.WithCancel(context.Background())
-		job := SyncJob{Version: 1, ID: rand.Text(), State: "running", StartedAt: time.Now().Unix()}
+		operation := "sync"
+		if input.PurgeOnly {
+			operation = "purge"
+		}
+		job := SyncJob{Version: 1, Operation: operation, ID: rand.Text(), State: "running", StartedAt: time.Now().Unix()}
 		if err := writeJSON(s.jobPath(), job, 4096); err != nil {
 			cancel()
 			serviceError(w, 500, "state_write_failed")
 			return
 		}
 		s.job, s.cancel, s.done = &job, cancel, make(chan struct{})
-		go s.run(ctx, profile, input.Restart, s.done)
+		go s.run(ctx, profile, input.Restart, input.PurgeOnly, s.done)
 		w.Header().Set("Location", "/v1/jobs/"+job.ID)
 		serviceJSON(w, 202, job)
 		return
@@ -401,10 +415,8 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				serviceError(w, 500, "state_write_failed")
 				return
 			}
-			s.invalidateClients()
-			if s.cancel != nil {
-				s.cancel()
-			}
+			s.invalidateSecret(key)
+			s.cancelSecretAcquisition(key)
 		default:
 			serviceError(w, 405, "method_not_allowed")
 			return
@@ -429,12 +441,11 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				serviceError(w, 500, "state_write_failed")
 				return
 			}
+			oldConnection := s.profile.Connections[name]
 			s.profile = next
 			s.refreshMediaRegistry()
-			s.invalidateClients()
-			if s.cancel != nil {
-				s.cancel()
-			}
+			s.retireConnection(oldConnection)
+			s.cancelConnectionAcquisition(name)
 			serviceJSON(w, 200, map[string]any{"version": 1, "state": "revoked"})
 			return
 		}
@@ -461,9 +472,10 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			serviceError(w, 500, "state_write_failed")
 			return
 		}
+		oldConnection := s.profile.Connections[name]
 		s.profile = next
 		s.refreshMediaRegistry()
-		s.invalidateClients()
+		s.retireConnection(oldConnection)
 		serviceJSON(w, 200, connection)
 		return
 	}
@@ -583,13 +595,12 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.profile = next
 		s.refreshMediaRegistry()
-		s.invalidateClients()
 		serviceJSON(w, 200, map[string]any{"version": 1, "state": "configured"})
 		return
 	}
 	serviceError(w, 404, "not_found")
 }
-func (s *Service) run(ctx context.Context, profile Profile, restart bool, done chan struct{}) {
+func (s *Service) run(ctx context.Context, profile Profile, restart, purgeOnly bool, done chan struct{}) {
 	defer close(done)
 	keep := map[string]bool{}
 	resolver := func(ctx context.Context, source Source, request Request, item Item) (MediaReference, error) {
@@ -600,13 +611,45 @@ func (s *Service) run(ctx context.Context, profile Profile, restart bool, done c
 		}
 		return ref, err
 	}
-	runner := Runner{Profile: profile, StateDir: s.runnerPath(), Factory: s.providerConnector, Restart: restart, MediaReference: resolver, MediaInventory: s.publishMediaAuthority}
-	err := s.purgeSources(ctx, profile)
-	if err == nil {
-		err = runner.Sync(ctx)
-	}
+	runner := Runner{mediaReferenceAuthorizes: true, Profile: profile, StateDir: s.runnerPath(), CatalogPath: filepath.Join(s.runnerPath(), "catalog.json"), Factory: s.providerConnector, Restart: restart, MediaReference: resolver, MediaInventory: s.publishMediaAuthority}
+	purged := []string{}
+	err := runner.withStateLock(ctx, func() error {
+		before, err := s.readPurges()
+		if err != nil {
+			return err
+		}
+		purgeErr := s.purgeSourcesLocked(ctx, profile)
+		after, err := s.readPurges()
+		if err != nil {
+			return err
+		}
+		remaining := map[string]bool{}
+		for _, source := range after.Sources {
+			remaining[source.ID] = true
+		}
+		for _, source := range before.Sources {
+			if !remaining[source.ID] {
+				purged = append(purged, source.ID)
+			}
+		}
+		if purgeErr != nil {
+			return purgeErr
+		}
+		if purgeOnly {
+			return nil
+		}
+		for _, source := range profile.Sources {
+			if _, ok := profile.Connections[source.Connection]; !ok {
+				return &sourceSyncError{sourceID: source.ID, phase: "connect", cause: fmt.Errorf("%w: source connection revoked", ErrInvalidInput)}
+			}
+		}
+		if err := runner.validate(); err != nil {
+			return err
+		}
+		return runner.syncLocked(ctx)
+	})
 	var cleanupErr error
-	if err == nil {
+	if err == nil && !purgeOnly {
 		cleanupErr = s.pruneMediaPins(keep)
 		if cleanupErr == nil {
 			cleanupErr = s.pruneMediaDigests(keep)
@@ -617,6 +660,7 @@ func (s *Service) run(ctx context.Context, profile Profile, restart bool, done c
 	s.cancel()
 	s.cancel = nil
 	s.job.State, s.job.FinishedAt = "completed", time.Now().Unix()
+	s.job.PurgedSourceCount = len(purged)
 	if cleanupErr != nil {
 		s.job.Code = "media_cleanup_failed"
 	}
@@ -662,10 +706,19 @@ func (s *Service) pinMedia(ctx context.Context, source Source, request Request, 
 	pin := mediaPinV2{Version: 2, mediaPinIdentity: mediaPinIdentity{SourceID: source.ID, SourceBinding: sourceMediaBinding(source), Connection: source.Connection, ConnectionBinding: connectionMediaBinding(connection), Item: item}, SHA256: digest, ContentIdentity: s.contentIdentity(connection, item)}
 	id := pinIdentityID(pin.mediaPinIdentity)
 	pin.MAC = s.pinReceiptMAC(pin)
+	// The stable identity and signed receipt are immutable. Reusing a verified
+	// descriptor avoids file replacement and two fsyncs per unchanged object.
+	existing, readErr := s.readMediaPin(id)
+	if readErr == nil && existing.MAC == pin.MAC {
+		return s.mediaReference(id, pin, item), nil
+	}
 	if err := writeJSON(s.pinPath(id), pin, 1<<20); err != nil {
 		return MediaReference{}, err
 	}
-	return MediaReference{ContentSHA256: digest, Type: "source", URI: s.baseURL + "/v1/media/" + id + "/" + s.mediaSignature(id), MIMEType: mediaMIME(item), Version: `"` + digest + `"`, VersionKind: "strong_etag", Length: item.Size}, nil
+	return s.mediaReference(id, pin, item), nil
+}
+func (s *Service) mediaReference(id string, pin mediaPinV2, item Item) MediaReference {
+	return MediaReference{ContentSHA256: pin.SHA256, Type: "source", URI: s.baseURL + "/v1/media/" + id + "/" + s.mediaSignature(id), MIMEType: mediaMIME(item), Version: `"` + pin.SHA256 + `"`, VersionKind: "strong_etag", Length: item.Size}
 }
 func mediaMIME(item Item) string {
 	typ := configString(item.Metadata, "mime_type")
@@ -708,6 +761,34 @@ func (s *Service) pruneMediaPins(keep map[string]bool) error {
 		}
 		if err == io.EOF {
 			return nil
+		}
+	}
+}
+
+// The state mutex is held by control mutations. Purge jobs have no provider
+// dependencies; unrelated revocations must not cancel their durable deletion.
+func (s *Service) cancelConnectionAcquisition(name string) {
+	if s.cancel == nil || s.job.Operation == "purge" {
+		return
+	}
+	for _, source := range s.profile.Sources {
+		if source.Connection == name {
+			s.cancel()
+			return
+		}
+	}
+}
+func (s *Service) cancelSecretAcquisition(key string) {
+	if s.cancel == nil || s.job.Operation == "purge" {
+		return
+	}
+	for _, source := range s.profile.Sources {
+		connection := s.profile.Connections[source.Connection]
+		for _, ref := range connection.SecretRefs {
+			if ref == key {
+				s.cancel()
+				return
+			}
 		}
 	}
 }
