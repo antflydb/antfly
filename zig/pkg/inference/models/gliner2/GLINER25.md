@@ -73,6 +73,52 @@ ZIG_GLOBAL_CACHE_DIR="$PWD/../.zig-cache/global" zig build inference-test \
   '-Dtest-filter=GLiNER bounded window composition'
 ```
 
+### Prepared windows and physical work budgets (2026-11-03)
+
+Long-document preparation retains tokenized windows in a request-local store.
+Fitting, geometry admission, workspace sizing and execution reuse those samples;
+physical batches are repacked against the current device/encoder limits without
+repeating tokenizer work. Geometry keys include artifact/tokenizer identity,
+schema, content and processor/window limits. Decoder/output-budget changes reuse
+the samples while recomputing the semantic plan fingerprint and rebinding live
+control/validator callbacks. No store survives its request. Default bounds are
+32 MiB per retained window cache and 64 MiB across the request, including fitting
+trials and retained geometry; the enclosing request heap remains the outer bound.
+
+Prompt-token reporting remains the logical sum of window prompts. Admission now
+charges padded physical batch tokens and attention elements across all layers.
+Backing-OOM retries count against both budgets, and subdivisions stay within the
+original admitted group boundaries. Declared evidence-budget exhaustion reports
+its memory-limit error without speculative smaller-group retries.
+
+Final Debug validation passed **71 tests locally (4 skips)** and **65 CUDA tests
+on glowworm's NVIDIA GB10 (no skips)**. Both Metal and CUDA completed the full
+4096-body-word boundary and a 16381/16384-token prompt under the default work
+budget. Pinned CUDA parity covered window groups of 1/2/4 and an injected backing
+allocation failure. An additional CUDA check verified increased retry charges,
+unchanged logical prompt usage and refusal when the original quota cannot cover
+those extra attempts. Repacking, physical budgets, semantic identity rebinding and
+all-allocation-failure cleanup checks passed.
+
+A real-tokenizer preparation-only benchmark measured three geometry passes per
+request, alternating reuse disabled/enabled in ABBA order. Two requests per mode
+totaled 407.008/140.516 ms locally (**2.90x**) and 326.430/109.333 ms on glowworm
+(**2.99x**). This compares the request store disabled/enabled in the same Debug
+implementation; it is not an old-head comparison or an end-to-end inference
+throughput claim. The public synthetic inputs, model pins, raw measurements and
+tested runtime-source hashes are recorded in
+[`gliner-preparation-reuse-20261103.json`](../../../../bench/baselines/gliner-preparation-reuse-20261103.json).
+
+To reproduce, extend the preceding focused command with
+`'-Dtest-filter=boundary preparation'`,
+`'-Dtest-filter=pipelines.gliner_boundary_processor.test.'` and
+`'-Dtest-filter=pipelines.gliner_boundary_long_document.test.'`, and set
+`ANTFLY_GLINER_PREPARATION_BENCH=1`. On CUDA, add `-Dcuda=true`; select
+`boundary full context learned CUDA` and
+`GLiNER bounded window composition pinned CUDA` for the learned checks. The
+receipt lists the exact scope and skip reasons; aggregate repository CI remains
+separate.
+
 ## Current status
 
 | Artifact | Backbone | Precision | Backend | Status |

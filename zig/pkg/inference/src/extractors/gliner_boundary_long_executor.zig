@@ -39,6 +39,7 @@ pub const Limits = struct {
     plan: document_mod.PlanOptions = .{},
     merge: document_mod.MergeOptions = .{},
     max_total_encoded_tokens: usize = 131072,
+    max_prepared_bytes: usize = 32 * 1024 * 1024,
     /// Null derives a cumulative budget from one fully admitted encoder call
     /// across every layer. A measured short-context constant must not make a
     /// valid full-context window unusable. Explicit smaller budgets are honored.
@@ -63,6 +64,7 @@ pub const Limits = struct {
     }
 };
 pub const Options = struct {
+    preparations: ?*PreparationStore = null,
     identity: artifact.Identity,
     processor: processor.Options = .{},
     engine: engine.Options = .{},
@@ -78,6 +80,7 @@ pub const Result = struct {
     arena: std.heap.ArenaAllocator,
     sample: pipeline.Sample,
     prompt_tokens: usize,
+    encoded_tokens: usize,
     attention_work_items: u64,
     window_count: usize,
     descriptor: document_mod.Descriptor,
@@ -122,6 +125,10 @@ fn hashOptions(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
                 hash.update("\x00");
                 hashOptions(hash, @field(value, reflected_name));
             }
+        },
+        .array => |info| {
+            if (info.child != u8) @compileError("Add explicit array hashing for " ++ @typeName(T));
+            hash.update(&value);
         },
         .optional => {
             hash.update(if (value == null) "0" else "1");
@@ -505,16 +512,53 @@ pub fn executeDevice(cb: *const compute.ComputeBackend, allocator: Allocator, co
     return execute(cb, allocator, config, tokenizer, item, supplied);
 }
 
-pub const GeometryUsage = struct { prompt_tokens: usize, attention_work_items: u64, window_count: usize };
+pub const GeometryUsage = struct { prompt_tokens: usize, encoded_tokens: usize, attention_work_items: u64, window_count: usize };
+const PhysicalGroup = struct { start: usize, count: usize };
+const PreparedCache = struct {
+    backing: Allocator,
+    budget: BoundedAllocator,
+    terminal: EvidenceAllocationFailure = null,
+    batches: []processor.PreparedBatch = &.{},
+    initialized: usize = 0,
+    groups: []PhysicalGroup = &.{},
+    group_count: usize = 0,
+
+    fn create(backing: Allocator, count: usize, limit: usize) !*PreparedCache {
+        if (limit == 0 or limit > 128 * 1024 * 1024) return error.InvalidLongDocumentLimits;
+        const self = try backing.create(PreparedCache);
+        self.* = .{ .backing = backing, .budget = .{ .backing = backing, .limit = limit } };
+        self.budget.failure_context = &self.terminal;
+        self.budget.allocation_failed = observeEvidenceAllocation;
+        errdefer self.deinit();
+        self.batches = self.budget.allocator().alloc(processor.PreparedBatch, count) catch |err| return evidenceAllocationError(self.terminal, err);
+        self.groups = self.budget.allocator().alloc(PhysicalGroup, count) catch |err| return evidenceAllocationError(self.terminal, err);
+        return self;
+    }
+    fn deinit(self: *PreparedCache) void {
+        for (self.batches[0..self.initialized]) |*batch| batch.deinit();
+        self.budget.allocator().free(self.batches);
+        self.budget.allocator().free(self.groups);
+        std.debug.assert(self.budget.live == 0);
+        self.backing.destroy(self);
+    }
+};
+
 const PreparedDocument = struct {
     options: Options,
     document: document_mod.Plan,
     process_options: processor.Options,
     engine_options: engine.Options,
     device_options: device_request.Options,
+    cache: ?*PreparedCache = null,
+    borrowed: bool = false,
+    fn deinit(self: *PreparedDocument) void {
+        if (self.borrowed) return;
+        if (self.cache) |cache| cache.deinit();
+        self.document.deinit();
+    }
 };
 
-fn prepareDocument(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, item: *const wire.Item, supplied: Options) !PreparedDocument {
+fn resolveOptions(config: *const model.Config, item: *const wire.Item, supplied: Options) !Options {
     var options = supplied;
     try check(options);
     options.processor = item.options.preprocessing(options.processor);
@@ -530,6 +574,11 @@ fn prepareDocument(backend: compute.BackendKind, allocator: Allocator, config: *
     }
     if (item.options.long_document.mode != .window or options.limits.max_total_encoded_tokens == 0 or options.limits.max_total_attention_work.? == 0 or
         options.limits.max_retained_evidence_bytes == 0 or options.limits.max_retained_evidence_bytes > 1024 * 1024 * 1024) return error.InvalidLongDocumentLimits;
+    return options;
+}
+
+fn prepareDocument(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, item: *const wire.Item, supplied: Options) !PreparedDocument {
+    const options = try resolveOptions(config, item, supplied);
     var planning = try qualification.longPlanning(config, item, options.limits.plan, options.control);
     planning.inference_fingerprint = try profile(allocator, config, item, options, @tagName(backend));
     observation.emit(options.observer, .{ .phase = .windowing });
@@ -550,7 +599,75 @@ fn prepareDocument(backend: compute.BackendKind, allocator: Allocator, config: *
 // measured qualification shapes. Search for a uniform word budget that fits
 // every exact tokenized window without imposing a measured context cap. This takes at most log2(word limit)
 // replans; no model executes during fitting and no document text is truncated.
+/// Serial, request-local store. The request, tokenizer and configuration must
+/// remain immutable and outlive this store; it is never shared across requests.
+/// All retained plans and token samples, including fitting trials, are bounded.
+pub const PreparationStore = struct {
+    budget: BoundedAllocator,
+    terminal: EvidenceAllocationFailure = null,
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    const Entry = struct { key: [32]u8, document: PreparedDocument };
+
+    pub fn init(backing: Allocator) PreparationStore {
+        return .{ .budget = .{ .backing = backing, .limit = 64 * 1024 * 1024 } };
+    }
+    pub fn deinit(self: *PreparationStore) void {
+        for (self.entries.items) |*entry| entry.document.deinit();
+        self.entries.deinit(self.budget.allocator());
+        std.debug.assert(self.budget.live == 0);
+    }
+};
+
 fn prepareTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options) !PreparedDocument {
+    const store = supplied.preparations orelse return fitTokenizedDocument(backend, allocator, config, tokenizer, item, supplied);
+    const effective = try resolveOptions(config, item, supplied);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(&effective.identity.fingerprint());
+    hash.update(@tagName(backend));
+    hash.update(&item.compiled.fingerprint);
+    hash.update(item.text);
+    // Decoder/output budgets do not change tokenization. Geometry keys only
+    // include values that can change the word plan or prepared input routes.
+    var process = effective.processor;
+    process.max_sequence_tokens = qualification.sequenceLimit(config, @min(process.max_sequence_tokens, effective.engine.limits.max_sequence_tokens, effective.engine.limits.max_batch_tokens, process.max_batch_tokens));
+    process.max_text_words = @min(process.max_text_words, config.max_len);
+    hashOptions(&hash, process);
+    hashOptions(&hash, try qualification.longPlanning(config, item, effective.limits.plan, effective.control));
+    hashOptions(&hash, effective.limits.max_prepared_bytes);
+    // Pointer identity prevents reuse with another tokenizer implementation.
+    hashOptions(&hash, @intFromPtr(tokenizer.ptr));
+    const key = hash.finalResult();
+    for (store.entries.items) |*entry| if (std.mem.eql(u8, &key, &entry.key)) {
+        var result = entry.document;
+        result.borrowed = true;
+        result.options = effective;
+        result.options.limits.plan.max_window_body_words = entry.document.options.limits.plan.max_window_body_words;
+        result.document.rebindInferenceProfile(try profile(allocator, config, item, effective, @tagName(backend)));
+        // Only callbacks and the current admitted device ceiling may change
+        // without changing the semantic key. Always rebind these live values.
+        result.engine_options = effective.engine;
+        result.engine_options.control = effective.control;
+        result.process_options.control = effective.control;
+        result.device_options.execution_policy = effective.metal_execution_policy;
+        result.device_options.pipeline = effective.pipeline;
+        result.device_options.pipeline.max_output_values = effective.limits.merge.max_input_candidates;
+        result.device_options.limits = effective.device;
+        result.device_options.limits.encoder = effective.engine.limits;
+        observation.emit(effective.observer, .{ .phase = .windowing });
+        observation.emit(effective.observer, .{ .document_planned = result.document.windows.len });
+        return result;
+    };
+    store.terminal = null;
+    store.budget.failure_context = &store.terminal;
+    store.budget.allocation_failed = observeEvidenceAllocation;
+    var retained = fitTokenizedDocument(backend, store.budget.allocator(), config, tokenizer, item, effective) catch |err| return evidenceAllocationError(store.terminal, err);
+    errdefer retained.deinit();
+    store.entries.append(store.budget.allocator(), .{ .key = key, .document = retained }) catch |err| return evidenceAllocationError(store.terminal, err);
+    retained.borrowed = true;
+    return retained;
+}
+
+fn fitTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options) !PreparedDocument {
     var options = supplied;
     options.limits.plan.max_window_body_words = @min(options.limits.plan.max_window_body_words, options.processor.max_text_words);
     const planning = try qualification.longPlanning(config, item, options.limits.plan, options.control);
@@ -561,7 +678,7 @@ fn prepareTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, 
     var width = upper;
     var best: ?PreparedDocument = null;
     var refusal: anyerror = error.BoundarySequenceLimitExceeded;
-    errdefer if (best) |*value| value.document.deinit();
+    errdefer if (best) |*value| value.deinit();
     while (true) {
         try check(options);
         options.limits.plan.max_window_body_words = width;
@@ -576,16 +693,16 @@ fn prepareTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, 
             continue;
         };
         const fits = tokenizedDocumentFits(allocator, tokenizer, item, &planned) catch |err| {
-            planned.document.deinit();
+            planned.deinit();
             return err;
         };
         if (fits) {
-            if (best) |*value| value.document.deinit();
+            if (best) |*value| value.deinit();
             best = planned;
             if (width == upper) return best.?;
             lower = width + 1;
         } else {
-            planned.document.deinit();
+            planned.deinit();
             refusal = error.BoundarySequenceLimitExceeded;
             upper = width - 1;
         }
@@ -594,14 +711,19 @@ fn prepareTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, 
     }
 }
 
-fn tokenizedDocumentFits(allocator: Allocator, tokenizer: Tokenizer, item: *const wire.Item, planned: *const PreparedDocument) !bool {
-    for (planned.document.windows) |window| {
-        var prepared = processor.prepare(allocator, tokenizer, &.{.{ .text = try planned.document.windowText(window.index), .schema = &item.compiled }}, planned.process_options) catch |err| {
+fn tokenizedDocumentFits(allocator: Allocator, tokenizer: Tokenizer, item: *const wire.Item, planned: *PreparedDocument) !bool {
+    const cache = try PreparedCache.create(allocator, planned.document.windows.len, planned.options.limits.max_prepared_bytes);
+    var retained = false;
+    defer if (!retained) cache.deinit();
+    for (planned.document.windows, 0..) |window, i| {
+        cache.batches[i] = processor.prepare(cache.budget.allocator(), tokenizer, &.{.{ .text = try planned.document.windowText(window.index), .schema = &item.compiled }}, planned.process_options) catch |err| {
             if (err == error.BoundarySequenceLimitExceeded) return false;
-            return err;
+            return evidenceAllocationError(cache.terminal, err);
         };
-        prepared.deinit();
+        cache.initialized += 1;
     }
+    planned.cache = cache;
+    retained = true;
     return true;
 }
 
@@ -609,16 +731,16 @@ fn tokenizedDocumentFits(allocator: Allocator, tokenizer: Tokenizer, item: *cons
 /// limits are aggregate limits: a valid full-context window must not be refused
 /// merely because several windows together exceed encoder/device capacity.
 fn prepareWindowGroup(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, planned: *const PreparedDocument, start: usize, maximum: usize) !processor.PreparedBatch {
+    _ = tokenizer;
     var count = @min(maximum, planned.options.processor.max_batch_items, planned.engine_options.limits.max_batch, planned.options.pipeline.head_limits.max_batch, planned.options.pipeline.task_limits.math.max_batch);
     if (backend == .metal or backend == .cuda) count = @min(count, planned.options.device.head.max_batch);
     if (count == 0) return error.ResourceLimitExceeded;
     while (true) {
         try check(planned.options);
-        const inputs = try allocator.alloc(processor.Item, count);
-        defer allocator.free(inputs);
-        for (planned.document.windows[start..][0..count], inputs) |window, *input|
-            input.* = .{ .text = try planned.document.windowText(window.index), .schema = &item.compiled };
-        var prepared = processor.prepare(allocator, tokenizer, inputs, planned.process_options) catch |err| {
+        const samples = try allocator.alloc(processor.Sample, count);
+        defer allocator.free(samples);
+        for (samples, planned.cache.?.batches[start..][0..count]) |*sample, batch| sample.* = batch.samples[0];
+        var prepared = processor.packSamples(allocator, samples, planned.process_options) catch |err| {
             if (err == error.BoundaryBatchLimitExceeded and count > 1) {
                 count = (count + 1) / 2;
                 continue;
@@ -653,35 +775,41 @@ fn checkDeviceGroup(allocator: Allocator, config: *const model.Config, prepared:
     _ = try device_request.plan(config, prepared, schemas, options);
 }
 
+fn physicalUsage(config: *const model.Config, prepared: *const processor.PreparedBatch, options: engine.Options) !struct { tokens: usize, attention: u64 } {
+    const per_layer = (try engine.plan(config, prepared, options)).attention_work_items;
+    return .{ .tokens = prepared.input_ids.len, .attention = std.math.mul(u64, per_layer, config.encoder.num_hidden_layers) catch return error.LongDocumentWorkLimitExceeded };
+}
+
 fn admitWindows(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, planned: *const PreparedDocument, receiver: anytype) !GeometryUsage {
     const options = planned.options;
     const document = planned.document;
-    const process_options = planned.process_options;
-    const engine_options = planned.engine_options;
-    const device_options = planned.device_options;
-    // Exact tokenizer/schema and cumulative attention admission precede any
-    // model execution. Recompute each small prepared window when it is used.
+    const cache = planned.cache.?;
     var tokens: usize = 0;
-    var attention: u64 = 0;
-    observation.emit(options.observer, .{ .phase = .tokenizing });
-    for (document.windows) |window| {
+    for (cache.batches) |*prepared| {
         try check(options);
-        var prepared = try processor.prepare(allocator, tokenizer, &.{.{ .text = try document.windowText(window.index), .schema = &item.compiled }}, process_options);
-        defer prepared.deinit();
-        try receiver.observe(item.text.len, document.words.len, document.windows.len, &prepared);
-        const attention_per_layer = switch (backend) {
-            .native, .wasm => (try engine.plan(config, &prepared, engine_options)).attention_work_items,
-            .metal, .cuda => (try device_request.plan(config, &prepared, &.{&item.compiled}, device_options)).encoder.native.attention_work_items,
-            else => return error.UnsupportedGlinerBoundaryBackend,
-        };
-        // Count attention score elements across every encoder layer. This is
-        // an admission work unit, not a FLOP or latency estimate.
-        const window_attention = std.math.mul(u64, attention_per_layer, config.encoder.num_hidden_layers) catch return error.LongDocumentWorkLimitExceeded;
-        tokens = std.math.add(usize, tokens, prepared.input_ids.len) catch return error.LongDocumentWorkLimitExceeded;
-        attention = std.math.add(u64, attention, window_attention) catch return error.LongDocumentWorkLimitExceeded;
-        if (tokens > options.limits.max_total_encoded_tokens or attention > options.limits.max_total_attention_work.?) return error.LongDocumentWorkLimitExceeded;
+        try receiver.observe(item.text.len, document.words.len, document.windows.len, prepared);
+        tokens = std.math.add(usize, tokens, prepared.samples[0].input_ids.len) catch return error.LongDocumentWorkLimitExceeded;
     }
-    return .{ .prompt_tokens = tokens, .attention_work_items = attention, .window_count = document.windows.len };
+    const batchable = item.compiled.schema.joint_ie == null and
+        (item.compiled.schema.classifications.len == 0 or backend == .cuda);
+    var encoded: usize = 0;
+    var attention: u64 = 0;
+    var start: usize = 0;
+    cache.group_count = 0;
+    while (start < document.windows.len) {
+        const n = if (batchable) @max(1, @min(options.limits.window_batch_size, document.windows.len - start)) else 1;
+        var prepared = try prepareWindowGroup(backend, allocator, config, tokenizer, item, planned, start, n);
+        defer prepared.deinit();
+        const usage = try physicalUsage(config, &prepared, planned.engine_options);
+        encoded = std.math.add(usize, encoded, usage.tokens) catch return error.LongDocumentWorkLimitExceeded;
+        attention = std.math.add(u64, attention, usage.attention) catch return error.LongDocumentWorkLimitExceeded;
+        if (encoded > options.limits.max_total_encoded_tokens or attention > options.limits.max_total_attention_work.?) return error.LongDocumentWorkLimitExceeded;
+        if (comptime @hasDecl(@TypeOf(receiver.*), "observeWindowGroup")) receiver.observeWindowGroup(&prepared);
+        cache.groups[cache.group_count] = .{ .start = start, .count = prepared.samples.len };
+        cache.group_count += 1;
+        start += prepared.samples.len;
+    }
+    return .{ .prompt_tokens = tokens, .encoded_tokens = encoded, .attention_work_items = attention, .window_count = document.windows.len };
 }
 
 /// Quiet bounded tokenization/planning only. The caller retains one policy
@@ -699,20 +827,8 @@ pub fn planGeometry(backend: compute.BackendKind, allocator: Allocator, config: 
     var quiet = supplied;
     quiet.observer = null;
     var planned = try prepareTokenizedDocument(backend, allocator, config, tokenizer, item, quiet);
-    defer planned.document.deinit();
+    defer planned.deinit();
     const used = try admitWindows(backend, allocator, config, tokenizer, item, &planned, receiver);
-    // Execution batches compatible windows. Workspace admission must include
-    // their padded physical rows, rather than only individual window lengths.
-    const batchable = item.compiled.schema.joint_ie == null and
-        (item.compiled.schema.classifications.len == 0 or backend == .cuda);
-    var start: usize = 0;
-    while (start < planned.document.windows.len) {
-        const n = if (batchable) @max(1, @min(planned.options.limits.window_batch_size, planned.document.windows.len - start)) else 1;
-        var prepared = try prepareWindowGroup(backend, allocator, config, tokenizer, item, &planned, start, n);
-        defer prepared.deinit();
-        if (comptime @hasDecl(@TypeOf(receiver.*), "observeWindowGroup")) receiver.observeWindowGroup(&prepared);
-        start += prepared.samples.len;
-    }
 
     try check(quiet);
     return used;
@@ -767,14 +883,15 @@ fn encodeGroup(
 
 fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options, gate: ?*qualification.Admission) !Result {
     var planned = try prepareTokenizedDocument(cb.kind(), allocator, config, tokenizer, item, supplied);
-    defer planned.document.deinit();
+    defer planned.deinit();
     const options = planned.options;
     const document = planned.document;
     const engine_options = planned.engine_options;
     const device_options = planned.device_options;
     const used = try admitWindows(cb.kind(), allocator, config, tokenizer, item, &planned, &WindowGate{ .value = gate });
     const tokens = used.prompt_tokens;
-    const attention = used.attention_work_items;
+    var attention: u64 = 0;
+    var encoded_tokens: usize = 0;
     // Both addresses remain valid until all retained window/metadata owners
     // have deinitialized. No callback or failure pointer escapes this call.
     var terminal: EvidenceAllocationFailure = null;
@@ -800,6 +917,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
         (item.compiled.schema.classifications.len == 0 or cb.kind() == .cuda);
 
     var start: usize = 0;
+    var group_index: usize = 0;
     while (start < document.windows.len) {
         try check(options);
         // The configured group size is a starting point, not a fixed shape:
@@ -812,7 +930,10 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
         // admission already ran through admitWindows above one window at a
         // time, independent of how windows get grouped for execution, so a
         // smaller runtime group needs no re-admission.
-        var n: usize = if (batchable) @max(1, @min(options.limits.window_batch_size, document.windows.len - start)) else 1;
+        const group = planned.cache.?.groups[group_index];
+        const group_end = group.start + group.count;
+        // OOM subdivisions never cross an admitted group's boundary.
+        var n = group_end - start;
         var prepared: processor.PreparedBatch = undefined;
         var result: pipeline.WindowResult = attempt: while (true) {
             observation.emit(options.observer, .{ .phase = .tokenizing });
@@ -829,15 +950,23 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             const schemas = allocator.alloc(SchemaPtr, n) catch |err| return evidenceAllocationError(terminal, err);
             defer allocator.free(schemas);
             for (schemas) |*s| s.* = &item.compiled;
+            // Charge every attempted physical group, including work that may
+            // precede a backing OOM. Retry work cannot escape request budgets.
+            const attempt_usage = try physicalUsage(config, &prepared, engine_options);
+            if (attempt_usage.tokens > options.limits.max_total_encoded_tokens - encoded_tokens or
+                attempt_usage.attention > options.limits.max_total_attention_work.? - attention) return error.LongDocumentWorkLimitExceeded;
+            encoded_tokens += attempt_usage.tokens;
+            attention += attempt_usage.attention;
             if (encodeGroup(cb, allocator, config, &prepared, engine_options, device_options, schemas, budget.allocator(), pipeline_options, options.control, options.pipeline.head_limits)) |value| {
                 break :attempt value;
             } else |err| {
-                if (err == error.OutOfMemory and n > 1) {
+                const classified = evidenceAllocationError(terminal, err);
+                if (classified == error.OutOfMemory and n > 1) {
                     prepared.deinit();
                     n = (n + 1) / 2;
                     continue :attempt;
                 }
-                return evidenceAllocationError(terminal, err);
+                return classified;
             }
         };
         defer prepared.deinit();
@@ -858,6 +987,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             observation.emit(options.observer, .window_completed);
         }
         start += n;
+        if (start == group_end) group_index += 1;
     }
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -865,7 +995,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
     var sample = try mergeAll(allocator, arena.allocator(), document, windows, item, config, options);
     sample.long_document = .{ .window_count = windows.len, .other_record_identity = if (document.descriptor.other_record_identity == .occurrence) .occurrence else .semantic };
     try check(options);
-    return .{ .arena = arena, .sample = sample, .prompt_tokens = tokens, .attention_work_items = attention, .window_count = windows.len, .descriptor = document.descriptor, .inference_fingerprint = document.inference_fingerprint.?, .peak_evidence_bytes = budget.peak };
+    return .{ .arena = arena, .sample = sample, .prompt_tokens = tokens, .encoded_tokens = encoded_tokens, .attention_work_items = attention, .window_count = windows.len, .descriptor = document.descriptor, .inference_fingerprint = document.inference_fingerprint.?, .peak_evidence_bytes = budget.peak };
 }
 
 test "boundary qualification default document work admits the full encoder context" {

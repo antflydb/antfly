@@ -148,12 +148,18 @@ fn parity(comptime backend: enum { native, metal, cuda }) !void {
         defer a.free(expected_json);
         const expected = try std.json.parseFromSlice(pipeline.ExpectedSample, a, expected_json, .{ .ignore_unknown_fields = true });
         defer expected.deinit();
+        var normal_group_tokens: usize = 0;
+        var normal_group_attention: u64 = 0;
         for ([_]usize{ 2, 4 }) |group_size| {
             var grouped_options = options;
             grouped_options.limits.window_batch_size = group_size;
             var grouped_gate = try @import("gliner_boundary_qualification.zig").Admission.init(options.identity, .cuda, &request, control);
             var grouped = try long.executeQualified(&managed.backend, a, &config, tokenizer.tokenizer(), item, grouped_options, &grouped_gate);
             defer grouped.deinit();
+            if (group_size == 4) {
+                normal_group_tokens = grouped.encoded_tokens;
+                normal_group_attention = grouped.attention_work_items;
+            }
             try std.testing.expectEqual(serial.window_count, grouped.window_count);
             try pipeline.expectSample(expected.value, grouped.sample, pipeline.fp32_confidence_tolerance);
         }
@@ -171,6 +177,19 @@ fn parity(comptime backend: enum { native, metal, cuda }) !void {
         try std.testing.expect(failure.attempts > (serial.window_count + 3) / 4);
         try std.testing.expectEqual(serial.window_count, recovered.window_count);
         try pipeline.expectSample(expected.value, recovered.sample, pipeline.fp32_confidence_tolerance);
+        try std.testing.expectEqual(serial.prompt_tokens, recovered.prompt_tokens);
+        try std.testing.expect(recovered.encoded_tokens > normal_group_tokens);
+        try std.testing.expect(recovered.attention_work_items > normal_group_attention);
+        // The original physical quota admits the no-failure request, but
+        // cannot silently absorb extra attempts after a backing OOM.
+        var capped_failure = EncodeAllocationFailure{ .allocator = std.testing.FailingAllocator.init(a, .{}) };
+        var capped_options = options;
+        capped_options.limits.window_batch_size = 4;
+        capped_options.limits.max_total_encoded_tokens = normal_group_tokens;
+        capped_options.observer = .{ .context = &capped_failure, .emit_fn = EncodeAllocationFailure.observe };
+        var capped_gate = try @import("gliner_boundary_qualification.zig").Admission.init(options.identity, .cuda, &request, control);
+        try std.testing.expectError(error.LongDocumentWorkLimitExceeded, long.executeQualified(&managed.backend, capped_failure.allocator.allocator(), &config, tokenizer.tokenizer(), item, capped_options, &capped_gate));
+        try std.testing.expect(capped_failure.allocator.has_induced_failure);
     }
 }
 

@@ -199,16 +199,37 @@ pub fn prepare(allocator: Allocator, tokenizer: Tokenizer, items: []const Item, 
     const alloc = arena.allocator();
     const markers = try Markers.resolve(alloc, tokenizer);
     const samples = try alloc.alloc(Sample, items.len);
+    var actual_tokens: usize = 0;
+    for (items, samples) |item, *sample| {
+        try options.check();
+        var builder = Builder{ .allocator = alloc, .tokenizer = tokenizer, .markers = markers, .options = options };
+        sample.* = try builder.build(item);
+        actual_tokens = std.math.add(usize, actual_tokens, sample.input_ids.len) catch return error.BoundaryBatchLimitExceeded;
+        if (actual_tokens > options.max_batch_tokens) return error.BoundaryBatchLimitExceeded;
+    }
+    return padSamples(&arena, samples, options);
+}
+
+/// Owns only padded routes and a shallow copy of the sample descriptors.
+/// Sample owners must outlive the returned batch. No tokenizer work is repeated.
+pub fn packSamples(allocator: Allocator, samples: []const Sample, options: Options) !PreparedBatch {
+    if (samples.len == 0 or samples.len > options.max_batch_items) return error.BoundaryBatchLimitExceeded;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const descriptors = try arena.allocator().dupe(Sample, samples);
+    return padSamples(&arena, descriptors, options);
+}
+
+fn padSamples(owner: *std.heap.ArenaAllocator, samples: []const Sample, options: Options) !PreparedBatch {
+    const alloc = owner.allocator();
     var sequence_length: usize = 0;
     var word_width: usize = 0;
     var query_width: usize = 0;
     var classification_width: usize = 0;
     var group_width: usize = 0;
     var actual_tokens: usize = 0;
-    for (items, samples) |item, *sample| {
+    for (samples) |sample| {
         try options.check();
-        var builder = Builder{ .allocator = alloc, .tokenizer = tokenizer, .markers = markers, .options = options };
-        sample.* = try builder.build(item);
         actual_tokens = std.math.add(usize, actual_tokens, sample.input_ids.len) catch return error.BoundaryBatchLimitExceeded;
         if (actual_tokens > options.max_batch_tokens) return error.BoundaryBatchLimitExceeded;
         sequence_length = @max(sequence_length, sample.input_ids.len);
@@ -217,10 +238,10 @@ pub fn prepare(allocator: Allocator, tokenizer: Tokenizer, items: []const Item, 
         classification_width = @max(classification_width, sample.classification_labels.len);
         group_width = @max(group_width, sample.groups.len);
     }
-    const padded_tokens = try product(items.len, sequence_length);
+    const padded_tokens = try product(samples.len, sequence_length);
     if (padded_tokens > options.max_batch_tokens) return error.BoundaryBatchLimitExceeded;
     var batch = PreparedBatch{
-        .arena = arena,
+        .arena = owner.*,
         .samples = samples,
         .sequence_length = sequence_length,
         .word_width = word_width,
@@ -230,16 +251,16 @@ pub fn prepare(allocator: Allocator, tokenizer: Tokenizer, items: []const Item, 
         // Upstream _pad_batch uses zeros, independently of pad_token_id.
         .input_ids = try zeros(i64, alloc, padded_tokens),
         .attention_mask = try zeros(i64, alloc, padded_tokens),
-        .text_word_indices = try zeros(i64, alloc, try product(items.len, word_width)),
-        .text_word_mask = try zeros(bool, alloc, try product(items.len, word_width)),
-        .query_marker_indices = try zeros(i64, alloc, try product(items.len, query_width)),
-        .query_marker_mask = try zeros(bool, alloc, try product(items.len, query_width)),
-        .query_group_index = try zeros(i64, alloc, try product(items.len, query_width)),
-        .cls_marker_indices = try zeros(i64, alloc, try product(items.len, classification_width)),
-        .cls_marker_mask = try zeros(bool, alloc, try product(items.len, classification_width)),
-        .cls_group_index = try zeros(i64, alloc, try product(items.len, classification_width)),
-        .parent_marker_indices = try zeros(i64, alloc, try product(items.len, group_width)),
-        .parent_marker_mask = try zeros(bool, alloc, try product(items.len, group_width)),
+        .text_word_indices = try zeros(i64, alloc, try product(samples.len, word_width)),
+        .text_word_mask = try zeros(bool, alloc, try product(samples.len, word_width)),
+        .query_marker_indices = try zeros(i64, alloc, try product(samples.len, query_width)),
+        .query_marker_mask = try zeros(bool, alloc, try product(samples.len, query_width)),
+        .query_group_index = try zeros(i64, alloc, try product(samples.len, query_width)),
+        .cls_marker_indices = try zeros(i64, alloc, try product(samples.len, classification_width)),
+        .cls_marker_mask = try zeros(bool, alloc, try product(samples.len, classification_width)),
+        .cls_group_index = try zeros(i64, alloc, try product(samples.len, classification_width)),
+        .parent_marker_indices = try zeros(i64, alloc, try product(samples.len, group_width)),
+        .parent_marker_mask = try zeros(bool, alloc, try product(samples.len, group_width)),
     };
     for (samples, 0..) |sample, row| {
         try options.check();
@@ -266,7 +287,7 @@ pub fn prepare(allocator: Allocator, tokenizer: Tokenizer, items: []const Item, 
     }
     try options.check();
     // All allocations above used arena through alloc; transfer its latest state.
-    batch.arena = arena;
+    batch.arena = owner.*;
     return batch;
 }
 
@@ -649,6 +670,26 @@ const TestTokenizer = struct {
         return 512;
     }
 };
+
+test "boundary processor repacks retained ragged samples without changing routes" {
+    const a = std.testing.allocator;
+    var simple = try ir.compile(a, simple_test_schema, .{});
+    defer simple.deinit();
+    var rich = try ir.compile(a, rich_test_schema, .{});
+    defer rich.deinit();
+    var tokenizer = TestTokenizer{};
+    const inputs = [_]Item{ .{ .text = "İstanbul ΟΣ", .schema = &rich }, .{ .text = "A", .schema = &simple } };
+    var expected = try prepare(a, tokenizer.tokenizer(), &inputs, .{});
+    defer expected.deinit();
+    var left = try prepare(a, tokenizer.tokenizer(), inputs[0..1], .{});
+    defer left.deinit();
+    var right = try prepare(a, tokenizer.tokenizer(), inputs[1..2], .{});
+    defer right.deinit();
+    var repacked = try packSamples(a, &.{ left.samples[0], right.samples[0] }, .{});
+    defer repacked.deinit();
+    inline for (.{ "samples", "sequence_length", "word_width", "query_width", "classification_width", "group_width", "input_ids", "attention_mask", "text_word_indices", "text_word_mask", "query_marker_indices", "query_marker_mask", "query_group_index", "cls_marker_indices", "cls_marker_mask", "cls_group_index", "parent_marker_indices", "parent_marker_mask" }) |field|
+        try std.testing.expectEqualDeep(@field(expected, field), @field(repacked, field));
+}
 
 test "boundary processor limits are atomic and empty subwords never shift offsets" {
     const allocator = std.testing.allocator;

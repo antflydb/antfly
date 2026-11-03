@@ -34,7 +34,10 @@ const Allocator = std.mem.Allocator;
 const observation = @import("extraction_observer.zig");
 const qualification = @import("gliner_boundary_qualification.zig");
 
+pub const PreparationStore = long_executor.PreparationStore;
+
 pub const Options = struct {
+    preparations: ?*PreparationStore = null,
     max_response_bytes: usize = 64 * 1024 * 1024,
     processor: processor.Options = .{},
     engine: engine.Options = .{},
@@ -154,9 +157,13 @@ pub fn executeQualified(cb: *const compute.ComputeBackend, allocator: Allocator,
         .cuda => .cuda,
         else => .native,
     }, request, options.pipeline, options.control);
-    try qualifyRequestGeometry(cb, allocator, config, tokenizer, request, options, &gate);
+    var local_store = PreparationStore.init(allocator);
+    defer local_store.deinit();
+    var prepared_options = options;
+    if (prepared_options.preparations == null) prepared_options.preparations = &local_store;
+    try qualifyRequestGeometry(cb, allocator, config, tokenizer, request, prepared_options, &gate);
     if (options.control) |control| try control.check();
-    return executeChecked(cb, allocator, config, tokenizer, request, options, &gate);
+    return executeChecked(cb, allocator, config, tokenizer, request, prepared_options, &gate);
 }
 
 /// The receiver is a compile-time parameter for the quiet scalar observation
@@ -320,6 +327,7 @@ fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, confi
             var pipeline_options = item.options.native(options.pipeline);
             pipeline_options.control = options.control;
             const used = try long_executor.planGeometry(backend, allocator, config, tokenizer, item, .{
+                .preparations = options.preparations,
                 .identity = options.identity.?,
                 .processor = item.options.preprocessing(options.processor),
                 .engine = options.engine,
@@ -331,7 +339,7 @@ fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, confi
                 .control = options.control,
                 .observer = null,
             }, gate);
-            remaining_tokens -= used.prompt_tokens;
+            remaining_tokens -= used.encoded_tokens;
             remaining_attention -= used.attention_work_items;
             remaining_windows -= used.window_count;
             index += 1;
@@ -375,6 +383,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             pipeline_options.control = options.control;
             pipeline_options.max_output_values = remaining_values;
             const long_options = long_executor.Options{
+                .preparations = options.preparations,
                 .identity = options.identity orelse return error.MissingGlinerBoundaryIdentity,
                 .processor = item.options.preprocessing(options.processor),
                 .engine = options.engine,
@@ -398,7 +407,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             const used = try outputValues(result.sample);
             if (used > remaining_values) return error.ExtractionOutputLimitExceeded;
             remaining_values -= used;
-            remaining_window_tokens -= result.prompt_tokens;
+            remaining_window_tokens -= result.encoded_tokens;
             remaining_window_attention -= result.attention_work_items;
             remaining_windows -= result.window_count;
             prompt_tokens = try std.math.add(usize, prompt_tokens, result.prompt_tokens);
@@ -1176,10 +1185,19 @@ test "boundary qualification real base tokenizer fits full encoded context" {
 
 test "boundary full context learned Metal base serving uses word and token capacity" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    try learnedFullContext(.metal);
+}
+
+test "boundary full context learned CUDA base serving uses word and token capacity" {
+    if (!@import("build_options").enable_cuda) return error.SkipZigTest;
+    try learnedFullContext(.cuda);
+}
+
+fn learnedFullContext(comptime backend: enum { metal, cuda }) !void {
     const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const factory = @import("../architectures/session_factory.zig");
-    const session = try factory.createMetalSession(a, directory);
+    const session = if (backend == .metal) try factory.createMetalSession(a, directory) else try factory.createCudaSession(a, directory);
     defer session.close();
     const config = try factory.getGlinerBoundaryConfig(session);
     const identity = try factory.getGlinerBoundaryIdentity(session);
@@ -1222,7 +1240,7 @@ test "boundary full context learned Metal base serving uses word and token capac
     const rows = root.get("data").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqual(@as(i64, 1), rows[0].object.get("long_document").?.object.get("window_count").?.integer);
-    std.debug.print("full-context learned Metal: body_words={} prompt_tokens={} windows=1\n", .{ config.max_len, exact_tokens });
+    std.debug.print("full-context learned {s}: body_words={} prompt_tokens={} windows=1\n", .{ @tagName(backend), config.max_len, exact_tokens });
 
     // Exercise the independent encoded-token boundary with the real tokenizer,
     // weights and default work budget too. Measure one word's token cost using
@@ -1251,7 +1269,142 @@ test "boundary full context learned Metal base serving uses word and token capac
     const dense_root = dense_parsed.value.object;
     try std.testing.expectEqual(@as(i64, @intCast(dense_tokens)), dense_root.get("usage").?.object.get("prompt_tokens").?.integer);
     try std.testing.expectEqual(@as(i64, 1), dense_root.get("data").?.array.items[0].object.get("long_document").?.object.get("window_count").?.integer);
-    std.debug.print("full-context learned Metal: prompt_tokens={}/{} windows=1 default_work_budget\n", .{ dense_tokens, capacity });
+    std.debug.print("full-context learned {s}: prompt_tokens={}/{} windows=1 default_work_budget\n", .{ @tagName(backend), dense_tokens, capacity });
+}
+
+const PreparationReuseTest = struct {
+    const Receiver = struct {
+        encoded: usize = 0,
+        attention: u64 = 0,
+        single_attention: u64 = 0,
+        pub fn observe(self: *@This(), _: usize, _: usize, _: usize, prepared: *const processor.PreparedBatch) !void {
+            self.single_attention += prepared.sequence_length * prepared.sequence_length;
+        }
+        pub fn observeWindowGroup(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            self.encoded += prepared.input_ids.len;
+            self.attention += prepared.samples.len * prepared.sequence_length * prepared.sequence_length;
+        }
+    };
+    fn exercise(a: Allocator) !void {
+        var request = try wire.parseJson(a,
+            \\{"schema_version":2,"model":"geometry-only","schema":{"entities":["concept"]},"options":{"long_document":{"mode":"window","window_words":4,"overlap_words":1}},"inputs":[{"content":"a b c d e f g h i j k l m n o p q r s t"}]}
+        , .{});
+        defer request.deinit();
+        var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+        const config = QualificationGeometryTest.config();
+        var store = PreparationStore.init(a);
+        defer store.deinit();
+        var identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+        identity.backbone = config.backbone;
+        const options = long_executor.Options{ .preparations = &store, .identity = identity };
+        var receiver = Receiver{};
+        const used = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+        try std.testing.expect(used.encoded_tokens > used.prompt_tokens);
+        try std.testing.expectEqual(receiver.encoded, used.encoded_tokens);
+        try std.testing.expectEqual(receiver.attention, used.attention_work_items);
+        const calls = tokenizer.calls;
+        receiver = .{};
+        const repeated = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+        try std.testing.expectEqual(calls, tokenizer.calls);
+        try std.testing.expectEqualDeep(used, repeated);
+        // Decoder caps may change after earlier items produce output; they
+        // must refresh semantic identity without re-tokenizing these windows.
+        var decoded = options;
+        decoded.pipeline.max_output_values -= 1;
+        const adjusted = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], decoded, &receiver);
+        try std.testing.expectEqualDeep(used, adjusted);
+        try std.testing.expectEqual(calls, tokenizer.calls);
+
+        receiver = .{};
+        _ = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+        try std.testing.expect(receiver.single_attention < used.attention_work_items);
+        var limited = options;
+        limited.limits.max_total_attention_work = receiver.single_attention;
+        const attention_failure = long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], limited, &receiver);
+        if (attention_failure) |_| return error.TestUnexpectedResult else |err| {
+            if (err == error.OutOfMemory) return err;
+            try std.testing.expectEqual(@as(anyerror, error.LongDocumentWorkLimitExceeded), err);
+        }
+        limited = options;
+        limited.limits.max_total_encoded_tokens = used.prompt_tokens;
+        const token_failure = long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], limited, &receiver);
+        if (token_failure) |_| return error.TestUnexpectedResult else |err| {
+            if (err == error.OutOfMemory) return err;
+            try std.testing.expectEqual(@as(anyerror, error.LongDocumentWorkLimitExceeded), err);
+        }
+        limited = options;
+        limited.limits.max_prepared_bytes = 1;
+        const memory_failure = long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], limited, &receiver);
+        if (memory_failure) |_| return error.TestUnexpectedResult else |err| {
+            if (err == error.OutOfMemory) return err;
+            try std.testing.expectEqual(@as(anyerror, error.MemoryBudgetExceeded), err);
+        }
+        _ = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+        try std.testing.expectEqual(calls, tokenizer.calls);
+    }
+};
+
+test "boundary qualification padded work and repeated planning reuse bounded samples" {
+    try PreparationReuseTest.exercise(std.testing.allocator);
+}
+
+test "boundary qualification retained preparation releases every failed allocation" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, PreparationReuseTest.exercise, .{});
+}
+
+test "boundary preparation benchmark isolates request-local tokenizer reuse" {
+    const env = @import("antfly_platform").env;
+    if (!env.getenvBool("ANTFLY_GLINER_PREPARATION_BENCH")) return error.SkipZigTest;
+    const directory = env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(path);
+    const bytes = try @import("../util/c_file.zig").readFile(a, path);
+    defer a.free(bytes);
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, bytes);
+    defer tokenizer.tokenizer().deinitTokenizer();
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const config_bytes = try fixtures.fixtureBytes(a, "models/base/config.json");
+    defer a.free(config_bytes);
+    const encoder_bytes = try fixtures.fixtureBytes(a, "models/base/encoder_config.json");
+    defer a.free(encoder_bytes);
+    const config = try model.parseConfig(a, config_bytes, encoder_bytes);
+    const sentence = "Alice met Bob at Antfly to discuss maintenance and visibility. ";
+    const text = try a.alloc(u8, sentence.len * 120);
+    defer a.free(text);
+    for (0..120) |i| @memcpy(text[i * sentence.len ..][0..sentence.len], sentence);
+    const raw = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = "base",
+        .schema = .{ .entities = .{ "person", "organization", "concept" } },
+        .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 128), .overlap_words = @as(usize, 16) } },
+        .inputs = .{.{ .content = text }},
+    }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    const Receiver = struct {
+        pub fn observe(_: *@This(), _: usize, _: usize, _: usize, _: *const processor.PreparedBatch) !void {}
+    };
+    var receiver = Receiver{};
+    var expected: ?long_executor.GeometryUsage = null;
+    var totals = [_]u64{ 0, 0 };
+    // ABBA ordering reduces warmup/order bias. Each request has three quiet
+    // geometry passes and a fresh store; tokenizer loading is outside timing.
+    for ([_]bool{ false, true, true, false }) |reuse| {
+        var store = PreparationStore.init(a);
+        defer store.deinit();
+        const options = long_executor.Options{ .identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1, .preparations = if (reuse) &store else null };
+        const started = @import("antfly_platform").time.monotonicNs();
+        for (0..3) |_| {
+            const used = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+            if (expected) |value| try std.testing.expectEqualDeep(value, used) else expected = used;
+        }
+        const elapsed = @import("antfly_platform").time.monotonicNs() - started;
+        totals[@intFromBool(reuse)] += elapsed;
+        std.debug.print("preparation_bench reuse={} passes=3 ns={}\n", .{ reuse, elapsed });
+    }
+    std.debug.print("preparation_bench total_without_ns={} total_with_ns={}\n", .{ totals[0], totals[1] });
 }
 
 test "boundary qualification later item and window rejection cancels quietly and retries cleanly" {

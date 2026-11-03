@@ -1,0 +1,163 @@
+{
+  "date": "2026-11-03",
+  "scope": "GLiNER prepared-window reuse and physical work admission; diagnostic preparation benchmark, not end-to-end throughput",
+  "source": {
+    "base_commit": "8c754843fb6350cde78d3684f95e992520cff81d",
+    "tested_runtime_patch_sha256": "3bbd004f725759dba4872c2212675a42a8f944847c0dcfa0cef1dc5d7eb2181d",
+    "files_sha256": {
+      "zig/pkg/inference/src/extractors/gliner_boundary_executor.zig": "dc32a3680dde256a80f98083667054b79772a384ef5792ed7741fce57d43bee6",
+      "zig/pkg/inference/src/extractors/gliner_boundary_long_executor.zig": "e8e2c5d105d3262f1da4e7bd9fe3b60f628e916598d1b25bf6a6f10aaf85229f",
+      "zig/pkg/inference/src/pipelines/gliner_boundary_long_document.zig": "2c86d7a584275faefab27d4944380871ccea05c3eed923a1449dcff222669cdd",
+      "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig": "870ea912a5d032869a3d5d7d6965bb3b85927452f00e1845fac69881d235b0f1",
+      "zig/pkg/inference/src/server/server.zig": "b8a49045c45ecfaa41d612fd4be4dfeed5df076ee52b5bbbb88ef0ae315b151a"
+    }
+  },
+  "model": {
+    "files": {
+      "config.json": {
+        "fixture": "models/base/config.json",
+        "sha256": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1",
+        "size_bytes": 3150
+      },
+      "encoder_config/config.json": {
+        "fixture": "models/base/encoder_config.json",
+        "sha256": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4",
+        "size_bytes": 857
+      },
+      "model.safetensors": {
+        "sha256": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+        "size_bytes": 774366564
+      },
+      "tokenizer.json": {
+        "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "size_bytes": 8341713
+      },
+      "tokenizer_config.json": {
+        "fixture": "models/base/tokenizer_config.json",
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+        "size_bytes": 645
+      }
+    },
+    "model_id": "fastino/gliner2.5-base-v1",
+    "revision": "72ac19b486cd4557424c8d61114e7530c243e9b0"
+  },
+  "resource_bounds": {
+    "request_preparation_store_bytes": 67108864,
+    "default_retained_window_cache_bytes": 33554432
+  },
+  "local": {
+    "host": "local macOS",
+    "optimize": "debug",
+    "passed": 71,
+    "skipped": 4,
+    "log_sha256": "034b7c68b1198c153552cefbe9f3e1acd128c18229ccd00ab93f364c6f87abd8",
+    "preparation_benchmark": {
+      "ordering": "ABBA: disabled, enabled, enabled, disabled",
+      "passes_per_request": 3,
+      "samples": [
+        {
+          "reuse": false,
+          "three_pass_request_ns": 208035000
+        },
+        {
+          "reuse": true,
+          "three_pass_request_ns": 70422000
+        },
+        {
+          "reuse": true,
+          "three_pass_request_ns": 70094000
+        },
+        {
+          "reuse": false,
+          "three_pass_request_ns": 198973000
+        }
+      ],
+      "disabled_total_ns": 407008000,
+      "enabled_total_ns": 140516000,
+      "ratio": 2.896524239232543
+    },
+    "full_context_learned": {
+      "body_words": 4096,
+      "body_boundary_prompt_tokens": 4105,
+      "dense_prompt_tokens": 16381,
+      "token_ceiling": 16384,
+      "windows_per_call": 1,
+      "default_work_budget": true
+    }
+  },
+  "cuda": {
+    "host": "glowworm",
+    "optimize": "debug",
+    "passed": 65,
+    "skipped": 0,
+    "log_sha256": "1efd4cfa4de7f0312e75a3b919f347289bca9224f87d132c71a2e654a2eb430b",
+    "preparation_benchmark": {
+      "ordering": "ABBA: disabled, enabled, enabled, disabled",
+      "passes_per_request": 3,
+      "samples": [
+        {
+          "reuse": false,
+          "three_pass_request_ns": 163578257
+        },
+        {
+          "reuse": true,
+          "three_pass_request_ns": 54671744
+        },
+        {
+          "reuse": true,
+          "three_pass_request_ns": 54661344
+        },
+        {
+          "reuse": false,
+          "three_pass_request_ns": 162851894
+        }
+      ],
+      "disabled_total_ns": 326430151,
+      "enabled_total_ns": 109333088,
+      "ratio": 2.985648324503557
+    },
+    "full_context_learned": {
+      "body_words": 4096,
+      "body_boundary_prompt_tokens": 4105,
+      "dense_prompt_tokens": 16381,
+      "token_ceiling": 16384,
+      "windows_per_call": 1,
+      "default_work_budget": true
+    },
+    "supplemental_retry_quota_check": {
+      "passed": 1,
+      "skipped": 0,
+      "log_sha256": "32b8d5e91013ac60b47f2521de31407db7600260bd85ea5418cadbcec2d427c2",
+      "test_source": "zig/pkg/inference/src/extractors/gliner_window_parity_test.zig",
+      "test_source_sha256": "d673b32fc9ba5fb664a0f76466f0afdfc311aebbb9f1708dd4d61a61ded015a8",
+      "test_patch_sha256": "6e1aaac590f995f7eb7930cc08988ebfa9e84bd8e80b259490800933e98c1329",
+      "assertions": [
+        "logical prompt usage is unchanged after recovery",
+        "encoded token and attention charges exceed the successful non-retry group plan",
+        "the successful non-retry physical quota rejects extra retry work with LongDocumentWorkLimitExceeded"
+      ]
+    }
+  },
+  "cuda_device": {
+    "name": "NVIDIA GB10",
+    "driver_version": "580.178.04",
+    "shared_host": true
+  },
+  "checks": [
+    "padded physical token and attention budgets reject ragged over-budget groups",
+    "repeated and decoder-budget-adjusted planning makes zero additional tokenizer calls",
+    "all-allocation-failure cleanup for retained preparation",
+    "declared preparation memory limit classification and recovery",
+    "repacked ragged Unicode samples preserve every input and route",
+    "semantic profile rebinding matches a freshly planned identity",
+    "native and Metal pinned parity and base upstream pipeline references",
+    "CUDA pinned window parity, group sizes 1/2/4, injected backing OOM retry",
+    "real learned full word/token boundary execution on Metal and CUDA",
+    "supplemental real CUDA OOM retry counters and exact-quota refusal"
+  ],
+  "limits": [
+    "No end-to-end inference throughput or optimized release comparison is claimed.",
+    "Repository-wide aggregate CI still requires maintainer approval.",
+    "Local skips are CUDA tests and unset small-model directory tests; CUDA run deliberately excludes native learned workloads."
+  ]
+}

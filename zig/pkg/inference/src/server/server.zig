@@ -11611,6 +11611,9 @@ pub const Node = struct {
         // and windows under the existing request heap. Observe its real CPU
         // phase while keeping decoded-item and window counters quiet. No CB or
         // model work precedes physical workspace admission.
+        var boundary_preparations = boundary_executor.PreparationStore.init(scratch);
+        defer boundary_preparations.deinit();
+        execution_options.preparations = &boundary_preparations;
         const workspace_tokens = if (execution_options.metal_execution_policy == .optimized_v2) tokens: {
             failure.* = .{ .stage = "tokenizing" };
             observer.emit(.{ .phase = .tokenizing });
