@@ -4888,7 +4888,7 @@
       "seconds": 36.04872883402277
     }
   },
-  "priority": "User requested testing whether this branch fixes issue1431 first. Run candidate-only original three-writer/status reproduction, then full15 corpus and data/index/storage checks. Defer common-control builds and broad soaks until that gate passes.",
+  "priority": "Candidate-only issue1431 gates failed. Investigate and fix the locally reproduced replay-byte-pressure admission problem before resuming final-host qualification or broad control comparisons.",
   "issue1431_candidate_debug_first": {
     "source_commit": "e63c0a4ca8d077ec4c4e129b4c21791a1d290068",
     "runtime_source_commit": "3b417dd180adadd11619a8c275fb512f09cfe7f5",
@@ -4949,7 +4949,50 @@
         3
       ]
     },
-    "original_topology": "Pending exact input indices 3/5/10 with actual CLI and no additional SQL reader. Previous stronger run used 1/2/3.",
+    "original_topology": {
+      "passed": false,
+      "seed_index": 0,
+      "writer_indices": [
+        3,
+        5,
+        10
+      ],
+      "native_busy_timeout_seconds": 5,
+      "watchdog_seconds": 900,
+      "watchdog_censored": false,
+      "peer_failure_stopped_remaining": false,
+      "reader": "actual CLI lite status, followed by one second sleep; no added SQL reader",
+      "cli_source_commit": "1ebaa00ba9221363b87d4d3e26ab1467c2cb1e0b",
+      "cli_sha256": "245c40de0cd7a14a91d65f307c2c2c77b30343eadd102cd85a0465bfa567d2b7",
+      "seconds": 327.2309901663102,
+      "writers": [
+        {
+          "input_index": 3,
+          "exit_code": 1,
+          "seconds": 327.1139002502896,
+          "error": "LiteReplayBacklogExceeded"
+        },
+        {
+          "input_index": 5,
+          "exit_code": 0,
+          "seconds": 84.40690091671422
+        },
+        {
+          "input_index": 10,
+          "exit_code": 0,
+          "seconds": 229.7411942910403
+        }
+      ],
+      "status_reader": {
+        "successful_reads": 237,
+        "active_writer_reads": 236,
+        "failures": 0,
+        "median_seconds": 0.22785658296197653,
+        "max_seconds": 7.058880874887109
+      },
+      "file_bytes": 864124928,
+      "harness_sha256": "16ef75444c0ab6ce476f1e2102b23dceddc468f66c08fb2a29191481c6d5adfc"
+    },
     "full15": {
       "passed": false,
       "attempted": 8,
@@ -4988,6 +5031,67 @@
       "full_cli_build": "passed",
       "cli_sha256": "245c40de0cd7a14a91d65f307c2c2c77b30343eadd102cd85a0465bfa567d2b7",
       "public_database_status_smoke_passed": true
-    }
+    },
+    "postfailure_physical_integrity": {
+      "scope": "Actual CLI check after every importer and reader exited. Physical integrity is distinct from complete acknowledged-payload, search/catch-up and end-to-end performance qualification.",
+      "full15_partial": {
+        "valid": true,
+        "tail_bytes": 0,
+        "seconds": 64.3770174169913,
+        "live_bytes": 739295666,
+        "live_records": 1521234,
+        "file_bytes": 1243435008,
+        "compact_size": 1042489344
+      },
+      "original_contention": {
+        "valid": true,
+        "tail_bytes": 0,
+        "seconds": 49.19937187526375,
+        "live_bytes": 493882778,
+        "live_records": 1190828,
+        "file_bytes": 864124928,
+        "compact_size": 728707072
+      }
+    },
+    "local_input7_reproducer": {
+      "source": "same immutable original importer and e5217fe9 Debug library, original frozen input 7 only, fresh database",
+      "passed": false,
+      "exit_code": 1,
+      "seconds": 540.5882089999504,
+      "watchdog_censored": false,
+      "error": "LiteReplayBacklogExceeded",
+      "metrics_enabled": true,
+      "scope": "Local diagnosis with two one-second profiles and two read-only pressure probes; not a matched throughput benchmark. Reproduces without the preceding seven imports. Private inputs/logs/databases were not exported from wolfspider.",
+      "postfailure_replay_admission": {
+        "bytes": 16624856,
+        "records": 344,
+        "limits": {
+          "bytes": 16777216,
+          "records": 4096
+        }
+      },
+      "lagging_indexes": [
+        {
+          "namespace_ordinal": 13,
+          "kind": "full_text",
+          "applied_sequence": 29,
+          "target_sequence": 91,
+          "replay_document_not_visible_skipped": 0
+        },
+        {
+          "namespace_ordinal": 37,
+          "kind": "full_text",
+          "applied_sequence": 59,
+          "target_sequence": 91,
+          "replay_document_not_visible_skipped": 0
+        }
+      ],
+      "profile_observations": [
+        "An early worker sample was preparing full-text segments, including analyzer work.",
+        "A later foreground sample was resolving SQL commit intents and publishing primary batches. These samples do not establish whole-run cost attribution."
+      ],
+      "next_step": "Minimize the local replay-byte-pressure reproducer and measure consumer progress/credit retirement across a large SQL commit. Preserve the precommit versus committed outcome distinction and bounded growth. Do not merely increase limits or claim the same optimized outcome without testing."
+    },
+    "decision": "Issue1431 is not qualified as fixed. Both candidate-only Debug original-topology contention and full15 gate failed replay-capacity admission; both stopped databases passed physical integrity. Expanded controls, optimized comparisons and long soaks remain deferred."
   }
 }
