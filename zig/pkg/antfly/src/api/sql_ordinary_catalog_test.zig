@@ -44,6 +44,7 @@ const Source = struct {
     lose: enum { none, before, after } = .none,
     hide: bool = false,
     fail_result_after_apply: ?*std.testing.FailingAllocator = null,
+    forge_relation_placement: bool = false,
     fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
         return .{ .metadata_group_id = group, .metrics = .{} };
     }
@@ -119,7 +120,13 @@ const Source = struct {
             .sql_catalog_prepare => |request| blk: {
                 self.prepares += 1;
                 try std.testing.expect(!self.locked);
-                break :blk @import("../system_catalog/operations.zig").prepareSqlCatalog(self, alloc, context, request);
+                const bytes = try @import("../system_catalog/operations.zig").prepareSqlCatalog(self, alloc, context, request);
+                if (!self.forge_relation_placement or request.relation == null) break :blk bytes;
+                defer alloc.free(bytes);
+                var parsed = try std.json.parseFromSlice(@import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand, alloc, bytes, .{});
+                defer parsed.deinit();
+                parsed.value.sql_relation.?.change.definition.table.placement_role = "forged-role";
+                break :blk std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
             },
             .sql_catalog_mutate => |command| @import("../system_catalog/operations.zig").mutateSqlCatalog(self, alloc, context, command),
             .sql_catalog_outcome => |request| blk: {
@@ -135,6 +142,11 @@ const Source = struct {
             },
             .read => |request| self.store.systemCatalogRead(alloc, group, request),
             .sql_type_bindings => |request| self.store.sqlTypeBindings(alloc, group, request, context),
+            .constraint_name_prepare => |request| self.store.prepareConstraintNamesJsonWithContext(alloc, group, .{ .addition = request }, context),
+            .constraint_name_check => |request| blk: {
+                try self.store.checkConstraintNamesWithContext(alloc, group, request, context);
+                break :blk alloc.dupe(u8, "true");
+            },
             else => error.UnexpectedOrdinaryCatalogCall,
         };
     }
@@ -461,4 +473,187 @@ test "SQL catalog ordinary view outcome decoder preserves object generations and
     try std.testing.expect((try T.decoded(request, result)) == null);
     result.removed = 1;
     try std.testing.expect((try T.decoded(request, result)) != null);
+}
+
+fn createRows(server: *http.ApiHttpServer, alloc: A, fence: L.scopes.CommandFence, declaration_sql: []const u8) !u64 {
+    var declaration = try local.sql_compiler.compile(alloc, declaration_sql, .{});
+    defer declaration.deinit();
+    const schema = try local.sql_ddl_runtime.createSchemaAlloc(alloc, declaration.statement.create_table);
+    const outcome = try @import("sql_catalog.zig").executeWithAllocators(server, null, .{ .sql_command_fence = &fence }, "default", "public", .{ .result = alloc, .scratch = alloc }, .{ .create_table = .{ .name = .{ .table = "annotated_rows" }, .schema_json = schema, .if_not_exists = false } }, null);
+    return outcome.catalog_receipt.?.object_id.?;
+}
+
+test "SQL catalog ordinary schema and annotation commands retain exact outcomes across lost replies and cold reopen" {
+    const Case = struct { declaration: []const u8, statements: []const []const u8 };
+    const cases = [_]Case{
+        .{ .declaration = "CREATE TABLE annotated_rows(id BIGINT,note TEXT,CONSTRAINT rows_id_check CHECK(id > 0))", .statements = &.{
+            "COMMENT ON TABLE annotated_rows IS 'stable presentation'",
+            "COMMENT ON COLUMN annotated_rows.id IS 'stable attribute'",
+            "COMMENT ON COLUMN annotated_rows.note IS 'new attribute'",
+            "COMMENT ON COLUMN annotated_rows.note IS NULL",
+            "CREATE INDEX rows_note_idx ON annotated_rows(note)",
+            "COMMENT ON INDEX rows_note_idx IS 'stable index'",
+            "COMMENT ON INDEX rows_note_idx IS NULL",
+            "COMMENT ON CONSTRAINT rows_id_check ON annotated_rows IS 'stable constraint'",
+            "COMMENT ON CONSTRAINT rows_id_check ON annotated_rows IS NULL",
+        } },
+        .{ .declaration = "CREATE TABLE annotated_rows(id BIGINT,note TEXT)", .statements = &.{ "ALTER TABLE annotated_rows ADD COLUMN extra TEXT", "COMMENT ON COLUMN annotated_rows.extra IS 'added column'" } },
+        .{ .declaration = "CREATE TABLE annotated_rows(id BIGINT,note TEXT)", .statements = &.{"ALTER TABLE annotated_rows ALTER COLUMN note SET DEFAULT 'future'"} },
+        .{ .declaration = "CREATE TABLE annotated_rows(id BIGINT,note TEXT DEFAULT 'future')", .statements = &.{"ALTER TABLE annotated_rows ALTER COLUMN note DROP DEFAULT"} },
+        .{ .declaration = "CREATE TABLE annotated_rows(id BIGINT,note TEXT)", .statements = &.{ "ALTER TABLE annotated_rows ADD CONSTRAINT rows_id_check CHECK(id > 0) NOT VALID", "COMMENT ON CONSTRAINT rows_id_check ON annotated_rows IS 'deferred constraint'" } },
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (cases, 0..) |case, ordinal| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/schema-notes-{d}", .{ tmp.sub_path, ordinal });
+        var store = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        var source: Source = .{ .store = &store };
+        const fence = try source.setup(alloc);
+        var server = source.server();
+        defer server.deinit();
+        const table_id = try createRows(&server, alloc, fence, case.declaration);
+        const initial = (try store.getTable(alloc, group, table_id)).?;
+        defer @import("../metadata/table_manager.zig").freeTable(alloc, initial);
+        var receipts: std.ArrayList(catalog.CatalogOperationReceipt) = .empty;
+        var prior_version = try @import("tables.zig").schemaVersion(initial.schema_json);
+        for (case.statements) |sql| {
+            source.lose = .after;
+            const before = source.attempts;
+            const prior_catalog = try store.systemCatalogMeta(alloc, group);
+            const outcome = try executeSql(&server, alloc, .{ .sql_command_fence = &fence }, sql);
+            const receipt = outcome.catalog_receipt orelse return error.MissingRelationReceipt;
+            try std.testing.expectEqual(.committed, receipt.state);
+            try std.testing.expectEqual(.table, receipt.kind);
+            try std.testing.expectEqual(before + 1, source.attempts);
+            try std.testing.expectEqual(@as(?u64, table_id), receipt.object_id);
+            const table = (try store.getTable(alloc, group, table_id)).?;
+            defer @import("../metadata/table_manager.zig").freeTable(alloc, table);
+            const version = try @import("tables.zig").schemaVersion(table.schema_json);
+            if (std.mem.startsWith(u8, sql, "COMMENT")) {
+                try std.testing.expectEqual(@as(?u64, prior_catalog.revision), receipt.catalog_revision);
+                try std.testing.expectEqual(prior_version, version);
+            } else {
+                try std.testing.expectEqual(prior_version + 1, version);
+                prior_version = version;
+            }
+            try receipts.append(alloc, receipt);
+        }
+        const before = try store.systemCatalogMeta(alloc, group);
+        const attempts = source.attempts;
+        store.deinit();
+        store = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        try source.scope(alloc, fence, 5000, .{ .fence = .close });
+        for (receipts.items) |receipt| {
+            const recovered = (try ordinary.recoverIfOrdinary(&server, null, .{}, alloc, receipt.recovery_token)).?;
+            try std.testing.expectEqual(.committed, recovered.state);
+            try std.testing.expectEqual(receipt.catalog_revision, recovered.catalog_revision);
+            try std.testing.expectEqual(receipt.object_id, recovered.object_id);
+        }
+        try std.testing.expectEqual(attempts, source.attempts);
+        try std.testing.expectEqual(before.revision, (try store.systemCatalogMeta(alloc, group)).revision);
+    }
+}
+
+fn relationImage(store: *storage.RaftApplyStore, alloc: A, guard: domain.RelationMutationGuard) ![]const u8 {
+    const table = (try store.getTable(alloc, group, guard.owner.table_id)).?;
+    var columns = try store.getSqlColumnIdentities(alloc, group, guard);
+    defer columns.deinit();
+    const object = try store.getSqlObjectAnnotation(alloc, group, .{ .guard = guard, .key = .{ .kind = .constraint, .name = "rows_id_check" } });
+    return std.json.Stringify.valueAlloc(alloc, .{ .table = table, .columns = columns.value, .object = object }, .{});
+}
+
+test "SQL catalog ordinary relation faults roll back all definition and annotation effects and retire definite refusals" {
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try storage.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/relation-faults", .{tmp.sub_path}) });
+    defer store.deinit();
+    var source: Source = .{ .store = &store };
+    const fence = try source.setup(alloc);
+    var server = source.server();
+    defer server.deinit();
+    const table_id = try createRows(&server, alloc, fence, "CREATE TABLE annotated_rows(id BIGINT,note TEXT,CONSTRAINT rows_id_check CHECK(id > 0))");
+    const captured = (try @import("sql_catalog.zig").captureTableAdmission(&server, null, .{}, alloc, .{ .table = "annotated_rows" }, true, null)).?;
+    for ([_][]const u8{
+        "COMMENT ON TABLE annotated_rows IS 'rollback table'",
+        "COMMENT ON COLUMN annotated_rows.id IS 'rollback column'",
+        "COMMENT ON CONSTRAINT rows_id_check ON annotated_rows IS 'rollback object'",
+        "ALTER TABLE annotated_rows ADD COLUMN rolled_back TEXT",
+    }) |sql| {
+        const before = try relationImage(&store, alloc, captured.guard);
+        const meta = try store.systemCatalogMeta(alloc, group);
+        store.sql_catalog_post_effect_error = error.CatalogGenerationChanged;
+        const outcome = try executeSql(&server, alloc, .{ .sql_command_fence = &fence }, sql);
+        try std.testing.expectEqual(.unknown, outcome.catalog_receipt.?.state);
+        try std.testing.expectEqualStrings(before, try relationImage(&store, alloc, captured.guard));
+        try std.testing.expectEqualDeep(meta, try store.systemCatalogMeta(alloc, group));
+    }
+    const Completion = struct {
+        id: u64,
+        version: u32,
+        prepared: usize = 0,
+        rejected: usize = 0,
+        fn txn(_: *anyopaque, _: [16]u8) !void {
+            return error.UnexpectedTransactionPreparation;
+        }
+        fn prepare(raw: *anyopaque, owner: local.api_operation.SQLCompletionOwner) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.id, owner.id);
+            try std.testing.expectEqual(self.version, owner.schema_version);
+            self.prepared += 1;
+        }
+        fn reject(raw: *anyopaque, owner: local.api_operation.SQLCompletionOwner) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.id, owner.id);
+            try std.testing.expectEqual(self.version, owner.schema_version);
+            self.rejected += 1;
+        }
+    };
+    var completion: Completion = .{ .id = table_id, .version = captured.guard.owner.schema_version + 1 };
+    source.forge_relation_placement = true;
+    const before = try relationImage(&store, alloc, captured.guard);
+    const meta = try store.systemCatalogMeta(alloc, group);
+    try std.testing.expectError(error.InvalidCatalogMutation, executeSql(&server, alloc, .{ .sql_command_fence = &fence, .sql_completion = .{ .ptr = &completion, .prepare_transaction = Completion.txn, .prepare_metadata = Completion.prepare, .reject_metadata = Completion.reject } }, "ALTER TABLE annotated_rows ADD COLUMN forged TEXT"));
+    try std.testing.expectEqual(@as(usize, 1), completion.prepared);
+    try std.testing.expect(completion.rejected != 0);
+    try std.testing.expectEqualStrings(before, try relationImage(&store, alloc, captured.guard));
+    try std.testing.expectEqual(meta.revision, (try store.systemCatalogMeta(alloc, group)).revision);
+}
+
+test "SQL catalog ordinary relation completion owns response identities before admission and preserves unknown recovery" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |unknown| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var store = try storage.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/relation-allocation-{s}", .{ tmp.sub_path, if (unknown) "unknown" else "known" }) });
+        defer store.deinit();
+        var source: Source = .{ .store = &store };
+        const fence = try source.setup(alloc);
+        var server = source.server();
+        defer server.deinit();
+        _ = try createRows(&server, alloc, fence, "CREATE TABLE annotated_rows(id BIGINT,note TEXT)");
+        var failed = std.testing.FailingAllocator.init(alloc, .{});
+        source.fail_result_after_apply = &failed;
+        defer source.fail_result_after_apply = null;
+        source.lose = if (unknown) .after else .none;
+        source.hide = unknown;
+        var compiled = try local.sql_compiler.compile(alloc, "ALTER TABLE annotated_rows ADD COLUMN retained TEXT", .{});
+        defer compiled.deinit();
+        const outcome = try @import("sql_catalog.zig").executeWithAllocators(&server, null, .{ .sql_command_fence = &fence }, "default", "public", .{ .result = failed.allocator(), .scratch = a }, .{ .catalog_ddl = compiled.statement.catalog_ddl }, null);
+        try std.testing.expect(!failed.has_induced_failure);
+        try std.testing.expectEqual(if (unknown) catalog.CatalogOperationReceipt.State.unknown else .committed, outcome.catalog_receipt.?.state);
+        source.hide = false;
+        const attempts = source.attempts;
+        const recovered = (try ordinary.recoverIfOrdinary(&server, null, .{}, alloc, outcome.catalog_receipt.?.recovery_token)).?;
+        try std.testing.expectEqual(.committed, recovered.state);
+        try std.testing.expectEqual(attempts, source.attempts);
+    }
 }

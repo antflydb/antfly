@@ -1186,8 +1186,10 @@ exclusive under the existing native envelope validator.
 Public SQL automatic connection enrollment is still gated. Ordinary DDL now
 joins public recovery receipts and authorization labels; public view definitions
 use the shared native journal with or without an enrolled command scope. Remaining
-work includes automatic ingress enrollment and guards for schema/annotation
-and table lifecycle mutation families. A private native outcome is not evidence that those
+work includes automatic ingress enrollment and coordinated validation, retirement,
+generation publication and table lifecycle mutation families. Scoped straight-line
+schema definitions and annotations now share the native journal and recovery
+receipts; presentation-only outcomes preserve schema and catalog epochs. A private native outcome is not evidence that those
 complete public features are activated. The original parity inventory remains
 unchanged by this command-boundary work. See the
 [view command integration](sql-catalog-lifecycle-parity.md#view-definitions-share-native-command-outcomes).

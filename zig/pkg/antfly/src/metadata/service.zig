@@ -555,6 +555,7 @@ fn commentObjectWithContextReceipt(service: anytype, context: api_operation.Requ
     });
     service.alloc.free(candidate);
     const incarnation = (try service.metadataIncarnation()) orelse return error.MissingMetadataIncarnation;
+    context.markSQLSubmission();
     const receipt = try service.proposeTransitionCommandWithReceipt(.{ .comment_object = command });
     service.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
     const applied_bytes = store.getSqlObjectAnnotation(service.alloc, service.metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown;
@@ -585,6 +586,7 @@ fn commentColumnWithContextReceipt(service: anytype, context: api_operation.Requ
     try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_column_comments_version);
     const command: metadata_storage.ColumnDescriptionCommand = .{ .guard = guard, .column = column, .column_id = id, .epoch = attributes.value.epoch };
     const incarnation = (try service.metadataIncarnation()) orelse return error.MissingMetadataIncarnation;
+    context.markSQLSubmission();
     const receipt = try service.proposeTransitionCommandWithReceipt(.{ .comment_column = command });
     service.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
     // After admission, only observation of the exact bound identity and value

@@ -24,6 +24,7 @@ pub const Preparation = struct {
     nonce: [16]u8,
     command_fence: ?@import("command_fence.zig").Fence = null,
     view: ?@import("views.zig").Request = null,
+    relation: ?@import("relations.zig").Intent = null,
 };
 pub const Admission = struct {
     request: outcomes.Admission,
@@ -62,16 +63,20 @@ pub const Observation = struct {
     admission: Admission,
     target: Target,
     expected_revision: u64,
+    revision_delta: u1 = 1,
     digest: [32]u8,
     pub fn validate(self: @This()) !void {
         try self.admission.validate();
         try self.target.validate();
-        if (self.expected_revision == std.math.maxInt(u64)) return error.InvalidCatalogMutation;
+        if (self.expected_revision == std.math.maxInt(u64) and self.revision_delta != 0) return error.InvalidCatalogMutation;
         if (std.mem.allEqual(u8, &self.digest, 0)) return error.InvalidCatalogMutation;
     }
 };
 const Command = @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand;
 fn hash(tag: []const u8, value: anytype) ![32]u8 {
+    return canonicalDigest(tag, value);
+}
+pub fn canonicalDigest(tag: []const u8, value: anytype) ![32]u8 {
     var state = std.crypto.hash.sha2.Sha256.init(.{});
     state.update(tag);
     var buffer: [4096]u8 = undefined;
@@ -93,6 +98,11 @@ pub fn validate(command: Command) !void {
     if (command.sql_native_index != null or command.sql_authorization != null or command.sql_type != null or command.sql_cast != null or command.sql_routine != null or command.sql_sequence != null) return error.InvalidCatalogMutation;
     if (command.version != 1 and command.version != 2 and command.version != 3 and command.version != Command.creation_sources_version) return error.InvalidCatalogMutation;
     try command.validateCreationSources();
+    if (command.sql_relation) |relation| {
+        try relation.validate();
+        const expected = @import("relations.zig").mutation(relation.guard(), relation.action());
+        if (command.version != 1 or command.sql_view != null or command.topology != null or command.placement_update != null or command.constraint_name_admission != null or command.column_sequences.len != 0 or !std.mem.eql(u8, &command.sql_catalog_admission.?.incarnation, &relation.guard().incarnation) or !std.mem.eql(u8, &try hash("antfly:sql-catalog-intent:v1", command.mutation), &try hash("antfly:sql-catalog-intent:v1", expected))) return error.InvalidCatalogMutation;
+    }
     if (command.sql_view) |view| {
         try view.validate();
         const expected = @import("views.zig").command(.{ .expected_revision = command.expected_revision, .mutation = view });
@@ -101,7 +111,7 @@ pub fn validate(command: Command) !void {
 }
 pub fn observation(_: A, command: Command) !Observation {
     try validate(command);
-    const result: Observation = .{ .admission = command.sql_catalog_admission.?, .target = .{ .kind = command.mutation.kind, .action = command.mutation.action, .database = command.mutation.database, .namespace = command.mutation.namespace, .name = command.mutation.name, .table_id = if (command.mutation.kind == .table) command.mutation.table_id else 0 }, .expected_revision = command.expected_revision, .digest = try hash("antfly:sql-catalog-command:v1", command) };
+    const result: Observation = .{ .admission = command.sql_catalog_admission.?, .target = .{ .kind = command.mutation.kind, .action = command.mutation.action, .database = command.mutation.database, .namespace = command.mutation.namespace, .name = command.mutation.name, .table_id = if (command.mutation.kind == .table) command.mutation.table_id else 0 }, .expected_revision = command.expected_revision, .revision_delta = if (command.sql_relation != null and command.sql_relation.?.action() == .comment) 0 else 1, .digest = try hash("antfly:sql-catalog-command:v1", command) };
     try result.validate();
     return result;
 }
@@ -227,4 +237,28 @@ test "SQL command fence view journal serialization binds definitions and rejects
     altered = command;
     altered.sql_view = null;
     try std.testing.expectError(error.InvalidCatalogMutation, observation(a, altered));
+}
+
+test "SQL command fence relation packets bind full records and annotation epoch policy without heap hashing" {
+    const a = std.testing.allocator;
+    const relations = @import("relations.zig");
+    const guard: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard = .{ .target = .{ .name = "rows" }, .logical_table = "rows", .owner = .{ .kind = .table, .table_id = 7, .schema_version = 1, .schema_digest = @splat(1) }, .incarnation = @splat(2) };
+    const table: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = 7, .name = "table:7", .schema_json = "{\"version\":1}" };
+    const command: Command = .{ .expected_revision = 8, .mutation = relations.mutation(guard, .comment), .sql_relation = .{ .intent_digest = @splat(3), .change = .{ .definition = .{ .mode = .description, .guard = guard, .expected = try relations.tableDigest(table), .table = table } } }, .sql_catalog_admission = .{ .request = .{ .nonce = @splat(4), .head = 0 }, .incarnation = @splat(2) } };
+    const observed = try observation(std.testing.failing_allocator, command);
+    try std.testing.expectEqual(@as(u1, 0), observed.revision_delta);
+    const bytes = try std.json.Stringify.valueAlloc(a, command, .{});
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(Command, a, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualDeep(observed, try observation(std.testing.failing_allocator, parsed.value));
+    var substituted = observed;
+    substituted.revision_delta = 1;
+    try std.testing.expect(!std.mem.eql(u8, &try boundDigest(a, observed), &try boundDigest(a, substituted)));
+    var different = table;
+    different.full_text_read_index = "changed-source";
+    try std.testing.expect(!std.mem.eql(u8, &try relations.tableDigest(table), &try relations.tableDigest(different)));
+    different = table;
+    different.sql_native_indexes_json = "[\"changed-name\"]";
+    try std.testing.expect(!std.mem.eql(u8, &try relations.tableDigest(table), &try relations.tableDigest(different)));
 }

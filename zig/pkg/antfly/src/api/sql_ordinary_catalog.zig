@@ -84,7 +84,7 @@ pub fn decodeOutcome(a: A, bytes: []const u8, request: native.Observation) ?nati
         result.validate() catch return null;
         const noop = request.target.kind == .view and request.target.action == .drop and result.no_op;
         if (noop and result.identity != null) return null;
-        if (result.revision != request.expected_revision + @as(u64, if (noop) 0 else 1) or result.removed != @intFromBool(request.target.action == .drop and !noop) or (result.no_op and !noop) or result.lock_effect != null or result.cascade_notice != null) return null;
+        if (result.revision != request.expected_revision + @as(u64, if (noop) 0 else request.revision_delta) or result.removed != @intFromBool(request.target.action == .drop and !noop) or (result.no_op and !noop) or result.lock_effect != null or result.cascade_notice != null) return null;
         if (!noop and (request.target.action == .drop or request.target.kind == .table) != (result.identity == null)) return null;
         if (result.identity) |identity| if (request.target.kind != .view and identity.generation != result.revision) return null;
     }
@@ -151,13 +151,22 @@ pub const Reply = struct {
     }
 };
 pub fn submit(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, allocators: local.sql_catalog.DdlAllocators, request: domain.Request) !Reply {
-    return submitIntent(server, identity, context, allocators, request, null);
+    return submitIntent(server, identity, context, allocators, request, null, null);
 }
 pub fn submitView(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, allocators: local.sql_catalog.DdlAllocators, view: @import("../system_catalog/views.zig").Request) !Reply {
-    return submitIntent(server, identity, context, allocators, .{ .mutation = @import("../system_catalog/views.zig").command(view).mutation }, view);
+    return submitIntent(server, identity, context, allocators, .{ .mutation = @import("../system_catalog/views.zig").command(view).mutation }, view, null);
 }
-fn submitIntent(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, allocators: local.sql_catalog.DdlAllocators, request: domain.Request, view: ?@import("../system_catalog/views.zig").Request) !Reply {
-    if (context.sql_command_fence == null and view == null) return .{ .legacy = try server.source.systemCatalog(allocators.result, context, .{ .mutate = request }) };
+pub fn submitRelation(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, allocators: local.sql_catalog.DdlAllocators, intent: @import("../system_catalog/relations.zig").Intent) !Reply {
+    try intent.validate();
+    if (context.sql_command_fence == null) return .{ .legacy = try server.source.systemCatalog(allocators.result, context, switch (intent) {
+        .schema => |value| .{ .relation_schema_mutate = value },
+        .description => |value| .{ .relation_description_mutate = value },
+    }) };
+    const relation = @import("../system_catalog/relations.zig");
+    return submitIntent(server, identity, context, allocators, .{ .mutation = relation.mutation(intent.guard(), intent.action()) }, null, intent);
+}
+fn submitIntent(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, allocators: local.sql_catalog.DdlAllocators, request: domain.Request, view: ?@import("../system_catalog/views.zig").Request, relation: ?@import("../system_catalog/relations.zig").Intent) !Reply {
+    if (context.sql_command_fence == null and view == null and relation == null) return .{ .legacy = try server.source.systemCatalog(allocators.result, context, .{ .mutate = request }) };
     var region: std.heap.ArenaAllocator = .init(allocators.scratch);
     defer region.deinit();
     const scratch = region.allocator();
@@ -168,10 +177,14 @@ fn submitIntent(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
     const command_fence = if (context.sql_command_fence) |fence| @as(?@import("../system_catalog/command_fence.zig").Fence, fence.*) else null;
-    const bytes = try server.source.systemCatalog(scratch, private, .{ .sql_catalog_prepare = .{ .request = request, .nonce = nonce, .command_fence = command_fence, .view = view } });
+    const bytes = try server.source.systemCatalog(scratch, private, .{ .sql_catalog_prepare = .{ .request = request, .nonce = nonce, .command_fence = command_fence, .view = view, .relation = relation } });
     const command = try std.json.parseFromSliceLeaky(Command, scratch, bytes, .{});
     const observation = try native.observation(scratch, command);
     if (view) |requested| if (observation.expected_revision != requested.expected_revision) return error.InvalidCatalogMutation;
+    if (relation) |requested| {
+        const prepared = command.sql_relation orelse return error.InvalidCatalogMutation;
+        if (!std.mem.eql(u8, &prepared.intent_digest, &try requested.digest()) or !std.mem.eql(u8, &try native.canonicalDigest("antfly:sql-relation-guard:v1", prepared.guard()), &try native.canonicalDigest("antfly:sql-relation-guard:v1", requested.guard()))) return error.InvalidCatalogMutation;
+    } else if (command.sql_relation != null) return error.InvalidCatalogMutation;
     // A faulty/foreign preparer cannot redirect permission or recovery labels.
     if (!try native.matchesViewIntent(scratch, command.sql_view, if (view) |value| value.mutation else null)) return error.InvalidCatalogMutation;
     if (!try native.matchesIntent(scratch, command.mutation, request.mutation) or !std.mem.eql(u8, &observation.admission.request.nonce, &nonce) or !std.meta.eql(observation.admission.request.command_fence, command_fence)) return error.InvalidCatalogMutation;
@@ -186,6 +199,11 @@ fn submitIntent(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     var outcome = if (reply) |value| decodeOutcome(scratch, value, observation) else null;
     if (outcome == null) outcome = observe(server, identity, context, scratch, observation);
     if (outcome) |known| {
+        // A retained native refusal proves that this schema owner was never
+        // changed, even though its rejection record crossed consensus.
+        if (known == .rejected and relation != null and relation.? == .schema) if (context.sql_completion_submission) |submitted| {
+            submitted.* = false;
+        };
         _ = try known.result();
         complete(&receipt, observation, known);
         return .{ .receipt = receipt, .table_id = observation.target.table_id, .table_id_text = table_id_text };

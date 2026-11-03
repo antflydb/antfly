@@ -374,6 +374,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     for ([_][]const u8{
         "SQL command fence catalog hashing streams large canonical definitions with zero heap allocation",
         "SQL command fence view journal serialization binds definitions and rejects mixed envelopes",
+        "SQL command fence relation packets bind full records and annotation epoch policy without heap hashing",
         "SQL command fence catalog identity binds the whole prepared command without duplicating intent",
         "SQL command fence catalog preparation cannot silently rebind a prepared native command",
         "SQL command fence ordinary catalog DDL journals exact topology outcomes across cold replicas and eviction",
@@ -756,6 +757,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL catalog ordinary view lifecycle retains exact lost replies dependency closure and cold recovery",
         "SQL catalog ordinary view post effect failures abort publication and journal together",
         "SQL catalog ordinary view outcome decoder preserves object generations and rejects impossible completions",
+        "SQL catalog ordinary schema and annotation commands retain exact outcomes across lost replies and cold reopen",
+        "SQL catalog ordinary relation faults roll back all definition and annotation effects and retire definite refusals",
+        "SQL catalog ordinary relation completion owns response identities before admission and preserves unknown recovery",
     }) |required| ordinary_catalog_audit.addArgs(&.{ "--filter", required });
     ordinary_catalog_audit.addArg("--inventory");
     ordinary_catalog_audit.addFileArg2(ordinary_catalog_inventory.captureStdErr(.{}), .{ .make_absolute = true });

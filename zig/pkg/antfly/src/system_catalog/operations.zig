@@ -161,13 +161,13 @@ pub fn prepareSqlCatalog(svc: anytype, alloc: std.mem.Allocator, context: operat
     if (!context.setting_admin) return error.Forbidden;
     if (std.mem.allEqual(u8, &request.nonce, 0)) return error.InvalidCatalogMutation;
     if (!std.meta.eql(request.command_fence, if (context.sql_command_fence) |fence| fence.* else null)) return error.InvalidCatalogMutation;
-    if (request.view != null) {
+    if (request.view != null or request.relation != null) {
         try context.ensureActive();
         const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_catalog_journal_version);
         try svc.ensureLinearizableReadWithContext(context);
         try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
         const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-        return @import("catalog_mutations.zig").prepareView(alloc, store, svc.metadata_group_id, request);
+        return if (request.relation != null) @import("relations.zig").prepare(alloc, store, svc.metadata_group_id, request) else @import("catalog_mutations.zig").prepareView(alloc, store, svc.metadata_group_id, request);
     }
     return mutateOrPrepare(svc, alloc, context, request.request, request);
 }

@@ -4187,6 +4187,7 @@ const LocalStandaloneMetadata = struct {
                     const reply = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").RelationReplacementResult{ .schema_version = request.guard.owner.schema_version }, .{});
                     errdefer alloc.free(reply);
                     try context.ensureActive();
+                    context.markSQLSubmission();
                     try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .comment_object = .{
                         .request = read,
                         .expected = .{ .epoch = snapshot.value.epoch, .object_id = snapshot.value.object.id },
@@ -4213,6 +4214,7 @@ const LocalStandaloneMetadata = struct {
                     const reply = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").RelationReplacementResult{ .schema_version = request.guard.owner.schema_version }, .{});
                     errdefer alloc.free(reply);
                     try context.ensureActive();
+                    context.markSQLSubmission();
                     store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .comment_column = .{ .guard = request.guard, .column = .{ .name = name, .value = request.description }, .column_id = id, .epoch = attributes.value.epoch } }) catch |err| return if (err == error.ColumnIdentityLimitExceeded) error.ProgramLimitExceeded else err;
                     self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
                     return reply;
@@ -4229,13 +4231,13 @@ const LocalStandaloneMetadata = struct {
             .relation_replace => |request| return self.replaceRelationLocked(alloc, context, request),
             .native_memory_create => unreachable,
             .mutate, .sql_catalog_prepare => {
-                if (call == .sql_catalog_prepare and call.sql_catalog_prepare.view != null) {
+                if (call == .sql_catalog_prepare and (call.sql_catalog_prepare.view != null or call.sql_catalog_prepare.relation != null)) {
                     if (!context.setting_admin) return error.Forbidden;
                     if (!std.meta.eql(call.sql_catalog_prepare.command_fence, if (context.sql_command_fence) |fence| fence.* else null)) return error.InvalidCatalogMutation;
                     const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
                     if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
                     try context.ensureActive();
-                    return @import("../system_catalog/catalog_mutations.zig").prepareView(alloc, store, group_ids.main_metadata_group_id, call.sql_catalog_prepare);
+                    return if (call.sql_catalog_prepare.relation != null) @import("../system_catalog/relations.zig").prepare(alloc, store, group_ids.main_metadata_group_id, call.sql_catalog_prepare) else @import("../system_catalog/catalog_mutations.zig").prepareView(alloc, store, group_ids.main_metadata_group_id, call.sql_catalog_prepare);
                 }
                 const scoped = call == .sql_catalog_prepare;
                 const request = if (scoped) call.sql_catalog_prepare.request else call.mutate;
@@ -19174,6 +19176,8 @@ test "system catalog prepared ordinary DDL submits exact native outcomes through
     var accepted: C.outcomes.Result = undefined;
     var prepared_view: Command = undefined;
     var accepted_view: C.outcomes.Result = undefined;
+    var prepared_relation: Command = undefined;
+    var accepted_relation: C.outcomes.Result = undefined;
     for (0..2) |pass| {
         var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
         defer metadata.deinit();
@@ -19213,6 +19217,14 @@ test "system catalog prepared ordinary DDL submits exact native outcomes through
             prepared_view = try std.json.parseFromSliceLeaky(Command, scratch, try source.systemCatalog(scratch, private, view_prepare), .{});
             accepted_view = try (try std.json.parseFromSliceLeaky(C.Outcome, scratch, try source.systemCatalog(scratch, private, .{ .sql_catalog_mutate = prepared_view }), .{})).result();
             try std.testing.expectEqual(@as(u64, 1), accepted_view.identity.?.generation);
+            const relation_bytes = try source.systemCatalog(scratch, private, .{ .resolve_many = .{ .relations = &.{.{ .name = "prepared_rows" }}, .include_query_definitions = true } });
+            const relation_cut = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, scratch, relation_bytes, .{});
+            const selected = relation_cut.relations[0].?;
+            const intent: @import("../system_catalog/relations.zig").Intent = .{ .description = .{ .guard = .{ .target = .{ .name = "prepared_rows" }, .logical_table = selected.logical_table, .owner = selected.owner, .incarnation = relation_cut.relation_epoch.?.incarnation }, .description = "retained standalone annotation" } };
+            prepared_relation = try std.json.parseFromSliceLeaky(Command, scratch, try source.systemCatalog(scratch, private, .{ .sql_catalog_prepare = .{ .nonce = @splat(22), .request = .{ .mutation = @import("../system_catalog/relations.zig").mutation(intent.guard(), intent.action()) }, .relation = intent } }), .{});
+            const before_note = try metadata.lifecycle_store.?.systemCatalogMeta(scratch, group_ids.main_metadata_group_id);
+            accepted_relation = try (try std.json.parseFromSliceLeaky(C.Outcome, scratch, try source.systemCatalog(scratch, private, .{ .sql_catalog_mutate = prepared_relation }), .{})).result();
+            try std.testing.expectEqual(before_note.revision, accepted_relation.revision);
         } else {
             const before = try metadata.lifecycle_store.?.systemCatalogMeta(scratch, group_ids.main_metadata_group_id);
             const repeated = try source.systemCatalog(scratch, private, .{ .sql_catalog_mutate = prepared });
@@ -19235,6 +19247,13 @@ test "system catalog prepared ordinary DDL submits exact native outcomes through
             alias = prepared_view;
             alias.sql_view.?.operation.publish.definition.query = "SELECT 8::BIGINT AS id";
             try std.testing.expectError(error.SequenceAdmissionConflict, source.systemCatalog(scratch, private, .{ .sql_catalog_mutate = alias }));
+            const note_replay = try source.systemCatalog(scratch, private, .{ .sql_catalog_mutate = prepared_relation });
+            try std.testing.expectEqualDeep(accepted_relation, try (try std.json.parseFromSliceLeaky(C.Outcome, scratch, note_replay, .{})).result());
+            const note_outcome = try source.systemCatalog(scratch, private, .{ .sql_catalog_outcome = try C.observation(scratch, prepared_relation) });
+            try std.testing.expectEqualDeep(accepted_relation, try (try std.json.parseFromSliceLeaky(?C.Outcome, scratch, note_outcome, .{})).?.result());
+            const annotated = (try metadata.lifecycle_store.?.getTable(scratch, group_ids.main_metadata_group_id, prepared_relation.mutation.table_id)).?;
+            try std.testing.expectEqualStrings("retained standalone annotation", annotated.description);
+            try std.testing.expectEqualDeep(before, try metadata.lifecycle_store.?.systemCatalogMeta(scratch, group_ids.main_metadata_group_id));
         }
     }
 }

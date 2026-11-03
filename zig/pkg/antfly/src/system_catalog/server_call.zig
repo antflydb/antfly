@@ -344,7 +344,7 @@ pub const Call = union(enum) {
     /// Calls whose native owners report the first possible durable effect.
     pub fn tracksSQLSubmission(self: @This()) bool {
         return switch (self) {
-            .mutate, .sql_catalog_mutate, .relation_replace, .relation_schema_mutate, .fk_initial_create_begin, .fk_generation_publication_begin => true,
+            .mutate, .sql_catalog_mutate, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .fk_initial_create_begin, .fk_generation_publication_begin => true,
             else => false,
         };
     }

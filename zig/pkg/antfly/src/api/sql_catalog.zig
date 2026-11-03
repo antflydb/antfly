@@ -339,14 +339,18 @@ fn commentIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authent
         if (owner.owner.kind != .index and owner.owner.kind != .constraint_index) return error.SqlWrongObjectType;
         var private = context;
         private.setting_admin = true;
-        const reply = server.source.systemCatalog(a, private, .{ .relation_description_mutate = .{
+        var reply = @import("sql_ordinary_catalog.zig").submitRelation(server, identity, private, allocators, .{ .description = .{
             .guard = .{ .target = target, .logical_table = owner.logical_table, .owner = owner.owner, .incarnation = resolved.relation_epoch.?.incarnation },
             .object = key,
             .description = ddl.comment_value orelse "",
         } }) catch |err| return if (err == error.MetadataMutationOutcomeUnknown) error.SqlMutationOutcomeUnknown else err;
-        const receipt = std.json.parseFromSliceLeaky(@import("../system_catalog/server_call.zig").RelationReplacementResult, a, reply, .{}) catch return error.SqlMutationOutcomeUnknown;
-        if (receipt.schema_version != owner.owner.schema_version) return error.SqlMutationOutcomeUnknown;
-        return .{ .mutation_outcome = .committed };
+        defer reply.deinit(allocators.result);
+        if (reply.unknown) return .{ .mutation_outcome = null, .catalog_receipt = reply.takeReceipt() };
+        if (reply.legacy) |reply_bytes| {
+            const receipt = std.json.parseFromSliceLeaky(@import("../system_catalog/server_call.zig").RelationReplacementResult, a, reply_bytes, .{}) catch return error.SqlMutationOutcomeUnknown;
+            if (receipt.schema_version != owner.owner.schema_version) return error.SqlMutationOutcomeUnknown;
+        }
+        return .{ .mutation_outcome = .committed, .catalog_receipt = reply.takeReceipt() };
     }
     return error.TableNotFound;
 }
@@ -400,16 +404,20 @@ fn commentTable(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authent
     const captured = (try captureTableAdmission(server, identity, context, a, target, ddl.name.database != null or ddl.name.namespace != null, path)) orelse return error.TableNotFound;
     var private = context;
     private.setting_admin = true;
-    const response = server.source.systemCatalog(a, private, .{ .relation_description_mutate = .{ .guard = captured.guard, .description = ddl.comment_value orelse "", .column = ddl.comment_column, .object = ddl.comment_object } }) catch |err| {
+    var reply = @import("sql_ordinary_catalog.zig").submitRelation(server, identity, private, allocators, .{ .description = .{ .guard = captured.guard, .description = ddl.comment_value orelse "", .column = ddl.comment_column, .object = ddl.comment_object } }) catch |err| {
         if (err == error.MetadataMutationOutcomeUnknown) return error.SqlMutationOutcomeUnknown;
         if (err == error.CatalogCommandTooLarge) return error.ProgramLimitExceeded;
         return err;
     };
     // A successful reply is a durable metadata receipt, never a schema
     // publication. Comments cannot manufacture an epoch or rewrite rows.
-    const receipt = std.json.parseFromSliceLeaky(@import("../system_catalog/server_call.zig").RelationReplacementResult, a, response, .{}) catch return error.SqlMutationOutcomeUnknown;
-    if (receipt.schema_version != captured.guard.owner.schema_version) return error.SqlMutationOutcomeUnknown;
-    return .{ .mutation_outcome = .committed };
+    defer reply.deinit(allocators.result);
+    if (reply.unknown) return .{ .mutation_outcome = null, .catalog_receipt = reply.takeReceipt() };
+    if (reply.legacy) |response| {
+        const receipt = std.json.parseFromSliceLeaky(@import("../system_catalog/server_call.zig").RelationReplacementResult, a, response, .{}) catch return error.SqlMutationOutcomeUnknown;
+        if (receipt.schema_version != captured.guard.owner.schema_version) return error.SqlMutationOutcomeUnknown;
+    }
+    return .{ .mutation_outcome = .committed, .catalog_receipt = reply.takeReceipt() };
 }
 
 fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, allocators: catalog.DdlAllocators, requested_target: domain.Target, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, admission: ?RelationAdmission, path: ?*const SearchPath) !catalog.DdlOutcome {
@@ -596,7 +604,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     var submitted = false;
     var observed_context = context;
     observed_context.sql_completion_submission = &submitted;
-    const version = submitSchema(server, observed_context, alloc, table.name, table.table_id, native.version, updated, retirement, validation, guard) catch |err| {
+    const submission = submitSchema(server, identity, observed_context, allocators, table.name, table.table_id, native.version, updated, retirement, validation, guard) catch |err| {
         if (!submitted) try @import("sql_completion.zig").rejectMetadataBeforeSubmission(context, completion_owner);
         try @import("sql_completion.zig").rejectMetadataWithContext(context, completion_owner, err);
         if (err == error.ForeignKeyReferenced) return error.SqlDependentConstraint;
@@ -608,6 +616,15 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         if (err == error.MetadataMutationOutcomeUnknown or (err == error.OutOfMemory and submitted)) return error.SqlMutationOutcomeUnknown;
         return err;
     };
+    errdefer if (submission.catalog_receipt) |value| value.deinit(alloc);
+    if (submission.unknown) {
+        if (receipt) |*value| {
+            value.state = .admission_unknown;
+            value.diagnostic = "Declaration admission is unresolved. Observe the catalog receipt before checking activation; do not replay the DDL.";
+        }
+        return .{ .mutation_outcome = null, .catalog_receipt = submission.catalog_receipt, .receipt = receipt };
+    }
+    const version = submission.version;
     if (lake_commit) |*prepared| server.activateLakeCommit(prepared);
     if (receipt) |*value| {
         value.schema_version = version;
@@ -616,15 +633,15 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
                 value.state = .pending;
                 value.diagnostic = "The index declaration committed; its online build is still pending. Inspect this table ID and schema version through /indexes; do not replay the DDL.";
             };
-            return .{ .mutation_outcome = if (value.state == .ready) .committed else if (value.state == .invalid) .committed_repair_required else .committed_pending, .receipt = value.* };
+            return .{ .mutation_outcome = if (value.state == .ready) .committed else if (value.state == .invalid) .committed_repair_required else .committed_pending, .receipt = value.*, .catalog_receipt = submission.catalog_receipt };
         }
         awaitActivation(server, context, alloc, table.name, value, allocators.completion) catch {
             value.state = .pending;
             value.diagnostic = "The declaration committed; activation is still pending. Inspect the table constraint status before using the index; do not replay the DDL.";
         };
-        return .{ .mutation_outcome = if (value.state == .ready) .committed else if (value.state == .invalid) .committed_repair_required else .committed_pending, .receipt = value.* };
+        return .{ .mutation_outcome = if (value.state == .ready) .committed else if (value.state == .invalid) .committed_repair_required else .committed_pending, .receipt = value.*, .catalog_receipt = submission.catalog_receipt };
     }
-    return .{};
+    return .{ .catalog_receipt = submission.catalog_receipt };
 }
 
 fn rewriteSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, physical: []const u8, table_id: u64, version: u32, schema: []const u8, default_columns: []const []const u8, guard: ?domain.RelationMutationGuard) !catalog.DdlOutcome {
@@ -849,18 +866,23 @@ fn retirementSnapshot(server: *server_mod.ApiHttpServer, context: operation.Requ
     }
 }
 
-fn submitSchema(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, physical: []const u8, table_id: u64, expected_version: u32, body: []const u8, retirement: bool, validation: bool, guard: domain.RelationMutationGuard) !u32 {
+const SchemaSubmission = struct { version: u32, catalog_receipt: ?catalog.CatalogOperationReceipt = null, unknown: bool = false };
+
+fn submitSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, allocators: catalog.DdlAllocators, physical: []const u8, table_id: u64, expected_version: u32, body: []const u8, retirement: bool, validation: bool, guard: domain.RelationMutationGuard) !SchemaSubmission {
+    const alloc = allocators.result;
     try context.ensureActive();
     const next_version = if (validation) expected_version else std.math.add(u32, expected_version, 1) catch return error.SqlLimitExceeded;
     if (!retirement and !validation) {
         var private = context;
         private.setting_admin = true;
-        const bytes = try server.source.systemCatalog(alloc, private, .{ .relation_schema_mutate = .{ .guard = guard, .schema_json = body } });
-        defer alloc.free(bytes);
-        var result = std.json.parseFromSlice(@import("../system_catalog/server_call.zig").RelationReplacementResult, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
-        defer result.deinit();
-        if (result.value.schema_version != next_version) return error.MetadataMutationOutcomeUnknown;
-        return result.value.schema_version;
+        var reply = try @import("sql_ordinary_catalog.zig").submitRelation(server, identity, private, allocators, .{ .schema = .{ .guard = guard, .schema_json = body } });
+        defer reply.deinit(alloc);
+        if (reply.legacy) |bytes| {
+            var result = std.json.parseFromSlice(@import("../system_catalog/server_call.zig").RelationReplacementResult, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+            defer result.deinit();
+            if (result.value.schema_version != next_version) return error.MetadataMutationOutcomeUnknown;
+        }
+        return .{ .version = next_version, .catalog_receipt = reply.takeReceipt(), .unknown = reply.unknown };
     }
     var snapshot = if (retirement) try retirementSnapshot(server, context, physical, table_id, expected_version) else (try server.source.adminSnapshot()) orelse return error.UnsupportedSqlExecution;
     defer server.source.freeAdminSnapshot(&snapshot);
@@ -871,7 +893,7 @@ fn submitSchema(server: *server_mod.ApiHttpServer, context: operation.RequestCon
         const writer = server.table_writes orelse return error.UnsupportedSqlExecution;
         if (context.sql_completion_submission) |observed| observed.* = true;
         try @import("relational_constraint_recovery.zig").retry(alloc, reader, writer, snapshot.tables, snapshot.ranges, .{ .table_name = physical, .relational_schema_version = expected_version }, context);
-        return expected_version;
+        return .{ .version = expected_version };
     }
     if (context.sql_completion_submission) |observed| observed.* = true;
     var replacement = try @import("relational_retirement_worker.zig").beginControlled(alloc, reader, snapshot.tables, snapshot.ranges, physical, body, false, context);
@@ -885,7 +907,7 @@ fn submitSchema(server: *server_mod.ApiHttpServer, context: operation.RequestCon
     defer result.deinit();
     // The retirement reservation still serves the predecessor schema.
     // Await the target epoch, not the currently active predecessor epoch.
-    return next_version;
+    return .{ .version = next_version };
 }
 
 fn authorizeTable(identity: ?server_mod.AuthenticatedIdentity, alloc: std.mem.Allocator, target: domain.Target) !void {
@@ -907,7 +929,7 @@ test "SQL catalog schema exhaustion is definite nonadmission for replacement and
     var server = server_mod.ApiHttpServer.init(alloc, .{}, .{ .ptr = &source, .vtable = &.{ .status = Source.status } }, null, null);
     defer server.deinit();
     for ([_]bool{ false, true }) |retirement| {
-        try std.testing.expectError(error.SqlLimitExceeded, submitSchema(&server, .{}, alloc, "items", 17, std.math.maxInt(u32), "{}", retirement, false, .{
+        try std.testing.expectError(error.SqlLimitExceeded, submitSchema(&server, null, .{}, .{ .result = alloc, .scratch = alloc }, "items", 17, std.math.maxInt(u32), "{}", retirement, false, .{
             .target = .{ .name = "items" },
             .logical_table = "items",
             .owner = .{ .table_id = 17, .schema_version = std.math.maxInt(u32), .schema_digest = @splat(1), .kind = .table },

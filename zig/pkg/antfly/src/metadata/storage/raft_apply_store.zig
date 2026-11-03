@@ -13320,42 +13320,8 @@ pub fn onlineMergeAdmissionDigest(alloc: std.mem.Allocator, record: metadata.Mer
     return OnlineMergeAdmission.recordDigest(alloc, record);
 }
 
-pub const ObjectDescriptionCommand = struct {
-    request: system_catalog.ObjectAnnotationRead,
-    expected: object_annotation_store.Expected,
-    description: ?[]const u8,
-
-    pub fn validate(self: @This()) !void {
-        try self.request.validate();
-        try object_annotations.validateDescription(self.description);
-        if (self.expected.object_id == 0 or self.expected.epoch.revision == 0 or std.mem.allEqual(u8, &self.expected.epoch.definition_digest, 0)) return error.InvalidCatalogMutation;
-    }
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        self.request.guard.deinitOwned(alloc);
-        alloc.free(self.request.key.name);
-        if (self.description) |description| alloc.free(description);
-        self.* = undefined;
-    }
-};
-
-pub const ColumnDescriptionCommand = struct {
-    guard: system_catalog.RelationMutationGuard,
-    column: column_identities.Description,
-    column_id: u64,
-    epoch: column_identities.Epoch,
-
-    pub fn validate(self: @This()) !void {
-        try self.guard.validate();
-        try self.column.validate();
-        if (self.guard.owner.kind != .table or self.guard.hasDefinitionIntent() or self.column_id == 0 or std.mem.allEqual(u8, &self.epoch.digest, 0)) return error.InvalidCatalogMutation;
-    }
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        self.guard.deinitOwned(alloc);
-        alloc.free(self.column.name);
-        if (self.column.value) |value| alloc.free(value);
-        self.* = undefined;
-    }
-};
+pub const ObjectDescriptionCommand = apply_contract.ObjectDescriptionCommand;
+pub const ColumnDescriptionCommand = apply_contract.ColumnDescriptionCommand;
 
 pub const TransitionCommand = union(enum) {
     comment_object: ObjectDescriptionCommand,
@@ -26683,7 +26649,7 @@ pub const RaftApplyStore = struct {
     /// Validate and serialize the exact admitted projection before proposing.
     fn validateSqlOwnerEnvelope(command: SystemCatalogCommand) !void {
         try command.validateCreationSources();
-        if (command.sql_catalog_admission != null) try sql_catalog_mutations.validate(command);
+        if (command.sql_catalog_admission != null or command.sql_relation != null) try sql_catalog_mutations.validate(command);
         if (command.sql_native_index != null and (command.sql_routine != null or command.sql_type != null or command.sql_cast != null or command.sql_authorization != null or command.sql_view != null or command.sql_sequence != null or command.column_sequences.len != 0 or command.creation_sources.len != 0 or command.creation_comment_sources.len != 0 or command.creation_object_comments.len != 0)) return error.InvalidCatalogMutation;
 
         const owner = command.mutation.sql_owner orelse return;
@@ -27447,7 +27413,7 @@ pub const RaftApplyStore = struct {
             .append => |ordinal| {
                 // Semantic refusals precede logical effects. From this point,
                 // every error aborts the transaction, regardless of its error tag.
-                const result = if (command.sql_view != null) try self.applyJournaledSqlViewTxn(txn, group, command) else try self.applyOrdinarySystemCatalogTxn(txn, group, bytes, command);
+                const result = if (command.sql_relation != null) try self.applyJournaledSqlRelationTxn(txn, group, command, digest) else if (command.sql_view != null) try self.applyJournaledSqlViewTxn(txn, group, command) else try self.applyOrdinarySystemCatalogTxn(txn, group, bytes, command);
                 if (builtin.is_test) if (self.sql_catalog_post_effect_error) |err| {
                     self.sql_catalog_post_effect_error = null;
                     return err;
@@ -27455,6 +27421,65 @@ pub const RaftApplyStore = struct {
                 try journal.append(a, ordinal, admission.request, digest, result);
             },
         }
+    }
+
+    fn applyJournaledSqlRelationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand, digest: [32]u8) !sql_catalog_mutations.Outcome {
+        const relation = command.sql_relation.?;
+        var region: std.heap.ArenaAllocator = .init(self.alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        const meta = try system_catalog_storage.readMeta(a, txn, group);
+        if (meta.revision != command.expected_revision) return .{ .rejected = .CatalogGenerationChanged };
+        if (meta.revision == std.math.maxInt(u64) and relation.action() != .comment) return .{ .rejected = .CatalogRevisionExhausted };
+        switch (relation.change) {
+            .definition => |value| {
+                const current = (try self.getTableTxn(a, txn, group, value.guard.owner.table_id)) orelse return .{ .rejected = .CatalogGenerationChanged };
+                if (!std.mem.eql(u8, &try @import("../../system_catalog/relations.zig").tableDigest(current), &value.expected)) return .{ .rejected = .CatalogGenerationChanged };
+                // Prepared schema deltas cannot edit unrelated placement,
+                // storage, presentation or replication metadata.
+                var allowed = current;
+                if (value.mode == .description) {
+                    allowed.description = value.table.description;
+                } else {
+                    allowed.schema_json = value.table.schema_json;
+                    allowed.read_schema_json = value.table.read_schema_json;
+                    allowed.schema_reader_requirements = value.table.schema_reader_requirements;
+                    allowed.indexes_json = value.table.indexes_json;
+                    allowed.sql_native_indexes_json = value.table.sql_native_indexes_json;
+                    allowed.full_text_read_index = value.table.full_text_read_index;
+                }
+                if (!metadata_table_manager.tableDefinitionsEqual(allowed, value.table)) return .{ .rejected = .InvalidCatalogMutation };
+                if (value.mode == .schema) {
+                    const header = std.json.parseFromSliceLeaky(struct { version: u32 = 0 }, a, value.table.schema_json, .{ .ignore_unknown_fields = true }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCatalogMutation;
+                    const expected_version = std.math.add(u32, value.guard.owner.schema_version, 1) catch return .{ .rejected = .CatalogGenerationExhausted };
+                    if (header.version != expected_version) return .{ .rejected = .InvalidCatalogMutation };
+                }
+                self.validateKnownRelationReplacementTxn(txn, group, value.guard, current, value.table) catch |err| return sql_catalog_mutations.Outcome.fromError(err) orelse return err;
+                // This writer returns false only before any user definition
+                // effects. Once writing begins, every error aborts the journal
+                // transaction, including errors also used for CAS refusal.
+                if (!metadata_table_manager.tableDefinitionsEqual(current, value.table) and !try self.tryApplyKnownTableCompareAndReplaceTxn(txn, group, current, value.table, value.guard.object_renames)) return .{ .rejected = .CatalogGenerationChanged };
+            },
+            .column => |value| {
+                const bytes = self.prepareColumnDescriptionTxn(txn, group, value) catch |err| return sql_catalog_mutations.Outcome.fromError(err) orelse return err;
+                defer self.alloc.free(bytes);
+                const key = try column_identities.key(.{ .group = group, .table = value.guard.owner.table_id });
+                const previous = try stagingGet(txn, &key);
+                if (previous == null or !std.mem.eql(u8, previous.?, bytes)) {
+                    try txn.put(&key, bytes);
+                    self.notifyCommittedKeyListeners(.{ .metadata_group_id = group, .key = &key });
+                }
+            },
+            .object => |value| {
+                var prepared = self.prepareObjectDescriptionTxn(txn, group, value) catch |err| return sql_catalog_mutations.Outcome.fromError(err) orelse return err;
+                defer prepared.deinit();
+                try self.writeObjectDescriptionTxn(txn, group, prepared);
+            },
+        }
+        const after = try system_catalog_storage.readMeta(a, txn, group);
+        if (after.revision != meta.revision or after.next_id != meta.next_id or !std.meta.eql(after.sequence_outcome_head, meta.sequence_outcome_head)) return error.CatalogGenerationChanged;
+        if (relation.action() != .comment) try system_catalog_storage.applyDelta(a, txn, group, .{ .next_id = meta.next_id, .upserts = &.{}, .removes = &.{} }, meta, digest);
+        return .{ .success = .{ .revision = meta.revision + @as(u64, if (relation.action() == .comment) 0 else 1), .identity = null, .removed = 0 } };
     }
 
     fn applyJournaledSqlViewTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: SystemCatalogCommand) !sql_catalog_mutations.Outcome {
@@ -37136,6 +37161,12 @@ pub const RaftApplyStore = struct {
         const actual = (try self.getTableTxn(self.alloc, txn, group, expected.table_id)) orelse return error.CatalogGenerationChanged;
         defer metadata_table_manager.freeTable(self.alloc, actual);
         if (!metadata_table_manager.tableDefinitionsEqual(actual, expected)) return error.CatalogGenerationChanged;
+        try self.validateKnownRelationReplacementTxn(txn, group, guard, expected, replacement);
+    }
+
+    fn validateKnownRelationReplacementTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, guard: system_catalog.RelationMutationGuard, expected: metadata.TableRecord, replacement: metadata.TableRecord) !void {
+        try guard.validate();
+        if (guard.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
         try self.validateRelationMutationTxn(txn, group, guard, expected, replacement);
         if (std.mem.eql(u8, expected.schema_json, replacement.schema_json) and std.mem.eql(u8, expected.indexes_json, replacement.indexes_json) and
             std.mem.eql(u8, expected.sql_native_indexes_json, replacement.sql_native_indexes_json)) return;
@@ -37291,6 +37322,10 @@ pub const RaftApplyStore = struct {
     fn applyObjectDescriptionTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: ObjectDescriptionCommand) !void {
         var prepared = try self.prepareObjectDescriptionTxn(txn, group, command);
         defer prepared.deinit();
+        try self.writeObjectDescriptionTxn(txn, group, prepared);
+    }
+
+    fn writeObjectDescriptionTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, prepared: object_annotation_store.PreparedComment) !void {
         try prepared.write(txn, group);
         if (prepared.directory != null) self.notifyCommittedKeyListeners(.{ .metadata_group_id = group, .key = &try object_annotations.directoryKey(group, prepared.table) });
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group, .key = &try object_annotations.annotationKey(group, prepared.table, prepared.object) });
@@ -37359,19 +37394,25 @@ pub const RaftApplyStore = struct {
         const current = try decodeTableRecord(self.alloc, encoded);
         defer metadata_table_manager.freeTable(self.alloc, current);
         if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return false;
+        return self.tryApplyKnownTableCompareAndReplaceTxn(txn, group_id, current, replacement, renames);
+    }
+
+    fn tryApplyKnownTableCompareAndReplaceTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, current: metadata.TableRecord, replacement: metadata.TableRecord, renames: []const object_annotations.Rename) !bool {
+        var key_buf: [160]u8 = undefined;
+        const key = try tableKeyForGroup(&key_buf, group_id, current.table_id);
         {
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
             const a = arena.allocator();
             if (!try resolverNamespaceAdoptionAllowedTxn(txn, group_id, a, current, replacement) or !try self.resolverProjectionValidTxn(a, txn, group_id, replacement)) {
-                try txn.put(try resolverRejectionKey(a, group_id, expected.table_id), try std.json.Stringify.valueAlloc(a, ResolverRejection{
-                    .digest = try resolverReplacementDigest(a, expected, replacement),
+                try txn.put(try resolverRejectionKey(a, group_id, current.table_id), try std.json.Stringify.valueAlloc(a, ResolverRejection{
+                    .digest = try resolverReplacementDigest(a, current, replacement),
                     .term = self.active_resolver_apply_position.term,
                     .index = self.active_resolver_apply_position.index,
                 }, .{}));
                 return false;
             }
-            try txn.delete(try resolverRejectionKey(a, group_id, expected.table_id));
+            try txn.delete(try resolverRejectionKey(a, group_id, current.table_id));
         }
 
         if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) {
@@ -37454,7 +37495,7 @@ pub const RaftApplyStore = struct {
         if (!std.mem.eql(u8, current.name, replacement.name) and
             try self.relationalDropBlockedTxn(txn, group_id, current)) return false;
         if (!try self.relationalDefinitionsRetainedForMutationTxn(txn, group_id, current, replacement)) return false;
-        if ((try self.loadTableTransitionFenceTxn(txn, group_id, expected.table_id)).active()) return false;
+        if ((try self.loadTableTransitionFenceTxn(txn, group_id, current.table_id)).active()) return false;
         if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return true;
         var prepared = (try self.prepareTableRecordWithIdentityHintsTxnMode(txn, group_id, key, replacement, false, .{}, renames)) orelse return false;
         defer prepared.deinit(self.alloc);

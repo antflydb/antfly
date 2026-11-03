@@ -239,6 +239,43 @@ pub const TableTopologyMutation = union(enum) {
     },
 };
 
+pub const ObjectDescriptionCommand = struct {
+    request: @import("antfly_local_sources").system_catalog_domain.ObjectAnnotationRead,
+    expected: @import("antfly_local_sources").system_catalog_domain.object_annotation_store.Expected,
+    description: ?[]const u8,
+
+    pub fn validate(self: @This()) !void {
+        try self.request.validate();
+        try @import("antfly_local_sources").system_catalog_domain.object_annotations.validateDescription(self.description);
+        if (self.expected.object_id == 0 or self.expected.epoch.revision == 0 or std.mem.allEqual(u8, &self.expected.epoch.definition_digest, 0)) return error.InvalidCatalogMutation;
+    }
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.request.guard.deinitOwned(alloc);
+        alloc.free(self.request.key.name);
+        if (self.description) |description| alloc.free(description);
+        self.* = undefined;
+    }
+};
+
+pub const ColumnDescriptionCommand = struct {
+    guard: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard,
+    column: @import("antfly_local_sources").system_catalog_column_identities.Description,
+    column_id: u64,
+    epoch: @import("antfly_local_sources").system_catalog_column_identities.Epoch,
+
+    pub fn validate(self: @This()) !void {
+        try self.guard.validate();
+        try self.column.validate();
+        if (self.guard.owner.kind != .table or self.guard.hasDefinitionIntent() or self.column_id == 0 or std.mem.allEqual(u8, &self.epoch.digest, 0)) return error.InvalidCatalogMutation;
+    }
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.guard.deinitOwned(alloc);
+        alloc.free(self.column.name);
+        if (self.column.value) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
 pub const SystemCatalogCommand = struct {
     pub const creation_sources_version: u16 = 8;
     version: u16 = 1,
@@ -248,6 +285,7 @@ pub const SystemCatalogCommand = struct {
     placement_update: ?struct { expected: metadata.TableRecord, replacement: metadata.TableRecord } = null,
     constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
     sql_view: ?@import("../../system_catalog/views.zig").Mutation = null,
+    sql_relation: ?@import("../../system_catalog/relations.zig").Prepared = null,
     sql_catalog_admission: ?@import("../../system_catalog/catalog_mutations.zig").Admission = null,
     sql_native_index: ?@import("../../system_catalog/native_indexes.zig").Mutation = null,
     sql_routine: ?@import("../../system_catalog/routines.zig").Mutation = null,
@@ -273,6 +311,7 @@ pub const SystemCatalogCommand = struct {
     }
 
     pub fn jsonStringify(self: SystemCatalogCommand, writer: anytype) !void {
+        if (self.sql_catalog_admission != null and self.sql_relation != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_relation = self.sql_relation, .sql_catalog_admission = self.sql_catalog_admission });
         if (self.sql_catalog_admission != null and self.sql_view != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_view = self.sql_view, .sql_catalog_admission = self.sql_catalog_admission });
         if (self.sql_catalog_admission != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .column_sequences = self.column_sequences, .creation_sources = self.creation_sources, .creation_comment_sources = self.creation_comment_sources, .creation_object_comments = self.creation_object_comments, .sql_catalog_admission = self.sql_catalog_admission });
         if (self.sql_native_index != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .sql_native_index = self.sql_native_index });

@@ -18413,3 +18413,43 @@ journal together; exact replay retains the original successful drop outcome.
 There are no skips, failures or leaks in these Debug gates. `make generate`,
 `make fmt`, inventory, source/control catalog, Apache-boundary and staged license
 checks pass. Original case counts remain unchanged.
+
+
+### Scoped relation definitions and annotation admission
+
+Scoped straight-line schema declarations and table, column, index and constraint
+annotations now prepare complete commands for the same native catalog outcome
+journal. Metadata captures the full predecessor's canonical digest and the
+complete guarded successor; the wire carries one table record rather than two.
+Column and object annotations bind their existing stable IDs and immutable
+epochs. Preparation uses the existing compiled metadata projections, outside the
+serialized proposal section. Native apply reuses the existing schema, policy,
+resolver, FK, extension-ownership and namespace validation/publication machinery.
+
+Presentation-only commands preserve both catalog and row-schema epochs. Their
+journal identity binds that epoch policy so a recovery token cannot substitute a
+schema-changing interpretation. Schema declarations advance their catalog epoch
+alongside the guarded record and durable result. Any failure after provisional
+writes aborts the entire transaction. Definite retained schema refusals retire
+the prepared completion owner; uncertain transport or storage failures retain
+its proof and a read-only recovery receipt.
+
+The public schema result preserves catalog admission separately from constraint
+or index activation. Completion owns response identities before submission and
+never replays a declaration after uncertainty. This closes another scoped
+admission boundary; automatic connection enrollment and the remaining coordinated
+validation, retirement, generation-publication and policy/settings boundaries
+remain guarded. No original parity disposition changes from this infrastructure
+cohort alone: 87 original cases remain unresolved, including 64 DDL/catalog cases.
+
+The Debug recovery gate passes all 122 build steps, including eleven public
+recovery contracts, twelve native fence contracts, three decoder contracts and
+standalone startup/cold replay. The annotation first-effect marker now belongs
+to the writer, after object/column identity checks, so definite missing-object
+errors retain PostgreSQL diagnostics. The final producer/object-comment gate
+passes all 96 steps (49 producer contracts and both mounted object-comment
+campaigns); the mounted column-comment campaign also passes without skips or
+leaks. An earlier broader run timed out during the DROP NOT NULL lifecycle
+amid metadata snapshot catch-up errors. A final-source rerun also timed out
+waiting for the serving schema during sql-0744. This mounted schema campaign
+remains failing and is not counted as a passing qualification.
