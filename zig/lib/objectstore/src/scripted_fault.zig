@@ -30,16 +30,23 @@ pub const Client = struct {
     next_put: PutFault = .none,
     put_filter: ?struct { ptr: *anyopaque, matches: *const fn (*anyopaque, []const u8, []const u8, []const u8) bool } = null,
     next_get: GetFault = .none,
+    get_filter: ?struct { ptr: *anyopaque, matches: *const fn (*anyopaque, []const u8, []const u8) bool } = null,
     hidden_bucket: ?[]u8 = null,
     hidden_key: ?[]u8 = null,
     hidden_reads_remaining: usize = 0,
     put_attempts: u64 = 0,
     get_attempts: u64 = 0,
+    delete_attempts: u64 = 0,
+    next_delete: DeleteFault = .none,
+    delete_filter: ?struct { ptr: *anyopaque, matches: *const fn (*anyopaque, []const u8, []const u8) bool } = null,
+
+    pub const DeleteFault = union(enum) { none, fail_before: anyerror, commit_then_fail: anyerror };
 
     pub const PutFault = union(enum) {
         none,
         fail_before: anyerror,
         commit_then_fail: anyerror,
+        commit_then_callback: struct { ptr: *anyopaque, run: *const fn (*anyopaque) void },
         partial_then_fail: struct {
             bytes: usize,
             err: anyerror,
@@ -55,6 +62,7 @@ pub const Client = struct {
         /// observed only the terminal error. Reads are side-effect free, so a
         /// retry must discard the ambiguous response and fetch it again.
         complete_then_fail: anyerror,
+        complete_then_callback: struct { ptr: *anyopaque, run: *const fn (*anyopaque) void },
         /// Models an otherwise successful provider response that omits the
         /// object version token required by a caller's read-modify-write CAS.
         omit_etag,
@@ -103,6 +111,9 @@ pub const Client = struct {
 
     pub fn omitEtagFromNextGet(self: *Client) void {
         self.next_get = .omit_etag;
+    }
+    pub fn commitNextDeleteThenFail(self: *Client, err: anyerror) void {
+        self.next_delete = .{ .commit_then_fail = err };
     }
 
     /// Models a client/process crash: pending call-local faults disappear,
@@ -174,39 +185,49 @@ pub const Client = struct {
         options: types.PutOptions,
     ) !types.PutResult {
         const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.putWithRevision(alloc, bucket, key, body, options, null);
+    }
+    fn putAtRevision(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, revision: types.ObjectRevision, options: types.PutOptions) !types.PutResult {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.putWithRevision(alloc, bucket, key, body, options, revision);
+    }
+    fn forwardPut(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, options: types.PutOptions, revision: ?types.ObjectRevision) !types.PutResult {
+        var backing = self.backing;
+        backing.allocator = alloc;
+        return if (revision) |value| backing.compareAndPut(bucket, key, body, value, options) else backing.putObject(bucket, key, body, options);
+    }
+    fn putWithRevision(self: *Client, alloc: Allocator, bucket: []const u8, key: []const u8, body: []const u8, options: types.PutOptions, revision: ?types.ObjectRevision) !types.PutResult {
         self.put_attempts +|= 1;
         if (self.put_filter) |filter| {
             if (!filter.matches(filter.ptr, bucket, key, body))
-                return self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options);
+                return self.forwardPut(alloc, bucket, key, body, options, revision);
             self.put_filter = null;
         }
         return switch (self.takePutFault()) {
-            .none => self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options),
+            .none => self.forwardPut(alloc, bucket, key, body, options, revision),
             .fail_before => |err| err,
             .commit_then_fail => |err| blk: {
-                var result = try self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options);
+                var result = try self.forwardPut(alloc, bucket, key, body, options, revision);
                 result.deinit(alloc);
                 break :blk err;
             },
+            .commit_then_callback => |callback| blk: {
+                const result = try self.forwardPut(alloc, bucket, key, body, options, revision);
+                callback.run(callback.ptr);
+                break :blk result;
+            },
             .partial_then_fail => |fault| blk: {
-                var result = try self.backing.vtable.put_object(
-                    self.backing.ptr,
-                    alloc,
-                    bucket,
-                    key,
-                    body[0..@min(fault.bytes, body.len)],
-                    options,
-                );
+                var result = try self.forwardPut(alloc, bucket, key, body[0..@min(fault.bytes, body.len)], options, revision);
                 result.deinit(alloc);
                 break :blk fault.err;
             },
             .duplicate => blk: {
-                var first = try self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options);
+                var first = try self.forwardPut(alloc, bucket, key, body, options, revision);
                 first.deinit(alloc);
-                break :blk self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options);
+                break :blk self.forwardPut(alloc, bucket, key, body, options, revision);
             },
             .hide_after_success => |reads| blk: {
-                const result = try self.backing.vtable.put_object(self.backing.ptr, alloc, bucket, key, body, options);
+                const result = try self.forwardPut(alloc, bucket, key, body, options, revision);
                 self.rememberHidden(bucket, key, reads) catch {
                     var owned = result;
                     owned.deinit(alloc);
@@ -221,6 +242,10 @@ pub const Client = struct {
         const self: *Client = @ptrCast(@alignCast(ptr));
         self.get_attempts +|= 1;
         if (self.consumeHiddenRead(bucket, key)) return error.FileNotFound;
+        if (self.get_filter) |filter| {
+            if (!filter.matches(filter.ptr, bucket, key)) return self.backing.vtable.get_object(self.backing.ptr, alloc, bucket, key, options);
+            self.get_filter = null;
+        }
         return switch (self.takeGetFault()) {
             .none => self.backing.vtable.get_object(self.backing.ptr, alloc, bucket, key, options),
             .fail_before => |err| err,
@@ -228,6 +253,11 @@ pub const Client = struct {
                 var result = try self.backing.vtable.get_object(self.backing.ptr, alloc, bucket, key, options);
                 result.deinit(alloc);
                 break :blk err;
+            },
+            .complete_then_callback => |callback| blk: {
+                const result = try self.backing.vtable.get_object(self.backing.ptr, alloc, bucket, key, options);
+                callback.run(callback.ptr);
+                break :blk result;
             },
             .omit_etag => blk: {
                 var result = try self.backing.vtable.get_object(self.backing.ptr, alloc, bucket, key, options);
@@ -252,7 +282,7 @@ pub const Client = struct {
 
     fn deleteObject(ptr: *anyopaque, bucket: []const u8, key: []const u8, options: types.DeleteOptions) !void {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        try self.backing.vtable.delete_object(self.backing.ptr, bucket, key, options);
+        try self.deleteWithRevision(bucket, key, options, null);
     }
 
     fn listObjects(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, options: types.ListOptions) !types.ListResult {
@@ -260,7 +290,46 @@ pub const Client = struct {
         return self.backing.vtable.list_objects(self.backing.ptr, alloc, bucket, options);
     }
 
+    fn deleteAtRevision(ptr: *anyopaque, bucket: []const u8, key: []const u8, revision: types.ObjectRevision, options: types.DeleteOptions) !void {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.deleteWithRevision(bucket, key, options, revision);
+    }
+    fn forwardDelete(self: *Client, bucket: []const u8, key: []const u8, options: types.DeleteOptions, revision: ?types.ObjectRevision) !void {
+        if (revision) |value| return self.backing.compareAndDelete(bucket, key, value, options);
+        return self.backing.deleteObject(bucket, key, options);
+    }
+    fn deleteWithRevision(self: *Client, bucket: []const u8, key: []const u8, options: types.DeleteOptions, revision: ?types.ObjectRevision) !void {
+        self.delete_attempts +|= 1;
+        if (self.delete_filter) |filter| {
+            if (!filter.matches(filter.ptr, bucket, key)) return self.forwardDelete(bucket, key, options, revision);
+            self.delete_filter = null;
+        }
+        const fault = self.next_delete;
+        self.next_delete = .none;
+        switch (fault) {
+            .none => return self.forwardDelete(bucket, key, options, revision),
+            .fail_before => |err| return err,
+            .commit_then_fail => |err| {
+                try self.forwardDelete(bucket, key, options, revision);
+                return err;
+            },
+        }
+    }
+    fn supportsVersions(ptr: *anyopaque, _: Allocator, bucket: []const u8, token: ?types.CancellationToken) !bool {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.backing.supportsObjectVersions(bucket, token);
+    }
+    fn listVersions(ptr: *anyopaque, alloc: Allocator, bucket: []const u8, options: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        var backing = self.backing;
+        backing.allocator = alloc;
+        return backing.listObjectVersions(bucket, options);
+    }
     const vtable: client_mod.Client.VTable = .{
+        .put_at_revision = putAtRevision,
+        .delete_at_revision = deleteAtRevision,
+        .supports_object_versions = supportsVersions,
+        .list_object_versions = listVersions,
         .deinit = erasedDeinit,
         .bucket_exists = bucketExists,
         .make_bucket = makeBucket,

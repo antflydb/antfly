@@ -1,0 +1,85 @@
+{
+  "name": "antfly-r2-builder",
+  "main": "builder-worker.mjs",
+  "compatibility_date": "2026-10-23",
+  "rules": [
+    {
+      "type": "CompiledWasm",
+      "globs": [
+        "**/*.wasm"
+      ],
+      "fallthrough": true
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "DATABASE",
+      "bucket_name": "antfly-serverless-r2-split"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "COMMITS",
+        "class_name": "R2CommitCoordinator",
+        "script_name": "antfly-r2-writer"
+      },
+      {
+        "name": "READERS",
+        "class_name": "R2ReadRuntime",
+        "script_name": "antfly-r2-reader"
+      },
+      {
+        "name": "BUILDERS",
+        "class_name": "R2BuildRuntime"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "split-v1",
+      "new_sqlite_classes": [
+        "R2BuildRuntime"
+      ]
+    }
+  ],
+  "vars": {
+    "ANTFLY_INCARNATION": "example-r2-split-v1",
+    "COORDINATOR_BACKEND": "r2",
+    "AUTO_GC": "true",
+    "READERS_PER_TENANT": "2",
+    "SPLIT_RUNTIME": "true"
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "limits": {
+    "cpu_ms": 30000
+  },
+  "queues": {
+    "producers": [
+      {
+        "binding": "MAINTENANCE",
+        "queue": "antfly-maintenance-r2-split"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "antfly-maintenance-r2-split",
+        "max_batch_size": 1,
+        "max_retries": 10,
+        "dead_letter_queue": "antfly-maintenance-r2-split-dead",
+        "max_concurrency": 4
+      }
+    ]
+  },
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  },
+  "version_metadata": {
+    "binding": "WORKER_VERSION"
+  },
+  "workers_dev": false
+}

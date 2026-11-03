@@ -103,6 +103,8 @@ pub const Quota = struct {
     backing: std.mem.Allocator,
     live_bytes: usize = 0,
     peak_bytes: usize = 0,
+    largest_rejected_growth: usize = 0,
+    largest_backing_failure: usize = 0,
     max_live_bytes: usize,
     limit_exceeded: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
@@ -137,6 +139,7 @@ pub const Quota = struct {
     fn permits(self: *Quota, growth: usize) bool {
         if (growth <= self.max_live_bytes -| self.live_bytes) return true;
         self.limit_exceeded = true;
+        self.largest_rejected_growth = @max(self.largest_rejected_growth, growth);
         return false;
     }
     fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
@@ -147,7 +150,10 @@ pub const Quota = struct {
         Guard.enter(&self.mutex);
         defer Guard.leave();
         if (!self.permits(len)) return null;
-        const result = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+        const result = self.backing.rawAlloc(len, alignment, ra) orelse {
+            self.largest_backing_failure = @max(self.largest_backing_failure, len);
+            return null;
+        };
         self.live_bytes += len;
         self.peak_bytes = @max(self.peak_bytes, self.live_bytes);
         return result;

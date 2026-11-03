@@ -28,7 +28,7 @@ const key = "\x00sql-prepared-v1";
 pub const max_resources = 128;
 pub const max_statement_bytes = 64 << 10;
 pub const max_record_bytes = 4 << 20;
-const max_resource_bytes = 512 << 10;
+pub const max_resource_bytes = 512 << 10;
 pub const ttl_ms: u64 = 60 * 60 * 1000;
 
 pub const Binding = struct {
@@ -137,7 +137,7 @@ pub fn loadForConnection(store: *transactions.DurableSessionStore, alloc: std.me
     };
 }
 
-fn resourceKey(id: []const u8) ![key.len + 1 + 32]u8 {
+pub fn resourceKey(id: []const u8) ![key.len + 1 + 32]u8 {
     if (id.len != 32) return error.SqlPreparedNotFound;
     var result: [key.len + 1 + 32]u8 = undefined;
     @memcpy(result[0..key.len], key);
@@ -182,6 +182,9 @@ pub fn closeForConnection(store: *transactions.DurableSessionStore, id: []const 
 }
 
 fn access(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64, connection_id: ?[32]u8) !void {
+    const mutation = store.mutationMutex();
+    @import("antfly_platform").sync.lockYielding(mutation);
+    defer mutation.unlock();
     if (store.fail_writes_for_test) return error.InjectedSessionStoreFailure;
     return switch (store.backend) {
         .docstore => |backend| blk: {

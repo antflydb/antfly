@@ -34,25 +34,52 @@ pub const Service = struct {
     }
 
     pub fn ingestBatch(self: *Service, req: api_types.IngestBatchRequest) !api_types.IngestBatchResult {
+        const namespace = try self.alloc.dupe(u8, req.namespace);
+        errdefer self.alloc.free(namespace);
         if (req.mutations.len == 0) return .{
-            .namespace = try self.alloc.dupe(u8, req.namespace),
+            .namespace = namespace,
             .mutation_count = 0,
             .start_lsn = 0,
             .end_lsn = 0,
         };
 
-        for (req.mutations) |mutation| {
-            if (mutation.kind == .checkpoint or mutation.kind == .enriched) return error.InvalidDocumentMutation;
-            if (mutation.body) |bytes| {
-                if (@import("../build/document_facts.zig").isInternalBody(bytes)) return error.InvalidDocumentMutation;
-                // Check the whole batch before appending any mutation. JSON
-                // ancestry is private too, including the legacy representation.
-                if (containsPrivateCheckpoint(self.alloc, bytes) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => false, // Plain text is a supported document body.
-                }) return error.InvalidDocumentMutation;
-            }
+        for (req.mutations) |mutation| try validatePublicMutation(self.alloc, mutation);
+        if (req.operation_id) |operation_id| {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const temporary = arena.allocator();
+            const payloads = try temporary.alloc([]const u8, req.mutations.len);
+            for (req.mutations, payloads) |mutation, *payload| payload.* = try api_codec.encodeMutationAlloc(temporary, mutation);
+            const result = try self.wal.appendBatchIdempotent(req.namespace, req.timestamp_ns, payloads, operation_id);
+            return .{ .namespace = namespace, .mutation_count = req.mutations.len, .start_lsn = result.start_lsn, .end_lsn = result.end_lsn };
         }
+
+        if (self.wal.supportsBatchAppend()) {
+            var cursor: usize = 0;
+            var first: u64 = 0;
+            var last: u64 = 0;
+            while (cursor < req.mutations.len) {
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena.deinit();
+                const temporary = arena.allocator();
+                var payloads = std.ArrayList([]const u8).empty;
+                var bytes: usize = 0;
+                while (cursor < req.mutations.len and payloads.items.len < 1024) {
+                    const encoded = try api_codec.encodeMutationAlloc(temporary, req.mutations[cursor]);
+                    const charge = std.math.add(usize, encoded.len, 32) catch return error.WalRecordTooLarge;
+                    if (charge > 8 * 1024 * 1024) return error.WalRecordTooLarge;
+                    if (charge > 8 * 1024 * 1024 - bytes and payloads.items.len != 0) break;
+                    try payloads.append(temporary, encoded);
+                    bytes += charge;
+                    cursor += 1;
+                }
+                const result = try self.wal.appendBatch(req.namespace, req.timestamp_ns, payloads.items);
+                if (first == 0) first = result.start_lsn;
+                last = result.end_lsn;
+            }
+            return .{ .namespace = namespace, .mutation_count = req.mutations.len, .start_lsn = first, .end_lsn = last };
+        }
+
         var start_lsn: u64 = 0;
         var end_lsn: u64 = 0;
         for (req.mutations, 0..) |mutation, idx| {
@@ -64,7 +91,7 @@ pub const Service = struct {
         }
 
         return .{
-            .namespace = try self.alloc.dupe(u8, req.namespace),
+            .namespace = namespace,
             .mutation_count = req.mutations.len,
             .start_lsn = start_lsn,
             .end_lsn = end_lsn,
@@ -74,6 +101,7 @@ pub const Service = struct {
     pub fn ingestTableBatch(self: *Service, req: api_types.TableIngestBatchDomainRequest) !api_types.TableIngestBatchResult {
         var result = try self.ingestBatch(.{
             .namespace = req.table_name,
+            .operation_id = req.operation_id,
             .timestamp_ns = req.timestamp_ns,
             .mutations = req.mutations,
         });
@@ -322,5 +350,18 @@ test "model aware media serverless public ingestion rejects internal checkpoint 
         .{ .kind = .upsert, .doc_id = "private", .body = "{\"_enrichment\":{\"chunk_embeddings_checkpoint\":{\"format\":1,\"parent\":{}}}}" },
     }) |private| {
         try std.testing.expectError(error.InvalidDocumentMutation, service.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 1, .mutations = &.{ .{ .kind = .upsert, .doc_id = "valid", .body = "{}" }, private } }));
+    }
+}
+
+pub fn validatePublicMutation(alloc: Allocator, mutation: api_types.DocumentMutation) !void {
+    if (mutation.kind == .checkpoint or mutation.kind == .enriched) return error.InvalidDocumentMutation;
+    if (mutation.body) |bytes| {
+        if (@import("../build/document_facts.zig").isInternalBody(bytes)) return error.InvalidDocumentMutation;
+        // Check the whole batch before appending any mutation. JSON
+        // ancestry is private too, including the legacy representation.
+        if (containsPrivateCheckpoint(alloc, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => false, // Plain text is a supported document body.
+        }) return error.InvalidDocumentMutation;
     }
 }

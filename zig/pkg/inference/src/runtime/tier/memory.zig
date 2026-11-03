@@ -650,18 +650,59 @@ pub const AdmissionAmounts = struct {
         return std.math.add(usize, self.host_scratch_bytes, self.backend_scratch_bytes);
     }
 
-    pub fn fitsLimits(self: @This(), limits: Limits) !bool {
+    pub const LimitExceeded = struct {
+        limit: enum { host, backend, combined, scratch, kv },
+        requested_bytes: usize,
+        limit_bytes: usize,
+    };
+
+    /// Return the first constraint that prevents this request fitting alone.
+    /// Keep validation and operator diagnostics on the same checked arithmetic.
+    pub fn firstLimitExceeded(self: @This(), limits: Limits) !?LimitExceeded {
         const host = try self.hostTotalBytesChecked();
         const device = try self.backendTotalBytesChecked();
         const combined = try std.math.add(usize, host, device);
         const scratch = try self.scratchTotalBytesChecked();
         const kv = try self.kvTotalBytesChecked();
-        inline for (.{ .{ host, limits.host_limit_bytes }, .{ device, limits.backend_limit_bytes }, .{ combined, limits.combined_limit_bytes }, .{ scratch, limits.scratch_limit_bytes }, .{ kv, limits.kv_limit_bytes } }) |pair| {
-            if (pair[1] != 0 and pair[0] > pair[1]) return false;
+        inline for (.{
+            .{ .host, host, limits.host_limit_bytes },
+            .{ .backend, device, limits.backend_limit_bytes },
+            .{ .combined, combined, limits.combined_limit_bytes },
+            .{ .scratch, scratch, limits.scratch_limit_bytes },
+            .{ .kv, kv, limits.kv_limit_bytes },
+        }) |entry| {
+            if (entry[2] != 0 and entry[1] > entry[2]) return .{
+                .limit = entry[0],
+                .requested_bytes = entry[1],
+                .limit_bytes = entry[2],
+            };
         }
-        return true;
+        return null;
+    }
+
+    pub fn fitsLimits(self: @This(), limits: Limits) !bool {
+        return (try self.firstLimitExceeded(limits)) == null;
     }
 };
+
+test "admission amounts identify the blocking budget even when scratch fits" {
+    const amounts = AdmissionAmounts{ .host_scratch_bytes = 40, .backend_scratch_bytes = 50, .backend_kv_bytes = 10 };
+    const cases = [_]struct { limits: Limits, expected: AdmissionAmounts.LimitExceeded }{
+        .{ .limits = .{ .host_limit_bytes = 39 }, .expected = .{ .limit = .host, .requested_bytes = 40, .limit_bytes = 39 } },
+        .{ .limits = .{ .backend_limit_bytes = 59 }, .expected = .{ .limit = .backend, .requested_bytes = 60, .limit_bytes = 59 } },
+        .{ .limits = .{ .combined_limit_bytes = 99, .scratch_limit_bytes = 100 }, .expected = .{ .limit = .combined, .requested_bytes = 100, .limit_bytes = 99 } },
+        .{ .limits = .{ .scratch_limit_bytes = 89 }, .expected = .{ .limit = .scratch, .requested_bytes = 90, .limit_bytes = 89 } },
+        .{ .limits = .{ .kv_limit_bytes = 9 }, .expected = .{ .limit = .kv, .requested_bytes = 10, .limit_bytes = 9 } },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, (try amounts.firstLimitExceeded(case.limits)).?);
+        try std.testing.expect(!try amounts.fitsLimits(case.limits));
+    }
+    try std.testing.expect(try amounts.fitsLimits(.{}));
+    try std.testing.expect(try amounts.fitsLimits(.{ .host_limit_bytes = 40, .backend_limit_bytes = 60, .combined_limit_bytes = 100, .scratch_limit_bytes = 90, .kv_limit_bytes = 10 }));
+    const overflow = AdmissionAmounts{ .host_scratch_bytes = std.math.maxInt(usize), .backend_scratch_bytes = 1 };
+    try std.testing.expectError(error.Overflow, overflow.firstLimitExceeded(.{}));
+}
 
 /// Optional process-owner bridge for coordinating inference admission with a
 /// broader resource manager. The inference runtime remains independent of the

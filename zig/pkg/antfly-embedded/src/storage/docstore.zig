@@ -1241,6 +1241,12 @@ pub const DocStore = struct {
         return self.runtime_store.capabilities();
     }
 
+    /// Preserve transaction coordination when this document facade wraps an
+    /// existing runtime store, including stores whose callbacks hold a gate.
+    pub fn writeSerialization(self: *const DocStore) backend_erased.WriteSerialization {
+        return self.runtime_store.writeSerialization();
+    }
+
     pub fn backendStore(self: *DocStore) BackendStore {
         return BackendStore.init(self);
     }

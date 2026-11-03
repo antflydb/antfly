@@ -26,6 +26,7 @@ pub const ChatWireFlavor = chat_wire.ChatWireFlavor;
 pub const ChatRequestOptions = chat_wire.ChatRequestOptions;
 pub const chatRequestJsonAlloc = chat_wire.chatRequestJsonAlloc;
 pub const chatRequestJsonWithOptionsAlloc = chat_wire.chatRequestJsonWithOptionsAlloc;
+pub const chatToolsFromValue = chat_wire.chatToolsFromValue;
 
 pub const Role = enum {
     system,
@@ -600,7 +601,8 @@ pub const GeneratorConfig = struct {
         if (self.image_input_token_bound) |bound| if (bound == 0 or bound > std.math.maxInt(i64)) return error.InvalidGeneratorConfig;
         if (self.max_tokens <= 0) return error.InvalidGeneratorConfig;
         if (self.max_completion_tokens) |limit| if (limit <= 0) return error.InvalidGeneratorConfig;
-        if (self.provider != .openai and self.provider != .chatgpt and (self.max_completion_tokens != null or self.reasoning_effort != null)) return error.InvalidGeneratorConfig;
+        if (self.provider != .openai and self.provider != .chatgpt and self.max_completion_tokens != null) return error.InvalidGeneratorConfig;
+        if (self.provider != .openai and self.provider != .chatgpt and self.provider != .ollama and self.reasoning_effort != null) return error.InvalidGeneratorConfig;
         if (self.temperature) |value| if (value < 0 or value > 2) return error.InvalidGeneratorConfig;
         if (self.top_p) |value| if (value < 0 or value > 1) return error.InvalidGeneratorConfig;
         if (self.top_k) |value| if (value <= 0) return error.InvalidGeneratorConfig;
@@ -1367,6 +1369,46 @@ test "executeChain falls back on timeout and retries within a link" {
     try std.testing.expectEqualStrings("fallback-success", fallback.content);
 }
 
+test "executeChain on_error retries only failures that are safe to repeat" {
+    // A timed-out generation may have run upstream, so an `on_error` link
+    // retries rate limits and unavailable upstreams but not timeouts; a link
+    // opts into retrying timeouts with `on_timeout`.
+    const alloc = std.testing.allocator;
+
+    const Fake = struct {
+        attempts: usize = 0,
+        first_error: anyerror,
+
+        fn create(ptr: *anyopaque, _: std.mem.Allocator, _: GeneratorConfig) !Generator {
+            return .{ .ptr = ptr, .vtable = &.{ .generate = generate } };
+        }
+
+        fn generate(ptr: *anyopaque, alloc_inner: std.mem.Allocator, _: []const u8, _: []const ChatMessage) !GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            if (self.attempts == 1) return self.first_error;
+            return .{ .content = try alloc_inner.dupe(u8, "retry-success"), .allocator = alloc_inner };
+        }
+    };
+
+    const chain = [_]ChainLink{.{
+        .generator = GeneratorConfig.fromOpenAI(.{ .model = "gpt-4.1" }),
+        .condition = .on_error,
+        .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 1 },
+    }};
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
+
+    var unavailable = Fake{ .first_error = error.ServiceUnavailable };
+    var retried = try executeChain(alloc, &chain, .{ .ptr = &unavailable, .vtable = &.{ .create = Fake.create } }, &messages);
+    defer retried.deinit();
+    try std.testing.expectEqualStrings("retry-success", retried.content);
+    try std.testing.expectEqual(@as(usize, 2), unavailable.attempts);
+
+    var timed_out = Fake{ .first_error = error.Timeout };
+    try std.testing.expectError(error.Timeout, executeChain(alloc, &chain, .{ .ptr = &timed_out, .vtable = &.{ .create = Fake.create } }, &messages));
+    try std.testing.expectEqual(@as(usize, 1), timed_out.attempts);
+}
+
 test "executeChain falls back on rate limit" {
     const alloc = std.testing.allocator;
 
@@ -1461,6 +1503,23 @@ test "generator config preserves OpenAI completion options through clone and rou
     defer reparsed.deinit(alloc);
     try std.testing.expectEqual(cfg.max_completion_tokens, reparsed.max_completion_tokens);
     try std.testing.expectEqual(cfg.reasoning_effort, reparsed.reasoning_effort);
+}
+
+test "generator config preserves Ollama reasoning through clone and round trip" {
+    const a = std.testing.allocator;
+    var cfg = try parseConfigFromSlice(a,
+        \\{"provider":"ollama","model":"thinking-model","reasoning_effort":"none","max_tokens":4096}
+    );
+    defer cfg.deinit(a);
+    var cloned = try cfg.clone(a);
+    defer cloned.deinit(a);
+    const encoded = try stringifyConfigAlloc(a, cloned);
+    defer a.free(encoded);
+    var reparsed = try parseConfigFromSlice(a, encoded);
+    defer reparsed.deinit(a);
+    try std.testing.expectEqual(OpenAIReasoningEffort.none, reparsed.reasoning_effort.?);
+    try std.testing.expectEqual(@as(i64, 4096), reparsed.outputTokenBudget());
+    try std.testing.expectEqual(@as(?i64, null), reparsed.max_completion_tokens);
 }
 
 test "generator config rejects ambiguous and invalid OpenAI completion options" {

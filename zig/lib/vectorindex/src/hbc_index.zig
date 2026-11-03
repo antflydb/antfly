@@ -3960,6 +3960,73 @@ const SubgroupScoreSink = struct {
     }
 };
 
+/// Rescores 1-bit candidates with a set's extended (multi-bit) codes:
+/// all of them, or only those whose 1-bit lower bound could still enter the
+/// candidate heap (`types.QuantizationRefine`).
+const ExRefine = struct {
+    /// Per-leaf query preparation is two dims-length float arrays; callers
+    /// back it with a stack buffer so scoring a leaf never hits the heap.
+    const stack_bytes = 32 * 1024;
+
+    /// Stack-backed allocation for one leaf's preparation, or the index
+    /// allocator when dims are too large for the buffer.
+    const Stack = struct {
+        buf: [stack_bytes]u8 align(16) = undefined,
+        fba: std.heap.FixedBufferAllocator = undefined,
+
+        fn get(self: *Stack, fallback: Allocator, dims: usize) Allocator {
+            // Unit query plus phase-split query, both dims-length f32.
+            if (dims * 8 + 64 > stack_bytes) return fallback;
+            self.fba = std.heap.FixedBufferAllocator.init(&self.buf);
+            return self.fba.allocator();
+        }
+    };
+
+    /// Prepared on the first rescore: most leaves have no candidate near the
+    /// cutoff, and preparation is O(dims) per leaf.
+    est: ?quantizer_mod.ExEstimator = null,
+    prepare_failed: bool = false,
+    alloc: Allocator,
+    query: []const f32,
+    set: *const proto.RaBitQuantizedVectorSet,
+    all: bool,
+    margin: f32 = 2,
+    refined: u64 = 0,
+
+    /// Returns null when the index is 1-bit or the set has no extended codes
+    /// (older payloads keep scoring 1-bit).
+    fn init(self: anytype, alloc: Allocator, set: *const proto.RaBitQuantizedVectorSet, approx_query: []const f32) !?ExRefine {
+        if (self.config.quantization_bits <= 1 or !set.hasEx()) return null;
+        return .{
+            .alloc = alloc,
+            .query = approx_query,
+            .set = set,
+            .all = self.config.quantization_refine == .all,
+            .margin = self.config.quantization_refine_margin,
+        };
+    }
+
+    fn deinit(self: *ExRefine) void {
+        if (self.est) |*est| est.deinit(self.alloc);
+    }
+
+    fn apply(self: *ExRefine, results: *const search_results.ApproxSearchResults, index: usize, distance: *f32, bound: *f32) void {
+        if (!self.all and distance.* - self.margin * bound.* > results.admissionCutoff()) return;
+        if (self.est == null) {
+            // On failure keep the (valid, looser) 1-bit estimate and bound.
+            if (self.prepare_failed) return;
+            self.est = quantizer_mod.ExEstimator.init(self.alloc, self.set, self.query) catch {
+                self.prepare_failed = true;
+                return;
+            };
+        }
+        const e = self.est.?.estimate(self.set, index);
+        distance.* = e.distance;
+        bound.* = e.bound;
+        self.refined += 1;
+    }
+};
+
 fn CandidateScoreSink(comptime with_projection: bool) type {
     return struct {
         results: *search_results.ApproxSearchResults,
@@ -3970,9 +4037,13 @@ fn CandidateScoreSink(comptime with_projection: bool) type {
         count: usize = 0,
         distances: [8]f32 = undefined,
         errors: [8]f32 = undefined,
+        refine: ?*ExRefine = null,
 
-        pub fn write(self: *@This(), index: usize, distance: f32, bound: f32) void {
+        pub fn write(self: *@This(), index: usize, distance_in: f32, bound_in: f32) void {
             std.debug.assert(index == self.first_row + self.count);
+            var distance = distance_in;
+            var bound = bound_in;
+            if (self.refine) |r| r.apply(self.results, index, &distance, &bound);
             self.distances[self.count] = distance;
             self.errors[self.count] = bound;
             self.count += 1;
@@ -4170,6 +4241,34 @@ fn scoreNativeLeafScan(
                 distances: [8]f32 = undefined,
                 bounds: [8]f32 = undefined,
                 count: usize = 0,
+                refine: ?quantizer_mod.ExEstimator = null,
+                refine_alloc: Allocator = undefined,
+                refine_query: []const f32 = &.{},
+                refine_enabled: bool = false,
+                refine_all: bool = false,
+                refine_margin: f32 = 2,
+                refined: u64 = 0,
+                /// Row-aware entry from Snapshot.scoreTo: refines with the
+                /// chunk's extended codes before admission.
+                pub fn writeRow(out: *@This(), set: *const proto.RaBitQuantizedVectorSet, row: usize, id: u64, distance: f32, bound: f32) void {
+                    var d = distance;
+                    var b = bound;
+                    if (out.refine_enabled and out.refine == null and set.hasEx() and (out.refine_all or d - out.refine_margin * b <= out.target.admissionCutoff())) {
+                        out.refine = quantizer_mod.ExEstimator.init(out.refine_alloc, set, out.refine_query) catch blk: {
+                            out.refine_enabled = false;
+                            break :blk null;
+                        };
+                    }
+                    if (out.refine) |*est| {
+                        if (set.hasEx() and set.ex_bits == est.codec.bits and (out.refine_all or d - out.refine_margin * b <= out.target.admissionCutoff())) {
+                            const e = est.estimate(set, row);
+                            d = e.distance;
+                            b = e.bound;
+                            out.refined += 1;
+                        }
+                    }
+                    out.write(id, d, b);
+                }
                 pub fn write(out: *@This(), id: u64, distance: f32, bound: f32) void {
                     out.ids[out.count] = id;
                     out.distances[out.count] = distance;
@@ -4183,7 +4282,18 @@ fn scoreNativeLeafScan(
                 }
             };
             const start = now();
-            var sink = Sink{ .target = results };
+            var sink = Sink{ .target = results, .refine_all = self.config.quantization_refine == .all, .refine_margin = self.config.quantization_refine_margin };
+            var ex_stack: ExRefine.Stack = .{};
+            const ex_alloc = ex_stack.get(self.alloc, self.config.dims);
+            if (self.config.quantization_bits > 1) {
+                sink.refine_enabled = true;
+                sink.refine_alloc = ex_alloc;
+                sink.refine_query = approx_query;
+            }
+            defer if (sink.refine) |*est| {
+                profile.ex_refined_vectors += sink.refined;
+                est.deinit(ex_alloc);
+            };
             try rows.scoreTo(&self.quantizer, approx_query, &scratch.estimate, if (req.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null, &sink);
             sink.flush();
             profile.leaf_score_ns += elapsed(start);
@@ -4352,7 +4462,13 @@ fn scoreLeafMemberIds(
     const original_positions: []const usize = if (direct_native_scoring) &.{} else scratch.positions[0..filtered_count];
     if (direct_no_copy) {
         try validateQuantizedSet(self, native_quantized.?, member_ids.len);
-        var sink = NoCopyCandidateScoreSink{ .results = results, .ids = member_ids };
+        var ex_stack: ExRefine.Stack = .{};
+        var refine = try ExRefine.init(self, ex_stack.get(self.alloc, self.config.dims), &native_quantized.?.rabit, approx_query);
+        defer if (refine) |*r| {
+            profile.ex_refined_vectors += r.refined;
+            r.deinit();
+        };
+        var sink = NoCopyCandidateScoreSink{ .results = results, .ids = member_ids, .refine = if (refine) |*r| r else null };
         try self.quantizer.estimateDistancesTo(
             &native_quantized.?.rabit,
             approx_query,
@@ -4385,7 +4501,13 @@ fn scoreLeafMemberIds(
             if (direct_native_scoring) {
                 const count = member_ids.len;
                 try validateQuantizedSet(self, native_quantized.?, count);
-                var sink = NativeCandidateScoreSink{ .results = results, .ids = member_ids, .plane = projection_plane, .dims = dims };
+                var ex_stack: ExRefine.Stack = .{};
+                var refine = try ExRefine.init(self, ex_stack.get(self.alloc, self.config.dims), &native_quantized.?.rabit, approx_query);
+                defer if (refine) |*r| {
+                    profile.ex_refined_vectors += r.refined;
+                    r.deinit();
+                };
+                var sink = NativeCandidateScoreSink{ .results = results, .ids = member_ids, .plane = projection_plane, .dims = dims, .refine = if (refine) |*r| r else null };
                 try self.quantizer.estimateDistancesTo(
                     &native_quantized.?.rabit,
                     approx_query,
@@ -4492,6 +4614,22 @@ fn scoreLeafMemberIds(
             const distances = scratch.distances[0..count];
             const error_bounds = scratch.error_bounds[0..count];
             try self.estimateQuantizedDistances(quantized_set, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
+            if (std.meta.activeTag(quantized_set.*) == .rabit) {
+                var ex_stack: ExRefine.Stack = .{};
+                if (try ExRefine.init(self, ex_stack.get(self.alloc, self.config.dims), &quantized_set.rabit, approx_query)) |refine_init| {
+                    // The heap does not change during this pass, so the cutoff
+                    // is conservative: it can only refine more, never less.
+                    var refine = refine_init;
+                    defer refine.deinit();
+                    if (direct_native_scoring) {
+                        for (0..count) |i| refine.apply(results, i, &distances[i], &error_bounds[i]);
+                    } else {
+                        // Filtered members score at their original positions.
+                        for (original_positions) |pos| refine.apply(results, pos, &distances[pos], &error_bounds[pos]);
+                    }
+                    profile.ex_refined_vectors += refine.refined;
+                }
+            }
             if (!has_extra_filters and !filters_active) {
                 var cancellation_index: usize = 0;
                 while (cancellation_index < scoring_member_ids.len) : (cancellation_index += 256) {
@@ -10139,6 +10277,87 @@ fn putMissingDeferredVecLeafMappings(self: anytype, txn: anytype, mappings: []co
     return writes;
 }
 
+/// Bounded commits for bulk builds larger than one storage commit admits.
+/// `budget` 0 disables rotation. The index type owns one of these as
+/// `bulk_commit_rotation` and sets the budget only inside a bulk-publication
+/// session, where intermediate commits are not published and an interrupted
+/// build leaves the bulk-publish marker that forces a rebuild on reopen.
+pub const BulkCommitRotation = struct {
+    budget: u64 = 0,
+    /// Builder's own estimate of bytes staged since the last commit.
+    staged: u64 = 0,
+    /// Measure the batch again once the scaled estimate reaches this.
+    next_check: u64 = 0,
+    /// Largest measured / estimated ratio seen; the estimate misses
+    /// per-entry overhead and derived writes, so this only grows.
+    ratio: f64 = 1,
+    commits: u64 = 0,
+};
+
+/// Notes `bytes` staged into `txn` by the bulk builder and, at or over the
+/// budget, commits it and continues in a fresh runtime batch. Callers invoke
+/// it only between complete writes (stored vectors, finished nodes).
+fn bulkNoteStaged(self: anytype, txn: anytype, bytes: u64) !void {
+    const Index = childType(@TypeOf(self));
+    if (comptime !@hasField(Index, "bulk_commit_rotation")) return;
+    if (comptime @TypeOf(txn) != *store.NamespaceBatch) return;
+    const rotation = &self.bulk_commit_rotation;
+    if (rotation.budget == 0) return;
+    rotation.staged +|= bytes;
+    if (rotation.next_check == 0) rotation.next_check = rotation.budget / 2;
+    const scaled: u64 = @intFromFloat(@as(f64, @floatFromInt(rotation.staged)) * rotation.ratio);
+    if (scaled < rotation.next_check) return;
+    // Measuring can walk the batch, so do it only at halving checkpoints
+    // toward the budget (a handful per commit), not on every write.
+    const measured = (try txn.stagedBytes()) orelse scaled;
+    if (rotation.staged > 0) rotation.ratio = @max(rotation.ratio, @as(f64, @floatFromInt(measured)) / @as(f64, @floatFromInt(rotation.staged)));
+    if (measured + rotation.budget / 64 < rotation.budget) {
+        rotation.next_check = measured + (rotation.budget - measured) / 2;
+        return;
+    }
+    // On a failed commit the batch is still open; the caller aborts it.
+    try txn.commit();
+    rotation.commits += 1;
+    rotation.staged = 0;
+    rotation.next_check = rotation.budget / 2;
+    txn.* = self.beginRuntimeBatchTxn() catch |err| {
+        txn.* = store.NamespaceBatch.inert(self.alloc);
+        return err;
+    };
+}
+
+/// Approximate bytes one finished bulk leaf of `count` members stages:
+/// vector-to-leaf mappings, the member list and node body, and its RaBitQ
+/// payload including extended codes.
+fn bulkLeafStagedBytes(self: anytype, count: usize) u64 {
+    const dims: u64 = self.config.dims;
+    const n: u64 = count;
+    const one_bit: u64 = @as(u64, rabitq.codeWidth(self.config.dims)) * 8 + 16;
+    const ex: u64 = if (self.config.quantization_bits > 1)
+        @as(u64, proto.RaBitQuantizedVectorSet.exWordsPerRow(self.config.dims, self.config.quantization_bits)) * 8 + 8
+    else
+        0;
+    return n * (40 + one_bit + ex) + dims * 8 + 256;
+}
+
+/// Conservative estimate of everything a bulk build of `count` vectors
+/// stages in one commit. Vector and metadata writes are counted exactly; the
+/// tree phase (mappings, node bodies, payloads) measured up to ~4x the leaf
+/// estimate, so it is inflated by that factor.
+fn bulkBuildStagedBytes(self: anytype, count: usize, metadata_bytes: u64, store_vectors: bool) u64 {
+    const vectors: u64 = if (store_vectors) @as(u64, count) * (@as(u64, self.config.dims) * 4 + 16) else 0;
+    return vectors + metadata_bytes + @as(u64, count) * 16 + 4 * bulkLeafStagedBytes(self, count);
+}
+
+/// Bounded commits cost a read-back of committed nodes during tree
+/// construction, so builds that comfortably fit one commit keep the single
+/// transaction: switch only above three chunk budgets (three quarters of
+/// the LSM commit backlog).
+fn bulkBuildNeedsBoundedCommits(self: anytype, staged_estimate: u64, budget: u64) bool {
+    _ = self;
+    return staged_estimate > budget *| 3;
+}
+
 pub fn bulkBuildWithMetadata(
     self: anytype,
     items: []const hbc_runtime.BatchInsertItem,
@@ -10157,6 +10376,19 @@ pub fn bulkBuildWithMetadataOptions(
 ) !void {
     if (items.len == 0) return;
 
+    const Index = childType(@TypeOf(self));
+    if (comptime @hasField(Index, "bulk_commit_rotation") and @hasDecl(Index, "bulkCommitBudgetBytes") and
+        @hasDecl(Index, "beginBulkIngestSession"))
+    {
+        const budget = self.bulkCommitBudgetBytes();
+        if (budget != 0 and self.write_session_depth == 0) {
+            var metadata_bytes: u64 = 0;
+            for (items) |item| metadata_bytes += item.metadata.len + 16;
+            if (bulkBuildNeedsBoundedCommits(self, bulkBuildStagedBytes(self, items.len, metadata_bytes, !options.skip_vector_store), budget))
+                return bulkBuildWithMetadataBounded(self, items, options, budget, now_fn, elapsed_fn);
+        }
+    }
+
     const publishing = try beginPublishSearchStateIfSupported(self);
     errdefer abortPublishSearchStateIfSupported(self, publishing);
     var batch = try self.beginRuntimeBatchTxn();
@@ -10170,6 +10402,93 @@ pub fn bulkBuildWithMetadataOptions(
     self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
     try finishPublishSearchStateIfSupported(self, publishing);
     seedRetainedVectorsAfterCommit(self, items, options);
+}
+
+/// A bulk build too large for one storage commit: stage it in commits of at
+/// most `budget` bytes inside a bulk-publication session. Searches keep the
+/// previous (empty) snapshot until the session finish publishes the tree.
+fn bulkBuildWithMetadataBounded(
+    self: anytype,
+    items: []const hbc_runtime.BatchInsertItem,
+    options: bulk_build.BulkBuildOptions,
+    budget: u64,
+    now_fn: fn () u64,
+    elapsed_fn: fn (u64) u64,
+) !void {
+    try self.beginBulkIngestSession();
+    var session_open = true;
+    errdefer if (session_open) self.abortBulkIngestSession();
+    self.bulk_commit_rotation = .{ .budget = budget };
+    // Keep `commits` as the last build's statistic.
+    defer {
+        self.bulk_commit_rotation.budget = 0;
+        self.bulk_commit_rotation.staged = 0;
+    }
+    {
+        var batch = try self.beginRuntimeBatchTxn();
+        errdefer batch.abort();
+        errdefer abortVectorCacheMutationsIfSupported(self);
+        try bulkBuildWithMetadataTxnOptions(self, &batch, items, options, now_fn, elapsed_fn);
+        try finalizeWriteTxnOptions(self, &batch, .{}, now_fn, elapsed_fn);
+        const commit_start = now_fn();
+        try batch.commit();
+        self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
+    }
+    self.bulk_commit_rotation.budget = 0;
+    session_open = false;
+    try self.finishBulkIngestSessionWithOptions(.{});
+    seedRetainedVectorsAfterCommit(self, items, options);
+}
+
+/// Commit budget for a bulk build of `inputs`, or null when it fits in one
+/// storage commit (or the index cannot stage across commits right now).
+pub fn preparedBulkBuildCommitBudget(self: anytype, inputs: []const bulk_build.PreparedBulkBuildInput, options: bulk_build.BulkBuildOptions) ?u64 {
+    const Index = childType(@TypeOf(self));
+    if (comptime !(@hasField(Index, "bulk_commit_rotation") and @hasDecl(Index, "bulkCommitBudgetBytes") and
+        @hasDecl(Index, "beginBulkIngestSession"))) return null;
+    const budget = self.bulkCommitBudgetBytes();
+    if (budget == 0 or self.write_session_depth != 0) return null;
+    var metadata_bytes: u64 = 0;
+    for (inputs) |input| metadata_bytes += input.metadata.len + 16;
+    if (!bulkBuildNeedsBoundedCommits(self, bulkBuildStagedBytes(self, inputs.len, metadata_bytes, !options.skip_vector_store), budget)) return null;
+    return budget;
+}
+
+/// Bulk build from prepared inputs, staged in commits of at most `budget`
+/// bytes inside a bulk-publication session that this call owns. Use when
+/// `preparedBulkBuildCommitBudget` returns a budget; smaller builds keep the
+/// caller-owned single transaction (`bulkBuildPreparedInputsTxn`).
+pub fn bulkBuildPreparedInputsBounded(
+    self: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    options: bulk_build.BulkBuildOptions,
+    budget: u64,
+    now_fn: fn () u64,
+    elapsed_fn: fn (u64) u64,
+) !void {
+    if (inputs.len == 0) return;
+    try self.beginBulkIngestSession();
+    var session_open = true;
+    errdefer if (session_open) self.abortBulkIngestSession();
+    self.bulk_commit_rotation = .{ .budget = budget };
+    // Keep `commits` as the last build's statistic.
+    defer {
+        self.bulk_commit_rotation.budget = 0;
+        self.bulk_commit_rotation.staged = 0;
+    }
+    {
+        var batch = try self.beginRuntimeBatchTxn();
+        errdefer batch.abort();
+        errdefer abortVectorCacheMutationsIfSupported(self);
+        try bulkBuildPreparedInputsTxnOptions(self, &batch, inputs, options, now_fn, elapsed_fn);
+        try finalizeWriteTxnOptions(self, &batch, .{}, now_fn, elapsed_fn);
+        const commit_start = now_fn();
+        try batch.commit();
+        self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
+    }
+    self.bulk_commit_rotation.budget = 0;
+    session_open = false;
+    try self.finishBulkIngestSessionWithOptions(.{});
 }
 
 pub fn bulkBuildWithMetadataTxn(self: anytype, txn: anytype, items: []const hbc_runtime.BatchInsertItem) !void {
@@ -10210,6 +10529,7 @@ pub fn bulkBuildPreparedInputsTxnOptions(
         if (input.metadata.len > 0) {
             var key_buf: [10]u8 = undefined;
             try self.appendNamespaced(txn, .vecs, hbc.encodeVecMetaKey(&key_buf, input.vector_id), input.metadata);
+            try bulkNoteStaged(self, txn, input.metadata.len + 16);
         }
     }
     if (!options.skip_vector_store) {
@@ -10217,6 +10537,7 @@ pub fn bulkBuildPreparedInputsTxnOptions(
             const input = inputs[input_idx];
             var key_buf: [10]u8 = undefined;
             try self.appendNamespaced(txn, .vecs, hbc.encodeVecKey(&key_buf, input.vector_id), std.mem.sliceAsBytes(input.vector));
+            try bulkNoteStaged(self, txn, input.vector.len * @sizeOf(f32) + 16);
         }
     } else if (shouldSeedRetainedVectorCacheOnSkipStore(self)) {
         for (sorted_indexes) |input_idx| {
@@ -11495,6 +11816,8 @@ fn buildBulkLeafIndexed(
     }
     try saveLeafNodeBodyWithKnownVectors(self, txn, &node, leaf_vectors, nowNsI128Fixed, elapsedSinceNsFixed);
     try self.putNodeSplitRange(txn, node_id, &range);
+    // Before freeing members: a failed rotation unwinds through the errdefers.
+    try bulkNoteStaged(self, txn, bulkLeafStagedBytes(self, indexes.len));
     self.alloc.free(members);
 
     return .{
@@ -11857,6 +12180,8 @@ fn buildBulkLeaf(
     }
     try self.saveNodeBody(txn, &node);
     try self.putNodeSplitRange(txn, node_id, &range);
+    // Before freeing members: a failed rotation unwinds through the errdefers.
+    try bulkNoteStaged(self, txn, bulkLeafStagedBytes(self, inputs.len));
     self.alloc.free(members);
 
     return .{
@@ -12591,6 +12916,9 @@ fn validateQuantizedSet(self: anytype, qs: *const hbc_runtime.QuantizedSet, expe
             if (self.config.metric != .l2_squared and set.centroid_dot_products.len != expected_count) {
                 return error.Corrupted;
             }
+            // Extended codes are optional (older payloads lack them) but must
+            // be complete when present.
+            if (set.ex_bits != 0 and (set.ex_bits > 8 or !set.hasEx())) return error.Corrupted;
         },
     }
 }

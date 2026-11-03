@@ -77,6 +77,15 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
     var opened = try ingestion.openQueue(a, binding, options);
     defer opened.deinit();
     const wal: @import("../serverless/lake_wal.zig").Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = try ingestion.prefix(scratch, opened.prefix, binding, options), .context = context };
-    const result = try wal.prune(scratch, wal_cut, request.max_deleted, request.dry_run);
+    var result = try wal.prune(scratch, wal_cut, request.max_deleted, request.dry_run);
+    if (!request.dry_run and result.complete) {
+        var artifacts = try @import("lake_index_store.zig").Store.openNative(scratch, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+        defer artifacts.deinit();
+        const identity = @import("lake_wal_image.zig").digest(.{ .storage = artifacts.identity, .table = table.table_id, .generation = table.object_storage_generation, .prefix = wal.prefix });
+        var shared = try wal.open(scratch, false);
+        defer shared.deinit();
+        result.collection = try server.lake_wal_collectors.step(scratch, identity, shared.indexed.?, server.embedding_provider_runtime.io, wal.collectionNamespace(), request.max_deleted, catalog.types.contextCancellation(&context));
+        result.complete = result.collection.?.phase == .finished or result.collection.?.phase == .idle;
+    }
     return .{ .body = try std.json.Stringify.valueAlloc(a, result, .{}), .mutated = false };
 }

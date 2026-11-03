@@ -242,7 +242,7 @@ pub const ObjectStore = struct {
         if (cutoff == 0) return error.InvalidPublicationFence;
         const key = try manifestKeyAlloc(self.alloc, self.opened.prefix, namespace, version);
         defer self.alloc.free(key);
-        var object = self.opened.client.getObject(self.opened.bucket, key, .{}) catch |err| switch (err) {
+        var object = self.opened.client.getObject(self.opened.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return false,
             else => return err,
         };
@@ -251,14 +251,14 @@ pub const ObjectStore = struct {
         defer current.deinit(self.alloc);
         if (current.publication_fencing_token == 0 or current.publication_fencing_token >= cutoff) return false;
         // Do not substitute a separate HEAD/STAT identity: recreation between
-        // GET and STAT could pair old authority with the new object's ETag.
-        const etag = object.metadata.etag orelse return error.ConditionalManifestDeletionUnsupported;
+        // GET and STAT could pair old authority with the new object's revision.
+        const revision = object.metadata.writeRevision() orelse return error.ConditionalManifestDeletionUnsupported;
         const head = self.getHead(namespace) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
         if (head == version) return error.CannotDeleteHead;
-        self.opened.client.deleteObject(self.opened.bucket, key, .{ .if_match_etag = etag }) catch |err| switch (err) {
+        self.opened.client.compareAndDelete(self.opened.bucket, key, revision, .{}) catch |err| switch (err) {
             error.FileNotFound, error.PreconditionFailed => return false,
             else => return err,
         };

@@ -43,13 +43,17 @@ pub fn modelSupportsCapability(
     // gliner_boundary_qualification.require() before any request executes.
     if (std.mem.eql(u8, gliner_model_type, gliner_boundary.model_type) and !gliner_boundary.runtime_available) return false;
     if (hasCapability(capabilities, capability)) return true;
+    // Entity-only profiles use the public NER name. Treat it as extraction
+    // without inheriting the legacy family's classifier or relation heads.
+    if (std.mem.eql(u8, capability, "extraction") and hasCapability(capabilities, "named_entity_recognition")) return true;
     // A recognized serving capability list is authoritative. This lets a
     // GLiNER span artifact expose only its reviewed decision head without
     // inheriting the legacy family's entity and relation capabilities.
     for (capabilities) |declared| {
         if (std.mem.eql(u8, declared, "classification") or
             std.mem.eql(u8, declared, "relations") or
-            std.mem.eql(u8, declared, "extraction")) return false;
+            std.mem.eql(u8, declared, "extraction") or
+            std.mem.eql(u8, declared, "named_entity_recognition")) return false;
     }
     if (std.mem.eql(u8, model_kind, "classifier")) {
         return std.mem.eql(u8, capability, "classification");
@@ -122,6 +126,20 @@ test "explicit GLiNER serving capabilities do not gain family capabilities" {
     try std.testing.expect(modelSupportsCapability("extractor", "gliner2", decision_capabilities, "classification"));
     try std.testing.expect(!modelSupportsCapability("extractor", "gliner2", decision_capabilities, "relations"));
     try std.testing.expect(!modelSupportsCapability("extractor", "gliner2", decision_capabilities, "extraction"));
+}
+
+test "specialty capability declarations expose only their reviewed task" {
+    const pii = &.{"named_entity_recognition"};
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", pii, "named_entity_recognition"));
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", pii, "extraction"));
+    for ([_][]const u8{ "classification", "relations", "zero_shot", "multi_label", "typed_decisions" }) |capability| {
+        try std.testing.expect(!modelSupportsCapability("extractor", "gliner2", pii, capability));
+    }
+    const gliguard = &.{"classification"};
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", gliguard, "classification"));
+    for ([_][]const u8{ "named_entity_recognition", "extraction", "relations", "typed_decisions" }) |capability| {
+        try std.testing.expect(!modelSupportsCapability("extractor", "gliner2", gliguard, capability));
+    }
 }
 
 test "modelKindAcceptsInput infers text and image modalities" {

@@ -173,7 +173,7 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
     };
     const key = try jobKey(scratch, store, table.table_id, cut);
     var client = store.opened.client;
-    var saved = client.getObject(store.opened.bucket, key, .{ .max_response_bytes = 2 * 1024 * 1024, .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
+    var saved = client.getObject(store.opened.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = 2 * 1024 * 1024, .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => null,
         else => return err,
     };
@@ -200,22 +200,22 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
     job.attempts +|= 1;
     io.random(&job.owner_token);
     job.last_error = null;
-    var claimed = client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, job, .{}), .{ .if_none_match = saved == null, .if_match_etag = if (saved) |value| value.metadata.etag orelse return error.MissingObjectEtag else null, .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
+    var claimed = client.compareAndPut(store.opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, job, .{}), if (saved) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
         error.PreconditionFailed, error.ObjectAlreadyExists => return error.IndexRebuilding,
         else => {
             // A canceled/lost response may follow a successful claim write.
             // Recover only our random ownership token within the same bounded
             // cleanup path; never release a concurrent or successor claim.
-            releaseClaim(scratch, store, key, "", job, io) catch {};
+            releaseClaim(scratch, store, key, null, job, io) catch {};
             return err;
         },
     };
     defer claimed.deinit(client.allocator);
     var job_finished = false;
     // Shutdown cancellation must not strand this claim until lease expiry.
-    // A separate one-second cleanup budget releases only our ETag; a crashed
+    // A separate one-second cleanup budget releases only our captured revision; a crashed
     // process still relies on normal lease expiry, and a newer owner is fenced.
-    errdefer if (!job_finished) releaseClaim(scratch, store, key, claimed.etag orelse "", job, io) catch {};
+    errdefer if (!job_finished) releaseClaim(scratch, store, key, claimed.writeRevision(), job, io) catch {};
     var artifacts = store.artifactStore();
     artifacts.upload_scope = try stores.UploadScope.forPublication(scopeDomain(table.table_id, store.identity), job.expires_ms, io);
     const object = artifacts.providerStore();
@@ -256,7 +256,7 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
     }
     // CAS ties completion to this claim; an expired worker cannot overwrite
     // a replacement. Immutable artifacts are safe orphan candidates on failure.
-    var completed = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, job, .{}), .{ .if_match_etag = claimed.etag orelse return error.MissingObjectEtag, .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null });
+    var completed = try client.compareAndPut(store.opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, job, .{}), claimed.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null });
     job_finished = true;
     completed.deinit(client.allocator);
     if (job.state != .ready) {
@@ -298,7 +298,7 @@ fn publishStatus(a: A, table: local.common_topology_records.TableRecord, publica
     // Exhaustion leaves no ready memo, so the next query can repair progress.
     for (0..3) |_| {
         try context.ensureActive();
-        var prior_status = client.getObject(store.opened.bucket, status_key, .{ .max_response_bytes = 2 * 1024 * 1024, .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
+        var prior_status = client.getObject(store.opened.bucket, status_key, .{ .skip_metadata_probe = true, .max_response_bytes = 2 * 1024 * 1024, .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
             error.NotFound, error.ObjectNotFound, error.FileNotFound => null,
             else => return err,
         };
@@ -310,7 +310,7 @@ fn publishStatus(a: A, table: local.common_topology_records.TableRecord, publica
                 (prior.state == .ready and std.mem.eql(u8, &prior.cut, &job.cut) and prior.coverage_until_ms >= job.coverage_until_ms);
         };
         {
-            var status_write = client.putObject(store.opened.bucket, status_key, try std.json.Stringify.valueAlloc(scratch, job, .{}), .{ .if_none_match = prior_status == null, .if_match_etag = if (prior_status) |value| value.metadata.etag orelse return error.MissingObjectEtag else null, .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
+            var status_write = client.compareAndPut(store.opened.bucket, status_key, try std.json.Stringify.valueAlloc(scratch, job, .{}), if (prior_status) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
                 error.PreconditionFailed, error.ObjectAlreadyExists => continue,
                 else => return err,
             };
@@ -320,7 +320,7 @@ fn publishStatus(a: A, table: local.common_topology_records.TableRecord, publica
     }
     return false;
 }
-fn releaseClaim(a: A, store: *Store, key: []const u8, etag: []const u8, previous: Job, io: std.Io) !void {
+fn releaseClaim(a: A, store: *Store, key: []const u8, revision: ?@import("objectstore").ObjectRevision, previous: Job, io: std.Io) !void {
     const protection = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(protection);
     const Cleanup = struct {
@@ -343,15 +343,15 @@ fn releaseClaim(a: A, store: *Store, key: []const u8, etag: []const u8, previous
     const token: local.storage_object_storage.CancellationToken = .{ .ptr = &cleanup, .is_cancelled_fn = Cleanup.cancelled };
     var observed: ?local.storage_object_storage.GetResult = null;
     defer if (observed) |*value| value.deinit(client.allocator);
-    const expected = if (etag.len != 0) etag else recovered: {
-        observed = try client.getObject(store.opened.bucket, key, .{ .max_response_bytes = 2 * 1024 * 1024, .cancellation = token });
+    const expected = revision orelse recovered: {
+        observed = try client.getObject(store.opened.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = 2 * 1024 * 1024, .cancellation = token });
         var parsed = try std.json.parseFromSlice(Job, a, observed.?.body, .{});
         defer parsed.deinit();
         const owned = parsed.value;
         if (owned.state != .building or !std.mem.eql(u8, &owned.owner_token, &previous.owner_token) or !std.mem.eql(u8, &owned.cut, &previous.cut) or owned.attempts != previous.attempts) return error.PreconditionFailed;
-        break :recovered observed.?.metadata.etag orelse return error.MissingObjectEtag;
+        break :recovered observed.?.metadata.writeRevision() orelse return error.MissingObjectRevision;
     };
-    var written = try client.putObject(store.opened.bucket, key, bytes, .{ .if_match_etag = expected, .cancellation = token });
+    var written = try client.compareAndPut(store.opened.bucket, key, bytes, expected, .{ .cancellation = token });
     written.deinit(client.allocator);
 }
 fn buildSegments(a: A, out: A, table: local.common_topology_records.TableRecord, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *stores.ArtifactStore, wrapper: *Store, context: Context, options: local.inference_managed_embedder.InitOptions) ![]const Declared {
@@ -515,7 +515,7 @@ pub fn status(a: A, store: *Store, table: local.common_topology_records.TableRec
     const key = try statusKey(a, store, table, namespace);
     defer a.free(key);
     var client = store.opened.client;
-    var saved = client.getObject(store.opened.bucket, key, .{ .max_response_bytes = 2 * 1024 * 1024, .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
+    var saved = client.getObject(store.opened.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = 2 * 1024 * 1024, .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => return std.json.Stringify.valueAlloc(a, .{ .state = if (recipe_changed) "recipe_changed" else "idle", .table_id = table.table_id }, .{}),
         else => return err,
     };
@@ -564,7 +564,7 @@ test "external lake bounded WAL interrupted enrichment claims release conditiona
     defer a.free(bytes);
     var claimed = try client.putObject(store.opened.bucket, key, bytes, .{});
     defer claimed.deinit(client.allocator);
-    try releaseClaim(a, &store, key, claimed.etag.?, job, std.testing.io);
+    try releaseClaim(a, &store, key, claimed.writeRevision(), job, std.testing.io);
     var released = try client.getObject(store.opened.bucket, key, .{});
     defer released.deinit(client.allocator);
     var state = try std.json.parseFromSlice(Job, a, released.body, .{});
@@ -578,14 +578,14 @@ test "external lake bounded WAL interrupted enrichment claims release conditiona
     defer a.free(next_bytes);
     var replacement = try client.putObject(store.opened.bucket, key, next_bytes, .{ .if_match_etag = released.metadata.etag.? });
     defer replacement.deinit(client.allocator);
-    try std.testing.expectError(error.PreconditionFailed, releaseClaim(a, &store, key, claimed.etag.?, job, std.testing.io));
+    try std.testing.expectError(error.PreconditionFailed, releaseClaim(a, &store, key, claimed.writeRevision(), job, std.testing.io));
     var current = try client.getObject(store.opened.bucket, key, .{});
     defer current.deinit(client.allocator);
     try std.testing.expectEqualStrings(next_bytes, current.body);
     // Losing the successful PUT response must not strand our lease. Recover
     // its token and ETag, while refusing a newer worker even without an ETag.
-    try std.testing.expectError(error.PreconditionFailed, releaseClaim(a, &store, key, "", job, std.testing.io));
-    try releaseClaim(a, &store, key, "", next_claim, std.testing.io);
+    try std.testing.expectError(error.PreconditionFailed, releaseClaim(a, &store, key, null, job, std.testing.io));
+    try releaseClaim(a, &store, key, null, next_claim, std.testing.io);
     var recovered = try client.getObject(store.opened.bucket, key, .{});
     defer recovered.deinit(client.allocator);
     var recovered_state = try std.json.parseFromSlice(Job, a, recovered.body, .{});

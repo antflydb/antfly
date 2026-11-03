@@ -574,7 +574,7 @@ pub fn transcriptionRequest(a: std.mem.Allocator, cfg: transcribing.Config, requ
 
 pub fn validateChatConfig(cfg: generating.GeneratorConfig) !void {
     if (cfg.top_k != null and cfg.provider != .antfly and cfg.provider != .ollama and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
-    if (cfg.reasoning_effort != null and cfg.provider != .openai) return error.UnsupportedInferenceFeature;
+    if (cfg.reasoning_effort != null and cfg.provider != .openai and cfg.provider != .ollama) return error.UnsupportedInferenceFeature;
 }
 
 pub fn chatBody(a: std.mem.Allocator, cfg: generating.GeneratorConfig, request: Json) ![]u8 {
@@ -662,6 +662,15 @@ fn openAiMessages(a: std.mem.Allocator, messages: Json) !Json {
                 try parts.array.append(part);
             }
             try message.object.put(a, "content", parts);
+        };
+        if (source.object.get("role")) |role| if (role == .string and std.mem.eql(u8, role.string, "assistant")) {
+            const content = source.object.get("content");
+            const calls = source.object.get("tool_calls");
+            const has_calls = if (calls) |value| value == .array and value.array.items.len > 0 else false;
+            if ((content == null or content.? == .null) and !has_calls) {
+                message.object = try message.object.clone(a);
+                try message.object.put(a, "content", .{ .string = "" });
+            }
         };
         try result.array.append(message);
     }
@@ -836,6 +845,36 @@ test "provider registry gateway audio reads preserve input and reject mixed sour
         "{\"audio\":\"x\",\"documents\":[]}",
         "{\"audio\":\"\"}",
     }) |invalid| try std.testing.expectError(error.InvalidInferenceRequest, readingBody(a, cfg, try std.json.parseFromSliceLeaky(Json, a, invalid, .{})));
+}
+
+test "provider registry gateway Ollama chat forwards reasoning and normalizes empty assistant turns" {
+    const a = std.testing.allocator;
+    const request = try std.json.parseFromSlice(Json, a,
+        \\{"messages":[{"role":"assistant"},{"role":"assistant","content":null,"tool_calls":[]},{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"search","arguments":"{}"}}]}]}
+    , .{});
+    defer request.deinit();
+    const cfg = generating.GeneratorConfig{
+        .provider = .ollama,
+        .model = "thinking-model",
+        .url = "http://localhost:11434/v1",
+        .reasoning_effort = .none,
+    };
+    try cfg.validate();
+    const body = try chatBody(a, cfg, request.value);
+    defer a.free(body);
+    const parsed = try std.json.parseFromSlice(Json, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("none", parsed.value.object.get("reasoning_effort").?.string);
+    try std.testing.expectEqual(@as(i64, generating.default_max_tokens), parsed.value.object.get("max_tokens").?.integer);
+    try std.testing.expect(!parsed.value.object.contains("max_completion_tokens"));
+    const turns = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqualStrings("", turns[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("", turns[1].object.get("content").?.string);
+    try std.testing.expect(!turns[2].object.contains("content"));
+    try std.testing.expect(!request.value.object.get("messages").?.array.items[0].object.contains("content"));
+    var unsupported = cfg;
+    unsupported.provider = .openrouter;
+    try std.testing.expectError(error.UnsupportedInferenceFeature, validateChatConfig(unsupported));
 }
 
 test "provider registry gateway read aliases preserve documents retention and caller defaults" {

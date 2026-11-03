@@ -13,6 +13,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const work_quantum = @import("work_quantum.zig");
+pub const ordered_tree = @import("ordered_tree.zig");
+pub const ordered_pages = @import("ordered_pages.zig");
+pub const transactional_store = @import("transactional_store.zig");
+pub const immutable_log = @import("immutable_log.zig");
+pub const conditional_root = @import("conditional_root.zig");
+pub const wasm_host = @import("wasm_host.zig");
 pub const types = @import("types.zig");
 pub const client = @import("client.zig");
 pub const filesystem = @import("filesystem.zig");
@@ -23,6 +30,7 @@ pub const gcs = @import("gcs.zig");
 pub const s3_compat = @import("s3_compat.zig");
 pub const scripted_fault = @import("scripted_fault.zig");
 
+pub const ObjectRevision = types.ObjectRevision;
 pub const ObjectMetadata = types.ObjectMetadata;
 pub const ObjectChecksum = types.ObjectChecksum;
 pub const ObjectChecksumAlgorithm = types.ObjectChecksumAlgorithm;
@@ -30,8 +38,10 @@ pub const ObjectChecksumScope = types.ObjectChecksumScope;
 pub const ObjectChecksumType = types.ObjectChecksumType;
 pub const VersionRetention = types.VersionRetention;
 pub const PutOptions = types.PutOptions;
+pub const PutObjectRequest = types.PutObjectRequest;
 pub const BucketOptions = types.BucketOptions;
 pub const GetOptions = types.GetOptions;
+pub const GetObjectRequest = types.GetObjectRequest;
 pub const StatOptions = types.StatOptions;
 pub const CancellationToken = types.CancellationToken;
 pub const DeleteOptions = types.DeleteOptions;
@@ -69,6 +79,12 @@ pub const s3ObjectUriAlloc = s3_compat.objectUriAlloc;
 pub const s3PutObjectShapeAlloc = s3_compat.putObjectShapeAlloc;
 
 test "objectstore module compiles" {
+    _ = work_quantum;
+    _ = ordered_tree;
+    _ = ordered_pages;
+    _ = immutable_log;
+    _ = conditional_root;
+    _ = transactional_store;
     _ = types;
     _ = client;
     _ = filesystem;
@@ -77,6 +93,7 @@ test "objectstore module compiles" {
     _ = gcs;
     _ = s3_compat;
     _ = scripted_fault;
+    _ = wasm_host;
     _ = ObjectMetadata;
     _ = PutOptions;
     _ = GetOptions;

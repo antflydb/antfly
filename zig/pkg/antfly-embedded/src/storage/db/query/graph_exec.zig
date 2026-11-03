@@ -2049,9 +2049,20 @@ fn buildGraphNodeHits(
     alloc: Allocator,
     req: types.SearchRequest,
     graph_query: graph_query_mod.GraphQuery,
-    nodes: []const graph_query_mod.GraphResultNode,
+    path_nodes: []const graph_query_mod.GraphResultNode,
     executor: anytype,
 ) ![]types.SearchHit {
+    var unique = @import("../../../graph/node_identity.zig").BorrowedMap(void){};
+    defer unique.deinit(alloc);
+    var unique_nodes: std.ArrayList(graph_query_mod.GraphResultNode) = .empty;
+    defer unique_nodes.deinit(alloc);
+    for (path_nodes) |node| {
+        if (unique.contains(.{ .table = node.table, .key = node.key })) continue;
+        try unique.ensureTotalCapacity(alloc, unique_nodes.items.len + 1);
+        unique.putAssumeCapacityNoClobber(.{ .table = node.table, .key = node.key }, {});
+        try unique_nodes.append(alloc, node);
+    }
+    const nodes = unique_nodes.items;
     if (graph_query.include_documents) {
         for (nodes) |node| {
             if (node.table != null) return error.UnsupportedQueryRequest;

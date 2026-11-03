@@ -73,6 +73,24 @@ pub const WorkingSetAllocator = struct {
         if (@import("antfly_local_sources").sql_memory_budget.optionalLocalHeadroom(a)) |layer| return @min(layer.available, headroom(layer.backing) orelse return null);
         return @import("antfly_local_sources").sql_memory_budget.optionalHeadroom(a);
     }
+    /// Optional cache retention may use a known quota above opaque backing.
+    /// Admission still uses strict headroom and actual allocation may fail.
+    pub fn cacheHeadroom(a: std.mem.Allocator) ?usize {
+        if (@import("antfly_platform").allocator.reclamation.Quota.owner(a)) |owner| {
+            const available = owner.available();
+            return @min(available, headroom(owner.backing) orelse available);
+        }
+        return headroom(a);
+    }
+    pub fn peakBytes(self: *const WorkingSetAllocator) usize {
+        return self.quota.peak_bytes;
+    }
+    pub fn largestRejectedGrowth(self: *const WorkingSetAllocator) usize {
+        return self.quota.largest_rejected_growth;
+    }
+    pub fn largestBackingFailure(self: *const WorkingSetAllocator) usize {
+        return self.quota.largest_backing_failure;
+    }
 };
 
 pub const Budget = struct {
@@ -185,6 +203,8 @@ test "lake build working-set allocator rejects growth before allocation" {
     defer bounded_alloc.free(first);
     try std.testing.expectError(error.OutOfMemory, bounded_alloc.alloc(u8, 1));
     try std.testing.expect(bounded.limitExceeded());
+    try std.testing.expect(bounded.largestRejectedGrowth() > 0);
+    try std.testing.expectEqual(@as(usize, 8), bounded.peakBytes());
     try std.testing.expectEqual(@as(usize, 8), bounded.liveBytes());
 }
 
@@ -264,4 +284,17 @@ test "external lake publication quota enables adaptive spill ownership and prese
     defer genuine.deinit();
     try std.testing.expectError(error.OutOfMemory, genuine.allocator().alloc(u8, 8));
     try std.testing.expect(!genuine.limitExceeded());
+}
+
+test "optional block retention respects a request cap above an opaque backing allocator" {
+    var buffer: [128 * 1024]u8 = undefined;
+    var buffer_allocator = std.heap.FixedBufferAllocator.init(&buffer);
+    var bounded = try WorkingSetAllocator.init(buffer_allocator.allocator(), .{ .max_working_set_bytes = 128 * 1024 });
+    const a = bounded.allocator();
+    try std.testing.expectEqual(@as(?usize, null), WorkingSetAllocator.headroom(a));
+    try std.testing.expectEqual(@as(?usize, 128 * 1024), WorkingSetAllocator.cacheHeadroom(a));
+    const bytes = try a.alloc(u8, 32 * 1024);
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(?usize, 96 * 1024), WorkingSetAllocator.cacheHeadroom(a));
+    try std.testing.expect(!bounded.limitExceeded());
 }

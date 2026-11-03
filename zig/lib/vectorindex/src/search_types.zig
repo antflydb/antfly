@@ -275,6 +275,9 @@ pub const SearchProfile = struct {
     approx_nodes_expanded: u64 = 0,
     approx_leaves_scored: u64 = 0,
     approx_vectors_scored: u64 = 0,
+    /// Candidates whose 1-bit estimate was replaced by an extended
+    /// (multi-bit) RaBitQ estimate.
+    ex_refined_vectors: u64 = 0,
     /// Largest posting presented to the candidate loop. This is intentionally
     /// measured before request filtering: routing and quantized payload reads
     /// still consume bandwidth for rejected members.

@@ -114,6 +114,10 @@ pub const Backend = struct {
         backend: *Backend,
         namespace: backend_types.Namespace,
 
+        pub fn writeSerialization(self: *@This()) backend_erased.WriteSerialization {
+            return .{ .gate = &self.backend.serialized_write_mutex };
+        }
+
         pub fn capabilities(_: *@This()) backend_types.Capabilities {
             return .{
                 .ordered_ranges = true,

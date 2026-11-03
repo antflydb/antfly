@@ -28,7 +28,7 @@ pub const Options = struct { operation_id: []const u8, dry_run: bool = true, exc
 pub const Result = struct { expired_snapshots: usize = 0, eligible_objects: usize = 0, deleted_objects: usize = 0, retained_objects: usize = 0, complete: bool = false, conflicted: bool = false, delegated: bool = false, provider: ?catalog.maintenance.Provider = null, provider_state: ?catalog.maintenance.State = null };
 const Retired = struct { snapshot: []const u8, objects: []const []const u8 };
 const Job = struct { id: []const u8, expected: []const u8, body: []const u8, timestamp_ms: i64, retired: []const Retired };
-const Marker = struct { uri: []const u8, sha256: []const u8, etag: ?[]const u8, owner: []const u8 };
+const Marker = struct { uri: []const u8, sha256: []const u8, revision: @import("objectstore").ObjectRevision, owner: []const u8 };
 fn has(values: []const []const u8, value: []const u8) bool {
     for (values) |candidate| if (std.mem.eql(u8, candidate, value)) return true;
     return false;
@@ -275,7 +275,7 @@ fn collectOwned(a: A, files: catalog.row_commit.Files, uri: []const u8, dry_run:
         return .retained;
     }
     const marker_key = try std.fmt.allocPrint(a, "{s}{s}.antfly-owned/{s}.json", .{ files.prefix, if (files.prefix.len == 0) "" else "/", catalog.types.digestHex(uri) });
-    var marker = client.getObject(files.bucket, marker_key, .{ .cancellation = catalog.types.contextCancellation(&files.context), .max_response_bytes = 4096 }) catch |err| switch (err) {
+    var marker = client.getObject(files.bucket, marker_key, .{ .skip_metadata_probe = true, .cancellation = catalog.types.contextCancellation(&files.context), .max_response_bytes = 4096 }) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => {
             return .retained;
         },
@@ -283,16 +283,16 @@ fn collectOwned(a: A, files: catalog.row_commit.Files, uri: []const u8, dry_run:
     };
     defer marker.deinit(client.allocator);
     const proof = try std.json.parseFromSliceLeaky(Marker, a, marker.body, .{});
-    if (!std.mem.eql(u8, proof.owner, "antfly-native-lake-v1") or !std.mem.eql(u8, proof.uri, uri) or proof.etag == null or proof.sha256.len != 64) return error.LakeArtifactIdentityConflict;
+    if (!std.mem.eql(u8, proof.owner, "antfly-native-lake-v2") or !std.mem.eql(u8, proof.uri, uri) or proof.sha256.len != 64) return error.LakeArtifactIdentityConflict;
     if (dry_run) return .eligible;
     const key = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ files.prefix, if (files.prefix.len == 0) "" else "/", uri[table_prefix.len..] });
-    client.deleteObject(files.bucket, key, .{ .if_match_etag = proof.etag, .cancellation = catalog.types.contextCancellation(&files.context) }) catch |err| switch (err) {
+    client.compareAndDelete(files.bucket, key, proof.revision, .{ .cancellation = catalog.types.contextCancellation(&files.context) }) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => {},
         else => return err,
     };
     // Removal of the ownership proof is conditional as well. A retry
     // after a lost delete response observes absence and stays safe.
-    try client.deleteObject(files.bucket, marker_key, .{ .if_match_etag = marker.metadata.etag orelse return error.MissingObjectEtag, .cancellation = catalog.types.contextCancellation(&files.context) });
+    try client.compareAndDelete(files.bucket, marker_key, marker.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = catalog.types.contextCancellation(&files.context) });
     return .deleted;
 }
 
