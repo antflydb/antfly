@@ -547,3 +547,11 @@ receipt, retaining unresolved work rather than claiming visibility after an
 incomplete native resolution. Database retirement must account for active scope
 bindings before removing the catalog object needed by cleanup. These remain
 activation requirements, not additional original-case credits.
+
+
+After merging `origin/main` at `24486f5f30`, regeneration resolves the generated
+Go client conflict from the combined OpenAPI source. The generated Go API
+package compiles. The merged qualification passes all **156 Debug build steps**
+and **87 selected tests**, with no skips, failures or leaks, including main's
+three agent-generation regressions. The source-boundary and original-inventory
+checks also pass on the merged tree; 87 original cases remain unresolved.

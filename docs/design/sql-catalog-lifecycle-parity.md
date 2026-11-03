@@ -18199,3 +18199,9 @@ Generation, formatting, source-boundary, license and inventory checks pass.
 Private full-index visibility/repair delivery and database-retirement scope
 barriers still require public activation qualification; no original disposition
 is changed by this coordinator cohort.
+
+Merged-main qualification (`origin/main` at `24486f5f30`): regeneration and
+formatting pass; the regenerated Go API package compiles; all 156 Debug build
+steps and 87 selected tests pass without skips, failures or leaks. The generated
+Go client conflict was resolved from the merged OpenAPI specs. Inventory and
+source-boundary audits pass, with the 87 unresolved original cases unchanged.
