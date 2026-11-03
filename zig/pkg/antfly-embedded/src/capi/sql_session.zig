@@ -122,7 +122,7 @@ pub const Session = struct {
         self.invalidateConstraintOverlay();
         if (comptime h.builtin.is_test) self.test_overlay_rebuilds += 1;
         self.countOverlay("sql_constraint_overlay_rebuilds", 1);
-        self.countOverlay("sql_constraint_overlay_rebuild_rows", @intCast(entry_count));
+        self.countOverlay("sql_constraint_overlay_rebuild_entries", @intCast(entry_count));
         self.constraint_overlay = .{ .witness = witness, .entry_count = entry_count, .value = .init(self.budget.allocator()) };
         errdefer self.invalidateConstraintOverlay();
         if (entry_count != 0) {
@@ -496,7 +496,7 @@ test "mutation fold SQL point reads fence staged table identity even when the ke
     var session: Session = .{ .handle = undefined, .budget = .{ .backing = a, .limit = 1024 * 1024 }, .arena = undefined };
     session.arena = .init(session.budget.allocator());
     defer session.deinit();
-    try session.entries.append(session.arena.allocator(), .{ .table = table, .mutation = .{ .key = "staged", .expected_version = 7 }, .encoded_row = "{}" });
+    try session.entries.append(session.arena.allocator(), .{ .table = table, .mutation = .{ .key = "staged", .expected_version = 7, .row = .{ .object = std.json.ObjectMap.init(session.arena.allocator()) } }, .encoded_row = "{}" });
     const missing = try session.stagedForScan(a, table, "absent");
     defer a.free(missing);
     try std.testing.expectEqual(@as(usize, 0), missing.len);
