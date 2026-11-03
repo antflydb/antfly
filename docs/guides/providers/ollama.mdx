@@ -34,3 +34,25 @@ host.
 Ollama embeddings do not accept retrieval input types or query instructions.
 For a local model with those controls, use the
 [Antfly provider](/docs/guides/providers/antfly).
+
+## Thinking Models
+
+Thinking models spend part of `max_tokens` on reasoning before producing an
+answer. Antfly's default is 256 tokens, which may leave no budget for visible
+output. Set a larger `max_tokens` budget when keeping thinking enabled, or set
+`reasoning_effort` to `"none"` to disable thinking on models that support it:
+
+```json
+{
+  "provider": "ollama",
+  "model": "your-thinking-model",
+  "reasoning_effort": "none",
+  "max_tokens": 1024
+}
+```
+
+Supported reasoning efforts depend on the selected model. An empty response
+with `finish_reason: "length"` fails with `InferenceOutputIncomplete` so agents
+cannot report an empty, truncated answer as a completed generation. JSON agent
+requests return HTTP 502 with `error: "InferenceOutputIncomplete"` and guidance
+to increase the output token budget or reduce reasoning effort.

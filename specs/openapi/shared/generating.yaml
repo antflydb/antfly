@@ -522,7 +522,10 @@ components:
           maximum: 2.0
         max_tokens:
           type: integer
-          description: "Maximum number of tokens to generate."
+          description: "Maximum number of tokens to generate, including reasoning tokens for thinking models."
+        reasoning_effort:
+          $ref: "#/components/schemas/OpenAIReasoningEffort"
+          description: Optional reasoning effort for Ollama's OpenAI-compatible endpoint. Use none to disable thinking on models that support it; supported values depend on the model.
         top_p:
           type: number
           format: float
