@@ -250,6 +250,13 @@ latency or long-context extraction accuracy, and aggregate CI remains outstandin
 The earlier concurrent timings are preserved as superseded evidence because
 validation could delay other clients' timestamps. The full-word four-client run
 failed after seven complete pairs with live-host-memory admission refusal.
+The corrected harness completed 100 pairs each for four-client short and
+reference-window requests. Their candidate/baseline median ratios were 0.9867
+(95% interval 0.9580–0.9958) and 1.0050 (0.9814–1.0264), meeting the declared
+1.05 upper-bound criterion. The same campaign then failed during composed
+windows after 53 complete pairs: live-host admission refused a fourth 512 MiB
+reservation. The server/model artifacts and cases were verified unchanged after
+failure. Composed-window and full-word concurrency qualification remain open.
 
 ## Current status
 

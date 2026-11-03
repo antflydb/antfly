@@ -51,7 +51,7 @@
     "duration_ns": 204781922167,
     "accuracy_qualified": false
   },
-  "performance_assessment": "Incomplete. Existing concurrent timing reports allow validation work to overlap other clients and are superseded for performance conclusions. Single-client results remain unchanged; the unexplained short-request slowdown and noninferiority uncertainty remain recorded.",
+  "performance_assessment": "Partial. Corrected four-client run completed100 pairs each for short_entities and reference_windows, both meeting the predeclared upper95% median-ratio bound<=1.05. It failed during composed_windows after53 completed pairs with candidate live-host admission refusal. Earlier concurrent timings are superseded. Single-client uncertainty and the isolated slowdown remain recorded; no overall performance or production-tail qualification is claimed.",
   "aggregate_ci": {
     "status": "pending",
     "run_url": "https://github.com/antflydb/antfly/actions/runs/41733141867",
@@ -504,13 +504,164 @@
       "completed_pairs": 7,
       "performance_timing_validated": false,
       "failure_attribution": "Candidate log at 2026-11-03T23:23:49Z: live_host admission refused a536870912-byte request; pending1073741824, capacity1546188226. No branch regression established."
+    },
+    "http-isolated-c4": {
+      "format_version": 1,
+      "status": "failed",
+      "scope": "warm_http",
+      "host": {
+        "system": "Darwin",
+        "machine": "arm64",
+        "kernel": "27.0.0",
+        "cpuinfo": null,
+        "affinity": null,
+        "cgroup": null,
+        "mountinfo": null,
+        "meminfo": null,
+        "commit": "29570dcf9924bce387c3d824af955f9f47956144",
+        "source_dirty": false,
+        "untracked_source_sha256": {},
+        "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "kernel_override": "auto",
+        "thread_override": null
+      },
+      "cases_sha256": "7731f939c9353345cb2bfc861ed81e2d23f42455453256829b10a6bc8f5a7359",
+      "artifacts": {
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-local-baseline/zig/zig-out/bin/antfly-inference-http-server": "ac7506cb30411829e21a1d80539d4339498a7517dd1071f2ba27c1ce7ba6548f",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/zig-out/bin/antfly-inference-http-server": "20f15770db057b64b3c2bf36e37758f5d6509f0a1b9b7287bc9a18b17ed8c06e",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/config.json": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/encoder_config/config.json": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/model.safetensors": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer.json": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer_config.json": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+      },
+      "arms": {
+        "baseline": "http://127.0.0.1:18775",
+        "candidate": "http://127.0.0.1:18776"
+      },
+      "warmup": 3,
+      "pairs": 100,
+      "concurrency": 4,
+      "round_scope": "synchronized_burst",
+      "timing": {
+        "client_latency": "HTTP send through response-body read; excludes JSON parsing and oracle comparison",
+        "burst": "barrier release through last response-body read; includes client dispatch and payload encoding",
+        "validation": "all response bodies and timestamps captured before any JSON parsing or oracle comparison"
+      },
+      "performance_release_qualified": false,
+      "comparisons": {
+        "short_entities": {
+          "candidate_ns": {
+            "min": 28742959.0,
+            "median": 35625458.5,
+            "mean": 36601897.07,
+            "p95": 44680981.55,
+            "max": 51801542.0,
+            "cv": 0.11726206479574303
+          },
+          "baseline_ns": {
+            "min": 27990916.0,
+            "median": 36206604.5,
+            "mean": 37578060.45,
+            "p95": 42694680.949999996,
+            "max": 125703458.0,
+            "cv": 0.25784450652488533
+          },
+          "candidate_over_baseline": {
+            "lower_95": 0.9580427838048223,
+            "median": 0.9867340862234573,
+            "upper_95": 0.995780655751602,
+            "samples": 2000,
+            "seed": 20260730,
+            "estimator": "median_paired_log_ratio"
+          },
+          "client_latency_ns": {
+            "baseline": {
+              "min": 18486458.0,
+              "median": 28643937.5,
+              "mean": 29604151.5425,
+              "p95": 40191558.349999994,
+              "max": 125516250.0,
+              "cv": 0.262954958763821
+            },
+            "candidate": {
+              "min": 18104083.0,
+              "median": 28971729.5,
+              "mean": 29384453.8475,
+              "p95": 40359741.95,
+              "max": 51333042.0,
+              "cv": 0.21528934788484333
+            }
+          },
+          "requests_per_second": {
+            "baseline": 106.4450892914565,
+            "candidate": 109.28395302435071
+          }
+        },
+        "reference_windows": {
+          "candidate_ns": {
+            "min": 406080333.0,
+            "median": 541234625.5,
+            "mean": 550665614.64,
+            "p95": 721929308.3499999,
+            "max": 859668167.0,
+            "cv": 0.16641472639091306
+          },
+          "baseline_ns": {
+            "min": 414582084.0,
+            "median": 538925374.5,
+            "mean": 552692405.83,
+            "p95": 722018749.35,
+            "max": 852451666.0,
+            "cv": 0.17168935882125508
+          },
+          "candidate_over_baseline": {
+            "lower_95": 0.9814468974627059,
+            "median": 1.0049622261784077,
+            "upper_95": 1.026379609472087,
+            "samples": 2000,
+            "seed": 20260730,
+            "estimator": "median_paired_log_ratio"
+          },
+          "client_latency_ns": {
+            "baseline": {
+              "min": 387546959.0,
+              "median": 508426979.0,
+              "mean": 524830127.0325,
+              "p95": 700205303.8499999,
+              "max": 852276208.0,
+              "cv": 0.1663222363391424
+            },
+            "candidate": {
+              "min": 360326042.0,
+              "median": 515361104.0,
+              "mean": 521837427.3125,
+              "p95": 654657124.9999999,
+              "max": 858847125.0,
+              "cv": 0.16016742330307526
+            }
+          },
+          "requests_per_second": {
+            "baseline": 7.237298645334274,
+            "candidate": 7.263936395620084
+          }
+        }
+      },
+      "error": "ValueError: http://127.0.0.1:18776/ai/v1/extract: HTTP 503: {\"error\":\"MODEL_RESOURCE_BUSY\",\"message\":\"insufficient inference capacity is currently available\",\"reason\":\"inference_capacity\",\"retryable\":true,\"retry_after_ms\":1000}",
+      "raw_report_sha256": "1fcef3e18416a8b1dd200017bee195ed2520cd31c7dec76308a144fdf159c11e",
+      "completed_pairs_by_case": {
+        "short_entities": 100,
+        "reference_windows": 100,
+        "composed_windows": 53
+      },
+      "transport_only_workers": true,
+      "artifacts_and_cases_verified_after_failure": true
     }
   },
   "outstanding": [
-    "Corrected concurrent performance profiles need completion. Previous full-word four-client run failed after seven complete pairs with live-host admission refusal.",
-    "Not all single-client confidence intervals establish the declared upper paired95% bound<=1.05.",
-    "The isolated short-request slowdown remains unexplained; later reversals do not prove a cause.",
-    "Aggregate CI has not passed; PR1490 currently requires approval."
+    "Complete corrected composed-window and full-word four-client profiles on a host with adequate memory headroom. The shared local host refused a fourth536870912-byte reservation with1610612736 pending and1932735283 live capacity.",
+    "Resolve single-client statistical uncertainty and the isolated short-request slowdown; later reversals do not prove a cause.",
+    "Aggregate CI requires maintainer approval for PR1490."
   ],
   "review_fixes": {
     "python_checks_passed": 8,
@@ -523,6 +674,7 @@
       "Capture every concurrent response before JSON parsing or oracle validation.",
       "Explicitly import architectures.deberta in the test root.",
       "Retain bounded HTTP failure details and endpoint in failed benchmark reports."
-    ]
+    ],
+    "implementation_commit": "29570dcf9924bce387c3d824af955f9f47956144"
   }
 }
