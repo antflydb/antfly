@@ -153,6 +153,25 @@ pub const Controller = struct {
         }
         return error.SqlConnectionBusy;
     }
+    pub fn retireAndWait(self: Controller, a: A) !void {
+        try self.check();
+        var connection = try @import("sql_connections.zig").load(self.store, a, self.connection, self.principal, self.node, self.now());
+        defer connection.deinit();
+        if (connection.value.state != .idle) return error.SqlConnectionBusy;
+        for (0..16) |_| {
+            try self.check();
+            var owned = try self.load(a);
+            defer owned.deinit();
+            if (owned.value.phase == .retired) return;
+            if (!owned.value.recovery) {
+                source.requestRecovery(self.store, self.principal, owned.value) catch |err| switch (err) {
+                    error.SqlConnectionChanged => continue,
+                    else => return err,
+                };
+            } else try self.advance(a, owned.value);
+        }
+        return error.SqlConnectionBusy;
+    }
     pub fn retire(self: Controller, a: A) !void {
         var owned = try self.load(a);
         defer owned.deinit();
@@ -228,5 +247,93 @@ pub const Loan = struct {
             return;
         }
         return error.SqlConnectionBusy;
+    }
+};
+
+/// Borrowed production hooks; callers initialize this at its final address.
+pub const Native = struct {
+    server: *@import("http_server.zig").ApiHttpServer,
+    context: @import("antfly_local_sources").api_operation.RequestContext,
+    pub fn controller(self: *Native, connection: [32]u8, identity: ?@import("http_server.zig").AuthenticatedIdentity) !Controller {
+        const server = self.server;
+        const store = server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+        var owned = (try source.load(store, server.alloc, connection)) orelse return error.SqlConnectionNotFound;
+        defer owned.deinit();
+        return .{ .store = store, .connection = connection, .principal = @import("http_server.zig").transactionPrincipal(identity) orelse "", .actor = try @import("sql_authorization_recovery.zig").actor(server, identity), .instance = try server.sql_connection_admission.executionInstance(server.embedding_provider_runtime.io), .node = server.localSessionNodeId(), .standalone = owned.value.registration.standalone, .port = .{ .ptr = self, .call = call }, .runtime = .{ .ptr = self, .now_ms = now, .nonce = nonce, .active = active, .pause = pause } };
+    }
+    fn call(raw: *anyopaque, a: A, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
+        const self: *Native = @ptrCast(@alignCast(raw));
+        var context = try self.context.platformDeadline();
+        const deadline = @import("antfly_platform").time.monotonicNs() +| std.time.ns_per_s;
+        context.deadline_ns = @min(context.deadline_ns orelse deadline, deadline);
+        var port: source.NativePort = .{ .server = self.server, .context = context };
+        return port.port().call(port.port().ptr, a, input);
+    }
+    fn now(_: *anyopaque) u64 {
+        return @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+    }
+    fn nonce(raw: *anyopaque) ![16]u8 {
+        const self: *Native = @ptrCast(@alignCast(raw));
+        var value: [16]u8 = undefined;
+        try self.server.embedding_provider_runtime.io.randomSecure(&value);
+        return value;
+    }
+    fn active(raw: *anyopaque) !void {
+        const self: *Native = @ptrCast(@alignCast(raw));
+        try self.context.ensureActive();
+    }
+    fn pause(raw: *anyopaque, ms: u32) !void {
+        const self: *Native = @ptrCast(@alignCast(raw));
+        try active(raw);
+        try self.server.embedding_provider_runtime.io.sleep(.fromMilliseconds(ms), .awake);
+        try active(raw);
+    }
+};
+
+/// One request borrows the connection's durable command authority. The pool
+/// releases its signal before this stack frame or the request context expires.
+pub const Request = struct {
+    native: Native = undefined,
+    loan: ?Loan = null,
+    signal: admission.Signal = .{},
+
+    pub fn start(self: *Request, server: *@import("http_server.zig").ApiHttpServer, context: @import("antfly_local_sources").api_operation.RequestContext, identity: ?@import("http_server.zig").AuthenticatedIdentity, lease: *admission.Lease, body: anytype) !bool {
+        if (self.loan != null) return error.InvalidSqlConnection;
+        const store = server.txn_sessions.durable orelse return false;
+        var enrolled = (try source.load(store, server.alloc, lease.key.connection)) orelse return false;
+        enrolled.deinit();
+        try server.ensureSqlCommandUpkeep();
+        self.native = .{ .server = server, .context = context };
+        const owner = try self.native.controller(lease.key.connection, identity);
+        var writer = std.Io.Writer.Hashing(std.crypto.hash.Blake3).initHasher(std.crypto.hash.Blake3.init(.{}), &.{});
+        try writer.writer.writeAll("antfly/sql-command-request/v1\x00");
+        try std.json.Stringify.value(body, .{}, &writer.writer);
+        var digest: [32]u8 = undefined;
+        writer.hasher.final(&digest);
+        self.loan = try owner.take(server.alloc, digest);
+        errdefer self.finish() catch {};
+        const io = server.embedding_provider_runtime.io;
+        try self.loan.?.bind(io, lease);
+        var current = try owner.load(server.alloc);
+        defer current.deinit();
+        if (current.value.recovery or current.value.phase != .executing or !std.meta.eql(current.value.ticket, @as(?source.Ticket, self.loan.?.ticket))) return error.SqlConnectionBusy;
+        self.signal.expires_at_ms.store(current.value.registration.lease.expires_at_ms, .release);
+        try lease.bindSignal(io, self.loan.?.ticket.command, &self.signal);
+        return true;
+    }
+    pub fn attach(self: *Request, context: @import("antfly_local_sources").api_operation.RequestContext) @import("antfly_local_sources").api_operation.RequestContext {
+        std.debug.assert(self.loan != null);
+        var result = context;
+        result.sql_command_fence = &self.loan.?.fence;
+        result.cancellation = .{ .ptr = self, .is_cancelled_fn = cancelled };
+        return result;
+    }
+    fn cancelled(raw: *const anyopaque) bool {
+        const self: *const Request = @ptrCast(@alignCast(raw));
+        return self.native.context.cancellation.isCancelled() or self.signal.lost.load(.acquire) or
+            @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms >= self.signal.expires_at_ms.load(.acquire);
+    }
+    pub fn finish(self: *Request) !void {
+        if (self.loan) |*loan| try loan.finish(self.native.server.alloc);
     }
 };

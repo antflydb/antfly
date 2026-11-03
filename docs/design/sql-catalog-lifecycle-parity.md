@@ -18253,3 +18253,29 @@ license, control-catalog and inventory audits pass. Original counts remain
 912 implemented, 138 rejected, 449 superseded and 87 unresolved (64 DDL).
 [SQL lock ownership](sql-lock-ownership.md#atomic-connection-reset-and-native-unlock)
 records the still-open public ingress and participant activation requirements.
+
+
+### Independent native upkeep and enrolled HTTP command lifetimes
+
+Native command upkeep now has a fixed, independent I/O lane with bounded keyset
+rounds. Exact successful renewal replies publish their lease locally without
+another native observation. Blocking one owner's RPC or exhausting ordinary
+request concurrency does not prevent other owners from advancing; shutdown
+cancels and joins the lane before API teardown.
+
+HTTP execution and prepared-resource operations on enrolled connections now pin
+one command loan and an atomic expiry/loss signal. Close drives native retirement
+before local reclamation. Failed completion after execution reports `40003`;
+all result reservations and encoded responses are released on the error path.
+Native local/Raft campaigns include actual HTTP advisory execution, cancellation,
+authority loss, completion-write failure and close, plus blocked-owner fairness
+and signal lifetime safety. The final Debug campaign passes 83 steps, 46
+source/controller cases, 42 API/native-result cases and the transaction lifecycle
+contracts, without skips, failures or leaks. Formatting and source/control,
+license and inventory checks pass.
+
+[SQL lock ownership](sql-lock-ownership.md#independent-upkeep-and-enrolled-http-request-ownership)
+records the remaining automatic enrollment, metadata guards, pgwire/portal,
+implicit advisory transaction and participant activation requirements. Original
+counts remain 912 implemented, 138 rejected, 449 superseded and 87 unresolved
+(64 DDL/catalog). No unsupported original is reclassified by this cohort.

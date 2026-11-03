@@ -4144,6 +4144,11 @@ pub const ApiHttpServer = struct {
     sql_lock_work_pending: std.atomic.Value(bool) = .init(false),
     sql_command_work_cursor: ?[32]u8 = null,
     sql_command_work_due_ns: u64 = 0,
+    sql_command_upkeep: ?*@import("sql_command_upkeep.zig").Service = null,
+    sql_command_upkeep_mutex: std.Io.Mutex = .init,
+    sql_command_upkeep_started: std.atomic.Value(bool) = .init(false),
+    sql_command_upkeep_closing: std.atomic.Value(bool) = .init(false),
+    sql_command_upkeep_admission_failures: std.atomic.Value(u64) = .init(0),
     last_full_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
     backup_maintenance_mutex: std.atomic.Mutex = .unlocked,
     backup_maintenance_queue: BackupRepositoryMaintenanceQueue = .{},
@@ -4934,6 +4939,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        self.stopSqlCommandUpkeep();
         self.object_tables.deinit(self.owner_alloc);
         if (self.pgwire_listener) |listener| {
             listener.deinit();
@@ -5485,7 +5491,44 @@ pub const ApiHttpServer = struct {
         return try self.ensureForeignRegistry();
     }
 
+    /// Called at a stable server address, after the first source is present.
+    /// Upkeep must not consume the request executor's final worker slot.
+    pub fn ensureSqlCommandUpkeep(self: *ApiHttpServer) !void {
+        if (self.sql_command_upkeep_closing.load(.acquire)) return error.SqlConnectionUnavailable;
+        if (self.sql_command_upkeep_started.load(.acquire)) return;
+        const io = self.embedding_provider_runtime.io;
+        try self.sql_command_upkeep_mutex.lock(io);
+        defer self.sql_command_upkeep_mutex.unlock(io);
+        if (self.sql_command_upkeep_closing.load(.acquire)) return error.SqlConnectionUnavailable;
+        if (self.sql_command_upkeep != null) return;
+        self.sql_command_upkeep = try @import("sql_command_upkeep.zig").Service.start(self);
+        self.sql_command_upkeep_started.store(true, .release);
+    }
+
+    fn maybeStartSqlCommandUpkeep(self: *ApiHttpServer) void {
+        if (self.sql_command_upkeep_started.load(.acquire)) return;
+        const store = self.txn_sessions.durable orelse return;
+        const page = @import("sql_command_producer.zig").scanWork(store, self.alloc, null, 1) catch {
+            _ = self.sql_command_upkeep_admission_failures.fetchAdd(1, .monotonic);
+            return;
+        };
+        defer self.alloc.free(page.ids);
+        if (page.ids.len != 0) self.ensureSqlCommandUpkeep() catch {
+            _ = self.sql_command_upkeep_admission_failures.fetchAdd(1, .monotonic);
+        };
+    }
+
+    fn stopSqlCommandUpkeep(self: *ApiHttpServer) void {
+        self.sql_command_upkeep_closing.store(true, .release);
+        const io = self.embedding_provider_runtime.io;
+        self.sql_command_upkeep_mutex.lockUncancelable(io);
+        defer self.sql_command_upkeep_mutex.unlock(io);
+        if (self.sql_command_upkeep) |service| service.stop();
+        self.sql_command_upkeep = null;
+    }
+
     fn runSqlCommandProducerMaintenanceOnce(self: *ApiHttpServer) void {
+        if (self.sql_command_upkeep_started.load(.acquire)) return;
         if (!self.sql_prepared_work_mutex.tryLock()) return;
         defer self.sql_prepared_work_mutex.unlock();
         const now = platform_time.monotonicNs();
@@ -6836,6 +6879,9 @@ pub const ApiHttpServer = struct {
         const previous_ns = self.last_session_maintenance_schedule_ns.load(.acquire);
         if (previous_ns != 0 and now_ns -| previous_ns < min_schedule_interval_ns) return;
         if (self.last_session_maintenance_schedule_ns.cmpxchgStrong(previous_ns, now_ns, .acq_rel, .acquire) != null) return;
+        // Upkeep admission failures must not suppress independent transaction
+        // recovery. Scoped requests still require successful upkeep admission.
+        self.maybeStartSqlCommandUpkeep();
         const previous_full = self.last_full_session_maintenance_schedule_ns.load(.acquire);
         const locks_only = pending_locks and previous_full != 0 and now_ns -| previous_full < std.time.ns_per_s;
         if (!locks_only) self.last_full_session_maintenance_schedule_ns.store(now_ns, .release);

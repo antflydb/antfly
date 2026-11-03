@@ -41,6 +41,7 @@ const Native = struct {
     serial: u64 = 1000,
     expiry_ms: u64 = 1000,
     database: []const u8 = "main",
+    principal: []const u8 = "alice",
     before: bool = false,
     after: bool = false,
     calls: usize = 0,
@@ -140,7 +141,7 @@ const Native = struct {
     fn step(self: *@This(), source: *transactions.DurableSessionStore, current_instance: [16]u8, now_ms: u64) !void {
         var owned = (try producer.load(source, a, connection)) orelse return error.MissingCommandProducer;
         defer owned.deinit();
-        try producer.advance(source, a, "alice", owned.value, current_instance, now_ms, self.nonce(), self.port());
+        try producer.advance(source, a, self.principal, owned.value, current_instance, now_ms, self.nonce(), self.port());
     }
     fn until(self: *@This(), source: *transactions.DurableSessionStore, want: producer.Phase, now_ms: u64) !void {
         for (0..128) |_| {
@@ -171,9 +172,9 @@ fn setup(metadata: *storage.RaftApplyStore, source: *transactions.DurableSession
     try metadata.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
     const node: u64 = if (standalone) 0 else 9;
     const created_at_ms = if (native.expiry_ms == 1000) 1 else native.expiry_ms - 60000;
-    _ = try connections.mutate(source, .{ .create = .{ .id = connection, .principal = "alice", .owner_node_id = node, .expires_at_ms = native.expiry_ms, .database = native.database, .namespace = "public" } }, "alice", node, created_at_ms);
+    _ = try connections.mutate(source, .{ .create = .{ .id = connection, .principal = native.principal, .owner_node_id = node, .expires_at_ms = native.expiry_ms, .database = native.database, .namespace = "public" } }, native.principal, node, created_at_ms);
     const registration: authority.scopes.Registration = .{ .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 }, .database = 1, .node = node, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = native.expiry_ms }, .connection = connection, .nonce = id(3), .standalone = standalone };
-    try producer.create(source, "alice", registration, actor, instance, try native.head(), native.nonce(), created_at_ms);
+    try producer.create(source, native.principal, registration, actor, instance, try native.head(), native.nonce(), created_at_ms);
 }
 fn begin(native: *Native, source: *transactions.DurableSessionStore, serial: u64) !producer.Ticket {
     var owned = (try producer.load(source, a, connection)).?;
@@ -1951,8 +1952,13 @@ test "SQL command producer native supervisor renews only live local owners and l
         var observed = (try producer.load(&source, a, connection)).?;
         defer observed.deinit();
         if (should_renew) {
-            try std.testing.expect(observed.value.pending.?.operation == .renew);
-            try std.testing.expect(observed.value.pending.?.operation.renew.expires_at_ms > native.expiry_ms);
+            if (mode == .finishing) {
+                try std.testing.expect(observed.value.pending.?.operation == .renew);
+                try std.testing.expect(observed.value.pending.?.operation.renew.expires_at_ms > native.expiry_ms);
+            } else {
+                try std.testing.expect(observed.value.pending == null);
+                try std.testing.expect(observed.value.registration.lease.expires_at_ms > native.expiry_ms);
+            }
             // The next sweep acknowledges native proof without another write.
             cursor = null;
             try std.testing.expect(try producer.advanceWork(&server, &cursor));
@@ -2161,4 +2167,231 @@ test "SQL command producer native DISCARD settings adapter survives lost control
         try std.testing.expectEqual(@as(u32, 0), cut.value.owner.?.resources);
         try std.testing.expectEqual(@as(@TypeOf(cut.value.scope.?.state), .active), cut.value.scope.?.state);
     };
+}
+
+test "SQL command producer native upkeep progresses with exhausted request concurrency and a blocked owner" {
+    const http = @import("http_server.zig");
+    const Forward = struct {
+        native: *Native,
+        io: std.Io = undefined,
+        mutex: std.Io.Mutex = .init,
+        entered: std.Io.Event = .unset,
+        waiting: std.atomic.Value(usize) = .init(0),
+        maximum: std.atomic.Value(usize) = .init(0),
+        stopped: std.atomic.Value(usize) = .init(0),
+        fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedStatusRead;
+        }
+        fn catalog(raw: *anyopaque, alloc: A, context: local.api_operation.RequestContext, input: Call) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (input == .sql_lock_read and input.sql_lock_read.backend != null and input.sql_lock_read.backend.?.eql(.{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 })) {
+                const concurrent = self.waiting.fetchAdd(1, .acq_rel) + 1;
+                defer _ = self.waiting.fetchSub(1, .release);
+                _ = self.maximum.fetchMax(concurrent, .acq_rel);
+                self.entered.set(self.io);
+                var event: std.Io.Event = .unset;
+                while (true) {
+                    context.ensureActive() catch |err| {
+                        if (err == error.Canceled) _ = self.stopped.fetchAdd(1, .release);
+                        return err;
+                    };
+                    event.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } }) catch |err| switch (err) {
+                        error.Timeout => {},
+                        error.Canceled => return err,
+                    };
+                }
+            }
+            try context.ensureActive();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            return Native.call(self.native, alloc, input);
+        }
+        fn deny(_: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            return error.ConcurrencyUnavailable;
+        }
+        fn empty() void {}
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/upkeep-independent", .{tmp.sub_path});
+    defer a.free(path);
+    var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer metadata.deinit();
+    var source = transactions.DurableSessionStore.init(a, &metadata.store);
+    const initial_expiry = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 30000;
+    var native: Native = .{ .metadata = &metadata, .replicated = true, .expiry_ms = initial_expiry };
+    try setup(&metadata, &source, true, &native);
+    try native.until(&source, .idle, 2);
+    var last: [32]u8 = undefined;
+    // More owners than upkeep workers: registration and renewal must make
+    // progress in bounded rounds while the first backend's RPC cannot finish.
+    for (0..20) |ordinal| {
+        const key = @import("sql_resource_routing.zig").encode(0, id(ordinal + 400));
+        last = key;
+        _ = try connections.mutate(&source, .{ .create = .{ .id = key, .principal = "alice", .owner_node_id = 0, .expires_at_ms = initial_expiry, .database = "default", .namespace = "public" } }, "alice", 0, initial_expiry - 30000);
+        const registration: authority.scopes.Registration = .{ .connection = key, .nonce = native.nonce(), .standalone = true, .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(ordinal + 500), .fence = 1 }, .database = 1, .node = 0, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = initial_expiry } };
+        try producer.create(&source, "alice", registration, actor, instance, try native.head(), native.nonce(), initial_expiry - 30000);
+    }
+    var runtime = try local.storage_db_selected_root.db.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var forward: Forward = .{ .native = &native };
+    var server = http.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .session_store = &source, .session_maintenance_local_only = true, .deployment_mode = .standalone }, .{ .ptr = &forward, .vtable = &.{ .status = Forward.status, .system_catalog = Forward.catalog } }, null, null);
+    var closed = false;
+    defer if (!closed) server.deinit();
+    const original_io = server.embedding_provider_runtime.io;
+    forward.io = original_io;
+    var denied_vtable = original_io.vtable.*;
+    denied_vtable.concurrent = Forward.deny;
+    server.embedding_provider_runtime.io.vtable = &denied_vtable;
+    defer if (!closed) {
+        server.embedding_provider_runtime.io = original_io;
+    };
+    try std.testing.expectError(error.ConcurrencyUnavailable, server.embedding_provider_runtime.io.concurrent(Forward.empty, .{}));
+    server.sql_connection_admission.instance = instance;
+    try std.testing.expect(server.sql_prepared_work_mutex.tryLock());
+    // Keep the ordinary maintenance lane unavailable for the entire campaign.
+    var prepared_locked = true;
+    defer if (prepared_locked) server.sql_prepared_work_mutex.unlock();
+    try server.ensureSqlCommandUpkeep();
+    const service = server.sql_command_upkeep.?;
+    try server.ensureSqlCommandUpkeep();
+    try std.testing.expect(service == server.sql_command_upkeep.?);
+    try forward.entered.waitTimeout(original_io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    const deadline = @import("antfly_platform").time.monotonicNs() + 8 * std.time.ns_per_s;
+    var renewed = false;
+    while (@import("antfly_platform").time.monotonicNs() < deadline) {
+        var record = (try producer.load(&source, a, last)).?;
+        defer record.deinit();
+        if (record.value.phase == .idle and record.value.pending == null and record.value.registration.lease.expires_at_ms > initial_expiry and forward.waiting.load(.acquire) != 0) {
+            renewed = true;
+            break;
+        }
+        try original_io.sleep(.fromMilliseconds(5), .awake);
+    }
+    try std.testing.expect(renewed);
+    try std.testing.expectEqual(@as(usize, 1), forward.maximum.load(.acquire));
+    try std.testing.expect(service.completed.load(.acquire) > 20);
+    // Shutdown cancels the still-blocked owner's native context and joins all
+    // workers before releasing the API's stores, I/O or borrowed source.
+    server.sql_prepared_work_mutex.unlock();
+    prepared_locked = false;
+    server.embedding_provider_runtime.io = original_io;
+    server.deinit();
+    closed = true;
+    try std.testing.expect(forward.stopped.load(.acquire) != 0);
+}
+
+test "SQL command producer native enrolled HTTP requests own authority through cancellation and close" {
+    const http = @import("http_server.zig");
+    const httpx = @import("httpx");
+    const Forward = struct {
+        native: *Native,
+        io: std.Io = undefined,
+        mutex: std.Io.Mutex = .init,
+        cancel: *std.atomic.Value(bool),
+        store: *transactions.DurableSessionStore,
+        server: ?*http.ApiHttpServer = null,
+        lose_signal: std.atomic.Value(bool) = .init(false),
+        fail_finish: std.atomic.Value(bool) = .init(false),
+        cancel_effect: std.atomic.Value(bool) = .init(false),
+        fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedStatusRead;
+        }
+        fn catalog(raw: *anyopaque, alloc: A, context: local.api_operation.RequestContext, input: Call) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.ensureActive();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            const bytes = try Native.call(self.native, alloc, input);
+            if (input == .sql_lock_mutate and input.sql_lock_mutate.operation == .effect) {
+                if (self.fail_finish.load(.acquire)) self.store.fail_command_finish_for_test.store(true, .release);
+                if (self.lose_signal.load(.acquire)) {
+                    const server = self.server.?;
+                    server.sql_connection_admission.publish(server.embedding_provider_runtime.io, .init(connection, ""), input.sql_lock_mutate.operation.effect.command, null);
+                    alloc.free(bytes);
+                    return error.Canceled;
+                }
+            }
+            if (input == .sql_lock_mutate and input.sql_lock_mutate.operation == .effect and self.cancel_effect.load(.acquire)) {
+                self.cancel.store(true, .release);
+                alloc.free(bytes);
+                return error.Canceled;
+            }
+            return bytes;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/enrolled-http-{any}", .{ tmp.sub_path, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        const now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated, .expiry_ms = now_ms + 60000, .database = "default", .principal = "" };
+        try setup(&metadata, &source, true, &native);
+        try native.until(&source, .idle, 2);
+        var runtime = try local.storage_db_selected_root.db.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+        defer runtime.deinit();
+        var cancelled: std.atomic.Value(bool) = .init(false);
+        var forward: Forward = .{ .native = &native, .cancel = &cancelled, .store = &source };
+        var server = http.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .session_store = &source, .session_maintenance_local_only = true, .deployment_mode = .standalone }, .{ .ptr = &forward, .vtable = &.{ .status = Forward.status, .system_catalog = Forward.catalog } }, null, null);
+        defer server.deinit();
+        forward.io = server.embedding_provider_runtime.io;
+        forward.server = &server;
+        server.sql_connection_admission.instance = instance;
+        var handler: @import("httpx_handler.zig").AntflyApiHandler = .{ .api_server = &server };
+        for ([_][]const u8{ "SELECT pg_advisory_lock(42)", "SELECT pg_advisory_lock(-42, 7)", "SELECT pg_advisory_unlock(42)", "SELECT pg_advisory_lock(43)", "SELECT pg_advisory_lock(45)", "SELECT pg_advisory_unlock_all()", "SELECT pg_advisory_lock(44)" }, 0..) |statement, ordinal| {
+            cancelled.store(false, .release);
+            forward.cancel_effect.store(ordinal == 3, .release);
+            forward.lose_signal.store(ordinal == 4, .release);
+            forward.fail_finish.store(ordinal == 6, .release);
+            var request = try httpx.Request.init(a, .POST, "http://127.0.0.1/db/v1/sql");
+            defer request.deinit();
+            const body = try std.json.Stringify.valueAlloc(a, .{ .statement = statement, .connection_id = &connection }, .{});
+            defer a.free(body);
+            request.body = body;
+            var context = httpx.Context.init(a, std.testing.io, &request);
+            defer context.deinit();
+            context.cancellation = &cancelled;
+            var response = try handler.executeSQL(&context);
+            defer response.deinit();
+            if (ordinal == 3 or ordinal == 4) {
+                try std.testing.expect(response.status.code >= 400);
+                try std.testing.expectEqual(ordinal == 3, cancelled.load(.acquire));
+            } else if (ordinal == 6) {
+                source.fail_command_finish_for_test.store(false, .release);
+                try std.testing.expect(response.status.code >= 400);
+                var diagnostic = try std.json.parseFromSlice(struct { code: []const u8 }, a, response.body.?, .{ .ignore_unknown_fields = true });
+                defer diagnostic.deinit();
+                try std.testing.expectEqualStrings("40003", diagnostic.value.code);
+            } else {
+                if (response.status.code != 200) std.debug.print("enrolled SQL response {d}: {s}\n", .{ response.status.code, response.body orelse "" });
+                try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            }
+            var current = (try producer.load(&source, a, connection)).?;
+            defer current.deinit();
+            if (ordinal == 6) try std.testing.expectEqual(producer.Phase.executing, current.value.phase) else try std.testing.expect(current.value.phase == .finishing or current.value.phase == .idle);
+            try std.testing.expect(!current.value.recovery);
+        }
+        cancelled.store(false, .release);
+        forward.cancel_effect.store(false, .release);
+        var request = try httpx.Request.init(a, .DELETE, "http://127.0.0.1/db/v1/sql/connections");
+        defer request.deinit();
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.closeSQLConnection(&context, &connection);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect((try producer.load(&source, a, connection)) == null);
+        try std.testing.expectError(error.SqlConnectionNotFound, connections.load(&source, a, connection, "", 0, now_ms));
+        // The native fence outlives local source/connection reclamation.
+        const bytes = try metadata.sqlLockRead(a, group, .{ .incarnation = @splat(0x11), .standalone = true, .actor = actor, .database = 1, .backend = .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 } }, .{ .setting_admin = true });
+        defer a.free(bytes);
+        var cut = try std.json.parseFromSlice(authority.Snapshot, a, bytes, .{});
+        defer cut.deinit();
+        try std.testing.expectEqual(@as(@TypeOf(cut.value.scope.?.state), .retired), cut.value.scope.?.state);
+        try std.testing.expectEqual(@as(u32, 0), cut.value.owner.?.resources);
+    }
 }

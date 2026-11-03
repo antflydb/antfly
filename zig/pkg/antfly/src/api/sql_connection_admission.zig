@@ -20,7 +20,11 @@
 const std = @import("std");
 const A = std.mem.Allocator;
 const Command = @import("antfly_local_sources").storage_pessimistic_lock_authority.Command;
-const Entry = struct { ticket: u64, command: ?Command = null };
+pub const Signal = struct {
+    expires_at_ms: std.atomic.Value(u64) = .init(0),
+    lost: std.atomic.Value(bool) = .init(false),
+};
+const Entry = struct { ticket: u64, command: ?Command = null, signal: ?*Signal = null };
 pub const capacity = 128;
 pub const Key = struct {
     connection: [32]u8,
@@ -44,6 +48,16 @@ pub const Lease = struct {
         const entry = pool.active.getPtr(self.key) orelse return error.SqlConnectionExecutionBusy;
         if (entry.ticket != self.ticket or (entry.command != null and !std.meta.eql(entry.command.?, command))) return error.SqlConnectionExecutionBusy;
         entry.command = command;
+    }
+    /// The owner keeps the signal alive through release. Upkeep accesses it
+    /// only while holding this same pool mutex, never across an RPC or wait.
+    pub fn bindSignal(self: *Lease, io: std.Io, command: Command, signal: *Signal) !void {
+        const pool = self.pool orelse return error.SqlConnectionExecutionBusy;
+        try pool.mutex.lock(io);
+        defer pool.mutex.unlock(io);
+        const entry = pool.active.getPtr(self.key) orelse return error.SqlConnectionExecutionBusy;
+        if (entry.ticket != self.ticket or !std.meta.eql(entry.command, @as(?Command, command)) or entry.signal != null or signal.expires_at_ms.load(.acquire) == 0) return error.SqlConnectionExecutionBusy;
+        entry.signal = signal;
     }
     pub fn release(self: *Lease, io: std.Io) void {
         const pool = self.pool orelse return;
@@ -78,6 +92,20 @@ pub const Pool = struct {
         defer self.mutex.unlock(io);
         const entry = self.active.get(key) orelse return false;
         return std.meta.eql(entry.command, @as(?Command, command));
+    }
+    pub fn hasSignal(self: *Pool, io: std.Io, key: Key, command: Command) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const entry = self.active.get(key) orelse return false;
+        return entry.signal != null and std.meta.eql(entry.command, @as(?Command, command));
+    }
+    pub fn publish(self: *Pool, io: std.Io, key: Key, command: Command, expiry: ?u64) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const entry = self.active.get(key) orelse return;
+        if (!std.meta.eql(entry.command, @as(?Command, command))) return;
+        const signal = entry.signal orelse return;
+        if (expiry) |value| signal.expires_at_ms.store(value, .release) else signal.lost.store(true, .release);
     }
     pub fn acquire(self: *Pool, a: A, io: std.Io, key: Key) !Lease {
         try self.mutex.lock(io);
@@ -166,4 +194,35 @@ test "SQL connection admission liveness binds the exact command and cannot be re
     try std.testing.expectError(error.SqlConnectionExecutionBusy, fresh.bindCommand(io, command));
     stale.release(io);
     try std.testing.expect(try pool.executing(io, key, next));
+}
+
+test "SQL connection admission publishes lease signals only to the exact live command" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var pool: Pool = .{};
+    defer pool.deinit(a);
+    const key = Key.init(@splat('1'), "alice");
+    const old: Command = .{ .sequence = 1, .nonce = @splat(1), .executor = @splat(2) };
+    const next: Command = .{ .sequence = 2, .nonce = @splat(3), .executor = @splat(4) };
+    var lease = try pool.acquire(a, io, key);
+    defer lease.release(io);
+    const retired = try a.create(Signal);
+    retired.* = .{};
+    retired.expires_at_ms.store(100, .release);
+    try lease.bindCommand(io, old);
+    try lease.bindSignal(io, old, retired);
+    pool.publish(io, key, old, 200);
+    try std.testing.expectEqual(@as(u64, 200), retired.expires_at_ms.load(.acquire));
+    lease.release(io);
+    a.destroy(retired);
+    lease = try pool.acquire(a, io, key);
+    var signal: Signal = .{};
+    signal.expires_at_ms.store(300, .release);
+    try lease.bindCommand(io, next);
+    try lease.bindSignal(io, next, &signal);
+    pool.publish(io, key, old, null);
+    try std.testing.expect(!signal.lost.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 300), signal.expires_at_ms.load(.acquire));
+    pool.publish(io, key, next, null);
+    try std.testing.expect(signal.lost.load(.acquire));
 }

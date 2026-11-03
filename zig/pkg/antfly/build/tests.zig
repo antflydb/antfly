@@ -775,6 +775,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL command producer native supervisor renews only live local owners and leaves expired sources fenced",
         "SQL command producer native DISCARD atomically resets resources with resumable unlock intent across cold faults",
         "SQL command producer native DISCARD settings adapter survives lost control replies and cancellation after reset",
+        "SQL command producer native upkeep progresses with exhausted request concurrency and a blocked owner",
+        "SQL command producer native enrolled HTTP requests own authority through cancellation and close",
+        "SQL connection admission publishes lease signals only to the exact live command",
         "durable SQL session rejects duplicate savepoint ids without double freeing overlays",
         "distributed txn session preserves numeric tokens across staging savepoints and durable recovery",
     }) |required| sql_command_producer_audit.addArgs(&.{ "--filter", required });

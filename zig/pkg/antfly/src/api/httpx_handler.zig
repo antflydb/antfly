@@ -6798,9 +6798,15 @@ pub const AntflyApiHandler = struct {
             const resource_principal = http_server_mod.transactionPrincipal(self.adapter.identity.*) orelse "";
             var connection_admission: ?@import("sql_connection_admission.zig").Lease = null;
             defer if (connection_admission) |*lease| lease.release(self.adapter.server.sharedApiIo().?);
-            // Preparation may own effects without calling Adapter.execute.
-            // Retire those owners before admitting the next connection command.
-            defer self.adapter.releaseExecutionOwners();
+            var command_scope: @import("sql_command_execution.zig").Request = .{};
+            const original_context = self.adapter.context;
+            defer {
+                self.adapter.releaseExecutionOwners();
+                command_scope.finish() catch |err| {
+                    if (self.failure == null) self.failure = if (self.execution_entered or self.prepared_response != null) error.SqlMutationOutcomeUnknown else err;
+                };
+                self.adapter.context = original_context;
+            }
             if (self.adapter.connection_id) |connection_id| {
                 const io = self.adapter.server.sharedApiIo() orelse return error.SqlConnectionUnavailable;
                 connection_admission = try self.adapter.server.sql_connection_admission.acquire(self.adapter.server.alloc, io, .init(connection_id, resource_principal));
@@ -6833,6 +6839,10 @@ pub const AntflyApiHandler = struct {
                     if (self.adapter.session_id != null) return error.SqlTransactionNotActive;
                     self.adapter.setting_overlay = connection.overlay;
                 }
+            }
+            if (connection_admission) |*lease| {
+                if (try command_scope.start(self.adapter.server, self.adapter.context, self.adapter.identity.*, lease, .{ .mode = @tagName(self.prepared_mode), .statement = self.statement, .prepared_id = self.prepared_id, .parameters = self.parameters, .database = self.database, .namespace = self.namespace }))
+                    self.adapter.context = command_scope.attach(self.adapter.context);
             }
             if (self.prepared_mode != .statement) {
                 const store = self.adapter.server.txn_sessions.durable orelse return error.SqlPreparedDurabilityUnavailable;
@@ -7185,6 +7195,13 @@ pub const AntflyApiHandler = struct {
             var buffer: [256]u8 = undefined;
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
         };
+        var enrolled = try @import("sql_command_producer.zig").load(store, self.api_server.alloc, connection_id);
+        defer if (enrolled) |*value| value.deinit();
+        if (enrolled != null) {
+            var native: @import("sql_command_execution.zig").Native = .{ .server = self.api_server, .context = operationContext(ctx, identity) };
+            const controller = try native.controller(connection_id, identity);
+            try controller.retireAndWait(self.api_server.alloc);
+        }
         _ = @import("sql_connections.zig").mutate(store, .{ .close = connection_id }, principal, self.api_server.localSessionNodeId(), now_ms) catch |err| {
             var buffer: [256]u8 = undefined;
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
@@ -7431,6 +7448,11 @@ pub const AntflyApiHandler = struct {
         // hitting an already-canceled sleep and spinning until commit ends.
         job.done.waitUncancelable(ctx.io);
         @import("protected_future.zig").wait(runtime_io, &future);
+        // Finalization can fail after result production. Every joined outcome
+        // owns the same cleanup, including diagnostics and encoding failures.
+        defer if (job.result) |*owned| owned.deinit();
+        defer if (job.prepared_response) |encoded| job.prepared_response_budget.allocator().free(encoded);
+        defer if (job.encoded_read) |encoded| job.prepared_response_budget.allocator().free(encoded);
         completion.unknown = false;
         if (job.failure) |err| {
             const captured_notices = try noticeWire(ctx.allocator, job.notice_buffer);
@@ -7453,21 +7475,14 @@ pub const AntflyApiHandler = struct {
                 },
             });
         }
-        if (job.prepared_response) |encoded| {
-            defer job.prepared_response_budget.allocator().free(encoded);
-            return jsonResponse(ctx, 200, encoded);
-        }
-        var result = job.result.?;
-        defer result.deinit();
+        if (job.prepared_response) |encoded| return jsonResponse(ctx, 200, encoded);
+        const result = job.result.?;
         if (result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required or (result.output.ddl_receipt != null and result.output.ddl_receipt.?.state != .ready)) {
             const ddl = if (result.output.ddl_receipt) |value| try std.json.Stringify.valueAlloc(ctx.allocator, value, .{ .emit_null_optional_fields = false }) else null;
             defer if (ddl) |value| ctx.allocator.free(value);
             completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, ddl);
         }
-        if (job.encoded_read) |encoded| {
-            defer job.prepared_response_budget.allocator().free(encoded);
-            return jsonResponse(ctx, 200, encoded);
-        }
+        if (job.encoded_read) |encoded| return jsonResponse(ctx, 200, encoded);
         const columns = ctx.allocator.alloc(sql_wire.SQLColumn, result.output.columns.len) catch |err| {
             if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
             return err;

@@ -493,6 +493,7 @@ pub fn skipBeforeTake(store: *transactions.DurableSessionStore, principal: []con
 }
 
 pub fn finish(store: *transactions.DurableSessionStore, principal: []const u8, prior: Record, instance: Id, ticket: Ticket, head: u64, nonce: Id) !void {
+    if (store.fail_command_finish_for_test.load(.acquire)) return error.InjectedSessionStoreFailure;
     try prior.validate(store.alloc);
     if (!std.mem.eql(u8, &instance, &ticket.instance) or (prior.pending != null and prior.control_effect == null and prior.pending.?.operation != .renew) or prior.phase != .executing or prior.recovery or !std.meta.eql(prior.ticket, @as(?Ticket, ticket))) return error.SqlConnectionBusy;
     var next = prior;
@@ -563,10 +564,26 @@ pub fn maintain(store: *transactions.DurableSessionStore, a: A, prior: Record, i
             .expires_at_ms = expires_at_ms,
             .observed_at_ms = now_ms,
         } });
-        _ = try port.deliver(a, pending);
+        if (try port.deliver(a, pending) == null) try acknowledgeRenewal(store, a, prior.principal, prior.registration.connection, pending);
         return;
     }
     try advance(store, a, prior.principal, prior, instance, now_ms, nonce, port);
+}
+
+/// An exact successful native receipt already proves this renewal. Publish
+/// that proof locally without another native snapshot. Control/FINISH owners
+/// retain their outbox and use the existing observation path to resume it.
+fn acknowledgeRenewal(store: *transactions.DurableSessionStore, a: A, principal: []const u8, connection: [32]u8, request: authority.Request) !void {
+    var owned = (try load(store, a, connection)) orelse return;
+    defer owned.deinit();
+    const prior = owned.value;
+    if (prior.recovery or prior.control_effect != null or (prior.phase != .idle and prior.phase != .executing) or prior.pending == null or prior.pending.?.operation != .renew) return;
+    if (!std.mem.eql(u8, principal, prior.principal) or !std.mem.eql(u8, &try authority.commandDigest(a, prior.pending.?), &try authority.commandDigest(a, request))) return;
+    if (prior.registration.lease.expires_at_ms != request.operation.renew.expected_expiry) return error.InvalidSqlBackendResponse;
+    var next = prior;
+    next.registration.lease.expires_at_ms = request.operation.renew.expires_at_ms;
+    next.pending = null;
+    try replace(store, principal, prior, next);
 }
 
 fn sameRegistration(left: authority.scopes.Registration, right: authority.scopes.Registration) bool {
@@ -698,7 +715,7 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
                     next.failure = failure;
                     next.recovery = true;
                     try replace(store, principal, prior, next);
-                }
+                } else try acknowledgeRenewal(store, a, principal, prior.registration.connection, prior.pending.?);
                 return;
             }
         } else if (prior.control_effect) |effect| {
@@ -898,14 +915,36 @@ pub fn advanceWork(server: *@import("http_server.zig").ApiHttpServer, after: *?[
     const page = try scanWork(store, a, after.*, 1);
     after.* = page.next_after;
     if (page.ids.len == 0) return false;
+    try advanceConnection(server, a, page.ids[0], .none);
+    return true;
+}
+
+/// The shared upkeep lane claims keys independently, then executes each owner
+/// outside its cursor mutex. No request/credential storage is borrowed here.
+pub fn advanceConnection(server: *@import("http_server.zig").ApiHttpServer, a: A, connection_id: [32]u8, cancellation: @import("antfly_local_sources").api_operation.CancellationToken) !void {
+    const store = server.txn_sessions.durable orelse return;
     // The index scan and record read can straddle legitimate retirement. Read
     // the record and its index membership together before calling it corrupt.
-    var owned = (try loadMode(store, a, page.ids[0], true)) orelse return true;
+    var owned = (try loadMode(store, a, connection_id, true)) orelse return;
     defer owned.deinit();
     const prior = owned.value;
+    const io_for_signal = server.embedding_provider_runtime.io;
+    const signal_command = if (prior.ticket) |ticket| if (server.sql_connection_admission.hasSignal(io_for_signal, .init(connection_id, prior.principal), ticket.command)) ticket.command else null else null;
+    var signal_invalid = false;
+    defer if (signal_command) |command| {
+        if (signal_invalid) server.sql_connection_admission.publish(io_for_signal, .init(connection_id, prior.principal), command, null);
+        if (load(store, a, connection_id)) |maybe| {
+            if (maybe) |value| {
+                var current = value;
+                defer current.deinit();
+                const live = !signal_invalid and current.value.phase == .executing and !current.value.recovery and current.value.ticket != null and std.meta.eql(current.value.ticket.?.command, command);
+                server.sql_connection_admission.publish(io_for_signal, .init(connection_id, prior.principal), command, if (live) current.value.registration.lease.expires_at_ms else null);
+            } else server.sql_connection_admission.publish(io_for_signal, .init(connection_id, prior.principal), command, null);
+        } else |_| {}
+    };
     // A shared physical session store does not confer another issuer's source
     // ownership. A different facade also isn't evidence of process death.
-    if (prior.registration.lease.node != server.localSessionNodeId()) return true;
+    if (prior.registration.lease.node != server.localSessionNodeId()) return;
     const time = @import("antfly_platform").time;
     if (prior.phase == .finishing and try uncertainConnection(store, a, prior.registration.connection)) {
         var reconciled = try @import("sql_connections.zig").loadReconciled(store, &server.txn_sessions, a, prior.registration.connection, prior.principal, prior.registration.lease.node, time.realtimeNs() / std.time.ns_per_ms);
@@ -915,7 +954,7 @@ pub fn advanceWork(server: *@import("http_server.zig").ApiHttpServer, after: *?[
     const instance = try server.sql_connection_admission.executionInstance(io);
     var nonce: Id = undefined;
     try io.randomSecure(&nonce);
-    var native: NativePort = .{ .server = server, .context = .{ .deadline_ns = time.monotonicNs() +| std.time.ns_per_s } };
+    var native: NativePort = .{ .server = server, .context = .{ .deadline_ns = time.monotonicNs() +| std.time.ns_per_s, .cancellation = cancellation } };
     const now_ms = time.realtimeNs() / std.time.ns_per_ms;
     const due = prior.registration.lease.expires_at_ms > now_ms and prior.registration.lease.expires_at_ms - now_ms <= renew_before_ms;
     const live: ?Liveness = if (!due or !std.mem.eql(u8, &prior.instance, &instance) or prior.recovery or (prior.pending != null and prior.pending.?.operation == .renew)) null else switch (prior.phase) {
@@ -941,8 +980,14 @@ pub fn advanceWork(server: *@import("http_server.zig").ApiHttpServer, after: *?[
         },
         else => null,
     };
-    try maintain(store, a, prior, instance, now_ms, nonce, native.port(), live);
-    return true;
+    maintain(store, a, prior, instance, now_ms, nonce, native.port(), live) catch |err| {
+        signal_invalid = switch (err) {
+            error.CatalogGenerationChanged, error.Forbidden, error.InvalidSqlBackendResponse, error.SqlConnectionNotFound => true,
+            else => false,
+        };
+        return err;
+    };
+    return;
 }
 
 test "SQL command producer native outbox aborts every staged write before WAL publication" {

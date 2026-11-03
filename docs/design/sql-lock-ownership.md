@@ -1003,3 +1003,62 @@ Formatting, license, Apache-boundary, control-catalog and inventory checks pass.
 This qualifies the scoped reset publication and recovery path; public ingress,
 pgwire connection ownership and distributed participant activation remain open.
 No original inventory disposition changes: **87 remain unresolved (64 DDL)**.
+
+
+## Independent upkeep and enrolled HTTP request ownership
+
+An API-owned `std.Io.Threaded` lane now runs eight bounded upkeep workers at a
+stable address. Workers claim each source key once per keyset round, with at
+most 128 queued identifiers and no duplicate in-flight owner. A blocked source
+cannot monopolize the ordinary session/prepared-maintenance queue or the request
+executor. Each native control quantum carries a one-second deadline. Shutdown
+cancels control contexts and joins every worker before freeing API state. A
+partial lane start likewise joins already-started workers before releasing its
+I/O implementation. Admission failures preserve ordinary transaction recovery;
+a scoped SQL request requires successful upkeep admission before execution.
+
+Successful exact renewal replies immediately publish the renewed local lease
+for idle/executing owners without a second native snapshot. Lost replies retain
+the immutable renewal request and resume through native observation or the exact
+retained receipt. FINISH and metadata-control owners keep their existing outbox
+barriers. Expiry and native fencing remain authoritative; upkeep does not replay
+SQL or grant a new body permit.
+
+The HTTP SQL worker now pins a command loan for an already-enrolled connection,
+including prepared-resource operations. Its body digest streams directly through
+a hashing writer. Admission binds an atomic expiry/loss signal to that exact
+command; scalar cancellation checks inspect it without I/O. Upkeep only accesses
+a borrowed signal under the admission mutex. Release removes it before request
+storage is reclaimed, and delayed progress for an old command cannot modify the
+next request's signal. Native control does not retain request or credential
+storage. The worker restores its original context after finishing execution
+owners and publishing command completion.
+
+HTTP close explicitly retires the enrolled native backend through the same
+irreversible, decision-gated control state machine before removing its local
+connection/source. Cancellation after an accepted advisory grant preserves the
+native session reference until explicit unlock/reset/close. A completion-write
+failure after execution reports SQLSTATE `40003`, rather than suggesting the
+statement can be replayed. Joined result and prepared/read response ownership is
+released on diagnostic and encoding paths as well as successful delivery.
+
+The native campaigns demonstrate progress for twenty other owners with one
+blocked RPC, an unavailable ordinary maintenance mutex and exhausted request
+concurrency. They also prove shutdown cancellation/join and exact-command signal
+publication after an old signal is freed. Real HTTP handlers execute bigint and
+two-key advisory operations through local/Raft metadata apply, including request
+cancellation after an accepted grant, authority-loss cancellation, failed durable
+completion, and native retirement/local reclamation on close. Fault injection
+exposed and fixed a completed-result reservation leak on the HTTP error path.
+
+Final Debug qualification passes **83/83 build steps**, including all **46
+source/controller cases**, **42 API/native-result cases**, and the transaction
+lifecycle campaigns, with no skips, failures or leaks. Formatting and license,
+Apache-boundary, control-catalog and original-inventory checks pass.
+
+This wires enrolled connections; automatic enrollment of newly opened public
+connections still needs the remaining metadata publication guards. Pgwire
+connection/portal ownership, implicit advisory transaction scopes and row/table
+participant enrollment also remain open. The original inventory is unchanged:
+**87 unresolved, including 64 DDL/catalog cases**. These remaining activation
+requirements are not claimed by the enrolled-connection fixtures.

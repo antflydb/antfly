@@ -1207,6 +1207,7 @@ pub const DurableSessionStore = struct {
     registration_recovery_before: ?u64 = null,
     registration_locks: [64]std.atomic.Mutex = @splat(.unlocked),
     fail_writes_for_test: bool = false,
+    fail_command_finish_for_test: std.atomic.Value(bool) = .init(false),
     fail_savepoint_publication_for_test: ?enum { session, source } = null,
     fail_connection_publication_for_test: ?enum { source, resources, connection } = null,
     fail_lease_transition_after_session_write_for_test: bool = false,
