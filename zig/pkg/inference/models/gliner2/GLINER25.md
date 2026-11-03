@@ -13,6 +13,66 @@ See [GLINER25_FAMILY.md](GLINER25_FAMILY.md) for the multilingual boundary
 artifacts and the ModernBERT Decide-1B architecture, tokenizer contracts,
 backend limits, and reproducible family checks.
 
+## Runtime capacity and measured coverage
+
+Boundary serving separates supported artifacts, backends and features from
+measured geometry. The `LengthContract` ranges below record test coverage; they
+are not runtime context ceilings or minimum request sizes. The evidence-only
+`Gate` continues to check them for qualification receipts. Serving uses
+`Admission` to verify the exact consumed artifact, backend and complete request
+feature union, then plans exact model and resource requirements before inference.
+
+The pinned base model supports **4096 body words**, including any separate
+synthetic terminal word and excluding synthetic enum-prefix words. The default
+processor/encoder ceiling is **16384 encoded prompt tokens**, including schema,
+enum prefixes and body subwords. These are different units. DeBERTa's relative
+position buckets do not impose a 512-token context ceiling; ModernBERT's declared
+position extent does constrain its encoded sequence. Explicit processor, device,
+attention-work, document and output budgets still apply and can refuse a request
+before inference. Published `boundary_runtime` values are default upper bounds,
+not a guarantee that every schema/shape fits every device budget.
+
+For windows using the full word limit, set `long_document.window_words` to `4096`; the default
+remains `1024` for throughput. Windows include schema cost in exact tokenization
+and shrink only when the real encoded prompt capacity requires it. Fitting uses
+a bounded search for a uniform word budget, preserves overlap/global offsets,
+and never silently truncates input. Physical window groups shrink independently
+when aggregate batch work or memory limits require it. Workspace planning and
+execution use the same preparation and group admission paths.
+
+Pull metadata retains `qualified_limits.profiles` as measured coverage and marks
+its role explicitly with `boundary_profiles_role`. `boundary_runtime` separately
+reports the model body-word bound and default encoded-token ceiling. SDKs already
+represent this metadata as an open object, so no SDK API change is required.
+
+### Full-context execution check (2026-11-02)
+
+Focused Debug validation passed 49 tests, with three skips (CUDA unavailable and
+the small-model directory environment unset). The installed pinned base model completed real
+Metal inference with all 4096 body words (4105 prompt tokens), and independently
+with 16381 of 16384 prompt tokens in one window under the default work budget.
+A tokenizer-only check with an explicitly larger work budget fitted a larger
+synthetic document to three windows with 37470 total tokens.
+Native/Metal pinned window parity, the base checkpoint's ten upstream pipeline
+reference cases, metadata, cancellation, declared-budget and allocation-failure
+checks passed. These checks establish execution/admission at the boundaries and
+preserve existing reference parity; they do not establish long-context extraction
+accuracy or optimized throughput.
+
+From `zig/`, set `ANTFLY_GLINER25_BASE_MODEL_DIR` and
+`ANTFLY_GLINER_WINDOW_MODEL_DIR` to the installed pinned base artifact, then run:
+
+```sh
+ZIG_GLOBAL_CACHE_DIR="$PWD/../.zig-cache/global" zig build inference-test \
+  -Doptimize=debug -j1 --cache-dir ../.zig-cache \
+  '-Dtest-filter=boundary qualification' \
+  '-Dtest-filter=extractors.gliner_boundary_long_executor.test.' \
+  '-Dtest-filter=gliner boundary pipeline Python parity pinned base' \
+  '-Dtest-filter=qualified limits JSON' \
+  '-Dtest-filter=boundary full context learned' \
+  '-Dtest-filter=GLiNER bounded window composition'
+```
+
 ## Current status
 
 | Artifact | Backbone | Precision | Backend | Status |
@@ -91,15 +151,12 @@ Advertisement and execution are enforced independently, on purpose:
    `ModelManifest.hasSupportedGlinerRuntime()` stays permanently `false` for
    boundary architecture there, by design (see its doc comment).
 2. **Request-time execution** (`zig/pkg/inference/src/extractors/gliner_boundary_qualification.zig`'s
-   `Gate`, backed by `gliner_boundary_qualification.require()`): every
-   extraction request against a boundary model re-derives the exact
-   identity of the live session's consumed weight/sidecar bytes, the actual
-   backend (native or Metal), the full feature union of the request, and the
-   real prepared geometry (words, windows, encoded sequence length) -- and
-   requires all four to match one production row before any learned work
-   runs. A mismatched digest, an unreviewed backend, a feature outside the
-   row (e.g. long-document windowing), or a request outside the measured
-   length bounds is refused, regardless of what pull-time advertised.
+   `Admission`): extraction revalidates the exact consumed artifact and backend
+   against a row supporting the complete feature union. Exact tokenization and
+   processor/encoder/device planning enforce model capacity and configured
+   resource budgets before learned work. Unknown digests/backends and unsupported
+   feature combinations remain refused. Historical measured geometry is checked
+   separately by the evidence-only `Gate`.
 
 Nothing in this design lets `runtime_available` or an empty-vs-nonempty
 production table "leak" execution permission to an unreviewed artifact:
@@ -127,8 +184,8 @@ follow from how these bounds were measured:
   plan real documents (no model weights) against the dogfood schema.
 - Bounds are schema-shape-specific. The schema's entity/relation vocabulary
   is encoded ahead of the document, so a narrower schema can produce a
-  `padded_sequence_tokens` value below a row's floor and be refused even for a
-  "shorter" request. Rows were measured with `examples/antfly-docs-knowledge-base`'s
+  `padded_sequence_tokens` value below a measured row's floor. That is outside
+  that row's evidence coverage; it is not a serving refusal. Rows were measured with `examples/antfly-docs-knowledge-base`'s
   11-entity/6-relation schema.
 - The single-window and long-document rows require disjoint features
   (`.single_window` vs `.long_document`), so neither can borrow the other's
@@ -191,24 +248,21 @@ independent of document length.
   per window. The default was chosen because attention cost is quadratic in
   window length: 1024-word windows measured ~2.1x faster end to end than the
   former 4096/128 default on real corpus sections.
-- Word-window sizes are ceilings. Serving selects a preparation token ceiling
-  from profiles compatible with the complete request's features and item count,
-  and replans source windows against the tokenizer's complete schema/text
-  prompt. Workspace sizing, qualification and execution share that ceiling.
-  A larger legacy context cannot be borrowed from a profile with incompatible
-  geometry: an early window must not eliminate the composition profile and
-  leave a short final window below the legacy profile's token minimum. All
-  source words retain their offsets; the unchanged gate still requires one
-  reviewed profile to cover every actual window before the first model call.
+- Word-window sizes are ceilings. Exact schema/body tokenization fits them to
+  actual processor/model capacity, independently of measured profile geometry.
+  Workspace planning and execution share this fitting and physical-group
+  admission path, preserving source offsets and bounded overlap.
 - `Limits.window_batch_size` (default **4**) groups a document's windows into
   one forward pass, except for schemas with classification or JointIE, which
   run one window per call. An `error.OutOfMemory` on a group retries the same
   starting window with a halved group (down to one window) instead of failing
   the document.
 - `Limits.max_total_encoded_tokens` (default 131,072) and
-  `Limits.max_total_attention_work` (default 8 GiB of attention-score
-  elements) are separate cumulative safety caps; a document inside the
-  reviewed geometry can still fail closed with
+  `Limits.max_total_attention_work` are separate cumulative safety caps. The
+  default attention budget is the configured encoder per-call attention-work
+  ceiling multiplied by the model layer count (48 Gi score elements for the
+  pinned base model), so it admits one full-context call. Explicit budgets,
+  including smaller ones, override that default. Requests can still fail with
   `error.LongDocumentWorkLimitExceeded`.
 - `examples/antfly-docs-knowledge-base` requests `"long_document":{"mode":"window"}` for every
   section; the wire default mode is `.reject`.
@@ -494,9 +548,9 @@ backend where it costs nothing), not because it is faster.
 6. Update this document's status table and evidence section.
 
 A mismatched digest, an unreviewed backend, a feature outside the row, or
-geometry outside the measured bounds must continue to fail closed with
-`error.UnsupportedGlinerBoundaryRuntime` -- that is what the qualification
-module's own tests in `models/gliner_boundary_qualification.zig` enforce.
+geometry outside the measured bounds must fail evidence qualification. Runtime
+admission still rejects mismatched artifacts, backends and unsupported features;
+geometry is enforced by actual model and resource limits instead.
 
 ### Embedded knowledge graph extraction and bounded windows
 
@@ -515,9 +569,10 @@ requires memory admission, including resident weights and bounded head scratch.
 The pinned base and multi-Decide FP32 boundary artifacts also qualify bounded
 word windows with descriptions and classification, including prompts smaller
 than the former 103-token floor. Each complete schema/body prompt is tokenized
-before execution and must fit 1024 tokens. Window bodies shrink to fit schema
-cost; oversized schemas fail before inference. Requests remain bounded by 64
-windows, 1 MiB of text, 131072 words and runtime token/output limits. These are
+before execution and must fit the model/backend token capacity. The 1024-token
+composition profile records measured coverage. Window bodies shrink to fit actual
+schema cost; oversized schemas fail before inference. Default planning bounds
+remain 64 windows, 1 MiB of text, 131072 words and runtime token/output limits. These are
 composed per-window and merger ceilings, not a claim of model attention across
 an entire document. Classification aggregates owned-word-weighted raw logits;
 mentions and relations preserve global offsets and overlap semantics.
