@@ -48,7 +48,7 @@ pub fn storeRootMutation(svc: anytype, alloc: std.mem.Allocator, context: operat
     defer alloc.free(bytes);
     if (bytes.len > 8192) return error.CatalogCommandTooLarge;
     const command: storage.TransitionCommand = if (enroll) .{ .apply_store_root_enrollment = bytes } else .{ .ack_initial_fk_retirement = bytes };
-    const receipt = try svc.proposeTransitionCommandWithReceipt(command);
+    const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, command);
     svc.unlockCatalogMutation();
     gate_held = false;
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
@@ -159,7 +159,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     const bytes = try std.json.Stringify.valueAlloc(a, command, .{});
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
     try context.ensureActive();
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_system_catalog = bytes });
+    const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_system_catalog = bytes });
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
     const observed = store.systemCatalogMeta(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
     var expected_hash: [32]u8 = undefined;
@@ -268,7 +268,7 @@ pub fn mutatePolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: 
     defer alloc.free(bytes);
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
     try context.ensureActive();
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_sql_policy_publication = bytes });
+    const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_sql_policy_publication = bytes });
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
     const observed = store.systemCatalogMeta(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
     var expected_hash: [32]u8 = undefined;
@@ -313,6 +313,14 @@ test "policy definition command serializes logical JSON literals without map poi
 }
 
 const fk_publication = @import("../metadata/fk_generation_publication.zig");
+
+pub fn fkPublicationCompletionJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: fk_publication.CompletionRequest) ![]u8 {
+    if (!context.fk_generation_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.fkPublicationCompletionJson(alloc, svc.metadata_group_id, request);
+}
 
 pub fn fkGenerationPublicationStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, child_table_id: u64) ![]u8 {
     if (!context.fk_generation_publication_authority) return error.Forbidden;
@@ -361,7 +369,7 @@ pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, con
     defer alloc.free(bytes);
     if (bytes.len > fk_publication.max_bytes) return error.CatalogCommandTooLarge;
     try context.ensureActive();
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_fk_generation_publication = bytes });
+    const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_fk_generation_publication = bytes });
     svc.unlockCatalogMutation();
     gate_held = false;
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
@@ -394,7 +402,7 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     // stale begin entries are deterministic no-ops at apply.
     try store.preflightFkInitialCreateCommand(svc.metadata_group_id, bytes);
     try context.ensureActive();
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_fk_initial_create = bytes });
+    const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_fk_initial_create = bytes });
     svc.unlockCatalogMutation();
     gate_held = false;
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
@@ -425,7 +433,7 @@ pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: o
     const bytes = try serializePolicyDefinitionCommand(alloc, command);
     defer alloc.free(bytes);
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_sql_policies = bytes });
+    const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_sql_policies = bytes });
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
     const observed = store.systemCatalogMeta(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
     var expected_hash: [32]u8 = undefined;
@@ -474,7 +482,7 @@ pub fn mutateSetting(svc: anytype, alloc: std.mem.Allocator, context: operation.
     defer alloc.free(bytes);
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
     try context.ensureActive();
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_sql_settings = bytes });
+    const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_sql_settings = bytes });
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
     const observed = store.systemCatalogMeta(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
     var expected_hash: [32]u8 = undefined;
@@ -526,6 +534,48 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .policy_publication_mutate => |command| mutatePolicyPublication(svc, alloc, context, command),
         .fk_generation_publication_begin => |plan| mutateFkGenerationPublication(svc, alloc, context, .{ .plan_id = plan.id, .child_table_id = plan.child_before.table_id, .expected_revision = 0, .action = .begin, .plan = plan }),
         .fk_generation_publication_mutate => |command| mutateFkGenerationPublication(svc, alloc, context, command),
+        .sql_completion_ready => blk: {
+            if (!context.fk_generation_publication_authority) return error.Forbidden;
+            _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_completion_admission_version);
+            break :blk alloc.dupe(u8, "true");
+        },
+        .sql_completion_reference => |reference| blk: {
+            if (!context.fk_generation_publication_authority) return error.Forbidden;
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.sqlCompletionReferenceJson(alloc, svc.metadata_group_id, reference);
+        },
+        .sql_completion_reference_mutate => |command| blk: {
+            if (!context.fk_generation_publication_authority) return error.Forbidden;
+            // Preserve the protocol-69 body for legacy references. Managed
+            // retirement/checkpoint commands require every apply peer at v71.
+            const bytes = if (command.managed)
+                try std.json.Stringify.valueAlloc(alloc, command, .{})
+            else
+                try std.json.Stringify.valueAlloc(alloc, .{ .reference_id = command.reference_id, .owner = command.owner, .action = command.action }, .{});
+            defer alloc.free(bytes);
+            const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (command.action == .prepare or command.action == .abandon or command.action == .forget) protocol.sql_completion_admission_version else if (command.managed) protocol.sql_completion_owner_version else protocol.sql_completion_reference_version);
+            try svc.ensureLinearizableReadWithContext(context);
+            svc.lockCatalogMutation();
+            var held = true;
+            defer if (held) svc.unlockCatalogMutation();
+            try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            try store.preflightSqlCompletionReference(svc.metadata_group_id, bytes);
+            context.markSQLSubmission();
+            const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_sql_completion_reference = bytes });
+            svc.unlockCatalogMutation();
+            held = false;
+            svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+            const observed = try store.sqlCompletionReferenceJson(alloc, svc.metadata_group_id, command.reference_id);
+            defer alloc.free(observed);
+            const refs = @import("../metadata/sql_completion_references.zig");
+            var status = try std.json.parseFromSlice(refs.Status, alloc, observed, .{});
+            defer status.deinit();
+            try refs.validateApplied(command, status.value);
+            break :blk alloc.dupe(u8, "true");
+        },
+        .fk_publication_completion => |request| fkPublicationCompletionJson(svc, alloc, context, request),
         .fk_generation_publication_status => |child_table_id| fkGenerationPublicationStatusJson(svc, alloc, context, child_table_id),
         .fk_generation_publication_work => |after_child_table_id| fkGenerationPublicationWorkJson(svc, alloc, context, after_child_table_id),
         .fk_generation_publication_decision => |request| fkGenerationPublicationDecisionJson(svc, alloc, context, request),
@@ -697,7 +747,7 @@ pub fn restore(svc: anytype, alloc: std.mem.Allocator, context: operation.Reques
     defer alloc.free(bytes);
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
     try context.ensureActive();
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_system_catalog = bytes });
+    const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .apply_system_catalog = bytes });
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
     const bound = (store.resolveSystemCatalogTable(alloc, svc.metadata_group_id, target) catch return error.MetadataMutationOutcomeUnknown) orelse return error.MetadataMutationOutcomeUnknown;
     defer table_manager.freeTable(alloc, bound);

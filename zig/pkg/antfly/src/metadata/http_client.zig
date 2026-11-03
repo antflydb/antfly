@@ -1194,6 +1194,14 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
+        return self.forwardSystemCatalogObserved(base_uri, input, forwarding, setting_admin, null);
+    }
+
+    pub fn forwardSystemCatalogObserved(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool, submitted: ?*bool) ![]u8 {
+        var possible_submission = false;
+        defer if (possible_submission) if (submitted) |observed| {
+            observed.* = true;
+        };
         if (input.requiresAdministrativeGrant() != setting_admin) return error.Forbidden;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
@@ -1212,8 +1220,12 @@ pub const MetadataHttpClient = struct {
             .{ .name = authority.header_name, .value = grant orelse "" },
         };
         var delivery: http_common.RequestDeliveryTracker = .{};
+        possible_submission = true;
         var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery }, self.internal_service) catch |err| {
-            if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) return error.RaftMutationRequestNotSent;
+            if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) {
+                possible_submission = false;
+                return error.RaftMutationRequestNotSent;
+            }
             return error.MetadataMutationOutcomeUnknown;
         };
         defer response.deinit(self.alloc);
@@ -1224,6 +1236,7 @@ pub const MetadataHttpClient = struct {
         if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_unknown)) return error.MetadataMutationOutcomeUnknown;
         if (response.status >= 200 and response.status < 300 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed)) return self.alloc.dupe(u8, response.body);
         if (!std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) return error.MetadataMutationOutcomeUnknown;
+        possible_submission = false; // Authenticated owner proved non-admission.
         return switch (response.status) {
             400 => if (input == .store_root_enroll and std.mem.eql(u8, response.body, "InvalidStoreRootEnrollment"))
                 error.InvalidStoreRootEnrollment
@@ -4742,4 +4755,43 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "SQL pgwire native metadata RPC preserves explicit submission evidence" {
+    const a = std.testing.allocator;
+    const Executor = struct {
+        outcome: []const u8,
+        status: u16 = 503,
+        disconnected: bool = false,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const fixture: *@This() = @ptrCast(@alignCast(ptr));
+            if (fixture.disconnected) {
+                request.delivery_tracker.?.markNotSent();
+                return error.ConnectionRefused;
+            }
+            const headers = try alloc.alloc(http_common.Header, 1);
+            headers[0] = .{ .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header), .value = try alloc.dupe(u8, fixture.outcome) };
+            return .{ .status = fixture.status, .headers = headers, .body = try alloc.dupe(u8, "{}") };
+        }
+    };
+    var fixture: Executor = .{ .outcome = routes.Routes.raft_mutation_outcome_not_proposed };
+    var client = MetadataHttpClient.init(a, .{ .ptr = &fixture, .vtable = &.{ .execute = Executor.execute } });
+    const input: @import("../system_catalog/server_call.zig").Call = .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "evidence" } } };
+    const forwarding: raft_mutation_forwarding.Context = .{ .remaining_ms = 1000, .forwards_remaining = 0, .campaign_allowed = false };
+    var submitted = false;
+    try std.testing.expectError(error.NotLeader, client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted));
+    try std.testing.expect(!submitted);
+    fixture.outcome = routes.Routes.raft_mutation_outcome_unknown;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted));
+    try std.testing.expect(submitted);
+    submitted = false;
+    fixture.disconnected = true;
+    try std.testing.expectError(error.RaftMutationRequestNotSent, client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted));
+    try std.testing.expect(!submitted);
+    fixture.disconnected = false;
+    fixture.status = 200;
+    fixture.outcome = routes.Routes.raft_mutation_outcome_committed;
+    const response = try client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted);
+    defer a.free(response);
+    try std.testing.expect(submitted);
 }

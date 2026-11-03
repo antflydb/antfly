@@ -135,6 +135,16 @@ pub const Session = struct {
     diagnostic: backend.Diagnostic = .{},
     mutation_ack_pending: bool = false,
     discard_after_reply: bool = false,
+    completion_safe: bool = true,
+    completion: @import("completion.zig").Completion = .{},
+    completion_destination: ?*@import("completion.zig").Completion = null,
+
+    fn addCompletion(self: *Session, transaction: ?[]const u8, ddl: ?[]const u8) void {
+        self.completion.add(self.alloc, transaction, ddl);
+        if (self.identity) |identity| if (identity.renewable) {
+            if (self.source.vtable.pin_completion) |pin| pin(self.source.context, self.alloc, &self.completion) else self.completion.unknown = true;
+        };
+    }
 
     pub fn deinit(self: *Session) void {
         if (self.hooks) |hooks| hooks.unregister(hooks.context, self);
@@ -148,8 +158,14 @@ pub const Session = struct {
         if (self.cursor_budget) |budget| self.alloc.destroy(budget);
         if (self.identity) |identity| {
             self.source.vtable.disconnect(self.source.context, identity, self.session_id);
+            if (self.source.vtable.completion_safe) |check| if (!check(self.source.context, identity)) self.addCompletion(self.session_id, null);
             identity.release(identity.context, self.alloc);
         }
+        if (self.completion_destination) |destination| {
+            destination.* = self.completion;
+            self.completion = .{};
+        }
+        self.completion.deinit(self.alloc);
         self.portals.deinit(self.alloc);
         self.sql_cursors.deinit(self.alloc);
         self.clearPrepared();
@@ -174,8 +190,8 @@ pub const Session = struct {
             return err;
         };
         if (!started) return;
+        self.setDeadline(self.limits.idle_timeout_ms);
         while (true) {
-            self.setDeadline(self.limits.idle_timeout_ms);
             const tag = self.reader.takeByte() catch |err| switch (err) {
                 error.EndOfStream => return,
                 else => return err,
@@ -186,12 +202,26 @@ pub const Session = struct {
                 if (payload.len != 0) return error.ProtocolViolation;
                 return;
             }
+            if (tag == 'p') {
+                if (!self.identity.?.renewable) return error.Unauthorized;
+                // PasswordMessage after startup is reserved for trusted gateway
+                // renewal. Never emit a client-visible response or retry work.
+                if (payload.len < 2 or payload.len > 4097 or payload[payload.len - 1] != 0) return error.ProtocolViolation;
+                const renew = self.source.vtable.refresh orelse return error.Unauthorized;
+                try renew(self.source.context, self.alloc, self.identity.?, payload[0 .. payload.len - 1]);
+                continue;
+            }
             if (self.skip_until_sync and tag != 'S') continue;
             const timeout = self.statement_timeout orelse self.limits.statement_timeout_ms;
             self.setDeadline(if (timeout == 0) self.limits.statement_timeout_ms else @min(timeout, self.limits.statement_timeout_ms));
             self.diagnostic = .{};
             self.mutation_ack_pending = false;
             self.dispatch(tag, payload) catch |err| {
+                const completion_code: []const u8 = if (self.diagnostic.code) |*code| code else sqlstate(err);
+                if (std.mem.eql(u8, completion_code, "40003") and !self.mutation_ack_pending) {
+                    self.completion_safe = false;
+                    self.addCompletion(if (self.diagnostic.transaction_id) |*id| id else null, null);
+                }
                 if (err == error.Canceled) return err;
                 self.skip_until_sync = tag != 'Q';
                 if (self.diagnostic.transaction_status) |status| {
@@ -220,6 +250,7 @@ pub const Session = struct {
                 if (tag == 'Q') try self.ready();
             };
             try self.writer.flush();
+            self.setDeadline(self.limits.idle_timeout_ms);
         }
     }
 
@@ -305,6 +336,15 @@ pub const Session = struct {
                     if (database) |value| self.database = try self.alloc.dupe(u8, value);
                     if (self.hooks) |hooks| try hooks.register(hooks.context, self);
                     try self.message('R', &.{ 0, 0, 0, 0 });
+                    if (self.identity.?.renewable) {
+                        try self.parameterStatus("antfly_trusted_principal_refresh", "1");
+                        if (self.source.vtable.completion_safe != null) {
+                            const check_ready = self.source.vtable.completion_ready orelse return error.SqlWriteCapacityUnavailable;
+                            if (!check_ready(self.source.context)) return error.SqlWriteCapacityUnavailable;
+                            if (self.source.vtable.reserve_completion) |reserve| try reserve(self.source.context, &self.completion, 3);
+                            try self.parameterStatus("antfly_session_completion", "12");
+                        }
+                    }
                     try self.parameterStatus("server_version", "16.0-antfly");
                     try self.parameterStatus("server_encoding", "UTF8");
                     try self.parameterStatus("client_encoding", "UTF8");
@@ -440,6 +480,22 @@ pub const Session = struct {
     }
 
     fn executeCells(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, native_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum, parameter_owner: ?*@import("antfly_local_sources").sql_parameter_frame.Ingress, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
+        if (self.identity) |identity| if (identity.renewable) {
+            if (!commands.isRollback(statement)) {
+                if (self.source.vtable.reserve_completion) |reserve| reserve(self.source.context, &self.completion, 3) catch {
+                    self.diagnostic.set("54000", "pending completion capacity exhausted; retry after existing work completes", null, false);
+                    return error.ProgramLimitExceeded;
+                };
+            }
+            self.completion.reserveExecution(self.alloc) catch |err| {
+                // ROLLBACK cannot admit a new mutation. Keep it available while
+                // the remaining reserved slots cover any teardown diagnostic.
+                if (err != error.ProgramLimitExceeded or !commands.isRollback(statement)) {
+                    if (err == error.ProgramLimitExceeded) self.diagnostic.set("54000", "pending completion capacity exhausted; close this session before executing more work", null, false);
+                    return err;
+                }
+            };
+        };
         if (try commands.settingCommand(alloc, statement)) |setting| {
             if (parameters.len != 0 or types.len != 0) return error.InvalidParameter;
             return switch (setting) {
@@ -460,6 +516,10 @@ pub const Session = struct {
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
         var req = self.request(statement, parameters, types);
+        if (self.identity.?.renewable) {
+            req.completion = &self.completion;
+            req.completion_allocator = self.alloc;
+        }
         req.parameter_descriptors = descriptors;
         req.parameter_cells = native_cells;
         req.parameter_owner = if (parameter_owner) |owner| owner.lease() else null;
@@ -476,8 +536,17 @@ pub const Session = struct {
         };
         if (commands.isCommit(statement)) try self.materializeHeldCursors();
         const previous_status = self.status;
+        defer if (self.identity.?.renewable) {
+            if (self.source.vtable.pin_completion) |pin| pin(self.source.context, self.alloc, &self.completion);
+        };
         var result = try self.source.vtable.execute(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req);
         errdefer result.deinit();
+        if (result.mutation_outcome == .committed_pending or result.mutation_outcome == .committed_repair_required or
+            (result.ddl_receipt_json != null and std.mem.eql(u8, result.command_tag, "DDL PENDING")))
+        {
+            self.completion_safe = false;
+            self.addCompletion(if (result.transaction_id) |*id| id else null, result.ddl_receipt_json);
+        }
         if (result.mutation_outcome != null) {
             self.mutation_ack_pending = true;
             self.diagnostic.transaction_id = result.transaction_id;

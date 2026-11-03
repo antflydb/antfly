@@ -170,7 +170,43 @@ fn serveConnection(state: *State, stream: std.Io.net.Stream) void {
         .limits = state.config.limits,
         .hooks = .{ .context = state, .register = State.register, .unregister = State.unregister, .cancel = State.cancel },
     };
-    defer session.deinit();
+    // A gateway must never infer completion from EOF, timeout or cancellation.
+    // Emit the private receipt only after structured cancellation has joined
+    // every execution owner and teardown has released transaction/portal state.
+    defer {
+        const renewable = if (session.identity) |identity| identity.renewable else false;
+        var completion: @import("completion.zig").Completion = .{};
+        session.completion_destination = &completion;
+        session.deinit();
+        defer completion.deinit(session.alloc);
+        if (renewable and session.source.vtable.completion_safe != null) {
+            const encoded = completion.encode(state.alloc) catch null;
+            if (encoded) |bytes| {
+                defer state.alloc.free(bytes);
+                // Completion delivery has its own watchdog after execution
+                // ownership has joined; a stalled reader cannot pin a slot.
+                const Send = struct {
+                    fn send(w: *std.Io.Writer, payload: []const u8) !void {
+                        try w.writeByte('y');
+                        try w.writeInt(u32, @intCast(payload.len + 4), .big);
+                        try w.writeAll(payload);
+                        try w.flush();
+                    }
+                    fn timeout(clock: std.Io) std.Io.Cancelable!void {
+                        try clock.sleep(.fromSeconds(5), .awake);
+                    }
+                };
+                const Delivered = union(enum) { write: anyerror!void, timeout: std.Io.Cancelable!void };
+                var deliveries: [2]Delivered = undefined;
+                var delivery = std.Io.Select(Delivered).init(io, &deliveries);
+                defer delivery.cancelDiscard();
+                delivery.concurrent(.write, Send.send, .{ &writer.interface, bytes }) catch {};
+                delivery.concurrent(.timeout, Send.timeout, .{io}) catch {};
+                _ = delivery.await() catch {};
+            }
+        }
+    }
+
     session.setDeadline(session.limits.startup_timeout_ms);
     const Outcome = union(enum) { session: anyerror!void, deadline: std.Io.Cancelable!void };
     var outcomes: [2]Outcome = undefined;

@@ -112,7 +112,28 @@ pub const RequestDiagnostics = struct {
     }
 };
 
+pub const SQLCompletionOwner = struct {
+    id: u64,
+    schema_version: u32,
+    kind: enum { table, fk_initial, fk_generation, restore } = .table,
+    publication_id: ?[16]u8 = null,
+};
+
 pub const RequestContext = struct {
+    pub fn markSQLSubmission(self: RequestContext) void {
+        if (self.sql_completion_submission) |observed| observed.* = true;
+    }
+    /// Borrowed native admission observer; never decoded from request JSON.
+    /// Set only at the first possible durable submission (or existing job).
+    sql_completion_submission: ?*bool = null,
+    /// Borrowed native ingress capability. The coordinator must reserve an
+    /// owner proof before sealing a mutation; never deserialize this from SQL.
+    sql_completion: ?struct {
+        ptr: *anyopaque,
+        prepare_transaction: *const fn (*anyopaque, [16]u8) anyerror!void,
+        prepare_metadata: ?*const fn (*anyopaque, SQLCompletionOwner) anyerror!void = null,
+        reject_metadata: ?*const fn (*anyopaque, SQLCompletionOwner) anyerror!void = null,
+    } = null,
     /// Native service admission only; never reconstructed from user input.
     native_service: ?@import("../common/service_ownership.zig").Owner = null,
     /// Granted only after administrator authentication by a trusted native

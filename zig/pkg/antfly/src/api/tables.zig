@@ -4384,7 +4384,7 @@ test "relational declarations bound predicate responses preserve integer datetim
     const config = try @import("relational_index_mutation.zig").configForDefinition(alloc, definition, &columns);
     defer alloc.free(config);
     try std.testing.expectEqual(@as(u32, 3), columns.cache.count());
-    try std.testing.expectEqualStrings("9007199254740993", definition.where.?[0].value.?.number_string);
+    try std.testing.expectEqualStrings("9007199254740993", definition.where.?[0].value.value.number_string);
     const updated = try @import("relational_index_mutation.zig").create(alloc, table, "partial", config);
     defer metadata_table_manager.freeTable(alloc, updated);
     try std.testing.expectEqual(@as(u32, 1), try schemaVersion(updated.schema_json));

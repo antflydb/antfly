@@ -77,6 +77,7 @@ pub fn executeRequest(
     request: http_common.HttpRequest,
     config: ?Config,
 ) !http_common.HttpResponse {
+    if (request.delivery_tracker) |tracker| tracker.markNotSent();
     const signing = config orelse return executor.execute(alloc, request);
     if (!requestTargetsInternalApi(request.uri)) return executor.execute(alloc, request);
 

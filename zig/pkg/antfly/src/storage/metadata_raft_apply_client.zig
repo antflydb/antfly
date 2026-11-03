@@ -547,6 +547,15 @@ pub const RaftApplyStore = struct {
         const value = try self.catalogProjection(bool, self.alloc, group_id, .{ .require_policy_topology_mutation_allowed = table_id });
         if (!value) return error.RowPolicyUnsupported;
     }
+    pub fn preflightSqlCompletionReference(self: *RaftApplyStore, group: u64, bytes: []const u8) !void {
+        if (!try self.catalogProjection(bool, self.alloc, group, .{ .sql_completion_reference_preflight = bytes })) return error.MetadataMutationOutcomeUnknown;
+    }
+    pub fn sqlCompletionReferenceJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, reference: [16]u8) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group, .{ .sql_completion_reference = reference });
+    }
+    pub fn fkPublicationCompletionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.CompletionRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_publication_completion = request });
+    }
     pub fn fkGenerationPublicationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, child_table_id: u64) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_publication_status = child_table_id });
     }
