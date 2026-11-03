@@ -182,6 +182,7 @@ test {
     _ = linalg;
     _ = graph;
     _ = architectures;
+    _ = architectures.deberta;
     _ = architectures.embedding_gemma2;
     _ = @import("architectures/embedding_gemma2_reference.zig");
     _ = @import("pipelines/embedding_gemma2_content.zig");
