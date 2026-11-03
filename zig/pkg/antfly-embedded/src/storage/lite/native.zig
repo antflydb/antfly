@@ -4979,7 +4979,18 @@ pub const NativeFile = struct {
             self.header.page_size != header.page_size or self.header.indexed_reclamation != header.indexed_reclamation) return error.EnrichmentWaitCanceled;
         if (std.meta.eql(self.header, header)) return;
         if (!std.mem.eql(u8, &self.activeCheckpoint().logical.indexes, &header.checkpoints[header.active_checkpoint].logical.indexes)) self.invalidateIndexPathRevisions();
-        self.allocator_rebase_header = if (self.free_pages_verified and self.ledger != null) self.header else null;
+        if (self.ledger == null) {
+            self.allocator_rebase_header = null;
+        } else if (self.allocator_rebase_header != null) {
+            // Several checked publications can arrive before this wrapper
+            // needs allocation. Its ledger still belongs to the original
+            // verified header, even if a proof verified an intermediate tip.
+            // Preserve that base; rebase/certificate validation must still
+            // authenticate the entire suffix before any reuse at the new tip.
+            self.allocator_work.retained_rebase_bases +|= 1;
+        } else if (self.free_pages_verified) {
+            self.allocator_rebase_header = self.header;
+        }
         if (self.allocator_rebase_header == null) self.invalidateLedger();
         self.page_cache.clear(self.allocator);
         if (self.secondary_page_cache) |cache| cache.clear(self.allocator);
@@ -5044,7 +5055,8 @@ pub const NativeFile = struct {
     /// The caller exclusively owns the donor cache. This only transfers a
     /// validation base: it grants no authority to allocate at the new tip.
     pub fn takeAllocatorRebaseBase(self: *NativeFile, donor: *NativeFile) !bool {
-        if (self == donor or !donor.free_pages_verified or donor.ledger == null or
+        const base = donor.allocator_rebase_header orelse if (donor.free_pages_verified) donor.header else return false;
+        if (self == donor or donor.ledger == null or
             !std.meta.eql(self.allocator, donor.allocator) or !std.mem.eql(u8, self.path, donor.path) or
             !self.header.indexed_reclamation or !donor.header.indexed_reclamation or
             self.header.page_size != donor.header.page_size or
@@ -5054,14 +5066,17 @@ pub const NativeFile = struct {
             self.checkpoint_publication_uncertain or donor.checkpoint_publication_uncertain) return false;
         if ((try self.file.stat(self.runtime())).inode != (try donor.file.stat(donor.runtime())).inode) return false;
         const state = donor.ledger.?;
-        if (state.root_page != donor.activeCheckpoint().free_map_root_page or state.digest_cache == null or
+        if (state.root_page != base.checkpoints[base.active_checkpoint].free_map_root_page or state.digest_cache == null or
             state.changes.count() != 0 or state.added.items.len != 0 or state.completed.items.len != 0) return false;
         self.invalidateLedger();
         self.ledger = donor.ledger;
         donor.ledger = null;
         self.allocator_work.absorb(&donor.allocator_work);
         self.allocator_work.cache_transfers +|= 1;
-        self.allocator_rebase_header = donor.header;
+        if (donor.allocator_rebase_header != null) self.allocator_work.pending_base_transfers +|= 1;
+        self.allocator_rebase_header = base;
+        donor.allocator_rebase_header = null;
+        donor.allocator_ledger_rebased = false;
         self.free_pages_verified = false;
         return true;
     }
@@ -5180,6 +5195,33 @@ pub const NativeFile = struct {
         return digest;
     }
 
+    /// A scheduling hint only. No page read or publication is authorized by
+    /// this identity; callers still need their normal snapshot/admission fence.
+    pub fn primaryPublicationIdentity(header: Header) [32]u8 {
+        const primary = header.checkpoints[header.active_checkpoint].logical.primary;
+        if (!header.indexed_reclamation or std.mem.allEqual(u8, &primary, 0)) return fingerprintHeader(header);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update(&header.reader_epoch_namespace);
+        hash.update(&primary);
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return digest;
+    }
+
+    /// Bounded best-effort preemption probe, including peer writers and inode
+    /// replacement. A torn/unreadable header asks optional work to yield.
+    /// It is deliberately insufficient as a checkpoint validation protocol.
+    pub fn primaryPublicationUnchanged(self: *NativeFile, expected: [32]u8) bool {
+        const io = self.runtime();
+        const named = std.Io.Dir.cwd().statFile(io, self.path, .{}) catch return false;
+        const opened = self.file.stat(io) catch return false;
+        if (named.inode != opened.inode) return false;
+        var raw: [header_size]u8 = undefined;
+        readHeaderExactAt(self.file, io, &raw) catch return false;
+        const header = decodeHeader(&raw) catch return false;
+        return std.mem.eql(u8, &expected, &primaryPublicationIdentity(header));
+    }
+
     /// Hash the complete canonical allocator state, not the physical encoding
     /// or hash-map iteration order. Loading already checks every ledger CRC.
     /// The pending list is ordered by monotonic ID on mutation and recovery.
@@ -5275,6 +5317,7 @@ pub const NativeFile = struct {
             // A reused physical journal anchor is not logical ancestry. The
             // certificate must match an independent reload before admitting
             // reuse; a cache miss must not force an unnecessary graph proof.
+            self.allocator_work.journal_rebase_digest_mismatches +|= 1;
             self.invalidateLedger();
             const independent = try self.loadLedgerForDigest(self.activeCheckpoint(), self.allocator_cancel_token, false);
             rebuilding = live;
@@ -5468,6 +5511,7 @@ pub const NativeFile = struct {
         if (self.allocator_rebase_header != null) if (self.ledger) |state| {
             errdefer self.invalidateLedger();
             const started = std.Io.Clock.awake.now(self.runtime());
+            self.allocator_work.journal_rebase_attempts +|= 1;
             const rebased = state.rebase(.{
                 .context = self,
                 .allocate = ledgerReadOnlyAllocate,
@@ -5483,6 +5527,7 @@ pub const NativeFile = struct {
                 else => return err,
             };
             const base = self.allocator_rebase_header.?;
+            if (!rebased) self.allocator_work.journal_rebase_misses +|= 1;
             const retained = for (self.header.checkpoints) |slot| {
                 if (std.meta.eql(slot, base.checkpoints[base.active_checkpoint])) break true;
             } else false;
@@ -5501,6 +5546,7 @@ pub const NativeFile = struct {
                 self.allocator_rebase_header = null;
                 return state;
             }
+            if (rebased and !authenticated) self.allocator_work.journal_rebase_auth_refusals +|= 1;
         };
         self.invalidateLedger();
         if (checkpoint.free_map_root_page != 0) {
@@ -8108,7 +8154,7 @@ pub const NativeFile = struct {
     fn documentReplayCost(self: *NativeFile, key: []const u8) !?replay_admission.Cost {
         const length = (try self.documentLength(key)) orelse return null;
         if (!replay_admission.isReservation(key)) return try replay_admission.cost(key, length, "");
-        if (length != 16 and length != 32) return error.InvalidNativeReplayAdmission;
+        if (!replay_admission.validReservationLength(length)) return error.InvalidNativeReplayAdmission;
         const raw = (try self.getDocumentAlloc(self.allocator, key)) orelse return error.InvalidNativeReplayAdmission;
         defer self.allocator.free(raw);
         return try replay_admission.cost(key, length, raw);
@@ -8146,7 +8192,7 @@ pub const NativeFile = struct {
                 var owned_descriptor: ?[]u8 = null;
                 defer if (owned_descriptor) |bytes| self.allocator.free(bytes);
                 if (replay_admission.isReservation(mutation.key) and mutation.external_value_root_page != 0) {
-                    if (length != 16 and length != 32) return error.InvalidNativeReplayAdmission;
+                    if (!replay_admission.validReservationLength(length)) return error.InvalidNativeReplayAdmission;
                     owned_descriptor = try self.readValuePagesAtCheckpointAlloc(self.allocator, mutation.external_value_root_page, length, self.activeCheckpoint());
                 }
                 break :next try replay_admission.cost(mutation.key, length, owned_descriptor orelse mutation.value);
@@ -21784,4 +21830,124 @@ test "lite native durable replay admission reserves prepared votes and resolves 
     try file.deleteDocument("\x02\xfe12345678");
     try std.testing.expectEqual(@as(u64, 0), (try file.replayAdmission()).?.records);
     try std.testing.expect((try file.check()).valid);
+}
+
+test "lite native cooperative shrink identity ignores housekeeping and detects source writes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cooperative-primary-identity.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    try file.putDocument("source", "initial");
+    const identity = NativeFile.primaryPublicationIdentity(file.header);
+    try file.putCatalogRecord("housekeeping", "metadata");
+    try file.putIndexCatalogRecord("index", "published index state");
+    try std.testing.expect(file.primaryPublicationUnchanged(identity));
+    try file.putDocument("source", "new source");
+    try std.testing.expect(!file.primaryPublicationUnchanged(identity));
+}
+
+test "lite allocator repeated header adoptions retain the checked rebase base" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "allocator-repeated-adoption.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.externally_locked = true;
+    writer.allocator_certificate_on_commit = true;
+    const Publish = struct {
+        fn row(file: *NativeFile, value: []const u8) !void {
+            try file.beginTransaction();
+            errdefer file.abortTransaction();
+            try file.putDocument("row", value);
+            try file.commitTransaction();
+        }
+    };
+    try Publish.row(&writer, "initial");
+    for ([_]bool{ false, true }) |inherit_intermediate_proof| {
+        var cached = try NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true });
+        defer cached.close();
+        try std.testing.expect(try cached.inheritAllocatorCertificate());
+        const base = cached.header;
+        const state = cached.ledger.?;
+        const loads = cached.allocator_work.full_loads;
+        const rebuilds = cached.allocator_work.digest_rebuilds;
+        try Publish.row(&writer, "second");
+        try cached.adoptIndexPublicationHeader(writer.header);
+        try std.testing.expect(!cached.free_pages_verified);
+        try std.testing.expectEqualDeep(base, cached.allocator_rebase_header.?);
+        if (inherit_intermediate_proof) {
+            try cached.inheritAllocatorVerification(&writer);
+            try std.testing.expect(cached.free_pages_verified);
+        }
+        try Publish.row(&writer, "third");
+        try cached.adoptIndexPublicationHeader(writer.header);
+        // An intermediate unverified tip is not a new validation base. Keep the
+        // original checked cache until the complete suffix can be authenticated.
+        try std.testing.expect(cached.ledger != null);
+        try std.testing.expect(cached.ledger.? == state);
+        try std.testing.expectEqualDeep(base, cached.allocator_rebase_header.?);
+        try std.testing.expect(!cached.free_pages_verified);
+        try std.testing.expect(try cached.inheritAllocatorCertificate());
+        try std.testing.expectEqual(loads, cached.allocator_work.full_loads);
+        try std.testing.expectEqual(rebuilds, cached.allocator_work.digest_rebuilds);
+        try std.testing.expectEqual(@as(u64, 1), cached.allocator_work.retained_rebase_bases);
+        const expected = try writer.loadLedgerForDigest(writer.activeCheckpoint(), null, true);
+        try std.testing.expectEqualSlices(u8, &try expected.incrementalFingerprint(), &try cached.ledger.?.incrementalFingerprint());
+        try std.testing.expect((try cached.check()).valid);
+    }
+}
+
+test "lite allocator transfers a pending checked base before verifying the latest tip" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "allocator-pending-base-transfer.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.externally_locked = true;
+    writer.allocator_certificate_on_commit = true;
+    const Publish = struct {
+        fn row(file: *NativeFile, value: []const u8) !void {
+            try file.beginTransaction();
+            errdefer file.abortTransaction();
+            try file.putDocument("row", value);
+            try file.commitTransaction();
+        }
+    };
+    try Publish.row(&writer, "initial");
+    for ([_]bool{ false, true }) |proof_at_latest_tip| {
+        var donor = try NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true });
+        defer donor.close();
+        try std.testing.expect(try donor.inheritAllocatorCertificate());
+        const base = donor.header;
+        const state = donor.ledger.?;
+        const loads = donor.allocator_work.full_loads;
+        const rebuilds = donor.allocator_work.digest_rebuilds;
+        try Publish.row(&writer, "second");
+        try donor.adoptIndexPublicationHeader(writer.header);
+        if (proof_at_latest_tip) try donor.inheritAllocatorVerification(&writer);
+        var receiver = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
+        defer receiver.close();
+        try std.testing.expect(try receiver.takeAllocatorRebaseBase(&donor));
+        try std.testing.expect(donor.ledger == null);
+        try std.testing.expect(donor.allocator_rebase_header == null);
+        try std.testing.expect(receiver.ledger.? == state);
+        try std.testing.expectEqualDeep(base, receiver.allocator_rebase_header.?);
+        try std.testing.expect(!receiver.free_pages_verified);
+        try std.testing.expect(try receiver.inheritAllocatorCertificate());
+        try std.testing.expectEqual(loads, receiver.allocator_work.full_loads);
+        try std.testing.expectEqual(rebuilds, receiver.allocator_work.digest_rebuilds);
+        try std.testing.expectEqual(@as(u64, 1), receiver.allocator_work.pending_base_transfers);
+        const expected = try writer.loadLedgerForDigest(writer.activeCheckpoint(), null, true);
+        try std.testing.expectEqualSlices(u8, &try expected.incrementalFingerprint(), &try receiver.ledger.?.incrementalFingerprint());
+        try std.testing.expect((try receiver.check()).valid);
+    }
 }

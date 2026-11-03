@@ -2088,13 +2088,18 @@ fn repairAssetSourceIndexWindow(
         last_scan_key: ?[]u8 = null,
         limit_reached: bool = false,
 
-        fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
-            _ = value;
+        fn consume(ptr: *anyopaque, key: []const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.resume_after) |resume_key_value| {
                 if (std.mem.order(u8, key, resume_key_value) != .gt) return;
             }
-            if (self.scanned >= self.limit or backfillDeadlineReached(self.deadline_ns)) {
+            // Probing an unrelated key does not materialize an artifact.
+            // Spending the candidate budget on metadata made sparse-source
+            // repair require one publication/turn per 32 unrelated records.
+            // Keep discovery independently bounded, including without a clock.
+            if (self.scanned >= 4096 or self.candidates.items.len >= self.limit or
+                backfillDeadlineReached(self.deadline_ns))
+            {
                 self.limit_reached = true;
                 return error.ReresolveWindowFull;
             }
@@ -2123,7 +2128,7 @@ fn repairAssetSourceIndexWindow(
     const root_lower = [_]u8{internal_keys.user_namespace};
     const lower: []const u8 = if (resume_after) |resume_key_value| resume_key_value else root_lower[0..];
     const upper = [_]u8{internal_keys.user_namespace + 1};
-    store.scanPrefix(lower, upper[0..], &collector, Collector.consume) catch |err| switch (err) {
+    store.scanKeys(lower, upper[0..], &collector, Collector.consume) catch |err| switch (err) {
         error.ScanUnsupported => return .{ .repair_complete = true },
         error.ReresolveWindowFull => {},
         else => return err,
@@ -3199,6 +3204,7 @@ pub fn DbArtifactStore(comptime Store: type) type {
             .put = putFn,
             .delete = deleteFn,
             .scan_prefix = if (Store == backend_erased.Store) scanPrefixFn else null,
+            .scan_keys = if (Store == backend_erased.Store) scanKeysFn else null,
             .materialize_row = materializeRowFn,
         };
 
@@ -3211,6 +3217,27 @@ pub fn DbArtifactStore(comptime Store: type) type {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (self.index_manager) |manager| return manager.materializeStoredValueAlloc(allocator, key, value);
             return relational_store.materializeStoredValueAlloc(allocator, key, value);
+        }
+
+        fn scanKeysFn(
+            ptr: *anyopaque,
+            lower: []const u8,
+            upper: []const u8,
+            ctx: *anyopaque,
+            consume: *const fn (*anyopaque, []const u8) anyerror!void,
+        ) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            var txn = try self.store.beginRead();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            cursor.setKeysOnly();
+            cursor.setUpperBound(upper);
+            var entry = try cursor.seekAtOrAfter(lower);
+            while (entry) |e| {
+                try consume(ctx, e.key);
+                entry = try cursor.next();
+            }
         }
 
         fn scanPrefixFn(
@@ -5737,4 +5764,73 @@ test "SourceCandidateProvider ANN batches unique vectors and bulk hydrates share
         try testing.expectEqual(@as(usize, 1), list.len);
         try testing.expectEqualStrings("person/ada", list[0].resolved_doc_ref.?.key);
     }
+}
+
+test "inline resolver replacement repair discovers sparse sources without scanning payload values" {
+    const a = testing.allocator;
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc:a", "asset", "kg");
+    defer a.free(key);
+    try map.store().put(key, test_extraction);
+    for (0..5000) |i| {
+        var name: [32]u8 = undefined;
+        const unrelated = try internal_keys.documentKeyAlloc(a, try std.fmt.bufPrint(&name, "a:{d:0>5}", .{i}));
+        defer a.free(unrelated);
+        try map.store().put(unrelated, "payload discovery must not materialize");
+    }
+    const KeyStore = struct {
+        map: *MapStore,
+        scans: usize = 0,
+        fn get(ptr: *anyopaque, allocator: Allocator, k: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.map.store().get(allocator, k);
+        }
+        fn put(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+            return error.TestUnexpectedPut;
+        }
+        fn delete(_: *anyopaque, _: []const u8) anyerror!void {
+            return error.TestUnexpectedDelete;
+        }
+        fn values(_: *anyopaque, _: []const u8, _: []const u8, _: *anyopaque, _: *const fn (*anyopaque, []const u8, []const u8) anyerror!void) anyerror!void {
+            return error.TestUnexpectedValueScan;
+        }
+        fn keys(ptr: *anyopaque, lower: []const u8, upper: []const u8, ctx: *anyopaque, consume: *const fn (*anyopaque, []const u8) anyerror!void) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scans += 1;
+            // MapStore's fallback also exercises scanKeys compatibility.
+            return self.map.store().scanKeys(lower, upper, ctx, consume);
+        }
+    };
+    var adapter = KeyStore{ .map = &map };
+    const store: resolver_lib.ArtifactStore = .{ .ptr = &adapter, .vtable = &.{ .get = KeyStore.get, .put = KeyStore.put, .delete = KeyStore.delete, .scan_prefix = KeyStore.values, .scan_keys = KeyStore.keys } };
+    const configs = [_]ResolverConfig{.{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ slug _entity.text }}" }};
+    const subscriptions = [_]SourceSubscription{.{ .kind = .asset, .artifact_name = "kg" }};
+    var output: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (output.items) |k| a.free(@constCast(k));
+        output.deinit(a);
+    }
+    var repairs: std.ArrayListUnmanaged(ArtifactWrite) = .empty;
+    defer {
+        for (repairs.items) |entry| {
+            a.free(entry.key);
+            a.free(entry.value);
+        }
+        repairs.deinit(a);
+    }
+    var result = try repairAssetSourceIndexWindow(a, store, &subscriptions, "", 32, &output, &configs, null, &repairs);
+    defer result.deinit(a);
+    // A hard probe bound yields even when none of the keys is a candidate.
+    try testing.expect(!result.repair_complete);
+    try testing.expect(result.repair_resume_after != null);
+    try testing.expectEqual(@as(usize, 0), output.items.len);
+    // The candidate budget still admits the source after thousands of cheap
+    // unrelated probes, without requiring hundreds of durable empty turns.
+    var resumed = try repairAssetSourceIndexWindow(a, store, &subscriptions, result.repair_resume_after, 32, &output, &configs, null, &repairs);
+    defer resumed.deinit(a);
+    try testing.expect(resumed.repair_complete);
+    try testing.expectEqual(@as(usize, 2), adapter.scans);
+    try testing.expectEqual(@as(usize, 1), output.items.len);
+    try testing.expectEqualStrings(key, output.items[0]);
 }

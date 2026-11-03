@@ -2038,7 +2038,7 @@ pub const Store = struct {
             self.mutex.unlock();
             if (@import("builtin").is_test) _ = self.test_maintenance_cycles.fetchAdd(1, .release);
             var failed = false;
-            self.maintainOnceWithCancel(retry, &self.maintenance_cancel) catch |err| {
+            self.maintainBackgroundOnceWithForce(retry, &self.maintenance_cancel) catch |err| {
                 failed = true;
                 self.recordMaintenanceError(err);
             };
@@ -2108,7 +2108,45 @@ pub const Store = struct {
         if (!self.file.free_pages_verified) return error.EnrichmentWaitCanceled;
     }
 
+    /// Automatic shrinking is optional and preemptible. Required allocator,
+    /// orphan and retirement service still runs before the replay/quiet checks.
+    pub fn maintainBackgroundOnce(self: *Store, cancel: ?*const maintenance.CancelToken) !void {
+        return self.maintainBackgroundOnceWithForce(false, cancel);
+    }
+
+    fn maintainBackgroundOnceWithForce(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken) !void {
+        self.maintainOnceWithMode(force, cancel, true) catch |err| {
+            if (err != error.ShrinkPreempted) return err;
+            lockStore(self);
+            defer self.mutex.unlock();
+            self.maintenance_policy.status.assessment_preemptions +|= 1;
+            self.maintenance_policy.status.state = .deferred;
+            self.maintenance_policy.status.reason = .writer_busy;
+            self.maintenance_policy.status.last_error = null;
+        };
+    }
+
+    const ShrinkGuard = struct {
+        file: *native.NativeFile,
+        parent: ?*const maintenance.CancelToken,
+        expected: [32]u8 = undefined,
+        next_probe_ns: i96 = 0,
+
+        fn check(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.parent) |parent| try parent.check();
+            const now = std.Io.Clock.awake.now(self.file.runtime()).nanoseconds;
+            if (now < self.next_probe_ns) return;
+            self.next_probe_ns = now + 10 * std.time.ns_per_ms;
+            if (!self.file.primaryPublicationUnchanged(self.expected)) return error.ShrinkPreempted;
+        }
+    };
+
     fn maintainOnceWithCancel(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken) !void {
+        return self.maintainOnceWithMode(force, cancel, false);
+    }
+
+    fn maintainOnceWithMode(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken, cooperative: bool) !void {
         if (self.read_only) return;
         // External owners also defer requested allocator-format conversion to
         // this detached maintenance turn. Vacuum uses the same short capture
@@ -2140,6 +2178,9 @@ pub const Store = struct {
             }
         }
         if (!self.maintenance_policy.options.enabled) return;
+        var guard: ShrinkGuard = .{ .file = &self.file, .parent = cancel };
+        var guard_token: maintenance.CancelToken = .{ .observer = .{ .ptr = &guard, .check = ShrinkGuard.check } };
+        const shrink_cancel: ?*const maintenance.CancelToken = if (cooperative) &guard_token else cancel;
         var snapshot: ?native.NativeFile = null;
         defer if (snapshot) |*source| source.close();
         var cached_stats: ?native.NativeFile.LiveStats = null;
@@ -2166,6 +2207,20 @@ pub const Store = struct {
             self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
             const retry_due = self.maintenance_policy.rewriteRetryDue(std.Io.Clock.awake.now(self.file.runtime()).nanoseconds);
             if (!force and !self.maintenance_policy.due(size) and !retry_due) return;
+            guard.expected = native.NativeFile.primaryPublicationIdentity(self.file.header);
+            if (cooperative) {
+                const debt = try self.file.replayAdmission();
+                const replay_pending = if (debt) |value| value.records != 0 else false;
+                if (!self.maintenance_policy.observeShrinkQuiet(guard.expected, std.Io.Clock.awake.now(self.file.runtime()).nanoseconds, replay_pending)) {
+                    // Quiet deferral still owns future work. The standalone
+                    // worker must take its timed retry path even when no new
+                    // mutation arrives after the final writer releases it.
+                    self.maintenance_policy.status.state = .deferred;
+                    self.maintenance_policy.status.reason = .writer_busy;
+                    self.maintenance_policy.status.last_error = null;
+                    return;
+                }
+            }
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
             assessed_checkpoint = self.file.activeCheckpoint();
             assessed_size = size;
@@ -2181,7 +2236,7 @@ pub const Store = struct {
                         // the growth/activity budget. Bound revalidation by
                         // time and scan cost instead of scanning every retry.
                         if (std.Io.Clock.awake.now(self.file.runtime()).nanoseconds < cache.revalidate_at.nanoseconds and
-                            try self.admitShrinkWorkspaceAssumeLocked(cache.stats.compact_size, cancel) == null) return;
+                            try self.admitShrinkWorkspaceAssumeLocked(cache.stats.compact_size, shrink_cancel) == null) return;
                     }
                 }
             }
@@ -2200,12 +2255,12 @@ pub const Store = struct {
         }
         if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .assessment);
         const scan_started = std.Io.Clock.awake.now(self.file.runtime());
-        const stats = cached_stats orelse try snapshot.?.liveStats(cancel);
+        const stats = cached_stats orelse try snapshot.?.liveStats(shrink_cancel);
         const scan_finished = std.Io.Clock.awake.now(self.file.runtime());
         const rewrite = blk: {
             lockStore(self);
             defer self.mutex.unlock();
-            if (cancel) |token| try token.check();
+            if (shrink_cancel) |token| try token.check();
             if (self.assessment_generation != assessed_generation) return error.FileBusy;
             const due = if (cached_stats != null)
                 self.maintenance_policy.worthwhile(assessed_size, stats.compact_size)
@@ -2226,7 +2281,7 @@ pub const Store = struct {
                 break :blk false;
             }
             self.maintenance_policy.scheduleRewriteRetry(scan_finished.nanoseconds, if (cached_stats == null) scan_started.durationTo(scan_finished).nanoseconds else null);
-            const workspace = (try self.admitShrinkWorkspaceAssumeLocked(stats.compact_size, cancel)) orelse break :blk false;
+            const workspace = (try self.admitShrinkWorkspaceAssumeLocked(stats.compact_size, shrink_cancel)) orelse break :blk false;
             self.maintenance_policy.status.state = .rewriting;
             self.maintenance_policy.status.temporary_bytes = workspace;
             break :blk true;
@@ -2241,7 +2296,7 @@ pub const Store = struct {
         // lock before vacuum; the owner takes its own capture snapshot.
         if (snapshot) |*source| source.close();
         snapshot = null;
-        const report = self.performVacuum(cancel, true) catch |err| {
+        const report = self.performVacuum(shrink_cancel, true) catch |err| {
             if (err == error.FileBusy or err == error.WouldBlock) {
                 lockStore(self);
                 self.shrink_waiting_for_writer = true;
@@ -11767,6 +11822,75 @@ test "lite typed score spans admit exact encoder after warmed graph scratch" {
     for (values[1..]) |value| try std.testing.expect(std.math.isNan(value));
 }
 
+test "lite reclamation cooperative shrink defers while replay is pending and resumes after quiet" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cooperative-replay-shrink.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    try store.file.putDocument("retained", "primary data");
+    try store.appendReplayOpaque(a, 1, "pending consumer work");
+    store.maintenance_policy = try reclamation.Policy.init(.{ .assessment_bytes = 4096, .minimum_reclaim_bytes = 4096 });
+    for (0..3) |_| {
+        store.maintenance_policy.shrink_primary_since_ns = -std.time.ns_per_s;
+        try store.maintainBackgroundOnce(null);
+    }
+    try std.testing.expectEqual(@as(u64, 0), store.maintenance_policy.status.assessment_count);
+    try std.testing.expectEqual(@as(u64, 3), store.maintenance_policy.status.assessment_deferrals);
+    try std.testing.expectEqual(reclamation.State.deferred, store.maintenance_policy.status.state);
+    // The raw adapter cutoff is exclusive; remove sequence 1.
+    try store.truncateReplayUpTo(a, 2);
+    try store.maintainBackgroundOnce(null);
+    store.maintenance_policy.shrink_primary_since_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - 2 * std.time.ns_per_s;
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
+    try std.testing.expect(!store.maintenance_running);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite reclamation cooperative shrink yields to an unannounced primary publication" {
+    const Hook = struct {
+        store: *Store,
+        writes: usize = 0,
+        fn notify(ptr: *anyopaque, phase: Store.MaintenancePhase) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (phase != .assessment) return;
+            // No connection notification or cancellation flag: peer writers
+            // are detected through the on-disk publication identity.
+            try self.store.file.putDocument("peer", "new primary value");
+            self.writes += 1;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cooperative-primary-preemption.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    try store.file.putDocument("retained", "original primary value");
+    store.maintenance_policy = try reclamation.Policy.init(.{ .assessment_bytes = 4096, .minimum_reclaim_bytes = 4096 });
+    try store.maintainBackgroundOnce(null);
+    store.maintenance_policy.shrink_primary_since_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - 2 * std.time.ns_per_s;
+    var hook: Hook = .{ .store = &store };
+    store.test_maintenance_hook = .{ .ptr = &hook, .notify = Hook.notify };
+    defer store.test_maintenance_hook = null;
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expectEqual(@as(usize, 1), hook.writes);
+    try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_preemptions);
+    try std.testing.expectEqual(@as(u64, 0), store.maintenance_policy.status.assessment_count);
+    try std.testing.expect(!store.maintenance_running);
+    try std.testing.expect(!store.maintenance_cancel.requested.load(.acquire));
+    const value = (try store.file.getDocumentAlloc(a, "peer")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("new primary value", value);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
 test "lite reclamation issue1431 canceled automatic rewrites retry without file growth" {
     const Admission = struct {
         captures: usize = 0,
@@ -11868,4 +11992,25 @@ test "lite primary reads after detached source release require current admission
     defer store.primary_reads_require_admission = false;
     try std.testing.expectError(error.EnrichmentWaitCanceled, store.beginRead());
     try std.testing.expectError(error.EnrichmentWaitCanceled, Txn.openReadWithPrefix(&store, "\x02db/named\x00"));
+}
+
+test "lite reclamation cooperative shrink preserves parent observer cancellation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "cooperative-parent-cancellation.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const Observer = struct {
+        fn check(_: *anyopaque) anyerror!void {
+            return error.MaintenanceCanceled;
+        }
+    };
+    var context: u8 = 0;
+    var cancel: maintenance.CancelToken = .{ .observer = .{ .ptr = &context, .check = Observer.check } };
+    try std.testing.expectError(error.MaintenanceCanceled, store.maintainBackgroundOnce(&cancel));
+    try std.testing.expect(!cancel.requested.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), store.maintenance_policy.status.assessment_preemptions);
 }

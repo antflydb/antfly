@@ -49,6 +49,8 @@ pub const VisibilityWait = struct {
     replay_budget: ?*@import("replay_budget.zig").Controller = null,
     publication_overhead_ns: ?*const std.atomic.Value(u64) = null,
     replay_record_cap: usize = 2048,
+    /// A producer may publish only a prefix during a cooperative source turn.
+    replay_target_cap: u64 = std.math.maxInt(u64),
     cancellation: types.CancellationToken = .none,
     deadline_ns: ?u64 = null,
     clock: ?platform_clock.Clock = null,

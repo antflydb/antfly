@@ -25311,11 +25311,20 @@ pub const DB = struct {
         for (intents) |*intent| {
             intent.retained_artifact_bytes = 0;
             intent.retained_artifact_keys = 0;
+            intent.replay_artifact_key_bytes = 0;
         }
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
-        const retention = (try @import("../retained_effects.zig").load(&read)) orelse return;
-        if (!retention.active() or !retention.direct_vectors) return;
+        const retention = try @import("../retained_effects.zig").load(&read);
+        const retain_vectors = if (retention) |state| state.active() and state.direct_vectors else false;
+        const replay_vectors = self.physical_root_mode == .external_backend and
+            (self.core.index_manager.dense_indexes.items.len != 0 or self.core.index_manager.sparse_indexes.items.len != 0 or quarantined: {
+                for (self.core.index_manager.status_only_index_configs) |config| {
+                    if (config.kind == .dense_vector or config.kind == .sparse_vector) break :quarantined true;
+                }
+                break :quarantined false;
+            });
+        if (!retain_vectors and !replay_vectors) return;
         for (intents) |*intent| {
             if (isMetadataKey(intent.key)) continue;
             if (intent.value) |value| {
@@ -25343,6 +25352,7 @@ pub const DB = struct {
                         const bytes = std.math.add(u64, 16 + key.len + enrichment_artifact_codec.header_len + 4, vector_bytes) catch return error.TransactionTooLarge;
                         intent.retained_artifact_bytes = std.math.add(u64, intent.retained_artifact_bytes, bytes) catch return error.TransactionTooLarge;
                         intent.retained_artifact_keys += 1;
+                        intent.replay_artifact_key_bytes = std.math.add(u64, intent.replay_artifact_key_bytes, 4 + key.len) catch return error.TransactionTooLarge;
                     }
                 }
                 // Explicit nulls publish vector tombstones in the retained
@@ -25354,6 +25364,7 @@ pub const DB = struct {
                     defer alloc.free(key);
                     intent.retained_artifact_bytes = std.math.add(u64, intent.retained_artifact_bytes, 16 + key.len) catch return error.TransactionTooLarge;
                     intent.retained_artifact_keys += 1;
+                    intent.replay_artifact_key_bytes = std.math.add(u64, intent.replay_artifact_key_bytes, 4 + key.len) catch return error.TransactionTooLarge;
                 }
             } else {
                 const prefix = try internal_keys.artifactRootPrefixAlloc(alloc, intent.key);
@@ -25369,6 +25380,7 @@ pub const DB = struct {
                     if (!internal_keys.isEmbeddingArtifactKey(record.key)) continue;
                     intent.retained_artifact_bytes = std.math.add(u64, intent.retained_artifact_bytes, 16 + record.key.len) catch return error.TransactionTooLarge;
                     intent.retained_artifact_keys += 1;
+                    intent.replay_artifact_key_bytes = std.math.add(u64, intent.replay_artifact_key_bytes, 4 + record.key.len) catch return error.TransactionTooLarge;
                 }
             }
         }
@@ -31901,6 +31913,8 @@ pub const DB = struct {
         drain_relational_indexes: bool = true,
         drain_graph_replacements: bool = true,
         bounded_replay: bool = false,
+        /// A background consumer may only inspect the completed producer cut.
+        replay_target_cap: u64 = std.math.maxInt(u64),
         /// Native replay releases its primary snapshot before artifact work.
         /// Explicit idle and hosted owners retain the complete drain below.
         source_work_only: bool = false,
@@ -31930,16 +31944,19 @@ pub const DB = struct {
         if (sequence == 0) return;
         if (!self.executor.hasWorkers()) {
             try ensureSnapshotActive(options.cancellation);
-            try replayPendingDerivedBatches(self, null, null, options);
+            var direct_options = options;
+            if (options.bounded_replay) direct_options.replay_target_cap = @min(options.replay_target_cap, sequence);
+            try replayPendingDerivedBatches(self, null, null, direct_options);
             try ensureSnapshotActive(options.cancellation);
             return;
         }
-        if (options.source_work_only) {
+        if (options.bounded_replay) {
             const state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
             self.executor.notifySequence(sequence);
             return self.executor.waitForAllWithVisibilityWait(sequence, .{
                 .cancellation = options.cancellation,
                 .replay_budget = &state.replay_budget,
+                .replay_target_cap = sequence,
                 .publication_overhead_ns = &state.publication_overhead_ns,
                 .replay_record_cap = if (state.replay_retirement.watermark != 0) docstore_mod.ReplayRetirement.record_cap else 2048,
             });
@@ -32135,6 +32152,36 @@ pub const DB = struct {
     }
 
     fn runEnrichmentUntilForDrain(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
+        if (options.bounded_replay) {
+            if (self.enrichment_runtime) |runtime| {
+                const state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
+                const budget = state.producer_replay_budget.budget(0);
+                const started = monotonicTimeNs();
+                const publication_before = state.publication_overhead_ns.load(.monotonic);
+                var observed: enrichment_runtime_mod.ReplayTurnStats = .{};
+                var failed = false;
+                defer {
+                    // Size preparation, as the index replay controller does.
+                    // Queueing behind foreground writes and publishing the
+                    // completed window are fixed costs to amortize, not slow
+                    // document preparation. Counting them shrinks contended
+                    // producers to tiny windows and amplifies those costs.
+                    const publication_ns = state.publication_overhead_ns.load(.monotonic) -| publication_before;
+                    const preparation_ns = (monotonicTimeNs() -| started) -| publication_ns;
+                    state.producer_replay_budget.observe(0, budget, preparation_ns, observed.discovered_document_groups, failed);
+                }
+                observed = runtime.catchUpTurnWithLimits(sequence, options.cancellation, .{ .max_records = 4096, .max_document_groups = budget.records, .max_input_bytes = @intCast(budget.bytes) }) catch |err| blk: {
+                    failed = true;
+                    // Parked producers must yield to the consumers which free
+                    // their credits; no failed window is treated as progress.
+                    switch (err) {
+                        error.LiteReplayBacklogExceeded, error.EnrichmentRetryInProgress => break :blk .{},
+                        else => return err,
+                    }
+                };
+            }
+            return;
+        }
         while (true) {
             const outcome = if (options.unbounded_enrichment_wait and options.cancellation.ptr == null)
                 self.runEnrichmentUntilForDrainUnbounded(sequence)
@@ -32181,7 +32228,11 @@ pub const DB = struct {
             // Drain the producer boundary first, then every consumer observes
             // the complete revision and can advance from durable evidence.
             try self.runEnrichmentUntilForDrain(stable_target, options);
-            try self.runDerivedUntilWithOptions(stable_target, options);
+            const consumer_target = if (options.bounded_replay) prefix: {
+                if (self.enrichment_runtime) |runtime| break :prefix @min(stable_target, runtime.stats().applied_sequence);
+                break :prefix stable_target;
+            } else stable_target;
+            try self.runDerivedUntilWithOptions(consumer_target, options);
             if (options.no_progress_timeout_ns != 0) try self.checkTargetAdvanceNoProgress(options.no_progress_timeout_ns);
 
             const next_target = self.core.nextDerivedSequence();
@@ -32428,6 +32479,14 @@ pub const DB = struct {
         return appendGeneratedBatchFromEnrichment(self.enrichment_append_context orelse return error.EnrichmentWaitCanceled, derived_batch, promotions, deletes, guards, fence);
     }
 
+    /// The caller holds checked writer admission for this captured runtime.
+    /// Commit output and its replay record together; downstream indexes consume
+    /// the completed producer prefix in their own bounded service turn.
+    pub fn enqueuePreparedGeneratedBatch(self: *DB, derived_batch: enrichment_runtime_mod.GeneratedRecordBatch, promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion, deletes: []const []const u8, guards: []const enrichment_runtime_mod.GeneratedSourceGuard, fence: ?enrichment_runtime_mod.GeneratedWriteFence) !enrichment_runtime_mod.GeneratedRecordCommit {
+        if (self.enrichment_append_context == null) try self.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+        return appendGeneratedBatchFromEnrichmentWithProjection(self.enrichment_append_context orelse return error.EnrichmentWaitCanceled, derived_batch, promotions, deletes, guards, fence, true);
+    }
+
     pub fn derivedAsyncAppendDerivedBatchRecord(self: *DB, derived_batch: derived_types.DerivedBatch) !u64 {
         if (comptime storage_engine.enabled) return storage_engine.call("derivedAsyncAppendDerivedBatchRecord", .{ self, derived_batch });
         return try appendDerivedBatchRecord(self, derived_batch);
@@ -32466,13 +32525,19 @@ pub const DB = struct {
                     // not the next append sequence. Include that record when
                     // recovering a missed runtime notification.
                     if (drained_sequence > 0) runtime.notifySequence(drained_sequence);
-                    try runtime.catchUp();
+                    if (options.bounded_replay)
+                        try runtime.catchUpOnce(options.deadline_ns orelse monotonicTimeNs() +| @import("derived/replay_budget.zig").Controller.quantum_ns)
+                    else
+                        try runtime.catchUp();
                 }
 
                 if (self.promotion_runtime) |runtime| {
                     const latest = self.core.nextDerivedSequence();
                     if (latest > 0) runtime.notifySequence(latest);
-                    try runtime.catchUp();
+                    if (options.bounded_replay)
+                        try runtime.catchUpOnce(options.deadline_ns orelse monotonicTimeNs() +| @import("derived/replay_budget.zig").Controller.quantum_ns)
+                    else
+                        try runtime.catchUp();
                 }
 
                 // Resolution can append graph/promotion replay before
@@ -34236,7 +34301,12 @@ pub const DB = struct {
         // Primary LSM/source maintenance still belongs to the source phase.
         // Deferring only index work must not strand this lane at idle.
         if (phase == .replay) _ = try self.runPrimaryLsmMaintenanceStep();
-        return finalized or self.core.nextDerivedSequence() > before or self.executor.snapshotStats().workers_with_replay_debt != 0 or
+        const enrichment_pending = if (self.enrichment_runtime) |runtime| pending: {
+            const runtime_stats = runtime.stats();
+            break :pending runtime_stats.applied_sequence < runtime_stats.target_sequence or runtime_stats.retrying;
+        } else false;
+        return finalized or enrichment_pending or self.core.nextDerivedSequence() > before or self.executor.snapshotStats().workers_with_replay_debt != 0 or
+            self.resolutionStageStats().catch_up_required or self.promotionStageStats().catch_up_required or
             self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending();
     }
 
@@ -54704,7 +54774,19 @@ fn appendGeneratedBatchFromEnrichment(
     source_guards: []const enrichment_runtime_mod.GeneratedSourceGuard,
     fence: ?enrichment_runtime_mod.GeneratedWriteFence,
 ) !enrichment_runtime_mod.GeneratedRecordCommit {
-    if (artifact_promotions.len == 0 and artifact_delete_keys.len == 0 and source_guards.len == 0 and fence == null)
+    return appendGeneratedBatchFromEnrichmentWithProjection(ctx_ptr, batch, artifact_promotions, artifact_delete_keys, source_guards, fence, false);
+}
+
+fn appendGeneratedBatchFromEnrichmentWithProjection(
+    ctx_ptr: *anyopaque,
+    batch: derived_types.DerivedBatch,
+    artifact_promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion,
+    artifact_delete_keys: []const []const u8,
+    source_guards: []const enrichment_runtime_mod.GeneratedSourceGuard,
+    fence: ?enrichment_runtime_mod.GeneratedWriteFence,
+    defer_projection: bool,
+) !enrichment_runtime_mod.GeneratedRecordCommit {
+    if (!defer_projection and artifact_promotions.len == 0 and artifact_delete_keys.len == 0 and source_guards.len == 0 and fence == null)
         return .{ .sequence = try appendDerivedBatchFromEnrichment(ctx_ptr, batch) };
 
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
@@ -55006,6 +55088,10 @@ fn appendGeneratedBatchFromEnrichment(
     releaseReplicationMutationShared(&replication_mutation);
     try deferred_replication_gates.waitForDurabilityAndAuthority(batch_ctx.replication_write_gate);
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
+    if (defer_projection) {
+        if (ctx.executor.hasWorkers()) ctx.executor.forceSequence(sequence);
+        return .{ .sequence = sequence, .promoted_artifact_bytes = promoted_artifact_bytes };
+    }
     if (ctx.executor.hasWorkers()) {
         ctx.executor.forceSequence(sequence);
         return .{ .sequence = sequence, .promoted_artifact_bytes = promoted_artifact_bytes };
@@ -55517,12 +55603,13 @@ fn replayPendingDerivedBatches(
         const applied = try self.core.loadAppliedSequence(self.alloc, index_ref.name);
         const use_dense_catch_up = index_ref.kind == .dense_vector;
         const resources = self.core.batchExecutionResources();
-        const target_sequence = try self.probeDerivedReplayTargetSequence(
+        const target_sequence = @min(options.replay_target_cap, try self.probeDerivedReplayTargetSequence(
             self.alloc,
             resources.replay_source,
             index_ref,
             applied,
-        );
+        ));
+        if (options.bounded_replay and target_sequence <= applied) continue;
         persist_progress_ctx.target_sequence = target_sequence;
         persist_progress_ctx.scanned_entries = 0;
         persist_progress_ctx.applied_entries = 0;
@@ -55589,7 +55676,11 @@ fn replayPendingDerivedBatches(
                     if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxChunkBytes() else derived_worker.catch_up_max_chunk_bytes_default,
                     if (options.bounded_replay) adaptive_budget.bytes else std.math.maxInt(u64),
                 ),
-                .max_windows_per_call = options.max_windows_per_index,
+                .max_collected_items_per_window = if (options.bounded_replay) adaptive_budget.records else 0,
+                .max_windows_per_call = if (options.bounded_replay) 1 else options.max_windows_per_index,
+                .target_sequence = if (options.bounded_replay) target_sequence else 0,
+                .max_call_ns = if (options.bounded_replay) @import("derived/replay_budget.zig").Controller.quantum_ns else 0,
+                .max_call_bytes = if (options.bounded_replay) adaptive_budget.bytes else 0,
                 .deadline_ns = options.deadline_ns,
             },
         );
@@ -55622,7 +55713,7 @@ fn replayPendingDerivedBatches(
             try self.core.saveAppliedSequence(index_ref.name, target_sequence);
         } else try abortReplayCapture(&replay_ctx, index_ref);
         if (options.bounded_replay)
-            replay_state.replay_budget.observe(replay_lane, adaptive_budget, monotonicTimeNs() - replay_started, stats.scanned_entries, false);
+            replay_state.replay_budget.observe(replay_lane, adaptive_budget, monotonicTimeNs() - replay_started, @max(stats.scanned_entries, stats.collected_items), false);
         replay_completed = true;
     }
     if (options.truncate_replay) try truncateReplayJournalIfSafe(self);
@@ -145425,4 +145516,185 @@ test "db manual text producers merge capacity without optional workers visibilit
     var completed = try std.json.parseFromSlice(std.json.Value, alloc, visible, .{});
     defer completed.deinit();
     try std.testing.expectEqual(@as(i64, 1), completed.value.object.get("count").?.integer);
+}
+
+test "background enrichment turn checkpoints a producer prefix before yielding to indexes" {
+    const alloc = std.testing.allocator;
+    var backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = std.testing.io },
+    });
+    defer backend_runtime.deinit();
+    var tmp = try TestDirectory.init("bounded-enrichment-turn");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{
+        .backend_runtime = backend_runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+        .physical_root_mode = .external_backend,
+        .start_index_workers = false,
+        .start_optional_runtimes = true,
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .enable_without_producers = true },
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "text", .producer_json = "{\"type\":\"copy\"}" });
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    for (0..32) |i| {
+        var key: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&key, "source-{d}", .{i});
+        try db.batch(.{ .writes = &.{.{ .key = name, .value = "{\"text\":\"bounded producer canary\"}" }}, .sync_level = .write });
+    }
+    // The bounded prefix must also tolerate a newer value for an early key.
+    try db.batch(.{ .writes = &.{.{ .key = "source-0", .value = "{\"text\":\"latest producer canary\"}" }}, .sync_level = .write });
+    const target = db.core.nextDerivedSequence();
+    const before = try db.core.loadAppliedSequence(alloc, "text");
+    try std.testing.expect(try db.runBackgroundTurnWithCancellation(.none, .replay));
+    const produced = db.enrichment_runtime.?.stats().applied_sequence;
+    try std.testing.expect(produced > 0);
+    try std.testing.expect(produced < target);
+    try std.testing.expect(db.enrichment_runtime.?.stats().processed_requests <= 8);
+    try std.testing.expect(try db.core.loadAppliedSequence(alloc, "text") <= @max(before, produced));
+    try db.runUntilIdle();
+    try std.testing.expect(db.enrichment_runtime.?.stats().applied_sequence >= target);
+    try std.testing.expect(db.enrichment_runtime.?.stats().processed_requests >= 32);
+    try std.testing.expect(try db.core.loadAppliedSequence(alloc, "text") >= target);
+}
+
+test "background enrichment turn batches independent absent copy effects" {
+    const alloc = std.testing.allocator;
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    var tmp = try TestDirectory.init("batched-absent-copy");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{
+        .backend_runtime = host.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+        .physical_root_mode = .external_backend,
+        .start_index_workers = false,
+        .start_optional_runtimes = true,
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .enable_without_producers = true },
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"copy\"}" });
+    for (0..8) |i| {
+        var key: [32]u8 = undefined;
+        try db.batch(.{ .writes = &.{.{ .key = try std.fmt.bufPrint(&key, "source-{d}", .{i}), .value = "{\"body\":\"old output\"}" }}, .sync_level = .write });
+    }
+    try db.runUntilIdle();
+    for (0..8) |i| {
+        var key: [32]u8 = undefined;
+        try db.batch(.{ .writes = &.{.{ .key = try std.fmt.bufPrint(&key, "source-{d}", .{i}), .value = "{\"other\":\"no source\"}" }}, .sync_level = .write });
+    }
+    const before = db.core.nextDerivedSequence();
+    try std.testing.expect(try db.runBackgroundTurnWithCancellation(.none, .replay));
+    // Eight independent absences share one bounded output publication,
+    // instead of appending a derived record for each source request.
+    try std.testing.expect(db.core.nextDerivedSequence() - before < 8);
+    try db.runUntilIdle();
+    for (0..8) |i| {
+        var key: [32]u8 = undefined;
+        const source = try std.fmt.bufPrint(&key, "source-{d}", .{i});
+        const artifact = try internal_keys.artifactNamedPrefixAlloc(alloc, source, "asset", "copy");
+        defer alloc.free(artifact);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, artifact));
+    }
+}
+
+test "background enrichment turn keeps never produced graph sources sparse across reopen" {
+    const a = std.testing.allocator;
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    var tmp = try TestDirectory.init("sparse-absent-graph");
+    defer tmp.cleanup();
+    const options: OpenOptions = .{ .backend_runtime = host.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtime_workers = false, .start_independent_maintenance = false };
+    const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(a, "doc:a", "g");
+    defer a.free(count_key);
+    {
+        var db = try DB.open(a, tmp.path(), options);
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json =
+            \\{"source":{"artifact":"relations","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+        });
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"no relations\"}" }}, .sync_level = .write });
+        const after_primary = db.core.nextDerivedSequence();
+        try db.runUntilIdle();
+        // Coverage advances without inventing artifact-change records when
+        // neither stored output nor a projected edge actually changed.
+        try std.testing.expectEqual(after_primary, db.core.nextDerivedSequence());
+        try std.testing.expectError(error.NotFound, db.core.store.get(a, count_key));
+        const prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(a, "doc:a", "g");
+        defer a.free(prefix);
+        const states = try db.core.store.scanPrefix(a, prefix);
+        defer docstore_mod.DocStore.freeResults(a, states);
+        try std.testing.expectEqual(@as(usize, 0), states.len);
+    }
+    {
+        var db = try DB.open(a, tmp.path(), options);
+        defer db.close();
+        try std.testing.expectError(error.NotFound, db.core.store.get(a, count_key));
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"relations\":{\"relations\":[{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:b\"}}]}}" }}, .sync_level = .enrichments });
+        try db.runUntilIdle();
+        {
+            const edges = try db.getEdges(a, "g", "doc:a", "mentions", .out);
+            defer graph_mod.GraphIndex.freeEdges(a, edges);
+            try std.testing.expectEqual(@as(usize, 1), edges.len);
+        }
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"relations removed\"}" }}, .sync_level = .enrichments });
+        try db.runUntilIdle();
+        const edges = try db.getEdges(a, "g", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(a, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+        const count = try db.core.store.get(a, count_key);
+        defer a.free(count);
+        try std.testing.expectEqual(@as(?usize, 0), try graph_edge_contender.decodeVisibleCount(count, db.core.index_manager.graphIndex("g").?.config.coverage_generation));
+    }
+}
+
+test "inline resolver replacement background replay yields within a large record" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("bounded-background-resolution");
+    defer directory.cleanup();
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    const options: OpenOptions = .{ .backend_runtime = host.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtime_workers = false, .start_independent_maintenance = false };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var sequence: u64 = 0;
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ uslug _entity.text }}", .promote = false }, .{ .drain_backfill = false });
+        try db.runUntilIdle();
+        var source_keys: [40][]const u8 = undefined;
+        for (&source_keys, 0..) |*key, i| {
+            key.* = try internal_keys.artifactNamedPrefixAlloc(scratch, try std.fmt.allocPrint(scratch, "doc:{d:0>3}", .{i}), "asset", "kg");
+            try db.core.store.put(key.*, "{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]}");
+        }
+        sequence = try appendDerivedBatchRecord(&db, .{ .changed_artifact_keys = &source_keys });
+        db.resolution_runtime.?.notifySequence(sequence);
+        try std.testing.expect(try db.runBackgroundTurnWithCancellation(.none, .replay));
+        const runtime = db.resolution_runtime.?;
+        // A source turn may durably process only a prefix of this record.
+        // Unbounded catchUp() consumed all 40 before returning to the owner.
+        try std.testing.expect(runtime.applied_sequence.load(.acquire) < sequence);
+        try std.testing.expect(runtime.replay_progress != null);
+        try std.testing.expect(runtime.replay_progress.?.next_key > 0);
+        try std.testing.expect(runtime.replay_progress.?.next_key <= 32);
+    }
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        try db.runUntilIdle();
+        try std.testing.expect(db.resolution_runtime.?.applied_sequence.load(.acquire) >= sequence);
+        for (0..40) |i| {
+            const key = try internal_keys.resolutionArtifactKeyAlloc(scratch, try std.fmt.allocPrint(scratch, "doc:{d:0>3}", .{i}), "resolved");
+            const value = try db.core.store.get(a, key);
+            defer a.free(value);
+            try std.testing.expect(std.mem.indexOf(u8, value, "entity/ada") != null);
+        }
+    }
 }

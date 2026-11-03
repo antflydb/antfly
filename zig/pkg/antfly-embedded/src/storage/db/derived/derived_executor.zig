@@ -414,19 +414,20 @@ const ManualRuntime = struct {
             .{
                 .resource_manager = self.backlog.resource_manager,
                 .max_records_per_window = if (wait.replay_budget != null) budget.records else derived_worker.catch_up_max_records_per_window_default,
+                .max_collected_items_per_window = if (wait.replay_budget != null) budget.records else 0,
                 .max_chunk_bytes = if (wait.replay_budget != null) budget.bytes else derived_worker.catch_up_max_chunk_bytes_default,
                 .max_windows_per_call = if (wait.replay_budget != null) 1 else 0,
                 .release_read_snapshot_after_collect = wait.replay_budget != null,
                 .max_call_ns = if (wait.replay_budget != null) @import("replay_budget.zig").Controller.quantum_ns else 0,
                 .max_call_bytes = if (wait.replay_budget != null) budget.bytes else 0,
-                .target_sequence = if (wait.replay_budget != null) worker.target_sequence else 0,
+                .target_sequence = if (wait.replay_budget != null) @min(worker.target_sequence, wait.replay_target_cap) else 0,
             },
         ) catch |err| {
             pressure_failure = err == error.ResourceBudgetExceeded or err == error.OutOfMemory;
             return err;
         };
         completed = true;
-        if (wait.replay_budget) |controller| controller.observe(lane, budget, replayWorkElapsedNs(wait, started, waited_before), stats.scanned_entries, false);
+        if (wait.replay_budget) |controller| controller.observe(lane, budget, replayWorkElapsedNs(wait, started, waited_before), @max(stats.scanned_entries, stats.collected_items), false);
         catch_up_open = false;
         return .{ .stats = stats, .token = token };
     }
@@ -434,7 +435,8 @@ const ManualRuntime = struct {
     fn waitForAll(self: *ManualRuntime, sequence: u64, wait: VisibilityWait) !void {
         for (self.workers.items) |*worker| {
             worker.target_sequence = @max(worker.target_sequence, sequence);
-            if (worker.target_sequence <= worker.applied_sequence) continue;
+            const target = @min(worker.target_sequence, wait.replay_target_cap);
+            if (target <= worker.applied_sequence) continue;
             // Manual execution cannot wait for a structural owner on this same thread.
             if (worker.paused) return error.DerivedWorkerPaused;
             try wait.check();
@@ -450,9 +452,9 @@ const ManualRuntime = struct {
             try wait.check();
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
-            else if (stats.shouldTryTargetAdvance(worker.applied_sequence, worker.target_sequence) and
-                try self.canAdvanceToTarget(worker, worker.applied_sequence, worker.target_sequence))
-                worker.target_sequence
+            else if (stats.shouldTryTargetAdvance(worker.applied_sequence, target) and
+                try self.canAdvanceToTarget(worker, worker.applied_sequence, target))
+                target
             else
                 worker.applied_sequence;
             session_open = false;
@@ -485,7 +487,8 @@ const ManualRuntime = struct {
         for (self.workers.items) |*worker| {
             if (!indexNameInList(worker.name, index_names)) continue;
             worker.target_sequence = @max(worker.target_sequence, sequence);
-            if (worker.target_sequence <= worker.applied_sequence) continue;
+            const target = @min(worker.target_sequence, wait.replay_target_cap);
+            if (target <= worker.applied_sequence) continue;
             // Manual execution cannot wait for a structural owner on this same thread.
             if (worker.paused) return error.DerivedWorkerPaused;
             try wait.check();
@@ -501,9 +504,9 @@ const ManualRuntime = struct {
             try wait.check();
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
-            else if (stats.shouldTryTargetAdvance(worker.applied_sequence, worker.target_sequence) and
-                try self.canAdvanceToTarget(worker, worker.applied_sequence, worker.target_sequence))
-                worker.target_sequence
+            else if (stats.shouldTryTargetAdvance(worker.applied_sequence, target) and
+                try self.canAdvanceToTarget(worker, worker.applied_sequence, target))
+                target
             else
                 worker.applied_sequence;
             session_open = false;
@@ -919,6 +922,54 @@ test "manual replay background budget persists partial progress and leaves foreg
     try std.testing.expectEqual(partial, probe.persisted);
     try std.testing.expectEqual(partial, probe.retired);
     try std.testing.expect(controller.snapshot().observations >= 2);
+    const produced_prefix = partial + 2;
+    try executor.waitForAllWithVisibilityWait(64, .{ .replay_budget = &controller, .replay_target_cap = produced_prefix });
+    try std.testing.expectEqual(produced_prefix, executor.appliedSequence("ft").?);
+    try std.testing.expectEqual(@as(usize, 1), executor.snapshotStats().workers_with_replay_debt);
+    try executor.waitForAll(64);
+    try std.testing.expectEqual(@as(u64, 64), executor.appliedSequence("ft").?);
+}
+
+test "manual replay background budget bounds document fanout rather than only journal records" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try @import("../../docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    for (1..65) |sequence| {
+        var keys: [64][]const u8 = undefined;
+        for (&keys, 0..) |*key, item| key.* = try std.fmt.allocPrint(arena.allocator(), "doc-{d}-{d}", .{ sequence, item });
+        const payload = try @import("change_journal.zig").encodeRecord(alloc, .{
+            .sequence = @intCast(sequence),
+            .changed_doc_keys = &keys,
+            .target_hints = &.{.full_text},
+        });
+        defer alloc.free(payload);
+        try store.appendReplayOpaque(alloc, @intCast(sequence), payload);
+    }
+    const Probe = struct {
+        maximum_documents: usize = 0,
+        fn apply(ptr: *anyopaque, batch: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.maximum_documents = @max(self.maximum_documents, batch.documents.len);
+            return true;
+        }
+        fn persist(_: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            return true;
+        }
+        fn truncate(_: *anyopaque, _: u64) !void {}
+    };
+    var probe: Probe = .{};
+    var executor = try initManual(alloc, replay_source_mod.Source.fromPrimaryStore(&store, null, null), &probe, Probe.apply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    defer executor.deinit(alloc);
+    try executor.addWorker("ft", .{ .name = "ft", .kind = .full_text }, 0);
+    var controller: @import("replay_budget.zig").Controller = .{};
+    const initial = controller.budget(0);
+    try executor.waitForAllWithVisibilityWait(64, .{ .replay_budget = &controller });
+    try std.testing.expectEqual(initial.records, probe.maximum_documents);
+    try std.testing.expect(executor.appliedSequence("ft").? < 64);
     try executor.waitForAll(64);
     try std.testing.expectEqual(@as(u64, 64), executor.appliedSequence("ft").?);
 }

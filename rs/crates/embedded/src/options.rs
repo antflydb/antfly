@@ -107,9 +107,10 @@ pub struct TtlCleanupOptions {
 
 /// Configures [`crate::Database::open`] and [`crate::Database::create`].
 ///
-/// `busy_timeout`, like `sqlite3_busy_timeout`, retries Lite admission while
-/// another process holds the writer lease or advances the allocator checkpoint.
-/// Mutation bodies are never replayed by this admission retry.
+/// `busy_timeout`, like `sqlite3_busy_timeout`, bounds waits for Lite writer
+/// admission and replay capacity. Active batch preparation is excluded from
+/// the capacity-wait budget. Refusals before primary commit may retry;
+/// committed mutations are never replayed.
 /// `None` (or `Some(Duration::ZERO)`) fails immediately with
 /// [`crate::Error::Busy`]. The C ABI takes whole milliseconds, so a
 /// sub-millisecond duration is rounded up.

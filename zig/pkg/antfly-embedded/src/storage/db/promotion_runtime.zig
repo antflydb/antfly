@@ -844,7 +844,21 @@ pub const PromotionRuntime = struct {
         return self.catchUpLocked(false);
     }
 
+    /// One atomic replay record is the cooperative publication unit. A
+    /// bounded caller cannot drain an arbitrarily growing sequence of records.
+    pub fn catchUpOnce(self: *PromotionRuntime, deadline_ns: u64) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("promotionCatchUpOnce", .{ self, deadline_ns });
+        if (!self.catch_up_mutex.tryLock()) return;
+        defer self.catch_up_mutex.unlock();
+        if (@import("antfly_platform").time.monotonicNs() >= deadline_ns) return;
+        return self.catchUpLockedWithLimit(true, 1);
+    }
+
     fn catchUpLocked(self: *PromotionRuntime, single_window: bool) !void {
+        return self.catchUpLockedWithLimit(single_window, default_max_records_per_window);
+    }
+
+    fn catchUpLockedWithLimit(self: *PromotionRuntime, single_window: bool, max_records: usize) !void {
         errdefer _ = self.error_count.fetchAdd(1, .monotonic);
 
         while (true) {
@@ -870,7 +884,7 @@ pub const PromotionRuntime = struct {
                     // from_sequence is exclusive (records with seq > from), matching
                     // the derived workers, which pass their applied_sequence.
                     applied,
-                    default_max_records_per_window,
+                    max_records,
                     self.catalog,
                 );
             } else result: {
@@ -886,7 +900,7 @@ pub const PromotionRuntime = struct {
                     das.artifactStore(),
                     null,
                     applied,
-                    default_max_records_per_window,
+                    max_records,
                     self.catalog,
                 );
             };
@@ -1903,4 +1917,33 @@ test "catchUpWindow with no matching records returns from_sequence" {
 
 test "PromotionRuntime compiles end-to-end" {
     testing.refAllDecls(PromotionRuntime);
+}
+
+test "inline resolver replacement promotion bounded turns commit one record and resume" {
+    const a = testing.allocator;
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    const key = try internal_keys.resolutionArtifactKeyAlloc(a, "doc:a", "resolved");
+    defer a.free(key);
+    try map.put(key, sample_resolution);
+    const first = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_artifact_keys = &.{key}, .target_hints = &.{.promotion} });
+    defer a.free(first);
+    const second = try change_journal_mod.encodeRecord(a, .{ .sequence = 2, .changed_artifact_keys = &.{key}, .target_hints = &.{.promotion} });
+    defer a.free(second);
+    var source = FakeSource{ .records = &.{ .{ .sequence = 1, .payload = first }, .{ .sequence = 2, .payload = second } } };
+    var capture = CaptureSink{ .alloc = a };
+    defer capture.deinit();
+    var store = try resolution_runtime.initRuntimeStore(a, map.backendStore());
+    defer store.deinit();
+    var runtime: PromotionRuntime = .{ .alloc = a, .store_handle = store, .replay_source = source.source(), .owner = null, .sink = capture.sink(), .sink_available = .init(true), .missing_sink_blocked = .init(false), .missing_sink_policy = .wait, .applied_sequence = .init(0), .target_sequence = .init(2), .error_count = .init(0), .shutdown_flag = .init(false), .io = null, .future = null };
+    try runtime.catchUpOnce(0);
+    try testing.expectEqual(@as(u64, 0), runtime.applied_sequence.load(.acquire));
+    try runtime.catchUpOnce(std.math.maxInt(u64));
+    try testing.expectEqual(@as(u64, 1), runtime.applied_sequence.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
+    try runtime.catchUpOnce(std.math.maxInt(u64));
+    try testing.expectEqual(@as(u64, 2), runtime.applied_sequence.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
+    try runtime.catchUp();
+    try testing.expectEqual(@as(u64, 2), runtime.applied_sequence.load(.acquire));
 }

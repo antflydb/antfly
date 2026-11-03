@@ -22,6 +22,11 @@ pub const State = struct {
     publication_overhead_ns: std.atomic.Value(u64) = .init(0),
     replay_retirement: @import("../docstore.zig").ReplayRetirement = .{},
     replay_budget: @import("derived/replay_budget.zig").Controller = .{},
+    producer_replay_budget: @import("derived/replay_budget.zig").Controller = .{
+        .lanes = @splat(.{ .records = 8, .bytes = 256 * 1024 }),
+        .max_records = 128,
+        .max_bytes = 4 * 1024 * 1024,
+    },
     slice_mutex: std.atomic.Mutex = .unlocked,
     allocator: ?std.mem.Allocator = null,
     worker: ?work.Worker = null,

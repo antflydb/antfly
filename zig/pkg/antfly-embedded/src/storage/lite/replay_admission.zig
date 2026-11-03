@@ -31,7 +31,9 @@ pub const State = struct {
 
     pub fn encode(self: State) [40]u8 {
         var raw: [40]u8 = @splat(0);
-        @memcpy(raw[0..4], "RAB1");
+        // New writers fence RAB1-only writers before publishing 40-byte intent
+        // descriptors; the physical file/checkpoint format is unchanged.
+        @memcpy(raw[0..4], "RAB2");
         std.mem.writeInt(u64, raw[4..12], self.bytes, .little);
         std.mem.writeInt(u64, raw[12..20], self.records, .little);
         std.mem.writeInt(u64, raw[20..28], self.limits.bytes, .little);
@@ -40,7 +42,7 @@ pub const State = struct {
         return raw;
     }
     pub fn decode(raw: []const u8) !State {
-        if (raw.len != 40 or !std.mem.eql(u8, raw[0..4], "RAB1") or
+        if (raw.len != 40 or (!std.mem.eql(u8, raw[0..4], "RAB1") and !std.mem.eql(u8, raw[0..4], "RAB2")) or
             std.mem.readInt(u32, raw[36..40], .little) != std.hash.Crc32.hash(raw[0..36])) return error.InvalidNativeReplayAdmission;
         return .{ .bytes = std.mem.readInt(u64, raw[4..12], .little), .records = std.mem.readInt(u64, raw[12..20], .little), .limits = .{ .bytes = std.mem.readInt(u64, raw[20..28], .little), .records = std.mem.readInt(u64, raw[28..36], .little) } };
     }
@@ -109,16 +111,26 @@ pub const Cost = struct {
     }
 };
 
+pub fn validReservationLength(length: u64) bool {
+    return length == 16 or length == 32 or length == 40;
+}
+
 pub fn cost(physical: []const u8, value_len: u64, descriptor: []const u8) !Cost {
     if (!isReservation(physical)) return .{ .bytes = try charge(physical, value_len), .records = 1 };
     // One durable intent admission reserves every possible replay hint lane.
     // Resolution deletes this descriptor atomically with its source/replay
     // commit. Credits therefore survive crash, refresh and process changes.
-    if (descriptor.len != 16 and descriptor.len != 32) return error.InvalidNativeReplayAdmission;
+    if (!validReservationLength(descriptor.len)) return error.InvalidNativeReplayAdmission;
     const count = std.mem.readInt(u64, descriptor[0..8], .little);
     if (count == 0) return .{ .bytes = 0, .records = 0 };
-    const intent_bytes = std.mem.readInt(u64, descriptor[8..16], .little);
-    return .{ .bytes = try std.math.add(u64, try std.math.mul(u64, intent_bytes, 9), 4096), .records = 9 };
+    // Legacy prepares retain their original conservative charge until replaced
+    // or resolved. New prepares persist a separate thin-key payload bound;
+    // primary JSON/AROW values and memory-admission overhead are not replay.
+    const payload_bytes = std.mem.readInt(u64, if (descriptor.len == 40) descriptor[32..40] else descriptor[8..16], .little);
+    const namespace_bytes = if (descriptor.len == 40) physical.len - logicalKey(physical).len else 0;
+    const payload = try std.math.mul(u64, payload_bytes, 9);
+    const overhead = try std.math.add(u64, 4096, try std.math.mul(u64, namespace_bytes, 9));
+    return .{ .bytes = try std.math.add(u64, payload, overhead), .records = 9 };
 }
 
 pub fn charge(physical: []const u8, value_len: u64) !u64 {
@@ -148,4 +160,38 @@ test "native replay refusal hints wait for actual credits and permit empty overs
     try std.testing.expect(hint.ready(.{ .bytes = 1, .records = 4091 }));
     try std.testing.expect(!hint.ready(.{ .bytes = 15, .records = 1, .limits = .{ .bytes = 20 } }));
     try std.testing.expect(hint.ready(.{ .limits = .{ .bytes = 1, .records = 1 } }));
+}
+
+test "native replay intent credits bound thin references instead of intent values" {
+    const a = std.testing.allocator;
+    const journal = @import("../db/derived/change_journal.zig");
+    const refs = [_][]const u8{ "document-a", "document-b", "document-c" };
+    const encoded = try journal.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &refs, .deleted_doc_keys = &refs, .overwritten_doc_keys = &refs, .changed_artifact_keys = &refs });
+    defer a.free(encoded);
+    var descriptor: [40]u8 = @splat(0);
+    std.mem.writeInt(u64, descriptor[0..8], refs.len, .little);
+    std.mem.writeInt(u64, descriptor[8..16], 64 * 1024 * 1024, .little);
+    var bound: u64 = 0;
+    for (refs) |ref| bound += 4 * (ref.len + 4);
+    std.mem.writeInt(u64, descriptor[32..40], bound, .little);
+    const physical = "\x02db/embedded/tables/2\x00" ++ reservation_prefix ++ "1234567890123456";
+    const reserved = try cost(physical, descriptor.len, &descriptor);
+    const actual = 9 * try charge("\x02db/embedded/tables/2\x00" ++ "\x02\x00" ++ "12345678", encoded.len);
+    try std.testing.expect(reserved.bytes >= actual);
+    try std.testing.expect(reserved.bytes < 16 * 1024);
+    try std.testing.expectEqual(@as(u64, 9), reserved.records);
+    const legacy = try cost(physical, 32, descriptor[0..32]);
+    try std.testing.expect(legacy.bytes > 16 * 1024 * 1024);
+}
+
+test "native replay admission reads RAB1 and publishes a RAB2 writer fence" {
+    const initial = State{ .bytes = 1234, .records = 12 };
+    var legacy = initial.encode();
+    try std.testing.expectEqualStrings("RAB2", legacy[0..4]);
+    @memcpy(legacy[0..4], "RAB1");
+    std.mem.writeInt(u32, legacy[36..40], std.hash.Crc32.hash(legacy[0..36]), .little);
+    const decoded = try State.decode(&legacy);
+    try std.testing.expectEqualDeep(initial, decoded);
+    const upgraded = decoded.encode();
+    try std.testing.expectEqualStrings("RAB2", upgraded[0..4]);
 }

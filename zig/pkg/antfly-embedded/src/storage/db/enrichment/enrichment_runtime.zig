@@ -444,8 +444,13 @@ const default_sync_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
 const borrowed_cancellation_poll_min_ns: i64 = 25 * std.time.ns_per_ms;
 const borrowed_cancellation_poll_max_ns: i64 = 250 * std.time.ns_per_ms;
 
+pub const ReplayTurnStats = struct { discovered_document_groups: usize = 0 };
+
 const ForegroundCatchUpGuard = struct {
     cancellation: CancellationToken = .none,
+    cooperative: bool = false,
+    replay_limits: replay_source_mod.Source.EnrichmentWindowLimits = .{ .max_records = 4096, .max_document_groups = 128, .max_input_bytes = 4 * 1024 * 1024 },
+    turn_stats: ?*ReplayTurnStats = null,
     deadline_ns: ?u64 = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
 
@@ -2826,7 +2831,7 @@ fn isGraphRecoveryPending(err: anyerror) bool {
 }
 
 fn isEnrichmentControlError(err: anyerror) bool {
-    return err == error.EnrichmentRetryAborted or err == error.ArtifactPublicationPending or isGraphRecoveryPending(err);
+    return err == error.EnrichmentRetryAborted or err == error.ArtifactPublicationPending or err == error.LiteReplayBacklogExceeded or isGraphRecoveryPending(err);
 }
 
 test "enrichment distinguishes transient capacity from permanent resource limits" {
@@ -4805,10 +4810,9 @@ const WorkerChunkSource = struct {
     source_record_digest: ?[32]u8,
 };
 
-const RequestPlanCacheEntry = struct {
-    doc_key: []u8,
-    requests: []const enrichment_types.GeneratedEnrichmentRequest,
-};
+// Cache lifetime remains one preparation quantum. Keys and request arrays are
+// owned; hashing avoids a growing full-key scan for every pending document.
+const RequestPlanCache = std.StringHashMapUnmanaged([]const enrichment_types.GeneratedEnrichmentRequest);
 
 const ChunkedDenseWindowItem = struct {
     precomputed: ?[]const f32 = null,
@@ -5018,10 +5022,11 @@ fn freeWorkerChunkCache(alloc: Allocator, cache: *std.ArrayListUnmanaged(WorkerC
     cache.deinit(alloc);
 }
 
-fn freeRequestPlanCache(alloc: Allocator, cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry)) void {
-    for (cache.items) |entry| {
-        alloc.free(entry.doc_key);
-        enrichment_types.deinitGeneratedRequests(alloc, entry.requests);
+fn freeRequestPlanCache(alloc: Allocator, cache: *RequestPlanCache) void {
+    var entries = cache.iterator();
+    while (entries.next()) |entry| {
+        alloc.free(entry.key_ptr.*);
+        enrichment_types.deinitGeneratedRequests(alloc, entry.value_ptr.*);
     }
     cache.deinit(alloc);
 }
@@ -5034,10 +5039,11 @@ fn clearWorkerChunkCache(alloc: Allocator, cache: *std.ArrayListUnmanaged(Worker
     cache.clearRetainingCapacity();
 }
 
-fn clearRequestPlanCache(alloc: Allocator, cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry)) void {
-    for (cache.items) |entry| {
-        alloc.free(entry.doc_key);
-        enrichment_types.deinitGeneratedRequests(alloc, entry.requests);
+fn clearRequestPlanCache(alloc: Allocator, cache: *RequestPlanCache) void {
+    var entries = cache.iterator();
+    while (entries.next()) |entry| {
+        alloc.free(entry.key_ptr.*);
+        enrichment_types.deinitGeneratedRequests(alloc, entry.value_ptr.*);
     }
     cache.clearRetainingCapacity();
 }
@@ -6502,6 +6508,16 @@ const UnsupportedEnrichmentRuntime = struct {
         try self.waitForAppliedWithVisibilityDeadline(sequence, cancellation, null);
     }
 
+    pub fn catchUpTurnWithCancellation(self: *@This(), sequence: u64, cancellation: CancellationToken) !void {
+        _ = try self.catchUpTurnWithLimits(sequence, cancellation, .{ .max_records = 4096, .max_document_groups = 128, .max_input_bytes = 4 * 1024 * 1024 });
+    }
+
+    pub fn catchUpTurnWithLimits(self: *@This(), sequence: u64, cancellation: CancellationToken, limits: replay_source_mod.Source.EnrichmentWindowLimits) !ReplayTurnStats {
+        var turn_result: ReplayTurnStats = .{};
+        try self.catchUpUntilGuarded(sequence, .{ .cancellation = cancellation, .cooperative = true, .replay_limits = limits, .turn_stats = &turn_result });
+        return turn_result;
+    }
+
     pub fn catchUpUntilWithCancellation(self: *@This(), sequence: u64, cancellation: CancellationToken) !void {
         try self.catchUpUntilWithVisibilityDeadline(sequence, cancellation, null);
     }
@@ -6577,7 +6593,12 @@ const UnsupportedEnrichmentRuntime = struct {
         self.retry_error_has_request_identity = false;
         self.notifySequence(sequence);
         try scavengeSharedPdfConsumerAttempts(self);
-        const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.replay_source, self.applied_sequence);
+        const replay_window = if (guard.cooperative)
+            try self.replay_source.collectEnrichmentDocumentGroupsWindow(self.alloc, self.applied_sequence, guard.replay_limits)
+        else
+            replay_source_mod.Source.EnrichmentWindow{ .groups = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.replay_source, self.applied_sequence), .last_sequence = 0 };
+        const pending = replay_window.groups;
+        if (guard.turn_stats) |turn_result| turn_result.discovered_document_groups = pending.len;
         defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
         var replay_cursor_assets = try loadReplayCursorForPass(self, self.applied_sequence, .assets);
         defer if (replay_cursor_assets) |*cursor| cursor.deinit(self.alloc);
@@ -6598,9 +6619,8 @@ const UnsupportedEnrichmentRuntime = struct {
             return err;
         };
         try drain_result;
-        if (pending.len == 0) {
-            max_seen = sequence;
-        }
+        max_seen = @max(max_seen, replay_window.last_sequence);
+        if (pending.len == 0 and replay_window.last_sequence == 0) max_seen = sequence;
 
         if (max_seen > self.applied_sequence) {
             self.active_failure_fingerprint = 0;
@@ -7321,6 +7341,23 @@ const PlatformEnrichmentRuntime = struct {
     pub fn catchUpUntil(self: *EnrichmentRuntime, sequence: u64) !void {
         if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentCatchUpUntil", .{ self, sequence });
         try self.catchUpUntilGuarded(sequence, .{});
+    }
+
+    /// Service one durable prefix. Background owners must return to downstream
+    /// indexes/retirement instead of draining a producer to the moving head.
+    pub fn catchUpTurnWithCancellation(self: *EnrichmentRuntime, sequence: u64, cancellation: CancellationToken) !void {
+        if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentCatchUpTurnWithCancellation", .{ self, sequence, cancellation });
+        _ = try self.catchUpTurnWithLimits(sequence, cancellation, .{ .max_records = 4096, .max_document_groups = 128, .max_input_bytes = 4 * 1024 * 1024 });
+    }
+
+    pub fn catchUpTurnWithLimits(self: *EnrichmentRuntime, sequence: u64, cancellation: CancellationToken, limits: replay_source_mod.Source.EnrichmentWindowLimits) !ReplayTurnStats {
+        if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentCatchUpTurnWithLimits", .{ self, sequence, cancellation, limits });
+        var turn_result: ReplayTurnStats = .{};
+        if (sequence == 0) return turn_result;
+        const io = (self.io_impl orelse return error.MissingBackendRuntimeIo).io();
+        self.notifySequence(sequence);
+        try runForegroundCatchUpPassGuarded(self, io, sequence, .{ .cancellation = cancellation, .cooperative = true, .replay_limits = limits, .turn_stats = &turn_result });
+        return turn_result;
     }
 
     pub fn catchUpUntilWithCancellation(self: *EnrichmentRuntime, sequence: u64, cancellation: CancellationToken) !void {
@@ -9088,6 +9125,7 @@ fn runForegroundCatchUpPassGuarded(
         // the durable worker retry budget.
         if (err == RuntimeError.EnrichmentWaitCanceled or
             err == RuntimeError.EnrichmentWaitTimeout or
+            err == error.LiteReplayBacklogExceeded or
             isGraphRecoveryPending(err)) return err;
         handleWorkerLoopError(runtime, io, err);
         return err;
@@ -9152,12 +9190,13 @@ fn runForegroundCatchUpPassOwned(
     // coalesce across up to 4096 records before paying for another checkpoint.
     // The byte limit also bounds discovery of large repeated-update records;
     // one complete record may exceed either soft limit.
-    const replay_window = try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, runtime.applied_sequence, .{
+    const replay_window = try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, runtime.applied_sequence, if (guard.cooperative) guard.replay_limits else .{
         .max_records = 4096,
         .max_document_groups = 128,
         .max_input_bytes = 4 * 1024 * 1024,
     });
     const pending = replay_window.groups;
+    if (guard.turn_stats) |turn_result| turn_result.discovered_document_groups = pending.len;
     defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
     var replay_cursor_assets = try loadReplayCursorForPass(runtime, runtime.applied_sequence, .assets);
     defer if (replay_cursor_assets) |*cursor| cursor.deinit(runtime.alloc);
@@ -13590,7 +13629,7 @@ fn processPendingDocumentGroup(
     runtime: *EnrichmentRuntime,
     pending: enrichment_worker.PendingDocumentGroup,
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
-    request_plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
+    request_plan_cache: *RequestPlanCache,
     deferred_plain_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     deferred_chunked_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     deferred_assets: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
@@ -13624,8 +13663,11 @@ fn processPendingDocumentGroup(
         try guard.check();
         var request = planned_request;
         request.sequence = pending.sequence;
-        // Publish completed generated writes before the next external embedder call can enter retry backoff.
-        if (window.hasDerivedItems()) try flushGeneratedReplayWindow(runtime, window);
+        // Independent local copies share the bounded publication window.
+        // Provider calls and causal dependencies must first make completed
+        // siblings durable, including the exact owner of any retry debt.
+        if (window.hasDerivedItems() and requestNeedsPublicationBarrier(runtime, request))
+            try flushGeneratedReplayWindow(runtime, window);
         try guard.check();
         processed_request_count.* += 1;
         const input_name = if (request.upstream_artifact_name.len != 0) request.upstream_artifact_name else if (request.input_kind != .document) request.artifact_name else "";
@@ -13702,6 +13744,23 @@ fn processPendingDocumentGroup(
             },
         }
     }
+}
+
+fn requestNeedsPublicationBarrier(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) bool {
+    if (request.kind != .asset or request.input_kind != .document or
+        request.upstream_artifact_name.len != 0 or request.requires_committed_graph or
+        request.prior_context_json.len != 0 or request.neighbor_context_json.len != 0 or
+        request.group_artifact_name.len != 0 or request.source_template.len != 0) return true;
+    const io = lockRuntime(runtime);
+    const retry_debt = runtime.retrying or runtime.consecutive_retry_count != 0 or
+        runtime.retry_failure_fingerprint != 0 or runtime.retry_error_has_request_identity;
+    unlockRuntime(runtime, io);
+    if (retry_debt) return true;
+    // Leave malformed configuration to the ordinary per-request failure
+    // boundary, after completed sibling output has been made durable.
+    var producer = asset_producer_mod.parseProducerConfig(runtime.alloc, request.producer_json) catch return true;
+    defer producer.deinit(runtime.alloc);
+    return producer.type != .copy;
 }
 
 /// The asset-producer (extraction, e.g. GLiNER2) execution lane. Owns a
@@ -14095,7 +14154,7 @@ const LanePipeline = struct {
 fn dispatchDeferredGeneratedWork(
     pipeline: *LanePipeline,
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
-    request_plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
+    request_plan_cache: *RequestPlanCache,
     deferred_plain_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     deferred_chunked_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     deferred_assets: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
@@ -14162,7 +14221,7 @@ fn runGeneratedCatchUpQuanta(
 ) !u64 {
     var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
     defer freeWorkerChunkCache(runtime.alloc, &chunk_cache);
-    var request_plan_cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
+    var request_plan_cache = RequestPlanCache{};
     defer freeRequestPlanCache(runtime.alloc, &request_plan_cache);
     var deferred_plain_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
     defer deferred_plain_dense.deinit(runtime.alloc);
@@ -14309,14 +14368,17 @@ fn processAsset(
         if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
-        if (producer_cfg.type == .document_extraction) {
+        const guard_start = window.source_guards.items.len;
+        const retired_output = if (producer_cfg.type == .document_extraction) blk: {
             try deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window);
-        } else {
-            try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
-            try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
-        }
+            break :blk true;
+        } else try queueAbsentAsset(runtime, window, request, doc_store_key, raw, key, state_key);
         try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
-        try materializeGraphAssetDeleteForRuntime(runtime, request, window);
+        const graph_effects = try materializeGraphAssetDeleteForRuntime(runtime, request, window);
+        // A never-produced source needs only sequence-aware coverage. No
+        // output or projection changed, so there is no replay effect to fence.
+        if (!retired_output and text_indexes.len == 0 and !graph_effects)
+            discardWindowSourceGuards(window, guard_start);
         // A null source is intentional no-output: settle graph/full_text
         // consumer coverage as skipped instead of leaving it pending.
         try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
@@ -14338,14 +14400,15 @@ fn processAsset(
         if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
-        if (producer_cfg.type == .document_extraction) {
+        const guard_start = window.source_guards.items.len;
+        const retired_output = if (producer_cfg.type == .document_extraction) blk: {
             try deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window);
-        } else {
-            try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
-            try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
-        }
+            break :blk true;
+        } else try queueAbsentAsset(runtime, window, request, doc_store_key, raw, key, state_key);
         try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
-        try materializeGraphAssetDeleteForRuntime(runtime, request, window);
+        const graph_effects = try materializeGraphAssetDeleteForRuntime(runtime, request, window);
+        if (!retired_output and text_indexes.len == 0 and !graph_effects)
+            discardWindowSourceGuards(window, guard_start);
         try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
         return;
     }
@@ -14478,6 +14541,34 @@ fn processAsset(
     key_owned = false;
     state_key_owned = false;
     state_value_owned = false;
+}
+
+/// Legacy absence is an effect of the observed source, just like produced
+/// bytes. Delete the artifact and its hash state atomically with the replay
+/// notification rather than issuing one raw transaction for every document.
+/// Guard both source identity and saved output so a delayed cleanup cannot
+/// erase a concurrently accepted replacement. Already absent records need no
+/// delete or change notification; callers still repair any actual projections.
+fn queueAbsentAsset(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    source_key: []const u8,
+    source: []const u8,
+    artifact_key: []const u8,
+    state_key: []const u8,
+) !bool {
+    try appendGeneratedSourceGuard(runtime, window, source_key, sourceRecordDigest(source), request.doc_key, request.sequence);
+    var changed = false;
+    for ([_][]const u8{ artifact_key, state_key }) |key| {
+        const previous = try currentRecordDigest(runtime, key);
+        try appendGeneratedSourceGuard(runtime, window, key, previous, null, 0);
+        if (previous == null) continue;
+        changed = true;
+        try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.artifact_delete_keys, &window.artifact_delete_key_index, key);
+    }
+    if (changed) try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, artifact_key);
+    return changed;
 }
 
 /// Sample the document's same-shard adjacency from the graph index named by
@@ -24844,7 +24935,9 @@ fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocato
         const logical = try runtime.index_manager.materializeStoredValueAlloc(alloc, row_key, raw);
         defer alloc.free(logical);
         try materializeGraphAssetForRuntime(context, request, value, logical, &window);
-    } else try materializeGraphAssetDeleteForRuntime(context, request, &window);
+    } else {
+        _ = try materializeGraphAssetDeleteForRuntime(context, request, &window);
+    }
     // Serialization owns all bytes before the snapshot is released. Queue
     // admission cannot itself credit replay or coverage; accepted retries use
     // the same logical-input receipt and skip mutable-state planning.
@@ -25241,15 +25334,17 @@ fn prepareGraphAssetForRuntime(
     }
 }
 
-fn materializeGraphAssetDeleteForRuntime(runtime: anytype, request: enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow) !void {
+fn materializeGraphAssetDeleteForRuntime(runtime: anytype, request: enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow) !bool {
     const before = window.artifact_promotions.items.len;
     const deletes_before = window.artifact_delete_keys.items.len;
     try prepareGraphAssetDeleteForRuntime(runtime, request, window);
+    const changed = window.artifact_promotions.items.len != before or window.artifact_delete_keys.items.len != deletes_before;
     // Publish before another source on this document arbitrates contenders.
     // Preparation releases primary/index leases before entering the writer.
     if (comptime @TypeOf(runtime) == *EnrichmentRuntime) {
-        if (window.artifact_promotions.items.len != before or window.artifact_delete_keys.items.len != deletes_before) try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
+        if (changed) try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
     }
+    return changed;
 }
 
 fn prepareGraphAssetDeleteForRuntime(
@@ -25371,7 +25466,17 @@ fn prepareGraphAssetDeleteForRuntime(
                 try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, edge_key);
             }
         }
-        try writes.append(runtime.alloc, .{
+        // In the local legacy path, an absent state already means no saved
+        // edges. Keep a never-produced source sparse. Existing state (including
+        // old generations) still needs its explicit retirement checkpoint.
+        // Ordered graph commands retain their required state/count receipts.
+        const write_empty_state = if (comptime @TypeOf(runtime) == *EnrichmentRuntime) blk: {
+            if (previous_keys != null) break :blk true;
+            const previous = try storeGetOptionalAllocWithRetry(runtime, state_key);
+            defer if (previous) |raw| runtime.alloc.free(raw);
+            break :blk previous != null;
+        } else true;
+        if (write_empty_state) try writes.append(runtime.alloc, .{
             .key = try runtime.alloc.dupe(u8, state_key),
             .value = try runtime.alloc.dupe(u8, state_value),
         });
@@ -25882,8 +25987,18 @@ fn runtimeReconcileGraphEdgeContenders(
         }
         result.visible_count = distinct_edges.count();
     }
-    const encoded_count = try graph_edge_contender.encodeVisibleCount(expected_generation, result.visible_count);
-    try result.writes.append(alloc, .{ .key = try alloc.dupe(u8, count_key), .value = try alloc.dupe(u8, &encoded_count) });
+    // Absence is already zero for local graph readers. Do not manufacture a
+    // durable zero witness for every document which has never owned an edge.
+    // Repair existing witnesses and preserve the explicit ordered-publication
+    // receipt contract, even when the resulting cardinality is zero.
+    const write_count = if (comptime @TypeOf(runtime) == *EnrichmentRuntime)
+        raw_count != null or changes.count() != 0 or result.visible_count != 0
+    else
+        true;
+    if (write_count) {
+        const encoded_count = try graph_edge_contender.encodeVisibleCount(expected_generation, result.visible_count);
+        try result.writes.append(alloc, .{ .key = try alloc.dupe(u8, count_key), .value = try alloc.dupe(u8, &encoded_count) });
+    }
 
     result.winners.deinit(alloc);
     result.winners = .{};
@@ -28333,11 +28448,12 @@ fn processChunkedDenseWindow(
 fn getOrCreatePlannedRequests(
     runtime: *EnrichmentRuntime,
     doc_key: []const u8,
-    request_plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
+    request_plan_cache: *RequestPlanCache,
 ) ![]const enrichment_types.GeneratedEnrichmentRequest {
-    for (request_plan_cache.items) |entry| {
-        if (std.mem.eql(u8, entry.doc_key, doc_key)) return entry.requests;
-    }
+    if (request_plan_cache.get(doc_key)) |requests| return requests;
+    // Reserve before acquiring owned keys/plans. Publication into the cache
+    // cannot fail after planning succeeds, including the empty/absence case.
+    try request_plan_cache.ensureUnusedCapacity(runtime.alloc, 1);
 
     const owned_doc_key = try runtime.alloc.dupe(u8, doc_key);
     errdefer runtime.alloc.free(owned_doc_key);
@@ -28352,11 +28468,8 @@ fn getOrCreatePlannedRequests(
     // planning object is never producer input: processAsset re-observes absence.
     const raw = observed orelse if (@import("../group_source_identity.zig").isAnchor(doc_key)) "{}" else {
         const empty = try runtime.alloc.alloc(enrichment_types.GeneratedEnrichmentRequest, 0);
-        try request_plan_cache.append(runtime.alloc, .{
-            .doc_key = owned_doc_key,
-            .requests = empty,
-        });
-        return request_plan_cache.items[request_plan_cache.items.len - 1].requests;
+        request_plan_cache.putAssumeCapacityNoClobber(owned_doc_key, empty);
+        return empty;
     };
 
     const explicit_dense: []const mapper.DenseEmbeddingWrite = &.{};
@@ -28368,11 +28481,8 @@ fn getOrCreatePlannedRequests(
         explicit_dense,
         explicit_sparse,
     );
-    try request_plan_cache.append(runtime.alloc, .{
-        .doc_key = owned_doc_key,
-        .requests = planned,
-    });
-    return request_plan_cache.items[request_plan_cache.items.len - 1].requests;
+    request_plan_cache.putAssumeCapacityNoClobber(owned_doc_key, planned);
+    return planned;
 }
 
 test "grouped sources production plans deleted unit descendants without source bytes" {
@@ -28412,7 +28522,7 @@ test "grouped sources production plans deleted unit descendants without source b
     defer alloc.free(anchor);
     const unit = try std.fmt.allocPrint(alloc, "{s}/p/segment/0/u/unit", .{anchor});
     defer alloc.free(unit);
-    var cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
+    var cache = RequestPlanCache{};
     defer freeRequestPlanCache(alloc, &cache);
     const planned = try getOrCreatePlannedRequests(&runtime, unit, &cache);
     try std.testing.expectEqual(@as(usize, 2), planned.len);
@@ -28421,6 +28531,19 @@ test "grouped sources production plans deleted unit descendants without source b
     try std.testing.expectEqualStrings("turns", planned[1].upstream_artifact_name);
     const ordinary = try getOrCreatePlannedRequests(&runtime, "deleted-primary", &cache);
     try std.testing.expectEqual(@as(usize, 0), ordinary.len);
+    // Grow through multiple rehashes while a caller borrows a nonempty plan.
+    // Cache hits must retain that owned plan rather than rebuilding its DAG.
+    for (0..4096) |i| {
+        var key: [64]u8 = undefined;
+        const missing = try std.fmt.bufPrint(&key, "missing-primary-{d}", .{i});
+        try std.testing.expectEqual(@as(usize, 0), (try getOrCreatePlannedRequests(&runtime, missing, &cache)).len);
+    }
+    try std.testing.expectEqual(@as(u32, 4098), cache.count());
+    const hit = try getOrCreatePlannedRequests(&runtime, unit, &cache);
+    try std.testing.expectEqual(planned.ptr, hit.ptr);
+    clearRequestPlanCache(alloc, &cache);
+    try std.testing.expectEqual(@as(u32, 0), cache.count());
+    try std.testing.expectEqual(@as(usize, 2), (try getOrCreatePlannedRequests(&runtime, unit, &cache)).len);
 }
 
 fn flushGeneratedReplayWindowIfNeeded(
@@ -28478,6 +28601,7 @@ fn flushGeneratedReplayWindowWithIdentity(
     if (!window.hasDerivedItems()) {
         try applyCoverageOutcomeTransitions(runtime, window.coverage_transitions.items);
         clearQueuedCoverageTransitions(runtime.alloc, &window.coverage_transitions, &window.coverage_transition_keys);
+        discardWindowSourceGuards(window, 0);
         try noteDurableRetryProgress(runtime, completed_failure_fingerprint);
         completeWindowPublishing(window);
         return;
@@ -28727,6 +28851,14 @@ fn freeGeneratedSourceGuards(alloc: Allocator, guards: []const GeneratedSourceGu
         if (guard.document_key) |key| alloc.free(@constCast(key));
     }
     if (guards.len > 0) alloc.free(guards);
+}
+
+fn discardWindowSourceGuards(window: *GeneratedReplayWindow, start: usize) void {
+    for (window.source_guards.items[start..]) |guard| {
+        window.alloc.free(@constCast(guard.key));
+        if (guard.document_key) |key| window.alloc.free(@constCast(key));
+    }
+    window.source_guards.shrinkRetainingCapacity(start);
 }
 
 fn appendGeneratedSourceGuard(
@@ -38019,13 +38151,13 @@ test "asset producer neighbor context samples local graph adjacency into the inp
     // requests from the admitted catalog the way the worker does. The target
     // has no local document, so it plans zero requests; the source re-runs
     // the producer and samples the two scheduled edges.
-    var request_plan_cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
+    var request_plan_cache = RequestPlanCache{};
     defer freeRequestPlanCache(alloc, &request_plan_cache);
     const runScheduled = struct {
         fn run(
             rt: *EnrichmentRuntime,
             groups: []const enrichment_worker.PendingDocumentGroup,
-            plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
+            plan_cache: *RequestPlanCache,
             sources: *PreparedDocumentSourceCache,
             win: *GeneratedReplayWindow,
         ) !void {

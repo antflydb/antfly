@@ -60,6 +60,12 @@ pub const AllocatorWork = struct {
     full_load_ns: u64 = 0,
     journal_rebases: u64 = 0,
     journal_rebase_ns: u64 = 0,
+    journal_rebase_attempts: u64 = 0,
+    journal_rebase_misses: u64 = 0,
+    journal_rebase_auth_refusals: u64 = 0,
+    journal_rebase_digest_mismatches: u64 = 0,
+    retained_rebase_bases: u64 = 0,
+    pending_base_transfers: u64 = 0,
     cache_transfers: u64 = 0,
     artifact_source_opens: u64 = 0,
     artifact_source_reuses: u64 = 0,
@@ -108,6 +114,8 @@ pub const Status = struct {
     live_bytes_estimate: ?u64 = null,
     estimated_at_sequence: ?u64 = null,
     assessment_count: u64 = 0,
+    assessment_deferrals: u64 = 0,
+    assessment_preemptions: u64 = 0,
     rewrite_count: u64 = 0,
     last_reclaimed_bytes: u64 = 0,
     last_error: ?[]const u8 = null,
@@ -124,12 +132,26 @@ pub const Policy = struct {
     assessment_activity_bytes: u64 = 0,
     retirement_bytes: u64 = 0,
     assessed_retirement_bytes: u64 = 0,
+    shrink_primary: ?[32]u8 = null,
+    shrink_primary_since_ns: i96 = 0,
+
     /// Retained by an external owner's checkpoint refresh even when its exact
     /// assessment cache is discarded. A canceled copy must not require more
     /// file growth before shrinking gets another bounded attempt.
     rewrite_retry_at_ns: ?i96 = null,
     rewrite_retry_delay_ns: i96 = 30 * std.time.ns_per_s,
 
+    /// Optional full-generation work waits for replay and a quiet primary.
+    /// Retain this scheduling state across cache refresh; it owns no page roots.
+    pub fn observeShrinkQuiet(self: *Policy, primary: [32]u8, now_ns: i96, replay_pending: bool) bool {
+        if (replay_pending or self.shrink_primary == null or !std.mem.eql(u8, &self.shrink_primary.?, &primary)) {
+            self.shrink_primary = primary;
+            self.shrink_primary_since_ns = now_ns;
+            self.status.assessment_deferrals +|= 1;
+            return false;
+        }
+        return now_ns - self.shrink_primary_since_ns >= @as(i96, self.options.retry_ms) * std.time.ns_per_ms;
+    }
     pub fn rewriteRetryDue(self: Policy, now_ns: i96) bool {
         return if (self.rewrite_retry_at_ns) |deadline| now_ns >= deadline else false;
     }
@@ -191,6 +213,22 @@ pub const Policy = struct {
         self.status.estimated_at_sequence = null;
     }
 };
+
+test "lite reclamation cooperative shrink waits for replay and quiet primary across cache refresh" {
+    var policy = try Policy.init(.{ .retry_ms = 10 });
+    const first: [32]u8 = @splat(1);
+    const second: [32]u8 = @splat(2);
+    const quantum = 10 * std.time.ns_per_ms;
+    try std.testing.expect(!policy.observeShrinkQuiet(first, 0, false));
+    try std.testing.expect(!policy.observeShrinkQuiet(first, quantum - 1, false));
+    try std.testing.expect(policy.observeShrinkQuiet(first, quantum, false));
+    try std.testing.expect(!policy.observeShrinkQuiet(first, quantum, true));
+    try std.testing.expect(!policy.observeShrinkQuiet(first, quantum + 1, false));
+    try std.testing.expect(!policy.observeShrinkQuiet(second, quantum * 2, false));
+    // A copied policy owns only scheduling state, never checkpoint/page borrows.
+    var adopted = policy;
+    try std.testing.expect(adopted.observeShrinkQuiet(second, quantum * 3, false));
+}
 
 test "lite reclamation policy uses hysteresis and saturating size arithmetic" {
     var policy = try Policy.init(.{ .assessment_bytes = 64, .minimum_reclaim_bytes = 256 });

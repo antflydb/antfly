@@ -1219,8 +1219,9 @@ pins while a batch waits.
 
 Replay prepares full-text inputs outside writer admission, then publishes each
 prepared chunk and its progress metadata in separate bounded admission groups.
-The source snapshot is released once all supported consumers own their inputs;
-consumers requiring live source access retain their snapshot. Native publication
+The source snapshot remains pinned until the replay turn returns and all journal
+cursors close; preparing the last segment does not end those cursors' borrowing
+lifetimes. Native publication
 checks exact inode, logical metadata identity, SQL decision, table mapping and
 selected catalog fingerprints before reusing prepared output. Runtime opening and
 tokenization do not run inside these publication groups. Replay sizing excludes
@@ -1228,12 +1229,81 @@ admission and publication time while continuing to charge input and compute work
 Under backlog pressure, source replay receives three turns between artifact
 service turns; retirement remains eligible on every turn.
 
+Native maintenance records runnable work per namespace. An owner wakeup does
+not make unrelated tables replay or rewrite idle status records. Each visit
+checks durable replay/projection debt and source-sequence advancement, including
+unindexed journal retirement; TTL, group commands and recovery retain their
+bounded visits. Interrupted work stays pending for its namespace. Idle lifecycle
+audits follow the next known index/WAL deadline, with a 30-second fallback audit.
+Artifact continuations have a separate pending flag and deadline. Running an LSM
+slice or retiring journal rows does not restart providers, replay or source
+status publication. Artifact-only turns retain the catalog publication fence,
+but acquire no primary source epoch; future LSM work respects its wake deadline.
+Source replay constructs a fresh runtime at its captured checkpoint rather than
+borrowing an artifact continuation's source caches. Producer replay services one
+adaptive prefix per background turn, initially eight document groups and 256 KiB,
+with ceilings of 128 groups and 4 MiB. Managed indexes consume only the completed
+producer prefix, and retain later targets for subsequent turns. Replay-capacity
+pressure yields to those downstream consumers without charging a provider retry.
+The direct replay fallback without registered workers obeys the same completed
+prefix and document-fan-out bounds as the registered manual executor.
+Explicit idle drains continue to inspect and complete all relevant work.
+
+Bounded allocator reuse, retirement and orphan service run independently of
+optional whole-generation shrinking. Automatic shrink assessments wait for the
+file-wide replay journal to empty and for a primary quiet interval. That cadence
+survives runtime refresh without retaining checkpoint roots. Assessment and copy
+work periodically probe the on-disk primary identity and named inode, yielding
+when a local or peer writer publishes. The probe grants no read/publication
+authority; retained snapshots and exact vacuum publication checks still apply.
+Explicit maintenance keeps its requested behavior. Replay therefore does not
+queue behind a whole-file assessment or retain its primary pages for the scan.
+
+Generated-enrichment preparation caches document plans by an owning hash map
+within each preparation quantum. Large windows do not linearly scan every
+previous document key for each request. Dispatch still clones borrowed requests
+into their execution lanes before clearing the cache; source/catalog changes
+retain the existing replan boundaries.
+
+Provider control-record leases borrow the captured raw store under checked
+writer admission. Generated document/result publication uses that same writer
+when its native catalog/recovery proof and namespace identity remain valid.
+The transaction rechecks source digests, document incarnations and lease tenure;
+changed index inputs fence later index publication. Shadow and external resolver
+dependencies retain the serving-runtime validation path. These groups avoid
+alternating between serving and captured writers for each output/control record.
+Before reserving an output sequence, the captured writer reconciles its separate
+DocStore sequence caches with the durable head under that same admission lease.
+Adopting physical roots alone does not update those caches. Output publication
+explicitly defers index replay instead of changing shared callback state.
+Independent local copies share a bounded output window. Provider calls,
+dependencies and existing retry debt retain publication barriers. Legacy
+missing-source cleanup carries source/output guards and commits its deletes with
+the replay notification. Never-produced legacy graph sources leave empty state
+and zero-count records absent; existing state/count repair and ordered-publication
+receipts remain explicit.
+Already absent artifacts emit no delete/change record when no full-text or graph
+effect needs publication. Their sequence-aware coverage can settle directly;
+existing output or stale projections still take the guarded retirement path.
+Producer sizing measures preparation separately from writer admission and
+publication, using the same cumulative publication-time counter as index replay.
+Contention must not force cheap preparation into ever smaller windows and
+multiply its fixed checkpoint/publication costs.
+Publication recovery witnesses admit the affected
+namespace and fence global SQL/FK decisions; unrelated unfinished DDL does not
+require a global clean-sweep witness. Quiescent allocator caches move through an
+authenticated checkpoint rebase when maintenance captures are replaced.
+
 Detached replay uses per-index-kind feedback retained by the namespace scheduling
-owner. Cheap full windows can grow up to 2,048 records and 16 MiB; slow or failed
-windows shrink, and observed blocked reuse lowers retention limits. The 25 ms
+owner. Cheap full windows can grow up to 2,048 records and 16 MiB. Collection
+also bounds expanded document/artifact keys, allowing one complete oversized
+record; it does not split ownership-completion callbacks. Slow or failed windows shrink, and observed blocked reuse lowers retention limits. The 25 ms
 quantum is a sizing target, not preemption of an individual record/provider call.
 Background and foreground retirement work remains capped per publication. Pending
-work diagnostics report replay budgets and the current retirement-work limit.
+work diagnostics report producer and consumer replay budgets and the current
+retirement-work limit. Producer sizing charges the complete producer turn,
+including output publication, so repeated expensive publications reduce the next
+discovery window. Each complete document group remains atomic.
 Explicit integrity reports split logical bytes among documents, control documents,
 metadata catalogs, and index artifacts; allocator checks independently load disk
 state rather than using a writer's transient traversal inventory. Document bytes
@@ -1414,6 +1484,128 @@ commits only when the inode and nonzero logical catalog/index identities match;
 changed inputs open a fresh runtime. Source read epochs and catalog proofs are
 released each turn. This gives replay another scheduling turn without discarding
 compaction progress or retaining primary history for an entire index drain.
+
+Idle namespace readiness is checked before opening its DB/index runtime. The
+owner compares durable replay and catalog fingerprints for the same table ID and
+root incarnation, and also honors TTL, artifact and periodic audit deadlines.
+Grouped-source control queues have an independent polling deadline: cursor and
+lease observations can make them runnable without appending a replay record.
+Matching controls are a scheduling hint only: they do not authorize admission,
+skip affected-namespace recovery, or waive any publication fence. Source writes
+(including unindexed writes) and catalog changes invalidate the hint; timed
+audits revisit control-only work without manufacturing replay on every wakeup.
+
+A native wrapper retains its original verified allocator rebase base when several
+physical headers are adopted before the ledger is needed again. Inheriting a
+proof for an intermediate header does not relabel the cached ledger. The complete
+journal suffix and the latest certificate must still authenticate before reuse;
+unknown ancestry, reused anchors or a mismatching digest retain the independent
+reload/verification path. A quiescent wrapper can donate that older checked base
+while its current tip is still unverified; the receiver gets no allocation
+authority until it authenticates the latest checkpoint. Allocator work counters
+distinguish retained and transferred pending bases,
+rebase attempts, ancestry misses, authentication refusals and digest mismatches.
+
+Transaction preparation records a separate bound for thin replay key references.
+Primary JSON/AROW values and the per-row memory-admission allowance remain in
+intent/retained-frame accounting; they are not multiplied into replay credits.
+The replay estimate covers all four key lists, every possible hint lane, and
+server-derived vector artifact keys. Replacing a prepared value for the same
+keys updates memory accounting without increasing replay reservation size.
+Resolution atomically exchanges the durable reservation for its replay records;
+abort releases it. Legacy intent/member descriptors retain conservative credits
+until replacement or resolution, including after reopening.
+
+The private replay-admission aggregate now publishes the `RAB2` writer fence
+and accepts both `RAB1` and `RAB2` on read. The physical `.aflite` format and C ABI
+are unchanged. Builds that understand only `RAB1` reject replay mutations after
+the upgrade; use one compatible library version for every writer of a file.
+New intent descriptors contain 40 bytes and member accounting contains 32 bytes;
+the new reader also accepts the prior descriptor sizes.
+
+The batch capacity retry charges the Busy timeout only for admission and
+capacity waits. Active preparation in a refused pre-commit attempt is excluded;
+otherwise a large batch can exhaust its timeout while holding the gate and fail
+before consumers receive any opportunity to free credit. A committed visibility
+failure remains a distinct nonretryable outcome. The
+`replay_refused_preparation_ns` counter reports this discarded active work.
+
+For a short local feedback loop, use an existing Debug library:
+
+```sh
+python3 scripts/bench/lite_namespace_replay.py \
+  --library zig/zig-out/lib/libantfly.dylib \
+  --idle-namespaces 0 8 45 --output .tools/namespace-replay-run
+```
+
+Each case creates synthetic indexed namespaces in a fresh directory and runs in
+its own process. The report separates fixture setup, a write burst plus quiet
+background observation, and explicit verification. The observation avoids
+database-status polling; it records latency, CPU, file growth, replay progress
+and available maintenance counters. Missing instrumentation remains absent.
+Acknowledged rows, search visibility, catch-up, integrity and reopening are
+checked after measurement. `--active-table default` also exercises the root
+namespace. `--grouped-copy` adds grouped-source fan-in and the built-in copy
+producer, so the same feedback loop also exercises enrichment and downstream
+index replay without models or private inputs. Reverse the namespace order and repeat comparisons on a quiet host;
+these short diagnostics do not establish importer or sustained-load qualification.
+The parent watchdog marks incomplete cases as failures and preserves any
+completed measurement before a stalled verification.
+
+For active-write diagnosis, add `--active-seconds 30 --progress-interval 1
+--visibility-deadline 10`. The duration is a soft bound: an in-flight call may
+finish later. The report records status-sampling overhead and follows fixed
+earlier index targets while writes continue, rather than requiring a moving
+target to become idle. Every observed index must advance, and a later quiet
+drain cannot erase a missed active deadline. The deadline is a diagnostic
+parameter, not a database visibility guarantee. `--measurement-only` explicitly
+skips drain, integrity and reopen checks and reports `verified: false` and
+`qualification: false`; omit it for verification. The fixture reuses an existing
+default full-text index instead of adding a duplicate source-text index.
+
+Committed replay writes notify a process-local, deduplicated runnable-namespace
+queue. Tickets contain table identity and incarnation, and are resolved against
+the admitted catalog before service. Notification cannot allocate or fail an
+already committed operation. Three priority selections are followed by a catalog
+audit; audits still discover foreign writes, recovery, timers and cleanup. A
+partial source turn requeues itself only after an applied replay watermark or
+durable intra-record/backfill cursor advances. Failed/provider-delayed work returns to audits rather than spinning.
+Bounded background turns use the resolver's resumable record/backfill page and
+one atomic promotion record, rather than invoking their full-drain APIs. Repair
+discovery scans keys without loading unrelated payload values. Explicit idle
+requests retain full-drain behavior. Physical storage service alternates with
+namespace service when both are pending.
+These scheduling hints grant no publication or recovery authority.
+
+The `maintenance_priority_turns`, `maintenance_audit_turns` and
+`maintenance_progress_requeues` counters distinguish source service from catalog
+rotation. Compare useful applied prefixes/publications with capture, artifact-open
+and admission counts; queue selection counts alone do not prove replay progress.
+
+Add `--resolver-backfill --active-seconds 30` to exercise a curation revision over
+a populated corpus while writes continue. The fixture warms 2,048 rows of 8 KiB
+by default (`--warm-documents` and `--warm-text-bytes` adjust it), and configures
+an extraction stream with no outputs, as with semantic extraction disabled.
+The report requires the accepted policy generation, completed corpus backfill,
+and its captured replay prefix within the visibility deadline. The intentionally
+empty extraction graph is excluded from the advancing full-text index check;
+its resolver/backfill progress is checked separately. Setup and final explicit
+draining cannot satisfy the active-write backfill deadline.
+
+`background_publications.maintenance_failures` separates capture, source replay,
+journal retirement, artifact work and storage failures. These are phase counts,
+including normal contention yielding; a cancellation count alone does not
+establish lost replay progress. Phase elapsed times also include waiting and
+must not be interpreted as CPU time.
+
+Create reusable benchmark seeds with `copy_stable_snapshot_file` (or the matching
+C snapshot operation), rather than copying only the `.aflite` bytes to a new
+pathname. The native operation binds the unpublished destination to its reader
+coordination directory and preserves a valid allocator seal. A raw copy retains
+the source binding without its authority at the destination; page reuse is then
+conservatively refused. Such a fixture measures that fallback and cannot isolate
+normal replay/reclamation performance. Record the seed hash, snapshot-library
+hash and destination snapshot report separately from measured import time.
 
 Sustained-write qualification must measure progress and storage while writers
 remain active. `scripts/bench/lite_contention.py native --require-sustained`

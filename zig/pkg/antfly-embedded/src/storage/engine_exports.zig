@@ -597,6 +597,14 @@ fn enrichmentWaitForAppliedWithVisibilityDeadline(self: *@import("db/enrichment/
     return .{ .value = self.waitForAppliedWithVisibilityDeadline(sequence, cancellation, deadline_ns) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn enrichmentCatchUpTurnWithCancellation(self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime, sequence: u64, cancellation: types.CancellationToken) engine.Outcome(void) {
+    return .{ .value = self.catchUpTurnWithCancellation(sequence, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn enrichmentCatchUpTurnWithLimits(self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime, sequence: u64, cancellation: types.CancellationToken, limits: @import("db/derived/replay_source.zig").Source.EnrichmentWindowLimits) engine.Outcome(@import("db/enrichment/enrichment_runtime.zig").ReplayTurnStats) {
+    return .{ .value = self.catchUpTurnWithLimits(sequence, cancellation, limits) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn enrichmentCatchUpUntil(self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime, sequence: u64) engine.Outcome(void) {
     return .{ .value = self.catchUpUntil(sequence) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -1984,6 +1992,10 @@ fn promotionStop(self: *@import("db/promotion_runtime.zig").PromotionRuntime) en
 
 fn promotionCatchUp(self: *@import("db/promotion_runtime.zig").PromotionRuntime) engine.Outcome(void) {
     return .{ .value = self.catchUp() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn promotionCatchUpOnce(self: *@import("db/promotion_runtime.zig").PromotionRuntime, deadline_ns: u64) engine.Outcome(void) {
+    return .{ .value = self.catchUpOnce(deadline_ns) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn pinnedSnapshotDeinit(self: *@import("db/core.zig").PinnedStoreSnapshot) engine.Outcome(void) {

@@ -524,6 +524,19 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     const capi_model_filters = [_][]const u8{"capi local model "};
     const capi_default_filters = [_][]const u8{
+        "capi native",
+        "background enrichment turn",
+        "inline resolver replacement background replay yields",
+        "db multi-source graph precedence falls back",
+        "db graph relation artifact materializer deletes",
+        "db graph source artifact deletion",
+        "db graph primary publication serializes",
+        "ordered artifact inventory accepted asset callback waits for graph publication",
+        "durable enrichment retry progress",
+        "asset preparation is lazy",
+        "stale embedding cleanup guards",
+        "grouped sources production plans deleted unit descendants",
+        "replay budget ",
         "capi lite standalone snapshots",
         "issue1015",
         "capi SQL",

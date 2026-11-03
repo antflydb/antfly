@@ -38,6 +38,7 @@ pub const FinishCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager
 
 pub const CatchUpStats = struct {
     scanned_entries: usize = 0,
+    collected_items: usize = 0,
     applied_entries: usize = 0,
     replay_scan_batches: usize = 0,
     replay_hint_filter_skips: usize = 0,
@@ -121,6 +122,10 @@ pub const CatchUpOptions = struct {
     max_records_per_window: usize = catch_up_max_records_per_window_default,
     max_chunk_bytes: u64 = catch_up_max_chunk_bytes_default,
     max_items_per_window: usize = 0,
+    /// Bound expanded work across complete journal records, without splitting
+    /// an apply callback's input-ownership boundary. One oversized record is
+    /// still admitted so the cursor can always advance.
+    max_collected_items_per_window: usize = 0,
     max_windows_per_call: usize = 0,
     release_read_snapshot_after_collect: bool = false,
     /// Cooperative publication quantum; expires only between complete chunks.
@@ -292,6 +297,12 @@ pub fn catchUpIndexFromMatchingCursor(
         if (options.max_call_bytes != 0)
             builder.max_chunk_bytes = @min(builder.max_chunk_bytes, options.max_call_bytes -| call_bytes);
         builder.max_items = options.max_items_per_window;
+        if (options.max_collected_items_per_window != 0) {
+            builder.max_items = if (builder.max_items == 0)
+                options.max_collected_items_per_window
+            else
+                @min(builder.max_items, options.max_collected_items_per_window);
+        }
         builder.estimated_dense_vector_bytes = options.estimated_dense_vector_bytes;
         builder.max_work_chunk_bytes = options.max_work_chunk_bytes;
         builder.dense_replay_working_set_factor = @max(@as(u64, 1), options.dense_replay_working_set_factor);
@@ -356,6 +367,7 @@ pub fn catchUpIndexFromMatchingCursor(
         }
 
         const collected_bytes = builder.tracked_bytes;
+        stats.collected_items += builder.item_count;
         const batch = try builder.finishBorrowed(chunk_stats.last_sequence);
         if (options.release_read_snapshot_after_collect) {
             std.debug.assert(options.max_windows_per_call == 1);

@@ -60,6 +60,7 @@ const IntentAdmission = struct {
     bytes: u64 = 0,
     retained_bytes: u64 = 0,
     retained_keys: u64 = 0,
+    replay_bytes: u64 = 0,
     retention_tracked: bool = true,
 
     fn reservation(self: @This()) u64 {
@@ -68,7 +69,7 @@ const IntentAdmission = struct {
         return self.retained_bytes +| 48;
     }
 };
-const IntentCost = struct { bytes: u64, retained: u64, retained_keys: u64 = 0 };
+const IntentCost = struct { bytes: u64, retained: u64, retained_keys: u64 = 0, replay_bytes: u64 = 0 };
 // Read dependencies that are not also writes need durable shared guards.
 // A predicate check alone is not a prepare vote: another transaction could
 // delete its parent row after the check but before the coordinator commits.
@@ -116,6 +117,9 @@ pub const WriteIntent = struct {
     /// catalog; public caller estimates are never used as admission authority.
     retained_artifact_bytes: u64 = 0,
     retained_artifact_keys: u64 = 0,
+    /// Server-authored encoded artifact-key references, independent of vector
+    /// values and retained-frame storage. Native preparation overwrites this.
+    replay_artifact_key_bytes: u64 = 0,
 };
 
 pub const IntentValue = struct {
@@ -149,6 +153,16 @@ pub fn intentAdmissionBytes(intent: WriteIntent) !u64 {
     const bytes = payload;
     const keys = std.math.mul(u64, intent.key.len, 16) catch return error.TransactionTooLarge;
     return std.math.add(u64, bytes, std.math.add(u64, keys, 4096) catch return error.TransactionTooLarge) catch error.TransactionTooLarge;
+}
+
+/// The thin journal has four key-reference lists and contains no document
+/// values. Cover a key in every list, plus authoritative artifact references;
+/// Native adds the per-record/namespace overhead and possible hint lanes.
+fn replayIntentBytes(intent: WriteIntent) !u64 {
+    const source = std.math.add(u64, intent.key.len, 4) catch return error.TransactionTooLarge;
+    const artifacts = if (intent.replay_artifact_key_bytes != 0) intent.replay_artifact_key_bytes else intent.retained_artifact_bytes;
+    const refs = std.math.add(u64, source, artifacts) catch return error.TransactionTooLarge;
+    return std.math.mul(u64, refs, 4) catch error.TransactionTooLarge;
 }
 
 /// REF3 contains final primary effects/timestamps and integrity records, not
@@ -785,18 +799,21 @@ pub const TxnManager = struct {
                 admission.bytes = std.math.add(u64, admission.bytes, cost) catch return error.TransactionTooLarge;
                 admission.retained_bytes = std.math.add(u64, admission.retained_bytes, retained) catch return error.TransactionTooLarge;
                 admission.retained_keys += @intFromBool(retained != 0);
-                try pending_costs.put(self.alloc, key, .{ .bytes = cost, .retained = retained, .retained_keys = @intFromBool(retained != 0) });
+                admission.replay_bytes = std.math.add(u64, admission.replay_bytes, cost) catch return error.TransactionTooLarge;
+                try pending_costs.put(self.alloc, key, .{ .bytes = cost, .retained = retained, .retained_keys = @intFromBool(retained != 0), .replay_bytes = cost });
                 const member_key = try makeIntentMemberKey(self.alloc, txn_id, key);
                 try appendOwnedBytes(self.alloc, &write_keys, member_key);
-                const member_value = try self.alloc.alloc(u8, 16);
+                const member_value = try self.alloc.alloc(u8, 32);
                 try appendOwnedBytes(self.alloc, &write_vals, member_value);
                 std.mem.writeInt(u64, member_value[0..8], cost, .little);
                 std.mem.writeInt(u64, member_value[8..16], retained, .little);
+                std.mem.writeInt(u64, member_value[16..24], @intFromBool(retained != 0), .little);
+                std.mem.writeInt(u64, member_value[24..32], cost, .little);
                 try writes.append(self.alloc, .{ .key = member_key, .value = member_value });
             }
             // Hash-map keys must outlive the snapshot.
             pending_costs.clearRetainingCapacity();
-            for (writes.items) |write| try pending_costs.put(self.alloc, write.key[intent_members_prefix.len + 17 ..], .{ .bytes = std.mem.readInt(u64, write.value[0..8], .little), .retained = std.mem.readInt(u64, write.value[8..16], .little), .retained_keys = @intFromBool(std.mem.readInt(u64, write.value[8..16], .little) != 0) });
+            for (writes.items) |write| try pending_costs.put(self.alloc, write.key[intent_members_prefix.len + 17 ..], .{ .bytes = std.mem.readInt(u64, write.value[0..8], .little), .retained = std.mem.readInt(u64, write.value[8..16], .little), .retained_keys = std.mem.readInt(u64, write.value[16..24], .little), .replay_bytes = std.mem.readInt(u64, write.value[24..32], .little) });
         }
 
         // Compute the final replacement-aware ledger before allocating any
@@ -810,23 +827,26 @@ pub const TxnManager = struct {
                     else => return err,
                 };
                 defer self.alloc.free(raw);
-                if (raw.len != 16 and raw.len != 24) return error.InvalidTxnRecord;
-                break :blk IntentCost{ .bytes = std.mem.readInt(u64, raw[0..8], .little), .retained = std.mem.readInt(u64, raw[8..16], .little), .retained_keys = if (raw.len == 24) std.mem.readInt(u64, raw[16..24], .little) else @intFromBool(std.mem.readInt(u64, raw[8..16], .little) != 0) };
+                if (raw.len != 16 and raw.len != 24 and raw.len != 32) return error.InvalidTxnRecord;
+                break :blk IntentCost{ .bytes = std.mem.readInt(u64, raw[0..8], .little), .retained = std.mem.readInt(u64, raw[8..16], .little), .retained_keys = if (raw.len >= 24) std.mem.readInt(u64, raw[16..24], .little) else @intFromBool(std.mem.readInt(u64, raw[8..16], .little) != 0), .replay_bytes = if (raw.len == 32) std.mem.readInt(u64, raw[24..32], .little) else std.mem.readInt(u64, raw[0..8], .little) };
             };
             const cost = try intentAdmissionBytes(intent);
             const retained = try retainedIntentBytes(self.alloc, intent);
             const retained_keys = try retainedIntentKeys(intent, retained);
+            const replay_bytes = try replayIntentBytes(intent);
             if (prior) |old| {
                 admission.bytes = std.math.sub(u64, admission.bytes, old.bytes) catch return error.InvalidTxnRecord;
                 admission.retained_bytes = std.math.sub(u64, admission.retained_bytes, old.retained) catch return error.InvalidTxnRecord;
                 admission.retained_keys = std.math.sub(u64, admission.retained_keys, old.retained_keys) catch return error.InvalidTxnRecord;
+                admission.replay_bytes = std.math.sub(u64, admission.replay_bytes, old.replay_bytes) catch return error.InvalidTxnRecord;
             } else {
                 admission.count = std.math.add(u64, admission.count, 1) catch return error.TransactionTooLarge;
             }
             admission.bytes = std.math.add(u64, admission.bytes, cost) catch return error.TransactionTooLarge;
             admission.retained_bytes = std.math.add(u64, admission.retained_bytes, retained) catch return error.TransactionTooLarge;
             admission.retained_keys = std.math.add(u64, admission.retained_keys, retained_keys) catch return error.TransactionTooLarge;
-            try pending_costs.put(self.alloc, intent.key, .{ .bytes = cost, .retained = retained, .retained_keys = retained_keys });
+            admission.replay_bytes = std.math.add(u64, admission.replay_bytes, replay_bytes) catch return error.TransactionTooLarge;
+            try pending_costs.put(self.alloc, intent.key, .{ .bytes = cost, .retained = retained, .retained_keys = retained_keys, .replay_bytes = replay_bytes });
             try last_intents.put(self.alloc, intent.key, index);
         }
         var range_reservations = std.ArrayListUnmanaged(VersionPredicate).empty;
@@ -867,10 +887,11 @@ pub const TxnManager = struct {
             if (last_intents.get(intent.key).? != index) continue;
             const member_key = try makeIntentMemberKey(self.alloc, txn_id, intent.key);
             try appendOwnedBytes(self.alloc, &write_keys, member_key);
-            const member_value = try self.alloc.alloc(u8, 24);
+            const member_value = try self.alloc.alloc(u8, 32);
             std.mem.writeInt(u64, member_value[0..8], pending_costs.get(intent.key).?.bytes, .little);
             std.mem.writeInt(u64, member_value[8..16], pending_costs.get(intent.key).?.retained, .little);
             std.mem.writeInt(u64, member_value[16..24], pending_costs.get(intent.key).?.retained_keys, .little);
+            std.mem.writeInt(u64, member_value[24..32], pending_costs.get(intent.key).?.replay_bytes, .little);
             try appendOwnedBytes(self.alloc, &write_vals, member_value);
             try writes.append(self.alloc, .{ .key = member_key, .value = member_value });
             const intent_key = try self.makeIntentKey(txn_id, intent.key);
@@ -916,11 +937,12 @@ pub const TxnManager = struct {
         try writes.append(self.alloc, .{ .key = &record_key, .value = record_value });
 
         const intent_keys_key = makeSidecarKey(intent_admission_prefix, txn_id);
-        const intent_keys_value = try self.alloc.alloc(u8, 32);
+        const intent_keys_value = try self.alloc.alloc(u8, 40);
         std.mem.writeInt(u64, intent_keys_value[0..8], admission.count, .little);
         std.mem.writeInt(u64, intent_keys_value[8..16], admission.bytes, .little);
         std.mem.writeInt(u64, intent_keys_value[16..24], admission.retained_bytes, .little);
         std.mem.writeInt(u64, intent_keys_value[24..32], admission.retained_keys, .little);
+        std.mem.writeInt(u64, intent_keys_value[32..40], admission.replay_bytes, .little);
         try appendOwnedBytes(self.alloc, &write_vals, intent_keys_value);
         try writes.append(self.alloc, .{ .key = &intent_keys_key, .value = intent_keys_value });
         if (extra_batch.schema_binding != null)
@@ -2416,8 +2438,8 @@ pub const TxnManager = struct {
             else => return err,
         };
         defer alloc.free(raw);
-        if (raw.len != 16 and raw.len != 32) return error.InvalidTxnRecord;
-        return .{ .count = std.mem.readInt(u64, raw[0..8], .little), .bytes = std.mem.readInt(u64, raw[8..16], .little), .retained_bytes = if (raw.len == 32) std.mem.readInt(u64, raw[16..24], .little) else 0, .retained_keys = if (raw.len == 32) std.mem.readInt(u64, raw[24..32], .little) else 0, .retention_tracked = raw.len == 32 };
+        if (raw.len != 16 and raw.len != 32 and raw.len != 40) return error.InvalidTxnRecord;
+        return .{ .count = std.mem.readInt(u64, raw[0..8], .little), .bytes = std.mem.readInt(u64, raw[8..16], .little), .retained_bytes = if (raw.len >= 32) std.mem.readInt(u64, raw[16..24], .little) else 0, .retained_keys = if (raw.len >= 32) std.mem.readInt(u64, raw[24..32], .little) else 0, .replay_bytes = std.mem.readInt(u64, if (raw.len == 40) raw[32..40] else raw[8..16], .little), .retention_tracked = raw.len >= 32 };
     }
 
     fn makeIntentMemberKey(alloc: Allocator, txn_id: TxnId, key: []const u8) ![]u8 {
@@ -3436,7 +3458,7 @@ test "transaction cumulative admission is atomic and membership metadata is incr
     const header_key = makeSidecarKey(intent_admission_prefix, txn);
     const header = try mgr.getAlloc(alloc, &header_key);
     defer alloc.free(header);
-    try std.testing.expectEqual(@as(usize, 32), header.len);
+    try std.testing.expectEqual(@as(usize, 40), header.len);
     try mgr.resolveIntents(txn, .aborted, 200);
     try std.testing.expectEqual(@as(?IntentAdmission, null), try mgr.loadIntentAdmission(alloc, txn));
     const member_key = try TxnManager.makeIntentMemberKey(alloc, txn, "a");
@@ -5026,4 +5048,63 @@ test "transaction participant batch releases migration allocations on every fail
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "transaction replay key bounds exclude values and retain artifact references" {
+    const a = std.testing.allocator;
+    const large = try a.alloc(u8, 4 * 1024 * 1024);
+    defer a.free(large);
+    @memset(large, 'v');
+    const small: WriteIntent = .{ .key = "same-key", .value = "{}" };
+    const big: WriteIntent = .{ .key = "same-key", .value = large };
+    try std.testing.expectEqual(try replayIntentBytes(small), try replayIntentBytes(big));
+    try std.testing.expect(try intentAdmissionBytes(big) > 4 * 1024 * 1024);
+    var vectors = big;
+    vectors.retained_artifact_bytes = 8 * 1024 * 1024;
+    vectors.retained_artifact_keys = 2;
+    vectors.replay_artifact_key_bytes = 200;
+    try std.testing.expectEqual((try replayIntentBytes(big)) + 800, try replayIntentBytes(vectors));
+    // Low-level callers predating the key-only estimate stay conservative.
+    vectors.replay_artifact_key_bytes = 0;
+    try std.testing.expect(try replayIntentBytes(vectors) >= vectors.retained_artifact_bytes);
+}
+
+test "transaction replay key bounds persist across replacement reopen and abort" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-replay-key-bound");
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    const id: TxnId = @splat(0x73);
+    const large = try a.alloc(u8, 4 * 1024 * 1024);
+    defer a.free(large);
+    @memset(large, 'v');
+    const expected = try replayIntentBytes(.{ .key = "row", .value = large });
+    {
+        var backend = try lsm_backend.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try manager.initTransaction(id, 1);
+        try manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+        try manager.writeIntents(id, &.{.{ .key = "row", .value = large }}, &.{});
+        const state = (try manager.loadIntentAdmission(a, id)).?;
+        try std.testing.expectEqual(@as(u64, 1), state.count);
+        try std.testing.expectEqual(expected, state.replay_bytes);
+        try std.testing.expect(state.bytes > large.len);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try std.testing.expectEqual(expected, (try manager.loadIntentAdmission(a, id)).?.replay_bytes);
+        try manager.writeIntents(id, &.{.{ .key = "row", .value = null }}, &.{});
+        try std.testing.expectEqual(expected, (try manager.loadIntentAdmission(a, id)).?.replay_bytes);
+        try manager.resolveIntents(id, .aborted, 2);
+        try std.testing.expect((try manager.loadIntentAdmission(a, id)) == null);
+    }
 }

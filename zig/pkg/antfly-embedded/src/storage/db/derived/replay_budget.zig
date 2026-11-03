@@ -26,6 +26,14 @@ pub const Snapshot = struct {
     retention_pressure: bool = false,
     target_quantum_ns: u64 = 25 * std.time.ns_per_ms,
 };
+pub const ProducerSnapshot = struct {
+    max_document_groups: usize = 8,
+    max_input_bytes: u64 = 256 * 1024,
+    observations: u64 = 0,
+    overruns: u64 = 0,
+    retention_pressure: bool = false,
+    target_quantum_ns: u64 = 25 * std.time.ns_per_ms,
+};
 pub const Controller = struct {
     mutex: std.atomic.Mutex = .unlocked,
     lanes: [5]Budget = @splat(.{}),
@@ -33,6 +41,8 @@ pub const Controller = struct {
     blocked_appends: u64 = 0,
     observations: u64 = 0,
     overruns: u64 = 0,
+    max_records: usize = 2048,
+    max_bytes: u64 = 16 * 1024 * 1024,
     pub const quantum_ns = 25 * std.time.ns_per_ms;
     fn lock(self: *Controller) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -53,6 +63,10 @@ pub const Controller = struct {
         }
         return result;
     }
+    pub fn producerSnapshot(self: *Controller) ProducerSnapshot {
+        const current = self.snapshot();
+        return .{ .max_document_groups = current.records[0], .max_input_bytes = current.bytes[0], .observations = current.observations, .overruns = current.overruns, .retention_pressure = current.retention_pressure, .target_quantum_ns = current.target_quantum_ns };
+    }
     pub fn budget(self: *Controller, lane: usize) Budget {
         self.lock();
         defer self.mutex.unlock();
@@ -71,7 +85,7 @@ pub const Controller = struct {
             self.overruns +|= @intFromBool(!failed);
             self.lanes[lane] = .{ .records = @max(8, used.records / 2), .bytes = @max(128 * 1024, used.bytes / 2) };
         } else if (!self.pressure and elapsed_ns < quantum_ns / 2 and scanned >= used.records) {
-            self.lanes[lane] = .{ .records = @min(2048, used.records * 2), .bytes = @min(16 * 1024 * 1024, used.bytes * 2) };
+            self.lanes[lane] = .{ .records = @min(self.max_records, used.records * 2), .bytes = @min(self.max_bytes, used.bytes * 2) };
         }
     }
 };
@@ -107,4 +121,17 @@ test "replay budget bounds memory and retains a minimum under pressure and failu
     try std.testing.expectEqual(@as(u64, 128 * 1024), state.budget(0).bytes);
     state.updatePressure(0, 1000, 1);
     try std.testing.expect(!state.pressure);
+}
+
+test "replay budget respects a producer specific discovery ceiling" {
+    var producer: Controller = .{ .lanes = @splat(.{ .records = 8, .bytes = 256 * 1024 }), .max_records = 128, .max_bytes = 4 * 1024 * 1024 };
+    for (0..20) |_| {
+        const used = producer.budget(0);
+        producer.observe(0, used, 1, used.records, false);
+    }
+    try std.testing.expectEqual(@as(usize, 128), producer.budget(0).records);
+    try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024), producer.budget(0).bytes);
+    const full = producer.budget(0);
+    producer.observe(0, full, Controller.quantum_ns + 1, full.records, false);
+    try std.testing.expectEqual(@as(usize, 64), producer.budget(0).records);
 }

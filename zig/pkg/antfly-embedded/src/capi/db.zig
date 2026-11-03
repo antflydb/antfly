@@ -2885,6 +2885,11 @@ pub fn openLiteHandleAllocWithSharedInference(
         backend.native_docstore.?.maintenance_start_suppressed = true;
     }
 
+    // Initial replay metadata writes can create the cached read generation.
+    // Its reader coordinator must be installed before that first transaction.
+    backend.native_docstore.?.artifact_reader_fence = resolved.artifact_reader_fence;
+    backend.native_docstore.?.file.reader_coordinator = resolved.reader_coordinator;
+
     if (create and resolved.profile == .native and backend.native_docstore.?.file.header.indexed_revision >= 8 and backend.native_docstore.?.file.header.indexed_reclamation) {
         // A new file starts with known zero debt. Legacy files bootstrap once
         // on their first replay mutation; normal commits never scan the file.
@@ -2894,9 +2899,6 @@ pub fn openLiteHandleAllocWithSharedInference(
         try initial.put(lite_backend.native.replay_admission.key, &empty_replay.encode());
         try initial.commit();
     }
-
-    backend.native_docstore.?.artifact_reader_fence = resolved.artifact_reader_fence;
-    backend.native_docstore.?.file.reader_coordinator = resolved.reader_coordinator;
 
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,
@@ -4734,12 +4736,12 @@ fn waitForReplayCapacity(ptr: ?*anyopaque, path: []const u8, hint: lite_backend.
 /// Retry only native replay capacity refusals known to precede primary
 /// commit. Registry/runtime/path access is released during sleep. Request data
 /// is caller-owned or allocated independently of a refreshed runtime.
-fn executeBatchWithReplayAdmissionRetry(ptr: ?*anyopaque, request: *anyopaque, apply: *const fn (*anyopaque, *Handle) anyerror!void) capi.ErrorCode {
+pub fn executeBatchWithReplayAdmissionRetry(ptr: ?*anyopaque, request: *anyopaque, apply: *const fn (*anyopaque, *Handle) anyerror!void) capi.ErrorCode {
     const alloc = std.heap.c_allocator;
     var entry = HandleEntry.capture(ptr) orelse return capi.mapError(error.InvalidArgument);
     const timeout_ms = if (entry.lock_handle.lite_connection) |connection| connection.options.busy_timeout_ms else 0;
     const io = handleLockIo();
-    const deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    var deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
     var backoff: i96 = std.time.ns_per_ms;
     var wait_path: ?[]u8 = null;
     defer if (wait_path) |path| alloc.free(path);
@@ -4748,10 +4750,21 @@ fn executeBatchWithReplayAdmissionRetry(ptr: ?*anyopaque, request: *anyopaque, a
         var held = true;
         defer if (held) guard.leave();
         if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+        const body_started = std.Io.Clock.awake.now(io).nanoseconds;
         apply(request, guard.handle) catch |err| {
             if (err == error.CommitVisibilityNotSatisfied)
                 return capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch");
             if (err != error.LiteReplayBacklogExceeded or timeout_ms == 0) return capi.mapError(err);
+            // Busy timeout bounds admission/capacity waits, not active batch
+            // preparation. A late, pre-commit quota refusal must still give
+            // consumers their remaining wait budget after releasing the gate.
+            // Committed visibility failures above never retry the mutation.
+            const body_ns = @max(0, std.Io.Clock.awake.now(io).nanoseconds - body_started);
+            deadline += body_ns;
+            if (guard.connection) |connection| {
+                const stats = &connection.owner.publication_stats;
+                stats.replay_refused_preparation_ns +|= @intCast(body_ns);
+            }
             const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
             if (remaining <= 0) return capi.mapError(err);
             var hint: ?lite_backend.native.replay_admission.WaitHint = null;
@@ -8009,18 +8022,126 @@ fn curationObservationCut(root: *Handle, fallback: *db_mod.DB, a: std.mem.Alloca
 }
 /// Capture before releasing mutation admission. These are private, immutable
 /// wait requirements; public response bytes never carry runtime ownership.
+const CurationSourceCapture = struct {
+    source_id: u64,
+    resolvers: std.StringHashMapUnmanaged(ResolverObservation) = .empty,
+};
+
+/// Native authority commands can publish without loading their consumers' DBs.
+/// Read just the selected namespace's durable identity/catalog: constructing an
+/// index/provider runtime here would put that work back under writer admission.
+fn captureNativeCurationSource(root: *Handle, a: std.mem.Allocator, name: []const u8) !?CurationSourceCapture {
+    const backend = if (root.owned_lite_backend) |*value| value else return null;
+    const store = backend.native_docstore orelse return null;
+    const id = if (std.mem.eql(u8, name, "default")) root.db.core.identity_namespace.table_id else root.embedded_table_records.get(name) orelse return null;
+    const namespace = if (std.mem.eql(u8, name, "default")) "root" else try @import("../storage/lite/embedded_catalog.zig").namespaceAlloc(a, id);
+    const prefix = if (std.mem.eql(u8, name, "default")) "" else try backend.documentPrefixAlloc(a, namespace);
+    var read = try @import("../storage/lite/docstore.zig").Txn.openReadWithPrefix(store, prefix);
+    defer read.abort();
+    const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
+    _ = try catalog.readMinimumReaderVersion(&read, catalog.supported_reader_version);
+    const raw = read.get(@import("../storage/lite/resolver_consumers.zig").catalog_key) catch |err| switch (err) {
+        error.NotFound => return .{ .source_id = id },
+        else => return err,
+    };
+    const configs = try catalog.deserializeCatalog(a, raw);
+    const merges = read.get(catalog.merge_catalog_key) catch |err| switch (err) {
+        error.NotFound => "[]",
+        else => return err,
+    };
+    try catalog.applyMergeState(a, configs, merges);
+    var result: CurationSourceCapture = .{ .source_id = id };
+    for (configs) |cfg| {
+        if (cfg.replacement_index.len != 0) continue;
+        if (cfg.retired and result.resolvers.contains(cfg.name)) continue;
+        const observation = try ResolverObservation.fromConfig(a, cfg);
+        try result.resolvers.put(a, observation.name, observation);
+    }
+    return result;
+}
+
+fn captureNativeCurationAuthority(root: *Handle, a: std.mem.Allocator, cfg: ResolverObservation) !?u64 {
+    const backend = if (root.owned_lite_backend) |*value| value else return null;
+    if (backend.native_docstore == null) return null;
+    const id = if (std.mem.eql(u8, cfg.table, "default")) root.db.core.identity_namespace.table_id else root.embedded_table_records.get(cfg.table) orelse return null;
+    const namespace = if (std.mem.eql(u8, cfg.table, "default")) "root" else try @import("../storage/lite/embedded_catalog.zig").namespaceAlloc(a, id);
+    const runtime = if (std.mem.eql(u8, cfg.table, "default")) backend.native_runtime_store.? else try backend.runtimeStoreForNamespace(namespace);
+    var facade = try @import("../storage/docstore.zig").DocStore.openRuntime(a, runtime);
+    defer facade.close();
+    var read = try facade.beginReadTxn();
+    defer read.abort();
+    const authority = @import("../storage/db/resolver_authority.zig");
+    var bridge: authority.Transaction(@import("../storage/docstore.zig").DocStore.Txn) = .{ .txn = &read };
+    return if (try bridge.store(a, authority.lite_prefix).ownsKeyTemplate(cfg.key_template)) id else null;
+}
+
 fn captureCurationWait(handle: *Handle, a: std.mem.Allocator, timeout: u64, out: *capi.Buffer) ![]const ?CurationWaitTarget {
     if (timeout == 0) return &.{};
     var result = try std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{});
     const root = handle.parent_handle orelse handle;
+    try @import("tables.zig").loadCatalog(root);
     const observed = try curationObservationCut(root, handle.database(), a, curationRows(&result), false);
     const targets = try a.alloc(?CurationWaitTarget, observed.len);
     @memset(targets, null);
     for (observed, targets) |value, *target| if (value) |current| {
         target.* = .{ .source_id = current.db.core.identity_namespace.table_id, .cfg = current.cfg, .authority_id = current.authority_id };
     };
+    // A synthetic/native authority route need not load source runtimes. Null
+    // targets would otherwise survive every later poll and force a timeout.
+    // Cache each catalog once, independent of the number of consumer rows.
+    var sources: std.StringHashMapUnmanaged(?CurationSourceCapture) = .empty;
+    var authorities: std.StringHashMapUnmanaged(?u64) = .empty;
+    for (curationRows(&result), targets) |row, *target| {
+        if (target.* != null or row != .object) continue;
+        const source = row.object.get("source_table") orelse continue;
+        const resolver = row.object.get("resolver") orelse continue;
+        if (source != .string or resolver != .string) continue;
+        const entry = try sources.getOrPut(a, source.string);
+        if (!entry.found_existing) entry.value_ptr.* = try captureNativeCurationSource(root, a, source.string);
+        const captured = entry.value_ptr.* orelse continue;
+        const cfg = captured.resolvers.get(resolver.string) orelse continue;
+        const scope = try std.json.Stringify.valueAlloc(a, .{ cfg.table, cfg.key_template }, .{});
+        const authority = try authorities.getOrPut(a, scope);
+        if (!authority.found_existing) authority.value_ptr.* = try captureNativeCurationAuthority(root, a, cfg);
+        target.* = .{ .source_id = captured.source_id, .cfg = cfg, .authority_id = authority.value_ptr.* };
+    }
     return targets;
 }
+
+test "capi resolver curation captures unloaded native namespaces without opening index runtimes" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("curation-cold-wait-capture");
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{directory.path()});
+    defer a.free(path);
+    const root = try openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const id = try publishHandle(root);
+    defer antfly_db_close(id);
+    const tables = @import("tables.zig");
+    try tables.create(root, "entities", "{}", false);
+    try tables.create(root, "notes", "{}", false);
+    const notes = try tables.get(root, "notes");
+    try notes.addResolver(.{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .promote = false });
+    var out: capi.Buffer = .{};
+    defer antfly_buffer_free(&out);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_entity_merge_json(id, .fromSlice("entities"), .fromSlice("concept/a"), .fromSlice("{\"into\":\"concept/b\"}"), &out));
+    const source_id = root.embedded_table_records.get("notes").?;
+    const authority_id = root.embedded_table_records.get("entities").?;
+    tables.closeAll(root);
+    root.embedded_tables = .empty;
+    const before = root.owned_lite_backend.?.native_docstore.?.file.allocator_work.artifact_source_opens;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const targets = try captureCurationWait(root, arena.allocator(), 1000, &out);
+    try std.testing.expectEqual(@as(usize, 1), targets.len);
+    const target = targets[0] orelse return error.TestExpectedCapturedNamespace;
+    try std.testing.expectEqual(source_id, target.source_id);
+    try std.testing.expectEqual(@as(?u64, authority_id), target.authority_id);
+    try std.testing.expectEqualStrings("concepts", target.cfg.name);
+    try std.testing.expectEqual(@as(usize, 0), root.embedded_tables.count());
+    try std.testing.expectEqual(before, root.owned_lite_backend.?.native_docstore.?.file.allocator_work.artifact_source_opens);
+}
+
 fn curationScopeMatches(target: CurationWaitTarget, observed: CurationObserved) bool {
     const cfg = observed.cfg;
     if (target.source_id != observed.db.core.identity_namespace.table_id or !std.mem.eql(u8, target.cfg.table, cfg.table) or !std.mem.eql(u8, target.cfg.key_template, cfg.key_template) or target.cfg.namespace_generation != cfg.namespace_generation or cfg.config_generation < target.cfg.config_generation) return false;

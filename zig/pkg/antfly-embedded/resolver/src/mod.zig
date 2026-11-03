@@ -1397,6 +1397,15 @@ pub const ArtifactStore = struct {
             ctx: *anyopaque,
             consume: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
         ) anyerror!void = null,
+        /// Optional key-only range scan. Discovery must not materialize
+        /// unrelated document/artifact payloads just to inspect their keys.
+        scan_keys: ?*const fn (
+            ptr: *anyopaque,
+            lower: []const u8,
+            upper: []const u8,
+            ctx: *anyopaque,
+            consume: *const fn (*anyopaque, []const u8) anyerror!void,
+        ) anyerror!void = null,
         /// Optional physical-row decoder supplied by the storage integration.
         /// Keeping this at the seam lets candidate scans pin the row's exact
         /// immutable schema epoch without teaching the resolver about formats.
@@ -1427,6 +1436,27 @@ pub const ArtifactStore = struct {
         const f = self.vtable.scan_prefix orelse return error.ScanUnsupported;
         return f(self.ptr, lower, upper, ctx, consume);
     }
+    pub fn scanKeys(
+        self: ArtifactStore,
+        lower: []const u8,
+        upper: []const u8,
+        ctx: *anyopaque,
+        consume: *const fn (*anyopaque, []const u8) anyerror!void,
+    ) anyerror!void {
+        if (self.vtable.scan_keys) |scan| return scan(self.ptr, lower, upper, ctx, consume);
+        // Older/non-native adapters retain their established scan semantics.
+        const Forward = struct {
+            ctx: *anyopaque,
+            consume: *const fn (*anyopaque, []const u8) anyerror!void,
+            fn visit(ptr: *anyopaque, key: []const u8, _: []const u8) anyerror!void {
+                const forward: *@This() = @ptrCast(@alignCast(ptr));
+                return forward.consume(forward.ctx, key);
+            }
+        };
+        var forward = Forward{ .ctx = ctx, .consume = consume };
+        return self.scanPrefix(lower, upper, &forward, Forward.visit);
+    }
+
     pub fn materializeRow(
         self: ArtifactStore,
         allocator: std.mem.Allocator,

@@ -3573,8 +3573,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         // prepared chunk under one exact catalog/input fence.
                         const native_publication = ctx.replay_index_publication;
                         if (native_publication) |port| {
-                            if (write_end == collected.docs.items.len and !publication_context.chunk_backed and !ctx.relational_base_rows)
-                                if (port.inputs_complete) |release| release(port.ptr);
                             try port.enter(port.ptr);
                         }
                         defer if (native_publication) |port| port.leave(port.ptr);

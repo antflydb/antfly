@@ -180,9 +180,10 @@ class OpenOptions:
     semantics only for Storage.LITE, so creating directory storage surfaces
     the library's own error rather than being special-cased here.
 
-    busy_timeout, like sqlite3_busy_timeout, retries Lite admission while
-    another process holds the writer lease or advances the allocator checkpoint.
-    Mutation bodies are never replayed by this admission retry. None
+    busy_timeout, like sqlite3_busy_timeout, bounds waits for Lite writer
+    admission and replay capacity. Active batch preparation is excluded from
+    the capacity-wait budget. Refusals before primary commit may retry;
+    committed mutations are never replayed. None
     or zero fails immediately with BusyError. Accepts a number of seconds
     (float/int) or a datetime.timedelta; the C ABI takes whole milliseconds,
     rounded up.

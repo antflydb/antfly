@@ -465,6 +465,15 @@ pub const ReplayRetirement = struct {
 };
 
 pub const DocStore = struct {
+    pub const ReplayMutationObserver = struct {
+        ptr: *anyopaque,
+        table_id: u64,
+        incarnation: u128,
+        notify: *const fn (*anyopaque, u64, u128) void,
+    };
+    /// Installed before exposing an owner-bound writer. Notification is only a
+    /// scheduling hint; it cannot allocate or fail an already committed write.
+    replay_mutation_observer: ?ReplayMutationObserver = null,
     payload_store: ?artifact_payload.Store = null,
     payload_capture_inline: bool = false,
     payload_migration_allowance: ?u64 = null,
@@ -2684,6 +2693,8 @@ pub const DocStore = struct {
     }
 
     fn observeCommittedReplaySequence(self: *DocStore, sequence: u64) void {
+        defer if (self.replay_mutation_observer) |observer|
+            observer.notify(observer.ptr, observer.table_id, observer.incarnation);
         const desired_next = sequence + 1;
         while (true) {
             const current = self.committed_replay_next_cached.load(.acquire);

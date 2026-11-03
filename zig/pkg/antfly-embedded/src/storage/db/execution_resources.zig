@@ -177,7 +177,6 @@ pub const ReplayPublication = struct {
 /// Only bounded metadata publication belongs inside this admission. Index
 /// preparation, provider callbacks and physical checkpoint construction do not.
 pub const ReplayMetadataPublication = struct {
-    inputs_complete: ?*const fn (*anyopaque) void = null,
     ptr: *anyopaque,
     enter: *const fn (*anyopaque) anyerror!void,
     leave: *const fn (*anyopaque) void,

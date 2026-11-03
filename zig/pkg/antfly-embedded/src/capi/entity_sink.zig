@@ -589,6 +589,18 @@ fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const c
 /// new replay work; a recursive taxonomy that does not converge fails boundedly.
 pub fn runUntilIdle(handle: *h.Handle) !void {
     const root = handle.parent_handle orelse handle;
+    // An explicit drain is a consumer too. Keep its generated/resolver
+    // publications in the same progress reserve as detached maintenance;
+    // ordinary producers remain fenced by the entry point's admission lease.
+    const native_file: ?*h.lite_backend.native.NativeFile = if (root.owned_lite_backend) |*backend|
+        if (backend.native_docstore) |store| &store.file else null
+    else
+        null;
+    const prior_consumer = if (native_file) |file| file.replay_consumer_admission else false;
+    if (native_file) |file| file.replay_consumer_admission = true;
+    defer if (native_file) |file| {
+        file.replay_consumer_admission = prior_consumer;
+    };
     if (root.embedded_path == null) return drainDatabase(root, handle.database());
     try tables.loadAvailable(root);
     for (0..1024) |_| {
@@ -2869,7 +2881,8 @@ test "capi resolver curation connection reads accepted policy and completes appl
     // completion directly without a load-dependent half-deadline threshold.
     var result = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
     defer result.deinit();
-    try std.testing.expect(result.value.object.get("applied").?.bool);
+    const applied = result.value.object.get("applied") orelse return error.TestExpectedAppliedCuration;
+    try std.testing.expect(applied == .bool and applied.bool);
 }
 
 test "capi resolver curation query follows native merge unmerge and suppression before replay" {
