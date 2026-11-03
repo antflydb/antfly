@@ -74,6 +74,12 @@ and model residency, rather than transcription accuracy.
   overflow, refusal cleanup, session observer lock ordering and sampler gating.
 - `admission-api-test`: six passed with strict error-log expectations and no
   leaks, including hierarchy diagnostics rejected before canonical dispatch.
+- Both production HTTP listener regressions passed with strict error-log checks,
+  no leaks and exit status zero: hierarchy JSON pointers and dense/sparse
+  table-creation resource refusals.
+- The full CPU database build passed with
+  `zig build antfly -j1 -Dmetal=false -Dcuda=false -Doptimize=ReleaseFast`.
+  The resulting executable also returned its version successfully.
 - Four storage admission/restart checks passed. The disk case closed and
   reopened the LSM backend through seventeen writes/replays; long scopes also
   exercised the status-key heap fallback.
