@@ -133,8 +133,9 @@ empty inventory and retires its previous full-text entries and chunk vectors.
 
 Scanned PDFs with an existing invisible OCR text layer retain that layer's
 positions for word and line reconstruction. Within an overlapping region,
-extraction retains both transcriptions and their source spans. Complementary OCR
-words return to their geometric position in the sentence; unrelated headings,
+extraction retains alternate transcriptions and their source spans, including
+independent invisible OCR copies. Complementary words fill the primary sentence
+in geometric order. Unrelated headings,
 footers, and columns keep their existing reading order. Antfly does not paint
 invisible text over the scanned image.
 
