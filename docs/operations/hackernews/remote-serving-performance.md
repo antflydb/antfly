@@ -183,3 +183,67 @@ checkpoint-hint GET, and the eventual TLS transport failure escaped the native
 callback ABI. That establishes one concrete failure path; it does not establish
 the cause of every timeout or the original 3.9-second local outlier. Failed
 attempts remain part of the qualification evidence in issue #1471.
+
+The final Debug engine passed 64 API and five embedded snapshot tests without
+allocator leaks, 180 copied-state real-GCS overlay queries, and all six retained-
+cursor recovery cases across filesystem, an S3 fixture and real GCS with both
+vector-storage modes. The 25 relevant Python harness tests also pass.
+
+## Matched optimized result (November 3)
+
+All eight cells passed, including ranked HN ID/score agreement, highlights, filters,
+pagination/restart and union/saved-overlay semantics. This is one paired cycle
+with 20 uninterrupted warm samples per workload on the shared macOS ARM64 host.
+Own compilation finished before timing; unrelated host workloads may remain.
+OS caches were not flushed. The fixture generation, size, MD5 and local SHA256
+were checked again after the run and were unchanged.
+
+The control is the exact pre-#1320 parent `bc168380f3`; the candidate engine is
+`0db255d3b6bec1eed04a27375aebcc982a1bf584`, ReleaseFast/stripped with Metal/CUDA
+disabled. The harness is `058812f98e`; the later startup correction changed no
+engine code. Full fingerprints, every warm sample, p95/max and scoped counters
+are retained in the [local evidence](https://github.com/antflydb/antfly/issues/1471#issuecomment-6599960593) and
+[GCS evidence](https://github.com/antflydb/antfly/issues/1471#issuecomment-6599961048).
+
+| Revision / objects / stored source | Publish s | Cold ms | Warm median / p95 / max ms | Restart ms | Union warm p95 ms | Overlay warm p95 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Before / local / yes | 5.05 | 16.18 | 6.68 / 7.29 / 9.46 | 20.04 | 54.58 | 82.47 |
+| After / local / yes | 5.05 | 16.91 | 4.85 / 6.18 / 8.33 | 19.51 | 51.95 | 62.75 |
+| Before / local / no | 4.04 | 62.35 | 9.18 / 10.41 / 10.84 | 21.06 | 53.86 | 61.00 |
+| After / local / no | 4.05 | 19.62 | 7.49 / 7.72 / 9.35 | 19.09 | 52.61 | 60.20 |
+| Before / gcs / yes | 570.50 | 6870.70 | 543.58 / 595.76 / 616.95 | 674.58 | 6087.84 | 6241.19 |
+| After / gcs / yes | 590.35 | 6348.89 | 189.07 / 339.83 / 340.91 | 489.95 | 4371.30 | 4631.30 |
+| Before / gcs / no | 421.13 | 5459.10 | 545.59 / 572.70 / 573.65 | 664.73 | 6193.65 | 6220.32 |
+| After / gcs / no | 418.23 | 6054.10 | 193.94 / 350.74 / 365.31 | 480.52 | 4661.46 | 4645.49 |
+
+For GCS with stored source, warm archive median fell from 543.58 to about 189 ms,
+union median from 2903.19 to 1068.35 ms, and saved-overlay median from 4344.75
+to 1309.02 ms. The corresponding composed p95s still reach 4–5 seconds.
+Cold results are mixed: the stored-source archive improved slightly, while the
+hydrated archive was slower in this cycle. Publication shows no consistent
+improvement. These observations establish no production SLO or DuckDB parity.
+
+Cold serving-cache provider reads were unchanged: 47 with stored source
+(about 2.80 MB) and 53 with hydration (about 3.62 MB). The new API-owner counters
+recorded zero bucket probes. The older control lacks these logical counters;
+missing values are unavailable, not zero. Background/nested calls overlap these
+intervals, and separately compiled native-owner operations remain outside their
+scope. The retained-object inventories also showed no consistent reduction;
+expiry and background GC affect them, so they do not measure publication-only
+write amplification.
+
+Stored source increased publication cost in this small fixture. Its Parquet
+export fits in cache; full-archive hydration costs need separate qualification.
+Keep the HN serving configuration explicit and measure its archive-scale storage,
+build and response costs before changing that policy.
+
+The original 3926.98 ms local first-repeat outlier remains unexplained. Additional
+optimized and Debug local repeats did not reproduce it. Earlier GCS publication
+and overlay failures remain recorded in #1471; the passing replacement matrix
+does not erase them.
+
+Remaining work is publication profiling, cold payload/hydration and native
+snapshot tail latency, followed by same-region Cloud and full-archive sizing.
+Raw-prefix discovery must retain fresh authority checks. Also qualify upgrades
+with the documented republish transition and managed credentials across an access-token
+lifetime before release/deployment signoff.
