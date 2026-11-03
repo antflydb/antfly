@@ -20,6 +20,7 @@ pub const managed = @import("managed.zig");
 pub const rest = @import("rest.zig");
 pub const parquet_writer = @import("parquet_writer.zig");
 pub const avro_writer = @import("avro_writer.zig");
+pub const manifest_inventory = @import("manifest_inventory.zig");
 pub const retirement_index = @import("retirement_index.zig");
 pub const row_commit = @import("row_commit.zig");
 const std = @import("std");
@@ -44,9 +45,9 @@ pub const Catalog = union(enum) {
             .rest => |*v| v.commit(a, request),
         };
     }
-    pub fn references(self: *const Catalog, a: std.mem.Allocator, objects: []const []const u8) !types.References {
+    pub fn references(self: *const Catalog, a: std.mem.Allocator, request: managed.ReferenceRequest) !types.References {
         return switch (self.*) {
-            .managed => |*value| value.references(a, objects),
+            .managed => |*value| value.referencesBounded(a, request),
             .rest => error.LakeVacuumCatalogCoordinationRequired,
         };
     }

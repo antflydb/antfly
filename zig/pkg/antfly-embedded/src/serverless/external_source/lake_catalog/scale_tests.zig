@@ -455,3 +455,64 @@ test "lake catalog retirement conflicts when authority advances during cold proo
     defer current.deinit(a);
     try std.testing.expect(current.retirement_root == null);
 }
+
+test "lake catalog reachability completes without an idle metadata turn" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = storage.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var table = try Table.init(alloc, memory.client(), "archive", "events", "gs://archive/events", "gs://archive/events");
+    defer table.deinit(alloc);
+    try table.commitRow(alloc, 2);
+    var warm = try awaitReferences(alloc, table.catalog, &.{});
+    warm.deinit(alloc);
+    var ready_count: usize = 0;
+    for (0..12) |n| {
+        const body = try std.fmt.allocPrint(a, "{{\"requirements\":[],\"updates\":[{{\"action\":\"set-properties\",\"updates\":{{\"owner\":\"v{d}\"}}}}]}}", .{n});
+        const next = try table.catalog.commit(alloc, .{ .id = try std.fmt.allocPrint(a, "props-{d}", .{n}), .expected_metadata_location = table.current.metadata_location, .body = body, .timestamp_ms = @intCast(n + 3) });
+        table.current.deinit(alloc);
+        table.current = next;
+        var references = try table.catalog.references(alloc, &.{});
+        defer references.deinit(alloc);
+        if (references.ready) ready_count += 1;
+        try std.testing.expectEqual(@as(usize, 0), references.steps);
+    }
+    try std.testing.expectEqual(@as(usize, 12), ready_count);
+    var quiescent = try table.catalog.references(alloc, &.{});
+    defer quiescent.deinit(alloc);
+    try std.testing.expect(quiescent.ready);
+}
+
+test "lake catalog reachability catches up under continuous appends across manifest merging" {
+    const alloc = std.testing.allocator;
+    var memory = storage.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var table = try Table.init(alloc, memory.client(), "archive", "events", "gs://archive/events", "gs://archive/events");
+    defer table.deinit(alloc);
+    var pending: usize = 0;
+    var ready_count: usize = 0;
+    for (1..129) |n| {
+        try table.commitRow(alloc, @intCast(n + 1));
+        var references = try table.catalog.references(alloc, &.{});
+        defer references.deinit(alloc);
+        try std.testing.expect(references.steps <= 64);
+        if (references.ready) {
+            ready_count += 1;
+            pending = 0;
+        } else pending += 1;
+        try std.testing.expect(pending < 16);
+    }
+    try std.testing.expect(ready_count > 100);
+    try std.testing.expectEqual(@as(usize, 0), pending);
+    // A read-only membership request never starts a new bootstrap pass.
+    var current = try table.catalog.load(alloc);
+    defer current.deinit(alloc);
+    var bounded = table.catalog;
+    bounded.context.deadline_ns = platform.time.monotonicNs() + std.time.ns_per_s;
+    var proof = try bounded.referencesBounded(alloc, .{ .objects = &.{}, .max_steps = 0 });
+    defer proof.deinit(alloc);
+    try std.testing.expect(proof.ready);
+    try std.testing.expectEqual(@as(usize, 0), proof.steps);
+}

@@ -21,7 +21,7 @@ const storage = @import("objectstore");
 const types = @import("types.zig");
 const metadata = @import("metadata.zig");
 const rows = @import("row_commit.zig");
-const avro = @import("../iceberg_avro.zig");
+const inventory = @import("manifest_inventory.zig");
 const retired = @import("retirement_index.zig");
 const A = std.mem.Allocator;
 const Digest = retired.Digest;
@@ -35,14 +35,12 @@ const Progress = struct {
     manifest: usize = 0,
     file: usize = 0,
     statistic: usize = 0,
+    list_marked: bool = false,
     members: ?Digest = null,
     manifests: ?Digest = null,
 };
 const Proof = struct { version: u8 = 1, metadata_hash: [64]u8, members: ?Digest };
-const ChunkRef = struct { hash: Digest, start: usize, count: usize, offset: usize, bytes: usize };
-const Inventory = struct { version: u8 = 1, uri: []const u8, manifest_list: bool, pack: Digest, chunks: []const ChunkRef, count: usize };
-const Chunk = struct { paths: []const []const u8 };
-pub const Result = struct { ready: bool, members: ?Digest = null };
+pub const Result = struct { ready: bool, members: ?Digest = null, steps: usize = 0 };
 
 pub const Builder = struct {
     files: rows.Files,
@@ -51,9 +49,10 @@ pub const Builder = struct {
     /// Proofs themselves are immutable and bound to the complete metadata hash.
     head_key: []const u8,
     index: retired.Index,
+    inventories: inventory.Store,
 
     pub fn init(a: A, files: rows.Files, prefix: []const u8, head_key: []const u8) Builder {
-        return .{ .files = files, .prefix = prefix, .head_key = head_key, .index = retired.Index.init(a, files.client, files.bucket, prefix, files.context) };
+        return .{ .files = files, .prefix = prefix, .head_key = head_key, .index = retired.Index.init(a, files.client, files.bucket, prefix, files.context), .inventories = .{ .files = files, .client = files.client, .bucket = files.bucket, .prefix = prefix } };
     }
     pub fn deinit(self: *Builder) void {
         self.index.deinit();
@@ -89,109 +88,6 @@ pub const Builder = struct {
         }
         return true;
     }
-    fn inventory(self: *Builder, a: A, uri: []const u8, manifest_list: bool, sources: *usize) !?Inventory {
-        const path = try self.key(a, try std.fmt.allocPrint(a, "inventories/{s}-{s}.json", .{ types.digestHex(uri), if (manifest_list) "list" else "manifest" }));
-        if (try self.get(a, path, types.max_metadata_bytes)) |value| {
-            var object = value;
-            defer object.deinit(a);
-            const result = try std.json.parseFromSliceLeaky(Inventory, a, object.body, .{ .allocate = .alloc_always });
-            if (result.version != 1 or result.manifest_list != manifest_list or !std.mem.eql(u8, result.uri, uri) or result.chunks.len > 65536) return error.InvalidLakeReachability;
-            var count: usize = 0;
-            var offset: usize = 0;
-            for (result.chunks) |chunk| {
-                if (chunk.start != count or chunk.count == 0 or chunk.count > 256 or chunk.offset != offset or chunk.bytes == 0 or chunk.bytes > 2 * 1024 * 1024) return error.InvalidLakeReachability;
-                count = std.math.add(usize, count, chunk.count) catch return error.InvalidLakeReachability;
-                offset = std.math.add(usize, offset, chunk.bytes) catch return error.InvalidLakeReachability;
-                if (offset > 64 * 1024 * 1024) return error.InvalidLakeReachability;
-            }
-            if (count != result.count) return error.InvalidLakeReachability;
-            return result;
-        }
-        // One bounded Avro object is the indivisible bootstrap unit. A turn
-        // reads at most two new objects, and never parses one again after its
-        // inventory receipt becomes durable.
-        if (sources.* == 0) return null;
-        sources.* -= 1;
-        const bytes = try rows.readLimited(a, self.files, uri, 16 * 1024 * 1024);
-        var paths: std.ArrayList([]const u8) = .empty;
-        if (manifest_list) {
-            const list = try avro.parseManifestListAlloc(a, bytes);
-            for (list.entries) |entry| try paths.append(a, entry.manifest_path);
-        } else {
-            try paths.append(a, uri);
-            const manifest = try avro.parseDataManifestAlloc(a, bytes);
-            for (manifest.entries) |entry| if (entry.status != .deleted) try paths.append(a, entry.file_path);
-        }
-        var chunks: std.ArrayList(ChunkRef) = .empty;
-        var bundle: std.ArrayList(u8) = .empty;
-        var start: usize = 0;
-        while (start < paths.items.len) {
-            var end = start;
-            var size: usize = 0;
-            while (end < paths.items.len and end - start < 256) : (end += 1) {
-                const item = paths.items[end];
-                if (item.len == 0 or item.len > 4096) return error.InvalidLakeReachability;
-                if (size + item.len > 256 * 1024 and end != start) break;
-                size += item.len;
-            }
-            const encoded = try std.json.Stringify.valueAlloc(a, Chunk{ .paths = paths.items[start..end] }, .{});
-            var hash: Digest = undefined;
-            std.crypto.hash.sha2.Sha256.hash(encoded, &hash, .{});
-            if (encoded.len + bundle.items.len > 64 * 1024 * 1024) return error.LakeReachabilityBudgetExceeded;
-            try chunks.append(a, .{ .hash = hash, .start = start, .count = end - start, .offset = bundle.items.len, .bytes = encoded.len });
-            try bundle.appendSlice(a, encoded);
-            start = end;
-        }
-        // Pack the authenticated chunks in one immutable object. Even an
-        // inventory with thousands of chunks takes one PUT; cold workers read
-        // just the chunk containing their persisted cursor using a range GET.
-        var pack: Digest = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bundle.items, &pack, .{});
-        try self.immutable(a, try self.key(a, try std.fmt.allocPrint(a, "chunks/{s}.bin", .{std.fmt.bytesToHex(pack, .lower)})), bundle.items);
-        const result: Inventory = .{ .uri = uri, .manifest_list = manifest_list, .pack = pack, .chunks = chunks.items, .count = paths.items.len };
-        try self.immutable(a, path, try std.json.Stringify.valueAlloc(a, result, .{}));
-        return result;
-    }
-    const Reader = struct {
-        builder: *Builder,
-        a: A,
-        inventory_: Inventory,
-        chunk: usize = 0,
-        offset: usize = 0,
-        paths: []const []const u8 = &.{},
-        /// Chunk inventories use at most 256 entries, but long paths can split
-        /// earlier. Seek in the small header, not preceding data pages.
-        fn next(self: *Reader, position: usize) !?[]const u8 {
-            if (position >= self.inventory_.count) return null;
-            while (self.offset + self.paths.len <= position) {
-                var low = self.chunk;
-                var high = self.inventory_.chunks.len;
-                while (low < high) {
-                    const middle = low + (high - low) / 2;
-                    const candidate = self.inventory_.chunks[middle];
-                    if (candidate.start + candidate.count <= position) low = middle + 1 else high = middle;
-                }
-                self.chunk = low;
-                if (self.chunk >= self.inventory_.chunks.len) return error.InvalidLakeReachability;
-                const ref = self.inventory_.chunks[self.chunk];
-                if (ref.start > position) return error.InvalidLakeReachability;
-                self.offset = ref.start;
-                const hash = ref.hash;
-                const key_ = try self.builder.key(self.a, try std.fmt.allocPrint(self.a, "chunks/{s}.bin", .{std.fmt.bytesToHex(self.inventory_.pack, .lower)}));
-                try self.builder.files.context.ensureActive();
-                var client = self.builder.files.client;
-                client.allocator = self.a;
-                var object = try client.getObject(self.builder.files.bucket, key_, .{ .skip_metadata_probe = true, .range = .{ .offset = ref.offset, .length = ref.bytes }, .max_response_bytes = ref.bytes, .cancellation = types.contextCancellation(&self.builder.files.context) });
-                defer object.deinit(self.a);
-                if (!std.mem.eql(u8, &types.digestHex(object.body), &std.fmt.bytesToHex(hash, .lower))) return error.InvalidLakeReachability;
-                const parsed = try std.json.parseFromSliceLeaky(Chunk, self.a, object.body, .{ .allocate = .alloc_always });
-                if (parsed.paths.len == 0 or parsed.paths.len > 256 or parsed.paths.len != ref.count) return error.InvalidLakeReachability;
-                self.paths = parsed.paths;
-                self.chunk += 1;
-            }
-            return self.paths[position - self.offset];
-        }
-    };
     fn roots(a: A, bytes: []const u8) !Roots {
         const parsed = try metadata.parse(a, bytes);
         var snapshots: std.ArrayList(Snapshot) = .empty;
@@ -243,7 +139,8 @@ pub const Builder = struct {
         progress.metadata_hash = hash;
     }
     /// One bounded durable step. No coordinator-supplied membership is trusted.
-    pub fn step(self: *Builder, a: A, table: types.Table) !Result {
+    pub fn step(self: *Builder, a: A, table: types.Table, max_steps: usize) !Result {
+        if (max_steps > types.max_reference_steps) return error.InvalidLakeReachability;
         const hash = types.digestHex(table.metadata_json);
         const proof_key = try self.key(a, try std.fmt.allocPrint(a, "versions/{s}.json", .{hash}));
         if (try self.get(a, proof_key, 16384)) |value| {
@@ -253,6 +150,7 @@ pub const Builder = struct {
             if (proof.version != 1 or !std.mem.eql(u8, &proof.metadata_hash, &hash)) return error.InvalidLakeReachability;
             return .{ .ready = true, .members = proof.members };
         }
+        if (max_steps == 0) return .{ .ready = false };
         const progress_key = try self.key(a, "build.json");
         var saved = try self.get(a, progress_key, 64 * 1024 * 1024);
         defer if (saved) |*object| object.deinit(a);
@@ -262,8 +160,11 @@ pub const Builder = struct {
             .{ .metadata_hash = hash, .roots = try roots(a, table.metadata_json) };
         if (progress.version != 1 or progress.snapshot > progress.roots.snapshots.len or progress.statistic > progress.roots.statistics.len) return error.InvalidLakeReachability;
         if (!std.mem.eql(u8, &progress.metadata_hash, &hash)) try retarget(a, &progress, try roots(a, table.metadata_json), hash);
-        var work: usize = 64;
-        var sources: usize = 2;
+        var work = max_steps;
+        // Read-only shared-manifest edges do not consume the mutation budget,
+        // but still have their own bound and deadline checks.
+        var edges: usize = 4096;
+        var sources: usize = 4;
         while (work != 0 and try self.canWork() and progress.statistic < progress.roots.statistics.len) {
             progress.members = try self.index.insert(progress.members, progress.roots.statistics[progress.statistic]);
             progress.statistic += 1;
@@ -271,26 +172,31 @@ pub const Builder = struct {
         }
         while (work != 0 and try self.canWork() and progress.snapshot < progress.roots.snapshots.len) {
             const uri = progress.roots.snapshots[progress.snapshot].uri;
-            const list = (try self.inventory(a, uri, true, &sources)) orelse break;
-            if (progress.manifest == 0 and progress.file == 0) progress.members = try self.index.insert(progress.members, uri);
-            var lists: Reader = .{ .builder = self, .a = a, .inventory_ = list };
-            while (work != 0 and try self.canWork()) {
+            const list = (try self.inventories.load(a, uri, true, &sources)) orelse break;
+            if (!progress.list_marked) {
+                progress.members = try self.index.insert(progress.members, uri);
+                progress.list_marked = true;
+                work -= 1;
+            }
+            var lists: inventory.Store.Reader = .{ .store = &self.inventories, .a = a, .inventory_ = list };
+            while (work != 0 and edges != 0 and try self.canWork()) {
                 const manifest = (try lists.next(progress.manifest)) orelse {
                     progress.snapshot += 1;
                     progress.manifest = 0;
                     progress.file = 0;
+                    progress.list_marked = false;
                     work -= 1;
                     break;
                 };
                 if (try self.index.contains(progress.manifests, manifest)) {
                     progress.manifest += 1;
                     progress.file = 0;
-                    work -= 1;
+                    edges -= 1;
                     continue;
                 }
-                const files = (try self.inventory(a, manifest, false, &sources)) orelse break;
-                var reader: Reader = .{ .builder = self, .a = a, .inventory_ = files };
-                while (work != 0 and try self.canWork()) {
+                const files = (try self.inventories.load(a, manifest, false, &sources)) orelse break;
+                var reader: inventory.Store.Reader = .{ .store = &self.inventories, .a = a, .inventory_ = files };
+                while (work != 0 and edges != 0 and try self.canWork()) {
                     const file = (try reader.next(progress.file)) orelse {
                         progress.manifests = try self.index.insert(progress.manifests, manifest);
                         progress.manifest += 1;
@@ -302,9 +208,9 @@ pub const Builder = struct {
                     progress.file += 1;
                     work -= 1;
                 }
-                if (sources == 0 or !try self.canWork()) break;
+                if (sources == 0 or edges == 0 or !try self.canWork()) break;
             }
-            if (sources == 0 or !try self.canWork()) break;
+            if (sources == 0 or edges == 0 or !try self.canWork()) break;
         }
         const complete = progress.snapshot == progress.roots.snapshots.len and progress.statistic == progress.roots.statistics.len;
         if (complete) {
@@ -321,15 +227,15 @@ pub const Builder = struct {
             var client = self.files.client;
             client.allocator = a;
             var stored = client.compareAndPut(self.files.bucket, progress_key, bytes, if (saved) |object| object.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = types.contextCancellation(&self.files.context) }) catch |err| switch (err) {
-                error.PreconditionFailed => return .{ .ready = false },
+                error.PreconditionFailed => return .{ .ready = complete, .members = progress.members, .steps = max_steps - work },
                 else => return err,
             };
             stored.deinit(a);
         }
-        // Bootstrap and destructive traversal have independent per-turn I/O
-        // budgets. Consume a newly published proof on the next invocation,
-        // rather than adding traversal writes to this turn's marking writes.
-        return .{ .ready = false };
+        // The caller charges these mutations against traversal's remaining
+        // work. A complete exact-metadata proof is usable immediately, even
+        // when the next maintenance turn will observe another catalog commit.
+        return .{ .ready = complete, .members = progress.members, .steps = max_steps - work };
     }
     pub fn contains(self: *Builder, root: ?Digest, uri: []const u8) !bool {
         return self.index.contains(root, uri);

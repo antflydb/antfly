@@ -120,7 +120,7 @@ pub const CatalogOperation = union(enum) {
     create: lake_catalog.types.Commit,
     commit: lake_catalog.types.Commit,
     retire: lake_catalog.managed.Retirement,
-    references: []const []const u8,
+    references: lake_catalog.managed.ReferenceRequest,
     resolve: struct { id: []const u8, hash: []const u8 },
 };
 pub const CatalogResult = union(enum) {
@@ -230,7 +230,7 @@ fn executeCatalog(a: Allocator, catalog: *lake_catalog.Catalog, operation: Catal
         .create => |c| .{ .table = try catalog.create(a, c.id, c.body, c.timestamp_ms) },
         .commit => |c| .{ .table = try catalog.commit(a, c) },
         .retire => |r| .{ .table = try catalog.retire(a, r) },
-        .references => |objects| .{ .references = try catalog.references(a, objects) },
+        .references => |request| .{ .references = try catalog.references(a, request) },
         .resolve => |c| .{ .outcome = try catalog.resolve(a, c.id, c.hash) },
     };
 }

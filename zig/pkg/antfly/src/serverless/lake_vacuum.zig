@@ -91,9 +91,10 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
         try roots.put(a, entry.uri, entry.root);
         cache_bytes += entry.uri.len + 160;
     }
+    var inventories: catalog.manifest_inventory.Store = .{ .files = destination, .client = client, .bucket = bucket, .prefix = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-inputs", .{plans.prefix}) };
     var steps: usize = 0;
     const initial_budget = budget.*;
-    while (!progress.spilling and progress.candidate < progress.candidates.len and retired.items.len < progress.max_expired and steps < request.max_plan_steps and initial_budget - budget.* < 8 * 1024 * 1024) {
+    while (!progress.spilling and progress.candidate < progress.candidates.len and retired.items.len < progress.max_expired and steps < request.max_plan_steps and initial_budget - budget.* + inventories.bytes_read < 8 * 1024 * 1024) {
         try plans.context.ensureActive();
         if (plans.context.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s >= deadline) break;
         const candidate = progress.candidates[progress.candidate];
@@ -116,41 +117,52 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
             progress.partial = null;
             continue;
         }
-        const bytes = try catalog.row_commit.readLimited(a, destination, candidate.uri, @intCast(@min(budget.*, 16 * 1024 * 1024)));
-        budget.* -= bytes.len;
+        var sources: usize = 1;
+        const list = (try inventories.load(a, candidate.uri, true, &sources)) orelse return error.InvalidLakeVacuumPlan;
+        const source_bytes = inventories.source_bytes_read;
+        inventories.source_bytes_read = 0;
         steps += 1;
-        const list = try iceberg.parseManifestListAlloc(a, bytes);
-        if (progress.manifest > list.entries.len) return error.InvalidLakeVacuumPlan;
+        if (progress.manifest > list.count) return error.InvalidLakeVacuumPlan;
+        var entries: catalog.manifest_inventory.Store.Reader = .{ .store = &inventories, .a = a, .inventory_ = list };
         var children: std.ArrayList([]const u8) = .empty;
         try children.append(a, progress.partial orelse try plans.objects(try a.dupe([]const u8, &.{candidate.uri})));
-        while (progress.manifest < list.entries.len) {
+        const first_manifest = progress.manifest;
+        while (progress.manifest < list.count) {
             try plans.context.ensureActive();
             if (plans.context.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s >= deadline) break;
-            const entry = list.entries[progress.manifest];
-            const ref = roots.get(entry.manifest_path) orelse built: {
-                if (steps >= request.max_plan_steps or initial_budget - budget.* >= 8 * 1024 * 1024) break;
-                const paths = try manifestFiles(a, destination, cache, entry.manifest_path, entry.manifest_length, budget);
+            // A large source list is cached durably in its own turn. On
+            // resume, admit at least one manifest even if the cache header
+            // itself exceeds the soft byte quantum; cursor progress is saved.
+            if (initial_budget - budget.* + inventories.bytes_read >= 8 * 1024 * 1024 and
+                (source_bytes != 0 or progress.manifest != first_manifest)) break;
+            const manifest_uri = (try entries.next(progress.manifest)) orelse return error.InvalidLakeVacuumPlan;
+            const ref = roots.get(manifest_uri) orelse built: {
+                if (steps >= request.max_plan_steps) break;
+                // Inventories need only URIs; the bounded GET enforces the
+                // remaining budget without trusting a declared source length.
+                const paths = try manifestFiles(a, destination, cache, manifest_uri, 0, budget);
                 steps += 1;
                 const objects = try a.alloc([]const u8, paths.len + 1);
-                objects[0] = entry.manifest_path;
+                objects[0] = manifest_uri;
                 @memcpy(objects[1..], paths);
                 const hash = try plans.objects(objects);
-                try roots.put(a, entry.manifest_path, hash);
-                try manifest_roots.append(a, .{ .uri = entry.manifest_path, .root = hash });
-                cache_bytes += entry.manifest_path.len + 160;
+                try roots.put(a, manifest_uri, hash);
+                try manifest_roots.append(a, .{ .uri = manifest_uri, .root = hash });
+                cache_bytes += manifest_uri.len + 160;
                 break :built hash;
             };
             try children.append(a, ref);
             progress.manifest += 1;
         }
         progress.partial = try plans.children(children.items);
-        if (progress.manifest == list.entries.len) {
+        if (progress.manifest == list.count) {
             try retired.append(a, .{ .snapshot = text, .object_plan = progress.partial });
             progress.candidate += 1;
             progress.manifest = 0;
             progress.partial = null;
         }
     }
+    budget.* -= inventories.bytes_read;
     progress.retired = retired.items;
     // Bound the cross-turn manifest cache independently of snapshot history.
     var start: usize = 0;
@@ -248,7 +260,7 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
     if (progress.pinned == job.retired.len) {
         if (progress.approved.len == 0) {
             selection: {
-                var ready = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .references = &.{} });
+                var ready = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .references = .{ .objects = &.{} } });
                 defer ready.deinit(a);
                 if (!ready.references.ready) break :selection;
                 var candidates: std.ArrayList([]const u8) = .empty;
@@ -256,7 +268,8 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                 var seen = catalog.retirement_index.Index.init(a, client, plans.bucket, try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-traversal", .{plans.prefix}), context);
                 defer seen.deinit();
                 var walker = try plan.Walker.init(plans, job.retired, &seen, progress.cursor);
-                var steps: usize = 64;
+                var steps = catalog.types.max_reference_steps - ready.references.steps;
+                if (steps == 0) break :selection;
                 var exhausted = false;
                 while (candidates.items.len < @min(16, request.max_deleted)) {
                     const uri = (walker.next(&steps) catch |err| switch (err) {
@@ -268,7 +281,7 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
                     };
                     if (!has(candidates.items, uri)) try candidates.append(a, uri);
                 }
-                var references = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .references = candidates.items });
+                var references = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .references = .{ .objects = candidates.items, .max_steps = 0 } });
                 defer references.deinit(a);
                 if (!references.references.ready) break :selection;
                 for (candidates.items, references.references.referenced) |uri, referenced| {
@@ -892,4 +905,138 @@ test "external lake vacuum resumes 200 snapshots within remote budgets and reval
     try std.testing.expect(replay.complete and !replay.conflicted);
     try std.testing.expectEqual(@as(usize, 198), replay.expired_snapshots);
     try std.testing.expectEqual(@as(usize, 0), replay.deleted_objects);
+}
+
+test "external lake vacuum planner resumes large manifest lists from private cached chunks" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const storage = @import("objectstore");
+    var memory = storage.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var authority: catalog.managed.Managed = .{ .client = memory.client(), .bucket = "archive", .prefix = "events", .source_uri = "gs://archive/events" };
+    var table = try authority.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    const files: catalog.row_commit.Files = .{ .client = memory.client(), .bucket = "archive", .prefix = "events", .uri = "gs://archive/events" };
+    const Count = struct {
+        reads: usize = 0,
+        fn matches(raw: *anyopaque, _: []const u8, key: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.endsWith(u8, key, "/wide-list.avro")) self.reads += 1;
+            return false;
+        }
+    };
+    var cache = storage.MemoryClient.init(alloc);
+    defer cache.deinit();
+    var faults = storage.ScriptedFaultClient.init(alloc, memory.client());
+    defer faults.deinit();
+    var count: Count = .{};
+    var wide_size: usize = 0;
+    for (1..3) |n| {
+        const row = try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{n}), .{});
+        const batch: catalog.row_commit.Batch = .{ .batch_id = try std.fmt.allocPrint(a, "b{d}", .{n}), .source = "s", .epoch = "1", .checkpoint = try std.fmt.allocPrint(a, "{d}", .{n}), .expected_checkpoint = if (n == 1) null else "1", .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = row }} };
+        const prepared = try catalog.row_commit.prepare(a, table, files, batch, n, @intCast(n + 1));
+        const body = try std.json.parseFromSliceLeaky(V, a, prepared.body, .{});
+        if (n == 1) {
+            for ((try catalog.metadata.get(body, "updates")).array.items) |*update| {
+                if (!std.mem.eql(u8, try catalog.metadata.str(try catalog.metadata.get(update.*, "action")), "add-snapshot")) continue;
+                const snapshot = update.object.getPtr("snapshot").?;
+                const original = try iceberg.parseManifestListAlloc(a, try catalog.row_commit.read(a, files, try catalog.metadata.str(try catalog.metadata.get(snapshot.*, "manifest-list"))));
+                const entries = try a.alloc(V, original.entries.len);
+                for (original.entries, entries) |entry, *out| out.* = try catalog.row_commit.listEntry(a, entry);
+                const padding = try a.alloc(u8, 8 * 1024 * 1024);
+                @memset(padding, 'x');
+                const bytes = try catalog.avro_writer.ocf(a, catalog.avro_writer.list_schema, entries, &.{ .{ .key = "format-version", .value = "2" }, .{ .key = "unused-padding", .value = padding } });
+                wide_size = bytes.len;
+                const uri = try catalog.row_commit.upload(a, files, "metadata/wide-list.avro", bytes);
+                try snapshot.object.put(a, "manifest-list", .{ .string = uri });
+            }
+        }
+        table = try authority.commit(a, .{ .id = batch.batch_id, .expected_metadata_location = table.metadata_location, .body = try std.json.Stringify.valueAlloc(a, body, .{}), .timestamp_ms = @intCast(n + 1) });
+    }
+    const root = try catalog.metadata.parse(a, table.metadata_json);
+    const uuid = try catalog.metadata.str(try catalog.metadata.get(root, "table-uuid"));
+    faults.get_filter = .{ .ptr = &count, .matches = Count.matches };
+    var source_files = files;
+    source_files.client = faults.client();
+    const pin_store: pins.Store = .{ .client = cache.client(), .bucket = "journal", .prefix = "pins", .context = .{} };
+    const request: Options = .{ .operation_id = "wide", .dry_run = false, .exclusive_ownership = true, .keep_latest = 1, .retain_ms = 600000 };
+    for (0..3) |turn| {
+        var plans: plan.Store = .{ .a = a, .client = cache.client(), .bucket = "journal", .prefix = "private", .context = .{}, .dry_run = false, .defer_writes = true };
+        var budget: u64 = 256 * 1024 * 1024;
+        var manifests: ManifestFiles = .empty;
+        const result = try planningTurn(a, cache.client(), "journal", "private/planning.json", root, uuid, &.{}, request, pin_store, source_files, &plans, &budget, &manifests);
+        if (turn == 0) try std.testing.expect(result == null) else try std.testing.expect(result != null);
+    }
+    var client = cache.client();
+    var object = try client.getObject("journal", "private/planning.json", .{});
+    defer object.deinit(alloc);
+    const progress = try std.json.parseFromSliceLeaky(Planning, a, object.body, .{});
+    try std.testing.expect(wide_size > 8 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 1), count.reads);
+    try std.testing.expectEqual(@as(usize, 0), progress.manifest);
+    try std.testing.expectEqual(@as(usize, 1), progress.candidate);
+    try std.testing.expectEqual(@as(usize, 1), progress.retired.len);
+}
+
+test "external lake vacuum progresses while ingestion advances metadata every turn" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-vacuum-continuous-ingestion");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(alloc, json);
+    defer config.deinit();
+    const binding: local.serverless_external_source_catalog_binding.Binding = .{ .table_id = "events", .format = .iceberg, .source_uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()}), .schema_fingerprint = "schema", .write_policy = .iceberg_writer, .catalog = .{ .type = .managed } };
+    const options: configured.BindingObjectStoreOpenOptions = .{ .node_config = &config, .catalog_table_id = 11 };
+    var opened = try configured.openBindingObjectStoreAlloc(alloc, binding, options);
+    defer opened.deinit();
+    const authority: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri };
+    var created = try authority.create(alloc, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    created.deinit(alloc);
+    const files = try ingestion.destinationFiles(a, opened, binding.source_uri, .{});
+    const Writer = struct {
+        fn append(allocator: A, managed: catalog.managed.Managed, destination: catalog.row_commit.Files, n: usize) !void {
+            var work = std.heap.ArenaAllocator.init(allocator);
+            defer work.deinit();
+            const scratch = work.allocator();
+            var table = try managed.load(scratch);
+            defer table.deinit(scratch);
+            const row = try std.json.parseFromSliceLeaky(V, scratch, try std.fmt.allocPrint(scratch, "{{\"id\":{d}}}", .{n}), .{});
+            const batch: catalog.row_commit.Batch = .{ .batch_id = try std.fmt.allocPrint(scratch, "b{d}", .{n}), .source = "s", .epoch = "1", .checkpoint = try std.fmt.allocPrint(scratch, "{d}", .{n}), .expected_checkpoint = if (n == 1) null else try std.fmt.allocPrint(scratch, "{d}", .{n - 1}), .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = row }} };
+            const prepared = try catalog.row_commit.prepare(scratch, table, destination, batch, n, @intCast(n + 1));
+            var published = try managed.commit(scratch, .{ .id = batch.batch_id, .expected_metadata_location = table.metadata_location, .body = prepared.body, .timestamp_ms = @intCast(n + 1) });
+            published.deinit(scratch);
+        }
+    };
+    for (1..21) |n| try Writer.append(alloc, authority, files, n);
+    const metrics = @import("objectstore").operation_metrics;
+    const Budget = struct {
+        start: u64,
+        fn writes() u64 {
+            const calls = metrics.runtime.snapshot().calls;
+            return calls[@backingInt(metrics.Operation.put)] + calls[@backingInt(metrics.Operation.conditional_put)];
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (writes() - self.start >= 600) return error.TestUnexpectedResult;
+        }
+    };
+    var result: Result = .{};
+    var deleted: usize = 0;
+    var turns: usize = 0;
+    while (!result.complete and turns < 256) : (turns += 1) {
+        // Production reconciliation drains WAL before running maintenance.
+        try Writer.append(alloc, authority, files, 21 + turns);
+        var budget: Budget = .{ .start = Budget.writes() };
+        result = try run(alloc, binding, options, .{ .checkpoint = .{ .ptr = &budget, .check = Budget.check } }, .{ .operation_id = "continuous-ingestion", .dry_run = false, .exclusive_ownership = true, .retain_ms = 600000, .keep_latest = 1 }, &.{});
+        deleted += result.deleted_objects;
+    }
+    try std.testing.expect(result.complete and !result.conflicted);
+    try std.testing.expect(deleted != 0);
+    try std.testing.expectEqual(@as(usize, 20), result.expired_snapshots);
+    const current = try authority.load(a);
+    try std.testing.expectEqual(@as(u64, 20 + turns), try ingestion.coverage(a, current));
 }

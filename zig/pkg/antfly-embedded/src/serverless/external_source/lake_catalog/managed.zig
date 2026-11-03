@@ -22,6 +22,11 @@ const metadata = @import("metadata.zig");
 const A = std.mem.Allocator;
 const retired = @import("retirement_index.zig");
 const reachability = @import("reachability.zig");
+pub const ReferenceRequest = struct {
+    objects: []const []const u8,
+    /// Zero only looks up an existing proof and never advances bootstrap.
+    max_steps: usize = types.max_reference_steps,
+};
 pub const Retirement = struct { id: []const u8, expected_metadata_location: []const u8, expected_version: []const u8, objects: []const []const u8 };
 
 pub const Record = struct {
@@ -189,27 +194,30 @@ pub const Managed = struct {
         defer p.deinit();
         return self.loadCommitted(a, p.value);
     }
-    fn referencesFor(self: *const Managed, a: A, table: types.Table, objects: []const []const u8) !types.References {
+    fn referencesFor(self: *const Managed, a: A, table: types.Table, objects: []const []const u8, max_steps: usize) !types.References {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
         const files: @import("row_commit.zig").Files = .{ .client = self.client, .bucket = self.bucket, .prefix = self.prefix, .uri = try self.artifactUri(scratch), .context = self.context };
         var builder = reachability.Builder.init(scratch, files, try self.catalogKey(scratch, "reachability"), try self.catalogKey(scratch, "head.json"));
         defer builder.deinit();
-        const proof = try builder.step(scratch, table);
+        const proof = try builder.step(scratch, table, max_steps);
         const flags = try a.alloc(bool, if (proof.ready) objects.len else 0);
         errdefer a.free(flags);
         if (proof.ready) {
             for (objects, flags) |uri, *flag| flag.* = try builder.contains(proof.members, uri);
         }
         // The public wrapper owns table; internal retirement borrows it.
-        return .{ .table = table, .ready = proof.ready, .referenced = flags };
+        return .{ .table = table, .ready = proof.ready, .referenced = flags, .steps = proof.steps };
     }
     pub fn references(self: *const Managed, a: A, objects: []const []const u8) !types.References {
-        if (objects.len > 4096) return error.InvalidLakeRetirement;
+        return self.referencesBounded(a, .{ .objects = objects });
+    }
+    pub fn referencesBounded(self: *const Managed, a: A, request: ReferenceRequest) !types.References {
+        if (request.objects.len > 4096 or request.max_steps > types.max_reference_steps) return error.InvalidLakeRetirement;
         var table = try self.load(a);
         errdefer table.deinit(a);
-        return self.referencesFor(a, table, objects);
+        return self.referencesFor(a, table, request.objects, request.max_steps);
     }
     /// Atomically publish irreversible retirements through the same HEAD CAS
     /// as ordinary commits. A writer that read before this CAS must conflict;
@@ -244,11 +252,11 @@ pub const Managed = struct {
         var index = retired.Index.init(a, self.client, self.bucket, try self.catalogKey(scratch, "retirements"), self.context);
         defer index.deinit();
         // Only catalog-owned, exact-metadata proofs authorize retirement.
-        // A deadline-bound maintenance call yields after one bootstrap step.
+        // Deadline-bound retirement only consumes an already prepared proof.
         while (true) {
             var work = std.heap.ArenaAllocator.init(a);
             defer work.deinit();
-            const refs = try self.referencesFor(work.allocator(), table, request.objects);
+            const refs = try self.referencesFor(work.allocator(), table, request.objects, if (self.context.deadline_ns != null) 0 else types.max_reference_steps);
             if (refs.ready) {
                 for (refs.referenced) |referenced| if (referenced) return error.LakeObjectStillReferenced;
                 break;

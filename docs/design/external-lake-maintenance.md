@@ -139,16 +139,24 @@ nodes are embedded before deciding which nodes need uploads. Planning cursors
 cover both snapshots and manifests, and the final intent rechecks fresh catalog
 references and protected snapshots, so ingestion can continue between turns.
 The managed catalog checkpoints an exact-metadata live-root proof independently
-of deletion traversal. Each bootstrap turn processes at most 64 membership or
-edge steps and two new Avro inputs, reserving time to publish its checkpoint.
+of deletion traversal. Reachability and traversal share a 64-step mutation
+budget; bootstrap also bounds read-only shared-manifest edges at 4,096 and new
+Avro inputs at four, reserving time to publish its checkpoint.
 Immutable inventories use authenticated chunks packed in one object per source;
 cold workers seek directly to their chunk with range reads. Both selection and
 authoritative retirement reuse the complete proof across retirement-only HEAD
 changes. Append-only metadata changes preserve partial progress; removed or
-replaced roots rebuild the exact live set from cached inventories. A newly built
-proof is consumed on a later turn so bootstrap and traversal write budgets do not
-stack. Retirement still validates the current catalog version and publishes its
+replaced roots rebuild the exact live set from cached inventories. A completed
+proof is usable immediately, with traversal limited to the remaining mutation
+budget. Continuous ingestion therefore need not leave an idle metadata turn.
+The final membership lookup is read-only; deadline-bound retirement consumes an
+already prepared proof, validates the current catalog version and publishes its
 fence through HEAD CAS.
+
+Planning uses the same inventory format in its private journal lane, with source
+and cache credentials kept separate. Large manifest lists are cached once, then
+resumed by chunk ranges. Crossing the soft read quantum cannot force each retry
+to reread the source list without advancing its manifest cursor.
 
 Execution checkpoints the reader-retirement barrier and each catalog-fenced
 physical deletion batch. The sweep stores its current frame, immutable parent

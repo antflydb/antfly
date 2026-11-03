@@ -761,6 +761,11 @@ closed, including during cached reads. Before shared-file deletion, the managed
 catalog requires a complete reachability proof bound to the exact metadata
 document. It checkpoints bootstrap work, caches immutable manifest inventories,
 and shares that proof between vacuum selection and authoritative retirement.
+A completed proof is usable in the same turn; marking and traversal share one
+mutation budget, so continuous catalog advancement does not require a pause in
+ingestion. Final membership lookup and deadline-bound retirement consume the
+prepared proof without starting another mark pass. Planning caches large source
+manifest lists in its private journal and resumes chunk ranges across turns.
 Retirement-only HEAD changes reuse the proof. Append-only root changes extend
 partially completed work; root removal or replacement rebuilds the exact set
 from cached inventories. Every retirement still uses the current HEAD CAS.
