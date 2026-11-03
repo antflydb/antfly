@@ -2232,6 +2232,7 @@ pub const ComputeBackend = struct {
         packedQkvRope: ?*const fn (ctx: *anyopaque, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) anyerror!?SplitLastDim3Result = null,
         ensureDeviceResident: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
         conv1dIm2col: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, in_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize, time_major: bool) anyerror!?CT = null,
+        whisperPrepareCrossKv: ?*const fn (ctx: *anyopaque, k: CT, v: CT) anyerror!?LinearNoBiasPairResult = null,
         whisperLogitsStatsEncode: ?*const fn (ctx: *anyopaque, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool = null,
         whisperLogitsStatsRead: ?*const fn (ctx: *anyopaque, slot: usize, out: *WhisperLogitsStatsRaw) bool = null,
         whisperGrammarWrite: ?*const fn (ctx: *anyopaque, state: *const WhisperGrammarState) bool = null,
@@ -4248,6 +4249,13 @@ pub const ComputeBackend = struct {
 
     pub fn packedQkvRope(self: *const ComputeBackend, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) !?SplitLastDim3Result {
         if (self.vtable.packedQkvRope) |f| return f(self.ptr, input, positions, hidden, head_dim, theta);
+        return null;
+    }
+
+    /// Return new immutable, backend-preferred cross-attention caches.
+    /// Inputs remain owned by the caller; null retains their current format.
+    pub fn whisperPrepareCrossKv(self: *const ComputeBackend, k: CT, v: CT) !?LinearNoBiasPairResult {
+        if (self.vtable.whisperPrepareCrossKv) |f| return f(self.ptr, k, v);
         return null;
     }
 

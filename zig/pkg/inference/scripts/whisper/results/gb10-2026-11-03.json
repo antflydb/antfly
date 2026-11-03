@@ -1,0 +1,216 @@
+{
+  "kind": "development qualification; not a production promotion receipt",
+  "date": "2026-11-03",
+  "source_state": "uncommitted feat/cloud-cuda-transcription worktrees",
+  "antfly_base": "7cf3812a345c2f483cc0042bdb790ead6b43ce1c",
+  "colony_base": "5fe560a54ad8900c507625db79215a5ae094c344",
+  "source_sha256": {
+    "zig/lib/audio/src/mod.zig": "93f60948fa54d62f897fe83e5327d32b45dda008187831277f266e97c2853daa",
+    "zig/pkg/inference/build.zig": "74415cc228c174cc1de18cb83560ef23a642c17520ba49f24cbf5e27ef4def02",
+    "zig/pkg/inference/src/architectures/session_factory.zig": "05d6d5d2b3df5a0de4b54ceefc8dd0531b1d870fdd1db675e0aad16a8b76e599",
+    "zig/pkg/inference/src/architectures/whisper.zig": "476351018f72e28709080f69e9b93d7272995f8360e30b6e80e6a1a5ab65740f",
+    "zig/pkg/inference/src/native_transcribe.zig": "1f2d3de30fd5592ca773a1e119e6d36a2a1c10c29df338ffdfa6f7cd54f464f2",
+    "zig/pkg/inference/src/ops/ops.zig": "0de2cd468dad1b522ca6eb2dc29e0f98efd7976937c5bd7427befb8ef806c012",
+    "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "b5fd723f646651c4d1f989c11bfe97b7b49de9a8a5cce75cd14a19acb92f5e33",
+    "zig/pkg/inference/src/ops/cuda/cudnn_sdpa.zig": "0ffec2803477b1bf3895a9af345dc528b373250da49102d2580bfcb8d9bdce2e",
+    "zig/pkg/inference/src/ops/cuda/whisper_cuda.zig": "6cebd761804c4790f31aa6e2a06c5bed63fce2f16e85be5bc2824bb7ca9a8b5b",
+    "zig/pkg/inference/src/ops/cuda/whisper_kernels.cu": "ab07df7bb513bbee542c749c171b73b607a5b2aebafbacf24db1f470ad95db6a",
+    "zig/pkg/inference/scripts/whisper/benchmark.py": "fb295e94ffeec224c9b38961ac115689b7c104ce0384d14a3495716fdfbc464e",
+    "zig/pkg/inference/scripts/whisper/regen-kernels.sh": "e9810a1a82b9cf302480269d07b70460bda6d9f9fec6fd24859c20649fcda278"
+  },
+  "hardware_and_weights": {
+    "gpu": "NVIDIA GB10, 580.178.04, 12.1",
+    "baseline_revision": "4da27c41cebadb3cbbcd2563e9c7cbc8d84bdcad",
+    "weights_sha256": {
+      ".benchmark-assets/models/whisper-small-xet/model.safetensors": "1d7734884874f1a1513ed9aa760a4f8e97aaa02fd6d93a3a85d27b2ae9ca596b",
+      ".benchmark-assets/models/whisper-cpp/ggml-small.bin": "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"
+    }
+  },
+  "artifacts": {
+    "source_sha256": "ab07df7bb513bbee542c749c171b73b607a5b2aebafbacf24db1f470ad95db6a",
+    "architectures": [
+      75,
+      80,
+      89,
+      90,
+      100,
+      110,
+      120
+    ],
+    "artifact_sha256": {
+      "ptx": "b030401606be5280d0d917076f9feda707048b85e744dfac8a56794ccc833b21",
+      "fatbin": "4d09d077605a54042e732a03599a9349f1e47ba2ab411549d830bd3f74c0e2b8",
+      "cubin": "641338425ea60e934f3a1d327d1e50a6836e2f7d3245cddd16938732bd04231d"
+    },
+    "compiler": "nvcc 13.2.86",
+    "portable_compiler": "CUDA 13.2; compute_75; PTX 9.2",
+    "purpose": "Whisper CUDA kernels; architecture coverage is not performance qualification"
+  },
+  "verification": {
+    "cuda_selected": {
+      "passed": 46,
+      "failed": 0,
+      "leaked": 0
+    },
+    "cpu_selected": {
+      "passed": 52,
+      "skipped": 7,
+      "failed": 0
+    },
+    "artifact_regeneration_check": "passed",
+    "fatbin_machine_code_verified": [
+      75,
+      80,
+      89,
+      90,
+      100,
+      110,
+      120
+    ],
+    "colony_inference_package": "passed",
+    "colony_infrastructure_build_and_tests": "passed",
+    "full_colony_go_suite": "failed: integration tests require unavailable external Antfly at localhost:8080",
+    "acceptance_runner": "syntax and quality-gate checks passed; live run pending"
+  },
+  "current_source_accuracy_under_shared_gpu_load": {
+    "english": {
+      "trials": 100,
+      "audio_sha256": "904c039735a6eec4186bed49369408638421937fb02104729afafea8c41b266d",
+      "maximum_wer": 0.1,
+      "actual_maximum_wer": {
+        "antfly": 0.0,
+        "whisper_cpp": 0.0
+      }
+    },
+    "timestamps": {
+      "trials": 100,
+      "audio_sha256": "904c039735a6eec4186bed49369408638421937fb02104729afafea8c41b266d",
+      "maximum_wer": 0.1,
+      "actual_maximum_wer": {
+        "antfly": 0.0,
+        "whisper_cpp": 0.0
+      }
+    },
+    "spanish": {
+      "trials": 100,
+      "audio_sha256": "c656aaeeb98a4239f9f0f6ab05eed6e76424b9b073caa0090ac6ac35d7312b35",
+      "maximum_wer": 0.3,
+      "actual_maximum_wer": {
+        "antfly": 0.18181818181818182,
+        "whisper_cpp": 0.18181818181818182
+      }
+    }
+  },
+  "performance_status": "pending an uncontended GPU window",
+  "excluded_timing_run": {
+    "reason": "Another unified-execution-bench process from 1166-bank-v41-validation was active on the GPU; run aborted. These timings are not qualification evidence.",
+    "observed_gpu_processes": [
+      {
+        "apps": "3756260, /srv/antfly/bin/antfly\n892737, .benchmark-assets/whisper.cpp/build/bin/whisper-server\n951794, .benchmark-assets/antfly-inference-http-gelu\n953283, /home/ajroetker/antfly/.worktrees/1166-bank-v41-validation/zig-out/perf-v79/bin/antfly-inference-unified-execution-bench",
+        "utilization": "96 %"
+      },
+      {
+        "apps": "3756260, /srv/antfly/bin/antfly\n892737, .benchmark-assets/whisper.cpp/build/bin/whisper-server\n951794, .benchmark-assets/antfly-inference-http-gelu\n953283, /home/ajroetker/antfly/.worktrees/1166-bank-v41-validation/zig-out/perf-v79/bin/antfly-inference-unified-execution-bench",
+        "utilization": "92 %"
+      },
+      {
+        "apps": "3756260, /srv/antfly/bin/antfly\n892737, .benchmark-assets/whisper.cpp/build/bin/whisper-server\n951794, .benchmark-assets/antfly-inference-http-gelu\n953315, /home/ajroetker/antfly/.worktrees/1166-bank-v41-validation/zig-out/perf-v79/bin/antfly-inference-unified-execution-bench",
+        "utilization": "96 %"
+      },
+      {
+        "apps": "3756260, /srv/antfly/bin/antfly\n892737, .benchmark-assets/whisper.cpp/build/bin/whisper-server\n951794, .benchmark-assets/antfly-inference-http-gelu\n953315, /home/ajroetker/antfly/.worktrees/1166-bank-v41-validation/zig-out/perf-v79/bin/antfly-inference-unified-execution-bench",
+        "utilization": "0 %"
+      },
+      {
+        "apps": "3756260, /srv/antfly/bin/antfly\n892737, .benchmark-assets/whisper.cpp/build/bin/whisper-server\n951794, .benchmark-assets/antfly-inference-http-gelu\n953315, /home/ajroetker/antfly/.worktrees/1166-bank-v41-validation/zig-out/perf-v79/bin/antfly-inference-unified-execution-bench",
+        "utilization": "7 %"
+      }
+    ],
+    "server_cpu_affinity": {
+      "892737": {
+        "executable": ".benchmark-assets/whisper.cpp/build/bin/whisper-server",
+        "threads": [
+          892737,
+          892748,
+          892749,
+          892753,
+          892754,
+          892755,
+          892756,
+          892757,
+          892758,
+          892759,
+          892760,
+          892761,
+          892762,
+          892763,
+          892764,
+          892765,
+          892766,
+          892767,
+          892768,
+          892769,
+          892770,
+          892771,
+          892772
+        ],
+        "cpu_affinity": [
+          15,
+          16,
+          17,
+          18
+        ]
+      },
+      "951792": {
+        "executable": ".benchmark-assets/antfly-inference-http-gelu",
+        "threads": [
+          951792
+        ],
+        "cpu_affinity": [
+          15,
+          16,
+          17,
+          18
+        ]
+      },
+      "951794": {
+        "executable": ".benchmark-assets/antfly-inference-http-gelu",
+        "threads": [
+          951794,
+          951795,
+          951796,
+          951797,
+          951798,
+          951799,
+          951800,
+          951801
+        ],
+        "cpu_affinity": [
+          15,
+          16,
+          17,
+          18
+        ]
+      }
+    },
+    "client_cpu_affinity": [
+      19
+    ]
+  },
+  "production_accepted": false,
+  "production_status": "New immutable runtime image, human-run rollout, and live cloud_transcription.py acceptance remain required.",
+  "colony_source_sha256": {
+    "go/pkg/colony/antfly_inference/edge.go": "28f4d59e5d8084e9b5a02958863cf2625ceda85afa4e316f122c146ab193f580",
+    "go/pkg/colony/antfly_inference/model_instances.go": "843cdd61277f9353f50458c8cef1a5f70fc41649a61961a03f1ff06e03c03f3b",
+    "go/pkg/colony/antfly_inference/model_instances_test.go": "9487b40fb202ebacd749f75b4233713909fc36e03f35c6da7aed3dd050a13d7d",
+    "go/pkg/colony/antfly_inference/transcribe_test.go": "6dfb4e967ea06feeb9513a31f2cdadcf935318ed1f5f3e67adf69b7dc3438c51",
+    "go/pkg/colony/antfly_inference/transcription_routing_test.go": "d04d6a1a8f65475a5895a054bbf9fa1376948b2ba4f97659a98e756ee79eb3bf",
+    "infra/src/antfly_inference/transcription_gpu_contract_test.go": "ef27d3a2e269facf9f5e2baca9eefa316f5f1cd521e81eb2b792fa92fd2c8156",
+    "infra/antfly-inference-candidates/transcription/pool.yaml": "45950df600299141f0a916595fde76c89e20e2ec80c957f6ca0cfa394d6440c0",
+    "infra/antfly-inference-candidates/transcription/route.yaml": "b1997f4a67e787ec4745b5dfec19c20fb4ea74f225a7692dde944ca9b4c0a943",
+    "scripts/acceptance/cloud_transcription.py": "d092863a00f9496aa679936a349fdc7e7639c794f8c742cb6c8d522d423e07d2"
+  },
+  "complete": false,
+  "benchmark_servers_stopped": true,
+  "publication_note": "Repository license headers applied before publication; regenerated CUDA artifact bytes are unchanged and regeneration check passed."
+}
