@@ -603,7 +603,11 @@ not enabled by this path.
 Each publication-worker pass group-commits the pending WAL suffix. Contiguous
 accepted transactions that share a source, epoch and key definition, and whose
 checkpoints chain exactly, fold into one Iceberg snapshot of at most 16,384
-changes and 8 MiB of payload. The snapshot's coverage is the group's last LSN
+changes and 8 MiB of payload. A forward reader shares one pinned WAL index
+traversal and hydrates only the group plus at most one lookahead transaction;
+saved intents replay without rereading pending payloads. Groups stop before a
+checkpoint cycle would make the final checkpoint equal the initial predecessor.
+The snapshot's coverage is the group's last LSN
 and its checkpoint is the last member's checkpoint. Later images of a key replace
 earlier ones, so the result equals committing each member in order. A lone
 transaction keeps its original batch and attempt identity. The saved intent is
@@ -620,8 +624,10 @@ leave their replacement rows visible. Unpartitioned manifests allow global key
 deletes across existing partition specs without rewriting historical files.
 Existing manifest references are retained in the new snapshot. Once 100 small
 (below 1 MiB) Antfly-written unpartitioned manifests of one content kind
-accumulate, the next commit rewrites them as one manifest whose entries keep
-their original snapshot and sequence numbers with EXISTING status. Manifests that
+accumulate, the next commit rewrites them into manifests of at most 1 MiB each.
+Input decoding uses bounded batches, and exact encoded output checks split batches
+when schema or sequence encoding would exceed the target. Entries keep their
+original snapshot and sequence numbers with EXISTING status. Manifests that
 carry partitions or column bounds are never merged. Without merging, each commit
 and each reader's planning step would grow with the total number of commits.
 Commits also trim `metadata-log` to the newest
@@ -718,7 +724,9 @@ Vacuum first expires unprotected Iceberg snapshots through the catalog CAS,
 then marks retained snapshot file graphs and sweeps only unreachable objects
 with native ownership proofs. One job expires at most `max_expired` (default
 256) eligible snapshots, oldest first, and reports the rest as
-`remaining_snapshots`. Within a job each immutable manifest is read once, even
+`remaining_snapshots`. This backlog is recomputed from current catalog metadata
+on every job turn, including saved-job replay after restarts or deletion limits.
+Within a job each immutable manifest is read once, even
 though snapshots carry their ancestors' manifests forward. When a scheduled job
 completes with a backlog, the scheduler plans the next bounded job immediately
 under a fresh operation ID. A large backlog therefore drains over consecutive

@@ -145,6 +145,48 @@ pub const max_group_payload_bytes: usize = 8 * 1024 * 1024;
 /// A contiguous accepted WAL suffix folded into one source transaction.
 pub const Group = struct { batch: Batch, first_lsn: u64, last_lsn: u64, records: usize };
 
+const GroupBuilder = struct {
+    result: Group,
+    changes: std.ArrayList(Batch.Change) = .empty,
+    bytes: usize,
+    tail: Batch,
+
+    fn init(a: A, record: wal.Record) !GroupBuilder {
+        const first = try std.json.parseFromSliceLeaky(Batch, a, record.payload, .{ .allocate = .alloc_always });
+        return .{ .result = .{ .batch = first, .first_lsn = record.lsn, .last_lsn = record.lsn, .records = 1 }, .bytes = record.payload.len, .tail = first };
+    }
+    fn full(self: GroupBuilder, max_changes: usize, max_bytes: usize) bool {
+        const count = if (self.result.records == 1) self.result.batch.changes.len else self.changes.items.len;
+        return count >= max_changes or self.bytes >= max_bytes;
+    }
+    fn add(self: *GroupBuilder, a: A, record: wal.Record, max_changes: usize, max_bytes: usize) !bool {
+        if (self.full(max_changes, max_bytes) or record.lsn != self.result.last_lsn + 1) return false;
+        if (record.payload.len > max_bytes - self.bytes) return false;
+        const next = try std.json.parseFromSliceLeaky(Batch, a, record.payload, .{ .allocate = .alloc_always });
+        const count = if (self.result.records == 1) self.result.batch.changes.len else self.changes.items.len;
+        if (next.changes.len > max_changes - count) return false;
+        if (!matchesPrevious(self.tail, next) or !keyFieldsEqual(self.tail.key_fields, next.key_fields)) return false;
+        // Checkpoints are opaque: a valid chain can revisit its starting value.
+        // Such a chain cannot be represented by one row batch (which forbids
+        // equal predecessor/successor), so leave this member for the next pass.
+        if (self.result.batch.expected_checkpoint) |initial| if (std.mem.eql(u8, initial, next.checkpoint)) return false;
+        if (self.result.records == 1) try self.changes.appendSlice(a, self.result.batch.changes);
+        try self.changes.appendSlice(a, next.changes);
+        self.bytes += record.payload.len;
+        self.result.last_lsn = record.lsn;
+        self.result.records += 1;
+        self.tail = next;
+        return true;
+    }
+    fn finish(self: *GroupBuilder, a: A) !Group {
+        if (self.result.records == 1) return self.result;
+        self.result.batch.batch_id = try std.fmt.allocPrint(a, "wal-group-{d}-{d}", .{ self.result.first_lsn, self.result.last_lsn });
+        self.result.batch.checkpoint = self.tail.checkpoint;
+        self.result.batch.changes = self.changes.items;
+        return self.result;
+    }
+};
+
 /// Fold the longest admissible prefix of `records` into one transaction.
 /// Members must share source, epoch and key definition and chain their
 /// checkpoints exactly. Later images of a key replace earlier ones when the
@@ -152,29 +194,19 @@ pub const Group = struct { batch: Batch, first_lsn: u64, last_lsn: u64, records:
 /// A single record is returned unchanged. Allocations belong to `a`.
 pub fn group(a: A, records: []const wal.Record, max_changes: usize, max_bytes: usize) !Group {
     if (records.len == 0) return error.InvalidWal;
-    const first = try std.json.parseFromSliceLeaky(Batch, a, records[0].payload, .{ .allocate = .alloc_always });
-    var result: Group = .{ .batch = first, .first_lsn = records[0].lsn, .last_lsn = records[0].lsn, .records = 1 };
-    var changes: std.ArrayList(Batch.Change) = .empty;
-    try changes.appendSlice(a, first.changes);
-    var bytes: usize = records[0].payload.len;
-    var tail = first;
-    for (records[1..]) |record| {
-        if (record.lsn != result.last_lsn + 1) break;
-        if (bytes + record.payload.len > max_bytes) break;
-        const next = try std.json.parseFromSliceLeaky(Batch, a, record.payload, .{ .allocate = .alloc_always });
-        if (changes.items.len + next.changes.len > max_changes) break;
-        if (!matchesPrevious(tail, next) or !keyFieldsEqual(tail.key_fields, next.key_fields)) break;
-        try changes.appendSlice(a, next.changes);
-        bytes += record.payload.len;
-        result.last_lsn = record.lsn;
-        result.records += 1;
-        tail = next;
+    var builder = try GroupBuilder.init(a, records[0]);
+    for (records[1..]) |record| if (!try builder.add(a, record, max_changes, max_bytes)) break;
+    return builder.finish(a);
+}
+
+fn readGroup(a: A, reader: *wal.Store.Reader, max_changes: usize, max_bytes: usize) !?Group {
+    const first = (try reader.next(a)) orelse return null;
+    var builder = try GroupBuilder.init(a, first);
+    while (!builder.full(max_changes, max_bytes)) {
+        const record = (try reader.next(a)) orelse break;
+        if (!try builder.add(a, record, max_changes, max_bytes)) break;
     }
-    if (result.records == 1) return result;
-    result.batch.batch_id = try std.fmt.allocPrint(a, "wal-group-{d}-{d}", .{ result.first_lsn, result.last_lsn });
-    result.batch.checkpoint = tail.checkpoint;
-    result.batch.changes = changes.items;
-    return result;
+    return try builder.finish(a);
 }
 
 /// The WAL coverage a prepared commit body publishes. Saved intents carry it
@@ -207,23 +239,9 @@ pub fn drainBounded(a: A, binding: Binding, options: Options, context: Context, 
     var current = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
     defer current.deinit(a);
     const cut = try coverage(a, current.table);
-    // Read the bounded pending suffix once. An oversized suffix still makes
-    // progress one transaction at a time.
-    const records: []const wal.Record = suffix: {
-        const pending_range = store.range(scratch, cut) catch |err| switch (err) {
-            error.LakeOverlayTooLarge => {
-                const one = (try store.next(scratch, cut)) orelse return false;
-                break :suffix try scratch.dupe(wal.Record, &.{one});
-            },
-            else => return err,
-        };
-        break :suffix pending_range.records;
-    };
-    if (records.len == 0) return false;
-    if (records[0].lsn != cut + 1) return error.LakeWalCoverageGap;
-    // The intent key names the group's first LSN. A saved intent pins the
-    // exact group chosen before a crash, even if more records arrived since.
-    const intent_key = try std.fmt.allocPrint(scratch, "{s}/active/{d}.json", .{ base, records[0].lsn });
+    // Resolve saved intents before touching WAL payloads. A retry publishes
+    // exactly its original group, independently of the current pending suffix.
+    const intent_key = try std.fmt.allocPrint(scratch, "{s}/active/{d}.json", .{ base, cut + 1 });
     var client = opened.client;
     var saved = client.getObject(opened.bucket, intent_key, .{ .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
         error.NotFound, error.ObjectNotFound, error.FileNotFound => null,
@@ -232,13 +250,15 @@ pub fn drainBounded(a: A, binding: Binding, options: Options, context: Context, 
     defer if (saved) |*value| value.deinit(client.allocator);
     var attempt: Attempt = undefined;
     if (saved) |value| attempt = try std.json.parseFromSliceLeaky(Attempt, scratch, value.body, .{}) else {
+        var reader = try store.reader(scratch, cut);
+        defer reader.deinit();
+        const planned = (try readGroup(scratch, &reader, max_changes, max_bytes)) orelse return false;
         var source_options = options;
         source_options.read_only = false;
         var files = try configured.openBindingObjectStoreAlloc(a, binding, source_options);
         defer files.deinit();
         const timestamp: i64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
         const destination = try destinationFiles(scratch, files, binding.source_uri, context);
-        const planned = try group(scratch, records, max_changes, max_bytes);
         const built = try catalog.row_commit.prepare(scratch, current.table, destination, planned.batch, planned.last_lsn, timestamp);
         const id = if (planned.records == 1) try attemptId(scratch, planned.first_lsn, current.table) else try groupAttemptId(scratch, planned.first_lsn, planned.last_lsn, current.table);
         attempt = .{ .id = id, .expected = current.table.metadata_location, .body = built.body, .timestamp_ms = timestamp };
@@ -581,6 +601,59 @@ test "external lake filesystem WAL group commit folds pending transactions into 
     try std.testing.expectEqual(@as(usize, 2), list.entries.len);
     try std.testing.expectEqual(@as(u64, 1), list.entries[0].added_rows_count);
     try std.testing.expectEqual(@as(u64, 2), list.entries[1].added_rows_count);
+    // Opaque checkpoints may revisit a prior value. Both transactions are
+    // admitted, but folding 5 -> 6 -> 5 must not create a forbidden no-op batch.
+    const cycle = [_][]const u8{
+        "{\"batch_id\":\"cycle-a\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"5\",\"checkpoint\":\"6\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":5}}]}",
+        "{\"batch_id\":\"cycle-b\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"6\",\"checkpoint\":\"5\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"delete\",\"row\":{\"id\":5}}]}",
+    };
+    for (cycle, 6..) |payload, lsn| try std.testing.expectEqual(@as(u64, lsn), try accept(a, binding, options, .{}, payload));
+    try std.testing.expect(try drain(a, binding, options, .{}));
+    try std.testing.expectEqual(@as(u64, 6), try coverage(a, try managed.load(a)));
+    try std.testing.expect(try drain(a, binding, options, .{}));
+    try std.testing.expectEqual(@as(u64, 7), try coverage(a, try managed.load(a)));
+    try std.testing.expect(!try drain(a, binding, options, .{}));
     // The exact original requests stay receipts after their group publishes.
     try std.testing.expectEqual(@as(u64, 2), try accept(a, binding, options, .{}, payloads[1]));
+}
+
+test "external lake WAL group reader stops before hydrating a bounded pending suffix" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = @import("objectstore").MemoryClient.init(alloc);
+    defer memory.deinit();
+    const store: wal.Store = .{ .client = memory.client(), .bucket = "archive", .prefix = "bounded-group" };
+    // Seed the shared WAL's supported unpacked layout. Its large-payload
+    // fixture is independent of the packed-page writer's batch-size ceiling.
+    var seed = try store.open(a, true);
+    defer seed.deinit();
+    seed.indexed.?.packed_pages_enabled = false;
+    const row = try std.json.parseFromSliceLeaky(V, a, "{\"id\":1}", .{});
+    for (0..4) |i| {
+        const batch: Batch = .{ .batch_id = try std.fmt.allocPrint(a, "b{d}", .{i}), .source = "s", .epoch = "1", .expected_checkpoint = try std.fmt.allocPrint(a, "{d}", .{i}), .checkpoint = try std.fmt.allocPrint(a, "{d}", .{i + 1}), .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = row }} };
+        _ = try seed.indexed.?.appendIdempotent(store.collectionNamespace(), 0, try std.json.Stringify.valueAlloc(a, batch, .{}), batch.batch_id);
+    }
+    // More than range()'s 32 MiB budget follows the group. No later payload
+    // needs parsing or hydrating just to commit the first two changes.
+    const large = try a.alloc(u8, 1024 * 1024);
+    @memset(large, 'x');
+    for (4..40) |i| _ = try seed.indexed.?.appendIdempotent(store.collectionNamespace(), 0, large, try std.fmt.allocPrint(a, "b{d}", .{i}));
+    var reader = try store.reader(a, 0);
+    defer reader.deinit();
+    const first = (try readGroup(a, &reader, 2, max_group_payload_bytes)).?;
+    try std.testing.expectEqual(@as(usize, 2), first.records);
+    try std.testing.expectEqual(@as(u64, 2), first.last_lsn);
+    try std.testing.expectEqual(@as(u64, 2), reader.position);
+    const second = (try readGroup(a, &reader, 2, max_group_payload_bytes)).?;
+    try std.testing.expectEqual(@as(u64, 3), second.first_lsn);
+    try std.testing.expectEqual(@as(u64, 4), second.last_lsn);
+    try std.testing.expectEqual(@as(u64, 4), reader.position);
+    // A byte-bound group consumes at most one lookahead, never the full suffix.
+    var byte_reader = try store.reader(a, 0);
+    defer byte_reader.deinit();
+    const one = (try readGroup(a, &byte_reader, max_group_changes, 1)).?;
+    try std.testing.expectEqual(@as(usize, 1), one.records);
+    try std.testing.expectEqual(@as(u64, 1), byte_reader.position);
 }

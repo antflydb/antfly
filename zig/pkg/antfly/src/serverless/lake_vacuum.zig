@@ -151,11 +151,9 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
             const id = try catalog.metadata.int(try catalog.metadata.get(snapshot, "snapshot-id"));
             const text = try std.fmt.allocPrint(scratch, "{d}", .{id});
             if (keep.contains(text)) continue;
-            // Count the backlog without reading pins or manifests for it.
-            if (ids.items.len == request.max_expired) {
-                result.remaining_snapshots += 1;
-                continue;
-            }
+            // Do not read pins or manifests beyond this job's bound. The
+            // backlog is counted below from the post-commit authority.
+            if (ids.items.len == request.max_expired) continue;
             if ((try pin_store.deadline(a, text)) +| pins.grace_ns >= now_ns) continue;
             try retired.append(scratch, .{ .snapshot = text, .objects = try collectSnapshot(scratch, destination, snapshot, &budget, &manifests) });
             try ids.append(scratch, id);
@@ -192,6 +190,11 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
     var latest = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
     defer latest.deinit(a);
     const live_root = try catalog.metadata.parse(scratch, latest.table.metadata_json);
+    // Backlog is derived from current authority on every turn, including saved
+    // job replay. It must not disappear after a timeout, deletion limit or pin.
+    const now_ms: i64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+    const before = now_ms -| (std.math.cast(i64, request.retain_ms) orelse return error.InvalidLakeMaintenanceLimits);
+    const keep = try retainedIds(scratch, live_root, protected, request.keep_latest, before);
     var marked: std.StringHashMapUnmanaged(void) = .empty;
     inline for (.{ "statistics", "partition-statistics" }) |kind| {
         if (live_root.object.get(kind)) |entries| {
@@ -205,6 +208,7 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
             if (std.mem.eql(u8, old.snapshot, id)) break true;
         } else false;
         if (request.dry_run and expired) continue;
+        if (!keep.contains(id)) result.remaining_snapshots += 1;
         for (try collectSnapshot(scratch, destination, snapshot, &budget, &manifests)) |uri| try marked.put(scratch, uri, {});
     }
     // Finish the full reader mark phase before deleting any shared object.
@@ -431,12 +435,27 @@ test "external lake vacuum expires a large backlog in bounded oldest-first jobs"
     }
     const expected = [_][2]usize{ .{ 2, 3 }, .{ 2, 1 }, .{ 1, 0 } };
     for (expected, 0..) |counts, pass| {
-        const result = try run(alloc, binding, options, .{}, .{ .operation_id = try std.fmt.allocPrint(a, "vacuum-{d}", .{pass}), .dry_run = false, .exclusive_ownership = true, .retain_ms = 10 * 60 * 1000, .keep_latest = 1, .max_expired = 2 }, &.{});
+        const request: Options = .{ .operation_id = try std.fmt.allocPrint(a, "vacuum-{d}", .{pass}), .dry_run = false, .exclusive_ownership = true, .retain_ms = 10 * 60 * 1000, .keep_latest = 1, .max_expired = 2, .max_deleted = 1 };
+        var result = try run(alloc, binding, options, .{}, request, &.{});
+        if (pass == 0) try std.testing.expect(!result.complete);
+        var deleted = result.deleted_objects;
+        // A deletion-limited job spans turns; every turn must retain backlog.
+        var turns: usize = 0;
+        while (!result.complete and turns < 16) : (turns += 1) {
+            try std.testing.expectEqual(counts[1], result.remaining_snapshots);
+            result = try run(alloc, binding, options, .{}, request, &.{});
+            deleted += result.deleted_objects;
+        }
         try std.testing.expect(result.complete and !result.conflicted);
         try std.testing.expectEqual(counts[0], result.expired_snapshots);
         try std.testing.expectEqual(counts[1], result.remaining_snapshots);
+        // Reopen the saved immutable job, as after a lost response/restart.
+        // Older jobs have no persisted backlog field; derive it from authority.
+        const replay = try run(alloc, binding, options, .{}, request, &.{});
+        try std.testing.expect(replay.complete and !replay.conflicted);
+        try std.testing.expectEqual(counts[1], replay.remaining_snapshots);
         // Expired manifest lists are owned and unreferenced, so they are collected.
-        try std.testing.expect(result.deleted_objects >= counts[0]);
+        try std.testing.expect(deleted >= counts[0]);
     }
     const final = try managed.load(a);
     const root = try catalog.metadata.parse(a, final.metadata_json);

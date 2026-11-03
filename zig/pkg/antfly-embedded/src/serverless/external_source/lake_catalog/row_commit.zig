@@ -207,7 +207,7 @@ pub fn listEntry(a: A, entry: iceberg.ManifestListEntry) !V {
 /// forward. Without merging, commit cost and reader planning grow with the
 /// number of commits. Once `manifest_merge_min_count` small Antfly-written
 /// unpartitioned manifests of one content kind accumulate, they are rewritten
-/// as one manifest whose entries keep their original snapshot and sequence
+/// as bounded manifests whose entries keep their original snapshot and sequence
 /// numbers with EXISTING status (Iceberg's commit.manifest-merge behavior).
 pub const manifest_merge_min_count: usize = 100;
 /// Merged manifests stop growing at this size and leave the merge pool. The
@@ -221,19 +221,52 @@ fn mergeable(entry: iceberg.ManifestListEntry, spec_id: i32) bool {
 }
 fn carryManifests(a: A, files: Files, previous: []const iceberg.ManifestListEntry, manifests: *V, context: MergeContext) !void {
     inline for (.{ iceberg.ManifestContent.data, iceberg.ManifestContent.deletes }) |kind| {
-        var pool: std.ArrayList(iceberg.ManifestListEntry) = .empty;
-        for (previous) |entry| if (entry.content == kind and mergeable(entry, context.spec_id)) try pool.append(a, entry);
-        const merged = if (pool.items.len >= manifest_merge_min_count) try mergeManifests(a, files, pool.items, kind, context) else Merge.unsupported;
-        for (previous) |entry| {
-            if (entry.content != kind) continue;
-            if (merged != .unsupported and mergeable(entry, context.spec_id)) continue;
-            try append(manifests, try listEntry(a, entry));
-        }
-        if (merged == .merged) try append(manifests, merged.merged);
+        try carryManifestKind(a, files, previous, manifests, kind, context);
     }
 }
-const Merge = union(enum) { unsupported, empty, merged: V };
-fn mergeManifests(a: A, files: Files, pool: []const iceberg.ManifestListEntry, comptime kind: iceberg.ManifestContent, context: MergeContext) !Merge {
+fn carryManifestKind(a: A, files: Files, previous: []const iceberg.ManifestListEntry, manifests: *V, comptime kind: iceberg.ManifestContent, context: MergeContext) !void {
+    var pool: std.ArrayList(iceberg.ManifestListEntry) = .empty;
+    for (previous) |entry| if (entry.content == kind and mergeable(entry, context.spec_id)) try pool.append(a, entry);
+    if (pool.items.len < manifest_merge_min_count) {
+        for (previous) |entry| if (entry.content == kind) try append(manifests, try listEntry(a, entry));
+        return;
+    }
+    for (previous) |entry| if (entry.content == kind and !mergeable(entry, context.spec_id)) try append(manifests, try listEntry(a, entry));
+    // Bound decoded input as well as output. An upgrade can encounter an
+    // arbitrarily large pool; never decode the entire pool in one arena.
+    var start: usize = 0;
+    var bytes: u64 = 0;
+    for (pool.items, 0..) |entry, index| {
+        if (bytes + entry.manifest_length > manifest_merge_target_bytes) {
+            try carryMergePool(a, files, pool.items[start..index], manifests, kind, context);
+            start = index;
+            bytes = 0;
+        }
+        bytes += entry.manifest_length;
+    }
+    try carryMergePool(a, files, pool.items[start..], manifests, kind, context);
+}
+const Merge = union(enum) { unsupported, too_large, empty, merged: V };
+fn carryMergePool(a: A, files: Files, pool: []const iceberg.ManifestListEntry, manifests: *V, comptime kind: iceberg.ManifestContent, context: MergeContext) anyerror!void {
+    if (pool.len == 0) return;
+    const merged = if (pool.len > 1) try mergeManifests(a, files, pool, kind, context) else Merge.unsupported;
+    switch (merged) {
+        .unsupported => for (pool) |entry| try append(manifests, try listEntry(a, entry)),
+        .empty => {},
+        .merged => |entry| try append(manifests, entry),
+        // Header/schema and inherited sequence encodings can grow the output.
+        // Split deterministically until every published manifest fits exactly.
+        .too_large => {
+            const middle = pool.len / 2;
+            try carryMergePool(a, files, pool[0..middle], manifests, kind, context);
+            try carryMergePool(a, files, pool[middle..], manifests, kind, context);
+        },
+    }
+}
+fn mergeManifests(alloc: A, files: Files, pool: []const iceberg.ManifestListEntry, comptime kind: iceberg.ManifestContent, context: MergeContext) !Merge {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
     var records = array(a);
     var rows_count: u64 = 0;
     var min_sequence: i64 = std.math.maxInt(i64);
@@ -258,8 +291,9 @@ fn mergeManifests(a: A, files: Files, pool: []const iceberg.ManifestListEntry, c
     if (records.array.items.len == 0) return .empty;
     const label = if (kind == .deletes) "delete" else "data";
     const manifest = try avro.ocf(a, avro.entry_schema, records.array.items, &.{ .{ .key = "schema", .value = context.schema_json }, .{ .key = "partition-spec", .value = "[]" }, .{ .key = "partition-spec-id", .value = context.spec_string }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = if (kind == .deletes) "deletes" else "data" } });
-    const uri = try upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-{s}-merge-{s}.avro", .{ context.digest, label }), manifest);
-    return .{ .merged = try json(a, .{ .manifest_path = uri, .manifest_length = manifest.len, .partition_spec_id = context.spec_id, .content = if (kind == .deletes) @as(i32, 1) else @as(i32, 0), .sequence_number = context.sequence, .min_sequence_number = min_sequence, .added_snapshot_id = context.snapshot_id, .added_files_count = 0, .existing_files_count = records.array.items.len, .deleted_files_count = 0, .added_rows_count = 0, .existing_rows_count = rows_count, .deleted_rows_count = 0 }) };
+    if (manifest.len > manifest_merge_target_bytes) return .too_large;
+    const uri = try upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-{s}-{s}-merge-{s}.avro", .{ context.digest, types.digestHex(manifest), label }), manifest);
+    return .{ .merged = try json(alloc, .{ .manifest_path = uri, .manifest_length = manifest.len, .partition_spec_id = context.spec_id, .content = if (kind == .deletes) @as(i32, 1) else @as(i32, 0), .sequence_number = context.sequence, .min_sequence_number = min_sequence, .added_snapshot_id = context.snapshot_id, .added_files_count = 0, .existing_files_count = records.array.items.len, .deleted_files_count = 0, .added_rows_count = 0, .existing_rows_count = rows_count, .deleted_rows_count = 0 }) };
 }
 /// Allocations belong to a caller-owned attempt arena. The request identity
 /// includes the pinned metadata location; a confirmed CAS conflict may build a
@@ -380,4 +414,62 @@ test "lake native row commit builds real data delete and retained manifests with
     var retained = try iceberg.parseManifestListAlloc(alloc, try read(a, files, try m.str(try m.get(later_snapshots[later_snapshots.len - 1], "manifest-list"))));
     defer retained.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 4), retained.entries.len);
+}
+
+test "lake catalog manifest merge splits a large eligible pool into bounded outputs" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    const files: Files = .{ .client = memory.client(), .bucket = "archive", .prefix = "events", .uri = "gs://archive/events" };
+    const padding = try a.alloc(u8, 240);
+    @memset(padding, 'x');
+    var previous: std.ArrayList(iceberg.ManifestListEntry) = .empty;
+    const rows_per_manifest = 256;
+    for (0..manifest_merge_min_count) |i| {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var records = array(sa);
+        for (0..rows_per_manifest) |j| {
+            const path = try std.fmt.allocPrint(sa, "gs://archive/events/data/{s}-{d}-{d}.parquet", .{ padding, i, j });
+            try append(&records, try json(sa, .{ .status = 1, .snapshot_id = i + 1, .sequence_number = i + 1, .file_sequence_number = i + 1, .data_file = .{ .content = 0, .file_path = path, .file_format = "PARQUET", .partition = object(sa), .record_count = 1, .file_size_in_bytes = 1 } }));
+        }
+        const bytes = try avro.ocf(sa, avro.entry_schema, records.array.items, &.{});
+        const uri = try upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-input-{d}-data.avro", .{i}), bytes);
+        try previous.append(a, .{ .manifest_path = try a.dupe(u8, uri), .manifest_length = bytes.len, .partition_spec_id = 0, .content = .data, .sequence_number = @intCast(i + 1), .min_sequence_number = @intCast(i + 1), .added_snapshot_id = @intCast(i + 1), .added_files_count = rows_per_manifest, .added_rows_count = rows_per_manifest });
+    }
+    var manifests = array(a);
+    try carryManifests(a, files, previous.items, &manifests, .{ .spec_id = 0, .spec_string = "0", .schema_json = "{}", .snapshot_id = 101, .sequence = 101, .digest = "bounded" });
+    try std.testing.expect(manifests.array.items.len > 1);
+    try std.testing.expect(manifests.array.items.len < previous.items.len);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var total: usize = 0;
+    for (manifests.array.items) |entry| {
+        try std.testing.expect(try m.int(try m.get(entry, "manifest_length")) <= manifest_merge_target_bytes);
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const bytes = try read(sa, files, try m.str(try m.get(entry, "manifest_path")));
+        const manifest = try iceberg.parseDataManifestAlloc(sa, bytes);
+        for (manifest.entries) |file| {
+            try std.testing.expectEqual(iceberg.ManifestEntryStatus.existing, file.status);
+            try std.testing.expectEqual(file.snapshot_id, file.data_sequence_number);
+            try std.testing.expectEqual(file.data_sequence_number, file.file_sequence_number);
+            try std.testing.expect(!seen.contains(file.file_path));
+            try seen.put(a, try a.dupe(u8, file.file_path), {});
+            total += 1;
+        }
+    }
+    try std.testing.expectEqual(manifest_merge_min_count * rows_per_manifest, total);
+    // A wider evolved schema may grow the encoded header beyond the target.
+    // Exact output validation must retain/split inputs instead of publishing it.
+    const schema_padding = try a.alloc(u8, @intCast(manifest_merge_target_bytes));
+    @memset(schema_padding, ' ');
+    var oversized = array(a);
+    try carryMergePool(a, files, previous.items[0..2], &oversized, .data, .{ .spec_id = 0, .spec_string = "0", .schema_json = schema_padding, .snapshot_id = 101, .sequence = 101, .digest = "large-header" });
+    try std.testing.expectEqual(@as(usize, 2), oversized.array.items.len);
+    for (oversized.array.items, previous.items[0..2]) |entry, original| try std.testing.expectEqualStrings(original.manifest_path, try m.str(try m.get(entry, "manifest_path")));
 }
