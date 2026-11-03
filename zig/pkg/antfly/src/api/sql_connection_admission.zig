@@ -19,6 +19,8 @@
 //! request must reload and validate those owners before doing any work.
 const std = @import("std");
 const A = std.mem.Allocator;
+const Command = @import("antfly_local_sources").storage_pessimistic_lock_authority.Command;
+const Entry = struct { ticket: u64, command: ?Command = null };
 pub const capacity = 128;
 pub const Key = struct {
     connection: [32]u8,
@@ -33,12 +35,22 @@ pub const Lease = struct {
     pool: ?*Pool,
     key: Key,
     ticket: u64,
+    /// Liveness proof only: this never grants native/durable authority.
+    pub fn bindCommand(self: *Lease, io: std.Io, command: Command) !void {
+        try command.validate();
+        const pool = self.pool orelse return error.SqlConnectionExecutionBusy;
+        try pool.mutex.lock(io);
+        defer pool.mutex.unlock(io);
+        const entry = pool.active.getPtr(self.key) orelse return error.SqlConnectionExecutionBusy;
+        if (entry.ticket != self.ticket or (entry.command != null and !std.meta.eql(entry.command.?, command))) return error.SqlConnectionExecutionBusy;
+        entry.command = command;
+    }
     pub fn release(self: *Lease, io: std.Io) void {
         const pool = self.pool orelse return;
         pool.mutex.lockUncancelable(io);
         defer pool.mutex.unlock(io);
         // An old copied lease cannot release a later request on this key.
-        if (pool.active.get(self.key)) |ticket| if (ticket == self.ticket) {
+        if (pool.active.get(self.key)) |entry| if (entry.ticket == self.ticket) {
             std.debug.assert(pool.active.remove(self.key));
         };
         self.pool = null;
@@ -46,7 +58,7 @@ pub const Lease = struct {
 };
 pub const Pool = struct {
     mutex: std.Io.Mutex = .init,
-    active: std.AutoHashMapUnmanaged(Key, u64) = .empty,
+    active: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
     next_ticket: u64 = 1,
     instance: ?[16]u8 = null,
     /// One secure source identity for this process-owned connection pool.
@@ -61,6 +73,12 @@ pub const Pool = struct {
         self.instance = value;
         return value;
     }
+    pub fn executing(self: *Pool, io: std.Io, key: Key, command: Command) !bool {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        const entry = self.active.get(key) orelse return false;
+        return std.meta.eql(entry.command, @as(?Command, command));
+    }
     pub fn acquire(self: *Pool, a: A, io: std.Io, key: Key) !Lease {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
@@ -70,7 +88,7 @@ pub const Pool = struct {
         // held while the caller compiles, waits, performs RPCs or encodes rows.
         try self.active.ensureUnusedCapacity(a, 1);
         const ticket = self.next_ticket;
-        self.active.putAssumeCapacity(key, ticket);
+        self.active.putAssumeCapacity(key, .{ .ticket = ticket });
         self.next_ticket += 1;
         return .{ .pool = self, .key = key, .ticket = ticket };
     }
@@ -120,4 +138,32 @@ test "SQL connection admission is bounded and reuses released capacity" {
     leases[0].release(io);
     var available = try pool.acquire(a, io, Key.init(@splat('f'), "alice"));
     available.release(io);
+}
+
+test "SQL connection admission liveness binds the exact command and cannot be renewed by a newer request" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var pool: Pool = .{};
+    defer pool.deinit(a);
+    const key = Key.init(@splat('1'), "alice");
+    const command: Command = .{ .sequence = 1, .nonce = @splat(1), .executor = @splat(2) };
+    var old = try pool.acquire(a, io, key);
+    var stale = old;
+    try old.bindCommand(io, command);
+    try old.bindCommand(io, command);
+    try std.testing.expect(try pool.executing(io, key, command));
+    old.release(io);
+    var fresh = try pool.acquire(a, io, key);
+    defer fresh.release(io);
+    try std.testing.expect(!try pool.executing(io, key, command));
+    try std.testing.expectError(error.SqlConnectionExecutionBusy, stale.bindCommand(io, command));
+    var next = command;
+    next.sequence = 2;
+    next.executor = @splat(3);
+    try fresh.bindCommand(io, next);
+    try std.testing.expect(try pool.executing(io, key, next));
+    try std.testing.expect(!try pool.executing(io, key, command));
+    try std.testing.expectError(error.SqlConnectionExecutionBusy, fresh.bindCommand(io, command));
+    stale.release(io);
+    try std.testing.expect(try pool.executing(io, key, next));
 }

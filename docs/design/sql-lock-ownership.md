@@ -882,3 +882,82 @@ against the reviewed production changes. Socket-based gates ran with local bind
 access rather than accepting sandbox skips. Inventory integrity and Apache/control
 catalog audits pass; the original dispositions remain **912 implemented, 138
 rejected, 449 superseded and 87 unresolved**.
+
+
+## Shared ingress controller and command-specific liveness
+
+`api/sql_command_execution.zig` provides the protocol-independent enrollment and
+command loan used to assemble public ingress ownership. Its native discovery is
+a capability-gated point lookup of one database. It returns the database ID,
+incarnation, realm and admission head without enumerating scopes, work items or
+prepared transactions. Decoder capability 157 protects this selector and reply.
+Mixed selectors, malformed database names and realm substitution fail closed.
+
+Enrollment requires the existing logical connection's authenticated owner and
+scope, persists the immutable native registration, and assists only registration
+or safe control work. A command loan observes native idleness, persists its exact
+request digest and ticket, then takes one durable execution permit. A fresh
+request cannot adopt a ready/executing body, including byte-identical SQL. Native
+control may resume after cold reopen; SQL evaluation never resumes implicitly.
+
+Completion reserves its nonce before taking the permit, so cancellation of the
+request or entropy source cannot prevent its local publication. An in-flight
+renewal survives transition to finishing even without a savepoint intent. The
+worker adopts its exact expiry proof before completing the command.
+
+Cancellation before permit taking has a different disposition: it marks the body
+skipped and hands the exact BEGIN/finish sequence to the existing worker. It does
+not issue an execution permit or retire the connection's earlier session locks.
+Fresh ingress may assist this frozen skip before taking its own new ticket. The
+skip marker clears only after native completion is proven. Process-loss recovery
+retains the existing irreversible fence and retirement behavior.
+
+Completion publication retries a bounded number of source CAS races using its
+reserved nonce. A delayed completion checks native backend identity and the
+monotone command sequence; it cannot complete a newer command. Admission binding
+also rechecks the durable taken ticket, so a copied old loan cannot occupy a new
+request's command slot. The local completion flag uses atomic publication for a
+concurrent heartbeat borrower.
+
+The local admission pool now records the exact command bound to an admission
+lease. Merely occupying a connection is not evidence that an older command is
+live. Copied stale leases cannot bind/release a newer admission, and a loan must
+match the lease's connection and authenticated principal. This is liveness proof,
+not durable authority or another SQL coordinator.
+
+Lease maintenance now distinguishes idle connections, exact executing commands,
+and body-free completion. The source worker renews only its own process instance;
+an executing source additionally requires the admission pool's exact command.
+Replacing an admission cannot keep the earlier body alive. Idle resources retain
+the existing connection TTL and active SQL transaction lease checks. A completed
+body can renew while its native cleanup or durable transaction decision remains
+pending, preserving session locks rather than treating slow cleanup as a crash.
+
+Renewal observes the native registration, persists its immutable admission, and
+delivers that admission in the same maintenance quantum. It does not wait another
+directory sweep before extending the native lease. Lost replies and cold reopen
+use the retained request and native expiry proof; expired/fenced owners cannot be
+revived. Healthy command heartbeat checks make no metadata RPCs. A command loan
+exposes the same exact-admission heartbeat operation to ingress owners.
+
+These components still require the HTTP/pgwire adapters, independent live-query
+heartbeat scheduling, disconnect retirement and portal-bound command ownership
+before public activation. The bounded maintenance sweep alone does not establish
+a renewal latency guarantee under slow RPCs. They do not close the original
+advisory cases or change the original inventory counts.
+
+Qualification: the combined source/API/transaction Debug run passed **83/83 build
+steps**, including **41 source/controller tests**, **42 native-result/API tests**,
+and the transaction lifecycle gates. The reviewed source/fence/submission run
+passed **92/92 steps**. After the final native-fence change, the source gate passed
+**61/61 steps**, with all **41 tests** and no skips, failures or leaks. The server
+maintenance campaign covers local and Raft apply, idle and executing owners,
+unbound/replacement admissions, foreign process instances, completion, expired
+leases and native fencing before local expiry. Native fencing publishes local
+recovery immediately rather than repeatedly attempting renewal.
+
+Full formatting, license, Apache-boundary, control-catalog and inventory checks
+pass. Main was fetched and merged again at `24486f5f30` (already contained). The
+original inventory remains **912 implemented, 138 rejected, 449 superseded and
+87 unresolved (64 DDL/catalog)**; public ingress and distributed activation are
+still required before crediting those originals.

@@ -272,9 +272,15 @@ pub const Query = struct {
     backend: ?locks.Backend = null,
     work: ?struct { observed_at_ms: u64, after: ?scopes.Work = null, wrap: bool = false } = null,
     effect: ?scopes.ledger.Effect = null,
+    /// Bounded ingress anchor: one database lookup, no backend/work scan.
+    discovery: ?[]const u8 = null,
     pub fn validate(self: Query) !void {
         try self.actor.validate();
-        if ((self.backend == null) == (self.work == null) or (self.work == null and std.mem.allEqual(u8, &self.incarnation, 0))) return error.InvalidCatalogMutation;
+        const selectors = @as(u8, @intFromBool(self.backend != null)) + @as(u8, @intFromBool(self.work != null)) + @as(u8, @intFromBool(self.discovery != null));
+        if (selectors != 1 or (self.backend != null and std.mem.allEqual(u8, &self.incarnation, 0))) return error.InvalidCatalogMutation;
+        if (self.discovery) |name| {
+            if (self.database != 0 or name.len == 0 or name.len > 256 or !std.unicode.utf8ValidateSlice(name) or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidCatalogMutation;
+        }
         if (self.effect) |effect| {
             try effect.validate();
             if (self.backend == null or !effect.backend.eql(self.backend.?)) return error.InvalidCatalogMutation;
@@ -295,6 +301,7 @@ pub const Snapshot = struct {
     next_work: ?scopes.Work,
     receipt: ?scopes.ledger.Receipt = null,
     wait_resource: ?scopes.ledger.ResourceStamp = null,
+    database_id: ?u64 = null,
 };
 
 pub const Observer = struct {

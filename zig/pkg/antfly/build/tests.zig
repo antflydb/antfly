@@ -766,6 +766,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL command producer native transaction savepoint projection retains monotone identities across cold rollback and release",
         "SQL command producer native savepoint publication atomically rewinds SQL and reparents locks through cold lost control replies",
         "SQL command producer native shared SQL savepoint adapter drains exact control without replaying SQL",
+        "SQL command producer native ingress discovers one database enrolls exact owners and never reissues a body",
+        "SQL command producer native ingress discovery is capability gated and cannot mix selectors or realms",
+        "SQL command producer native ingress cancellation skips an untaken body without dropping existing session locks",
+        "SQL connection admission liveness binds the exact command and cannot be renewed by a newer request",
+        "SQL command producer native exact command heartbeat renews through cold lost replies and rejects replacement admissions",
+        "SQL command producer native completion renews pending control without replaying SQL or dropping session grants",
+        "SQL command producer native supervisor renews only live local owners and leaves expired sources fenced",
         "durable SQL session rejects duplicate savepoint ids without double freeing overlays",
         "distributed txn session preserves numeric tokens across staging savepoints and durable recovery",
     }) |required| sql_command_producer_audit.addArgs(&.{ "--filter", required });

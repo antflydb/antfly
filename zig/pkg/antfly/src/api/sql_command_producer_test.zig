@@ -1570,3 +1570,400 @@ test "SQL command producer native shared SQL savepoint adapter drains exact cont
         try native.until(&source, .idle, 2);
     }
 }
+
+const IngressRuntime = struct {
+    native: *Native,
+    now_ms: u64 = 2,
+    cancelled: bool = false,
+    cancel_on_begin: bool = false,
+    fn call(raw: *anyopaque, alloc: A, input: Call) anyerror![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const cancel = self.cancel_on_begin and input == .sql_lock_mutate and input.sql_lock_mutate.operation == .begin;
+        defer if (cancel) {
+            self.cancelled = true;
+        };
+        return Native.call(self.native, alloc, input);
+    }
+    fn now(raw: *anyopaque) u64 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.now_ms;
+    }
+    fn nonce(raw: *anyopaque) ![16]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.cancelled) return error.Canceled;
+        return self.native.nonce();
+    }
+    fn active(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.cancelled) return error.Canceled;
+    }
+    fn pause(_: *anyopaque, _: u32) !void {}
+    fn runtime(self: *@This()) @import("sql_command_execution.zig").Runtime {
+        return .{ .ptr = self, .now_ms = now, .nonce = nonce, .active = active, .pause = pause };
+    }
+};
+
+test "SQL command producer native ingress discovers one database enrolls exact owners and never reissues a body" {
+    const execution = @import("sql_command_execution.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ingress-owner-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .standalone = standalone, .replicated = replicated };
+        try metadata.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = @splat('1') });
+        if (standalone) try metadata.replaceStandaloneCatalog(group, try metadata.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
+        const activation = try std.json.Stringify.valueAlloc(a, protocol.Activation{ .version = protocol.current_version, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+        defer a.free(activation);
+        try metadata.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+        const node: u64 = if (standalone) 0 else 9;
+        _ = try connections.mutate(&source, .{ .create = .{ .id = connection, .principal = "alice", .owner_node_id = node, .expires_at_ms = 1000, .database = "default", .namespace = "public" } }, "alice", node, 1);
+        var hooks: IngressRuntime = .{ .native = &native };
+        const owner: execution.Controller = .{ .store = &source, .connection = connection, .principal = "alice", .actor = actor, .instance = instance, .node = node, .standalone = standalone, .port = native.port(), .runtime = hooks.runtime() };
+        native.after = true;
+        try owner.enroll(a, "default");
+        try std.testing.expectEqual(producer.Phase.idle, try phase(&source));
+        const registered = native.calls;
+        try owner.enroll(a, "default");
+        try std.testing.expectEqual(registered, native.calls);
+        var first = try owner.take(a, @splat(8));
+        var pool: @import("sql_connection_admission.zig").Pool = .{};
+        defer pool.deinit(a);
+        const key = @import("sql_connection_admission.zig").Key.init(connection, "alice");
+        var admitted = try pool.acquire(a, std.testing.io, key);
+        defer admitted.release(std.testing.io);
+        try std.testing.expect(!try pool.executing(std.testing.io, key, first.ticket.command));
+        try first.bind(std.testing.io, &admitted);
+        try std.testing.expect(try pool.executing(std.testing.io, key, first.ticket.command));
+        try std.testing.expectError(error.SqlConnectionBusy, owner.take(a, @splat(8)));
+        var foreign = owner;
+        foreign.instance = id(999);
+        try std.testing.expectError(error.SqlConnectionBusy, foreign.take(a, @splat(8)));
+        {
+            var renewing = (try producer.load(&source, a, connection)).?;
+            defer renewing.deinit();
+            try producer.renew(&source, "alice", renewing.value, instance, 80000, try native.head(), native.nonce(), 2);
+        }
+        // A cancelled request cannot generate more entropy, but completion
+        // has reserved its nonce before taking the execution permit. Its
+        // in-flight renewal remains exact even without savepoint control.
+        var copied_first = first;
+        var substituted = first;
+        substituted.fence.backend.id = id(900);
+        try std.testing.expectError(error.SqlConnectionChanged, substituted.finish(a));
+        hooks.cancelled = true;
+        try first.finish(a);
+        try first.finish(a);
+        try std.testing.expectEqual(producer.Phase.finishing, try phase(&source));
+        hooks.cancelled = false;
+        admitted.release(std.testing.io);
+        try std.testing.expect(!try pool.executing(std.testing.io, key, first.ticket.command));
+        // Reopen before the next ingress command. Only pending native control
+        // resumes; the earlier body cannot be adopted by either facade.
+        metadata.deinit();
+        metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var second = try owner.take(a, @splat(8));
+        try std.testing.expectEqual(first.ticket.command.sequence + 1, second.ticket.command.sequence);
+        try std.testing.expect(!std.meta.eql(first.ticket.command, second.ticket.command));
+        const before_old_finish = native.calls;
+        admitted = try pool.acquire(a, std.testing.io, key);
+        try std.testing.expectError(error.SqlConnectionBusy, copied_first.bind(std.testing.io, &admitted));
+        try std.testing.expect(!try pool.executing(std.testing.io, key, first.ticket.command));
+        try second.bind(std.testing.io, &admitted);
+        try copied_first.finish(a);
+        try std.testing.expect(try pool.executing(std.testing.io, key, second.ticket.command));
+        try std.testing.expectEqual(before_old_finish, native.calls);
+        var still_executing = (try producer.load(&source, a, connection)).?;
+        defer still_executing.deinit();
+        try std.testing.expectEqualDeep(second.ticket, still_executing.value.ticket.?);
+        try std.testing.expectEqual(producer.Phase.executing, still_executing.value.phase);
+        try second.finish(a);
+        try native.until(&source, .idle, 2);
+        try owner.retire(a);
+        try native.until(&source, .retired, 2);
+        try std.testing.expectError(error.SqlConnectionNotFound, owner.take(a, @splat(8)));
+    };
+}
+
+test "SQL command producer native ingress discovery is capability gated and cannot mix selectors or realms" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ingress-discovery", .{tmp.sub_path});
+    defer a.free(path);
+    var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer metadata.deinit();
+    try metadata.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = @splat('1') });
+    const query: authority.Query = .{ .incarnation = @splat(0), .standalone = false, .actor = actor, .database = 0, .discovery = "default" };
+    const before = try std.json.Stringify.valueAlloc(a, protocol.Activation{ .version = authority.decoder_version - 1, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+    defer a.free(before);
+    try metadata.applyStandaloneCommand(group, .{ .activate_topology_protocol = before });
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, metadata.sqlLockRead(a, group, query, .{}));
+    const current = try std.json.Stringify.valueAlloc(a, protocol.Activation{ .version = authority.decoder_version, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+    defer a.free(current);
+    try metadata.applyStandaloneCommand(group, .{ .activate_topology_protocol = current });
+    const bytes = try metadata.sqlLockRead(a, group, query, .{});
+    defer a.free(bytes);
+    var cut = try std.json.parseFromSlice(authority.Snapshot, a, bytes, .{});
+    defer cut.deinit();
+    try std.testing.expectEqual(@as(?u64, 1), cut.value.database_id);
+    try std.testing.expect(cut.value.scope == null and cut.value.owner == null and cut.value.next_work == null);
+    var forged = query;
+    forged.standalone = true;
+    try std.testing.expectError(error.CatalogGenerationChanged, metadata.sqlLockRead(a, group, forged, .{}));
+    forged = query;
+    forged.work = .{ .observed_at_ms = 2 };
+    try std.testing.expectError(error.InvalidCatalogMutation, forged.validate());
+    forged = query;
+    forged.database = 1;
+    try std.testing.expectError(error.InvalidCatalogMutation, forged.validate());
+    forged = query;
+    forged.discovery = "missing";
+    try std.testing.expectError(error.DatabaseNotFound, metadata.sqlLockRead(a, group, forged, .{}));
+}
+
+test "SQL command producer native ingress cancellation skips an untaken body without dropping existing session locks" {
+    const execution = @import("sql_command_execution.zig");
+    const advisory = @import("sql_advisory_execution.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| for ([_]bool{ false, true }) |after| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ingress-skipped-{any}-{any}-{any}", .{ tmp.sub_path, standalone, replicated, after });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated };
+        try setup(&metadata, &source, standalone, &native);
+        try native.until(&source, .idle, 2);
+        var hooks: IngressRuntime = .{ .native = &native };
+        const owner: execution.Controller = .{ .store = &source, .connection = connection, .principal = "alice", .actor = actor, .instance = instance, .node = if (standalone) 0 else 9, .standalone = standalone, .port = .{ .ptr = &hooks, .call = IngressRuntime.call }, .runtime = hooks.runtime() };
+        var first = try owner.take(a, @splat(8));
+        var held = try advisory.Machine.init(advisoryFrame(&source, first.fence), .pg_advisory_lock, &.{local.sql_scalar.Datum.json(.{ .integer = 42 })}, null, native.nonce());
+        _ = try finishMachine(&native, &held);
+        try first.finish(a);
+        try native.until(&source, .idle, 2);
+        hooks.cancel_on_begin = true;
+        native.before = !after;
+        native.after = after;
+        try std.testing.expectError(error.Canceled, owner.take(a, @splat(9)));
+        {
+            var skipped = (try producer.load(&source, a, connection)).?;
+            defer skipped.deinit();
+            try std.testing.expect(skipped.value.body_skipped and !skipped.value.recovery);
+            try std.testing.expectEqual(producer.Phase.beginning, skipped.value.phase);
+        }
+        metadata.deinit();
+        metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        source = transactions.DurableSessionStore.init(a, &metadata.store);
+        hooks.cancel_on_begin = false;
+        hooks.cancelled = false;
+        // Fresh ingress can assist the frozen skip, but can never turn it
+        // into a permission to evaluate the cancelled SQL body.
+        var next = try owner.take(a, @splat(10));
+        try std.testing.expectEqual(first.ticket.command.sequence + 2, next.ticket.command.sequence);
+        var cut = try nativeCut(&native, next.fence.backend, held.effect);
+        defer cut.deinit();
+        try std.testing.expectEqual(authority.scopes.ledger.Outcome.granted, cut.value.receipt.?.outcome);
+        try std.testing.expectEqual(@as(u32, 1), cut.value.owner.?.resources);
+        try std.testing.expectEqual(@as(@TypeOf(cut.value.scope.?.state), .active), cut.value.scope.?.state);
+        try next.finish(a);
+        try native.until(&source, .idle, 2);
+        var idle = (try producer.load(&source, a, connection)).?;
+        defer idle.deinit();
+        try std.testing.expect(!idle.value.body_skipped and !idle.value.recovery);
+    };
+}
+
+test "SQL command producer native exact command heartbeat renews through cold lost replies and rejects replacement admissions" {
+    const execution = @import("sql_command_execution.zig");
+    const admission = @import("sql_connection_admission.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/command-heartbeat-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated, .expiry_ms = 60002 };
+        try setup(&metadata, &source, standalone, &native);
+        try native.until(&source, .idle, 2);
+        var hooks: IngressRuntime = .{ .native = &native };
+        const owner: execution.Controller = .{ .store = &source, .connection = connection, .principal = "alice", .actor = actor, .instance = instance, .node = if (standalone) 0 else 9, .standalone = standalone, .port = native.port(), .runtime = hooks.runtime() };
+        var loan = try owner.take(a, @splat(8));
+        var pool: admission.Pool = .{};
+        defer pool.deinit(a);
+        var lease = try pool.acquire(a, std.testing.io, .init(connection, "alice"));
+        defer lease.release(std.testing.io);
+        try std.testing.expectError(error.SqlConnectionBusy, loan.keepAlive(a, std.testing.io, &pool));
+        try loan.bind(std.testing.io, &lease);
+        const before = native.calls;
+        const reads = native.scope_reads;
+        try std.testing.expectEqual(@as(u64, 60002), try loan.keepAlive(a, std.testing.io, &pool));
+        try std.testing.expectEqual(before, native.calls);
+        try std.testing.expectEqual(reads, native.scope_reads);
+        hooks.now_ms = 25000;
+        native.after = true;
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, loan.keepAlive(a, std.testing.io, &pool));
+        try std.testing.expectEqual(before + 1, native.calls);
+        {
+            var pending = (try producer.load(&source, a, connection)).?;
+            defer pending.deinit();
+            try std.testing.expectEqual(@as(u64, 85000), pending.value.pending.?.operation.renew.expires_at_ms);
+            try std.testing.expectEqual(@as(u64, 60002), pending.value.registration.lease.expires_at_ms);
+            try std.testing.expectEqualDeep(loan.ticket, pending.value.ticket.?);
+        }
+        metadata.deinit();
+        metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        source = transactions.DurableSessionStore.init(a, &metadata.store);
+        try std.testing.expectEqual(@as(u64, 85000), try loan.keepAlive(a, std.testing.io, &pool));
+        try std.testing.expectEqual(before + 1, native.calls);
+        var foreign = loan;
+        foreign.controller.instance = id(900);
+        try std.testing.expectError(error.SqlConnectionBusy, foreign.keepAlive(a, std.testing.io, &pool));
+        lease.release(std.testing.io);
+        lease = try pool.acquire(a, std.testing.io, .init(connection, "alice"));
+        hooks.now_ms = 50000;
+        try std.testing.expectError(error.SqlConnectionBusy, loan.keepAlive(a, std.testing.io, &pool));
+        try std.testing.expectEqual(before + 1, native.calls);
+        // An unbound newer admission cannot extend the abandoned command.
+        try loan.finish(a);
+        try native.until(&source, .idle, hooks.now_ms);
+        var fresh = try owner.take(a, @splat(9));
+        try fresh.bind(std.testing.io, &lease);
+        try std.testing.expectError(error.SqlConnectionBusy, loan.keepAlive(a, std.testing.io, &pool));
+        _ = try fresh.keepAlive(a, std.testing.io, &pool);
+        _ = try fresh.keepAlive(a, std.testing.io, &pool);
+        hooks.now_ms = 110001;
+        try std.testing.expectError(error.SqlConnectionBusy, fresh.keepAlive(a, std.testing.io, &pool));
+        var expired = (try producer.load(&source, a, connection)).?;
+        defer expired.deinit();
+        try std.testing.expect(expired.value.recovery);
+        try std.testing.expectEqual(@as(u64, 110000), expired.value.registration.lease.expires_at_ms);
+    };
+}
+
+test "SQL command producer native completion renews pending control without replaying SQL or dropping session grants" {
+    const execution = @import("sql_command_execution.zig");
+    const advisory = @import("sql_advisory_execution.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/completion-heartbeat-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated, .expiry_ms = 60002 };
+        try setup(&metadata, &source, standalone, &native);
+        try native.until(&source, .idle, 2);
+        var hooks: IngressRuntime = .{ .native = &native };
+        const owner: execution.Controller = .{ .store = &source, .connection = connection, .principal = "alice", .actor = actor, .instance = instance, .node = if (standalone) 0 else 9, .standalone = standalone, .port = native.port(), .runtime = hooks.runtime() };
+        var loan = try owner.take(a, @splat(8));
+        var held = try advisory.Machine.init(advisoryFrame(&source, loan.fence), .pg_advisory_lock, &.{local.sql_scalar.Datum.json(.{ .integer = 42 })}, null, native.nonce());
+        _ = try finishMachine(&native, &held);
+        try loan.finish(a);
+        {
+            var pending = (try producer.load(&source, a, connection)).?;
+            defer pending.deinit();
+            const before = native.calls;
+            native.after = true;
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, producer.maintain(&source, a, pending.value, instance, 25000, native.nonce(), native.port(), .control));
+            try std.testing.expectEqual(before + 1, native.calls);
+        }
+        metadata.deinit();
+        metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        source = transactions.DurableSessionStore.init(a, &metadata.store);
+        try native.until(&source, .idle, 25000);
+        var idle = (try producer.load(&source, a, connection)).?;
+        defer idle.deinit();
+        try std.testing.expectEqual(@as(u64, 85000), idle.value.registration.lease.expires_at_ms);
+        try std.testing.expectEqual(loan.ticket.command.sequence + 1, idle.value.next_command);
+        try std.testing.expect(!idle.value.recovery);
+        var cut = try nativeCut(&native, loan.fence.backend, held.effect);
+        defer cut.deinit();
+        try std.testing.expectEqual(@as(u32, 1), cut.value.owner.?.resources);
+        try std.testing.expectEqual(authority.scopes.ledger.Outcome.granted, cut.value.receipt.?.outcome);
+        const before = native.calls;
+        try producer.maintain(&source, a, idle.value, id(999), 50000, native.nonce(), native.port(), .idle);
+        try std.testing.expectEqual(before, native.calls);
+    };
+}
+
+test "SQL command producer native supervisor renews only live local owners and leaves expired sources fenced" {
+    const Server = @import("http_server.zig").ApiHttpServer;
+    const Forward = struct {
+        fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedStatusRead;
+        }
+        fn catalog(raw: *anyopaque, alloc: A, context: local.api_operation.RequestContext, input: Call) anyerror![]u8 {
+            try std.testing.expect(context.setting_admin);
+            try std.testing.expect(context.sql_completion == null);
+            try context.ensureActive();
+            return Native.call(raw, alloc, input);
+        }
+    };
+    const Mode = enum { idle, executing, unbound, foreign_idle, foreign_executing, finishing, expired_idle, expired_executing, fenced };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |replicated| for (std.enums.values(Mode)) |mode| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/supervisor-heartbeat-{any}-{s}", .{ tmp.sub_path, replicated, @tagName(mode) });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        const now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+        const expired = mode == .expired_idle or mode == .expired_executing;
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated, .expiry_ms = if (expired) now_ms - 1 else now_ms + 30000 };
+        try setup(&metadata, &source, true, &native);
+        try native.until(&source, .idle, 2);
+        const executing = mode == .executing or mode == .unbound or mode == .foreign_executing or mode == .expired_executing or mode == .fenced;
+        var command: ?authority.scopes.Command = null;
+        if (executing or mode == .finishing) {
+            const ticket = try begin(&native, &source, 200);
+            _ = try execute(&source, ticket);
+            command = ticket.command;
+            if (mode == .finishing) try finishBody(&native, &source, ticket);
+        }
+        var runtime = try local.storage_db_selected_root.db.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+        defer runtime.deinit();
+        var server = Server.init(a, .{ .backend_runtime = runtime.ptr(), .session_store = &source, .session_maintenance_local_only = true, .deployment_mode = .standalone }, .{ .ptr = &native, .vtable = &.{ .status = Forward.status, .system_catalog = Forward.catalog } }, null, null);
+        defer server.deinit();
+        server.sql_connection_admission.instance = if (mode == .foreign_idle or mode == .foreign_executing) id(999) else instance;
+        const io = server.embedding_provider_runtime.io;
+        var lease = try server.sql_connection_admission.acquire(a, io, .init(connection, "alice"));
+        defer lease.release(io);
+        if (executing and mode != .unbound) try lease.bindCommand(io, command.?);
+        if (mode == .fenced) {
+            var live = (try producer.load(&source, a, connection)).?;
+            defer live.deinit();
+            try native.submit(live.value, .{ .fence = .close });
+        }
+        const before = native.calls;
+        var cursor: ?[32]u8 = null;
+        try std.testing.expect(try producer.advanceWork(&server, &cursor));
+        const should_renew = mode == .idle or mode == .executing or mode == .finishing;
+        try std.testing.expectEqual(before + @as(usize, if (should_renew) 1 else 0), native.calls);
+        var observed = (try producer.load(&source, a, connection)).?;
+        defer observed.deinit();
+        if (should_renew) {
+            try std.testing.expect(observed.value.pending.?.operation == .renew);
+            try std.testing.expect(observed.value.pending.?.operation.renew.expires_at_ms > native.expiry_ms);
+            // The next sweep acknowledges native proof without another write.
+            cursor = null;
+            try std.testing.expect(try producer.advanceWork(&server, &cursor));
+            try std.testing.expectEqual(before + 1, native.calls);
+            var renewed = (try producer.load(&source, a, connection)).?;
+            defer renewed.deinit();
+            try std.testing.expect(renewed.value.registration.lease.expires_at_ms > native.expiry_ms);
+            try std.testing.expect(!renewed.value.recovery);
+        } else {
+            try std.testing.expectEqual(native.expiry_ms, observed.value.registration.lease.expires_at_ms);
+            try std.testing.expectEqual(expired or mode == .fenced, observed.value.recovery);
+        }
+    };
+}

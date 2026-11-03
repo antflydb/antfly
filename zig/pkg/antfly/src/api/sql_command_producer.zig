@@ -25,7 +25,7 @@ const Call = @import("../system_catalog/server_call.zig").Call;
 const A = std.mem.Allocator;
 const native_group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
 pub const execution_lease_ms: u64 = 60000;
-pub const renew_before_ms: u64 = execution_lease_ms / 3;
+pub const renew_before_ms: u64 = execution_lease_ms * 2 / 3;
 pub const Id = [16]u8;
 const prefix = "\x00sql-command-producer-v1/";
 const work_prefix = "\x00sql-command-producer-work-v1/";
@@ -53,6 +53,8 @@ pub const Record = struct {
     pending: ?authority.Request = null,
     /// SQL savepoint metadata is already durable. Resume native control only.
     savepoint_control: ?authority.scopes.ledger.Effect = null,
+    /// No execution permit was taken. Recovery may finish begin/finish only.
+    body_skipped: bool = false,
     recovery: bool = false,
     failure: ?authority.outcomes.Rejection = null,
 
@@ -80,6 +82,7 @@ pub const Record = struct {
                 else => return error.InvalidSqlConnection,
             }
         }
+        if (self.body_skipped and (self.ticket == null or (self.phase != .beginning and self.phase != .finishing and self.phase != .fencing and self.phase != .closing))) return error.InvalidSqlConnection;
         if (self.failure != null and !self.recovery) return error.InvalidSqlConnection;
         if (self.phase == .retired and (!self.recovery or self.pending != null)) return error.InvalidSqlConnection;
         if ((self.phase == .fencing or self.phase == .closing) and !self.recovery) return error.InvalidSqlConnection;
@@ -100,7 +103,7 @@ pub const Record = struct {
                     if (self.phase != .finishing and (self.phase != .executing or self.savepoint_control == null or !std.meta.eql(input.effect, self.savepoint_control.?))) return error.InvalidSqlConnection;
                 },
                 .fence => if (self.phase != .fencing) return error.InvalidSqlConnection,
-                .renew => |renewal| if ((self.phase != .idle and self.phase != .ready and self.phase != .executing and !(self.phase == .finishing and self.savepoint_control != null)) or renewal.expected_expiry != self.registration.lease.expires_at_ms or renewal.expires_at_ms <= renewal.expected_expiry) return error.InvalidSqlConnection,
+                .renew => |renewal| if ((self.phase != .idle and self.phase != .ready and self.phase != .executing and self.phase != .finishing) or renewal.expected_expiry != self.registration.lease.expires_at_ms or renewal.expires_at_ms <= renewal.expected_expiry) return error.InvalidSqlConnection,
                 .release => if (self.phase != .closing) return error.InvalidSqlConnection,
                 .close_step => if (self.phase != .closing) return error.InvalidSqlConnection,
                 else => return error.InvalidSqlConnection,
@@ -384,7 +387,7 @@ fn changeTxn(a: A, txn: anytype, id: [32]u8, principal: []const u8, node: u64, a
         .take => |claim| blk: {
             if (connection == null) return error.SqlConnectionNotFound;
             var old = if (previous) |value| value.value else return error.SqlConnectionNotFound;
-            if (old.revision != claim.revision or !std.mem.eql(u8, &try digest(a, old), &claim.prior_digest) or old.pending != null or old.phase != .ready or old.recovery or !std.meta.eql(old.ticket, @as(?Ticket, claim.ticket))) return error.SqlConnectionBusy;
+            if (old.revision != claim.revision or !std.mem.eql(u8, &try digest(a, old), &claim.prior_digest) or old.pending != null or old.phase != .ready or old.recovery or old.body_skipped or !std.meta.eql(old.ticket, @as(?Ticket, claim.ticket))) return error.SqlConnectionBusy;
             old.phase = .executing;
             old.revision = std.math.add(u64, old.revision, 1) catch return error.SqlProgramLimitExceeded;
             break :blk old;
@@ -456,9 +459,24 @@ pub fn take(store: *transactions.DurableSessionStore, principal: []const u8, pri
     try change(store, prior.registration.connection, principal, prior.registration.lease.node, .{ .take = .{ .revision = prior.revision, .prior_digest = try digest(store.alloc, prior), .ticket = ticket } });
     return prior.fence();
 }
+/// Cancellation before take cannot justify dropping an existing session's
+/// locks. Persist a body-free begin/finish handoff instead of retiring it.
+pub fn skipBeforeTake(store: *transactions.DurableSessionStore, principal: []const u8, prior: Record, instance: Id, ticket: Ticket, nonce: Id) !void {
+    try prior.validate(store.alloc);
+    if (!std.mem.eql(u8, &instance, &ticket.instance) or prior.recovery or !std.meta.eql(prior.ticket, @as(?Ticket, ticket)) or
+        (prior.phase != .beginning and prior.phase != .ready)) return error.SqlConnectionBusy;
+    var next = prior;
+    next.body_skipped = true;
+    if (prior.phase == .ready) {
+        next.phase = .finishing;
+        next.pending = if (prior.pending != null and prior.pending.?.operation == .renew) prior.pending else next.controlRequest(0, nonce, .{ .finish = ticket.command });
+    }
+    try replace(store, principal, prior, next);
+}
+
 pub fn finish(store: *transactions.DurableSessionStore, principal: []const u8, prior: Record, instance: Id, ticket: Ticket, head: u64, nonce: Id) !void {
     try prior.validate(store.alloc);
-    if (!std.mem.eql(u8, &instance, &ticket.instance) or (prior.pending != null and prior.savepoint_control == null) or prior.phase != .executing or prior.recovery or !std.meta.eql(prior.ticket, @as(?Ticket, ticket))) return error.SqlConnectionBusy;
+    if (!std.mem.eql(u8, &instance, &ticket.instance) or (prior.pending != null and prior.savepoint_control == null and prior.pending.?.operation != .renew) or prior.phase != .executing or prior.recovery or !std.meta.eql(prior.ticket, @as(?Ticket, ticket))) return error.SqlConnectionBusy;
     var next = prior;
     next.phase = .finishing;
     // A renewal may already have escaped. Preserve its exact expiry proof
@@ -470,11 +488,67 @@ pub fn renew(store: *transactions.DurableSessionStore, principal: []const u8, pr
     try prior.validate(store.alloc);
     // Replacing a control admission never replaces its immutable effect.
     // Its native receipt/job remains the authority after renewal completes.
-    if ((prior.pending != null and (prior.savepoint_control == null or (prior.pending.?.operation != .effect and prior.pending.?.operation != .step))) or prior.recovery or (prior.phase != .idle and prior.phase != .ready and prior.phase != .executing) or
+    const replaceable = if (prior.pending) |pending| switch (pending.operation) {
+        .effect => prior.savepoint_control != null,
+        .step => prior.savepoint_control != null or prior.phase == .finishing,
+        .finish, .cancel => prior.phase == .finishing,
+        else => false,
+    } else true;
+    if (!replaceable or prior.recovery or (prior.phase != .idle and prior.phase != .ready and prior.phase != .executing and prior.phase != .finishing) or
         !std.mem.eql(u8, &prior.instance, &instance) or now_ms >= prior.registration.lease.expires_at_ms or expires_at_ms <= prior.registration.lease.expires_at_ms) return error.SqlConnectionBusy;
     var next = prior;
     next.pending = next.controlRequest(head, nonce, .{ .renew = .{ .expected_expiry = prior.registration.lease.expires_at_ms, .expires_at_ms = expires_at_ms, .observed_at_ms = now_ms } });
     try replace(store, principal, prior, next);
+}
+
+/// Local liveness is deliberately separate from durable native authority.
+/// An admitted request without its exact taken command is not a heartbeat.
+pub const Liveness = union(enum) {
+    idle,
+    command: authority.scopes.Command,
+    control,
+
+    fn permits(self: Liveness, prior: Record) bool {
+        return switch (self) {
+            .idle => prior.phase == .idle,
+            .command => |command| prior.phase == .executing and prior.ticket != null and std.meta.eql(command, prior.ticket.?.command),
+            .control => prior.phase == .finishing,
+        };
+    }
+};
+
+/// One observation and at most one delivery. Stage the exact renewal before
+/// sending it; a lost reply or crash is resumed by advance, never by SQL replay.
+/// Deliver in this quantum so a full directory sweep need not elapse between
+/// staging a renewal and extending the native lease.
+pub fn maintain(store: *transactions.DurableSessionStore, a: A, prior: Record, instance: Id, now_ms: u64, nonce: Id, port: Port, liveness: ?Liveness) !void {
+    const eligible = liveness != null and liveness.?.permits(prior) and !prior.recovery and
+        std.mem.eql(u8, &prior.instance, &instance) and prior.registration.lease.expires_at_ms > now_ms;
+    const due = prior.registration.lease.expires_at_ms -| now_ms <= renew_before_ms;
+    if (eligible and due and (prior.pending == null or prior.pending.?.operation != .renew)) {
+        // A source CAS cannot revive an expired or fenced native owner. Observe
+        // its incarnation and registration before retaining a new admission.
+        var observed = try port.snapshot(a, prior);
+        defer observed.deinit();
+        const scope = observed.value.scope orelse return error.SqlConnectionNotFound;
+        if (scope.state != .active or scope.registration.lease.expires_at_ms <= now_ms) {
+            // Native fencing is authoritative even while the local expiry is
+            // still in the future. Stop local SQL immediately; the next
+            // quantum drains native retirement instead of retrying renewal.
+            try requestRecovery(store, prior.principal, prior);
+            return;
+        }
+        const expires_at_ms = now_ms +| execution_lease_ms;
+        try renew(store, prior.principal, prior, instance, expires_at_ms, observed.value.head, nonce, now_ms);
+        const pending = prior.controlRequest(observed.value.head, nonce, .{ .renew = .{
+            .expected_expiry = prior.registration.lease.expires_at_ms,
+            .expires_at_ms = expires_at_ms,
+            .observed_at_ms = now_ms,
+        } });
+        _ = try port.deliver(a, pending);
+        return;
+    }
+    try advance(store, a, prior.principal, prior, instance, now_ms, nonce, port);
 }
 
 fn sameRegistration(left: authority.scopes.Registration, right: authority.scopes.Registration) bool {
@@ -574,6 +648,7 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
         next.recovery = prior.recovery or scope.registration.lease.expires_at_ms <= now_ms;
         if (scope.state == .retired) {
             next.phase = .retired;
+            next.body_skipped = false;
             next.savepoint_control = null;
             next.recovery = true;
             next.ticket = null;
@@ -597,7 +672,7 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
             next.pending = next.controlRequest(cut.head, nonce, .{ .fence = .close });
         } else if (prior.pending != null and prior.pending.?.operation == .renew) {
             if (scope.registration.lease.expires_at_ms == prior.pending.?.operation.renew.expires_at_ms) {
-                next.pending = if (prior.savepoint_control) |effect| next.controlRequest(cut.head, nonce, .{ .effect = .{ .command = prior.ticket.?.command, .effect = effect } }) else null;
+                next.pending = if (prior.savepoint_control) |effect| next.controlRequest(cut.head, nonce, .{ .effect = .{ .command = prior.ticket.?.command, .effect = effect } }) else if (prior.phase == .finishing) next.controlRequest(cut.head, nonce, .{ .finish = prior.ticket.?.command }) else null;
             } else if (expired(prior.pending.?, cut.head)) {
                 next.pending = next.controlRequest(cut.head, nonce, prior.pending.?.operation);
             } else {
@@ -654,8 +729,8 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
                     }
                     return;
                 }
-                next.phase = .ready;
-                next.pending = null;
+                next.phase = if (prior.body_skipped) .finishing else .ready;
+                next.pending = if (prior.body_skipped) next.controlRequest(cut.head, nonce, .{ .finish = prior.ticket.?.command }) else null;
             },
             .finishing => {
                 // A returned SQL body may still await an independent durable
@@ -716,6 +791,7 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
                     return;
                 }
                 next.phase = .idle;
+                next.body_skipped = false;
                 next.ticket = null;
                 next.pending = null;
                 next.next_command = scope.next_command;
@@ -822,7 +898,32 @@ pub fn advanceWork(server: *@import("http_server.zig").ApiHttpServer, after: *?[
     var nonce: Id = undefined;
     try io.randomSecure(&nonce);
     var native: NativePort = .{ .server = server, .context = .{ .deadline_ns = time.monotonicNs() +| std.time.ns_per_s } };
-    try advance(store, a, prior.principal, prior, instance, time.realtimeNs() / std.time.ns_per_ms, nonce, native.port());
+    const now_ms = time.realtimeNs() / std.time.ns_per_ms;
+    const due = prior.registration.lease.expires_at_ms > now_ms and prior.registration.lease.expires_at_ms - now_ms <= renew_before_ms;
+    const live: ?Liveness = if (!due or !std.mem.eql(u8, &prior.instance, &instance) or prior.recovery or (prior.pending != null and prior.pending.?.operation == .renew)) null else switch (prior.phase) {
+        .executing => if (try server.sql_connection_admission.executing(io, .init(prior.registration.connection, prior.principal), prior.ticket.?.command)) .{ .command = prior.ticket.?.command } else null,
+        .finishing => .control,
+        .idle => blk: {
+            var connection = @import("sql_connections.zig").load(store, a, prior.registration.connection, prior.principal, prior.registration.lease.node, now_ms) catch |err| switch (err) {
+                error.SqlConnectionNotFound => break :blk null,
+                else => return err,
+            };
+            defer connection.deinit();
+            if (connection.value.active_txn) |txn_id| {
+                var session = (try server.txn_sessions.getSqlState(a, txn_id)) orelse break :blk null;
+                defer session.deinit(a);
+                if (!std.meta.eql(session.connection_id, @as(?[32]u8, prior.registration.connection)) or session.owner_node_id != prior.registration.lease.node or
+                    session.execution_started or session.terminal != null or session.terminal_prepare or session.terminal_abort) break :blk null;
+                server.txn_sessions.validateSqlLease(a, txn_id, prior.registration.lease.node) catch |err| switch (err) {
+                    error.SessionLeaseLost => break :blk null,
+                    else => return err,
+                };
+            }
+            break :blk .idle;
+        },
+        else => null,
+    };
+    try maintain(store, a, prior, instance, now_ms, nonce, native.port(), live);
     return true;
 }
 

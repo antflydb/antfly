@@ -40581,6 +40581,13 @@ pub const RaftApplyStore = struct {
         const standalone = group == group_ids.main_metadata_group_id and try stagingGet(&txn, standalone_catalog_key) != null;
         if (query.standalone != standalone) return error.CatalogGenerationChanged;
         _ = try self.standbyRelationActivationTxn(&txn, group, SqlLocks.decoder_version);
+        if (query.discovery) |name| {
+            const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group, .meta = try system_catalog_storage.readMeta(a, &txn, group) };
+            const database = (try view.lookup(.database, 0, name)) orelse return error.DatabaseNotFound;
+            const journal: SqlLocks.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
+            try context.ensureActive();
+            return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .incarnation = incarnation, .standalone = standalone, .head = try journal.head(a), .scope = null, .owner = null, .next_work = null, .database_id = database.id }, .{});
+        }
         const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = incarnation };
         const item: ?SqlLocks.scopes.WorkItem = if (query.work) |work| blk: {
             const after = if (work.after != null and std.mem.eql(u8, &work.after.?.backend.incarnation, &incarnation)) work.after else null;

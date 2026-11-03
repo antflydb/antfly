@@ -18205,3 +18205,30 @@ formatting pass; the regenerated Go API package compiles; all 156 Debug build
 steps and 87 selected tests pass without skips, failures or leaks. The generated
 Go client conflict was resolved from the merged OpenAPI specs. Inventory and
 source-boundary audits pass, with the 87 unresolved original cases unchanged.
+
+
+### Native ingress loans and command-specific lease maintenance
+
+The shared native command controller now resolves a database through a bounded
+capability-gated lookup, enrolls the existing logical connection, and takes one
+durable body permit. Cancellation before taking that permit freezes a body-free
+BEGIN/finish sequence; it preserves earlier session locks and cannot turn into
+SQL replay after restart. Completion reserves its nonce before execution,
+preserves uncertain renewal, retries local CAS races, and rejects stale loans
+attempting to bind or complete a newer command.
+
+Source maintenance distinguishes live idle connections, exact executing commands
+and body-free completion. It renews only the current process's owners and keeps
+native cleanup alive without reexecuting SQL. Healthy command heartbeat ticks
+make no metadata RPCs. Lost renewal replies, cold proof adoption, expiry and
+native fencing use the real standalone/clustered metadata graph and local/Raft
+apply. Native fencing stops local authority before waiting for local expiry.
+
+Debug qualification passes 83 combined source/API/transaction steps and 92
+reviewed source/fence/submission steps. The final source gate passes all 61 steps
+and 41 tests, without skips, failures or leaks. Formatting and license,
+Apache-boundary, control-catalog and inventory audits pass. See
+[SQL lock ownership](sql-lock-ownership.md#shared-ingress-controller-and-command-specific-liveness)
+for the precise remaining HTTP/pgwire, scheduling, disconnect and portal
+activation requirements. No original cases are credited from these component
+and source-worker campaigns: **87 remain unresolved (64 DDL/catalog)**.
