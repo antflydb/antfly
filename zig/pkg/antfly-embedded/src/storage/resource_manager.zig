@@ -1159,6 +1159,8 @@ pub const ResourceManager = struct {
     dense_read_single_helper: bool = true,
     dense_read_adaptive: bool = false,
     dense_read_profile: bool = false,
+    native_chunks: std.atomic.Value(?*NativeChunks) = .init(null),
+    native_chunks_mutex: std.atomic.Mutex = .unlocked,
     dense_projection_pages: std.atomic.Value(?*ProjectionPageCache.Cache) = .init(null),
     dense_projection_pages_mutex: std.atomic.Mutex = .unlocked,
     dense_read_extra_tasks: std.atomic.Value(u32) = .init(0),
@@ -1268,6 +1270,73 @@ pub const ResourceManager = struct {
 
     pub fn queryEmbeddingCacheBudget(self: *ResourceManager) *cache_budget.CacheBudget {
         return &self.query_embedding_cache_budget;
+    }
+
+    const NativeChunks = struct {
+        const Cache = @import("../serverless/query/lake_decoded_cache.zig").Cache;
+        metadata: Reservation,
+        budget: BudgetedAllocator,
+        cache: Cache,
+        reclaimer: u64 = 0,
+        fn reclaim(ptr: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Cache admission normally takes cache -> allocator locks. Reverse
+            // that order only with tryLock on both; never wait for an owner.
+            if (target == 0 or !allocator_residency.Guard.allowed() or !self.budget.allocator_mutex.tryLock()) return 0;
+            defer self.budget.allocator_mutex.unlock();
+            allocator_residency.Guard.enter(&self.budget.allocator_mutex);
+            defer allocator_residency.Guard.leave();
+            allocator_residency.Guard.beginReclaim();
+            defer allocator_residency.Guard.endReclaim();
+            const before = self.budget.reservation.bytes;
+            // Spare credit is cheaper to return than useful cached payloads.
+            _ = self.budget.releaseUnusedCredit();
+            const remaining = target -| (before - self.budget.reservation.bytes);
+            if (remaining != 0) {
+                _ = self.cache.reclaim(remaining);
+                // Hash-table capacity can keep the allocator alive after all
+                // payloads are evicted. Trim the new spare credit as well.
+                _ = self.budget.releaseUnusedCredit();
+            }
+            // Admission relief, rather than logical payload bytes freed.
+            return before - self.budget.reservation.bytes;
+        }
+        fn deinit(self: *@This()) void {
+            self.budget.reservation.manager.unregisterReclaimer(self.reclaimer);
+            self.cache.deinit();
+            self.budget.deinit();
+            self.metadata.release();
+            std.heap.page_allocator.destroy(self);
+        }
+    };
+
+    /// Shared retained extents are owned by the node, not a short-lived adapter.
+    /// All allocations participate in host admission and pressure reclamation.
+    pub fn nativeChunkCache(self: *ResourceManager, max_bytes: usize) ?*NativeChunks.Cache {
+        if (max_bytes == 0) return null;
+        if (self.native_chunks.load(.acquire)) |owner| return &owner.cache;
+        if (!self.native_chunks_mutex.tryLock()) return null;
+        defer self.native_chunks_mutex.unlock();
+        if (self.native_chunks.load(.acquire)) |owner| return &owner.cache;
+        var metadata = self.reserveImmediate(.hbc_node_metadata_cache, @sizeOf(NativeChunks)) catch return null;
+        const owner = std.heap.page_allocator.create(NativeChunks) catch {
+            metadata.release();
+            return null;
+        };
+        owner.* = .{
+            .metadata = metadata,
+            .budget = BudgetedAllocator.init(self, .hbc_node_metadata_cache, std.heap.page_allocator, 1),
+            .cache = undefined,
+        };
+        owner.cache = .{ .a = owner.budget.threadSafeAllocator(), .max_bytes = @min(max_bytes, 32 * 1024 * 1024) };
+        owner.reclaimer = self.registerReclaimer(.hbc_node_metadata_cache, owner, NativeChunks.reclaim) catch {
+            owner.budget.deinit();
+            metadata.release();
+            std.heap.page_allocator.destroy(owner);
+            return null;
+        };
+        self.native_chunks.store(owner, .release);
+        return &owner.cache;
     }
 
     pub fn projectionPageCache(self: *ResourceManager) ?*ProjectionPageCache.Cache {
@@ -1888,6 +1957,7 @@ pub const ResourceManager = struct {
         self.dense_checkpoint_ready.assertUnbound();
         self.dense_rerank_admission.assertIdle();
         self.dense_driver_admission.assertIdle();
+        if (self.native_chunks.load(.acquire)) |owner| owner.deinit();
         if (self.dense_projection_pages.load(.acquire)) |cache| cache.deinit();
         if (self.dense_read_extra_tasks.load(.acquire) != 0)
             @panic("resource manager deinitialized with active dense read workers");
@@ -6770,4 +6840,63 @@ test "SQL host allocator optional residency includes owned spare credit and pres
     var ordinary = BudgetedAllocator.init(&manager, .sql_execution_working_set, a, 1);
     defer ordinary.deinit();
     try std.testing.expect(BudgetedAllocator.reclamationLayer(ordinary.threadSafeAllocator()) == null);
+}
+
+test "external lake native chunk reclamation returns allocator credit for required admission" {
+    const a = std.testing.allocator;
+    for ([_]u64{ 1536 * 1024, 2 * MiB - 4096 }, 0..) |required, index| {
+        var manager = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 2 * MiB } });
+        defer manager.deinit(a);
+        const cache = manager.nativeChunkCache(512 * 1024).?;
+        const lease = try cache.create(64 * 1024);
+        const bytes = try lease.item.arena.allocator().alloc(u8, 4096);
+        @memset(bytes, 42);
+        cache.publish(@splat(1), lease);
+        lease.release();
+        try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+        const owner = manager.native_chunks.load(.acquire).?;
+        const before = owner.budget.reservation.bytes;
+        try std.testing.expect(before > owner.budget.live_bytes);
+
+        // Both reservations used to fail even after payload eviction. Spare
+        // credit alone serves the smaller request; the larger needs eviction.
+        var query = try manager.reserve(.dense_search_working_set, required);
+        defer query.release();
+        try std.testing.expectEqual(@as(usize, if (index == 0) 1 else 0), cache.entries.count());
+        try std.testing.expectEqual(owner.budget.live_bytes, owner.budget.reservation.bytes);
+        try std.testing.expectEqual(before - owner.budget.reservation.bytes, manager.snapshot().reclaimed_bytes);
+        try std.testing.expect(manager.snapshot().memory.used_bytes <= 2 * MiB);
+    }
+}
+
+test "external lake native chunk reclamation preserves pins and skips contended owners" {
+    const a = std.testing.allocator;
+    var manager = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 2 * MiB } });
+    defer manager.deinit(a);
+    const cache = manager.nativeChunkCache(512 * 1024).?;
+    const owner = manager.native_chunks.load(.acquire).?;
+    const lease = try cache.create(64 * 1024);
+    defer lease.release();
+    const bytes = try lease.item.arena.allocator().dupe(u8, "pinned native extent");
+    cache.publish(@splat(2), lease);
+    const before = owner.budget.reservation.bytes;
+    {
+        try std.testing.expect(owner.budget.allocator_mutex.tryLock());
+        defer owner.budget.allocator_mutex.unlock();
+        try std.testing.expectEqual(@as(u64, 0), ResourceManager.NativeChunks.reclaim(owner, MiB));
+        try std.testing.expectEqual(before, owner.budget.reservation.bytes);
+    }
+    {
+        try std.testing.expect(cache.mutex.tryLock());
+        defer cache.mutex.unlock();
+        // A busy cache still permits unused credit to be returned without
+        // freeing any entry or waiting for its owner lock.
+        const released = ResourceManager.NativeChunks.reclaim(owner, MiB);
+        try std.testing.expect(released > 0);
+        try std.testing.expectEqual(before - owner.budget.reservation.bytes, released);
+        try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+    }
+    try std.testing.expectEqual(@as(u64, 0), ResourceManager.NativeChunks.reclaim(owner, MiB));
+    try std.testing.expectEqualStrings("pinned native extent", bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
 }

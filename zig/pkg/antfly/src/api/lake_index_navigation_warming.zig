@@ -162,7 +162,7 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     defer store.deinit();
     if (!std.mem.eql(u8, &publication.signature.store, &store.identity)) return error.ExternalLakeIndexStoreChanged;
     var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update(&store.identity);
+    hash.update(&store.cache_identity);
     var table_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &table_bytes, table.table_id, .little);
     hash.update(&table_bytes);
@@ -206,7 +206,7 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
     try server.prepareLakeCache();
     store.implementation.cloud_io = context.io;
     try store.bindPublication(publication, token);
-    const cached: artifacts.CachedRead = .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context };
+    const cached: artifacts.CachedRead = .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context };
     // Published metadata can hold only the directory reference. Read the small
     // authenticated declaration document; never expand maintenance contributions.
     const declarations = if (publication.directory != null and publication.declarations.len == 0) blk: {

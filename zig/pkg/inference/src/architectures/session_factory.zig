@@ -97,6 +97,7 @@ const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.Ca
     gliner25_boundary,
     gliner25_modern_bert,
     florence2,
+    whisper,
     gemma4,
     gemma4_training,
     qwen3_embedding,
@@ -2333,6 +2334,11 @@ fn cudaProfileForArch(
         .gliner_modern_bert => |cfg| if (cfg.num_attention_heads > 0 and cfg.max_position_embeddings <= 8192 and
             (cfg.hidden_size / cfg.num_attention_heads == 64 or cfg.hidden_size / cfg.num_attention_heads == 128)) .gliner25_modern_bert else null,
         .florence => .florence2,
+        .whisper => |cfg| if (cfg.encoder_attention_heads > 0 and cfg.decoder_attention_heads > 0 and
+            cfg.d_model % cfg.encoder_attention_heads == 0 and cfg.d_model % cfg.decoder_attention_heads == 0 and
+            cfg.encoderHeadDim() == 64 and cfg.decoderHeadDim() == 64 and cfg.max_source_positions == 1500 and
+            cfg.max_target_positions > 0 and cfg.max_target_positions <= 2048 and
+            (cfg.num_mel_bins == 80 or cfg.num_mel_bins == 128)) .whisper else null,
         .gpt => |cfg| switch (cfg.family) {
             .gemma => .gemma4,
             .qwen3 => if (task == .generic and model_manifest.isLastTokenDecoderEmbedder()) .qwen3_embedding else null,
@@ -2382,6 +2388,9 @@ test "cuda support gate admits only supported model roles" {
     try std.testing.expect(cudaSupportsArch(.{ .deberta = .{} }, &generic_manifest));
     try std.testing.expect(cudaSupportsArch(.{ .gliner = .{} }, &generic_manifest));
     try std.testing.expect(cudaSupportsArch(.{ .florence = .{} }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .whisper = .{} }, &generic_manifest));
+    try std.testing.expect(!cudaSupportsArch(.{ .whisper = .{ .encoder_attention_heads = 0 } }, &generic_manifest));
+    try std.testing.expect(!cudaSupportsArch(.{ .whisper = .{ .d_model = 192 } }, &generic_manifest));
     const span_modern_manifest = manifest_mod.ModelManifest{
         .allocator = std.testing.allocator,
         .model_type = .extractor,

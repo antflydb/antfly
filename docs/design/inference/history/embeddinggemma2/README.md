@@ -8,3 +8,5 @@ usage guide is [EmbeddingGemma 2](../../../../guides/models/embeddinggemma2.mdx)
   long-context and PyTorch comparisons, per-case performance gate, video and
   CUDA BF16 qualification. This was the full guide before it was split.
 - [PyTorch comparison data, 2026-10-07](2026-10-07-comparison.json)
+- [CPU qualification on GB10, 2026-11-03](2026-11-03-cpu-qualification.md):
+  text/image accuracy, retrieval, serving limits and GIF first-frame behavior.

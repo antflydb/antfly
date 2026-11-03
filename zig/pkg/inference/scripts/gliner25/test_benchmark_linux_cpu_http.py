@@ -21,11 +21,27 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 import benchmark_linux_cpu_http as bench
 
 
 class ContractTests(unittest.TestCase):
+    def test_concurrent_round_overlaps_clients_and_checks_every_result(self):
+        entered = threading.Barrier(4, timeout=5)
+
+        def checked_request(*_):
+            entered.wait()
+            return {"duration_ns": 1, "output": {"ok": True}}
+
+        with patch.object(bench, "request", side_effect=checked_request):
+            result = bench.request_round("http://localhost", {}, 10, 4)
+        self.assertEqual(len(result["requests"]), 4)
+        self.assertGreater(result["duration_ns"], 0)
+        with patch.object(bench, "request", side_effect=ValueError("mismatch")):
+            with self.assertRaisesRegex(ValueError, "mismatch"):
+                bench.request_round("http://localhost", {}, 10, 4)
+
     def test_numeric_tolerance_does_not_hide_decision_or_offset_changes(self):
         expected = {"label": "refund", "start": 2, "confidence": 0.8}
         bench.require_equal(expected, dict(expected, confidence=0.8001), 0.0005)
@@ -98,6 +114,8 @@ class ContractTests(unittest.TestCase):
                             "0",
                             "--pairs",
                             "2",
+                            "--concurrency",
+                            "4",
                         ],
                         capture_output=True,
                         text=True,
@@ -114,6 +132,12 @@ class ContractTests(unittest.TestCase):
                         )
                         self.assertIn(
                             "candidate_over_reference", report["comparisons"]["decide"]
+                        )
+                        self.assertEqual(report["concurrency"], 4)
+                        summary = report["comparisons"]["decide"]
+                        self.assertIn("client_latency_ns", summary)
+                        self.assertGreater(
+                            summary["requests_per_second"]["candidate"], 0
                         )
         finally:
             server.shutdown()

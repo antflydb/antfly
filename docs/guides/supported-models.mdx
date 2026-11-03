@@ -119,6 +119,11 @@ Automatic backend selection may fall back to another compatible backend (for exa
 
 `BAAI/bge-m3` resolves to the official repository's ONNX export and serves its normalized 1024-dimensional dense vector. See [Model Downloads](/docs/guides/model-downloads#bge-m3) for its other formats.
 
+Local Whisper safetensors can run on CUDA. Default fatbin builds include native
+A100 (SM80) and L4 (SM89) images; explicit CUDA placement is strict. See
+[CUDA transcription](/docs/guides/transcription#cuda-execution) for backend
+selection and the supported checkpoint format.
+
 ## Generation Families
 
 | Family | Verified with |

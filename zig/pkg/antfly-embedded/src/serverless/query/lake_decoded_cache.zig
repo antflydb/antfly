@@ -341,6 +341,34 @@ pub const Cache = struct {
         self.hits += 1;
         return .{ .cache = self, .item = item };
     }
+    /// Retirement removes residency while existing leases keep their buffers.
+    pub fn discard(self: *Cache, key: [32]u8) void {
+        self.lock();
+        defer self.mutex.unlock();
+        const removed = self.entries.fetchRemove(key) orelse return;
+        self.bytes -= removed.value.footprint();
+        removed.value.cached = false;
+        if (removed.value.refs == 0) removed.value.destroy(self);
+    }
+    /// Pressure reclamation never waits for queries or discards pinned values.
+    pub fn reclaim(self: *Cache, target: u64) u64 {
+        if (!self.mutex.tryLock()) return 0;
+        defer self.mutex.unlock();
+        var freed: u64 = 0;
+        while (freed < target) {
+            var it = self.entries.iterator();
+            const key = while (it.next()) |entry| {
+                if (entry.value_ptr.*.refs == 0) break entry.key_ptr.*;
+            } else break;
+            const removed = self.entries.fetchRemove(key).?;
+            const size = removed.value.footprint();
+            self.bytes -= size;
+            removed.value.cached = false;
+            removed.value.destroy(self);
+            freed +|= size;
+        }
+        return freed;
+    }
     pub fn create(self: *Cache, limit: usize) !Lease {
         const item = try self.a.create(Item);
         item.* = .{ .budget = .{ .backing = self.a, .limit = limit }, .arena = undefined };
@@ -378,6 +406,24 @@ pub const Cache = struct {
         self.bytes += size;
     }
 };
+
+test "external lake native retired decoded residency preserves outstanding leases" {
+    const a = std.testing.allocator;
+    var cache: Cache = .{ .a = a };
+    defer cache.deinit();
+    const key: [32]u8 = @splat(1);
+    const lease = try cache.create(4096);
+    defer lease.release();
+    const bytes = try lease.item.arena.allocator().dupe(u8, "pinned");
+    cache.publish(key, lease);
+    try std.testing.expect(cache.bytes != 0);
+    cache.discard(key);
+    try std.testing.expect(cache.lookup(key) == null);
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+    try std.testing.expect(!lease.item.cached);
+    // The leased arena is still usable until the last reader releases it.
+    try std.testing.expectEqualStrings("pinned", bytes);
+}
 
 test "external lake decoded leases preserve pinned buffers under bounded eviction" {
     var cache: Cache = .{ .a = std.testing.allocator, .max_entries = 1 };

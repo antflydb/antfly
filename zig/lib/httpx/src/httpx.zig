@@ -195,6 +195,7 @@ pub const negotiateVersion = http.negotiateVersion;
 
 pub const Client = client_mod.Client;
 pub const isRetryableTransportError = client_mod.isRetryableTransportError;
+pub const isRetryableTransportErrorName = client_mod.isRetryableTransportErrorName;
 pub const ClientConfig = client_mod.ClientConfig;
 pub const RequestOptions = client_mod.RequestOptions;
 pub const AttemptObserver = @import("core/attempt_observer.zig").AttemptObserver;

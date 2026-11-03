@@ -110,7 +110,7 @@ pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publicati
     // completed composition proves coverage of the actual table cut.
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
-    const aggregate_key = @import("lake_wal_image.zig").digest(.{ .format = "recent-vector-composed-status-v1", .store = store.identity, .cut = try cutDigest(scratch.allocator(), table, publication, overlay), .lsn = overlay.pending.lsn });
+    const aggregate_key = @import("lake_wal_image.zig").digest(.{ .format = "recent-vector-composed-status-v1", .store = store.cache_identity, .cut = try cutDigest(scratch.allocator(), table, publication, overlay), .lsn = overlay.pending.lsn });
     if (memo) |cache| if (try cache.get(scratch.allocator(), aggregate_key, cut_expires_ms)) |_| return prepared;
     const observed = try publishStatus(a, table, publication, overlay, store, context, .ready, cut_expires_ms, aggregate);
     if (observed) if (memo) |cache| cache.put(aggregate_key, .{ .declarations = &.{} }, aggregate.until_ms);
@@ -160,7 +160,7 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
     const scratch = arena.allocator();
     const cut = try cutDigest(scratch, table, publication, overlay);
     var cache_hash = std.crypto.hash.Blake3.init(.{});
-    cache_hash.update(&store.identity);
+    cache_hash.update(&store.cache_identity);
     cache_hash.update(&cut);
     var cache_key: [32]u8 = undefined;
     cache_hash.final(&cache_key);

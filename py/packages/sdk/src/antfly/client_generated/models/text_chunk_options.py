@@ -19,12 +19,16 @@ class TextChunkOptions:
         target_tokens (int | Unset): Target number of tokens per chunk.
         overlap_tokens (int | Unset): Number of tokens to overlap between consecutive chunks. Helps maintain context
             across chunk boundaries. Only used by fixed-size chunkers.
+        min_chars (int | Unset): Minimum non-whitespace Unicode scalar values in a fixed text chunk. Shorter chunks are
+            omitted before storage and embedding; original source offsets are preserved. Zero disables filtering (default).
+            Does not filter model-aware media windows or image/audio chunks. Default: 0.
         separator (str | Unset): Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size
             chunkers.
     """
 
     target_tokens: int | Unset = UNSET
     overlap_tokens: int | Unset = UNSET
+    min_chars: int | Unset = 0
     separator: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -32,6 +36,8 @@ class TextChunkOptions:
         target_tokens = self.target_tokens
 
         overlap_tokens = self.overlap_tokens
+
+        min_chars = self.min_chars
 
         separator = self.separator
 
@@ -42,6 +48,8 @@ class TextChunkOptions:
             field_dict["target_tokens"] = target_tokens
         if overlap_tokens is not UNSET:
             field_dict["overlap_tokens"] = overlap_tokens
+        if min_chars is not UNSET:
+            field_dict["min_chars"] = min_chars
         if separator is not UNSET:
             field_dict["separator"] = separator
 
@@ -54,11 +62,14 @@ class TextChunkOptions:
 
         overlap_tokens = d.pop("overlap_tokens", UNSET)
 
+        min_chars = d.pop("min_chars", UNSET)
+
         separator = d.pop("separator", UNSET)
 
         text_chunk_options = cls(
             target_tokens=target_tokens,
             overlap_tokens=overlap_tokens,
+            min_chars=min_chars,
             separator=separator,
         )
 
