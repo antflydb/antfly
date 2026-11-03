@@ -10938,6 +10938,7 @@ pub const DataServer = struct {
                 const repository = try self.alloc.create(Repository);
                 errdefer self.alloc.destroy(repository);
                 repository.* = try Repository.init(self.alloc, self.api_server_cfg.node_config, self.api_server_cfg.secret_store, self.api_server_cfg.deployment_mode, self.api_server_cfg.native_lake_artifact_base_dir);
+                repository.attachResources(&self.provisioned_storage.resource_manager);
                 self.native_query_repository = repository;
                 ptr.query_cut_repository = repository.capability();
             };

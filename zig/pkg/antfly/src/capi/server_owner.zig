@@ -893,6 +893,7 @@ pub fn storageOwnerContextConfigureNativeQueries(context: ?*anyopaque, setup: ke
         owner.alloc.destroy(next);
         return storageOwnerStatusFromError(err);
     };
+    next.attachResources(&owner.resources.resource_manager);
     if (owner.native_queries) |previous| {
         previous.deinit();
         owner.alloc.destroy(previous);

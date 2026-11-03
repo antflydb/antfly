@@ -2836,7 +2836,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-artifact-http-test", "Run artifact maintenance request and authorization contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, artifact_http_tests, artifact_http_filters).step);
-    const native_query_repository_filters = &.{ "external lake native", "external lake invalid native" };
+    const native_query_repository_filters = &.{ "external lake native", "external lake invalid native", "objectstore-backed configured adapters", "external lake single request", "external lake bounded WAL retained cuts", "external lake retained cursor cohorts" };
     const native_query_repository_tests = b.addTest(.{
         .name = "native-query-repository-tests",
         .root_module = api_http_runtime_test_mod,

@@ -29,6 +29,16 @@ pub const max_ttl_ms: u64 = std.time.ms_per_hour;
 pub fn configuredTtl(config: ?*const local.common_config.Config) u64 {
     return if (config) |value| value.lake_indexes.query_cursors.retention_ms else ttl_ms;
 }
+/// Align issuance to a small expiry cohort so identical immutable cuts can
+/// share one durable capability. Never shorten requested retention or exceed
+/// the protocol maximum. Maximum-retention configurations keep exact expiry.
+pub fn cursorExpiry(now: u64, retention: u64) !u64 {
+    if (retention == 0 or retention > max_ttl_ms) return error.InvalidQueryRequest;
+    const desired = now +| retention;
+    const window = @min(@as(u64, 5000), retention / 100, max_ttl_ms - retention);
+    if (window == 0) return desired;
+    return @min(now +| max_ttl_ms, desired +| ((window - desired % window) % window));
+}
 pub const max_bytes: usize = 40 * 1024 * 1024;
 pub const prefix = "lake2:";
 pub const Descriptor = struct {
@@ -82,6 +92,9 @@ const LeaseEnvelope = struct {
     reader_token: catalog.Token,
     state: StateRef,
 };
+fn leaseKey(identity: [32]u8, envelope: LeaseEnvelope) [32]u8 {
+    return @import("lake_wal_image.zig").digest(.{ .format = "retained-lease-cohort-v1", .store = identity, .envelope = envelope });
+}
 fn stateKey(descriptor: Descriptor, identity: [32]u8) [32]u8 {
     // Hash the small immutable authority/recipe view. The accepted image has
     // its own authenticated head identity; do not encode its rows on a hit.
@@ -111,7 +124,8 @@ fn saveReference(a: A, store: *stores.ArtifactStore, store_identity: catalog.Dig
     try cancellation.check();
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
     if (descriptor.expires_ms <= now or descriptor.expires_ms > now +| max_ttl_ms) return error.DeadlineExceeded;
-    const key = stateKey(descriptor, store_identity);
+    const cache_scope = store.cacheScope(store_identity);
+    const key = stateKey(descriptor, cache_scope);
     const state_ref = (if (cache) |memo| try memo.get(a, key, descriptor.expires_ms) else null) orelse built: {
         const flight = if (cache) |memo| try memo.claim(key, io, cancellation) else null;
         defer if (flight) |held| held.deinit();
@@ -152,7 +166,7 @@ fn saveReference(a: A, store: *stores.ArtifactStore, store_identity: catalog.Dig
                 if (!exists) continue;
                 var fingerprint: [32]u8 = undefined;
                 hash.final(&fingerprint);
-                const part_key = @import("lake_wal_image.zig").digest(.{ .format = "retained-row-group-v2-native", .domain = scope.domain, .keys = pending.key_fields, .key_identity = pending.key_identity, .prefix = index, .content = fingerprint });
+                const part_key = @import("lake_wal_image.zig").digest(.{ .format = "retained-row-group-v2-native", .cache_scope = cache_scope, .domain = scope.domain, .keys = pending.key_fields, .key_identity = pending.key_identity, .prefix = index, .content = fingerprint });
                 const part = (if (cache) |memo| try memo.get(a, part_key, descriptor.expires_ms) else null) orelse new: {
                     const part_flight = if (cache) |memo| try memo.claim(part_key, io, cancellation) else null;
                     defer if (part_flight) |held| held.deinit();
@@ -187,8 +201,23 @@ fn saveReference(a: A, store: *stores.ArtifactStore, store_identity: catalog.Dig
     try cancellation.check();
     try validateStateRef(state_ref, domain(descriptor.table_id, store_identity), descriptor.expires_ms);
     const envelope: LeaseEnvelope = .{ .expires_ms = descriptor.expires_ms, .table_id = descriptor.table_id, .object_generation = descriptor.object_generation, .desired = descriptor.desired, .reader_token = descriptor.reader_token, .state = state_ref };
+    const lease_key = leaseKey(cache_scope, envelope);
+    if (cache) |memo| if (try memo.get(a, lease_key, now)) |ref| {
+        try validateStateRef(ref, domain(descriptor.table_id, store_identity), descriptor.expires_ms);
+        try cancellation.check();
+        return ref;
+    };
+    const flight = if (cache) |memo| try memo.claim(lease_key, io, cancellation) else null;
+    defer if (flight) |held| held.deinit();
+    if (cache) |memo| if (try memo.get(a, lease_key, now)) |ref| {
+        try validateStateRef(ref, domain(descriptor.table_id, store_identity), descriptor.expires_ms);
+        try cancellation.check();
+        return ref;
+    };
     const scope = try stores.UploadScope.forPublication(domain(descriptor.table_id, store_identity), descriptor.expires_ms, io);
-    return upload(a, store, scope, envelope, cancellation);
+    const ref = try upload(a, store, scope, envelope, cancellation);
+    if (cache) |memo| memo.put(lease_key, ref, descriptor.expires_ms);
+    return ref;
 }
 fn validateStateRef(ref: StateRef, expected_domain: [32]u8, expiry: u64) !void {
     _ = try stores.sha256ChecksumFromArtifactId(ref.id);
@@ -408,7 +437,7 @@ fn groupLimit(part: StateRef) usize {
     return @min(64 * 1024 * 1024, @as(usize, part.bytes) *| 32 +| 1024 * 1024);
 }
 fn acquireGroup(cache: *local.serverless_query_lake_decoded_cache.Cache, store: stores.ArtifactStore, part: StateRef, version: u8, keys: []const []const u8, encoding: ingestion.KeyIdentity, expected_domain: [32]u8, token: Token, context: local.serverless_query_lake_read_context.Context) anyerror!local.serverless_query_lake_decoded_cache.Lease {
-    const key_ = @import("lake_wal_image.zig").digest(.{ .format = "decoded-retained-row-group-v1", .domain = expected_domain, .version = version, .keys = keys, .encoding = encoding, .ref = part });
+    const key_ = @import("lake_wal_image.zig").digest(.{ .format = "decoded-retained-row-group-v1", .cache_scope = store.cacheScope(expected_domain), .domain = expected_domain, .version = version, .keys = keys, .encoding = encoding, .ref = part });
     var loader: GroupLoader = .{ .store = store, .ref = part, .version = version, .keys = keys, .encoding = encoding, .cancellation = token };
     return cache.acquire(key_, groupLimit(part), context, .{ .ptr = &loader, .load = GroupLoader.decode }) catch |err| switch (err) {
         error.OutOfMemory, error.SqlMemoryLimitExceeded => private: {
@@ -490,7 +519,7 @@ fn loadImpl(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
         if (lease.expires_ms <= now or lease.expires_ms > now +| max_ttl_ms or lease.expires_ms != scope.fencingToken() or lease.table_id != table.table_id or lease.object_generation != table.object_storage_generation or !std.mem.eql(u8, &lease.desired, &catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
         try validateStateRef(lease.state, expected_domain, lease.expires_ms);
         const decoded: Decoded = if (cache) |memo| shared: {
-            const key = @import("lake_wal_image.zig").digest(.{ .format = "retained-decoded-state-v1", .store = store_identity, .table = table.table_id, .incarnation = table.object_storage_generation, .ref = lease.state });
+            const key = @import("lake_wal_image.zig").digest(.{ .format = "retained-decoded-state-v1", .store = store_identity, .cache_scope = store.cacheScope(store_identity), .table = table.table_id, .incarnation = table.object_storage_generation, .ref = lease.state });
             var loader: StateLoader = .{ .store = store.*, .ref = lease.state, .domain = expected_domain, .expiry = lease.expires_ms, .cancellation = cancellation, .groups = groups, .context = context };
             const Check = struct {
                 token: Token,
@@ -638,20 +667,22 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
             return std.json.parseFromSliceLeaky(State, alloc, bytes, .{ .allocate = .alloc_always });
         }
     };
+    const same = try saveCached(sa, &artifacts, identity, std.testing.io, descriptor, .none, &cache);
+    try std.testing.expectEqualStrings(token, same);
     const old_envelope = try Read.envelope(sa, &artifacts, token);
     const old_state = try Read.state(sa, &artifacts, old_envelope.state);
     try std.testing.expectEqual(@as(usize, 2), old_state.change_parts.len);
-    try std.testing.expectEqual(@as(u64, 3), cache.puts);
+    try std.testing.expectEqual(@as(u64, 4), cache.puts);
     {
         // Model unchanged row groups retained from an earlier day's cut.
         // They still cover the current five-minute query, but not a later
         // twenty-minute query. A new root must inherit that earlier horizon.
         var aging: Cache = .{ .budget = .{ .backing = a, .limit = 1024 * 1024 } };
         defer aging.deinit();
-        const root_key = stateKey(descriptor, identity);
+        const root_key = stateKey(descriptor, artifacts.cacheScope(identity));
         var entries = cache.entries.iterator();
         while (entries.next()) |entry| {
-            if (std.mem.eql(u8, &entry.key_ptr.*, &root_key)) continue;
+            if (std.mem.eql(u8, &entry.key_ptr.*, &root_key) or std.mem.eql(u8, &entry.key_ptr.*, &leaseKey(artifacts.cacheScope(identity), old_envelope))) continue;
             const original = try std.json.parseFromSliceLeaky(StateRef, sa, entry.value_ptr.bytes, .{});
             const body = try readRetained(&artifacts, original, .none);
             defer artifacts.allocator.free(body);
@@ -696,15 +727,17 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
         };
         for (&jobs) |*job| job.* = try std.testing.io.concurrent(Worker.run, .{ &artifacts, identity, descriptor, &concurrent });
         var published: ?[]const u8 = null;
+        var issued: ?[]const u8 = null;
         for (&jobs) |*job| {
             var running = job.*.?;
             job.* = null;
             const value = try running.await(std.testing.io);
             defer std.heap.page_allocator.free(value);
+            if (issued) |prior| try std.testing.expectEqualStrings(prior, value) else issued = try sa.dupe(u8, value);
             const envelope = try Read.envelope(sa, &artifacts, value);
             if (published) |prior| try std.testing.expectEqualStrings(prior, envelope.state.id) else published = envelope.state.id;
         }
-        try std.testing.expectEqual(@as(u64, 3), concurrent.puts);
+        try std.testing.expectEqual(@as(u64, 4), concurrent.puts);
     }
     descriptor.expires_ms += 60_000;
     descriptor.reader_token = @splat(6);
@@ -714,7 +747,7 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
     try std.testing.expectEqualStrings(old_envelope.state.id, fresh_envelope.state.id);
     try std.testing.expectEqual(descriptor.expires_ms, fresh_envelope.expires_ms);
     try std.testing.expectEqual(descriptor.reader_token, fresh_envelope.reader_token);
-    try std.testing.expectEqual(@as(u64, 3), cache.puts);
+    try std.testing.expectEqual(@as(u64, 5), cache.puts);
     {
         var decoded: local.serverless_query_lake_decoded_cache.Cache = .{ .a = a };
         defer decoded.deinit();
@@ -868,7 +901,7 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
         if (std.mem.eql(u8, old_part.id, new_part.id)) reused += 1;
     };
     try std.testing.expectEqual(@as(usize, 1), reused);
-    try std.testing.expectEqual(@as(u64, 5), cache.puts);
+    try std.testing.expectEqual(@as(u64, 8), cache.puts);
     // A legacy descriptor retains its original JSON-array row IDs.
     var legacy = descriptor;
     const legacy_row = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"id\":-0.0,\"body\":\"legacy\"}", .{});
@@ -925,4 +958,19 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
     changed = table;
     changed.indexes_json = "{\"text\":{\"type\":\"full_text\"}}";
     try std.testing.expectError(error.CatalogGenerationChanged, load(scratch, &reads, identity, token, changed, now + 1, .none));
+}
+
+test "external lake retained cursor cohorts preserve requested retention and maximum" {
+    const now: u64 = 1001;
+    const retention: u64 = 600000;
+    const expiry = try cursorExpiry(now, retention);
+    try std.testing.expect(expiry >= now + retention);
+    try std.testing.expect(expiry < now + retention + 5000);
+    try std.testing.expectEqual(expiry, try cursorExpiry(4000, retention));
+    try std.testing.expectEqual(now + max_ttl_ms, try cursorExpiry(now, max_ttl_ms));
+    try std.testing.expectEqual(now + 1, try cursorExpiry(now, 1));
+    try std.testing.expect((try cursorExpiry(now, max_ttl_ms - 1)) <= now + max_ttl_ms);
+    try std.testing.expectEqual(std.math.maxInt(u64), try cursorExpiry(std.math.maxInt(u64) - 1, retention));
+    try std.testing.expectError(error.InvalidQueryRequest, cursorExpiry(now, 0));
+    try std.testing.expectError(error.InvalidQueryRequest, cursorExpiry(now, max_ttl_ms + 1));
 }

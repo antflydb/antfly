@@ -70,6 +70,13 @@ pub const WorkingSetAllocator = struct {
         if (@import("antfly_platform").allocator.reclamation.Quota.owner(a)) |owner| return @min(owner.available(), headroom(owner.backing) orelse return null);
         if (@import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator.parentAllocator(a)) |parent| return headroom(parent);
         if (comptime @import("builtin").is_test) if (a.vtable == std.testing.allocator.vtable) return std.math.maxInt(usize);
+        const Host = @import("antfly_local_sources").storage_resource_manager.BudgetedAllocator;
+        if (Host.fromAllocator(a)) |owner| {
+            // fromAllocator also recognizes standard arenas. Optional capture
+            // cannot assume those arenas refund their backing on every wave.
+            if (a.ptr != @as(*anyopaque, @ptrCast(owner))) return null;
+            return @min(owner.availableAllocationBytesThreadSafe(), headroom(owner.backing) orelse return null);
+        }
         if (@import("antfly_local_sources").sql_memory_budget.optionalLocalHeadroom(a)) |layer| return @min(layer.available, headroom(layer.backing) orelse return null);
         return @import("antfly_local_sources").sql_memory_budget.optionalHeadroom(a);
     }
@@ -297,4 +304,22 @@ test "optional block retention respects a request cap above an opaque backing al
     defer a.free(bytes);
     try std.testing.expectEqual(@as(?usize, 96 * 1024), WorkingSetAllocator.cacheHeadroom(a));
     try std.testing.expect(!bounded.limitExceeded());
+}
+
+test "external lake native publication headroom respects managed host admission and opaque arenas" {
+    const resources = @import("antfly_local_sources").storage_resource_manager;
+    const a = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 4 * 1024 * 1024 } });
+    defer manager.deinit(a);
+    var host = resources.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer host.deinit();
+    var bounded = try WorkingSetAllocator.init(host.threadSafeAllocator(), .{ .max_working_set_bytes = 8 * 1024 * 1024 });
+    defer bounded.deinit();
+    try std.testing.expectEqual(@as(?usize, 4 * 1024 * 1024), WorkingSetAllocator.headroom(bounded.allocator()));
+    const bytes = try bounded.allocator().alloc(u8, 1024);
+    defer bounded.allocator().free(bytes);
+    try std.testing.expectEqual(@as(?usize, 4 * 1024 * 1024 - 1024), WorkingSetAllocator.headroom(bounded.allocator()));
+    var arena = std.heap.ArenaAllocator.init(host.threadSafeAllocator());
+    defer arena.deinit();
+    try std.testing.expectEqual(@as(?usize, null), WorkingSetAllocator.headroom(arena.allocator()));
 }

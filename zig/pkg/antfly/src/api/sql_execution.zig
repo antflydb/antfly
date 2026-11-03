@@ -1781,7 +1781,7 @@ pub const Adapter = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.adapter.verify(self.a, self.table);
             const recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot .. slot + 1] };
-            const reader = try @import("lake_index_aggregate_artifact.zig").Reader.openWithCache(self.a, self.store.artifactStore(), self.artifacts[slot], recipe, .{ .ptr = self, .is_cancelled_fn = canceled }, .{ .cache = &self.adapter.server.lake_read_cache, .scope = self.store.identity, .context = self.read_context });
+            const reader = try @import("lake_index_aggregate_artifact.zig").Reader.openWithCache(self.a, self.store.artifactStore(), self.artifacts[slot], recipe, .{ .ptr = self, .is_cancelled_fn = canceled }, .{ .cache = &self.adapter.server.lake_read_cache, .scope = self.store.cache_identity, .context = self.read_context });
             errdefer reader.cursor().close(reader);
             if (self.recipe.inputs.len > 1) {
                 try reader.setOutputSlot(@intCast(slot));
@@ -1789,7 +1789,7 @@ pub const Adapter = struct {
                 for (self.artifacts[slot + 1 ..], slot + 1..) |artifact, index| {
                     if (self.fused[index]) continue;
                     const input_recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[index .. index + 1] };
-                    const candidate = try @import("lake_index_aggregate_artifact.zig").Reader.openWithCache(self.a, self.store.artifactStore(), artifact, input_recipe, .{ .ptr = self, .is_cancelled_fn = canceled }, .{ .cache = &self.adapter.server.lake_read_cache, .scope = self.store.identity, .context = self.read_context });
+                    const candidate = try @import("lake_index_aggregate_artifact.zig").Reader.openWithCache(self.a, self.store.artifactStore(), artifact, input_recipe, .{ .ptr = self, .is_cancelled_fn = canceled }, .{ .cache = &self.adapter.server.lake_read_cache, .scope = self.store.cache_identity, .context = self.read_context });
                     defer candidate.cursor().close(candidate);
                     if (try reader.fuse(candidate, @intCast(index))) self.fused[index] = true;
                 }

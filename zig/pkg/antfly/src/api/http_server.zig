@@ -6742,6 +6742,7 @@ pub const ApiHttpServer = struct {
         } else {
             var repository = try @import("native_query_repository.zig").Repository.init(a, config, self.cfg.secret_store, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
             defer repository.deinit();
+            repository.attachResources(self.shared_resource_manager orelse &self.local_resource_manager);
             const control: @import("antfly_local_sources").storage_db_native_query_cut.Control = .{ .parent = cancel, .deadline_ns = request.deadline_ns.? };
             if (self.native_query_gc_collection == null) {
                 const runtime = self.cfg.backend_runtime orelse return;
