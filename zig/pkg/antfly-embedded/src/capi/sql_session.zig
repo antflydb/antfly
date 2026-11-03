@@ -496,7 +496,7 @@ test "mutation fold SQL point reads fence staged table identity even when the ke
     var session: Session = .{ .handle = undefined, .budget = .{ .backing = a, .limit = 1024 * 1024 }, .arena = undefined };
     session.arena = .init(session.budget.allocator());
     defer session.deinit();
-    try session.entries.append(session.arena.allocator(), .{ .table = table, .mutation = .{ .key = "staged", .expected_version = 7, .row = .{ .object = std.json.ObjectMap.init(session.arena.allocator()) } }, .encoded_row = "{}" });
+    try session.entries.append(session.arena.allocator(), .{ .table = table, .mutation = .{ .key = "staged", .expected_version = 7, .row = null }, .encoded_row = "{}" });
     const missing = try session.stagedForScan(a, table, "absent");
     defer a.free(missing);
     try std.testing.expectEqual(@as(usize, 0), missing.len);

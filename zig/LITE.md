@@ -1406,7 +1406,7 @@ the requested key is absent. Cache storage is charged to the transaction budget
 and optional allocation failures evict it. COMMIT still performs authoritative
 constraint preparation and checks every original version/digest predicate.
 Background publication statistics expose SQL overlay hits, rebuilds, rebuilt
-rows, evictions and staged statements; rebuild rows distinguish work avoided
+staged entries, evictions and staged statements; rebuilt entries distinguish work avoided
 across statements from an arbiter and validator sharing one statement's input.
 
 Native revision-7 background turns separate source-derived replay from immutable
