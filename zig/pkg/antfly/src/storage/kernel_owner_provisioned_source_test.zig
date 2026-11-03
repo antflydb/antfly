@@ -931,6 +931,9 @@ test "native index owner adapter inspects cold native ownership and rejects fore
             var committed = try provisioned.replicatedBatchAtRaftEntryJson("items", row, 1, 1);
             committed.deinit();
         }
+        // Directory renames bypass the normal snapshot publication callback.
+        // Apply its cache invalidation before opening the replaced physical root.
+        try source.context.invalidateCaches();
         checkpoint = "observe committed replacement disk";
         const replacement = try source.raftSchemaOwnerObservationAtRoot(7501, "items", actual_binding, .{});
         try std.testing.expectEqual(applied.root_generation, replacement.root_generation);
@@ -938,12 +941,23 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         try std.testing.expect(replacement.observation.header == null);
         // This root contains the real replacement row committed above. Its
         // data clock must remain truthful even though it has no schema job.
+        {
+            var reopened = try source.acquireRaftSchemaOwnerSession(7501, "items", actual_binding, .{});
+            defer reopened.deinit();
+            const lookup = try table_reads.encodeStorageKernelLookupRequest(alloc, "replacement", .{});
+            defer alloc.free(lookup);
+            var found = try reopened.lease.entry.owner.lookupJson("items", lookup);
+            defer found.deinit();
+            if (found.version() == 0) std.debug.print("replacement row missing after reopen: {s}\n", .{found.bytes()});
+            try std.testing.expect(found.version() > 0);
+        }
         try std.testing.expect(replacement.observation.applied != null);
         try std.testing.expectEqual(@as(u64, 1), replacement.observation.applied.?.term);
         try std.testing.expectEqual(@as(u64, 1), replacement.observation.applied.?.index);
         try std.testing.expectEqual(@as(usize, 1), source.retireTable("items"));
         try std.Io.Dir.renameAbsolute(seed_path, replacement_path, std.testing.io);
         try std.Io.Dir.renameAbsolute(retained_path, seed_path, std.testing.io);
+        try source.context.invalidateCaches();
         try control.reacquireAfterApply();
         try std.testing.expectEqualDeep(applied, try control.recoverCommitted());
 
