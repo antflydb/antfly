@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const hasMinimumContent = types.hasMinimumTextContent;
 const HfTokenizer = @import("inference_hf_tokenizer").HfTokenizer;
 
 const tokenizer_json = @import("inference_fixed_tokenizer_data").tokenizer_json;
@@ -599,24 +600,6 @@ test "fixed text chunker counts unspaced CJK paragraphs per character" {
     for (chunks) |chunk| {
         try std.testing.expect(try countTokens(alloc, tokenizer, chunk.text.?) <= 256);
     }
-}
-
-/// Count scalars rather than bytes or English words. Whitespace cannot make a
-/// page label eligible. Opt-in so short captions and identifiers remain usable.
-fn hasMinimumContent(text: []const u8, minimum: usize) bool {
-    if (minimum == 0) return true;
-    const view = std.unicode.Utf8View.init(text) catch return false;
-    var it = view.iterator();
-    var count: usize = 0;
-    while (it.nextCodepoint()) |cp| {
-        switch (cp) {
-            0x09...0x0d, 0x20, 0x85, 0xa0, 0x1680, 0x2000...0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => continue,
-            else => {},
-        }
-        count += 1;
-        if (count >= minimum) return true;
-    }
-    return false;
 }
 
 test "fixed text minimum content omits page scraps without truncating later passages" {
