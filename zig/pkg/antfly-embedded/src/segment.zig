@@ -3030,6 +3030,51 @@ pub fn preparePrivateMerge(alloc: Allocator, inputs: []const MergeInput, scratch
     return result;
 }
 
+test "private merge all-deleted inputs retire without an output or scratch file" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    try writer.addStoredDoc("first", "{}");
+    try writer.addStoredDoc("second", "{}");
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.add(0);
+    try deleted.add(1);
+    const inputs = [_]MergeInput{ .{ .reader = &reader, .deleted = deleted }, .{ .reader = &reader, .deleted = deleted } };
+    var result = try preparePrivateMerge(a, &inputs, .{ .io = std.testing.io, .directory = directory }, null, 1024 * 1024);
+    defer result.deinit();
+    try std.testing.expect(result.run == null);
+    try std.testing.expect(result.source_map == null);
+    const Fault = struct {
+        fn run(alloc: Allocator, sources: []const MergeInput, options: MergeScratchOptions) !void {
+            var empty = try preparePrivateMerge(alloc, sources, options, null, 0);
+            defer empty.deinit();
+            try std.testing.expect(empty.run == null and empty.source_map == null);
+            try std.testing.expectEqual(sources.len, empty.input_uses.items.len);
+        }
+    };
+    // There is nothing to encode, so even an unavailable scratch directory
+    // and zero output capacity must not prevent removal of the dead inputs.
+    const absent = try std.mem.concat(a, u8, &.{ directory, "/absent" });
+    defer a.free(absent);
+    const scratch: MergeScratchOptions = .{ .io = std.testing.io, .directory = absent };
+    try Fault.run(a, &inputs, scratch);
+    try std.testing.checkAllAllocationFailures(a, Fault.run, .{ &inputs, scratch });
+    var canceled: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectError(error.Canceled, preparePrivateMerge(a, &inputs, scratch, &canceled, 0));
+    try deleted.remove(1);
+    try deleted.add(2);
+    try std.testing.expectError(error.InvalidData, preparePrivateMerge(a, &.{.{ .reader = &reader, .deleted = deleted }}, scratch, null, 0));
+}
+
 test "private merge preserves surviving documents and provenance without publication" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

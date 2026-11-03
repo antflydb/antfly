@@ -5095,6 +5095,10 @@ fn seedPausedPrivateMerge(fixture: *AdmissionFollowupFixture) !*PendingTextMerge
 }
 
 fn seedPausedPrivateMergeInTable(fixture: *AdmissionFollowupFixture, table_name: ?[]const u8) !*PendingTextMerge {
+    return seedPausedPrivateMergeWithDeletes(fixture, table_name, false);
+}
+
+fn seedPausedPrivateMergeWithDeletes(fixture: *AdmissionFollowupFixture, table_name: ?[]const u8, delete_inputs: bool) !*PendingTextMerge {
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
     if (table_name == null) try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
     const owner = fixture.connection.owner;
@@ -5119,6 +5123,10 @@ fn seedPausedPrivateMergeInTable(fixture: *AdmissionFollowupFixture, table_name:
             defer std.testing.allocator.free(bytes);
             try entry.persistent.indexSegment(bytes);
         }
+        if (delete_inputs) for (0..12) |i| {
+            var id: [32]u8 = undefined;
+            try std.testing.expect(try entry.persistent.deleteById(try std.fmt.bufPrint(&id, "private-{d}", .{i})));
+        };
         entry.compaction_pending.store(true, .release);
     }
     test_private_merge_entered.store(false, .release);
@@ -5138,6 +5146,54 @@ fn seedPausedPrivateMergeInTable(fixture: *AdmissionFollowupFixture, table_name:
     try std.testing.expect(owner.maintenance_snapshot != pending.root);
     try std.testing.expect(!pending.done.load(.acquire));
     return pending;
+}
+
+test "capi native asynchronous text merge removes inputs already fully deleted at capture" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("private-merge-all-deleted", 5000, .batch);
+    defer fixture.deinit();
+    defer test_pause_private_merge.store(false, .release);
+    const pending = try seedPausedPrivateMergeWithDeletes(&fixture, "empty-merge", true);
+    const owner = fixture.connection.owner;
+    const ids = try std.testing.allocator.alloc(u64, pending.task.source.len);
+    defer std.testing.allocator.free(ids);
+    for (pending.task.source, pending.task.merge_indices, ids) |source, index, *id| {
+        id.* = source.id;
+        try std.testing.expectEqual(@as(usize, pending.task.snapshot.segments[index].reader.doc_count), source.deleted.?.cardinality());
+    }
+    const applied_before = owner.publication_stats.text_merge_jobs_applied;
+    const staged_before = owner.publication_stats.text_merge_staged_bytes;
+    {
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const root = try owner.refresh();
+        const database = try @import("tables.zig").get(root, "empty-merge");
+        const entry = database.core.index_manager.textIndexEntry("text").?;
+        var writer = segment_mod.SegmentWriter.init(std.testing.allocator);
+        defer writer.deinit();
+        try writer.addStoredDoc("newer-survivor", "{}");
+        const bytes = try writer.build();
+        defer std.testing.allocator.free(bytes);
+        try entry.persistent.indexSegment(bytes);
+    }
+    test_pause_private_merge.store(false, .release);
+    for (0..256) |_| {
+        _ = try owner.maintenanceTurn();
+        if (owner.publication_stats.text_merge_jobs_applied > applied_before) break;
+        try h.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(owner.publication_stats.text_merge_jobs_applied > applied_before);
+    try std.testing.expectEqual(staged_before, owner.publication_stats.text_merge_staged_bytes);
+    var lease = try fixture.connection.acquire();
+    defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    defer lease.close();
+    const root = try owner.refresh();
+    const database = try @import("tables.zig").get(root, "empty-merge");
+    const snapshot = database.core.index_manager.textIndexEntry("text").?.persistent.snapshot();
+    try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
+    for (snapshot.segments) |segment| for (ids) |id| try std.testing.expect(segment.id != id);
+    try std.testing.expect((try root.owned_lite_backend.?.native_docstore.?.file.check()).valid);
 }
 
 test "capi native asynchronous text merge preserves newer segments and deletion races while replay advances" {
