@@ -749,6 +749,7 @@ impl Default for types::CreateFullTextIndexRequest {
 impl Default for types::CreateEmbeddingsIndexRequest {
     fn default() -> Self {
         Self {
+            algorithm: None,
             chunk_size: 1024,
             chunker: None,
             coverage_policy: None,
@@ -761,9 +762,12 @@ impl Default for types::CreateEmbeddingsIndexRequest {
             execution: None,
             external: false,
             field: None,
+            leann: None,
             mem_only: None,
             min_weight: None,
             publication_policy: Some(types::IndexPublicationPolicy::Progressive),
+            quantization_bits: None,
+            quantization_refine: None,
             source_artifact_name: None,
             sources: None,
             sparse: false,
