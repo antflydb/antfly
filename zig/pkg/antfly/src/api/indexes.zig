@@ -743,8 +743,11 @@ pub fn encodeIndexList(
     return try out.toOwnedSlice(alloc);
 }
 
-fn isInterruptedLakeBuild(reason: []const u8) bool {
-    inline for (.{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout" }) |name| {
+fn isRetryableLakeBuildFailure(reason: []const u8) bool {
+    // This controls coordinator readiness, not HTTP replay. The coordinator
+    // reacquires its fence and resumes verified checkpoints after backoff.
+    // In particular, an ambiguous TLS write must not be blindly replayed.
+    inline for (.{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "TlsTransportReadFailed", "NameServerFailure", "ConnectionReset", "ConnectionResetByPeer", "ConnectionAborted", "ConnectionClosed", "ConnectionTimeout", "ConnectionTimedOut", "BrokenPipe" }) |name| {
         if (std.mem.eql(u8, reason, name)) return true;
     }
     return false;
@@ -782,10 +785,9 @@ pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_m
         break :published null;
     } else null;
     const serving_ready = queryable and published != null;
-    // Reconciliation retries interrupted attempts after their durable backoff.
-    // Shutdown/deadline cancellation is pending work, not a terminal load
-    // failure. Queryability still requires the independent serving proof.
-    const terminal_failure = if (failure) |value| !isInterruptedLakeBuild(value.reason) else false;
+    // Reconciliation retries interruptions and transient transport failures
+    // after durable backoff. Queryability still requires the independent proof.
+    const terminal_failure = if (failure) |value| !isRetryableLakeBuildFailure(value.reason) else false;
     const readiness: indexes_openapi.IndexReadinessStatus = .{
         .state = if (serving_ready) .ready else if (terminal_failure) .failed else .pending,
         .queryable = serving_ready,
@@ -11213,7 +11215,7 @@ test "external lake native interrupted publication is pending while integrity an
     defer config.deinit();
     var table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "events", .indexes_json = "{\"body_text\":{\"type\":\"full_text\"}}" };
     const desired = lake.desiredFingerprint(table);
-    for ([_][]const u8{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "ArtifactIntegrityMismatch", "SqlProgramLimitExceeded" }, 0..) |reason, i| {
+    for ([_][]const u8{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "TlsTransportReadFailed", "ConnectionResetByPeer", "NameServerFailure", "ArtifactIntegrityMismatch", "SqlProgramLimitExceeded", "TlsBadRecordMac", "TlsAlert", "AccessDenied" }, 0..) |reason, i| {
         const catalog_json = try lake.encode(a, .{ .generation = 1, .failure = .{ .generation = 1, .desired = desired, .reason = reason, .retry_at_ms = 1000 } });
         defer a.free(catalog_json);
         table.lake_index_catalog_json = catalog_json;
@@ -11223,9 +11225,9 @@ test "external lake native interrupted publication is pending while integrity an
         defer parsed.deinit();
         const status = parsed.value.object.get("status").?;
         const readiness = status.object.get("readiness").?;
-        try std.testing.expectEqualStrings(if (i < 4) "pending" else "failed", readiness.object.get("state").?.string);
+        try std.testing.expectEqualStrings(if (i < 7) "pending" else "failed", readiness.object.get("state").?.string);
         try std.testing.expect(!readiness.object.get("queryable").?.bool);
-        try std.testing.expectEqualStrings(if (i < 4) "publication" else "load_failure", readiness.object.get("pending_reasons").?.array.items[0].string);
+        try std.testing.expectEqualStrings(if (i < 7) "publication" else "load_failure", readiness.object.get("pending_reasons").?.array.items[0].string);
         try std.testing.expectEqualStrings(reason, status.object.get("error").?.string);
     }
 }

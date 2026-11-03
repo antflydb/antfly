@@ -141,3 +141,62 @@ class RemotePerformanceTests(unittest.TestCase):
         self.assertEqual(result["median_ms"], 6.745)
         self.assertEqual(result["p95_ms"], 3926.98)
         self.assertEqual(result["max_ms"], 3926.98)
+
+    def test_incomplete_cells_cannot_relabel_resumed_build_time(self):
+        for status in ("failed", "interrupted", "running", None):
+            with (
+                self.subTest(status=status),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                binary = root / "binary"
+                binary.write_bytes(b"engine")
+                state = root / "attempt"
+                state.mkdir()
+                (state / "data").mkdir()
+                if status is not None:
+                    (state / "matrix-result.json").write_text(
+                        json.dumps({"status": status})
+                    )
+                cell = {
+                    "name": "attempt",
+                    "state": str(state),
+                    "harness_sha256": {},
+                    "fixture": [],
+                    "command": ["poc.py", "--binary", str(binary)],
+                    "binary_sha256": matrix.fingerprint(binary),
+                }
+                with patch.object(matrix.subprocess, "Popen") as launch:
+                    with self.assertRaisesRegex(
+                        ValueError, "requires fresh state|Unmeasured existing"
+                    ):
+                        matrix.execute([cell], root)
+                    launch.assert_not_called()
+                self.assertTrue((state / "data").exists())
+                self.assertFalse((root / "matrix.lock").exists())
+
+    def test_completed_cells_resume_without_launching_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "binary"
+            binary.write_bytes(b"engine")
+            state = root / "passed"
+            state.mkdir()
+            (state / "data").mkdir()
+            (state / "matrix-result.json").write_text(
+                json.dumps({"status": "passed", "measurements": {"top_hits": []}})
+            )
+            cell = {
+                "name": "passed",
+                "state": str(state),
+                "harness_sha256": {},
+                "fixture": [],
+                "command": ["poc.py", "--binary", str(binary)],
+                "binary_sha256": matrix.fingerprint(binary),
+            }
+            with patch.object(matrix.subprocess, "Popen") as launch:
+                matrix.execute([cell], root)
+                launch.assert_not_called()
+            self.assertTrue(
+                json.loads((root / "matrix-summary.json").read_text())["complete"]
+            )

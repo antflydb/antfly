@@ -64,6 +64,11 @@ use Debug to investigate and fix engine failures. OS caches are not flushed.
 Run regional qualification with the serving process in the bucket's region;
 label developer cross-region measurements separately.
 
+Resume skips only completed cells with unchanged recipes and fingerprints.
+Preserve failed or interrupted attempts, then use fresh state and a fresh
+artifact prefix for their replacements. Reusing an incomplete engine would
+mislabel remaining construction time as a fresh publication measurement.
+
 Local GCS runs validate a conservative credential lifetime before every child
 start and refresh when insufficient. A still-valid in-memory token is retained
 across restarts even if another CLI user refreshes the shared gcloud cache. A single cached `gcloud auth print-access-token` result can
@@ -149,6 +154,9 @@ production SLOs or upgrades. Those remain explicit release/deployment checks.
 Shutdown can interrupt a newer Iceberg index publication while accepted reads
 continue through the prior publication and WAL overlay. The coordinator already
 retries the interrupted attempt. Readiness reports cancellation/deadline/timeout
-interruptions as pending publication, retaining the error for diagnostics;
-integrity and admission failures remain failed. A pending attempt never grants
-queryability without an independent serving proof.
+interruptions and transient transport failures as pending publication, retaining
+the error for diagnostics. Reconciliation reacquires its fence and resumes
+verified checkpoints after backoff; this does not enable blind HTTP write
+replays. Integrity, TLS authentication/protocol, authorization and admission
+failures remain failed. A pending attempt never grants queryability without an
+independent serving proof.

@@ -260,7 +260,23 @@ def wait_for_index(
             return status
         if readiness.get("state") == "failed":
             code = detail.get("error")
-            if code not in {"Timeout", "DeadlineExceeded", "Canceled", "Cancelled"}:
+            # Older engines label these coordinator-retryable failures failed.
+            # Wait for fenced recovery; never replay the underlying HTTP write.
+            if code not in {
+                "Timeout",
+                "DeadlineExceeded",
+                "Canceled",
+                "Cancelled",
+                "TlsTransportReadFailed",
+                "NameServerFailure",
+                "ConnectionReset",
+                "ConnectionResetByPeer",
+                "ConnectionAborted",
+                "ConnectionClosed",
+                "ConnectionTimeout",
+                "ConnectionTimedOut",
+                "BrokenPipe",
+            }:
                 raise RuntimeError("Index construction failed: " + json.dumps(status))
             elapsed = round(now() - started, 2)
             failure = failures.setdefault(

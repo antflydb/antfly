@@ -253,11 +253,16 @@ def execute(cells, root):
             ):
                 raise ValueError("Binary changed after planning: " + cell["name"])
             status_path = state / "matrix-result.json"
-            if (
-                status_path.exists()
-                and json.loads(status_path.read_text()).get("status") == "passed"
-            ):
-                continue
+            if status_path.exists():
+                if json.loads(status_path.read_text()).get("status") == "passed":
+                    continue
+                raise ValueError(
+                    "Incomplete matrix cell requires fresh state and artifact prefix: "
+                    + cell["name"]
+                    + "; preserve the failed attempt as evidence"
+                )
+            if any(path.name != "matrix-cell.json" for path in state.iterdir()):
+                raise ValueError("Unmeasured existing engine state: " + cell["name"])
             status = {
                 "status": "running",
                 "started_at": time.time(),

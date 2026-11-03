@@ -126,7 +126,13 @@ class ConstructionRecoveryTests(unittest.TestCase):
         self.assertEqual(observed["transient_failures"]["Timeout"]["observations"], 2)
 
     def test_interrupted_legacy_build_recovers_under_original_deadline(self):
-        for reason in ("Canceled", "Cancelled"):
+        for reason in (
+            "Canceled",
+            "Cancelled",
+            "TlsTransportReadFailed",
+            "ConnectionResetByPeer",
+            "NameServerFailure",
+        ):
             failed = {"status": {"readiness": {"state": "failed"}, "error": reason}}
             ready = {"status": {"readiness": {"queryable": True}}}
             result, observed, _ = self.run_sequence([failed, ready])
@@ -155,14 +161,21 @@ class ConstructionRecoveryTests(unittest.TestCase):
             )
 
     def test_permanent_admission_fails_immediately(self):
-        failed = {
-            "status": {
-                "readiness": {"state": "failed"},
-                "error": "SqlProgramLimitExceeded",
+        for reason in (
+            "SqlProgramLimitExceeded",
+            "ArtifactIntegrityMismatch",
+            "TlsBadRecordMac",
+            "TlsAlert",
+            "AccessDenied",
+        ):
+            failed = {
+                "status": {
+                    "readiness": {"state": "failed"},
+                    "error": reason,
+                }
             }
-        }
-        with self.assertRaisesRegex(RuntimeError, "Index construction failed"):
-            self.run_sequence([failed])
+            with self.assertRaisesRegex(RuntimeError, "Index construction failed"):
+                self.run_sequence([failed])
 
 
 if __name__ == "__main__":
