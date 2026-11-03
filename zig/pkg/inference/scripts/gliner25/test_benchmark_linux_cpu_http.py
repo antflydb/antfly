@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import unittest
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 import benchmark_linux_cpu_http as bench
@@ -30,6 +31,22 @@ import qualify_context_http as capacity
 
 
 class ContractTests(unittest.TestCase):
+    def test_admission_failure_records_endpoint_and_bounded_error_body(self):
+        error = HTTPError(
+            "http://localhost/extract",
+            503,
+            "busy",
+            {},
+            io.BytesIO(b'{"reason":"live_host"}'),
+        )
+        with patch.object(bench, "urlopen", side_effect=error):
+            with self.assertRaisesRegex(
+                ValueError, "localhost/extract: HTTP 503: .*live_host"
+            ):
+                bench.receive(
+                    "http://localhost", {"path": "/extract", "request": {}}, 10
+                )
+
     def test_capacity_campaign_fills_exact_boundary_and_rejects_inexact_usage(self):
         word = "configuration_visibility_maintenance_acknowledgement "
         exact = word * 1819 + "the " * 3
@@ -109,13 +126,50 @@ class ContractTests(unittest.TestCase):
                     capacity.execute("http://localhost/extract", "abc", 10)
 
     def test_burst_ends_at_response_completion_not_after_validation(self):
-        response = {"duration_ns": 1, "response_completed_ns": 150, "output": {}}
+        response = {"duration_ns": 1, "response_completed_ns": 150, "raw": b"{}"}
         with (
-            patch.object(bench, "request", return_value=response),
+            patch.object(bench, "receive", return_value=response),
             patch.object(bench.time, "perf_counter_ns", side_effect=[100, 1000]),
         ):
-            result = bench.request_round("http://localhost", {}, 10, 4)
+            result = bench.request_round(
+                "http://localhost", {"expected": {}, "confidence_tolerance": 0}, 10, 4
+            )
         self.assertEqual(result["duration_ns"], 50)
+
+    def test_no_parsing_or_validation_until_every_response_is_captured(self):
+        entered = threading.Barrier(4, timeout=5)
+        captured = 0
+        lock = threading.Lock()
+
+        def receive(*_):
+            nonlocal captured
+            entered.wait()
+            with lock:
+                captured += 1
+            return {
+                "duration_ns": 1,
+                "response_completed_ns": time.perf_counter_ns(),
+                "raw": b'{"ok":true}',
+            }
+
+        real_parse = bench.strict_json
+
+        def parse(raw):
+            self.assertEqual(captured, 4)
+            return real_parse(raw)
+
+        with (
+            patch.object(bench, "receive", side_effect=receive),
+            patch.object(bench, "strict_json", side_effect=parse) as parsed,
+        ):
+            result = bench.request_round(
+                "http://localhost",
+                {"expected": {"ok": True}, "confidence_tolerance": 0},
+                10,
+                4,
+            )
+        self.assertEqual(parsed.call_count, 4)
+        self.assertEqual(len(result["requests"]), 4)
 
     def test_concurrent_round_overlaps_clients_and_checks_every_result(self):
         entered = threading.Barrier(4, timeout=5)
@@ -125,16 +179,25 @@ class ContractTests(unittest.TestCase):
             return {
                 "duration_ns": 1,
                 "response_completed_ns": time.perf_counter_ns(),
-                "output": {"ok": True},
+                "raw": b'{"ok":true}',
             }
 
-        with patch.object(bench, "request", side_effect=checked_request):
-            result = bench.request_round("http://localhost", {}, 10, 4)
+        case = {"expected": {"ok": True}, "confidence_tolerance": 0}
+        with patch.object(bench, "receive", side_effect=checked_request):
+            result = bench.request_round("http://localhost", case, 10, 4)
         self.assertEqual(len(result["requests"]), 4)
         self.assertGreater(result["duration_ns"], 0)
-        with patch.object(bench, "request", side_effect=ValueError("mismatch")):
-            with self.assertRaisesRegex(ValueError, "mismatch"):
-                bench.request_round("http://localhost", {}, 10, 4)
+        with patch.object(
+            bench,
+            "receive",
+            return_value={
+                "duration_ns": 1,
+                "response_completed_ns": time.perf_counter_ns(),
+                "raw": b'{"ok":false}',
+            },
+        ):
+            with self.assertRaisesRegex(ValueError, "value differs"):
+                bench.request_round("http://localhost", case, 10, 4)
 
     def test_numeric_tolerance_does_not_hide_decision_or_offset_changes(self):
         expected = {"label": "refund", "start": 2, "confidence": 0.8}

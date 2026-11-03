@@ -51,7 +51,7 @@
     "duration_ns": 204781922167,
     "accuracy_qualified": false
   },
-  "performance_assessment": "Incomplete. Retain all measured confidence intervals, the short-request asymmetry, and the controlled CPU/page-in diagnostics; do not treat later reversals as proof of causality.",
+  "performance_assessment": "Incomplete. Existing concurrent timing reports allow validation work to overlap other clients and are superseded for performance conclusions. Single-client results remain unchanged; the unexplained short-request slowdown and noninferiority uncertainty remain recorded.",
   "aggregate_ci": {
     "status": "pending",
     "run_url": "https://github.com/antflydb/antfly/actions/runs/41733141867",
@@ -379,7 +379,9 @@
           }
         }
       },
-      "raw_report_sha256": "9cba8e944febf59a8106d56cc4e103b2aacf847a66f83855e40e26f1bad8e61a"
+      "raw_report_sha256": "9cba8e944febf59a8106d56cc4e103b2aacf847a66f83855e40e26f1bad8e61a",
+      "performance_timing_validated": false,
+      "superseded_reason": "Oracle validation could delay other concurrent response timestamps; rerun with transport-only workers."
     },
     "http-fixed-full-word-c1": {
       "format_version": 1,
@@ -453,12 +455,74 @@
         }
       },
       "raw_report_sha256": "e68499e11bcd048a3f8c23fec2e75bfe96b81a47e56d2d6342f60e9cedd83224"
+    },
+    "http-fixed-full-word-c4": {
+      "format_version": 1,
+      "status": "failed",
+      "scope": "warm_http",
+      "host": {
+        "system": "Darwin",
+        "machine": "arm64",
+        "kernel": "27.0.0",
+        "cpuinfo": null,
+        "affinity": null,
+        "cgroup": null,
+        "mountinfo": null,
+        "meminfo": null,
+        "commit": "2ca873bf37a1ff2d2faf6c586a5fcd1cdb6e1ec5",
+        "source_dirty": false,
+        "untracked_source_sha256": {},
+        "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "kernel_override": "auto",
+        "thread_override": null
+      },
+      "cases_sha256": "c70cef0a51560e2756926a925f60f9b5b381268cba59e7bca74430b1e17ec038",
+      "artifacts": {
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-local-baseline/zig/zig-out/bin/antfly-inference-http-server": "ac7506cb30411829e21a1d80539d4339498a7517dd1071f2ba27c1ce7ba6548f",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/zig-out/bin/antfly-inference-http-server": "20f15770db057b64b3c2bf36e37758f5d6509f0a1b9b7287bc9a18b17ed8c06e",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/config.json": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/encoder_config/config.json": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/model.safetensors": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer.json": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer_config.json": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+      },
+      "arms": {
+        "baseline": "http://127.0.0.1:18775",
+        "candidate": "http://127.0.0.1:18776"
+      },
+      "warmup": 3,
+      "pairs": 20,
+      "concurrency": 4,
+      "round_scope": "synchronized_burst",
+      "timing": {
+        "client_latency": "HTTP send through response-body read; excludes JSON parsing and oracle comparison",
+        "burst": "barrier release through last response-body read; includes client dispatch and payload encoding"
+      },
+      "performance_release_qualified": false,
+      "comparisons": {},
+      "error": "HTTPError: HTTP Error 503: Service Unavailable",
+      "completed_pairs": 7,
+      "performance_timing_validated": false,
+      "failure_attribution": "Candidate log at 2026-11-03T23:23:49Z: live_host admission refused a536870912-byte request; pending1073741824, capacity1546188226. No branch regression established."
     }
   },
   "outstanding": [
-    "Four-client full-word profile is still running; its result is not included.",
-    "No material median-cost regression is established only when the paired upper 95% bound is <= 1.05. Not all completed profiles meet that gate.",
+    "Corrected concurrent performance profiles need completion. Previous full-word four-client run failed after seven complete pairs with live-host admission refusal.",
+    "Not all single-client confidence intervals establish the declared upper paired95% bound<=1.05.",
     "The isolated short-request slowdown remains unexplained; later reversals do not prove a cause.",
-    "Aggregate CI has not passed."
-  ]
+    "Aggregate CI has not passed; PR1490 currently requires approval."
+  ],
+  "review_fixes": {
+    "python_checks_passed": 8,
+    "native_regression_standalone": {
+      "selected": 1,
+      "passed": 1,
+      "skipped": 0
+    },
+    "changes": [
+      "Capture every concurrent response before JSON parsing or oracle validation.",
+      "Explicitly import architectures.deberta in the test root.",
+      "Retain bounded HTTP failure details and endpoint in failed benchmark reports."
+    ]
+  }
 }

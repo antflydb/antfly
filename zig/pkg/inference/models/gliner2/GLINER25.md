@@ -229,7 +229,8 @@ python3 pkg/inference/scripts/gliner25/qualify_context_http.py \
 
 `benchmark_linux_cpu_http.py --concurrency 4` adds synchronized client bursts to
 the paired warm HTTP comparison. Burst timing starts when all clients are ready
-and ends at the last response body; response parsing and oracle comparison finish
+and ends at the last response body. Every client captures its body and timestamp
+before any response parsing or oracle comparison begins; all checks finish
 before the next arm starts. Reports retain individual client latencies, burst
 throughput, paired confidence intervals and per-round host load. Every response
 is checked against the pinned oracle, and binaries/model files are hashed before
@@ -246,6 +247,9 @@ median-cost bound, and one short-request phase showed a large slowdown that was
 not consistently reproduced. Changing host/runtime state remains an unresolved
 confounder. These shared-host measurements do not establish production tail
 latency or long-context extraction accuracy, and aggregate CI remains outstanding.
+The earlier concurrent timings are preserved as superseded evidence because
+validation could delay other clients' timestamps. The full-word four-client run
+failed after seven complete pairs with live-host-memory admission refusal.
 
 ## Current status
 

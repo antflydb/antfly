@@ -34,6 +34,7 @@ import time
 import threading
 from pathlib import Path
 from urllib.parse import urlsplit
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -80,7 +81,8 @@ def require_equal(expected, actual, tolerance, path="output"):
         raise ValueError(f"{path}: value differs")
 
 
-def request(base, case, timeout):
+def receive(base, case, timeout):
+    """Capture transport bytes/timestamps only; never parse or validate here."""
     path = case["path"]
     if not path.startswith("/") or path.startswith("//"):
         raise ValueError("case path must be an absolute API path")
@@ -92,23 +94,40 @@ def request(base, case, timeout):
         method="POST",
     )
     start = time.perf_counter_ns()
-    with urlopen(req, timeout=timeout) as response:
-        raw = response.read(16 * 1024 * 1024 + 1)
-        if response.status != 200 or len(raw) > 16 * 1024 * 1024:
-            raise ValueError("unsuccessful or oversized response")
+    try:
+        with urlopen(req, timeout=timeout) as response:
+            raw = response.read(16 * 1024 * 1024 + 1)
+            if response.status != 200 or len(raw) > 16 * 1024 * 1024:
+                raise ValueError("unsuccessful or oversized response")
+    except HTTPError as error:
+        with error:
+            detail = error.read(4096).decode("utf-8", errors="replace")
+        raise ValueError(f"{req.full_url}: HTTP {error.code}: {detail}") from error
     completed = time.perf_counter_ns()
     duration = completed - start
-    output = strict_json(raw)
-    require_equal(case["expected"], output, case["confidence_tolerance"])
     return {
         "duration_ns": duration,
         "response_completed_ns": completed,
+        "raw": raw,
+    }
+
+
+def validate(sample, case):
+    output = strict_json(sample["raw"])
+    require_equal(case["expected"], output, case["confidence_tolerance"])
+    return {
+        "duration_ns": sample["duration_ns"],
+        "response_completed_ns": sample["response_completed_ns"],
         "output": output,
     }
 
 
+def request(base, case, timeout):
+    return validate(receive(base, case, timeout), case)
+
+
 def request_round(base, case, timeout, concurrency):
-    """One isolated arm: simultaneous clients, each response checked by request()."""
+    """Capture the entire burst before parsing or validating any response."""
     if concurrency == 1:
         return request(base, case, timeout)
     start = 0
@@ -121,16 +140,19 @@ def request_round(base, case, timeout, concurrency):
 
     def client():
         ready.wait()
-        return request(base, case, timeout)
+        return receive(base, case, timeout)
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         pending = [pool.submit(client) for _ in range(concurrency)]
         ready.wait()
         samples = [future.result() for future in pending]
-        # Result parsing/comparison must finish before the next arm starts,
-        # but is not part of the measured HTTP completion interval.
         duration = max(sample["response_completed_ns"] for sample in samples) - start
-    return {"duration_ns": duration, "requests": samples}
+    # No worker can compete with a pending response's timestamp for Python
+    # execution time. Still finish every oracle check before starting a new arm.
+    return {
+        "duration_ns": duration,
+        "requests": [validate(sample, case) for sample in samples],
+    }
 
 
 def main():
@@ -198,6 +220,7 @@ def main():
         "timing": {
             "client_latency": "HTTP send through response-body read; excludes JSON parsing and oracle comparison",
             "burst": "barrier release through last response-body read; includes client dispatch and payload encoding",
+            "validation": "all response bodies and timestamps captured before any JSON parsing or oracle comparison",
         },
         "performance_release_qualified": False,
         "samples": [],
