@@ -15,6 +15,7 @@
 
 import argparse
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -96,6 +97,38 @@ class RemotePerformanceTests(unittest.TestCase):
             with patch.object(matrix.subprocess, "Popen") as launch:
                 with self.assertRaisesRegex(
                     ValueError, "Harness changed after planning"
+                ):
+                    matrix.execute([cell], root)
+                launch.assert_not_called()
+            self.assertFalse((root / "matrix.lock").exists())
+
+    def test_passed_cell_rejects_a_binary_changed_after_planning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "binary"
+            binary.write_bytes(b"old")
+            state = root / "cached"
+            state.mkdir()
+            (state / "matrix-result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "passed",
+                        "measurements": {"top_hits": []},
+                    }
+                )
+            )
+            cell = {
+                "name": "cached",
+                "state": str(state),
+                "harness_sha256": {},
+                "fixture": [],
+                "command": ["poc.py", "--binary", str(binary)],
+                "binary_sha256": matrix.fingerprint(binary),
+            }
+            binary.write_bytes(b"new")
+            with patch.object(matrix.subprocess, "Popen") as launch:
+                with self.assertRaisesRegex(
+                    ValueError, "Binary changed after planning"
                 ):
                     matrix.execute([cell], root)
                 launch.assert_not_called()

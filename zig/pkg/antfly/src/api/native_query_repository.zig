@@ -79,7 +79,7 @@ pub const Repository = struct {
     store: Store,
     limits: cut.Limits = .{},
     owned_collection: CollectionState,
-    owned_config: ?local.common_config.Config = null,
+    owned_config: ?*local.common_config.Config = null,
     owned_base_dir: ?[]u8 = null,
     // Readers are short-lived, but immutable extents recur across logical cuts.
     // Keep verified payloads at the repository owner, with bounded residency and
@@ -156,31 +156,38 @@ pub const Repository = struct {
                 try connections.object.put(scratch, entry.key_ptr.*, try std.json.parseFromSliceLeaky(std.json.Value, scratch, encoded, .{}));
             }
         }
-        const bytes = if (config) |value| try std.json.Stringify.valueAlloc(a, .{ .storage = .{ .engine = "local", .artifacts = if (value.storage.artifacts.connection != null) @as(?local.common_config.Config.ObjectStorageLocation, value.storage.artifacts) else null, .local = .{ .base_dir = base_dir orelse value.storage.local_base_dir orelse "." } }, .connections = connections, .lake_indexes = value.lake_indexes, .deployment_mode = deployment }, .{ .emit_null_optional_fields = false }) else try a.dupe(u8, "{}");
+        const bytes = if (config) |value| try std.json.Stringify.valueAlloc(a, .{ .storage = .{ .engine = "local", .artifacts = if (value.storage.artifacts.connection != null) @as(?local.common_config.Config.ObjectStorageLocation, value.storage.artifacts) else null, .local = .{ .base_dir = base_dir orelse value.storage.local_base_dir orelse "." } }, .connections = connections, .lake_cache = value.lake_cache, .lake_indexes = value.lake_indexes, .deployment_mode = deployment }, .{ .emit_null_optional_fields = false }) else try a.dupe(u8, "{}");
         defer a.free(bytes);
         return std.json.Stringify.valueAlloc(a, Setup{ .config_json = bytes, .deployment = deployment, .base_dir = base_dir }, .{});
     }
     pub fn initFromSetup(a: A, bytes: []const u8, secrets: ?*local.common_secrets.FileStore) !Repository {
         var parsed = try std.json.parseFromSlice(Setup, a, bytes, .{});
         defer parsed.deinit();
-        var config = try local.common_config.Config.parseFromSlice(a, parsed.value.config_json);
+        // Store.reopen_options borrows this configuration. A heap owner keeps
+        // that pointer valid when the returned repository moves into its slot.
+        const config = try a.create(local.common_config.Config);
+        errdefer a.destroy(config);
+        config.* = try local.common_config.Config.parseFromSlice(a, parsed.value.config_json);
         errdefer config.deinit();
         config.deployment_mode = parsed.value.deployment;
         const base = if (parsed.value.base_dir) |value| try a.dupe(u8, value) else null;
         errdefer if (base) |value| a.free(value);
-        var repository = try init(a, &config, secrets, parsed.value.deployment, base);
+        var repository = try init(a, config, secrets, parsed.value.deployment, base);
         repository.owned_config = config;
         repository.owned_base_dir = base;
         return repository;
     }
     pub fn init(a: A, config: ?*const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, deployment: local.common_config.DeploymentMode, base_dir: ?[]const u8) !Repository {
-        return .{ .a = a, .owned_collection = .{ .a = a }, .chunks = .{ .a = a, .max_bytes = if (config) |value| @intCast(@min(value.lake_cache.max_memory_bytes / 4, 32 * 1024 * 1024)) else 16 * 1024 * 1024 }, .store = try Store.openNative(a, config, secrets, false, deployment, base_dir), .limits = if (config) |value| .{ .max_cuts = value.lake_indexes.query_cursors.max_native_cuts, .max_bytes = value.lake_indexes.query_cursors.max_native_retained_bytes } else .{} };
+        return .{ .a = a, .owned_collection = .{ .a = a }, .chunks = .{ .a = a, .max_bytes = if (config) |value| if (value.lake_cache.enabled) @intCast(@min(value.lake_cache.max_memory_bytes / 4, 32 * 1024 * 1024)) else 0 else 16 * 1024 * 1024 }, .store = try Store.openNative(a, config, secrets, false, deployment, base_dir), .limits = if (config) |value| .{ .max_cuts = value.lake_indexes.query_cursors.max_native_cuts, .max_bytes = value.lake_indexes.query_cursors.max_native_retained_bytes } else .{} };
     }
     pub fn deinit(self: *Repository) void {
         self.chunks.deinit();
         self.owned_collection.deinit();
         self.store.deinit();
-        if (self.owned_config) |*value| value.deinit();
+        if (self.owned_config) |value| {
+            value.deinit();
+            self.a.destroy(value);
+        }
         if (self.owned_base_dir) |value| self.a.free(value);
     }
     pub fn capability(self: *Repository) port.Port {
@@ -948,8 +955,9 @@ pub const Repository = struct {
         try artifacts.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
         if (ref.byte_len == 0 or ref.byte_len > chunk_bytes) return error.CatalogGenerationChanged;
         const key_ = self.chunkKey(ref.artifact_id);
+        const cache_ = self.chunkCache();
         const Cached = struct { bytes: []const u8 };
-        if (self.chunkCache().lookup(key_)) |lease| {
+        if (cache_.lookup(key_)) |lease| {
             defer lease.release();
             const cached: *const Cached = @ptrCast(@alignCast(lease.item.payload.extension));
             if (cached.bytes.len != ref.byte_len) return error.CatalogGenerationChanged;
@@ -969,14 +977,14 @@ pub const Repository = struct {
         try cancellation.check();
         // Cache admission is optional; denied residency must preserve the normal
         // verified read. Parallel misses may duplicate I/O but publish one key.
-        if (self.chunkCache().max_bytes != 0) cache: {
-            const lease = self.chunkCache().create(chunk_bytes + 64 * 1024) catch break :cache;
+        if (cache_.max_entries != 0 and bytes.len <= cache_.max_bytes) cache: {
+            const lease = cache_.create(chunk_bytes + 64 * 1024) catch break :cache;
             defer lease.release();
             const owned = lease.item.arena.allocator();
             const cached = owned.create(Cached) catch break :cache;
             cached.* = .{ .bytes = owned.dupe(u8, bytes) catch break :cache };
             lease.item.payload = .{ .extension = cached };
-            self.chunkCache().publish(key_, lease);
+            cache_.publish(key_, lease);
         }
         return bytes;
     }
@@ -1115,6 +1123,36 @@ pub const Repository = struct {
         if (std.fs.path.dirname(root)) |parent| try fs.syncDirPortable(io, parent);
     }
 };
+
+test "external lake native oversized optional chunks do not allocate an uncachable copy" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        allocations: usize = 0,
+        fn denied(raw: *anyopaque, _: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.allocations += 1;
+            return null;
+        }
+    };
+    var directory = try local.common_test_directory.TestDirectory.init("native-query-small-cache");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    var store = repository.store.artifactStore();
+    var ref = try store.put("larger than the optional residency cap");
+    defer ref.deinit(a);
+    var probe: Probe = .{};
+    // No allocation can succeed, so the remaining allocator entrypoints are
+    // unreachable. Store/mandatory read allocations still use the normal heap.
+    var vtable = a.vtable.*;
+    vtable.alloc = Probe.denied;
+    repository.chunks.a = .{ .ptr = &probe, .vtable = &vtable };
+    repository.chunks.max_bytes = 1;
+    const bytes = try Repository.readChunk(&repository, a, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, .none);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("larger than the optional residency cap", bytes);
+    try std.testing.expectEqual(@as(usize, 0), probe.allocations);
+}
 
 test "external lake native residency is node managed and safe after owner teardown" {
     const a = std.testing.allocator;
@@ -1325,6 +1363,28 @@ test "external lake native reuse validates physical retention before extending c
     const result = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, next, namespace, .none), next, namespace);
     try std.testing.expectEqual(@as(u64, 123), rebound.sequence);
     try std.testing.expectEqualStrings(object.artifact_id, result.files[0].chunks[0].artifact_id);
+}
+
+test "external lake native repository setup preserves cache limits and disabled residency" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-query-cache-policy");
+    defer directory.cleanup();
+    var config = try local.common_config.Config.parseFromSlice(a, "{\"storage\":{\"engine\":\"local\",\"local\":{\"base_dir\":\"/tmp/fixture\"}},\"lake_cache\":{\"max_memory_bytes\":1048576}}");
+    defer config.deinit();
+    for ([_]bool{ true, false }) |enabled| {
+        config.lake_cache.enabled = enabled;
+        const encoded = try Repository.setupJsonAlloc(a, &config, .standalone, directory.path());
+        defer a.free(encoded);
+        var repository = try Repository.initFromSetup(a, encoded, null);
+        defer repository.deinit();
+        try std.testing.expectEqual(enabled, repository.owned_config.?.lake_cache.enabled);
+        try std.testing.expectEqual(@as(usize, 1048576), repository.owned_config.?.lake_cache.max_memory_bytes);
+        try std.testing.expectEqual(@as(usize, if (enabled) 262144 else 0), repository.chunks.max_bytes);
+        try std.testing.expect(repository.store.reopen_options.?.config == repository.owned_config.?);
+        var reopened = try repository.store.reopenReadOnly(a);
+        defer reopened.deinit();
+        try std.testing.expectEqual(repository.store.identity, reopened.identity);
+    }
 }
 
 test "external lake native repository setup round trips protocol-specific connection fields" {

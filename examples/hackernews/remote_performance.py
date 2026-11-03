@@ -245,12 +245,6 @@ def execute(cells, root):
                 source = Path(cell["fixture_root"]) / item["path"]
                 if fingerprint(source) != item["sha256"]:
                     raise ValueError("Fixture changed after planning: " + cell["name"])
-            status_path = state / "matrix-result.json"
-            if (
-                status_path.exists()
-                and json.loads(status_path.read_text()).get("status") == "passed"
-            ):
-                continue
             if (
                 fingerprint(
                     Path(cell["command"][cell["command"].index("--binary") + 1])
@@ -258,6 +252,12 @@ def execute(cells, root):
                 != cell["binary_sha256"]
             ):
                 raise ValueError("Binary changed after planning: " + cell["name"])
+            status_path = state / "matrix-result.json"
+            if (
+                status_path.exists()
+                and json.loads(status_path.read_text()).get("status") == "passed"
+            ):
+                continue
             status = {
                 "status": "running",
                 "started_at": time.time(),
