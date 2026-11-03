@@ -80,7 +80,7 @@ ZIG_GLOBAL_CACHE_DIR="$PWD/../.zig-cache/global" zig build inference-test \
   '-Dtest-filter=extractors.gliner_boundary_long_executor.test.' \
   '-Dtest-filter=gliner boundary pipeline Python parity pinned base' \
   '-Dtest-filter=qualified limits JSON' \
-  '-Dtest-filter=boundary full context learned' \
+  '-Dtest-filter=boundary full context learned Metal' \
   '-Dtest-filter=GLiNER bounded window composition'
 ```
 
@@ -185,6 +185,45 @@ states isolate head execution from the encoder. All 16 optional-head combination
 and pinned base all-task pipeline parity passed. The no-model-read regression
 also proves that impossible head caps fail before encoder dispatch. GPU execution
 and throughput were not remeasured for this native admission change.
+
+### Complete native pipeline and HTTP qualification
+
+Real-weight native Debug execution now covers the encoder, shared head and
+decoder together at 4096 body words (4105 prompt tokens), and at four full-word
+windows (16440 logical prompt tokens). Both checks passed without skips. With
+the pinned base model installed, select them separately from the more expensive
+encoded-token boundary:
+
+```sh
+ANTFLY_GLINER25_BASE_MODEL_DIR=/path/to/gliner2.5-base-v1 \
+VECLIB_MAXIMUM_THREADS=2 \
+ZIG_GLOBAL_CACHE_DIR="$PWD/../.zig-cache/global" zig build inference-test \
+  -Doptimize=debug -j1 --cache-dir ../.zig-cache \
+  '-Dtest-filter=boundary full context learned native base word capacity' \
+  '-Dtest-filter=boundary full context learned native grouped words'
+```
+
+The explicit `scripts/gliner25/qualify_context_http.py` command checks encoded
+capacity through an already-running loopback HTTP service. It measures repeated
+word token cost using two small requests, fills the 16384-token ceiling, and
+requires a single window, exact reported token usage and valid source spans.
+It does not measure long-context extraction accuracy:
+
+```sh
+python3 pkg/inference/scripts/gliner25/qualify_context_http.py \
+  --endpoint http://127.0.0.1:18776/ai/v1/extract --output context-report.json
+```
+
+`benchmark_linux_cpu_http.py --concurrency 4` adds synchronized client bursts to
+the paired warm HTTP comparison. Burst timing starts when all clients are ready
+and ends at the last response body; response parsing and oracle comparison finish
+before the next arm starts. Reports retain individual client latencies, burst
+throughput, paired confidence intervals and per-round host load. Every response
+is checked against the pinned oracle, and binaries/model files are hashed before
+and after measurement. The four-client profile provisions the same 4 GiB
+aggregate scratch allowance on both services (`--scratch-budget-mb 4096`); the
+initial baseline trial exhausted its default 1 GiB allowance. Per-request model,
+head and work limits remain unchanged.
 
 ## Current status
 

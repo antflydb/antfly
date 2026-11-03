@@ -41,13 +41,22 @@ class ContractTests(unittest.TestCase):
                     "entities": [{"start": 0, "end": 3, "text": "abc"}],
                 }
             ],
-            "usage": {"prompt_tokens": 27},
+            "usage": {"prompt_tokens": 27, "completion_tokens": 0, "total_tokens": 27},
         }
         with patch.object(
             capacity, "urlopen", return_value=Response(json.dumps(good).encode())
         ):
             result = capacity.execute("http://localhost/extract", "abc", 10)
         self.assertEqual(result["output"], good)
+        changed = json.loads(json.dumps(good))
+        changed["usage"]["total_tokens"] = 28
+        with patch.object(
+            capacity, "urlopen", return_value=Response(json.dumps(changed).encode())
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "inconsistent extraction token usage"
+            ):
+                capacity.execute("http://localhost/extract", "abc", 10)
         for split, text in ((True, "abc"), (False, "wrong")):
             changed = json.loads(json.dumps(good))
             changed["data"][0]["long_document"]["window_count"] = 2 if split else 1

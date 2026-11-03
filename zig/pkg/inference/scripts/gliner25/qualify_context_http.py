@@ -39,6 +39,7 @@ def execute(endpoint, text, timeout):
         "schema": {"entities": ["concept"]},
         "options": {
             "include_spans": True,
+            "offset_unit": "utf8_bytes",
             "long_document": {
                 "mode": "window",
                 "window_words": 4096,
@@ -56,6 +57,12 @@ def execute(endpoint, text, timeout):
             raise ValueError("unsuccessful or oversized response")
     duration = time.perf_counter_ns() - start
     output = strict_json(raw)
+    usage = output["usage"]
+    if (
+        usage["completion_tokens"] != 0
+        or usage["total_tokens"] != usage["prompt_tokens"]
+    ):
+        raise ValueError("inconsistent extraction token usage")
     if len(output["data"]) != 1:
         raise ValueError("expected one result")
     row = output["data"][0]
