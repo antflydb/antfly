@@ -2979,6 +2979,7 @@ const PrivateMergeSink = struct {
 pub fn preparePrivateMerge(alloc: Allocator, inputs: []const MergeInput, scratch: MergeScratchOptions, canceled: ?*const std.atomic.Value(bool), maximum_output_bytes: usize) !PrivateMergeResult {
     const control: PrivateMergeControl = .{ .io = scratch.io, .canceled = canceled };
     try control.check();
+    if (inputs.len == 0) return error.NoSegments;
     var result: PrivateMergeResult = .{ .allocator = alloc };
     errdefer result.deinit();
     try result.input_uses.ensureTotalCapacity(alloc, inputs.len);
@@ -2992,7 +2993,17 @@ pub fn preparePrivateMerge(alloc: Allocator, inputs: []const MergeInput, scratch
     defer alloc.free(bound);
     const counts = try alloc.alloc(u32, inputs.len);
     defer alloc.free(counts);
+    var live: u32 = 0;
     for (inputs, 0..) |input, i| {
+        try control.check();
+        const deleted_count = if (input.deleted) |deleted| blk: {
+            const cardinality = deleted.cardinality();
+            // Match the rank-map bounds check even when the empty result
+            // bypasses the encoder. Cardinality alone cannot prove coverage.
+            if (deleted.rank(input.reader.doc_count) != cardinality) return error.InvalidData;
+            break :blk @as(u32, @intCast(cardinality));
+        } else 0;
+        live = try std.math.add(u32, live, input.reader.doc_count - deleted_count);
         const backing = input.reader.immutableSource();
         if (!backing.acquireUse()) return error.EnrichmentWaitCanceled;
         result.input_uses.appendAssumeCapacity(backing);
@@ -3005,6 +3016,10 @@ pub fn preparePrivateMerge(alloc: Allocator, inputs: []const MergeInput, scratch
         bound[i] = .{ .reader = &readers[i], .deleted = input.deleted };
         counts[i] = input.reader.doc_count;
     }
+    // A successful empty replacement retires the captured sources. Do not
+    // encode an empty artifact or call finishOutput(0): retrying that error
+    // would repeatedly select the same dead segments without freeing them.
+    if (live == 0) return result;
     result.source_map = try MergeSourceMap.init(alloc, counts);
     const index_sort = try commonIndexSortForMergeInputsAlloc(alloc, bound);
     defer freeIndexSortFields(alloc, index_sort);
@@ -3022,8 +3037,6 @@ pub fn preparePrivateMerge(alloc: Allocator, inputs: []const MergeInput, scratch
         },
         else => return err,
     };
-    var live: u32 = 0;
-    for (inputs) |input| live += input.reader.doc_count - if (input.deleted) |deleted| @as(u32, @intCast(deleted.cardinality())) else @as(u32, 0);
     try result.source_map.?.finishOutput(live);
     try run.seal(0);
     try control.check();
