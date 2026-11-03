@@ -1479,6 +1479,18 @@ This prevents foreground cache refresh from repeatedly invalidating detached
 background work. Replay processing budgets exclude fixed publication admission
 and catalog validation overhead; they continue to charge actual replay work.
 
+Native retired text-segment readers enqueue cleanup instead of taking writer
+admission from their release callbacks. Maintenance deletes at most eight files
+in one atomic native catalog transaction per boundary, with separate queue and
+I/O locks so reader release can continue while admission or storage is blocked.
+Failed publications retain both retry state and durable retirement markers.
+Discovery checks at most 64 markers per page, advances only after recording the
+whole page, and services a deletion batch before a detached runtime can close.
+Retry deadlines participate in maintenance wake scheduling. Shutdown disables
+new cleanup and drains in-flight I/O before releasing the storage provider;
+late callbacks never dereference that provider. Standalone storage retains its
+existing per-file deletion behavior.
+
 Coordinated text-index applied watermarks and replay seals sync their durable WAL
 state before publishing coverage. They do not force a new SST generation for
 every bounded replay window. Cache shutdown preserves that WAL, and recovery

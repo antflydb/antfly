@@ -243,6 +243,22 @@ def run(args):
         report.update(
             status="failed", error_type=type(error).__name__, error=str(error)
         )
+        if report.get("failed_commit", {}).get("sqlstate") == "55P03":
+            # Verify the refusal after session/handle teardown. An exit status
+            # or absent receipt cannot establish that COMMIT changed no rows.
+            successful = len(report["transactions"])
+            check = report["failed_commit_primary_check"] = {
+                "passed": False,
+                "successful_commit_responses": successful,
+                "rows_per_table": successful * args.rows,
+            }
+            with af.open_readonly(database) as root:
+                for name, keys in zip(names, expected):
+                    verify_rows(root, name, keys[: successful * args.rows], text)
+                valid = root.check()["valid"]
+                if not valid:
+                    raise RuntimeError("integrity failed after refused COMMIT")
+            check.update(passed=True, integrity_valid=valid)
         raise
     finally:
         save()

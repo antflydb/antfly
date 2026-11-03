@@ -568,6 +568,7 @@ pub const FileTrailer = struct {
 pub const Storage = struct {
     pub const ContentRevision = [16]u8;
     pub const Trailer = FileTrailer;
+    pub const max_atomic_file_deletions: usize = 64;
 
     pub const Lease = struct {
         view: Storage,
@@ -640,6 +641,10 @@ pub const Storage = struct {
         sync_parent_absolute: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
         rename_absolute: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         delete_file_absolute: *const fn (*anyopaque, []const u8) anyerror!void,
+        /// Atomically remove a bounded set of files, accepting absent files.
+        /// Providers with publication admission can amortize its lease and
+        /// durability barrier. Borrowed paths remain live through this call.
+        delete_files_absolute: ?*const fn (*anyopaque, []const []const u8) anyerror!void = null,
         delete_tree: *const fn (*anyopaque, []const u8) anyerror!void,
         list_file_names_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![][]u8 = null,
         /// Immediate child directories, including virtual directories inferred
@@ -888,6 +893,13 @@ pub const Storage = struct {
 
     pub fn deleteFileAbsolute(self: Storage, path: []const u8) !void {
         return BoundaryAbi.call("delete_file_absolute", self.boundary_dispatch, self.vtable.delete_file_absolute, .{ self.ptr, path });
+    }
+
+    pub fn deleteFilesAbsolute(self: Storage, paths: []const []const u8) !void {
+        if (paths.len > max_atomic_file_deletions) return error.FileDeletionBatchTooLarge;
+        if (paths.len == 0) return;
+        const remove = self.vtable.delete_files_absolute orelse return error.AtomicFileDeletionUnsupported;
+        return BoundaryAbi.call("delete_files_absolute", self.boundary_dispatch, remove, .{ self.ptr, paths });
     }
 
     pub fn deleteTree(self: Storage, path: []const u8) !void {

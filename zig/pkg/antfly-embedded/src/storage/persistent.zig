@@ -443,12 +443,19 @@ const RetiredSegmentFileDeleter = struct {
     const completed_markers_per_boundary: usize = 64;
     const retry_base_delay_ns: u64 = 10 * std.time.ns_per_ms;
     const retry_max_delay_ns: u64 = 5 * std.time.ns_per_s;
+    const retry_audit_delay_ns: u64 = 100 * std.time.ns_per_ms;
 
     allocator: Allocator,
     root_dir: []u8,
     storage: storage_io.Storage,
     native_storage_lease: ?storage_io.NativeStorage.Lease = null,
+    // Captured while the provider is alive. A late, disarmed cleanup callback
+    // may not inspect the borrowed provider's vtable after index shutdown.
+    defer_deletions: bool = false,
     refs: std.atomic.Value(usize) = .init(1),
+    // IO/draining has a separate lock: releasing a reader only queues work
+    // and must not wait behind a deletion's writer admission or fsync.
+    io_mu: std.atomic.Mutex = .unlocked,
     delete_mu: std.atomic.Mutex = .unlocked,
     delete_enabled: bool = true,
     completed_ids: std.ArrayListUnmanaged(u64) = .empty,
@@ -465,11 +472,13 @@ const RetiredSegmentFileDeleter = struct {
         var native_storage_lease: ?storage_io.NativeStorage.Lease = null;
         errdefer if (native_storage_lease) |*lease| lease.deinit();
         if (store.storage_owner) |owner| native_storage_lease = try owner.acquireLease();
+        const storage = if (native_storage_lease) |*lease| lease.storage() else store.storage;
         deleter.* = .{
             .allocator = allocator,
             .root_dir = try allocator.dupe(u8, store.root_dir),
-            .storage = if (native_storage_lease) |*lease| lease.storage() else store.storage,
+            .storage = storage,
             .native_storage_lease = native_storage_lease,
+            .defer_deletions = storage.vtable.delete_files_absolute != null,
         };
         return deleter;
     }
@@ -502,6 +511,8 @@ const RetiredSegmentFileDeleter = struct {
     /// unlink files from the restored generation, even if a snapshot is
     /// released concurrently with teardown.
     fn disarm(self: *RetiredSegmentFileDeleter) void {
+        platform_sync.lockYielding(&self.io_mu);
+        defer self.io_mu.unlock();
         platform_sync.lockYielding(&self.delete_mu);
         defer self.delete_mu.unlock();
         self.delete_enabled = false;
@@ -558,6 +569,16 @@ const RetiredSegmentFileDeleter = struct {
         try self.enqueueRetryLocked(seg_id);
     }
 
+    fn enqueueFailedDelete(self: *RetiredSegmentFileDeleter, seg_id: u64) !void {
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        if (!self.delete_enabled) return;
+        try self.enqueueRetryLocked(seg_id);
+        const entry = &self.retry_entries.items[self.retry_positions.get(seg_id).?];
+        entry.failure_count = @max(entry.failure_count, 1);
+        entry.next_attempt_ns = platform_time.monotonicNs() +| retryDelayNs(entry.failure_count);
+    }
+
     fn removeRetryLocked(self: *RetiredSegmentFileDeleter, seg_id: u64) void {
         const removed = self.retry_positions.fetchRemove(seg_id) orelse return;
         const position = removed.value;
@@ -580,6 +601,8 @@ const RetiredSegmentFileDeleter = struct {
     /// Record a stale retirement marker for a segment which is still active.
     /// Any queued unlink must be cancelled before the marker is cleared.
     fn completeWithoutDelete(self: *RetiredSegmentFileDeleter, seg_id: u64) !void {
+        platform_sync.lockYielding(&self.io_mu);
+        defer self.io_mu.unlock();
         platform_sync.lockYielding(&self.delete_mu);
         defer self.delete_mu.unlock();
         if (!self.delete_enabled) return;
@@ -590,32 +613,60 @@ const RetiredSegmentFileDeleter = struct {
     /// Attempt one unlink and retain failures in the live owner. The durable
     /// retirement marker remains authoritative if even queue allocation fails.
     fn deleteOrQueue(self: *RetiredSegmentFileDeleter, seg_id: u64) !void {
+        platform_sync.lockYielding(&self.io_mu);
+        defer self.io_mu.unlock();
         platform_sync.lockYielding(&self.delete_mu);
-        defer self.delete_mu.unlock();
-        if (!self.delete_enabled) return;
+        const enabled = self.delete_enabled;
+        self.delete_mu.unlock();
+        if (!enabled) return;
 
         const path = self.pathAlloc(seg_id) catch {
-            try self.enqueueRetryLocked(seg_id);
+            try self.enqueueFailedDelete(seg_id);
             return;
         };
         defer self.allocator.free(path);
         self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => {
-                try self.enqueueRetryLocked(seg_id);
+                try self.enqueueFailedDelete(seg_id);
                 if (builtin.os.tag != .freestanding) {
                     std.log.warn("retired text segment cleanup deferred segment={d}: {s}", .{ seg_id, @errorName(err) });
                 }
                 return;
             },
         };
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
         try self.appendCompletedLocked(seg_id);
         self.removeRetryLocked(seg_id);
     }
 
+    fn failAttemptLocked(self: *RetiredSegmentFileDeleter, seg_id: u64) void {
+        const position = self.retry_positions.get(seg_id) orelse return;
+        const entry = &self.retry_entries.items[position];
+        entry.failure_count +|= 1;
+        entry.next_attempt_ns = platform_time.monotonicNs() +| retryDelayNs(entry.failure_count);
+        self.retry_failures +|= 1;
+    }
+
+    fn finishAttemptLocked(self: *RetiredSegmentFileDeleter, seg_id: u64, failed: bool) void {
+        if (failed) return self.failAttemptLocked(seg_id);
+        self.appendCompletedLocked(seg_id) catch return self.failAttemptLocked(seg_id);
+        self.removeRetryLocked(seg_id);
+    }
+
     fn retryFailedDeletes(self: *RetiredSegmentFileDeleter) void {
+        // Optional maintenance never waits behind another unlink. Disarm takes
+        // this same lock to drain IO before a restored generation is exposed.
+        if (!self.io_mu.tryLock()) return;
+        defer self.io_mu.unlock();
+        var ids: [retry_attempts_per_boundary]u64 = undefined;
+        var paths: [retry_attempts_per_boundary][]const u8 = undefined;
+        var count: usize = 0;
+        defer for (paths[0..count]) |path| self.allocator.free(path);
         platform_sync.lockYielding(&self.delete_mu);
-        defer self.delete_mu.unlock();
+        var locked = true;
+        defer if (locked) self.delete_mu.unlock();
         if (!self.delete_enabled) return;
 
         const now_ns = platform_time.monotonicNs();
@@ -627,10 +678,10 @@ const RetiredSegmentFileDeleter = struct {
             self.retry_entries.items.len > 0)
         {
             const position = self.retry_cursor % self.retry_entries.items.len;
-            const entry = &self.retry_entries.items[position];
+            const entry = self.retry_entries.items[position];
             inspections += 1;
+            self.retry_cursor = (position + 1) % self.retry_entries.items.len;
             if (entry.next_attempt_ns > now_ns) {
-                self.retry_cursor = (position + 1) % self.retry_entries.items.len;
                 continue;
             }
 
@@ -638,34 +689,61 @@ const RetiredSegmentFileDeleter = struct {
             attempts += 1;
             self.retry_attempts +|= 1;
             const path = self.pathAlloc(seg_id) catch {
-                entry.failure_count +|= 1;
-                entry.next_attempt_ns = now_ns +| retryDelayNs(entry.failure_count);
-                self.retry_failures +|= 1;
-                self.retry_cursor = (position + 1) % self.retry_entries.items.len;
+                self.failAttemptLocked(seg_id);
                 continue;
             };
-            const delete_result = self.storage.deleteFileAbsolute(path);
-            self.allocator.free(path);
-            delete_result catch |err| switch (err) {
+            ids[count] = seg_id;
+            paths[count] = path;
+            count += 1;
+        }
+        self.delete_mu.unlock();
+        locked = false;
+        if (count == 0) return;
+        // No queue lock survives admission or IO. Native catalog deletion is
+        // one atomic publication, so a failed batch retains every retry and
+        // every durable retirement marker. Standalone files retain per-file
+        // outcomes and their existing missing-file semantics.
+        if (self.defer_deletions) {
+            var failed = false;
+            self.storage.deleteFilesAbsolute(paths[0..count]) catch {
+                failed = true;
+            };
+            platform_sync.lockYielding(&self.delete_mu);
+            defer self.delete_mu.unlock();
+            for (ids[0..count]) |seg_id| self.finishAttemptLocked(seg_id, failed);
+        } else for (ids[0..count], paths[0..count]) |seg_id, path| {
+            var failed = false;
+            self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => {
-                    entry.failure_count +|= 1;
-                    entry.next_attempt_ns = now_ns +| retryDelayNs(entry.failure_count);
-                    self.retry_failures +|= 1;
-                    self.retry_cursor = (position + 1) % self.retry_entries.items.len;
-                    continue;
+                    failed = true;
                 },
             };
-            self.appendCompletedLocked(seg_id) catch {
-                entry.failure_count +|= 1;
-                entry.next_attempt_ns = now_ns +| retryDelayNs(entry.failure_count);
-                self.retry_failures +|= 1;
-                self.retry_cursor = (position + 1) % self.retry_entries.items.len;
-                continue;
-            };
-            self.removeRetryLocked(seg_id);
-            if (self.retry_entries.items.len > 0) self.retry_cursor = position % self.retry_entries.items.len;
+            platform_sync.lockYielding(&self.delete_mu);
+            self.finishAttemptLocked(seg_id, failed);
+            self.delete_mu.unlock();
         }
+    }
+
+    fn nextWakeDelayNs(self: *RetiredSegmentFileDeleter) ?u64 {
+        if (!self.io_mu.tryLock()) return retry_audit_delay_ns;
+        defer self.io_mu.unlock();
+        platform_sync.lockYielding(&self.delete_mu);
+        defer self.delete_mu.unlock();
+        if (!self.delete_enabled) return null;
+        if (self.completed_ids.items.len != 0) return 0;
+        const count = @min(retry_inspections_per_boundary, self.retry_entries.items.len);
+        if (count == 0) return null;
+        const now = platform_time.monotonicNs();
+        var delay: u64 = std.math.maxInt(u64);
+        for (0..count) |offset| {
+            const entry = self.retry_entries.items[(self.retry_cursor + offset) % self.retry_entries.items.len];
+            delay = @min(delay, entry.next_attempt_ns -| now);
+        }
+        // Large queues retain bounded inspection. A timed audit advances past
+        // delayed entries to ready work beyond this page without busy polling.
+        if (count < self.retry_entries.items.len) delay = @min(delay, retry_audit_delay_ns);
+        return delay;
     }
 
     fn hasRetirementWork(self: *RetiredSegmentFileDeleter) bool {
@@ -689,7 +767,8 @@ const RetiredSegmentFileDeleter = struct {
 
     fn delete(ptr: *anyopaque, seg_id: u64) void {
         const self: *RetiredSegmentFileDeleter = @ptrCast(@alignCast(ptr));
-        self.deleteOrQueue(seg_id) catch |err| {
+        const result = if (self.defer_deletions) self.enqueueRetry(seg_id) else self.deleteOrQueue(seg_id);
+        result catch |err| {
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("retired text segment cleanup could not be queued segment={d}: {s}", .{ seg_id, @errorName(err) });
             }
@@ -1104,6 +1183,7 @@ pub const PersistentIndex = struct {
     segment_files: ?SegmentFileStore,
     retired_segment_file_deleter: ?*RetiredSegmentFileDeleter = null,
     retirement_reconcile_pending: bool = false,
+    retirement_reconcile_after: ?u64 = null,
     deferred_retirement_maintenance: bool = false,
     active_rebuild_page: ?*RebuildPage = null,
     wal: wal_mod.WAL,
@@ -1775,13 +1855,9 @@ pub const PersistentIndex = struct {
         const deleter = self.retired_segment_file_deleter orelse return;
         const store = &(self.segment_files orelse return);
 
-        // Retry work discovered by an earlier transaction once per subsequent
-        // publication boundary. Newly discovered failures wait for the next
-        // boundary, avoiding a tight retry loop on a persistent I/O failure.
-        deleter.retryFailedDeletes();
         if (self.retirement_reconcile_pending) {
-            if (self.discoverRetiredSegmentFilesInTxn(txn)) {
-                self.retirement_reconcile_pending = false;
+            if (self.discoverRetiredSegmentFilesInTxn(txn)) |complete| {
+                self.retirement_reconcile_pending = !complete;
             } else |err| {
                 // Reconciliation is maintenance, not a publication
                 // prerequisite. Preserve the pending bit and let the write
@@ -1791,6 +1867,11 @@ pub const PersistentIndex = struct {
                 }
             }
         }
+        // Service one bounded batch, including newly discovered native work,
+        // before a cache generation can close. Failure deadlines prevent an
+        // immediate second attempt after a standalone discovery unlink fails.
+        // Durable markers retain every unserviced ID across runtime refresh.
+        deleter.retryFailedDeletes();
         const completed_ids = deleter.snapshotCompletedIds(self.alloc, RetiredSegmentFileDeleter.completed_markers_per_boundary) catch return;
         defer self.alloc.free(completed_ids);
         if (completed_ids.len == 0) return;
@@ -1859,14 +1940,14 @@ pub const PersistentIndex = struct {
         if (self.read_only) return;
         if (self.segment_files == null or self.retired_segment_file_deleter == null) return;
         self.retirement_reconcile_pending = true;
+        self.retirement_reconcile_after = null;
         self.flushCompletedRetirementMarkersLocked();
     }
 
-    fn discoverRetiredSegmentFilesInTxn(self: *PersistentIndex, txn: *MainTxn) !void {
-        const deleter = self.retired_segment_file_deleter orelse return;
-        const retired_ids = try loadRetiredSegmentIdsFromTxn(txn, self.alloc);
-        defer self.alloc.free(retired_ids);
-        for (retired_ids) |seg_id| {
+    fn discoverRetiredSegmentFilesInTxn(self: *PersistentIndex, txn: *MainTxn) !bool {
+        const deleter = self.retired_segment_file_deleter orelse return true;
+        const page = try loadRetiredSegmentIdsPage(txn, self.retirement_reconcile_after);
+        for (page.ids[0..page.count]) |seg_id| {
             const active_key = activeSegmentMetaKey(seg_id);
             const is_active = if (txn.get(.meta, &active_key)) |_| true else |err| switch (err) {
                 error.NotFound => false,
@@ -1874,10 +1955,18 @@ pub const PersistentIndex = struct {
             };
             if (is_active) {
                 try deleter.completeWithoutDelete(seg_id);
+            } else if (deleter.defer_deletions) {
+                try deleter.enqueueRetry(seg_id);
             } else {
                 try deleter.deleteOrQueue(seg_id);
             }
         }
+        // Advance only after every marker in this page has a recorded result.
+        // An allocation/read failure retries the page, preserving all durable
+        // markers; the live queues deduplicate already accepted IDs.
+        if (page.count != 0) self.retirement_reconcile_after = page.ids[page.count - 1];
+        if (page.exhausted) self.retirement_reconcile_after = null;
+        return page.exhausted;
     }
 
     pub fn resetAllForRebuild(self: *PersistentIndex) !void {
@@ -1962,7 +2051,8 @@ pub const PersistentIndex = struct {
     }
 
     pub fn lsmMaintenanceScore(self: *const PersistentIndex) u64 {
-        return self.main_store_owner.lsmMaintenanceScore() +| @intFromBool(self.retirement_reconcile_pending);
+        const due = if (self.retired_segment_file_deleter) |deleter| if (deleter.nextWakeDelayNs()) |delay| delay == 0 else false else false;
+        return self.main_store_owner.lsmMaintenanceScore() +| @intFromBool(self.retirement_reconcile_pending or due);
     }
 
     pub fn lsmMaintenanceDebtHint(self: *const PersistentIndex) u64 {
@@ -1973,10 +2063,14 @@ pub const PersistentIndex = struct {
     }
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const PersistentIndex) ?u64 {
-        return switch (self.main_store_owner) {
+        if (self.retirement_reconcile_pending) return 0;
+        const storage_delay: ?u64 = switch (self.main_store_owner) {
             .mem => null,
             .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
         };
+        const retirement_delay = if (self.retired_segment_file_deleter) |deleter| deleter.nextWakeDelayNs() else null;
+        if (storage_delay) |delay| return if (retirement_delay) |other| @min(delay, other) else delay;
+        return retirement_delay;
     }
 
     pub fn refreshLsmMaintenanceDebtHint(self: *PersistentIndex) void {
@@ -3789,8 +3883,34 @@ fn loadActiveSegmentIdsFromTxn(txn: *PersistentIndex.MainTxn, alloc: Allocator) 
     return try loadSegmentIdsForMetaPrefix(txn, alloc, meta_active_segment_prefix);
 }
 
-fn loadRetiredSegmentIdsFromTxn(txn: *PersistentIndex.MainTxn, alloc: Allocator) ![]u64 {
-    return try loadSegmentIdsForMetaPrefix(txn, alloc, meta_retired_segment_prefix);
+const RetiredSegmentPage = struct {
+    ids: [RetiredSegmentFileDeleter.retry_inspections_per_boundary]u64 = undefined,
+    count: usize = 0,
+    exhausted: bool = false,
+};
+
+fn loadRetiredSegmentIdsPage(txn: *PersistentIndex.MainTxn, after: ?u64) !RetiredSegmentPage {
+    var cursor = txn.openCursor(.meta) catch |err| switch (err) {
+        error.NotFound => return .{ .exhausted = true },
+        else => return err,
+    };
+    defer cursor.close();
+    var page: RetiredSegmentPage = .{};
+    const key = retiredSegmentMetaKey(after orelse 0);
+    var entry = try cursor.seekAtOrAfter(if (after != null) &key else meta_retired_segment_prefix);
+    if (after != null) if (entry) |item| if (std.mem.eql(u8, item.key, &key)) {
+        entry = try cursor.next();
+    };
+    while (entry) |item| {
+        if (!std.mem.startsWith(u8, item.key, meta_retired_segment_prefix)) break;
+        if (item.key.len != meta_retired_segment_prefix.len + 8) return error.InvalidRetiredSegmentMetadata;
+        page.ids[page.count] = std.mem.readInt(u64, item.key[meta_retired_segment_prefix.len..][0..8], .big);
+        page.count += 1;
+        entry = try cursor.next();
+        if (page.count == page.ids.len) break;
+    }
+    page.exhausted = if (entry) |item| !std.mem.startsWith(u8, item.key, meta_retired_segment_prefix) else true;
+    return page;
 }
 
 fn loadSegmentIdsForMetaPrefix(txn: *PersistentIndex.MainTxn, alloc: Allocator, prefix: []const u8) ![]u64 {
@@ -4618,6 +4738,163 @@ test "retired segment cleanup outlives persistent index close" {
         error.FileNotFound,
         verifier.storage().readFileAlloc(alloc, retired_path_b, 64),
     );
+}
+
+test "retired segment callbacks do not wait for native cleanup IO" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const State = struct {
+        memory: storage_io.MemoryStorage,
+        entered: std.Io.Event = .unset,
+        release_io: std.Io.Event = .unset,
+        queued: std.Io.Event = .unset,
+        single_calls: usize = 0,
+        batch_calls: usize = 0,
+        fn batch(ptr: *anyopaque, paths: []const []const u8) !void {
+            const memory: *storage_io.MemoryStorage = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @fieldParentPtr("memory", memory);
+            try std.testing.expectEqual(@as(usize, 1), paths.len);
+            self.batch_calls += 1;
+            self.entered.set(std.testing.io);
+            self.release_io.waitUncancelable(std.testing.io);
+        }
+        fn single(ptr: *anyopaque, _: []const u8) !void {
+            const memory: *storage_io.MemoryStorage = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @fieldParentPtr("memory", memory);
+            self.single_calls += 1;
+            return error.UnexpectedSynchronousDeletion;
+        }
+        fn drain(deleter: *RetiredSegmentFileDeleter) void {
+            deleter.retryFailedDeletes();
+        }
+        fn queue(self: *@This(), deleter: *RetiredSegmentFileDeleter) void {
+            RetiredSegmentFileDeleter.delete(deleter, 2);
+            self.queued.set(std.testing.io);
+        }
+    };
+    var state: State = .{ .memory = .init(a) };
+    defer state.memory.deinit();
+    var storage = state.memory.storage();
+    var vtable = storage.vtable.*;
+    vtable.delete_file_absolute = State.single;
+    vtable.delete_files_absolute = State.batch;
+    storage.vtable = &vtable;
+    var files = try SegmentFileStore.open(a, "/text", storage, false, .threaded, null);
+    defer files.close();
+    const deleter = try RetiredSegmentFileDeleter.init(a, &files);
+    defer deleter.release();
+    RetiredSegmentFileDeleter.delete(deleter, 1);
+    try std.testing.expectEqual(@as(usize, 0), state.single_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.batch_calls);
+    const worker = try std.Thread.spawn(.{}, State.drain, .{deleter});
+    defer worker.join();
+    defer state.release_io.set(io);
+    try state.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    const callback = try std.Thread.spawn(.{}, State.queue, .{ &state, deleter });
+    defer callback.join();
+    var returned = true;
+    state.queued.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } }) catch {
+        returned = false;
+    };
+    state.release_io.set(io);
+    try std.testing.expect(returned);
+    try std.testing.expectEqual(@as(usize, 0), state.single_calls);
+}
+
+test "retired segment native batches bound work and preserve failed retries" {
+    const a = std.testing.allocator;
+    const State = struct {
+        memory: storage_io.MemoryStorage,
+        calls: usize = 0,
+        largest: usize = 0,
+        fail: bool = true,
+        fn batch(ptr: *anyopaque, paths: []const []const u8) !void {
+            const memory: *storage_io.MemoryStorage = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @fieldParentPtr("memory", memory);
+            self.calls += 1;
+            self.largest = @max(self.largest, paths.len);
+            if (self.fail) return error.TestCleanupFailure;
+        }
+    };
+    var state: State = .{ .memory = .init(a) };
+    defer state.memory.deinit();
+    var storage = state.memory.storage();
+    var vtable = storage.vtable.*;
+    vtable.delete_files_absolute = State.batch;
+    storage.vtable = &vtable;
+    var files = try SegmentFileStore.open(a, "/text", storage, false, .threaded, null);
+    defer files.close();
+    const deleter = try RetiredSegmentFileDeleter.init(a, &files);
+    defer deleter.release();
+    const n = RetiredSegmentFileDeleter.retry_attempts_per_boundary;
+    for (0..n * 3) |id| RetiredSegmentFileDeleter.delete(deleter, id);
+    deleter.retryFailedDeletes();
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    try std.testing.expectEqual(n, state.largest);
+    try std.testing.expectEqual(n * 3, deleter.retry_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), deleter.completed_ids.items.len);
+    for (deleter.retry_entries.items) |*entry| entry.next_attempt_ns = std.math.maxInt(u64);
+    try std.testing.expect(deleter.nextWakeDelayNs().? > 0);
+    deleter.retryFailedDeletes();
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    state.fail = false;
+    for (deleter.retry_entries.items) |*entry| entry.next_attempt_ns = 0;
+    for (0..3) |_| deleter.retryFailedDeletes();
+    try std.testing.expectEqual(@as(usize, 4), state.calls);
+    try std.testing.expectEqual(@as(usize, 0), deleter.retry_entries.items.len);
+    try std.testing.expectEqual(n * 3, deleter.completed_ids.items.len);
+    deleter.disarm();
+    // Simulate the borrowed provider and its vtable being destroyed. Late
+    // callbacks and maintenance must use only the disarmed owned context.
+    deleter.storage.vtable = @ptrFromInt(@alignOf(storage_io.Storage.VTable));
+    RetiredSegmentFileDeleter.delete(deleter, 999);
+    deleter.retryFailedDeletes();
+    try std.testing.expectEqual(@as(usize, 4), state.calls);
+    try std.testing.expectEqual(@as(?u64, null), deleter.nextWakeDelayNs());
+}
+
+test "retired segment recovery pages keep their cursor after interrupted discovery" {
+    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var pi = try PersistentIndex.open(a, .{ .path = path });
+    defer pi.close();
+    const deleter = pi.retired_segment_file_deleter.?;
+    const Batch = struct {
+        fn remove(_: *anyopaque, _: []const []const u8) !void {}
+    };
+    var vtable = deleter.storage.vtable.*;
+    vtable.delete_files_absolute = Batch.remove;
+    deleter.storage.vtable = &vtable;
+    deleter.defer_deletions = true;
+    const n = RetiredSegmentFileDeleter.retry_inspections_per_boundary;
+    {
+        var txn = try pi.beginWriteMainTxn();
+        errdefer txn.abort();
+        for (0..n * 2 + 1) |id| try txn.put(.meta, &retiredSegmentMetaKey(id), "");
+        try txn.commit();
+    }
+    pi.retirement_reconcile_pending = true;
+    var read = try pi.beginReadMainTxn();
+    defer read.abort();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    deleter.allocator = failing.allocator();
+    const interrupted = pi.discoverRetiredSegmentFilesInTxn(&read);
+    deleter.allocator = a;
+    try std.testing.expectError(error.OutOfMemory, interrupted);
+    try std.testing.expectEqual(@as(?u64, null), pi.retirement_reconcile_after);
+    try std.testing.expect(pi.retirement_reconcile_pending);
+    try std.testing.expect(!try pi.discoverRetiredSegmentFilesInTxn(&read));
+    try std.testing.expectEqual(@as(?u64, n - 1), pi.retirement_reconcile_after);
+    try std.testing.expectEqual(n, deleter.retry_entries.items.len);
+    try std.testing.expect(!try pi.discoverRetiredSegmentFilesInTxn(&read));
+    try std.testing.expectEqual(n * 2, deleter.retry_entries.items.len);
+    try std.testing.expect(try pi.discoverRetiredSegmentFilesInTxn(&read));
+    try std.testing.expectEqual(@as(?u64, null), pi.retirement_reconcile_after);
+    try std.testing.expectEqual(n * 2 + 1, deleter.retry_entries.items.len);
 }
 
 test "retired segment cleanup bounds maintenance work per publication boundary" {

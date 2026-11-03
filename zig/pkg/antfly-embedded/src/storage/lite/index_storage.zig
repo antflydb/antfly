@@ -74,6 +74,7 @@ pub const Store = struct {
         .begin_atomic_write = beginAtomicWrite,
         .rename_absolute = renameAbsolute,
         .delete_file_absolute = deleteFileAbsolute,
+        .delete_files_absolute = deleteFilesAbsolute,
         .delete_tree = deleteTree,
         .list_file_names_alloc = listFileNamesAlloc,
         .list_directory_names_alloc = listDirectoryNamesAlloc,
@@ -411,6 +412,84 @@ fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     try validateWritePath(self, path);
     var mutation = CatalogWrite{ .kind = .delete, .path = path };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
+}
+
+fn deleteFilesAbsolute(ptr: *anyopaque, paths: []const []const u8) !void {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    if (paths.len > StorageIo.max_atomic_file_deletions) return error.FileDeletionBatchTooLarge;
+    // Validate the entire request before opening a transaction. In particular,
+    // a later foreign path must not leave earlier deletions committed.
+    for (paths) |path| try validateWritePath(self, path);
+    if (paths.len == 0) return;
+    const Delete = struct {
+        paths: []const []const u8,
+        fn apply(context: *anyopaque, file: *native.NativeFile) !void {
+            const request: *@This() = @ptrCast(@alignCast(context));
+            var mutations: [StorageIo.max_atomic_file_deletions]native.CatalogMutation = undefined;
+            for (request.paths, mutations[0..request.paths.len]) |path, *mutation|
+                mutation.* = .{ .key = path, .is_delete = true };
+            // Native catalog tombstones already accept missing keys. Keep all
+            // other failures authoritative, and edit the catalog once rather
+            // than rebuilding it separately for each retired file.
+            try file.putIndexCatalogBatch(mutations[0..request.paths.len]);
+        }
+    };
+    var request: Delete = .{ .paths = paths };
+    try self.docs.submitIndexMutation(&request, Delete.apply, true);
+}
+
+test "lite native retired file batches use one admission and roll back together" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "retired-files-batch.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .exclusive = true, .no_sync = true });
+    defer docs.close();
+    docs.maintenance_cancel.request();
+    var indexes = Store.initWithNamespace(a, &docs, "/scope");
+    const storage = indexes.storage();
+    try storage.writeFileAbsolute("/scope/a", "first");
+    try storage.writeFileAbsolute("/scope/b", "second");
+    const Probe = struct {
+        enters: usize = 0,
+        leaves: usize = 0,
+        fn enter(ptr: *anyopaque, scope: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(docstore.PublicationScope.index, scope);
+            self.enters += 1;
+        }
+        fn leave(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.leaves += 1;
+        }
+    };
+    var probe: Probe = .{};
+    docs.writer_admission = .{ .ptr = &probe, .enter = Probe.enter, .leave = Probe.leave };
+    defer docs.writer_admission = null;
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.deleteFilesAbsolute(&.{ "/scope/a", "/foreign/b" }));
+    const too_many: [StorageIo.max_atomic_file_deletions + 1][]const u8 = @splat("/scope/a");
+    try std.testing.expectError(error.FileDeletionBatchTooLarge, storage.deleteFilesAbsolute(&too_many));
+    try std.testing.expectEqual(@as(usize, 0), probe.enters);
+    docs.file.test_page_write_fail_after = 0;
+    const failed = storage.deleteFilesAbsolute(&.{ "/scope/a", "/scope/b" });
+    docs.file.test_page_write_fail_after = null;
+    try std.testing.expectError(error.TestPageWriteFailure, failed);
+    try std.testing.expectEqual(@as(usize, 1), probe.enters);
+    {
+        const first = try storage.readFileAlloc(a, "/scope/a", 64);
+        defer a.free(first);
+        const second = try storage.readFileAlloc(a, "/scope/b", 64);
+        defer a.free(second);
+        try std.testing.expectEqualStrings("first", first);
+        try std.testing.expectEqualStrings("second", second);
+    }
+    try storage.deleteFilesAbsolute(&.{ "/scope/a", "/scope/missing", "/scope/b", "/scope/a" });
+    try std.testing.expectEqual(@as(usize, 2), probe.enters);
+    try std.testing.expectEqual(probe.enters, probe.leaves);
+    try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(a, "/scope/a", 64));
+    try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(a, "/scope/b", 64));
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
 }
 
 fn deleteTree(ptr: *anyopaque, path: []const u8) !void {

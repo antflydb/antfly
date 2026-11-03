@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Not qualified: public model preflight passes, but the unchanged original importer reproduced LiteReplayBacklogExceeded in the exact three-writer Debug topology and on full-corpus input 7. Local replay service and publication work is under validation. Matched optimized importer runs, index catch-up, sustained-write soaks, Beads-owned factory and aggregate CI remain.",
+  "status": "Not qualified: the unchanged original input-7 importer still fails with LiteReplayBacklogExceeded in both the f280 ReleaseFast reference and the bounded-cleanup Debug candidate. Native, C API, and SDK correctness gates pass. The remaining replay service bottleneck is under local investigation; final matched optimized imports, active-write soaks, Beads factory, and aggregate CI remain.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -5277,5 +5277,154 @@
       "zig/pkg/antfly-embedded/src/storage/db/db.zig": "c54934c512b400d9d9f403d572cf691eb670e8fc1ba89ec50efeffaefb26f91b",
       "scripts/bench/lite_sql_replay_pressure.py": "9ae0f0902dbfd04e11f5a08bb0abd39eefff6e19f3e1a64170050dbb68306889"
     }
+  },
+  "bounded_native_retired_segment_cleanup": {
+    "base_commit": "f280b65a2d065476ed7a3d1495b2133be9502ace",
+    "source_manifest": {
+      "base_commit": "f280b65a2d065476ed7a3d1495b2133be9502ace",
+      "revision": "bounded_native_gc_v3",
+      "source_files_sha256": {
+        "zig/pkg/antfly-embedded/src/storage/persistent.zig": "febe69cb85b8dc53f8e90fffef9a3c8c0d26c32701b1048321fd440a70cf7579",
+        "zig/pkg/antfly-embedded/src/storage/lite/index_storage.zig": "21742698c1e6499c82b41212bd203e096013398aa26d874d9342528590e4d1ec",
+        "zig/pkg/antfly-embedded/src/storage/lsm_backend/storage_io.zig": "dd9926f2224a822f049192109ac82343e0efa7a8878ac931ea4c459ecb728705",
+        "scripts/bench/lite_sql_replay_pressure.py": "f8908c8e2740688174d902fa68886f4d45e7c1013d04942108c6884d823725ad"
+      },
+      "previous_focused_debug_gate": "passed six persistent retirement tests, native retirement groups, zero leaks",
+      "full_v2_debug_gate": "stopped intermediate compilation to add provider-shutdown regression; not a pass",
+      "optimized_gate": "not started; f280 original importer remains a failing reference"
+    },
+    "debug_library_sha256": "9406a19d15efde57f34d56c4d1e17e17d4cd5fd7506b72cbfefa4b3e4efdf869",
+    "design": [
+      "Reader-release callbacks enqueue; one native atomic catalog batch deletes up to eight retired files per maintenance boundary.",
+      "Queue and IO draining use separate locks; shutdown waits for active deletion before invalidating the provider.",
+      "Retirement discovery is paged at 64 markers; failed pages retain the cursor, failed deletion retains durable markers, and retry deadlines participate in maintenance wake scheduling."
+    ],
+    "validation": {
+      "native": {
+        "passed": 732,
+        "skipped": 5,
+        "failed": 0,
+        "leaks": 0
+      },
+      "persistent": {
+        "passed": 62,
+        "skipped": 1,
+        "failed": 0,
+        "leaks": 0
+      },
+      "capi_owner": {
+        "passed": 182,
+        "skipped": 3,
+        "failed": 0,
+        "leaks": 0
+      },
+      "manual_replay_budget": {
+        "passed": 5,
+        "failed": 0
+      },
+      "sdk_sql_concurrency_catalog": {
+        "passed": 205,
+        "environment_note": "Combined run: 204 passes and one child import-environment failure; crash recovery passed when rerun with absolute SDK /src PYTHONPATH."
+      },
+      "capi_smoke_and_linkage": "passed; 134 public C exports",
+      "public_sql_pressure_8_transactions": "passed: 16,512 acknowledged rows, catch-up, integrity, reopening; concurrent builds invalidate timing comparisons"
+    },
+    "original_input_7_debug": {
+      "passed": false,
+      "actual_importer_exit": 1,
+      "summary": [
+        0,
+        0,
+        1
+      ],
+      "error": "LiteReplayBacklogExceeded",
+      "elapsed_seconds": 529.513854541,
+      "peak_native_builds": 5,
+      "censored": false,
+      "scope": "Functional diagnostic only; concurrent compilation, instrumentation enabled. No throughput improvement established."
+    },
+    "optimized_f280_reference": {
+      "library_sha256": "8071b3406171f5fde303cfdce13b09faa454202d682b764c2bd1150c5e3fc91c",
+      "passed": false,
+      "actual_importer_exit": 1,
+      "summary": [
+        0,
+        0,
+        1
+      ],
+      "error": "LiteReplayBacklogExceeded",
+      "elapsed_seconds": 414.996,
+      "acknowledged_primary_rows_checked": 274894,
+      "primary_tables_checked": 45,
+      "integrity": true,
+      "scope": "Functional diagnostic only, compilation overlap; matching CLI build stopped after failure."
+    },
+    "identical_stopped_snapshot_debug": {
+      "scope": "20-second local diagnostic per library, two concurrent native builds; not performance qualification. Both start from the same quiescent database clone.",
+      "baseline": {
+        "case": "baseline",
+        "open_seconds": 0.43800187506712973,
+        "peak_native_builds": 2,
+        "first_debt": 16624856,
+        "last_debt": 15624136,
+        "poll_seconds": 1.312773124780506,
+        "counter_delta": {
+          "maintenance_database_turns": 13,
+          "maintenance_source_turns": 13,
+          "maintenance_capture_ns": 1262318000,
+          "maintenance_replay_ns": 8666955000,
+          "maintenance_artifacts_ns": 17564000,
+          "maintenance_storage_ns": 33193000,
+          "serving_runtime_refreshes": 18,
+          "replay_index_groups": 4,
+          "replay_metadata_groups": 4,
+          "replay_publication_overhead_ns": 562336500,
+          "replay_index_admission_ns": 1021000,
+          "replay_metadata_admission_ns": 14452000,
+          "publication_hold_ns": 658130075,
+          "allocator_proof_walks": 0
+        },
+        "fts_events": 4,
+        "fts_stage_sums": {
+          "documents": 4096,
+          "total_ms": 10094,
+          "full_text_prepare_ms": 8794,
+          "full_text_apply_lock_held_ms": 384
+        }
+      },
+      "candidate": {
+        "case": "candidate",
+        "open_seconds": 0.36871162499301136,
+        "peak_native_builds": 2,
+        "first_debt": 16624856,
+        "last_debt": 15624136,
+        "poll_seconds": 1.288914414937608,
+        "counter_delta": {
+          "maintenance_database_turns": 13,
+          "maintenance_source_turns": 13,
+          "maintenance_capture_ns": 1264186000,
+          "maintenance_replay_ns": 8653767000,
+          "maintenance_artifacts_ns": 17914000,
+          "maintenance_storage_ns": 35827000,
+          "serving_runtime_refreshes": 18,
+          "replay_index_groups": 4,
+          "replay_metadata_groups": 4,
+          "replay_publication_overhead_ns": 550362838,
+          "replay_index_admission_ns": 1038000,
+          "replay_metadata_admission_ns": 13742000,
+          "publication_hold_ns": 649186836,
+          "allocator_proof_walks": 0
+        },
+        "fts_events": 4,
+        "fts_stage_sums": {
+          "documents": 4096,
+          "total_ms": 10093,
+          "full_text_prepare_ms": 8802,
+          "full_text_apply_lock_held_ms": 382
+        }
+      },
+      "conclusion": "No measurable replay-rate improvement from deferred batched cleanup on this stopped snapshot. Full-text preparation accounts for about 8.8 of 10.1 seconds across 4,096 documents in both runs."
+    },
+    "remaining_evidence": "Three live samples on a further 50-second stopped-snapshot candidate run show segment preparation dominated by analysis/postings work in two windows and synchronous text merge in the third. These phases remain investigation targets, not a complete causal attribution of end-to-end regression."
   }
 }
