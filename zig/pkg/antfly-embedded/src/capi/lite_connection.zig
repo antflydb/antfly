@@ -1760,6 +1760,7 @@ pub const Owner = struct {
         self.publication_stats.last_maintenance_error = @errorName(err);
         self.publication_stats.last_maintenance_failure = @errorName(err);
         self.publication_stats.last_maintenance_failure_table_id = table_id;
+        if (qualificationMetricsEnabled()) std.log.info("antfly_bench_native_maintenance_failure phase={s} error={s}", .{ @tagName(phase), @errorName(err) });
     }
 
     fn inheritReclamationTelemetry(destination: anytype, source: anytype) void {
@@ -3088,15 +3089,21 @@ pub const Owner = struct {
         }
     }
 
-    fn logQualificationSummary(self: *Owner) void {
-        if (comptime h.builtin.os.tag == .freestanding) return;
-        const raw = std.c.getenv("ANTFLY_BENCH_METRICS") orelse return;
+    fn qualificationMetricsEnabled() bool {
+        if (comptime h.builtin.os.tag == .freestanding) return false;
+        const raw = std.c.getenv("ANTFLY_BENCH_METRICS") orelse return false;
         const enabled = std.mem.span(raw);
-        if (enabled.len == 0 or std.mem.eql(u8, enabled, "0") or std.ascii.eqlIgnoreCase(enabled, "false")) return;
+        return enabled.len != 0 and !std.mem.eql(u8, enabled, "0") and !std.ascii.eqlIgnoreCase(enabled, "false");
+    }
+
+    fn logQualificationSummary(self: *Owner) void {
+        if (!qualificationMetricsEnabled()) return;
         const p = &self.publication_stats;
         // Numeric/enum diagnostics only: no path, SQL, model or document data.
         // Preparation overlaps actor service; durations are not additive.
         std.log.info("antfly_bench_native_owner source_turns={d} capture_ns={d} replay_ns={d} artifacts_ns={d} storage_ns={d} runtime_refreshes={d} maintenance_errors={d} maintenance_timeouts={d} merge_started={d} merge_applied={d} merge_discarded={d} merge_prepare_ns={d} merge_staging_ns={d} merge_staged_bytes={d} merge_publication_ns={d} sql_overlay_hits={d} sql_overlay_rebuilds={d} sql_overlay_rebuild_entries={d} sql_overlay_evictions={d} sql_staged_statements={d} replay_waits={d} replay_refused_prepare_ns={d} last_failure={s}", .{ p.maintenance_source_turns, p.maintenance_capture_ns, p.maintenance_replay_ns, p.maintenance_artifacts_ns, p.maintenance_storage_ns, p.serving_runtime_refreshes, p.maintenance_errors, p.maintenance_queue_timeouts, p.text_merge_jobs_started, p.text_merge_jobs_applied, p.text_merge_jobs_discarded, p.text_merge_prepare_ns, p.text_merge_staging_ns, p.text_merge_staged_bytes, p.text_merge_publication_ns, p.sql_constraint_overlay_hits, p.sql_constraint_overlay_rebuilds, p.sql_constraint_overlay_rebuild_entries, p.sql_constraint_overlay_evictions, p.sql_constraint_staged_statements, p.replay_backpressure_waits, p.replay_refused_preparation_ns, p.last_maintenance_failure orelse "none" });
+        const f = p.maintenance_failures;
+        std.log.info("antfly_bench_native_owner_failures capture={d} source={d} retirement={d} artifacts={d} storage={d}", .{ f.capture, f.source, f.retirement, f.artifacts, f.storage });
     }
 
     fn deinit(self: *Owner) void {

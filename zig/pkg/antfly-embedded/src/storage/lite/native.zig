@@ -4354,7 +4354,8 @@ const PageCache = struct {
 
 /// Bounded, page-addressed write staging. Pages may finish out of allocation
 /// order (notably packed records and streaming index nodes). Keep ready pages
-/// ordered in one fixed buffer, then write contiguous runs without filling gaps.
+/// ordered by small descriptors over fixed page slots, then write contiguous
+/// runs without filling gaps or moving retained page payloads.
 /// Cache admission happens only after every run succeeds; failure poisons the
 /// batch so partially written private pages cannot be retried or published.
 const PageWriteBatch = struct {
@@ -4364,6 +4365,8 @@ const PageWriteBatch = struct {
     options: WriteOptions = .{},
     buffer: [capacity]u8 = undefined,
     page_ids: [max_pages]u64 = undefined,
+    buffer_slots: [max_pages]u8 = undefined,
+    occupied: u16 = 0,
     used: usize = 0,
     failure: ?anyerror = null,
 
@@ -4372,11 +4375,12 @@ const PageWriteBatch = struct {
         const size: usize = self.file.header.page_size;
         var count = self.used / size;
         var slot = count;
-        // Consecutive writes append without moving bytes. Late packed pages
-        // normally move only their immediately following index page.
+        // Only descriptors move. A fragmented reusable pool can drain one
+        // page at a time; shifting the retained 60 KiB on every 4 KiB write
+        // would multiply memory traffic while holding publication admission.
         while (slot > 0 and self.page_ids[slot - 1] > page_id) : (slot -= 1) {}
         if (slot > 0 and self.page_ids[slot - 1] == page_id)
-            return self.buffer[(slot - 1) * size ..][0..size];
+            return self.page(slot - 1);
         if (self.used + size > self.buffer.len) {
             // Drain only the earliest contiguous run. Keep the later run in
             // the window so an unfinished packed page can still join it.
@@ -4387,11 +4391,22 @@ const PageWriteBatch = struct {
             slot = count;
             while (slot > 0 and self.page_ids[slot - 1] > page_id) : (slot -= 1) {}
         }
-        std.mem.copyBackwards(u8, self.buffer[(slot + 1) * size .. self.used + size], self.buffer[slot * size .. self.used]);
-        std.mem.copyBackwards(u64, self.page_ids[slot + 1 .. count + 1], self.page_ids[slot..count]);
+        var storage_slot: u4 = 0;
+        while (self.occupied & (@as(u16, 1) << storage_slot) != 0) storage_slot += 1;
+        std.debug.assert(@as(usize, storage_slot) < capacity / size);
+        @memmove(self.page_ids[slot + 1 .. count + 1], self.page_ids[slot..count]);
+        @memmove(self.buffer_slots[slot + 1 .. count + 1], self.buffer_slots[slot..count]);
         self.page_ids[slot] = page_id;
+        self.buffer_slots[slot] = storage_slot;
+        self.occupied |= @as(u16, 1) << storage_slot;
         self.used += size;
-        return self.buffer[slot * size ..][0..size];
+        return self.page(slot);
+    }
+
+    fn page(self: *PageWriteBatch, index: usize) []u8 {
+        const size: usize = self.file.header.page_size;
+        const offset = @as(usize, self.buffer_slots[index]) * size;
+        return self.buffer[offset..][0..size];
     }
 
     fn appendPage(self: *PageWriteBatch, page_id: u64, kind: PageKind, payload: []const u8) !void {
@@ -4420,10 +4435,24 @@ const PageWriteBatch = struct {
         }
         const file = self.file;
         const size: usize = file.header.page_size;
+        // The common ordered append writes directly from its slots. Gather
+        // only an out-of-order contiguous run, copying each flushed page at
+        // most once. Retained pages are never copied or re-encoded.
+        var gathered: [capacity]u8 = undefined;
         var start: usize = 0;
         while (start < count) {
             var end = start + 1;
-            while (end < count and self.page_ids[end] - self.page_ids[end - 1] == 1) : (end += 1) {}
+            var ordered = true;
+            while (end < count and self.page_ids[end] - self.page_ids[end - 1] == 1) : (end += 1)
+                ordered = ordered and self.buffer_slots[end] == self.buffer_slots[end - 1] + 1;
+            const length = (end - start) * size;
+            const bytes = if (ordered)
+                self.buffer[@as(usize, self.buffer_slots[start]) * size ..][0..length]
+            else blk: {
+                for (start..end) |index| @memcpy(gathered[(index - start) * size ..][0..size], self.page(index));
+                if (builtin.is_test) _ = file.test_page_batch_copy_bytes.fetchAdd(@intCast(length), .monotonic);
+                break :blk gathered[0..length];
+            };
             if (builtin.is_test) {
                 if (file.test_page_write_fail_after) |remaining| {
                     if (remaining == 0) return zig017_failure: {
@@ -4435,17 +4464,19 @@ const PageWriteBatch = struct {
                 _ = file.test_page_write_calls.fetchAdd(1, .monotonic);
                 _ = file.test_page_writes.fetchAdd(@intCast(end - start), .monotonic);
             }
-            (file.file.writePositionalAll(file.runtimeIo(), self.buffer[start * size .. end * size], self.page_ids[start] * @as(u64, size)) catch |zig017_err| {
+            (file.file.writePositionalAll(file.runtimeIo(), bytes, self.page_ids[start] * @as(u64, size)) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
             start = end;
         }
-        for (self.page_ids[0..count], 0..) |page_id, i|
-            file.cacheWrittenPage(page_id, self.buffer[i * size ..][0..size], self.options);
+        for (self.page_ids[0..count], 0..) |page_id, i| {
+            file.cacheWrittenPage(page_id, self.page(i), self.options);
+            self.occupied &= ~(@as(u16, 1) << @intCast(self.buffer_slots[i]));
+        }
         const remaining = self.used - count * size;
-        std.mem.copyForwards(u8, self.buffer[0..remaining], self.buffer[count * size .. self.used]);
-        std.mem.copyForwards(u64, self.page_ids[0 .. remaining / size], self.page_ids[count .. self.used / size]);
+        @memmove(self.page_ids[0 .. remaining / size], self.page_ids[count .. self.used / size]);
+        @memmove(self.buffer_slots[0 .. remaining / size], self.buffer_slots[count .. self.used / size]);
         self.used = remaining;
     }
 };
@@ -4748,6 +4779,7 @@ pub const NativeFile = struct {
     test_page_writes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
 
     test_page_write_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_page_batch_copy_bytes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_write_fail_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
@@ -16720,6 +16752,64 @@ test "lite native page batches coalesce runs without heap allocation and preserv
         try std.testing.expectEqualStrings("low page", try decodePagePayload(raw[0..size], .data));
         try readExactAt(file.file, std.testing.io, raw[0..size], @as(u64, size) * 102);
         try std.testing.expectEqualStrings("high page", try decodePagePayload(raw[0..size], .data));
+    }
+}
+
+test "lite native page batches bound copying across fragmented drains and slot reuse" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "page-batch-slots.aflite");
+    defer a.free(path);
+    var budget = MaintenanceTestAllocator{ .backing = a };
+    var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    file.page_cache_enabled.store(false, .monotonic);
+    budget.limit = budget.live;
+    const first = file.activeCheckpoint().page_count;
+    for ([_]u32{ 4096, 8192, 16384, 32768, 65536 }) |size| {
+        file.header.page_size = size;
+        const window: usize = PageWriteBatch.capacity / size;
+        const count = window + 64;
+        var sparse = PageWriteBatch{ .file = &file };
+        const copies = file.test_page_batch_copy_bytes.load(.monotonic);
+        try file.writePage(first + 1, .data, "gap");
+        // Reverse the first window, then force repeated one-page drains and
+        // slot reuse. No retained payload may move in this sparse workload.
+        for (0..count) |i| {
+            const ordinal = if (i < window) window - 1 - i else i;
+            var payload: [8]u8 = undefined;
+            std.mem.writeInt(u64, &payload, ordinal, .little);
+            try sparse.appendPage(first + 2 * ordinal, .data, &payload);
+        }
+        try sparse.flush();
+        try std.testing.expectEqual(copies, file.test_page_batch_copy_bytes.load(.monotonic));
+        var raw: [65536]u8 = undefined;
+        for (0..count) |i| {
+            try readExactAt(file.file, std.testing.io, raw[0..size], (first + 2 * i) * @as(u64, size));
+            const payload = try decodePagePayload(raw[0..size], .data);
+            try std.testing.expectEqual(@as(u64, i), std.mem.readInt(u64, payload[0..8], .little));
+        }
+        try readExactAt(file.file, std.testing.io, raw[0..size], (first + 1) * @as(u64, size));
+        try std.testing.expectEqualStrings("gap", try decodePagePayload(raw[0..size], .data));
+        // Reversed physical slots must still gather a logically contiguous
+        // run into one write, copying at most the pages actually flushed.
+        var dense = PageWriteBatch{ .file = &file };
+        const writes = file.test_page_write_calls.load(.monotonic);
+        for (0..window) |i| {
+            var payload: [8]u8 = undefined;
+            const ordinal = window - 1 - i;
+            std.mem.writeInt(u64, &payload, ordinal, .little);
+            try dense.appendPage(first + ordinal, .data, &payload);
+        }
+        try dense.flush();
+        try std.testing.expectEqual(@as(u64, 1), file.test_page_write_calls.load(.monotonic) - writes);
+        try std.testing.expect(file.test_page_batch_copy_bytes.load(.monotonic) - copies <= PageWriteBatch.capacity);
+        for (0..window) |i| {
+            try readExactAt(file.file, std.testing.io, raw[0..size], (first + i) * @as(u64, size));
+            const payload = try decodePagePayload(raw[0..size], .data);
+            try std.testing.expectEqual(@as(u64, i), std.mem.readInt(u64, payload[0..8], .little));
+        }
     }
 }
 

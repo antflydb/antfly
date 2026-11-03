@@ -195,6 +195,9 @@ The implementation now consists of:
   and vacuum copies stage pages by address and coalesce contiguous runs into
   positional writes. When the buffer fills, it drains the earliest contiguous
   run and retains later pages so late packed-record pages can fill their gaps.
+  Page payloads stay in fixed slots; only bounded descriptors move. Out-of-order
+  contiguous runs gather each flushed page at most once in a second 64 KiB
+  buffer, while ordered runs write directly and retained pages are never copied.
   Fragmented free-page runs flush separately. Value-chain writers retain only
   one next-page ID. A completed tree is flushed before its root can be read or
   published. A failed flush admits none of its requested pages and poisons its batch; abort drops
