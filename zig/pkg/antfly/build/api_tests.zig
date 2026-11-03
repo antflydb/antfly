@@ -2729,7 +2729,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_validation_tests = b.addTest(.{
         .root_module = sql_owner_lifecycle_test_mod,
         .filters = &.{ "mounted SQL original nullability validates staged generations and preserves relaxation across restart", "mounted SQL original validation publication", "mounted SQL original foreign key validation" },
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 16 else 12) else 7) * 1024 * 1024 * 1024,
+        // Native Darwin Debug peaked at 17,398,562,816 bytes after the
+        // schema-owner recovery graph grew. Reserve 18 GiB (over 10% headroom)
+        // so the scheduler can admit the compiler without changing test scope.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 18 else 12) else 7) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const sql_nullability_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_validation_tests, &.{"mounted SQL original nullability validates staged generations and preserves relaxation across restart"});
