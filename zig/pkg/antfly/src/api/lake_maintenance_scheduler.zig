@@ -123,6 +123,7 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
     };
     defer claimed.deinit(client.allocator);
     var mutated = false;
+    var pending = false;
     if (state.request) |request| {
         var context = parent;
         const deadline = @import("antfly_platform").time.monotonicNs() +| 60 * std.time.ns_per_s;
@@ -135,6 +136,7 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
             mutated = result.mutated;
             const completed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, result.body, .{});
             const complete = if (completed.object.get("complete")) |value| value == .bool and value.bool else true;
+            pending = !complete;
             if (complete) {
                 state.request = null;
                 // A bounded vacuum that left expirable snapshots plans the next
@@ -153,7 +155,7 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
     state.lease_until_ms = 0;
     var completed = try client.compareAndPut(opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, state, .{}), claimed.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = catalog.types.contextCancellation(&parent) });
     completed.deinit(client.allocator);
-    return mutated;
+    return mutated or pending;
 }
 
 test "external lake scheduler requires bounded policy and prohibits automatic REST vacuum" {

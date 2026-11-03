@@ -132,6 +132,15 @@ part of the source-file sweep. Jobs cache at most 2 MiB of shared nodes in their
 root journal; larger inventories load bounded chunks on replay. Version-one inline
 jobs remain readable. Workers must be upgraded before they can resume new jobs;
 older workers reject the new journal schema without deleting files.
+Managed jobs checkpoint planning separately from the immutable expiry intent.
+Repeat the same operation ID while `complete` is false, including responses with
+`planning: true`. Input reads and spill uploads advance in bounded turns; small
+nodes are embedded before deciding which nodes need uploads. Planning cursors
+cover both snapshots and manifests, and the final intent rechecks fresh catalog
+references and protected snapshots, so ingestion can continue between turns.
+Execution checkpoints the reader-retirement barrier and each catalog-fenced
+physical deletion batch. Lost responses replay that batch safely. The scheduler
+continues checkpoint-only work even when no catalog metadata changed that turn.
 Pending receipts report no physical deletions; completed receipts report final
 counts. A dry run must report zero deletions. Rejection surfaces as a conflict;
 transport failure leaves the immutable journal available for exact retry.

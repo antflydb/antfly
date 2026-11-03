@@ -29,8 +29,8 @@ pub const Retired = struct {
     object_plan: ?[]const u8 = null,
 };
 const Node = struct { objects: []const []const u8 = &.{}, children: []const []const u8 = &.{} };
-pub const Inline = struct { hash: []const u8, node: Node };
-const Cached = struct { node: Node, bytes: usize };
+pub const Inline = struct { hash: []const u8, node: Node, durable: bool = false };
+const Cached = struct { node: Node, bytes: usize, durable: bool = false };
 pub const inline_budget = 2 * 1024 * 1024;
 
 /// Allocations and all supplied object/child slices belong to the job arena.
@@ -41,6 +41,8 @@ pub const Store = struct {
     prefix: []const u8,
     context: catalog.types.Context,
     dry_run: bool,
+    defer_writes: bool = false,
+    uploads_remaining: usize = std.math.maxInt(usize),
     nodes: std.StringHashMapUnmanaged(Cached) = .empty,
     budget: usize = 256 * 1024 * 1024,
 
@@ -57,21 +59,61 @@ pub const Store = struct {
         const digest = catalog.types.digestHex(bytes);
         if (self.nodes.getEntry(&digest)) |entry| return entry.key_ptr.*;
         const hash = try self.a.dupe(u8, &digest);
-        if (!self.dry_run) {
-            const path = try self.key(hash);
-            var result: ?objectstore.PutResult = self.client.putObject(self.bucket, path, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
-                error.PreconditionFailed, error.ObjectAlreadyExists => existing: {
-                    var previous = try self.client.getObject(self.bucket, path, .{ .max_response_bytes = max_node_bytes, .cancellation = catalog.types.contextCancellation(&self.context) });
-                    defer previous.deinit(self.client.allocator);
-                    if (!std.mem.eql(u8, previous.body, bytes)) return error.ArtifactIntegrityMismatch;
-                    break :existing null;
-                },
-                else => return err,
-            };
-            if (result) |*stored| stored.deinit(self.client.allocator);
-        }
-        try self.nodes.put(self.a, hash, .{ .node = node, .bytes = bytes.len });
+        if (!self.dry_run and !self.defer_writes) try self.upload(hash, bytes);
+        try self.nodes.put(self.a, hash, .{ .node = node, .bytes = bytes.len, .durable = !self.dry_run and !self.defer_writes });
         return hash;
+    }
+    fn upload(self: *Store, hash: []const u8, bytes: []const u8) !void {
+        const path = try self.key(hash);
+        var result: ?objectstore.PutResult = self.client.putObject(self.bucket, path, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
+            error.PreconditionFailed, error.ObjectAlreadyExists => existing: {
+                var previous = try self.client.getObject(self.bucket, path, .{ .max_response_bytes = max_node_bytes, .cancellation = catalog.types.contextCancellation(&self.context) });
+                defer previous.deinit(self.client.allocator);
+                if (!std.mem.eql(u8, previous.body, bytes)) return error.ArtifactIntegrityMismatch;
+                break :existing null;
+            },
+            else => return err,
+        };
+        if (result) |*stored| stored.deinit(self.client.allocator);
+    }
+    /// Select inline nodes before writing spills. An external node always owns
+    /// a durable descendant closure, so future turns can skip closed subtrees.
+    pub fn persist(self: *Store, roots: []const []const u8, inline_nodes: []const Inline) !void {
+        if (self.dry_run) return;
+        var embedded: std.StringHashMapUnmanaged(void) = .empty;
+        for (inline_nodes) |entry| try embedded.put(self.a, entry.hash, {});
+        var visited: std.StringHashMapUnmanaged(bool) = .empty;
+        for (roots) |root| try self.persistNode(root, &embedded, &visited, false);
+    }
+    fn persistNode(self: *Store, root: []const u8, embedded: *const std.StringHashMapUnmanaged(void), visited: *std.StringHashMapUnmanaged(bool), closure: bool) anyerror!void {
+        try self.context.ensureActive();
+        // A missing cache entry was already durable in the previous checkpoint.
+        const cached = self.nodes.get(root) orelse return;
+        if (cached.durable) return;
+        const external = closure or !embedded.contains(root);
+        // A node seen only as inline may later be reached through an external
+        // parent, whose complete closure must be persisted independently.
+        if (visited.get(root)) |was_external| if (was_external or !external) return;
+        try visited.put(self.a, root, external);
+        for (cached.node.children) |child| try self.persistNode(child, embedded, visited, external);
+        if (external) {
+            const bytes = try std.json.Stringify.valueAlloc(self.a, cached.node, .{});
+            defer self.a.free(bytes);
+            if (self.uploads_remaining == 0) return error.LakeVacuumPlanYield;
+            try self.upload(root, bytes);
+            self.uploads_remaining -= 1;
+            self.nodes.getPtr(root).?.durable = true;
+        }
+    }
+    pub fn inlineFor(self: *Store, roots: []const []const u8) ![]const Inline {
+        var reachable: std.StringHashMapUnmanaged(void) = .empty;
+        var stack: std.ArrayList([]const u8) = .empty;
+        try stack.appendSlice(self.a, roots);
+        while (stack.pop()) |root| {
+            if ((try reachable.getOrPut(self.a, root)).found_existing) continue;
+            if (self.nodes.get(root)) |cached| try stack.appendSlice(self.a, cached.node.children);
+        }
+        return self.selectInline(&reachable, inline_budget);
     }
     pub fn objects(self: *Store, paths: []const []const u8) ![]const u8 {
         var parts: std.ArrayList([]const u8) = .empty;
@@ -109,11 +151,15 @@ pub const Store = struct {
     /// Keep a bounded cache of small shared nodes in the root journal. Normal
     /// jobs reopen with one GET; larger inventories spill to authenticated nodes.
     pub fn inlineNodes(self: *Store) ![]const Inline {
+        return self.selectInline(null, inline_budget);
+    }
+    fn selectInline(self: *Store, reachable: ?*const std.StringHashMapUnmanaged(void), limit: usize) ![]const Inline {
         const Ranked = struct { entry: Inline, cost: usize };
         var ranked: std.ArrayList(Ranked) = .empty;
         var iterator = self.nodes.iterator();
         while (iterator.next()) |entry| {
-            try ranked.append(self.a, .{ .entry = .{ .hash = entry.key_ptr.*, .node = entry.value_ptr.node }, .cost = entry.value_ptr.bytes + 128 });
+            if (reachable) |set| if (!set.contains(entry.key_ptr.*)) continue;
+            try ranked.append(self.a, .{ .entry = .{ .hash = entry.key_ptr.*, .node = entry.value_ptr.node, .durable = entry.value_ptr.durable }, .cost = entry.value_ptr.bytes + 128 });
         }
         std.mem.sort(Ranked, ranked.items, {}, struct {
             fn less(_: void, left: Ranked, right: Ranked) bool {
@@ -124,22 +170,36 @@ pub const Store = struct {
         var out: std.ArrayList(Inline) = .empty;
         var bytes: usize = 2;
         for (ranked.items) |entry| {
-            if (entry.cost > inline_budget - bytes) break;
+            if (entry.cost > limit - bytes) break;
             bytes += entry.cost;
             try out.append(self.a, entry.entry);
         }
         return out.items;
     }
+    // A planner temporarily retains unflushed nodes while bounded uploads
+    // drain. The final immutable job keeps the smaller normal inline budget.
+    pub const planning_budget = 24 * 1024 * 1024;
+    pub fn pendingNodes(self: *Store) ![]const Inline {
+        const selected = try self.selectInline(null, planning_budget);
+        if (selected.len != self.nodes.count()) return error.LakeVacuumBudgetExceeded;
+        return selected;
+    }
     pub fn seed(self: *Store, nodes: []const Inline) !void {
+        return self.seedLimit(nodes, inline_budget);
+    }
+    pub fn seedPlanning(self: *Store, nodes: []const Inline) !void {
+        return self.seedLimit(nodes, planning_budget);
+    }
+    fn seedLimit(self: *Store, nodes: []const Inline, limit: usize) !void {
         var total: usize = 2;
         for (nodes) |entry| {
             try self.context.ensureActive();
             const bytes = try std.json.Stringify.valueAlloc(self.a, entry.node, .{});
             defer self.a.free(bytes);
-            if (bytes.len > max_node_bytes or entry.node.children.len > fanout or bytes.len + 128 > inline_budget - total) return error.InvalidLakeVacuumPlan;
+            if (bytes.len > max_node_bytes or entry.node.children.len > fanout or bytes.len + 128 > limit - total) return error.InvalidLakeVacuumPlan;
             total += bytes.len + 128;
             if (!std.mem.eql(u8, &catalog.types.digestHex(bytes), entry.hash)) return error.ArtifactIntegrityMismatch;
-            try self.nodes.put(self.a, entry.hash, .{ .node = entry.node, .bytes = bytes.len });
+            try self.nodes.put(self.a, entry.hash, .{ .node = entry.node, .bytes = bytes.len, .durable = entry.durable });
         }
     }
     fn load(self: *Store, hash: []const u8) !Node {
@@ -154,7 +214,7 @@ pub const Store = struct {
         if (!std.mem.eql(u8, &catalog.types.digestHex(result.body), hash)) return error.ArtifactIntegrityMismatch;
         const node = try std.json.parseFromSliceLeaky(Node, self.a, result.body, .{ .allocate = .alloc_always });
         if (node.children.len > fanout) return error.InvalidLakeVacuumPlan;
-        try self.nodes.put(self.a, try self.a.dupe(u8, hash), .{ .node = node, .bytes = result.body.len });
+        try self.nodes.put(self.a, try self.a.dupe(u8, hash), .{ .node = node, .bytes = result.body.len, .durable = true });
         return node;
     }
 };
@@ -320,4 +380,39 @@ test "external lake vacuum plan dry runs keep inventories in memory" {
     var listed = try client.listObjects("archive", .{ .prefix = "plans/" });
     defer listed.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), listed.entries.len);
+}
+
+test "external lake vacuum plan checkpoints bounded spills without uploading inline nodes" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var faults = objectstore.ScriptedFaultClient.init(alloc, memory.client());
+    defer faults.deinit();
+    var store: Store = .{ .a = a, .client = faults.client(), .bucket = "archive", .prefix = "plans", .context = .{}, .dry_run = false, .defer_writes = true };
+    const first = try store.objects(&.{"first"});
+    const second = try store.objects(&.{"second"});
+    const root = try store.children(&.{ first, second });
+    const embedded = try store.inlineFor(&.{root});
+    // This fault must remain armed while the entire graph is embedded.
+    faults.commitNextPutThenFail(error.InjectedAckLoss);
+    try store.persist(&.{root}, embedded);
+    try std.testing.expectError(error.InjectedAckLoss, store.persist(&.{root}, &.{}));
+    store.uploads_remaining = 1;
+    try std.testing.expectError(error.LakeVacuumPlanYield, store.persist(&.{root}, &.{}));
+    // Reopen only the saved checkpoint. Durable descendants are not uploaded
+    // again; the external parent is published after its entire closure.
+    const checkpoint = try store.pendingNodes();
+    var reopened: Store = .{ .a = a, .client = faults.client(), .bucket = "archive", .prefix = "plans", .context = .{}, .dry_run = false, .defer_writes = true, .uploads_remaining = 1 };
+    try reopened.seedPlanning(checkpoint);
+    try std.testing.expectError(error.LakeVacuumPlanYield, reopened.persist(&.{root}, &.{}));
+    reopened.uploads_remaining = 1;
+    try reopened.persist(&.{root}, &.{});
+    var cold: Store = .{ .a = a, .client = memory.client(), .bucket = "archive", .prefix = "plans", .context = .{}, .dry_run = false };
+    var iterator: Iterator = .{ .store = &cold, .retired = &.{.{ .snapshot = "1", .object_plan = root }} };
+    try std.testing.expectEqualStrings("first", (try iterator.next()).?);
+    try std.testing.expectEqualStrings("second", (try iterator.next()).?);
+    try std.testing.expect(try iterator.next() == null);
 }
