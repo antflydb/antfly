@@ -998,7 +998,7 @@ fn encodeRecord(alloc: Allocator, generation: u64, version: u64, ops: []const Op
             },
         }
     }
-    const crc = std.hash.Crc32.hash(w.written());
+    const crc = @import("antfly_hash").Crc32.hash(w.written());
     try wr.writeInt(u32, crc, .little);
     return w.toOwnedSlice();
 }
@@ -1020,7 +1020,7 @@ const DecodedRecord = struct {
 fn decodeRecord(alloc: Allocator, bytes: []const u8) !DecodedRecord {
     if (bytes.len < 25) return error.InvalidRecord;
     const body = bytes[0 .. bytes.len - 4];
-    if (std.hash.Crc32.hash(body) != std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little)) return error.InvalidRecord;
+    if (@import("antfly_hash").Crc32.hash(body) != std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little)) return error.InvalidRecord;
     var r: std.Io.Reader = .fixed(body);
     if ((r.takeByte() catch return error.InvalidRecord) != record_magic) return error.InvalidRecord;
     var out = DecodedRecord{

@@ -803,7 +803,7 @@ pub const LeannStore = struct {
             try wr.writeAll(e.key);
             try wr.writeInt(u64, e.digest, .little);
         }
-        const crc = std.hash.Crc32.hash(w.written());
+        const crc = @import("antfly_hash").Crc32.hash(w.written());
         try wr.writeInt(u32, crc, .little);
         return w.toOwnedSlice();
     }
@@ -811,7 +811,7 @@ pub const LeannStore = struct {
     fn decode(self: *LeannStore, bytes: []const u8) !void {
         if (bytes.len < magic.len + 8) return error.InvalidLeannStore;
         const body = bytes[0 .. bytes.len - 4];
-        if (std.hash.Crc32.hash(body) != std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little)) return error.InvalidLeannStore;
+        if (@import("antfly_hash").Crc32.hash(body) != std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little)) return error.InvalidLeannStore;
         var r: std.Io.Reader = .fixed(body);
         const head = r.take(magic.len) catch return error.InvalidLeannStore;
         if (!std.mem.eql(u8, head, magic)) return error.InvalidLeannStore;
