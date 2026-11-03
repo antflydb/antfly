@@ -1883,7 +1883,7 @@ fn synthesizePulledModelManifestJsonFromPlan(
 
 const PulledManifestSource = enum { published, staging_plan };
 
-fn qualifiedLimitsJsonAlloc(allocator: std.mem.Allocator, boundary_identity: ?@import("../models/gliner_boundary_bundle.zig").Identity, decide_identity: ?decide_qualification.Identity) ![]u8 {
+fn qualifiedLimitsJsonAlloc(allocator: std.mem.Allocator, boundary_identity: ?@import("../models/gliner_boundary_bundle.zig").Identity, boundary_config: ?gliner_boundary.Config, decide_identity: ?decide_qualification.Identity) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1898,6 +1898,12 @@ fn qualifiedLimitsJsonAlloc(allocator: std.mem.Allocator, boundary_identity: ?@i
     };
     return try std.json.Stringify.valueAlloc(allocator, .{
         .profiles = profiles.items,
+        .boundary_profiles_role = if (boundary_identity != null) @as(?[]const u8, "measured_coverage") else null,
+        .boundary_runtime = if (boundary_identity != null and boundary_config != null) .{
+            .max_body_words = boundary_config.?.max_len,
+            .default_max_sequence_tokens = @import("../extractors/gliner_boundary_qualification.zig").sequenceLimit(&boundary_config.?, (@import("../architectures/gliner/boundary_engine.zig").Limits{}).max_sequence_tokens),
+            .geometry_admission = "exact_model_backend_and_request_budgets",
+        } else null,
         .decide = if (decide_identity) |identity| try decide_qualification.requestLimits(identity) else null,
         .span_extraction_status = if (decide_identity) |identity| if (decide_qualification.supportsSpanExtraction(identity)) @as(?[]const u8, "parity_only_no_nonempty_eval") else null else null,
         .span_windows = if (decide_identity) |identity| if (decide_qualification.supportsSpanExtraction(identity)) @import("../models/gliner_span_window_limits.zig").qualified else null else null,
@@ -1907,13 +1913,20 @@ fn qualifiedLimitsJsonAlloc(allocator: std.mem.Allocator, boundary_identity: ?@i
 
 test "qualified limits JSON shares serving geometry and window bounds" {
     const a = std.testing.allocator;
-    const raw = try qualifiedLimitsJsonAlloc(a, gliner_qualification.fastino_gliner25_base_v1, decide_qualification.pinned_fp32_identity);
+    var boundary_config = std.mem.zeroes(gliner_boundary.Config);
+    boundary_config.max_len = 4096;
+    boundary_config.encoder.family = .deberta;
+    const raw = try qualifiedLimitsJsonAlloc(a, gliner_qualification.fastino_gliner25_base_v1, boundary_config, decide_qualification.pinned_fp32_identity);
     defer a.free(raw);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
     try std.testing.expect(root.get("runtime_revalidates_artifact").?.bool);
     try std.testing.expect(root.get("profiles").?.array.items.len > 0);
+    try std.testing.expectEqualStrings("measured_coverage", root.get("boundary_profiles_role").?.string);
+    const boundary_runtime = root.get("boundary_runtime").?.object;
+    try std.testing.expectEqual(@as(i64, 4096), boundary_runtime.get("max_body_words").?.integer);
+    try std.testing.expectEqual(@as(i64, 16384), boundary_runtime.get("default_max_sequence_tokens").?.integer);
     const published = root.get("decide").?.object;
     const enforced = (try decide_qualification.requestLimits(decide_qualification.pinned_fp32_identity)).?;
     try std.testing.expectEqual(@as(i64, @intCast(enforced.sequence_tokens)), published.get("sequence_tokens").?.integer);
@@ -1925,7 +1938,7 @@ test "qualified limits JSON shares serving geometry and window bounds" {
     try std.testing.expectEqual(@as(i64, @intCast(bounds.max_request_tokens)), windows.get("max_request_tokens").?.integer);
     try std.testing.expectEqual(@as(i64, @intCast(bounds.max_document_bytes)), windows.get("max_document_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, @intCast(bounds.max_document_words)), windows.get("max_document_words").?.integer);
-    const absent = try qualifiedLimitsJsonAlloc(a, null, null);
+    const absent = try qualifiedLimitsJsonAlloc(a, null, null, null);
     defer a.free(absent);
     const none = try std.json.parseFromSlice(std.json.Value, a, absent, .{});
     defer none.deinit();
@@ -2085,7 +2098,7 @@ fn synthesizePulledModelManifestJsonInternal(
     if (qualified_decide or specialty_profile == .gliguard)
         try body.appendSlice(allocator, ",\"gliner_classification_head\":\"label_marker_mlp\"");
     if (qualified_boundary or qualified_decide) {
-        const limits = try qualifiedLimitsJsonAlloc(allocator, boundary_identity, decide_identity);
+        const limits = try qualifiedLimitsJsonAlloc(allocator, boundary_identity, manifest.gliner_boundary_config, decide_identity);
         defer allocator.free(limits);
         try body.appendSlice(allocator, ",\"qualified_limits\":");
         try body.appendSlice(allocator, limits);
