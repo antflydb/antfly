@@ -107,9 +107,17 @@ pub const Result = struct {
     windows: usize,
     silent: bool = true,
     truncated: bool = false,
+    /// At least one active window could not establish recognition.
+    unresolved: bool = false,
     output_tokens: usize = 0,
     /// Summed over decoded windows.
     timing: transcription.Timing = .{},
+
+    /// Text-only consumers must not discard recognition completion evidence.
+    pub fn requireComplete(self: *const Result) !void {
+        if (self.truncated) return error.ReadOutputTruncated;
+        if (self.unresolved or (self.text.len == 0 and !self.silent)) return error.DocumentUnresolved;
+    }
 
     pub fn deinit(self: *Result) void {
         freeSegments(self.allocator, self.segments);
@@ -178,6 +186,7 @@ pub fn transcribeLong(
     var timing = transcription.Timing{};
     var silent = true;
     var truncated = false;
+    var unresolved = false;
     var output_tokens: usize = 0;
 
     const initial_tokens: []i32 = if (options.initial_prompt) |prompt|
@@ -213,6 +222,10 @@ pub fn transcribeLong(
         defer result.deinit();
         timing.add(result.timing);
         truncated = truncated or result.truncated;
+        // A retained prefix cannot establish coverage of a later active
+        // window where the recognizer abstained. Keep text and evidence, but
+        // prevent downstream consumers from treating that prefix as complete.
+        unresolved = unresolved or result.silent or std.mem.trim(u8, result.text, " \t\r\n").len == 0;
         output_tokens += result.output_tokens;
         if (language == null) if (result.language) |detected| {
             language = try allocator.dupe(u8, detected);
@@ -253,6 +266,7 @@ pub fn transcribeLong(
         .windows = windows.len,
         .silent = silent,
         .truncated = truncated,
+        .unresolved = unresolved,
         .output_tokens = output_tokens,
         .timing = timing,
     };
@@ -546,7 +560,7 @@ test "long transcription keeps truncation and distinguishes silent from empty re
     var empty = FakeTranscriber{ .allocator = a, .empty_result = true, .silent_result = true };
     var unresolved = try transcribeLong(a, &empty, samples, 1000, .{});
     defer unresolved.deinit();
-    try std.testing.expect(unresolved.text.len == 0 and !unresolved.silent);
+    try std.testing.expect(unresolved.text.len == 0 and !unresolved.silent and unresolved.unresolved);
     @memset(samples, 0);
     var silent = try transcribeLong(a, &empty, samples, 1000, .{});
     defer silent.deinit();
@@ -582,4 +596,38 @@ test "long transcription recognizes quiet nonzero audio and charges discarded ou
     try std.testing.expectEqual(@as(usize, 0), silent.output_tokens);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectError(error.UnsupportedAudioFormat, transcribeLong(a, &fake, &.{}, 16000, .{}));
+}
+
+test "long transcription preserves unresolved active windows after a recognized prefix" {
+    const Drop = struct {
+        inner: FakeTranscriber,
+        pub fn encodePromptText(self: *@This(), a: std.mem.Allocator, text: []const u8) ![]i32 {
+            return self.inner.encodePromptText(a, text);
+        }
+        pub fn lockLanguage(self: *@This(), code: []const u8) bool {
+            return self.inner.lockLanguage(code);
+        }
+        pub fn transcribePcmConditioned(self: *@This(), samples: []const f32, rate: u32, prefix: []const i32) !transcription.TranscribeResult {
+            self.inner.empty_result = self.inner.calls > 0;
+            self.inner.silent_result = self.inner.calls > 0;
+            return self.inner.transcribePcmConditioned(samples, rate, prefix);
+        }
+    };
+    const a = std.testing.allocator;
+    const samples = try a.alloc(f32, 16000 * 40);
+    defer a.free(samples);
+    @memset(samples, 0.1);
+    var transcriber = Drop{ .inner = .{ .allocator = a } };
+    var result = try transcribeLong(a, &transcriber, samples, 16000, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), transcriber.inner.calls);
+    try std.testing.expectEqual(@as(usize, 1), result.segments.len);
+    try std.testing.expect(result.text.len > 0 and result.unresolved and !result.truncated and !result.silent);
+    try std.testing.expectError(error.DocumentUnresolved, result.requireComplete());
+    // Verified trailing silence does not invalidate an otherwise complete read.
+    @memset(samples[30 * 16000 ..], 0);
+    var complete = FakeTranscriber{ .allocator = a };
+    var silent_tail = try transcribeLong(a, &complete, samples, 16000, .{});
+    defer silent_tail.deinit();
+    try std.testing.expect(!silent_tail.unresolved);
 }

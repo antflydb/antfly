@@ -134,17 +134,28 @@ pub const Config = struct {
         return if (self.project_id) |value| try alloc.dupe(u8, value) else try vertexProjectIdFromConfigAlloc(alloc, self.credentials_path);
     }
 
+    /// Owned endpoint with provider-specific defaults resolved by transport.
+    pub fn effectiveEndpointAlloc(self: Config, alloc: Allocator) !?[]u8 {
+        if (self.provider == .cloudflare) return try @import("antfly_cloudflare").nativeEndpointAlloc(alloc, .{
+            .account_id = self.account_id orelse return error.InvalidCloudflareConfig,
+            .model = self.effectiveModel() orelse return error.UnsupportedCloudflareModel,
+            .api_key = "",
+            .url = self.effectiveEndpoint(),
+        });
+        return if (self.effectiveEndpoint()) |url| try alloc.dupe(u8, url) else null;
+    }
+
     /// Only routing fields consumed by the adapter may distinguish physical
     /// recognizers. Credentials and ignored provider options never do.
     pub fn modelIdentity(self: Config, alloc: Allocator) ![32]u8 {
         const project = try self.effectiveProjectId(alloc);
         defer if (project) |value| alloc.free(value);
+        const endpoint = try self.effectiveEndpointAlloc(alloc);
+        defer if (endpoint) |value| alloc.free(value);
         const bytes = try std.json.Stringify.valueAlloc(alloc, .{
             .provider = self.provider,
             .model = self.effectiveModel(),
-            .endpoint = self.effectiveEndpoint(),
-            .account = if (self.provider == .cloudflare) self.account_id else null,
-            .gateway = if (self.provider == .cloudflare) self.gateway_id else null,
+            .endpoint = endpoint,
             .project = project,
             .location = self.effectiveLocation(),
         }, .{});
@@ -1679,7 +1690,9 @@ fn parseVertexRecognizeResponseAlloc(alloc: Allocator, payload: []const u8) !Res
     var response = Response{
         .text = try alloc.dupe(u8, text.items),
         .language = try dupOpt(alloc, results[0].languageCode),
-        .duration_ms = if (last_end_ms > 0) last_end_ms else null,
+        // Recognition endpoints describe evidence positions, not the source
+        // recording's duration (which may include leading/trailing silence).
+        .duration_ms = null,
     };
     errdefer deinitResponse(alloc, &response);
     if (segments.items.len > 0) response.segments = try segments.toOwnedSlice(alloc);
@@ -1729,7 +1742,7 @@ test "vertex recognize response yields speaker turns with word timing" {
     defer deinitResponse(alloc, &response);
     try std.testing.expectEqualStrings("hello there how are you fine thanks", response.text.?);
     try std.testing.expectEqualStrings("en-US", response.language.?);
-    try std.testing.expectEqual(@as(?i64, 3250), response.duration_ms);
+    try std.testing.expectEqual(@as(?i64, null), response.duration_ms);
     const segments = response.segments.?;
     try std.testing.expectEqual(@as(usize, 3), segments.len);
     try std.testing.expectEqualStrings("hello there", segments[0].text.?);
@@ -2619,4 +2632,37 @@ test "transcription physical identity resolves Vertex resource defaults" {
     const implicit = Config{ .provider = .vertex, .project_id = "project" };
     const explicit = Config{ .provider = .vertex, .project_id = "project", .location = "global", .model = "latest_long", .api_key = "different-credential" };
     try std.testing.expectEqual(try implicit.modelIdentity(a), try explicit.modelIdentity(a));
+}
+
+test "audio read Cloudflare physical identity shares transport endpoint resolution" {
+    const a = std.testing.allocator;
+    const implicit = Config{ .provider = .cloudflare, .account_id = "account", .model = "@cf/openai/whisper-large-v3-turbo" };
+    const endpoint = (try implicit.effectiveEndpointAlloc(a)).?;
+    defer a.free(endpoint);
+    var explicit = implicit;
+    explicit.base_url = endpoint;
+    explicit.gateway_id = "logging-gateway";
+    explicit.api_key = "different-credential";
+    try std.testing.expectEqual(try implicit.modelIdentity(a), try explicit.modelIdentity(a));
+    // On an explicit full URL the account field does not select the endpoint.
+    explicit.account_id = "other-account";
+    try std.testing.expectEqual(try implicit.modelIdentity(a), try explicit.modelIdentity(a));
+    explicit.base_url = "https://other.example/recognizer";
+    try std.testing.expect(!std.mem.eql(u8, &try implicit.modelIdentity(a), &try explicit.modelIdentity(a)));
+}
+
+test "audio read Vertex duration remains unknown while evidence clocks survive" {
+    const a = std.testing.allocator;
+    var response = try parseVertexRecognizeResponseAlloc(a,
+        \\{"results":[{"alternatives":[{"transcript":"hello"}],"resultEndOffset":"2s","languageCode":"en-US"}]}
+    );
+    defer deinitResponse(a, &response);
+    try std.testing.expectEqual(@as(?i64, null), response.duration_ms);
+    const wire = try readResponseJsonAlloc(a, "speech", .{ .provider = .vertex, .project_id = "project" }, response, .{ .timestamps = true });
+    defer a.free(wire);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, wire, .{});
+    defer parsed.deinit();
+    const metadata = parsed.value.object.get("data").?.array.items[0].object.get("audio").?.object;
+    try std.testing.expect(metadata.get("duration_ms").? == .null);
+    try std.testing.expectEqual(@as(i64, 2000), metadata.get("segments").?.array.items[0].object.get("end_ms").?.integer);
 }

@@ -34,6 +34,68 @@ pub fn validateTyped(comptime T: type, alloc: std.mem.Allocator, input: []const 
     if (try scanner.next() != .end_of_document) return error.UnexpectedToken;
 }
 
+/// Validate an already-parsed tree without constructing a second typed copy.
+/// Generated OpenAPI metadata remains authoritative for names, required fields
+/// and nullability. Slices borrow strings and inspect arrays element by element;
+/// custom leaf parsers use reclaimable scratch, as in validateTyped.
+pub fn validateTypedValue(comptime T: type, alloc: std.mem.Allocator, source: std.json.Value) !void {
+    return validateValueDepth(T, alloc, source, 0);
+}
+
+fn validateValueDepth(comptime T: type, alloc: std.mem.Allocator, source: std.json.Value, depth: usize) anyerror!void {
+    @setEvalBranchQuota(100000);
+    if (depth > 128) return error.UnexpectedToken;
+    if (T == std.json.Value) return; // Parsing already validated dynamic JSON.
+    switch (@typeInfo(T)) {
+        .optional => |info| {
+            if (source == .null) return;
+            return validateValueDepth(info.child, alloc, source, depth + 1);
+        },
+        .pointer => |info| if (info.size == .slice) {
+            if (info.child == u8 and source == .string) return;
+            if (source != .array) return error.UnexpectedToken;
+            for (source.array.items) |item| try validateValueDepth(info.child, alloc, item, depth + 1);
+            return;
+        },
+        .@"struct" => |info| {
+            if (@hasDecl(T, "openApiFieldMetadata") or (!info.is_tuple and !@hasDecl(T, "jsonParseFromValue"))) {
+                if (source != .object) return error.UnexpectedToken;
+                for (source.object.keys()) |name| {
+                    inline for (info.field_names, 0..) |field, i| {
+                        const wire = if (@hasDecl(T, "openApiFieldMetadata")) T.openApiFieldMetadata[i][0] else field;
+                        if (std.mem.eql(u8, name, wire)) break;
+                    } else return error.UnknownField;
+                }
+                inline for (info.field_names, info.field_types, info.field_attrs, 0..) |field, Field, attrs, i| {
+                    const wire = if (@hasDecl(T, "openApiFieldMetadata")) T.openApiFieldMetadata[i][0] else field;
+                    if (source.object.get(wire)) |value| {
+                        if (@hasDecl(T, "openApiFieldMetadata")) {
+                            if (T.openApiFieldMetadata[i][2] and value == .null) return error.UnexpectedToken;
+                        }
+                        try validateValueDepth(Field, alloc, value, depth + 1);
+                    } else if (attrs.defaultValue(Field) == null) return error.MissingField;
+                }
+                return;
+            }
+            if (@hasField(T, "map")) {
+                const Map = @FieldType(T, "map");
+                if (@typeInfo(Map) == .@"struct" and @hasDecl(Map, "values")) {
+                    const Child = @typeInfo(@TypeOf(@as(Map, undefined).values())).pointer.child;
+                    if (T == std.json.ArrayHashMap(Child)) {
+                        if (source != .object) return error.UnexpectedToken;
+                        for (source.object.values()) |value| try validateValueDepth(Child, alloc, value, depth + 1);
+                        return;
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    _ = try std.json.parseFromValueLeaky(T, scratch.allocator(), source, .{});
+}
+
 /// Observe validated members of the root object. Names borrow object scratch
 /// until this callback returns; ranges borrow the scanner's complete input.
 pub const MemberObserver = struct {
@@ -690,4 +752,31 @@ test "schema name scratch reuses across siblings and recursive dispatch" {
     try validateTyped([]Row, counted.allocator(), input.written());
     try std.testing.expect(counted.allocations <= 4);
     try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+}
+
+test "typed parsed-value validation borrows large strings and checks metadata and numeric bounds" {
+    const Row = struct {
+        url: []const u8,
+        count: ?u8 = null,
+        pub const openApiFieldMetadata = .{ .{ "url", "url", false }, .{ "count", "count", true } };
+    };
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    var value: std.json.Value = .{ .object = .empty };
+    defer value.object.deinit(a);
+    try value.object.put(a, "url", .{ .string = payload });
+    try value.object.put(a, "count", .{ .integer = 255 });
+    try validateTypedValue(Row, std.testing.failing_allocator, value);
+    try value.object.put(a, "count", .{ .integer = 256 });
+    if (validateTypedValue(Row, std.testing.failing_allocator, value)) |_| return error.TestUnexpectedResult else |_| {}
+    try value.object.put(a, "count", .null);
+    try std.testing.expectError(error.UnexpectedToken, validateTypedValue(Row, a, value));
+    _ = value.object.swapRemove("count");
+    try value.object.put(a, "extra", .null);
+    try std.testing.expectError(error.UnknownField, validateTypedValue(Row, a, value));
+    _ = value.object.swapRemove("extra");
+    _ = value.object.swapRemove("url");
+    try std.testing.expectError(error.MissingField, validateTypedValue(Row, a, value));
 }

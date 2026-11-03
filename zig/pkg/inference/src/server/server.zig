@@ -11024,7 +11024,7 @@ pub const Node = struct {
             .duration_ms = std.math.cast(i64, result.duration_ms) orelse std.math.maxInt(i64),
         };
         errdefer transcribing_api.deinitResponse(allocator, &response);
-        response.status = try allocator.dupe(u8, if (result.truncated) "truncated" else if (result.text.len == 0 and !result.silent) "unresolved" else "complete");
+        response.status = try allocator.dupe(u8, if (result.truncated) "truncated" else if (result.unresolved or (result.text.len == 0 and !result.silent)) "unresolved" else "complete");
         if (result.language) |language| response.language = try allocator.dupe(u8, language);
         response.segments = try transcriptionSegmentsAlloc(allocator, result.segments);
         response.speakers = try transcriptionSpeakersAlloc(allocator, result.segments);
@@ -21140,13 +21140,16 @@ pub const Node = struct {
             defer self.allocator.free(speaker_path);
             speaker_revision = try self.chunkSpeakerRevision(speaker_path, control.io orelse self.session_manager.io orelse std.Options.debug_io, control);
         }
+        const endpoint = if (cfg) |hosted| try hosted.effectiveEndpointAlloc(a) else null;
+        defer if (endpoint) |value| a.free(value);
         // Explicit allowlist: credentials never enter persisted execution pins.
         const bytes = try std.json.Stringify.valueAlloc(a, .{
             .options = options,
             .speaker_revision = speaker_revision,
             .provider = if (cfg) |hosted| hosted.provider else null,
             .model = if (cfg) |hosted| hosted.effectiveModel() else null,
-            .endpoint = if (cfg) |hosted| hosted.effectiveEndpoint() else null,
+            .endpoint = endpoint,
+            .gateway = if (cfg) |hosted| (if (hosted.provider == .cloudflare) hosted.gateway_id else null) else null,
             .punctuation = if (cfg) |hosted| hosted.enable_automatic_punctuation else null,
             .enhanced = if (cfg) |hosted| hosted.use_enhanced else null,
             .download_assets = if (cfg) |hosted| hosted.download_assets else false,
@@ -21254,7 +21257,7 @@ pub const Node = struct {
             if (options.diarization orelse false) metadata.speakers = labels;
             const text = try a.dupe(u8, result.text);
             errdefer a.free(text);
-            return .{ .text = text, .completion_tokens = result.output_tokens, .truncated = result.truncated, .unresolved = unresolved_speaker, .silent_audio = result.silent and text.len == 0, .audio_json = try std.json.Stringify.valueAlloc(a, metadata, .{}) };
+            return .{ .text = text, .completion_tokens = result.output_tokens, .truncated = result.truncated, .unresolved = result.unresolved or unresolved_speaker, .silent_audio = result.silent and text.len == 0, .audio_json = try std.json.Stringify.valueAlloc(a, metadata, .{}) };
         }
         const silent = try digitalAudioSilence(decoded.samples);
         if (silent) {
@@ -22288,6 +22291,7 @@ pub const Node = struct {
             };
         };
         defer transcript.deinit();
+        transcript.requireComplete() catch |err| return documentFailureResponse(ctx, err);
         if (serverGenerateTimingEnabled()) {
             const t = transcript.timing;
             std.log.info("dictate timing model={s} audio_ms={d} mel_ms={d} encoder_ms={d} prefill_ms={d} decode_ms={d} decode_steps={d} kv_cached={}", .{
@@ -48652,4 +48656,36 @@ test "document audio framed payload is borrowed without proportional context all
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 404), response.status.code);
     try std.testing.expect(budget.peak < 65536);
+}
+
+test "audio read unresolved prefix cannot become complete transcription evidence" {
+    const a = std.testing.allocator;
+    const result = long_transcription.Result{ .allocator = a, .text = @constCast("recognized prefix"), .segments = @constCast(&.{}), .language = null, .duration_ms = 40000, .windows = 2, .silent = false, .unresolved = true };
+    var response = try Node.transcriptionResponseAlloc(a, &result);
+    defer transcribing_api.deinitResponse(a, &response);
+    try std.testing.expectEqualStrings("recognized prefix", response.text.?);
+    try std.testing.expectEqualStrings("unresolved", response.status.?);
+    try std.testing.expectError(error.DocumentUnresolved, transcribing_api.requireComplete(response));
+}
+
+test "hosted audio document Cloudflare aliases fail verifier preflight before source IO" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "readers/test/plan");
+    try tmp.dir.writeFile(io, .{ .sub_path = "readers/test/plan/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "readers/test/plan/document_agent.json", .data =
+        \\{"allow_remote":true,"models":[{"name":"reader","model":"transcribers/implicit","operation":"read","input":"audio"},{"name":"verifier","model":"transcribers/explicit","operation":"read","input":"audio"}],"read":{"reader":"reader","verification_reader":"verifier"}}
+    });
+    const models = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(models);
+    const configs = [_]transcribing_api.NamedConfig{
+        .{ .name = "implicit", .config = .{ .provider = .cloudflare, .account_id = "account", .model = "@cf/openai/whisper-large-v3-turbo", .max_total_tokens = 100 } },
+        .{ .name = "explicit", .config = .{ .provider = .cloudflare, .account_id = "account", .model = "@cf/openai/whisper-large-v3-turbo", .max_total_tokens = 100, .base_url = "https://api.cloudflare.com/client/v4/accounts/account/ai/run/@cf/openai/whisper-large-v3-turbo", .gateway_id = "logging" } },
+    };
+    var node = try Node.init(a, .{ .models_dir = models, .audio_readers = &configs });
+    defer node.deinit();
+    try node.attachIo(io);
+    try std.testing.expectError(error.InvalidDocumentDefinition, node.readDocumentsJsonWithControl(a, "{\"model\":\"readers/test/plan\",\"audio\":\"AAAA\"}", .{ .io = io }));
 }

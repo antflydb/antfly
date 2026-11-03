@@ -26,7 +26,7 @@ const image = @import("antfly_image");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const A = std.mem.Allocator;
 const V = std.json.Value;
-const adapter_version = "antfly-documents-v11";
+const adapter_version = "antfly-documents-v12";
 const durable = @import("durable.zig");
 
 /// Payloads are borrowed for the complete synchronous operation. Durable runs
@@ -3320,6 +3320,7 @@ fn testDurableReading(comptime Node: type, node: *Node, comptime audio: bool) !v
     try std.testing.expectEqual(@as(i64, 0), response.value.object.get("usage").?.object.get("physical_model_calls").?.integer);
     try std.testing.expectEqual(@as(i64, 2), response.value.object.get("usage").?.object.get("model_calls").?.integer);
     if (audio) {
+        try std.testing.expectEqualStrings(if (node.unresolved) "unresolved" else "complete", response.value.object.get("data").?.array.items[0].object.get("status").?.string);
         const metadata = response.value.object.get("data").?.array.items[0].object.get("audio").?;
         const segment = metadata.object.get("segments").?.array.items[0].object;
         try std.testing.expectEqual(@as(i64, 65000), segment.get("start_ms").?.integer);
@@ -3936,4 +3937,9 @@ test "document audio run identity includes deployment decoder ceilings" {
     var two = try std.json.parseFromSlice(V, a, second, .{});
     defer two.deinit();
     try std.testing.expect(!std.mem.eql(u8, one.value.object.get("document").?.object.get("run_sha256").?.string, two.value.object.get("document").?.object.get("run_sha256").?.string));
+}
+
+test "document audio unresolved prefix remains unresolved after durable replay" {
+    var node = AudioPlanTestNode{ .unresolved = true };
+    try testDurableReading(AudioPlanTestNode, &node, true);
 }

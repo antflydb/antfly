@@ -279,6 +279,7 @@ export function useConnectionsWithModels(): ConnectionsState {
 }
 
 interface DirectModelInfo {
+  audio_read?: { forced_language?: boolean };
   capabilities?: string[];
   inputs?: string[];
 }
@@ -292,6 +293,7 @@ function directModelEntries(models: Record<string, DirectModelInfo> | undefined)
     name,
     capabilities: info.capabilities,
     inputs: info.inputs,
+    audio_read: info.audio_read,
   }));
 }
 
@@ -416,6 +418,7 @@ export function useConnectedModels(): ConnectedModelsState {
 
 /** Models exposed by the inference connection selected for playground requests. */
 export interface SelectedInferenceModel {
+  audio_read?: { forced_language?: boolean };
   name: string;
   display_name?: string;
   dimensions?: number;

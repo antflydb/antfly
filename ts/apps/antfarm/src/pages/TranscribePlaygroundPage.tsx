@@ -61,6 +61,7 @@ import {
 } from "@/lib/audio-utils";
 import {
   getMediaChunks,
+  audioReaderChoices,
   modelsAcceptingInput,
   reconcileModelSelection,
 } from "@/lib/inference-playground-contracts";
@@ -143,9 +144,15 @@ const TranscribePlaygroundPage: React.FC = () => {
   );
   const { models: connectedGenerators, loading: generatorsLoading } =
     useSelectedInferenceModels("generator");
+  const { models: connectedReaders, loading: readersLoading } =
+    useSelectedInferenceModels("reader");
+  const audioReaders = useMemo(
+    () => audioReaderChoices(connectedTranscribers, connectedReaders, connectedGenerators),
+    [connectedTranscribers, connectedReaders, connectedGenerators]
+  );
   const connectionTranscribers = useMemo(
-    () => modelsAcceptingInput(connectedTranscribers, "audio").map((model) => model.name),
-    [connectedTranscribers]
+    () => audioReaders.map((model) => model.name),
+    [audioReaders]
   );
   const connectionGenerators = useMemo(
     () => modelsAcceptingInput(connectedGenerators, "text").map((model) => model.name),
@@ -156,7 +163,8 @@ const TranscribePlaygroundPage: React.FC = () => {
   const availableTranscribers = connectionTranscribers;
   const availableChunkers = connectionChunkers;
   const availableGenerators = connectionGenerators;
-  const modelsLoaded = !transcribersLoading && !chunkersLoading && !generatorsLoading;
+  const modelsLoaded =
+    !transcribersLoading && !readersLoading && !chunkersLoading && !generatorsLoading;
 
   // Config
   const [selectedChunkerModel, setSelectedChunkerModel] = useState("");
@@ -396,24 +404,33 @@ const TranscribePlaygroundPage: React.FC = () => {
       updateSegment(index, { status: "transcribing" });
 
       if (signal.aborted) return;
-      const result = await fetchInferenceJson<components["schemas"]["InferenceReadResponse"]>(requestEndpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          audio: audioBase64,
-          model: transcriberModel,
-          audio_options: { language: lang.trim() || undefined },
-        }),
-        signal,
-      });
+      const result = await fetchInferenceJson<components["schemas"]["InferenceReadResponse"]>(
+        requestEndpoint,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            audio: audioBase64,
+            model: transcriberModel,
+            audio_options: {
+              language: audioReaders.find((model) => model.name === transcriberModel)
+                ?.forcedLanguage
+                ? lang.trim() || undefined
+                : undefined,
+            },
+          }),
+          signal,
+        }
+      );
       if (signal.aborted) return;
 
       const item = result.data[0];
       const rawText = (item?.text || "").trim();
       if (item?.status === "truncated" || item?.status === "unresolved") {
-        const message = item.status === "truncated"
-          ? "Transcript is incomplete: the reader reached its output limit."
-          : "The reader could not recognize this audio.";
+        const message =
+          item.status === "truncated"
+            ? "Transcript is incomplete: the reader reached its output limit."
+            : "The reader could not recognize this audio.";
         updateSegment(index, { rawText, status: "done", error: message });
         throw new Error(message);
       }
@@ -451,7 +468,7 @@ const TranscribePlaygroundPage: React.FC = () => {
         updateSegment(index, { rawText, status: "done" });
       }
     },
-    [requestEndpoint, generationEndpoint, updateSegment]
+    [requestEndpoint, generationEndpoint, updateSegment, audioReaders]
   );
 
   // Main pipeline
@@ -644,7 +661,7 @@ const TranscribePlaygroundPage: React.FC = () => {
             {/* Row 1: Core config */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <Field className="gap-2">
-                <FieldLabel htmlFor="transcriber-model">Transcriber Model</FieldLabel>
+                <FieldLabel htmlFor="transcriber-model">Audio Reader Model</FieldLabel>
                 <Select
                   value={selectedTranscriberModel}
                   onValueChange={setSelectedTranscriberModel}
@@ -673,7 +690,16 @@ const TranscribePlaygroundPage: React.FC = () => {
                 <FieldLabel htmlFor="language">Language</FieldLabel>
                 <Input
                   id="language"
-                  placeholder="Auto-detect (or e.g. en, es)"
+                  disabled={
+                    audioReaders.find((model) => model.name === selectedTranscriberModel)
+                      ?.forcedLanguage === false
+                  }
+                  placeholder={
+                    audioReaders.find((model) => model.name === selectedTranscriberModel)
+                      ?.forcedLanguage === false
+                      ? "Language control unavailable"
+                      : "Auto-detect (or e.g. en, es)"
+                  }
                   value={language}
                   onChange={(e) => setLanguage(e.target.value)}
                 />

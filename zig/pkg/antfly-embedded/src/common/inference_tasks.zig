@@ -553,17 +553,17 @@ fn readingRequest(a: std.mem.Allocator, cfg: readers.Config, request: Json) !Jso
             try forwarded.object.put(a, name, try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, fallback, .{}), .{}));
         };
     }
-    const decoded = std.json.parseFromValue(@import("inference_api").ReadRequest, a, forwarded, .{}) catch return error.InvalidInferenceRequest;
-    defer decoded.deinit();
-    const body = decoded.value;
-    const forms = @as(usize, @intFromBool(body.images != null)) + @intFromBool(body.documents != null) + @intFromBool(body.audio != null);
-    if (forms != 1) return error.InvalidInferenceRequest;
-    if (body.audio) |audio| {
-        if (audio.len == 0) return error.InvalidInferenceRequest;
-    }
-    const count = if (body.images) |images| images.len else if (body.documents) |documents| documents.len else 1;
-    if (count == 0 or count > 64) return error.InvalidInferenceRequest;
-    if (body.max_tokens) |tokens| if (tokens < 1 or tokens > readers.max_output_tokens) return error.InvalidInferenceRequest;
+    // Validate the generated contract directly over borrowed JSON. A typed
+    // reparse would clone every inline recording/image/document URL merely to
+    // inspect metadata, making alias planning proportional to payload size.
+    @import("antfly-json").validateTypedValue(@import("inference_api").ReadRequest, a, forwarded) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidInferenceRequest,
+    };
+    if (forwarded.object.get("max_tokens")) |value| if (value != .null) {
+        const tokens = std.json.parseFromValueLeaky(i64, a, value, .{}) catch return error.InvalidInferenceRequest;
+        if (tokens < 1 or tokens > readers.max_output_tokens) return error.InvalidInferenceRequest;
+    };
     return forwarded;
 }
 
@@ -1160,5 +1160,55 @@ test "provider registry gateway raw reading plans borrow large inline media" {
         const plan = (try planReading(scratch.allocator(), view, try view.resolve(.read, id, &.{}), request)).?;
         try std.testing.expect(plan.request.object.get("audio").?.string.ptr == audio.ptr);
         try std.testing.expectEqual(audio.len, plan.request.object.get("audio").?.string.len);
+    }
+}
+
+test "provider registry gateway audio aliases validate large borrowed payloads within metadata scratch" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'A');
+    for ([_][]const u8{ "audio", "images", "documents" }) |form| {
+        var storage: [16384]u8 = undefined;
+        var scratch = std.heap.FixedBufferAllocator.init(&storage);
+        const work = scratch.allocator();
+        var request: Json = .{ .object = .empty };
+        try request.object.put(work, "model", .{ .string = "transcribers/speech" });
+        if (std.mem.eql(u8, form, "audio")) {
+            try request.object.put(work, form, .{ .string = payload });
+        } else {
+            var item: Json = .{ .object = .empty };
+            try item.object.put(work, "url", .{ .string = payload });
+            if (std.mem.eql(u8, form, "documents")) {
+                try item.object.put(work, "id", .{ .string = "recording" });
+                try item.object.put(work, "media_type", .{ .string = "audio/wav" });
+            }
+            var items = std.json.Array.init(work);
+            try items.append(item);
+            try request.object.put(work, form, .{ .array = items });
+        }
+        const plan = try audioReadingRequest(work, .{ .provider = .antfly, .model = "whisper" }, "whisper", request);
+        const borrowed = if (std.mem.eql(u8, form, "audio")) plan.object.get("audio").?.string else plan.object.get(form).?.array.items[0].object.get("url").?.string;
+        try std.testing.expectEqual(@intFromPtr(payload.ptr), @intFromPtr(borrowed.ptr));
+    }
+}
+
+test "provider registry gateway borrowed read validation preserves generated contract errors" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"audio\":42}",
+        "{\"audio\":\"AAAA\",\"unknown\":true}",
+        "{\"audio\":\"AAAA\",\"audio_options\":{\"timestamps\":\"true\"}}",
+        "{\"audio\":\"AAAA\",\"max_tokens\":0}",
+        "{\"audio\":\"AAAA\",\"max_tokens\":8193}",
+        "{\"audio\":\"AAAA\",\"retain_artifact\":1}",
+        "{\"documents\":[{\"url\":\"source\",\"media_type\":\"audio/wav\"}]}",
+        "{\"documents\":[{\"id\":\"s\",\"url\":\"source\",\"media_type\":\"audio/wav\",\"pages\":[\"one\"]}]}",
+    }) |raw| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const work = arena.allocator();
+        const request = try std.json.parseFromSliceLeaky(Json, work, raw, .{});
+        try std.testing.expectError(error.InvalidInferenceRequest, readingRequest(work, .{ .provider = .antfly, .model = "whisper" }, request));
     }
 }
