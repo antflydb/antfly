@@ -92,7 +92,9 @@ pub const Store = struct {
         deadline_ns: u64,
         fn canceled(raw: *const anyopaque) bool {
             const self: *const Lease = @ptrCast(@alignCast(raw));
-            self.store.context.ensureActive() catch return true;
+            // Deadline and checkpoint hooks remain on the copied Context, so
+            // their original errors are preserved by ensureActive().
+            if (self.store.context.cancellation) |token| if (token.isCancelled()) return true;
             return self.store.clock.read(self.store.clock.ptr) >= self.expires_ms;
         }
         pub fn context(self: *const Lease) Context {
@@ -337,4 +339,27 @@ test "external lake vacuum inputs cleanup is bounded resumes lost outcomes and r
     defer proof.deinit(alloc);
     try std.testing.expectEqualStrings("authoritative proof", proof.body);
     try std.testing.expect(try store.finish(a));
+}
+
+test "external lake vacuum inputs preserve caller checkpoint errors" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = storage.MemoryClient.init(alloc);
+    defer memory.deinit();
+    const Check = struct {
+        fail: bool = false,
+        fn run(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.InjectedCallerCheckpoint;
+        }
+    };
+    var check: Check = .{};
+    const store = try Store.init(a, memory.client(), "journal", "table", "caller-context", .{ .checkpoint = .{ .ptr = &check, .check = Check.run } });
+    var writer = try store.acquire(a);
+    check.fail = true;
+    try std.testing.expectError(error.InjectedCallerCheckpoint, writer.context().ensureActive());
+    check.fail = false;
+    try writer.release(a);
 }

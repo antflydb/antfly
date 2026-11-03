@@ -67,7 +67,10 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
         error.LakeVacuumPlanClosed => return null,
         else => return err,
     };
-    defer lease.release(a) catch {};
+    // On failure an object PUT may still have an uncertain remote outcome.
+    // Retain admission until its deadline/grace rather than releasing early.
+    var checkpointed = false;
+    defer if (checkpointed) lease.release(a) catch {};
     plans.context = lease.context();
     defer plans.context = original_context;
     var leased_destination = destination;
@@ -201,6 +204,7 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
     else
         try client.putObject(bucket, key, body, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&plans.context) });
     stored.deinit(client.allocator);
+    checkpointed = true;
     return if (!progress.spilling and (progress.candidate == progress.candidates.len or progress.retired.len == progress.max_expired)) progress else null;
 }
 const Execution = struct {
@@ -1119,4 +1123,29 @@ test "external lake vacuum no-op jobs reclaim inputs and replay without catalog 
     var current = try authority.load(a);
     defer current.deinit(a);
     try std.testing.expectEqualStrings(table.metadata_location, current.metadata_location);
+
+    // An uncertain planning-checkpoint response must not release its writer
+    // lease: the remote write may still be completing after the caller fails.
+    var faults = @import("objectstore").ScriptedFaultClient.init(alloc, queue.client);
+    defer faults.deinit();
+    var failed_request = request;
+    failed_request.operation_id = "failed-planner";
+    const failed_inputs = try inputs.Store.init(a, faults.client(), queue.bucket, base, failed_request.operation_id, .{});
+    var target_key = .{ .key = failed_inputs.planning_key };
+    faults.put_filter = .{ .ptr = &target_key, .matches = struct {
+        fn matches(raw: *anyopaque, _: []const u8, key: []const u8, _: []const u8) bool {
+            const expected_key: *const struct { key: []const u8 } = @ptrCast(@alignCast(raw));
+            return std.mem.eql(u8, expected_key.key, key);
+        }
+    }.matches };
+    faults.next_put = .{ .commit_then_fail = error.ConnectionResetByPeer };
+    var failed_plans: plan.Store = .{ .a = a, .client = faults.client(), .bucket = queue.bucket, .prefix = base, .context = .{}, .dry_run = false, .defer_writes = true };
+    const failed_pins: pins.Store = .{ .client = queue.client, .bucket = queue.bucket, .prefix = "failed-pins", .context = .{} };
+    var failed_budget: u64 = 256 * 1024 * 1024;
+    var failed_cache: ManifestFiles = .empty;
+    try std.testing.expectError(error.ConnectionResetByPeer, planningTurn(a, faults.client(), queue.bucket, failed_inputs.planning_key, root, try catalog.metadata.str(try catalog.metadata.get(root, "table-uuid")), &.{}, failed_request, failed_pins, files, &failed_plans, &failed_budget, &failed_cache));
+    var registration = try client.getObject(queue.bucket, failed_inputs.state_key, .{});
+    defer registration.deinit(client.allocator);
+    const admission = try std.json.parseFromSliceLeaky(V, a, registration.body, .{});
+    try std.testing.expectEqual(@as(usize, 1), (try catalog.metadata.get(admission, "leases")).array.items.len);
 }
