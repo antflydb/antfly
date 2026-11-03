@@ -73,7 +73,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     const retained_api = @import("lake_retained_cut.zig");
     // The cut lifetime begins at admission, so a slow query cannot extend a
     // recent segment or lake pin beyond the retention checked when binding it.
-    const cut_expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms +| retained_api.configuredTtl(server.cfg.node_config);
+    const cut_expires_ms = try retained_api.cursorExpiry(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, retained_api.configuredTtl(server.cfg.node_config));
     var retained_arena = std.heap.ArenaAllocator.init(a);
     defer retained_arena.deinit();
     const ra = retained_arena.allocator();
@@ -97,7 +97,11 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     var schema = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return null;
     defer schema.deinit(a);
     const total_started = @import("antfly_platform").time.monotonicNs();
-    defer server.lake_query_metrics.record(.total, total_started);
+    var request_profile: @import("lake_query_metrics.zig").ComposedProfile = .{};
+    defer {
+        request_profile.record(&server.lake_query_metrics, .total, total_started);
+        server.lake_query_metrics.retainSlowLake(request_profile);
+    }
     // Graph and search aggregation execution require their own native ports;
     // reject them before selecting a publication rather than dropping clauses.
     if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.aggregations_json.len != 0) return error.UnsupportedQueryRequest;
@@ -160,7 +164,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
             var queue = try ingestion.openQueue(oa, schema.binding, options);
             defer queue.deinit();
             const queue_prefix = try ingestion.prefix(oa, queue.prefix, schema.binding, options);
-            const authority_bytes = try std.json.Stringify.valueAlloc(oa, .{ store.identity, table.table_id, table.object_storage_generation, table.schema_json, queue_prefix, publication.generation, publication.signature, publication.namespace, publication.inventory.artifact_id, if (publication.directory) |directory| directory.artifact_id else "" }, .{});
+            const authority_bytes = try std.json.Stringify.valueAlloc(oa, .{ store.cache_identity, table.table_id, table.object_storage_generation, table.schema_json, queue_prefix, publication.generation, publication.signature, publication.namespace, publication.inventory.artifact_id, if (publication.directory) |directory| directory.artifact_id else "" }, .{});
             var identity: [32]u8 = undefined;
             std.crypto.hash.Blake3.hash(authority_bytes, &identity, .{});
             wal_cut = try server.lake_wal_cuts.acquire(identity, .{ .client = queue.client, .bucket = queue.bucket, .prefix = queue_prefix, .context = context }, cut, context);
@@ -180,7 +184,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     if (retained != null) if (req.lake_read) |read| if (read.through) |receipt| if (retained_pending.lsn < receipt.wal_lsn) return error.IndexRebuilding;
     var source = blk: {
         const source_started = @import("antfly_platform").time.monotonicNs();
-        defer server.lake_query_metrics.record(.source, source_started);
+        defer request_profile.record(&server.lake_query_metrics, .source, source_started);
         break :blk try @import("lake_published_navigation.zig").open(a, server, table.table_id, table.lake_index_catalog_json, .{ .storage_mode = .relational, .external_base_source = source_schema }, options.lakeOptions(), context, request, lease);
     };
     defer source.deinit();
@@ -194,7 +198,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     server.attachLakeRepairHint(&source);
     var selected = blk: {
         const publication_started = @import("antfly_platform").time.monotonicNs();
-        defer server.lake_query_metrics.record(.publication, publication_started);
+        defer request_profile.record(&server.lake_query_metrics, .publication, publication_started);
         break :blk (try @import("lake_index_selection.zig").selectCachedWithLease(ca, sql_table, &source, &store, context, .required, &server.lake_read_cache, lease)) orelse return error.ExternalLakeIndexUnavailable;
     };
     defer selected.deinit();
@@ -234,7 +238,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     defer owner.deinit();
     var proof: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = context, .expected_delete_objects = selected.delete_objects };
     if (selected.publication().source_navigation) |ref| {
-        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context };
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context };
         navigation_pin = try @import("lake_index_decoded_metadata.zig").acquire(navigation_api.Root, cached, store.artifactStore(), ref, retained_cancellation, navigation_api.load);
         const root = navigation_pin.?.value.*;
         if (!std.mem.eql(u8, &root.domain, &owner.domain) or !std.mem.eql(u8, root.source, source.inventory.source_id) or
@@ -276,7 +280,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     };
     if (build_recent) return null;
     if (has_vectors) {
-        const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = server, .table = sql_table, .source = &source, .context = normalized, .store = store.artifactStore(), .store_identity = store.identity, .read_context = context, .pinned = .{ .artifacts = store.artifactStore(), .store_identity = store.identity, .domain = owner.domain, .declarations = owner.declarations, .read_context = context } };
+        const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = server, .table = sql_table, .source = &source, .context = normalized, .store = store.artifactStore(), .cache_scope = store.cache_identity, .read_context = context, .pinned = .{ .artifacts = store.artifactStore(), .cache_scope = store.cache_identity, .domain = owner.domain, .declarations = owner.declarations, .read_context = context } };
         owner.vector_filter = if (effective.filter_query_json.len != 0) try std.json.parseFromSliceLeaky(std.json.Value, ca, effective.filter_query_json, .{}) else null;
         owner.vector_exclusion = if (effective.exclusion_query_json.len != 0) try std.json.parseFromSliceLeaky(std.json.Value, ca, effective.exclusion_query_json, .{}) else null;
         if (owner.overlay) |pending_overlay| {
@@ -310,7 +314,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     if (owner.typed_delivery) execution_req.include_stored = false;
     const started = @import("antfly_platform").time.monotonicNs();
     var result = blk: {
-        defer server.lake_query_metrics.record(.ranking, started);
+        defer request_profile.record(&server.lake_query_metrics, .ranking, started);
         break :blk if (execution_req.full_text_queries.len != 0 or execution_req.sparse_queries.len != 0 or execution_req.dense_queries.len != 0)
             try search.searchComposed(a, execution_req, .{ .ctx = &owner, .search_components = Execution.searchComponents, .search_text_query = Execution.searchText, .search_text = Execution.dispatchText, .search_dense = Execution.searchDense, .search_sparse = Execution.searchSparse, .clone_named_set = Execution.cloneSet, .fuse_named_sets = Execution.fuseSets, .attach_graph_results = Execution.attachGraph })
         else if (execution_req.dense) |dense| try Execution.searchDense(&owner, a, execution_req, dense) else if (execution_req.sparse) |sparse| try Execution.searchSparse(&owner, a, execution_req, sparse) else if (execution_req.full_text) |text| try Execution.searchText(&owner, a, execution_req, text) else try Execution.dispatchText(&owner, a, execution_req);
@@ -323,7 +327,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     // files/indexes remain shared, protected by their durable reader protocols.
     const serving_token: []const u8 = cursor: {
         const cursor_started = @import("antfly_platform").time.monotonicNs();
-        defer server.lake_query_metrics.record(.cursor_retention, cursor_started);
+        defer request_profile.record(&server.lake_query_metrics, .cursor_retention, cursor_started);
         break :cursor if (retained != null) req.remote_snapshot.? else if (req.remote_snapshot != null) &snapshot_token else cut: {
             var artifacts = store.artifactStore();
             if (cut_expires_ms <= @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) return error.DeadlineExceeded;
@@ -361,7 +365,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     meta.took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| total_started) / std.time.ns_per_ms);
     const response = delivery_result: {
         const delivery_started = @import("antfly_platform").time.monotonicNs();
-        defer server.lake_query_metrics.record(.result_delivery, delivery_started);
+        defer request_profile.record(&server.lake_query_metrics, .result_delivery, delivery_started);
         break :delivery_result try local.api_query.encodeQueryResponsesWithDelivery(a, table.name, effective, meta, result, prepared_delivery);
     };
     const finished = @import("antfly_platform").time.monotonicNs();
@@ -950,7 +954,7 @@ const Execution = struct {
     }
     fn buildOverlayPhysicalFilter(raw: *anyopaque, a: A, filter: []const u8) anyerror!@import("lake_index_physical_set.zig").Set {
         const self: *Execution = @ptrCast(@alignCast(raw));
-        const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+        const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
         const excluded = (try resolver.resolve(a, filter)) orelse return error.UnsupportedQueryRequest;
         if (!excluded.exact) return error.UnsupportedQueryRequest;
         return excluded.bitmap;
@@ -985,7 +989,7 @@ const Execution = struct {
     const HighlightPlan = struct { query: search.HighlightQuery, name: []const u8, stores_source: bool };
     fn highlightPlan(self: *Execution, name: ?[]const u8, text: types.TextQuery) !?HighlightPlan {
         const selected = (try self.textDeclaration(name)) orelse return null;
-        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.cache_identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
         const token: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, token, corpus.loadDirectory);
         defer metadata.release();
@@ -1030,7 +1034,7 @@ const Execution = struct {
             return try overlay_api.Overlay.window(pin, &empty, preparation.root.collection.?, preparation.plan.?, self.context);
         }
         const selected = (try self.textDeclaration(name)) orelse return null;
-        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics, .lazy_lineage = self.lazy_lineage };
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.cache_identity, .context = self.context, .metrics = &self.server.lake_query_metrics, .lazy_lineage = self.lazy_lineage };
         const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
         defer metadata.release();
@@ -1069,7 +1073,7 @@ const Execution = struct {
                 try self.resolveOverlayPhysical();
                 var excluded = try identities.bitmapForPhysical(self.arena, &overlay.physical.?, self.store.artifactStore(), cached);
                 defer excluded.deinit();
-                var recent_pin = try self.server.lake_recent_text.acquireFamily(@import("lake_recent_text_cache.zig").Cache.key(self.store.identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name, overlay), @import("lake_recent_text_cache.zig").Cache.family(self.store.identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name), overlay, pin.name, pin.text_analysis, pin.runtime_schema, pin.selected_field, self.context);
+                var recent_pin = try self.server.lake_recent_text.acquireFamily(@import("lake_recent_text_cache.zig").Cache.key(self.store.cache_identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name, overlay), @import("lake_recent_text_cache.zig").Cache.family(self.store.cache_identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name), overlay, pin.name, pin.text_analysis, pin.runtime_schema, pin.selected_field, self.context);
                 defer recent_pin.deinit();
                 // Saturation can return a private pin; sharing gives the composed
                 // owner the same lifetime contract as a cache hit.
@@ -1176,7 +1180,7 @@ const Execution = struct {
         defer a.free(winners);
         var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
         defer live.deinit(a);
-        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.cache_identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
         var input = std.heap.ArenaAllocator.init(a);
         defer input.deinit();
         for (hits, winners, 0..) |hit, *winner, index| {
@@ -1351,7 +1355,7 @@ const Execution = struct {
         const name = self.delivery_index orelse return false;
         for (hits) |hit| if (!self.delivery_locations.contains(hit.id)) return false;
         const declaration = (try self.textDeclaration(name)) orelse return false;
-        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics, .lazy_lineage = true };
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.cache_identity, .context = self.context, .metrics = &self.server.lake_query_metrics, .lazy_lineage = true };
         const token: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), declaration.artifact, token, corpus.loadDirectory);
         defer metadata.release();
@@ -1659,7 +1663,7 @@ const Execution = struct {
             return .{ .bitmap = result };
         }
         const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
-        const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .allow_partial = self.predicate_allow_partial and !std.mem.eql(u8, json, self.predicate_exclusion_json), .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+        const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .allow_partial = self.predicate_allow_partial and !std.mem.eql(u8, json, self.predicate_exclusion_json), .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .store = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
         var result = (try resolver.resolve(a, json)) orelse return null;
         errdefer result.deinit();
         if (self.overlay) |overlay| {
@@ -1728,7 +1732,7 @@ const Execution = struct {
                 self.position += 1;
                 self.scanned += 1;
                 const execution = self.execution;
-                const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &execution.server.lake_read_cache, .scope = execution.store.identity, .context = execution.context };
+                const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &execution.server.lake_read_cache, .scope = execution.store.cache_identity, .context = execution.context };
                 if (try self.identities.ordinal(self.a, &self.bitmaps, execution.store.artifactStore(), cached, ref)) |number| return number;
             }
         }
@@ -1944,7 +1948,7 @@ const Execution = struct {
                     const row = self.page[self.position];
                     self.position += 1;
                     const execution = self.owner.execution;
-                    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &execution.server.lake_read_cache, .scope = execution.store.identity, .context = execution.context };
+                    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &execution.server.lake_read_cache, .scope = execution.store.cache_identity, .context = execution.context };
                     const matched = self.owner.identities.ordinal(self.window.allocator(), &self.live, execution.store.artifactStore(), cached, row) catch |err| switch (err) {
                         error.OutOfMemory, error.QueryCandidateBudgetExceeded, error.ArtifactReadBudgetExceeded => {
                             self.fallback = true;
@@ -1989,7 +1993,7 @@ const Execution = struct {
             // authenticated decoded pages remain in the publication cache.
             var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
             defer live.deinit(a);
-            const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.execution.server.lake_read_cache, .scope = self.execution.store.identity, .context = self.execution.context };
+            const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.execution.server.lake_read_cache, .scope = self.execution.store.cache_identity, .context = self.execution.context };
             const archive_docs = self.identities.offsets[self.identities.offsets.len - 1];
             var refs: [256]local.storage_rowsource_types.RowRef = undefined;
             var positions: [256]usize = undefined;
@@ -2048,7 +2052,7 @@ const Execution = struct {
         var arena = std.heap.ArenaAllocator.init(budget.allocator());
         defer arena.deinit();
         const a = arena.allocator();
-        const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+        const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
         var allowance: local.serverless_query_lake_serving.ServingSource.TranslationAllowance = .{};
         var candidates = (try resolver.selectiveCandidates(a, json, if (self.relocated()) @min(4096, candidate_limit) else candidate_limit, &allowance)) orelse return null;
         defer candidates.deinit();
@@ -2095,7 +2099,7 @@ const Execution = struct {
                 (if (req.index_name) |name| std.mem.eql(u8, declaration.name, name) else indexes == 1 or std.mem.eql(u8, declaration.name, local.common_full_text_index_defaults.default_full_text_index_name))) break declaration;
         } else return null;
         try self.bindIndex(selected.name);
-        var cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
+        var cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.cache_identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
         const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
         defer metadata.release();
@@ -2180,7 +2184,7 @@ const Execution = struct {
         defer if (pack_probe) |probe| probe.deinit();
         const stream_predicate = req.filter_query_json.len != 0 and scoreFrontierEligible(req, if (ordering) |*order| order else null);
         if (stream_predicate and !self.relocated()) {
-            const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+            const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
             pack_probe = pack_probe_mod.create(root, cached, resolver, req.filter_query_json, cancellation) catch |err| switch (err) {
                 error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.QueryCandidateBudgetExceeded => null,
                 else => return err,
@@ -2219,7 +2223,7 @@ const Execution = struct {
             const config = try std.json.parseFromSliceLeaky(std.json.Value, self.arena, root.config_json, .{});
             const field: ?[]const u8 = if (config == .object) if (config.object.get("field")) |value| if (value == .string) value.string else null else null else null;
             const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(self.arena, root.config_json, runtime);
-            var pin = try self.server.lake_recent_text.acquireFamily(@import("lake_recent_text_cache.zig").Cache.key(self.store.identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name, overlay), @import("lake_recent_text_cache.zig").Cache.family(self.store.identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name), overlay, selected.name, analysis, runtime, field, self.context);
+            var pin = try self.server.lake_recent_text.acquireFamily(@import("lake_recent_text_cache.zig").Cache.key(self.store.cache_identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name, overlay), @import("lake_recent_text_cache.zig").Cache.family(self.store.cache_identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name), overlay, selected.name, analysis, runtime, field, self.context);
             errdefer pin.deinit();
             recent = try pin.share(std.heap.page_allocator);
         }
@@ -2928,7 +2932,7 @@ const Execution = struct {
             const identities = self.text_identities.get(@intFromPtr(candidate_pin.?.snapshot)) orelse return error.InvalidNativeLakeTextCorpus;
             var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
             defer live.deinit(a);
-            const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
+            const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.cache_identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
             for (rows) |row| if (try identities.ordinal(a, &live, self.store.artifactStore(), cached, row)) |number| {
                 try numbers.append(a, number);
             };
@@ -2999,7 +3003,7 @@ const Execution = struct {
             return entry;
         }
         try self.runtimes.ensureUnusedCapacity(self.arena, 1);
-        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context, if (self.active_recent) if (self.recent_run) |run| run.cloud_generations else self.recent_cloud else self.cloud_generations);
+        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.cache_identity, self.context, if (self.active_recent) if (self.recent_run) |run| run.cloud_generations else self.recent_cloud else self.cloud_generations);
         errdefer runtime.release();
         const entry = runtime.dense_entry.?;
         try entries.put(self.arena, if (self.active_recent) selected.artifact.artifact_id else selected.name, entry);
@@ -3044,7 +3048,7 @@ const Execution = struct {
     }
     fn prepareVectorMembership(self: *Execution, a: A, req: types.SearchRequest) !void {
         if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return;
-        const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+        const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
         if (req.filter_query_json.len != 0) self.vector_include_provider = try resolver.openMembership(a, req.filter_query_json);
         if (req.exclusion_query_json.len != 0) self.vector_exclude_provider = try resolver.openMembership(a, req.exclusion_query_json);
     }
@@ -3361,7 +3365,7 @@ const Execution = struct {
             return entry;
         }
         try self.runtimes.ensureUnusedCapacity(self.arena, 1);
-        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context, if (self.active_recent) if (self.recent_run) |run| run.cloud_generations else self.recent_cloud else self.cloud_generations);
+        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.cache_identity, self.context, if (self.active_recent) if (self.recent_run) |run| run.cloud_generations else self.recent_cloud else self.cloud_generations);
         errdefer runtime.release();
         const entry = runtime.sparse_entry.?;
         try entries.put(self.arena, if (self.active_recent) selected.artifact.artifact_id else selected.name, entry);
@@ -3448,7 +3452,7 @@ const Execution = struct {
         }
         // Deferred fusion/delivery reopens one exact run at a time. It must not
         // pin every winning partition or alias equal index names across runs.
-        const runtime = try self.server.lake_native_runtimes.acquire(self.server, declaration, try @import("lake_recent_vectors.zig").runtimeDomain(declaration), self.store.identity, self.context, if (run) |value| value.cloud_generations else if (recent) self.recent_cloud else self.cloud_generations);
+        const runtime = try self.server.lake_native_runtimes.acquire(self.server, declaration, try @import("lake_recent_vectors.zig").runtimeDomain(declaration), self.store.cache_identity, self.context, if (run) |value| value.cloud_generations else if (recent) self.recent_cloud else self.cloud_generations);
         return .{ .entry = runtime, .owned = true };
     }
     fn unitPayload(self: *Execution, a: A, key: []const u8) ![]u8 {
@@ -3704,7 +3708,7 @@ const Execution = struct {
                 };
                 var request = self.request;
                 request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled, .check_fn = highlightCheckpoint };
-                const covered = @import("lake_index_sql_rows.zig").gatherCovering(a, self.server, self.table, self.source, request, .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context }, refs, fields) catch |err| switch (err) {
+                const covered = @import("lake_index_sql_rows.zig").gatherCovering(a, self.server, self.table, self.source, request, .{ .artifacts = self.store.artifactStore(), .cache_scope = self.store.cache_identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context }, refs, fields) catch |err| switch (err) {
                     error.SqlMemoryLimitExceeded, error.ArtifactReadBudgetExceeded => null,
                     else => return err,
                 };
@@ -5443,7 +5447,7 @@ test "external lake covering search hydration survives missing Parquet and prese
     {
         const predicates = @import("lake_index_text_predicate.zig");
         const ordered_rows = @import("lake_index_sql_rows.zig");
-        const resolver: predicates.PhysicalResolver = .{ .server = &server, .table = table, .source = &source, .context = .{}, .store = artifacts, .store_identity = store.identity, .read_context = owner.context, .pinned = .{ .artifacts = artifacts, .store_identity = store.identity, .domain = owner.domain, .declarations = owner.declarations, .read_context = owner.context } };
+        const resolver: predicates.PhysicalResolver = .{ .server = &server, .table = table, .source = &source, .context = .{}, .store = artifacts, .cache_scope = store.cache_identity, .read_context = owner.context, .pinned = .{ .artifacts = artifacts, .cache_scope = store.cache_identity, .domain = owner.domain, .declarations = owner.declarations, .read_context = owner.context } };
         var membership: predicates.PhysicalResolver.Membership = .{ .a = a, .resolver = resolver, .arena = .init(a), .json = "{\"amount\":9007199254740993}", .budget = std.math.maxInt(u64) };
         defer membership.deinit();
         // Exercise the tile probe even for this tiny fixture; normal planning

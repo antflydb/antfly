@@ -16,8 +16,12 @@
 """Transient recovery keeps the original construction deadline and admission errors."""
 
 import importlib.util
+import datetime
+import json
+import subprocess
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
     "hackernews_poc", Path(__file__).resolve().parents[1] / "poc.py"
@@ -27,6 +31,53 @@ spec.loader.exec_module(poc)
 
 
 class ConstructionRecoveryTests(unittest.TestCase):
+    def test_gcs_credentials_require_lifetime_and_redact_helper_failures(self):
+        expiry = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+            hours=1
+        )
+        body = json.dumps(
+            {
+                "credential": {
+                    "access_token": "private-token",
+                    "token_expiry": expiry.isoformat(),
+                }
+            }
+        )
+        with patch.object(
+            poc.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, body)
+        ) as run:
+            self.assertEqual(poc.gcs_bearer("dev", 1800), "private-token")
+            self.assertIn("1800s", run.call_args.args[0])
+            self.assertTrue(run.call_args.kwargs["capture_output"])
+        expired = json.dumps(
+            {
+                "credential": {
+                    "access_token": "private-token",
+                    "token_expiry": "2000-01-01T00:00:00Z",
+                }
+            }
+        )
+        with patch.object(
+            poc.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, expired),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "sufficient remaining lifetime"
+            ) as error:
+                poc.gcs_bearer("dev")
+            self.assertNotIn("private-token", str(error.exception))
+        with patch.object(
+            poc.subprocess,
+            "run",
+            side_effect=subprocess.CalledProcessError(
+                1, "gcloud", output="private-token", stderr="secret"
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as error:
+                poc.gcs_bearer("dev")
+            self.assertNotIn("private-token", str(error.exception))
+
     def run_sequence(self, statuses, deadline=10):
         clock = [0]
         observed = {}

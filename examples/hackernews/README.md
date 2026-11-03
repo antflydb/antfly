@@ -991,6 +991,11 @@ or a production latency qualification.
 
 ### Qualification after #1063
 
+For the current matched local/GCS investigation, source-storage settings, tail
+samples and the resumable comparison matrix, see
+[Remote serving performance qualification](../../docs/operations/hackernews/remote-serving-performance.md)
+and [issue #1471](https://github.com/antflydb/antfly/issues/1471).
+
 Rebuild publications with the merged routing/statistics formats before comparing
 against the earlier results. Use `--build-only` first, and run query measurements
 after the qualification compilers finish. Repeat each scenario twice on the same

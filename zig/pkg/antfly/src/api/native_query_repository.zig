@@ -28,6 +28,7 @@ const fs = @import("antfly_runtime_fs").fs_paths;
 const A = std.mem.Allocator;
 const Namespace = local.storage_db_doc_identity_namespace.Namespace;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
+const ChunkCache = local.serverless_query_lake_decoded_cache;
 /// Register discovery before publishing a capability. Even a failed physical
 /// capture must leave its descriptor discoverable after restart or table drop.
 pub fn saveWithCover(a: A, store: *Store, io: std.Io, table: anytype, now: u64, retention_ms: u64, cover: anytype, cancellation: Cancellation) ![]const u8 {
@@ -80,6 +81,19 @@ pub const Repository = struct {
     owned_collection: CollectionState,
     owned_config: ?local.common_config.Config = null,
     owned_base_dir: ?[]u8 = null,
+    // Readers are short-lived, but immutable extents recur across logical cuts.
+    // Keep verified payloads at the repository owner, with bounded residency and
+    // process-accounted allocation. A manifest is still authorized on every open.
+    chunks: ChunkCache.Cache,
+    shared_chunks: ?*ChunkCache.Cache = null,
+    pub fn attachResources(self: *Repository, manager: *local.storage_resource_manager.ResourceManager) void {
+        self.shared_chunks = manager.nativeChunkCache(self.chunks.max_bytes);
+        // Host admission failure disables optional residency, never reads.
+        self.chunks.max_bytes = 0;
+    }
+    fn chunkCache(self: *Repository) *ChunkCache.Cache {
+        return self.shared_chunks orelse &self.chunks;
+    }
     /// The maintenance owner retains this across short-lived provider adapters.
     /// At most one namespace iterator and one tree reaper are open at a time.
     pub const CollectionState = struct {
@@ -160,9 +174,10 @@ pub const Repository = struct {
         return repository;
     }
     pub fn init(a: A, config: ?*const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, deployment: local.common_config.DeploymentMode, base_dir: ?[]const u8) !Repository {
-        return .{ .a = a, .owned_collection = .{ .a = a }, .store = try Store.openNative(a, config, secrets, false, deployment, base_dir), .limits = if (config) |value| .{ .max_cuts = value.lake_indexes.query_cursors.max_native_cuts, .max_bytes = value.lake_indexes.query_cursors.max_native_retained_bytes } else .{} };
+        return .{ .a = a, .owned_collection = .{ .a = a }, .chunks = .{ .a = a, .max_bytes = if (config) |value| @intCast(@min(value.lake_cache.max_memory_bytes / 4, 32 * 1024 * 1024)) else 16 * 1024 * 1024 }, .store = try Store.openNative(a, config, secrets, false, deployment, base_dir), .limits = if (config) |value| .{ .max_cuts = value.lake_indexes.query_cursors.max_native_cuts, .max_bytes = value.lake_indexes.query_cursors.max_native_retained_bytes } else .{} };
     }
     pub fn deinit(self: *Repository) void {
+        self.chunks.deinit();
         self.owned_collection.deinit();
         self.store.deinit();
         if (self.owned_config) |*value| value.deinit();
@@ -477,10 +492,12 @@ pub const Repository = struct {
         const remaining_budget = budget - links.visited;
         const Visitor = struct {
             store: *artifacts.ArtifactStore,
+            repository: *Repository,
             deleted: usize = 0,
             fn visit(raw: *anyopaque, _: artifacts.UploadScope, id: []const u8) !void {
                 const visitor: *@This() = @ptrCast(@alignCast(raw));
                 try visitor.store.delete(id);
+                visitor.repository.chunkCache().discard(visitor.repository.chunkKey(id));
                 visitor.deleted += 1;
             }
         };
@@ -488,7 +505,7 @@ pub const Repository = struct {
         const cut_identity = try @import("native_retained_cut.zig").storeIdentity(self.a, self.store.locator);
         const descriptors = try @import("native_retained_cut.zig").collectBounded(&store, namespace.table_id, cut_identity, now, remaining_budget, cancellation);
         if (descriptors == remaining_budget) return true;
-        var visitor: Visitor = .{ .store = &store, .deleted = descriptors };
+        var visitor: Visitor = .{ .store = &store, .repository = self, .deleted = descriptors };
         store.visitScopedUploads(try self.domain(self.a, namespace), .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_cutoff = now -| 30_000, .max_entries = remaining_budget - descriptors }, cancellation) catch |err| switch (err) {
             error.ArtifactEnumerationPaused => {},
             else => return err,
@@ -589,19 +606,60 @@ pub const Repository = struct {
         // expiry collector reclaim references after their chunk horizon.
         return std.fmt.allocPrint(a, "{s}{s}native-query-generations/{d}/{d}/{d}/{d:0>20}/extent-{s}.json", .{ self.store.opened.prefix, if (self.store.opened.prefix.len == 0) "" else "/", namespace.table_id, namespace.shard_id, namespace.range_id, expires, std.fmt.bytesToHex(&digest, .lower) });
     }
-    fn checkpointExtent(self: *Repository, a: A, namespace: Namespace, digest: [32]u8, expected_domain: [32]u8, expires: u64, source: local.storage_db_native_backup_seal.File, needed_until: u64, cancellation: Cancellation) !?[]const Ref {
+    fn checkpointObject(self: *Repository, key_: []const u8, limit: usize, cancellation: Cancellation) !?objectstore.GetResult {
+        try cancellation.check();
         const bridge: TokenBridge = .{ .token = cancellation };
-        for ([_]u64{ expires, expires +| cache_window_ms, expires -| cache_window_ms }) |epoch| {
+        return self.store.opened.client.getObject(self.store.opened.bucket, key_, .{ .skip_metadata_probe = true, .max_response_bytes = limit, .cancellation = bridge.object() }) catch |err| {
             try cancellation.check();
-            var object = self.store.opened.client.getObject(self.store.opened.bucket, try self.checkpointKey(a, namespace, epoch, digest), .{ .skip_metadata_probe = true, .max_response_bytes = max_manifest_bytes, .cancellation = bridge.object() }) catch |err| {
-                try cancellation.check();
-                switch (err) {
-                    error.ObjectNotFound, error.NotFound, error.FileNotFound, error.NoSuchKey => continue,
-                    else => return err,
-                }
+            return switch (err) {
+                error.ObjectNotFound, error.NotFound, error.FileNotFound, error.NoSuchKey, error.ResponseTooLarge => null,
+                else => err,
             };
+        };
+    }
+    fn checkpointExtent(self: *Repository, a: A, io: std.Io, namespace: Namespace, digest: [32]u8, expected_domain: [32]u8, expires: u64, source: local.storage_db_native_backup_seal.File, needed_until: u64, cancellation: Cancellation) !?[]const Ref {
+        if (source.size > max_generation_bytes) return error.QueryCandidateBudgetExceeded;
+        // An extent descriptor cannot need an unbounded response for a tiny
+        // native control file. Include conservative escaped-path/header space.
+        const limit: usize = @intCast(@min(max_manifest_bytes, 65536 + (source.size / chunk_bytes + 1) * 512));
+        const first = try self.checkpointKey(a, namespace, expires, digest);
+        defer a.free(first);
+        if (try self.checkpointObject(first, limit, cancellation)) |value| {
+            var object = value;
             defer object.deinit(self.store.opened.client.allocator);
-            if (try checkedExtent(a, object.body, expected_domain, epoch, source, true, needed_until)) |refs| return refs;
+            if (try checkedExtent(a, object.body, expected_domain, expires, source, true, needed_until)) |refs| return refs;
+        }
+        // Keep the ordinary positive path at one GET. Only after a miss, look
+        // in adjacent horizons in one bounded wave rather than serial RTTs.
+        const epochs = [_]u64{ expires +| cache_window_ms, expires -| cache_window_ms };
+        var keys: [2][]const u8 = undefined;
+        var initialized: usize = 0;
+        defer for (keys[0..initialized]) |key_| a.free(key_);
+        for (&keys, epochs) |*key_, epoch| {
+            key_.* = try self.checkpointKey(a, namespace, epoch, digest);
+            initialized += 1;
+        }
+        var results: [2]?objectstore.GetResult = @splat(null);
+        defer for (&results) |*result| if (result.*) |*object| object.deinit(self.store.opened.client.allocator);
+        var failures: [2]?anyerror = @splat(null);
+        const Worker = struct {
+            fn run(repository: *Repository, key_: []const u8, maximum: usize, token: Cancellation, result: *?objectstore.GetResult, failure: *?anyerror) void {
+                result.* = repository.checkpointObject(key_, maximum, token) catch |err| {
+                    failure.* = err;
+                    return;
+                };
+            }
+        };
+        var group: std.Io.Group = .init;
+        for (0..2) |i| group.async(io, Worker.run, .{ self, keys[i], limit, cancellation, &results[i], &failures[i] });
+        group.await(io) catch |err| {
+            group.cancel(io);
+            return err;
+        };
+        try cancellation.check();
+        for (epochs, results, failures) |epoch, object, failure| {
+            if (failure) |err| return err;
+            if (object) |value| if (try checkedExtent(a, value.body, expected_domain, epoch, source, true, needed_until)) |refs| return refs;
         }
         return null;
     }
@@ -764,7 +822,7 @@ pub const Repository = struct {
             }
             // Local hints are disposable. A completed remote checkpoint can
             // prove extent coverage after hint loss without uploading it again.
-            if (try self.checkpointExtent(a, namespace, digest, generation_domain, chunk_expiry, file, request.expires_ms, cancellation)) |cached| {
+            if (try self.checkpointExtent(a, io, namespace, digest, generation_domain, chunk_expiry, file, request.expires_ms, cancellation)) |cached| {
                 try files.append(a, .{ .path = file.path, .size = file.size, .chunks = cached });
                 const cached_bytes = try std.json.Stringify.valueAlloc(a, CachedFile{ .domain = generation_domain, .expires_ms = chunk_expiry, .source = file, .chunks = cached }, .{});
                 _ = try local.storage_db_native_backup.writeFileDurable(io, cache_path, cached_bytes);
@@ -873,17 +931,54 @@ pub const Repository = struct {
         try cancellation.check();
         return true;
     }
+    fn chunkKey(self: *Repository, artifact_id: []const u8) [32]u8 {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("native-retained-chunk-v1");
+        hash.update(&self.store.cache_identity);
+        hash.update(artifact_id);
+        var key_: [32]u8 = undefined;
+        hash.final(&key_);
+        return key_;
+    }
     fn readChunk(raw: *anyopaque, a: A, ref: Ref, cancellation: Cancellation) ![]u8 {
         const self: *Repository = @ptrCast(@alignCast(raw));
+        try cancellation.check();
+        // Identity includes the configured credential scope as well as location.
+        // Invalid references cannot alias an already verified cache entry.
+        try artifacts.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
+        if (ref.byte_len == 0 or ref.byte_len > chunk_bytes) return error.CatalogGenerationChanged;
+        const key_ = self.chunkKey(ref.artifact_id);
+        const Cached = struct { bytes: []const u8 };
+        if (self.chunkCache().lookup(key_)) |lease| {
+            defer lease.release();
+            const cached: *const Cached = @ptrCast(@alignCast(lease.item.payload.extension));
+            if (cached.bytes.len != ref.byte_len) return error.CatalogGenerationChanged;
+            try cancellation.check();
+            return a.dupe(u8, cached.bytes);
+        }
         var store = self.store.artifactStore();
         store.allocator = a;
-        return store.getVerifiedAllocWithCancellation(ref.artifact_id, @intCast(ref.byte_len), ref.checksum, cancellation) catch |err| {
+        const bytes = store.getVerifiedAllocWithCancellation(ref.artifact_id, @intCast(ref.byte_len), ref.checksum, cancellation) catch |err| {
             std.log.warn("retained native chunk read failed err={s} bytes={d}", .{ @errorName(err), ref.byte_len });
             return switch (err) {
                 error.NotFound, error.ObjectNotFound, error.FileNotFound, error.ArtifactIntegrityMismatch => error.CatalogGenerationChanged,
                 else => err,
             };
         };
+        errdefer a.free(bytes);
+        try cancellation.check();
+        // Cache admission is optional; denied residency must preserve the normal
+        // verified read. Parallel misses may duplicate I/O but publish one key.
+        if (self.chunkCache().max_bytes != 0) cache: {
+            const lease = self.chunkCache().create(chunk_bytes + 64 * 1024) catch break :cache;
+            defer lease.release();
+            const owned = lease.item.arena.allocator();
+            const cached = owned.create(Cached) catch break :cache;
+            cached.* = .{ .bytes = owned.dupe(u8, bytes) catch break :cache };
+            lease.item.payload = .{ .extension = cached };
+            self.chunkCache().publish(key_, lease);
+        }
+        return bytes;
     }
     /// Rebind a proved unchanged physical generation to a new logical cursor.
     /// Extent horizons must cover the new cursor; never extend them by assertion.
@@ -1020,6 +1115,79 @@ pub const Repository = struct {
         if (std.fs.path.dirname(root)) |parent| try fs.syncDirPortable(io, parent);
     }
 };
+
+test "external lake native residency is node managed and safe after owner teardown" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-query-managed-chunks");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    var manager = local.storage_resource_manager.ResourceManager.init(.{});
+    {
+        defer manager.deinit(a);
+        repository.attachResources(&manager);
+        const cache = repository.shared_chunks.?;
+        try std.testing.expectEqual(cache, manager.nativeChunkCache(16 * 1024 * 1024).?);
+        const lease = try cache.create(8192);
+        const bytes = try lease.item.arena.allocator().dupe(u8, "managed extent");
+        cache.publish(@splat(42), lease);
+        try std.testing.expect(cache.bytes != 0);
+        try std.testing.expectEqual(@as(u64, 0), cache.reclaim(1));
+        try std.testing.expectEqualStrings("managed extent", bytes);
+        lease.release();
+        try std.testing.expect(cache.reclaim(1) != 0);
+        try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+        // The metadata owner and its allocator close with the manager. The
+        // repository closes later and never dereferences the borrowed cache.
+    }
+}
+
+test "external lake native verified chunks survive reader churn with bounded scoped residency" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-query-chunk-cache");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    repository.chunks.max_entries = 1;
+    var store = repository.store.artifactStore();
+    var first = try store.put("first immutable extent");
+    defer first.deinit(a);
+    var second = try store.put("second immutable extent");
+    defer second.deinit(a);
+    const ref: Ref = .{ .artifact_id = first.artifact_id, .checksum = first.checksum, .byte_len = first.byte_len };
+    {
+        const bytes = try Repository.readChunk(&repository, a, ref, .none);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("first immutable extent", bytes);
+    }
+    {
+        const bytes = try Repository.readChunk(&repository, a, ref, .none);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("first immutable extent", bytes);
+        try std.testing.expectEqual(@as(u64, 1), repository.chunks.hits);
+    }
+    var wrong = ref;
+    wrong.checksum = &(@as([64]u8, @splat('0')));
+    try std.testing.expectError(error.InvalidArtifactId, Repository.readChunk(&repository, a, wrong, .none));
+    wrong = ref;
+    wrong.byte_len += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, Repository.readChunk(&repository, a, wrong, .none));
+    const cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, Repository.readChunk(&repository, a, ref, Cancellation.fromAtomic(&cancelled)));
+    {
+        const bytes = try Repository.readChunk(&repository, a, .{ .artifact_id = second.artifact_id, .checksum = second.checksum, .byte_len = second.byte_len }, .none);
+        defer a.free(bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), repository.chunks.entries.count());
+    // Scope is part of the key even when content and physical location match.
+    const previous_hits = repository.chunks.hits;
+    repository.store.cache_identity[0] ^= 1;
+    {
+        const bytes = try Repository.readChunk(&repository, a, ref, .none);
+        defer a.free(bytes);
+    }
+    try std.testing.expectEqual(previous_hits, repository.chunks.hits);
+}
 
 test "external lake native reuse avoids capture and invalidates writes metadata and ranges" {
     const a = std.testing.allocator;
@@ -1381,6 +1549,9 @@ test "external lake native repository reuses immutable extents and collects expi
     const capability = try retained.save(a, &store, identity, io, table, cut.nowMs(), .none);
     defer a.free(capability);
     try store.delete(first_manifest.files[0].chunks[0].artifact_id);
+    // Remove the repository's verified local copy as well: this assertion is
+    // specifically about a reader with neither local bytes nor remote data.
+    repository.chunks.discard(repository.chunkKey(first_manifest.files[0].chunks[0].artifact_id));
     // An uncached reader detects authoritative loss when it reads a page.
     // Open itself only authenticates the manifest and chunk references.
     var lost = (try repository.chunkedCapability().openRead(io, virtual_root, second, namespace, .none)).?;
@@ -1905,4 +2076,49 @@ test "external lake native linked reader releases partial metadata ownership" {
     const path = try std.fs.path.join(std.testing.allocator, &.{ directory.path(), ".lease" });
     defer std.testing.allocator.free(path);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{path});
+}
+
+test "external lake native checkpoint misses overlap adjacent epochs and drain before return" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-checkpoint-miss-wave");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const expires = cut.nowMs() + 2 * cache_window_ms;
+    const digest: [32]u8 = @splat(1);
+    const primary = try repository.checkpointKey(a, namespace, expires, digest);
+    defer a.free(primary);
+    const Fixture = struct {
+        io: std.Io,
+        primary: []const u8,
+        started: std.atomic.Value(usize) = .init(0),
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        fn get(raw: *anyopaque, _: A, _: []const u8, key_: []const u8, _: objectstore.GetOptions) anyerror!objectstore.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, key_, self.primary)) return error.FileNotFound;
+            const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            _ = self.peak.fetchMax(active, .monotonic);
+            _ = self.started.fetchAdd(1, .acq_rel);
+            const deadline = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s;
+            while (self.started.load(.acquire) < 2) {
+                if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.CheckpointLookupsWereSerial;
+                try self.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.FileNotFound;
+        }
+    };
+    var fixture: Fixture = .{ .io = io, .primary = primary };
+    const original = repository.store.opened.client;
+    defer repository.store.opened.client = original;
+    var vtable = original.vtable.*;
+    vtable.get_object = Fixture.get;
+    repository.store.opened.client = .{ .allocator = a, .ptr = &fixture, .vtable = &vtable };
+    try std.testing.expect(try repository.checkpointExtent(a, io, namespace, digest, @splat(2), expires, .{ .path = "control", .size = 32, .inode = 1, .mtime_ns = 0 }, expires - 1, .none) == null);
+    try std.testing.expectEqual(@as(usize, 2), fixture.started.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), fixture.peak.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fixture.active.load(.acquire));
 }

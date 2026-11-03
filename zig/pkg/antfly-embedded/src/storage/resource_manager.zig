@@ -1159,6 +1159,8 @@ pub const ResourceManager = struct {
     dense_read_single_helper: bool = true,
     dense_read_adaptive: bool = false,
     dense_read_profile: bool = false,
+    native_chunks: std.atomic.Value(?*NativeChunks) = .init(null),
+    native_chunks_mutex: std.atomic.Mutex = .unlocked,
     dense_projection_pages: std.atomic.Value(?*ProjectionPageCache.Cache) = .init(null),
     dense_projection_pages_mutex: std.atomic.Mutex = .unlocked,
     dense_read_extra_tasks: std.atomic.Value(u32) = .init(0),
@@ -1268,6 +1270,54 @@ pub const ResourceManager = struct {
 
     pub fn queryEmbeddingCacheBudget(self: *ResourceManager) *cache_budget.CacheBudget {
         return &self.query_embedding_cache_budget;
+    }
+
+    const NativeChunks = struct {
+        const Cache = @import("../serverless/query/lake_decoded_cache.zig").Cache;
+        metadata: Reservation,
+        budget: BudgetedAllocator,
+        cache: Cache,
+        reclaimer: u64 = 0,
+        fn reclaim(ptr: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.cache.reclaim(target);
+        }
+        fn deinit(self: *@This()) void {
+            self.budget.reservation.manager.unregisterReclaimer(self.reclaimer);
+            self.cache.deinit();
+            self.budget.deinit();
+            self.metadata.release();
+            std.heap.page_allocator.destroy(self);
+        }
+    };
+
+    /// Shared retained extents are owned by the node, not a short-lived adapter.
+    /// All allocations participate in host admission and pressure reclamation.
+    pub fn nativeChunkCache(self: *ResourceManager, max_bytes: usize) ?*NativeChunks.Cache {
+        if (max_bytes == 0) return null;
+        if (self.native_chunks.load(.acquire)) |owner| return &owner.cache;
+        if (!self.native_chunks_mutex.tryLock()) return null;
+        defer self.native_chunks_mutex.unlock();
+        if (self.native_chunks.load(.acquire)) |owner| return &owner.cache;
+        var metadata = self.reserveImmediate(.hbc_node_metadata_cache, @sizeOf(NativeChunks)) catch return null;
+        const owner = std.heap.page_allocator.create(NativeChunks) catch {
+            metadata.release();
+            return null;
+        };
+        owner.* = .{
+            .metadata = metadata,
+            .budget = BudgetedAllocator.init(self, .hbc_node_metadata_cache, std.heap.page_allocator, 1),
+            .cache = undefined,
+        };
+        owner.cache = .{ .a = owner.budget.threadSafeAllocator(), .max_bytes = @min(max_bytes, 32 * 1024 * 1024) };
+        owner.reclaimer = self.registerReclaimer(.hbc_node_metadata_cache, owner, NativeChunks.reclaim) catch {
+            owner.budget.deinit();
+            metadata.release();
+            std.heap.page_allocator.destroy(owner);
+            return null;
+        };
+        self.native_chunks.store(owner, .release);
+        return &owner.cache;
     }
 
     pub fn projectionPageCache(self: *ResourceManager) ?*ProjectionPageCache.Cache {
@@ -1888,6 +1938,7 @@ pub const ResourceManager = struct {
         self.dense_checkpoint_ready.assertUnbound();
         self.dense_rerank_admission.assertIdle();
         self.dense_driver_admission.assertIdle();
+        if (self.native_chunks.load(.acquire)) |owner| owner.deinit();
         if (self.dense_projection_pages.load(.acquire)) |cache| cache.deinit();
         if (self.dense_read_extra_tasks.load(.acquire) != 0)
             @panic("resource manager deinitialized with active dense read workers");

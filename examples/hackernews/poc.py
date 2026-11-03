@@ -21,6 +21,7 @@ to configuration, results, or stdout. This does not change cloud IAM or buckets.
 """
 
 import argparse
+import datetime
 import hashlib
 import struct
 import json
@@ -39,6 +40,44 @@ import urllib.request
 import uuid
 
 
+def gcs_bearer(project, minimum_seconds=1800):
+    """Require enough remaining lifetime; never persist helper output/errors."""
+    try:
+        result = subprocess.run(
+            [
+                "gcloud",
+                "config",
+                "config-helper",
+                "--project",
+                project,
+                "--min-expiry",
+                str(minimum_seconds) + "s",
+                "--format=json",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        credential = json.loads(result.stdout)["credential"]
+        expiry = datetime.datetime.fromisoformat(credential["token_expiry"])
+        remaining = (
+            expiry - datetime.datetime.now(datetime.timezone.utc)
+        ).total_seconds()
+        token = credential["access_token"]
+        if (
+            not isinstance(token, str)
+            or not token
+            or len(token) > 65536
+            or remaining < minimum_seconds
+        ):
+            raise ValueError("Insufficient token lifetime")
+        return token
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError, TypeError):
+        raise RuntimeError(
+            "Unable to acquire a GCS token with sufficient remaining lifetime"
+        ) from None
+
+
 def parse_lake_metrics(text):
     """Retain aggregate query phases without arbitrary metric label values."""
     phases = {"total", "publication", "search", "hydration", "delivery"}
@@ -49,13 +88,33 @@ def parse_lake_metrics(text):
     result = {}
     for line in text.splitlines():
         fields = line.split()
-        if len(fields) != 2 or not fields[0].startswith("antfly_lake_"):
+        if len(fields) != 2 or not fields[0].startswith(
+            ("antfly_lake_", "antfly_objectstore_")
+        ):
             continue
         key = fields[0]
         if "{" in key and key not in phase_keys:
             continue
         result[key] = int(fields[1])
     return result
+
+
+def process_cpu_seconds(text):
+    """Parse ps TIME (optional days/hours, otherwise minutes:seconds)."""
+    value = text.strip()
+    days = 0
+    if "-" in value:
+        day, value = value.split("-", 1)
+        days = int(day)
+    parts = [float(part) for part in value.split(":")]
+    if len(parts) not in (2, 3) or any(
+        not math.isfinite(part) or part < 0 for part in parts
+    ):
+        raise ValueError("Invalid process CPU time")
+    clock = 0
+    for part in parts:
+        clock = clock * 60 + part
+    return days * 86400 + clock
 
 
 def lake_metric_deltas(before, after):
@@ -437,6 +496,11 @@ def main():
         help="Skip pre-query metric-refresh sleeps for the first archive query",
     )
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument(
+        "--diagnose-warm",
+        action="store_true",
+        help="Collect serial metrics around every warm query; adds idle intervals and changes the timing scenario",
+    )
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--workload-terms", nargs="+", default=[])
     parser.add_argument("--query-term", default="database")
@@ -466,7 +530,12 @@ def main():
         default=1000,
         help="Bounded recent-row sample copied into a native table for composition benchmarks",
     )
-    parser.add_argument("--store-source", action="store_true")
+    parser.add_argument(
+        "--store-source",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable stored source for serving comparisons; --no-store-source explicitly qualifies remote Parquet hydration",
+    )
     parser.add_argument(
         "--cursor-term", help="Separate broad query for deep cursor coverage"
     )
@@ -518,12 +587,10 @@ def main():
         if not token or len(token) > 65536:
             raise ValueError("Expected a bounded bearer token on stdin")
     else:
-        token = subprocess.run(
-            ["gcloud", "auth", "print-access-token", "--project", args.project],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
+        # Begin with nearly a full token lifetime. Besides bounding this run,
+        # this permits matched measurements of older engines whose publication
+        # signatures incorrectly depended on the literal bearer token.
+        token = gcs_bearer(args.project, 3300)
     local_source_root = (
         prepare_filesystem_source(args.filesystem_source, args.state)
         if args.filesystem_source
@@ -594,8 +661,13 @@ def main():
     startup_samples_ms = []
 
     def start():
+        nonlocal process, log, container, token
+        if not args.filesystem_source and not args.bearer_stdin:
+            token = gcs_bearer(
+                args.project, min(3300, max(1800, args.build_timeout + 600))
+            )
+            env["HN_GCS_BEARER"] = token
         startup_started = time.monotonic()
-        nonlocal process, log, container
         log = (args.state / "server.log").open("a")
         command = [
             str(Path(args.binary).resolve()),
@@ -732,6 +804,17 @@ def main():
     def resource_counters():
         # Linux counters help separate CPU work from remote transfer. Network
         # counters cover non-loopback interfaces, including TLS/DNS overhead.
+        if args.diagnose_warm and sys.platform == "darwin" and not args.docker:
+            try:
+                sample = subprocess.run(
+                    ["ps", "-o", "time=", "-p", str(process.pid)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return {"child_cpu_seconds": process_cpu_seconds(sample.stdout)}
+            except (subprocess.SubprocessError, OSError, ValueError):
+                return None
         if args.docker or not Path("/proc/net/dev").exists():
             return None
         counters = {"network_rx_bytes": 0, "network_tx_bytes": 0}
@@ -764,6 +847,10 @@ def main():
             "cursor_initial",
             "cursor_depth_restart",
         } or phase.startswith("composed_cold.")
+        if args.diagnose_warm and (
+            phase == "warm" or phase.startswith("composed_warm.")
+        ):
+            serial_profile = True
         if args.immediate_first_query and phase == "cold":
             serial_profile = False
         metrics_before = lake_metrics() if serial_profile else None
@@ -1375,6 +1462,12 @@ def main():
             "cold_cache_cleared_after_publication": args.cold_cache,
             "first_query_without_metric_refresh_delay": args.immediate_first_query,
             "process_memory_budget_mb": args.process_memory_budget_mb,
+            "diagnose_warm": args.diagnose_warm,
+            "credential_mode": "filesystem"
+            if args.filesystem_source
+            else "supplied_bearer"
+            if args.bearer_stdin
+            else "gcloud_min_expiry",
             "navigation_warming_enabled": not args.disable_navigation_warming,
             "startup_samples_ms": startup_samples_ms,
             "engine_child_peak_rss_bytes": engine_peak_rss_bytes,
