@@ -134,10 +134,11 @@ class ConstructionRecoveryTests(unittest.TestCase):
             "NameServerFailure",
         ):
             failed = {"status": {"readiness": {"state": "failed"}, "error": reason}}
+            pending = {"status": {"readiness": {"state": "pending"}, "error": reason}}
             ready = {"status": {"readiness": {"queryable": True}}}
-            result, observed, _ = self.run_sequence([failed, ready])
+            result, observed, _ = self.run_sequence([failed, pending, ready])
             self.assertEqual(result, ready)
-            self.assertEqual(observed["transient_failures"][reason]["observations"], 1)
+            self.assertEqual(observed["transient_failures"][reason]["observations"], 2)
             with self.assertRaisesRegex(RuntimeError, "build deadline"):
                 self.run_sequence([failed], deadline=3)
 

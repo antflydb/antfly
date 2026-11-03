@@ -258,26 +258,29 @@ def wait_for_index(
             )
         if readiness.get("queryable"):
             return status
-        if readiness.get("state") == "failed":
-            code = detail.get("error")
-            # Older engines label these coordinator-retryable failures failed.
-            # Wait for fenced recovery; never replay the underlying HTTP write.
-            if code not in {
-                "Timeout",
-                "DeadlineExceeded",
-                "Canceled",
-                "Cancelled",
-                "TlsTransportReadFailed",
-                "NameServerFailure",
-                "ConnectionReset",
-                "ConnectionResetByPeer",
-                "ConnectionAborted",
-                "ConnectionClosed",
-                "ConnectionTimeout",
-                "ConnectionTimedOut",
-                "BrokenPipe",
-            }:
-                raise RuntimeError("Index construction failed: " + json.dumps(status))
+        code = detail.get("error")
+        # Older engines label these coordinator-retryable failures failed.
+        # Wait for fenced recovery; never replay the underlying HTTP write.
+        retryable = code in {
+            "Timeout",
+            "DeadlineExceeded",
+            "Canceled",
+            "Cancelled",
+            "TlsTransportReadFailed",
+            "NameServerFailure",
+            "ConnectionReset",
+            "ConnectionResetByPeer",
+            "ConnectionAborted",
+            "ConnectionClosed",
+            "ConnectionTimeout",
+            "ConnectionTimedOut",
+            "BrokenPipe",
+        }
+        if readiness.get("state") == "failed" and not retryable:
+            raise RuntimeError("Index construction failed: " + json.dumps(status))
+        if retryable and readiness.get("state") in {"failed", "pending"}:
+            # Preserve diagnostics from corrected engines too, where pending
+            # status accurately reports recovery instead of terminating it.
             elapsed = round(now() - started, 2)
             failure = failures.setdefault(
                 code,
