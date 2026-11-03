@@ -156,11 +156,17 @@ pub const PageStore = struct {
         return (artifacts.UploadScope{ .domain = domain, .attempt = ref.attempt }).artifactId(&std.fmt.bytesToHex(&ref.artifactDigest(), .lower));
     }
 
+    fn resetStreamingReadBudget(self: *PageStore, page_count: usize) void {
+        // Admit one bounded page/wave before dispatching through any backend
+        // or cache capability. Ordinary query stores keep cumulative budgets.
+        if (self.streaming) self.remaining_read_bytes.* = @as(u64, tree.max_page_bytes) * page_count;
+    }
+
     fn get(ptr: *anyopaque, alloc: std.mem.Allocator, ref: tree.Ref) ![]u8 {
         const self: *PageStore = @ptrCast(@alignCast(ptr));
         try ref.validate();
         const id = try identity(self.domain, ref);
-        if (self.streaming) self.remaining_read_bytes.* = tree.max_page_bytes;
+        self.resetStreamingReadBudget(1);
         if (self.read_phase) |phase| try phase.begin(phase.ptr, 1);
         var guard: artifacts.IoGuard = .{ .phase = self.read_phase };
         defer guard.abort();
@@ -221,19 +227,22 @@ pub const PageStore = struct {
             return tree.readNavigationPage(a, plain, ref);
         }
         const cache = self.read_cache.?;
+        self.resetStreamingReadBudget(1);
         return cache.decoded_read.?(cache.ptr, a, self.artifacts, self.domain, ref, self.cancellation, self.remaining_read_bytes);
     }
 
     fn readMany(raw: *anyopaque, a: std.mem.Allocator, refs_: []const tree.Ref, output: []tree.NavigationPage) !void {
         const self: *PageStore = @ptrCast(@alignCast(raw));
         if (refs_.len != output.len or refs_.len > tree.max_read_batch) return error.InvalidGraphPage;
-        if (self.read_phase != null) return self.readCoalesced(a, refs_, output);
-        if (self.read_cache) |cache| if (cache.decoded_many) |many| return many(cache.ptr, a, self.artifacts, self.domain, refs_, output, self.cancellation, self.remaining_read_bytes);
         var bytes: u64 = 0;
         for (refs_) |ref| {
             try ref.validate();
             bytes += ref.bytes;
         }
+        try self.cancellation.check();
+        self.resetStreamingReadBudget(refs_.len);
+        if (self.read_phase != null) return self.readCoalesced(a, refs_, output);
+        if (self.read_cache) |cache| if (cache.decoded_many) |many| return many(cache.ptr, a, self.artifacts, self.domain, refs_, output, self.cancellation, self.remaining_read_bytes);
         if (self.read_cache) |cache| if (cache.read_many) |many| {
             const scheduler = @import("antfly_local_sources").sql_parallel_scheduler.global();
             const reservation = @min(24 * 1024 * 1024, @as(usize, @intCast(bytes)) * 3 + refs_.len * 32 * 1024 + 256 * 1024);
@@ -340,7 +349,6 @@ pub const PageStore = struct {
             }
             owners[index] = count - 1;
         }
-        if (self.streaming) self.remaining_read_bytes.* = @as(u64, tree.max_page_bytes) * refs_.len;
         try artifacts.chargeReadBudget(self.remaining_read_bytes, bytes);
         defer for (jobs[0..count]) |job| if (job.bytes) |data| a.free(data);
         if (self.read_phase) |_| {

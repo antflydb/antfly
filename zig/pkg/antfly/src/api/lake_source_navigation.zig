@@ -406,7 +406,7 @@ pub const Batch = struct {
                 return std.mem.order(u8, l.key, r.key) == .lt;
             }
         }.less);
-        root.* = try tree.apply(self.arena.allocator(), storage, root.*, self.changes.items);
+        root.* = try tree.applyPacked(self.arena.allocator(), storage, root.*, self.changes.items);
         _ = self.arena.reset(.retain_capacity);
         self.changes = .empty;
     }
@@ -442,6 +442,7 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
     var reads: u64 = tree.max_page_bytes;
     var writes: u64 = tree.max_page_bytes;
     var pages: pages_mod.PageStore = .{ .domain = root.domain, .attempt = store.upload_scope.?.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    pages.admitPublication();
     var file_storage = pages.store();
     file_storage.reduce = reduceFiles;
     if (data) |digest| root.delete_proof = try publishDeleteProof(a, pages.store(), provider, digest);
@@ -742,6 +743,7 @@ pub const CostingBuilder = struct {
     checkpoint: ?struct { ptr: *anyopaque, save: *const fn (*anyopaque, Ref) anyerror!void } = null,
     fn storage(self: *@This(), pages: *pages_mod.PageStore) tree.Store {
         pages.* = .{ .domain = self.root.domain, .attempt = self.store.upload_scope.?.attempt, .artifacts = self.store, .cancellation = self.token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .streaming = true };
+        pages.admitPublication();
         var result = pages.store();
         result.reduce = reduce;
         return result;
@@ -965,56 +967,28 @@ pub const Resolver = struct {
         return owned;
     }
     fn storage(self: *@This()) tree.Store {
-        self.pages = .{ .domain = self.root.domain, .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .read_cache = .{ .ptr = self, .read = readPage } };
+        self.pages = .{ .domain = self.root.domain, .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .read_cache = @import("lake_index_navigation_pages.zig").cacheBinding(&self.cached) };
         if (self.page_cache == null) self.page_cache = .{ .alloc = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .underlying = self.pages.store(), .max_bytes = self.page_cache_limit };
         return self.page_cache.?.store();
     }
-    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, length: usize, page_digest: [32]u8, token: Token, budget: *u64) ![]u8 {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        try self.cached.context.ensureActive();
-        try stores.chargeReadBudget(budget, length);
-        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, page_digest, token, self.cached);
-    }
+
     fn point(self: *@This(), a: A, root: ?tree.Ref, id: []const u8) !?[]u8 {
         var ref = root orelse return null;
         var lower: ?[32]u8 = null;
         var upper: ?[32]u8 = null;
-        const Loader = struct {
-            owner: *Resolver,
-            ref: tree.Ref,
-            fn decode(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
-                const self_: *@This() = @ptrCast(@alignCast(raw));
-                const owned = item.arena.allocator();
-                const page = try owned.create(tree.NavigationPage);
-                page.* = try tree.readNavigationPage(owned, self_.owner.storage(), self_.ref);
-                for (page.entries, 0..) |_, i| if (page.key(i).len() != 32) return error.InvalidNativeLakeFileState;
-                item.payload = .{ .extension = page };
-            }
-        };
-        const Check = struct {
-            owner: *Resolver,
-            fn check(raw: *anyopaque) !void {
-                const self_: *@This() = @ptrCast(@alignCast(raw));
-                try self_.owner.token.check();
-                try self_.owner.cached.context.ensureActive();
-            }
-        };
-        var check: Check = .{ .owner = self };
-        var context = self.cached.context;
-        context.checkpoint = .{ .ptr = &check, .check = Check.check };
+        const reader: @import("lake_index_navigation_pages.zig").Reader = .{ .store = self.store, .domain = self.root.domain, .cached = self.cached, .token = self.token };
         while (true) {
-            try context.ensureActive();
-            const cache_key = @import("lake_wal_image.zig").digest(.{ .format = "decoded-file-navigation-page-v1", .scope = self.cached.scope, .domain = self.root.domain, .ref = ref });
-            var loader: Loader = .{ .owner = self, .ref = ref };
-            const lease = self.cached.cache.decoded.acquire(cache_key, @min(64 * 1024 * 1024, @as(usize, ref.bytes) * 16 + 65536), context, .{ .ptr = &loader, .load = Loader.decode }) catch |err| switch (err) {
-                // Caching is optional under memory pressure. The ordinary
-                // authenticated cursor retains the same complete point lookup.
-                error.OutOfMemory, error.SqlMemoryLimitExceeded => return lookup(a, self.storage(), root, id),
-                else => return err,
+            try self.token.check();
+            try self.cached.context.ensureActive();
+            var page = (try reader.lookup(ref)) orelse cold: {
+                try stores.chargeReadBudget(&self.reads, ref.bytes);
+                break :cold reader.read(a, ref, null) catch |err| switch (err) {
+                    error.OutOfMemory, error.SqlMemoryLimitExceeded => return lookup(a, self.storage(), root, id),
+                    else => return err,
+                };
             };
-            defer lease.release();
-            try context.ensureActive();
-            const page: *const tree.NavigationPage = @ptrCast(@alignCast(lease.item.payload.extension));
+            defer page.deinit(a);
+            for (page.entries, 0..) |_, i| if (page.key(i).len() != 32) return error.InvalidNativeLakeFileState;
             if (lower) |first| if (page.key(0).order(tree.KeyView.from(&first)) != .eq) return error.InvalidNativeLakeFileState;
             if (upper) |last| if (page.key(page.entries.len - 1).order(tree.KeyView.from(&last)) != .lt) return error.InvalidNativeLakeFileState;
             var lo: usize = 0;
@@ -1189,6 +1163,22 @@ fn navigationRefreshScenario(identity_version: u8) !void {
     const first = try buildProven(a, ca, &store, &provider, null, .none, @splat(9));
     defer first.deinit();
     const old = try load(ca, store, first.ref, .none, null);
+    {
+        // A multi-page census packs sibling pages without changing their
+        // authenticated identities or requiring a new reader protocol.
+        var reads: u64 = 4 * 1024 * 1024;
+        var writes: u64 = 0;
+        var pages: pages_mod.PageStore = .{ .domain = old.domain, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        var page = try tree.readNavigationPage(a, pages.store(), old.files.?);
+        defer page.deinit(a);
+        try std.testing.expect(old.files.?.height > 0);
+        var has_pack = false;
+        for (page.entries) |entry| if (entry.child) |child| {
+            has_pack = has_pack or child.pack != null;
+        };
+        try std.testing.expect(has_pack);
+    }
+
     const descriptor = try encodeInventory(a, &provider, old);
     defer a.free(descriptor);
     try std.testing.expect(descriptor.len < 8192);
@@ -1367,7 +1357,7 @@ test "external lake metadata navigation durable delete selectors validate only r
         a.free(selector.etag);
         a.free(selector.version);
     }
-    try std.testing.expect(cache.decoded.hits > 0);
+    try std.testing.expect(cache.navigation.hits > 0);
     const before = provider_storage.stats;
     const version = try deleteVersion(a, store, root, 0, deletes[0], .none, .{});
     defer {
