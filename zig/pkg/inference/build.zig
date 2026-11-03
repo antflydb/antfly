@@ -1598,6 +1598,20 @@ pub fn build(b: *std.Build) void {
     // Tests
     const suite = workflows_tests.create(workflow_ctx);
     const tests = suite.tests;
+    const memory_admission_root = b.createModule(.{
+        .root_source_file = b.path("src/test_memory_admission.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    var memory_admission_imports = tests.root_module.import_table.iterator();
+    while (memory_admission_imports.next()) |entry| memory_admission_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    memory_admission_root.link_libc = true;
+    const memory_admission_tests = b.addTest(.{
+        .root_module = memory_admission_root,
+        .filters = &.{"admission"},
+        .test_runner = .{ .path = b.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    b.step("test-memory-admission", "Run memory-policy, contention and recovery contracts without server discovery").dependOn(&b.addRunArtifact(memory_admission_tests).step);
     b.step("test-embeddinggemma2", "Run the filtered inference suite for EmbeddingGemma 2 qualification").dependOn(&suite.run_tests.step);
     b.step("install-embeddinggemma2-tests", "Install the filtered EmbeddingGemma2 suite for execution on another host").dependOn(&b.addInstallArtifact(tests, .{ .dest_sub_path = "embeddinggemma2-tests" }).step);
     const video_model_root = b.createModule(.{ .root_source_file = b.path("src/inference_internal.zig"), .target = target, .optimize = optimize });

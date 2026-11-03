@@ -239,6 +239,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const functions_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "decision functions", "function bindings", "decision provider", "provider quotas" } });
     b.step("functions-test", "Run provider and expression decision function contracts").dependOn(&b.addRunArtifact(functions_tests).step);
 
+    const admission_api_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/admission_api_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, admission_api_root, true, true);
+    const admission_api_tests = b.addTest(.{
+        .root_module = admission_api_root,
+        .filters = &.{
+            "public table create index preserves permanent inference budget",
+            "public artifact enrichment preserves permanent inference budget",
+            "public table query returns hierarchy validation pointers",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("admission-api-test", "Run public admission failure and hierarchy validation contracts without a linked inference kernel").dependOn(&addFilteredTestRunArtifact(b, admission_api_tests).step);
+
     // Parser/worker projection contracts need no HTTP server or linked kernel.
     // Reuse the lean source-discovery root so this boundary remains affordable
     // to check independently of the full API runtime harness.

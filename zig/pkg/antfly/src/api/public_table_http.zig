@@ -6830,6 +6830,7 @@ test "public table create index preserves permanent inference budget identity" {
 }
 
 test "public table query returns hierarchy validation pointers without leaking between requests" {
+    @import("antfly_test_error_logs").expectErrorLogs(2);
     const Backend = struct {
         fn query(_: *anyopaque, a: std.mem.Allocator, table: []const u8, body: []const u8, _: ?[]const u8, _: operation.RequestContext) TableApi.ExecuteQueryError![]u8 {
             var parsed = query_contract.parseQueryRequest(a, null, table, body) catch return error.InvalidQueryRequest;
