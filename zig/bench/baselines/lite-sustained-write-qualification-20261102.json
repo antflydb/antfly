@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Not qualified: current-main Debug integration, unchanged fourth-input importer, primary/integrity and active replay/backfill gates pass. Component integration, aggregate CI and final-host optimized qualification remain pending.",
+  "status": "Not qualified: known Debug failures fixed; current-main correctness, SDK/model/ABI, active replay/backfill, unchanged fourth-input primary/integrity/semantic verification and embedded Beads component smoke pass. Final-host optimized qualification, full factory and aggregate CI remain.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -946,14 +946,13 @@
     "final_file_bytes": 22945792
   },
   "pending": [
-    "Fix full original-importer replay-capacity failures; repeat all 15 inputs and normalized semantic comparison plus drained/compacted payload accounting",
+    "Repeat all 15 unchanged frozen inputs with normalized logical-key/field comparison and settled/compacted accounting",
     "Original unchanged-importer three-writer/one-reader contention and primary/integrity checks",
-    "Matched Debug and optimized short churn/append comparisons",
+    "Matched final-host optimized short churn and append comparisons against current-main control",
     "Multi-GB retained-file warm batch/SQL cost comparisons",
     "Human-triggered repository aggregate CI",
-    "Factory harness located in Beads antfly/integration; historical remote trial is not embedded factory qualification, and its pinned binary needs rebuilding",
-    "Repeat ten-minute constant/changing-word active-write soaks on the final follow-up runtime",
-    "Finish broad correctness gates for the final follow-up runtime"
+    "Full factory session/housekeeping soak; fresh embedded Beads/Gas City component smoke now passes",
+    "Final-host ten-minute constant/changing-word active-write/storage soaks on frozen runtime 806695b4fb"
   ],
   "final_host": {
     "environment": {
@@ -4411,9 +4410,10 @@
         "environment": "Metal access required; initial sandbox denial rerun with host Metal access."
       },
       "reporting_tests": {
-        "passed": 26,
+        "passed": 33,
         "failed": 0,
-        "skipped": 0
+        "skipped": 0,
+        "includes_logical_projection": 7
       },
       "active_resolver": [
         {
@@ -4540,14 +4540,45 @@
           "integrity": true,
           "seconds": 160.85218412498944,
           "scope": "Primary rows and integrity; indexed visibility and settled field hashes are separate final-host gates. Stats.doc_count reports visible index documents and can lag primary rows."
+        },
+        "semantic_comparison": {
+          "passed": true,
+          "reference_library_sha256": "55d9ca75d7457611efa2ca4ed0421cf69c06c26ebfa3cd3ebef54034fa1b4cfc",
+          "scope": "Same rebound input/seed as prior successful Debug candidate. Four tables with different raw storage row hashes match exactly by declared SQL keys and every field; remaining 41 primary table hashes already match.",
+          "logical_field_tables": 4,
+          "logical_field_rows": 22894,
+          "history_projection_rows": 4,
+          "missing_logical_keys": 0,
+          "duplicate_logical_keys": 0,
+          "changed_fields": 0
         }
       },
-      "component_integration": "Canonical pinned Bazel build passed; fresh embedded smoke running.",
-      "optimized_build": "Stopped. No optimized build of these source changes has started.",
+      "component_integration": {
+        "status": "passed",
+        "scope": "Fresh disposable embedded Beads CLI smoke and Gas City provider integration, not full factory session/housekeeping soak.",
+        "beads_commit": "e8d6fc11a1bef9bfb5fb640e2c1ecfcbf9d5eca9",
+        "bazel_version": "9.3.0",
+        "binary_sha256": "6177be8fee1e1cbb9b5ec024248cc344d37a2fd38b66c46962e5993263915f92",
+        "script_sha256": "d09775ebb67d7373568671269a6d68c85724dbe57ab770d70bd9fe4ebc4af33a",
+        "command": "scripts/antfly-smoke.py --bd bazel-bin/cmd/bd/bd_/bd --library <fair-backfill-debug-library> --timeout 300",
+        "checks": [
+          "native issue storage",
+          "competing claims",
+          "branch merge and idempotent retry",
+          "three-way conflicts",
+          "native memory",
+          "knowledge replay and invalid-configuration recovery",
+          "forgetting",
+          "cited context",
+          "evaluation",
+          "Gas City provider lifecycle and scoping"
+        ]
+      },
+      "optimized_build": "Runtime frozen at 806695b4fb after known Debug failures and component gates pass. Final host build has not started.",
       "remaining": [
-        "Final-host original-importer normalized field comparisons and contention",
-        "Fresh embedded component smoke; full factory remains a separate gate",
-        "Final-host matched ReleaseFast comparisons, importer contention and ten-minute active-write/storage qualification",
+        "Final-host matched original-importer normalized-field comparisons and contention",
+        "Final-host matched ReleaseFast active-write/storage/append/large-database measurements and two ten-minute soaks",
+        "Full factory session/housekeeping qualification; component smoke passed",
         "Human-triggered aggregate CI"
       ],
       "grouped_copy": [
@@ -4576,7 +4607,8 @@
           "verification_seconds": 102.34649487503339,
           "busy_responses": 0
         }
-      ]
+      ],
+      "source_runtime_commit": "806695b4fbeb391aad4c9fb6dd4d6c2d016d212d"
     },
     "recursive_text_size_attribution": {
       "qualification": false,
@@ -4592,6 +4624,29 @@
       "repeated_large_occurrences": 453,
       "repeated_large_bytes": 8210614,
       "scope": "All recursive primary JSON strings, not actual index-binding/analyzer input attribution. No private values or digests retained in the report. Exact duplicates alone do not establish analyzer work as the dominant fix."
+    },
+    "qualification_identity_followup": {
+      "problem": "Generated SQL storage row IDs differ across equivalent importer runs. Hashing raw IDs produces false cross-run content differences.",
+      "change": "Compare by declared SQL primary-key tuples, reject duplicate/missing/null keys, hash every present field, and sort logical identities independently of storage iteration order. Only existing explicitly bounded clock/path normalization remains.",
+      "helper": "scripts/bench/lite_logical_projection.py",
+      "regressions": {
+        "passed": 7,
+        "checks": [
+          "row and JSON object order",
+          "nested payload changes",
+          "missing and replaced rows",
+          "compound key boundaries",
+          "absent versus null fields",
+          "invalid or duplicate keys",
+          "no private values in reports"
+        ]
+      },
+      "final_controller": "Cross-version logical-key and field comparisons now fail the full-import/concurrency phase on mismatch; previously it only produced field reports.",
+      "controller_rejection_probes_passed": 4,
+      "final_host_script_sha256": {
+        "qualify_projection_fields.py": "68414e1d289b12f306d8abe2226d7ed8bc5a9994b7878a1079aa0868c31b0607",
+        "longterm_final_qualification.py": "fbf580c0f8356dcacc2844a43da5a641b6857c6aa92958e2c64a126050f780a6"
+      }
     }
   },
   "runtime_commit_scope": "Top-level runtime/base commits identify historical optimized qualification only; newer Debug candidates and immutable artifact hashes are recorded under valid_snapshot_local_diagnosis."

@@ -1307,9 +1307,7 @@ record; it does not split ownership-completion callbacks. Slow or failed windows
 quantum is a sizing target, not preemption of an individual record/provider call.
 Background and foreground retirement work remains capped per publication. Pending
 work diagnostics report producer and consumer replay budgets and the current
-retirement-work limit. Producer sizing charges the complete producer turn,
-including output publication, so repeated expensive publications reduce the next
-discovery window. Each complete document group remains atomic.
+retirement-work limit. Each complete document group remains atomic.
 Explicit integrity reports split logical bytes among documents, control documents,
 metadata catalogs, and index artifacts; allocator checks independently load disk
 state rather than using a writer's transient traversal inventory. Document bytes
@@ -1612,6 +1610,13 @@ the source binding without its authority at the destination; page reuse is then
 conservatively refused. Such a fixture measures that fallback and cannot isolate
 normal replay/reclamation performance. Record the seed hash, snapshot-library
 hash and destination snapshot report separately from measured import time.
+
+Cross-run SQL payload comparisons use declared SQL primary keys rather than
+generated storage row IDs. `scripts/bench/lite_logical_projection.py` hashes
+every present field under that logical identity, independently of scan order,
+and rejects duplicate, missing or null keys. Fixture-specific clock/path
+normalization must remain explicit in the caller. Missing fields and explicit
+nulls remain distinct; reports retain hashes rather than private fixture values.
 
 Sustained-write qualification must measure progress and storage while writers
 remain active. `scripts/bench/lite_contention.py native --require-sustained`
