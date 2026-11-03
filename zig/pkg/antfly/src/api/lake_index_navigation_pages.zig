@@ -145,9 +145,17 @@ pub const Reader = struct {
         var context = self.cached.context;
         context.checkpoint = .{ .ptr = &check_, .check = Check.active };
         const held = self.cached.cache.navigation.acquire(self.key(ref), tree.readWorkspace(ref) * 2, context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
-            if (err != error.SqlMemoryLimitExceeded) return err;
+            if (err != error.OutOfMemory and err != error.SqlMemoryLimitExceeded) return err;
+            // Flights, cache items and their payloads are optional residency.
+            // The request may already own enough workspace for a required read
+            // even when the cache's backing allocator cannot grow. Decode
+            // directly without re-entering admission or charging its caller's
+            // read allowance a second time.
             try self.check();
-            return tree.decodeNavigationPage(a, self.domain, ref, try loader.bytes(a));
+            var decoded = try tree.decodeNavigationPage(a, self.domain, ref, try loader.bytes(a));
+            errdefer decoded.deinit(a);
+            try self.check();
+            return decoded;
         };
         errdefer held.release();
         try self.check();
@@ -214,6 +222,58 @@ pub const Reader = struct {
         }
     }
 };
+
+test "external lake navigation cache allocation failures preserve required reads and budgets" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("navigation-admission-fallback");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const scope = try stores.UploadScope.forPublication(@splat(5), 1, std.testing.io);
+    store.upload_scope = scope;
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes = reads;
+    var storage: pages.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var builder: tree.SortedBuilder = .{ .alloc = a, .store = storage.store() };
+    defer builder.deinit();
+    try builder.add("key", "value");
+    const ref = (try builder.finish()).?;
+    // Fail flight creation, flight-map growth, item creation and payload
+    // allocation independently; request and backend allocations remain healthy.
+    for (0..4) |failure_index| {
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = failure_index });
+        cache.navigation.a = failing.allocator();
+        const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(9), .context = .{ .io = std.testing.io } };
+        storage.read_cache = cacheBinding(&cached);
+        reads = ref.bytes;
+        var actual = try tree.readNavigationPage(a, storage.store(), ref);
+        defer actual.deinit(a);
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expect(actual.lease == null);
+        try std.testing.expectEqualStrings("value", actual.entries[0].value);
+        try std.testing.expectEqual(@as(u64, 0), reads);
+        // The batched binding must also preserve its single range charge.
+        reads = ref.bytes;
+        const batch = storage.store().read_many.?;
+        var output: [1]tree.NavigationPage = undefined;
+        try batch.read(batch.ptr, a, &.{ref}, &output);
+        defer output[0].deinit(a);
+        try std.testing.expectEqualStrings("value", output[0].entries[0].value);
+        try std.testing.expectEqual(@as(u64, 0), reads);
+        const cancelled = std.atomic.Value(bool).init(true);
+        var reader: Reader = .{ .store = store, .domain = scope.domain, .cached = cached, .token = Token.fromAtomic(&cancelled) };
+        try std.testing.expectError(error.Canceled, reader.read(a, ref, null));
+        reader.token = .none;
+        reader.cached.context.deadline_ns = @import("antfly_platform").time.monotonicNs() -| 1;
+        try std.testing.expectError(error.DeadlineExceeded, reader.read(a, ref, null));
+        reader.cached.context.deadline_ns = null;
+        var request_failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, reader.read(request_failure.allocator(), ref, null));
+    }
+}
 
 test "external lake shared navigation leases reuse decoded pages and preserve authority budgets and shapes" {
     const a = std.testing.allocator;

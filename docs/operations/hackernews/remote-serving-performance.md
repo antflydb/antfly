@@ -448,3 +448,12 @@ qualification project/bucket; no export, VM or hosted deployment was launched.
 The harness retains complete warm sample histories in its qualification reports;
 the tables above summarize them. Same-region Cloud, archive-scale capacity and credential-lifetime
 qualification remain outstanding, alongside the unexplained outliers.
+
+A subsequent review fix makes navigation-cache allocation failure fall back to
+request-owned authenticated decoding. Denied flight, item or payload allocation
+must not fail a required read when its request still has workspace. Single and
+batched reads preserve their original budget charge, cancellation and deadline
+checks; failures of required request allocations still propagate. Nine focused
+Debug navigation, warming, source-resolution and text-directory tests pass
+without leaks. The performance tables remain pinned to the recorded engine
+revision above; this memory-pressure fix is validated separately.
