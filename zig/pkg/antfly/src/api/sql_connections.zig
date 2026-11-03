@@ -32,16 +32,21 @@ const Directory = struct { entries: []const Entry = &.{} };
 pub const Owned = std.json.Parsed(record.Record);
 
 pub fn load(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, id: [32]u8, principal: []const u8, owner_node_id: u64, now_ms: u64) !Owned {
+    return loadWithCommand(store, alloc, id, principal, owner_node_id, now_ms, null);
+}
+/// An executing command can outlive the connection's idle-resource TTL. Only
+/// its exact, unexpired source fence permits that bypass, in the same read view.
+pub fn loadWithCommand(store: *transactions.DurableSessionStore, alloc: std.mem.Allocator, id: [32]u8, principal: []const u8, owner_node_id: u64, now_ms: u64, fence: ?*const @import("../system_catalog/command_fence.zig").Fence) !Owned {
     return switch (store.backend) {
         .docstore => |backend| blk: {
             var txn = try backend.beginReadTxn();
             defer txn.abort();
-            break :blk try loadTxn(&txn, alloc, id, principal, owner_node_id, now_ms);
+            break :blk try loadCommandTxn(&txn, alloc, id, principal, owner_node_id, now_ms, fence);
         },
         .runtime => |backend| blk: {
             var txn = try backend.beginRead();
             defer txn.abort();
-            break :blk try loadTxn(&txn, alloc, id, principal, owner_node_id, now_ms);
+            break :blk try loadCommandTxn(&txn, alloc, id, principal, owner_node_id, now_ms, fence);
         },
     };
 }
@@ -89,14 +94,14 @@ fn loadReconciledAt(
         }
         // A racing BEGIN must bind the exact still-beginning ID before it
         // responds. After this CAS succeeds it cannot return a session ID.
-        _ = mutate(store, .{ .abort_begin = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
+        _ = mutateReconciled(store, .{ .abort_begin = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
             error.SqlConnectionBusy => return owned,
             else => return err,
         };
         _ = registry.removeBeforeExecution(alloc, txn_id);
     } else if (session) |value| {
         if (value.terminal == null and !value.terminal_prepare and !value.terminal_abort) return owned;
-        _ = mutate(store, .{ .terminal = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
+        _ = mutateReconciled(store, .{ .terminal = .{ .id = id, .txn_id = txn_id } }, principal, owner_node_id, authority_ms) catch |err| switch (err) {
             error.SqlConnectionBusy => return owned,
             else => return err,
         };
@@ -178,6 +183,13 @@ fn loadTxn(txn: anytype, alloc: std.mem.Allocator, id: [32]u8, principal: []cons
     return value;
 }
 
+fn loadCommandTxn(txn: anytype, alloc: std.mem.Allocator, id: [32]u8, principal: []const u8, owner_node_id: u64, now_ms: u64, fence: ?*const @import("../system_catalog/command_fence.zig").Fence) !Owned {
+    var owned = try loadTxn(txn, alloc, id, principal, owner_node_id, if (fence != null) 0 else now_ms);
+    errdefer owned.deinit();
+    if (fence != null) try @import("sql_command_producer.zig").requireCommandTxn(alloc, txn, id, fence, now_ms);
+    return owned;
+}
+
 pub const Action = union(enum) {
     create: record.Record,
     discard: [32]u8,
@@ -194,6 +206,16 @@ pub const Action = union(enum) {
 };
 
 pub fn mutate(store: *transactions.DurableSessionStore, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64) !usize {
+    return mutateWithCommand(store, action, principal, owner_node_id, now_ms, null);
+}
+pub fn mutateWithCommand(store: *transactions.DurableSessionStore, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64, fence: ?*const @import("../system_catalog/command_fence.zig").Fence) !usize {
+    return mutateMode(store, action, principal, owner_node_id, now_ms, fence, false);
+}
+fn mutateReconciled(store: *transactions.DurableSessionStore, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64) !usize {
+    if (action != .abort_begin and action != .terminal) return error.InvalidSqlConnection;
+    return mutateMode(store, action, principal, owner_node_id, now_ms, null, true);
+}
+fn mutateMode(store: *transactions.DurableSessionStore, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64, fence: ?*const @import("../system_catalog/command_fence.zig").Fence, reconciliation: bool) !usize {
     const mutation = store.mutationMutex();
     @import("antfly_platform").sync.lockYielding(mutation);
     defer mutation.unlock();
@@ -202,24 +224,25 @@ pub fn mutate(store: *transactions.DurableSessionStore, action: Action, principa
         .docstore => |backend| blk: {
             var txn = try backend.beginWriteTxn();
             errdefer txn.abort();
-            const result = try mutateTxn(store, &txn, store.alloc, action, principal, owner_node_id, now_ms);
+            const result = try mutateTxn(store, &txn, store.alloc, action, principal, owner_node_id, now_ms, fence, reconciliation);
             try txn.commit();
             break :blk result;
         },
         .runtime => |backend| blk: {
             var txn = try backend.beginWrite();
             errdefer txn.abort();
-            const result = try mutateTxn(store, &txn, store.alloc, action, principal, owner_node_id, now_ms);
+            const result = try mutateTxn(store, &txn, store.alloc, action, principal, owner_node_id, now_ms, fence, reconciliation);
             try txn.commit();
             break :blk result;
         },
     };
 }
 
-fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.mem.Allocator, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64) !usize {
+fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.mem.Allocator, action: Action, principal: []const u8, owner_node_id: u64, now_ms: u64, fence: ?*const @import("../system_catalog/command_fence.zig").Fence, reconciliation: bool) !usize {
     if (action == .create) {
         const value = action.create;
         try value.validate();
+        try @import("sql_command_producer.zig").requireUnusedTxn(alloc, txn, value.id);
         if (value.state != .idle or value.generation != 1 or value.revision != 1 or value.active_txn != null or value.overlay.len != 0 or value.lookup_path != null or
             value.sequence_epoch != 1 or value.sequence_state.values.len != 0 or value.sequence_state.last != null or
             value.owner_node_id != owner_node_id or !std.mem.eql(u8, value.principal, principal) or
@@ -255,12 +278,13 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
                     defer owned.deinit();
                     // Never collect an expired connection while a transaction
                     // could still have an uncertain commit decision.
-                    if (owned.value.state != .idle) {
+                    if (owned.value.state != .idle or !try @import("sql_command_producer.zig").retirementReadyTxn(alloc, txn, entry.id)) {
                         entries[count] = entry;
                         count += 1;
                         continue;
                     }
                     _ = try prepared.discardConnectionTxn(txn, alloc, entry.id);
+                    try @import("sql_command_producer.zig").forgetRetiredTxn(alloc, txn, entry.id);
                     try txn.delete(&old_key);
                 }
                 continue;
@@ -290,9 +314,11 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
         .discard_sequences => |value| value,
         .sequence_state => |value| value.id,
     };
-    var owned = try loadTxn(txn, alloc, id, principal, owner_node_id, now_ms);
+    var owned = try loadTxn(txn, alloc, id, principal, owner_node_id, if (fence != null) 0 else now_ms);
     defer owned.deinit();
     var next = owned.value;
+    const can_reconcile = reconciliation and try @import("sql_command_producer.zig").reconciliationReadyTxn(alloc, txn, id);
+    if (!can_reconcile and (action != .close or fence != null)) try @import("sql_command_producer.zig").requireCommandTxn(alloc, txn, id, fence, now_ms);
     return switch (action) {
         .create => unreachable,
         .discard_sequences => blk: {
@@ -314,6 +340,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             break :blk 0;
         },
         .discard, .close => blk: {
+            if (!try @import("sql_command_producer.zig").retirementReadyTxn(alloc, txn, id)) return error.SqlConnectionBusy;
             if (next.state != .idle) return error.SqlConnectionBusy;
             const removed = try prepared.discardConnectionTxn(txn, alloc, id);
             if (action == .discard) {
@@ -329,6 +356,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
                 try record.putTxn(txn, alloc, next);
             } else {
                 const connection_key = try record.key(&id);
+                try @import("sql_command_producer.zig").forgetRetiredTxn(alloc, txn, id);
                 try txn.delete(&connection_key);
                 // Remove the exact directory entry as part of this commit.
                 const raw = try txn.get(directory_key);

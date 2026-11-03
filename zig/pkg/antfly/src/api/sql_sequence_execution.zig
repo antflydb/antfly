@@ -188,7 +188,7 @@ pub const Owner = struct {
             self.state_allocator = borrowed.allocator;
         } else if (root.connection_id) |id| {
             const store = root.server.txn_sessions.durable orelse return error.SequenceProviderUnavailable;
-            var connection = try @import("sql_connections.zig").load(store, a, id, principal orelse "", node, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+            var connection = try @import("sql_connections.zig").loadWithCommand(store, a, id, principal orelse "", node, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, root.context.sql_command_fence);
             defer connection.deinit();
             if (!std.meta.eql(connection.value.active_txn, root.active_transaction)) return error.SqlConnectionBusy;
             self.transaction = connection.value.active_txn;
@@ -363,7 +363,7 @@ pub const Owner = struct {
         if (!self.state.dirty) {
             if (root.connection_id) |id| {
                 const store = root.server.txn_sessions.durable orelse return error.SequenceProviderUnavailable;
-                var observed = try @import("sql_connections.zig").load(store, a, id, http.transactionPrincipal(root.identity.*) orelse "", root.server.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+                var observed = try @import("sql_connections.zig").loadWithCommand(store, a, id, http.transactionPrincipal(root.identity.*) orelse "", root.server.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, root.context.sql_command_fence);
                 defer observed.deinit();
                 if (observed.value.generation != self.connection_generation.? or observed.value.sequence_epoch != self.connection_sequence_epoch.? or !std.meta.eql(observed.value.active_txn, self.transaction)) return error.SqlConnectionChanged;
             }
@@ -379,7 +379,7 @@ pub const Owner = struct {
         defer snapshot_value.deinit(a);
         if (root.connection_id) |id| {
             const store = root.server.txn_sessions.durable orelse return error.SequenceProviderUnavailable;
-            _ = try @import("sql_connections.zig").mutate(store, .{ .sequence_state = .{ .id = id, .generation = self.connection_generation.?, .sequence_epoch = self.connection_sequence_epoch.?, .active_txn = self.transaction, .value = snapshot_value } }, http.transactionPrincipal(root.identity.*) orelse "", root.server.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+            _ = try @import("sql_connections.zig").mutateWithCommand(store, .{ .sequence_state = .{ .id = id, .generation = self.connection_generation.?, .sequence_epoch = self.connection_sequence_epoch.?, .active_txn = self.transaction, .value = snapshot_value } }, http.transactionPrincipal(root.identity.*) orelse "", root.server.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, root.context.sql_command_fence);
         } else if (self.transaction) |id| {
             try root.server.txn_sessions.setSqlSequenceState(a, id, http.transactionPrincipal(root.identity.*), root.server.localSessionNodeId(), snapshot_value, false);
         }

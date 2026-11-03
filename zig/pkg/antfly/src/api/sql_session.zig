@@ -139,12 +139,13 @@ pub const Adapter = struct {
     supports_range_guards: bool = false,
     connection_id: ?[32]u8 = null,
     connection_revision: ?u64 = null,
+    command_fence: ?*const @import("../system_catalog/command_fence.zig").Fence = null,
     connection_overlay: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = &.{},
     connection_search_path: ?@import("../pgwire/search_path.zig").Path = null,
 
     fn connectionMutation(self: *Adapter, scope: sql.Scope, action: connections.Action) !void {
         const store = self.registry.durable orelse return error.SqlConnectionUnavailable;
-        _ = try connections.mutate(store, action, scope.principal, self.node_id, platform_time.realtimeNs() / std.time.ns_per_ms);
+        _ = try connections.mutateWithCommand(store, action, scope.principal, self.node_id, platform_time.realtimeNs() / std.time.ns_per_ms, self.command_fence);
     }
 
     pub fn owner(self: *Adapter) sql.Owner {

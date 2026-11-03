@@ -73,7 +73,7 @@ pub fn execute(alloc: std.mem.Allocator, adapter: *execution.Adapter, command: C
     if (command == .discard_sequences) {
         if (adapter.connection_id) |connection| {
             const store = adapter.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
-            _ = try connections.mutate(store, .{ .discard_sequences = connection }, principal orelse "", adapter.server.localSessionNodeId(), platform_time.realtimeNs() / std.time.ns_per_ms);
+            _ = try connections.mutateWithCommand(store, .{ .discard_sequences = connection }, principal orelse "", adapter.server.localSessionNodeId(), platform_time.realtimeNs() / std.time.ns_per_ms, adapter.context.sql_command_fence);
         } else {
             try adapter.server.txn_sessions.setSqlSequenceState(session_alloc, id, principal, state.owner_node_id, .{}, true);
         }
@@ -124,15 +124,15 @@ fn executeConnection(alloc: std.mem.Allocator, adapter: *execution.Adapter, comm
     const owner_node_id = adapter.server.localSessionNodeId();
     const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
     if (command == .discard_sequences) {
-        _ = try connections.mutate(store, .{ .discard_sequences = id }, principal, owner_node_id, now_ms);
+        _ = try connections.mutateWithCommand(store, .{ .discard_sequences = id }, principal, owner_node_id, now_ms, adapter.context.sql_command_fence);
         return runtime.Result.empty(alloc, "DISCARD SEQUENCES");
     }
     if (command == .discard_all) {
-        _ = try connections.mutate(store, .{ .discard = id }, principal, owner_node_id, now_ms);
+        _ = try connections.mutateWithCommand(store, .{ .discard = id }, principal, owner_node_id, now_ms, adapter.context.sql_command_fence);
         return runtime.Result.empty(alloc, "DISCARD ALL");
     }
     if (command == .reset_all) {
-        _ = try connections.mutate(store, .{ .overlay = .{ .id = id, .expected_revision = expected_revision, .entries = &.{}, .reset_search_path = true } }, principal, owner_node_id, now_ms);
+        _ = try connections.mutateWithCommand(store, .{ .overlay = .{ .id = id, .expected_revision = expected_revision, .entries = &.{}, .reset_search_path = true } }, principal, owner_node_id, now_ms, adapter.context.sql_command_fence);
         return runtime.Result.empty(alloc, "RESET");
     }
     if (command == .search_path) {
@@ -141,7 +141,7 @@ fn executeConnection(alloc: std.mem.Allocator, adapter: *execution.Adapter, comm
         // PostgreSQL SET LOCAL outside a transaction is a successful no-op.
         if (setting == .set and setting.set.local) return runtime.Result.empty(alloc, "SET");
         const path = if (setting == .set) setting.set.path else null;
-        _ = try connections.mutate(store, .{ .search_path = .{ .id = id, .expected_revision = expected_revision, .value = path } }, principal, owner_node_id, now_ms);
+        _ = try connections.mutateWithCommand(store, .{ .search_path = .{ .id = id, .expected_revision = expected_revision, .value = path } }, principal, owner_node_id, now_ms, adapter.context.sql_command_fence);
         return runtime.Result.empty(alloc, if (setting == .reset) "RESET" else "SET");
     }
     const setting = command.catalog;
@@ -202,7 +202,7 @@ fn executeConnection(alloc: std.mem.Allocator, adapter: *execution.Adapter, comm
         entries[count] = next;
         count += 1;
     };
-    _ = try connections.mutate(store, .{ .overlay = .{ .id = id, .expected_revision = expected_revision, .entries = entries[0..count] } }, principal, owner_node_id, now_ms);
+    _ = try connections.mutateWithCommand(store, .{ .overlay = .{ .id = id, .expected_revision = expected_revision, .entries = entries[0..count] } }, principal, owner_node_id, now_ms, adapter.context.sql_command_fence);
     return runtime.Result.empty(alloc, if (setting == .set) "SET" else "RESET");
 }
 

@@ -732,6 +732,35 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&schema_submission_run.step);
     system_catalog_api_step.dependOn(&schema_submission_run.step);
     const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response" } });
+    const sql_command_producer_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{ "SQL command producer native", "HTTP connection", "HTTP sequence sessions", "SQL connection admission" },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 28 else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_command_producer_run = addFilteredTestRunArtifact(b, sql_command_producer_tests);
+    sql_command_producer_run.addArg("--require-no-skips");
+    const sql_command_producer_inventory = b.addRunArtifact(sql_command_producer_tests);
+    sql_command_producer_inventory.addArg("--list-tests");
+    const sql_command_producer_audit = b.addSystemCommand(&.{"python3"});
+    sql_command_producer_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for ([_][]const u8{
+        "SQL command producer native cold recovery never replays SQL and retires bound scopes incrementally",
+        "SQL command producer native shared facades preserve execution ownership lease renewal and admission recovery",
+        "SQL command producer native connection GC retains uncertain owners and native fences prevent identity resurrection",
+        "SQL command producer native supervisor uses existing authenticated transport without executing abandoned SQL",
+        "SQL command producer native outbox aborts every staged write before WAL publication",
+        "SQL command producer native providers must prove transaction-wide shared writer serialization",
+        "SQL command producer native idle facade handoff stages one command and cannot adopt ready or executing SQL",
+        "SQL command producer native orphaned connections retire through native fences without evaluating SQL",
+        "SQL command producer native closure survives a delayed renewal after its outbox was superseded",
+        "SQL command producer native retired sources preserve independent connection begin and terminal reconciliation",
+    }) |required| sql_command_producer_audit.addArgs(&.{ "--filter", required });
+    sql_command_producer_audit.addArg("--inventory");
+    sql_command_producer_audit.addFileArg2(sql_command_producer_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    sql_command_producer_run.step.dependOn(&sql_command_producer_audit.step);
+    b.step("antfly-sql-command-producer-test", "Qualify durable SQL source permits, exact control delivery and native cold retirement")
+        .dependOn(&sql_command_producer_run.step);
     const sql_read_admission_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"SQL statement read admission"} });
     const sql_view_authority_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
@@ -2441,6 +2470,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const api_http_runtime_default_filters = [_][]const u8{
         "native memory",
+        "SQL command producer native",
         "httpx internal control routes call typed operations directly",
         "caller cancellation does not interrupt protected child work",
         "httpx SQL dispatch preserves imported executor authority including unavailable views",

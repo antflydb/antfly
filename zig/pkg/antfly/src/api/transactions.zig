@@ -2113,7 +2113,7 @@ pub const DurableSessionStore = struct {
         return try self.scanPrefixFromWithContext(prefix, null, ctx, callback);
     }
 
-    fn scanPrefixFromWithContext(
+    pub fn scanPrefixFromWithContext(
         self: *DurableSessionStore,
         prefix: []const u8,
         start_after: ?[]const u8,

@@ -18146,3 +18146,29 @@ for the receiving contract and the explicit remaining public-activation work.
 Legacy mutation paths without shared admission remain closed to scoped dispatch.
 This is architecture qualification, not a new original-fixture closure: the
 inventory remains 912 implemented, 138 rejected, 449 superseded, and 87 unresolved.
+
+### Durable command-source ownership and recovery
+
+The source connection now has a durable control outbox and a one-use execution
+permit, alongside the previously qualified receiving fence. Native control
+retries and cold observations never rerun SQL. Proven idle handoff can stage the
+next command in one source CAS; ready/executing commands retain their executor.
+The existing supervisor drives bounded keyset recovery, decision-gated release,
+orphan cleanup and retirement. Local source state is reclaimed with its retired
+connection while existing native replay fences remain authoritative. Lease
+renewal, cancellation races, lost replies and every staged source write boundary
+have concrete native LSM/WAL campaigns in both catalog realms and local/Raft apply.
+
+Broader Debug qualification passes 138 build steps; the final source review passes
+61 steps and 20 source/connection tests without skips, failures or leaks. Public
+HTTP/pgwire source pinning, universal scoped private commits, ordered advisory
+scalars, the native unlock/reset publication for DISCARD ALL, unjournaled metadata
+paths, prepared handoff, distributed lock enrollment and native retirement-floor
+GC remain activation work. No original SQL case is credited from component or
+control-source qualification: the inventory remains 87 unresolved (64 DDL).
+
+The final source-lifetime gate additionally passes all 126 Debug build steps:
+21 source/connection tests, 41 public SQL/pgwire native contracts, seven mounted
+sequence/session tests, five metadata-submission tests, and standalone cold
+prepared recovery. It covers publication across an idle TTL using only a live
+source fence, and independent connection reconciliation after source retirement.

@@ -48,6 +48,19 @@ pub const Pool = struct {
     mutex: std.Io.Mutex = .init,
     active: std.AutoHashMapUnmanaged(Key, u64) = .empty,
     next_ticket: u64 = 1,
+    instance: ?[16]u8 = null,
+    /// One secure source identity for this process-owned connection pool.
+    /// Durable command records retain it; a new pool cannot resume old SQL.
+    pub fn executionInstance(self: *Pool, io: std.Io) ![16]u8 {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        if (self.instance) |value| return value;
+        var value: [16]u8 = undefined;
+        try io.randomSecure(&value);
+        if (std.mem.allEqual(u8, &value, 0)) return error.InvalidSqlConnection;
+        self.instance = value;
+        return value;
+    }
     pub fn acquire(self: *Pool, a: A, io: std.Io, key: Key) !Lease {
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);

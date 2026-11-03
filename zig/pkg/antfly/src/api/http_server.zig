@@ -4142,6 +4142,8 @@ pub const ApiHttpServer = struct {
     sql_prepared_work_due_ns: u64 = 0,
     sql_lock_work_due_ns: u64 = 0,
     sql_lock_work_pending: std.atomic.Value(bool) = .init(false),
+    sql_command_work_cursor: ?[32]u8 = null,
+    sql_command_work_due_ns: u64 = 0,
     last_full_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
     backup_maintenance_mutex: std.atomic.Mutex = .unlocked,
     backup_maintenance_queue: BackupRepositoryMaintenanceQueue = .{},
@@ -5483,7 +5485,27 @@ pub const ApiHttpServer = struct {
         return try self.ensureForeignRegistry();
     }
 
+    fn runSqlCommandProducerMaintenanceOnce(self: *ApiHttpServer) void {
+        if (!self.sql_prepared_work_mutex.tryLock()) return;
+        defer self.sql_prepared_work_mutex.unlock();
+        const now = platform_time.monotonicNs();
+        if (now < self.sql_command_work_due_ns) return;
+        self.sql_command_work_due_ns = now +| std.time.ns_per_s;
+        const end = now +| 20 * std.time.ns_per_ms;
+        for (0..8) |_| {
+            const more = @import("sql_command_producer.zig").advanceWork(self, &self.sql_command_work_cursor) catch |err| switch (err) {
+                error.UnsupportedSqlExecution, error.TableTopologyProtocolUpgradeRequired, error.CatalogGenerationChanged, error.MetadataMutationOutcomeUnknown, error.CatalogPublicationProofPending, error.Timeout, error.Canceled, error.DeadlineExceeded, error.SqlConnectionChanged => false,
+                else => blk: {
+                    std.log.warn("SQL command source recovery deferred err={s}", .{@errorName(err)});
+                    break :blk false;
+                },
+            };
+            if (!more or platform_time.monotonicNs() >= end) break;
+        }
+    }
+
     fn runLocalSessionMaintenanceOnce(self: *ApiHttpServer) !void {
+        self.runSqlCommandProducerMaintenanceOnce();
         @import("sql_completion.zig").recoverUnpublished(self, self.alloc, 32) catch |err| {
             std.log.warn("unpublished SQL completion cleanup deferred err={s}", .{@errorName(err)});
         };

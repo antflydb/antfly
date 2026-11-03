@@ -392,3 +392,89 @@ capability floors 69, 71, and 78. The combined unpublished SQL profile now
 requires capability 154 for command fences (153 for native lock scopes); its
 private transition tags occupy 82–95. Earlier qualification entries retain
 the development capability numbers used when those checks ran.
+
+## Durable source command producer
+
+`api/sql_command_producer.zig` owns registration, exact control delivery,
+command admission and source retirement in the existing durable session store.
+Pending control requests are committed before RPC delivery. The source record
+binds the native registration, source instance, immutable command/executor
+identity, and logical request-body digest. It stores no executable SQL body and
+creates no new transaction decision protocol. Providers must prove transaction-
+wide shared writer serialization; a facade-local mutex cannot protect a shared
+execution CAS.
+
+Native BEGIN acknowledgement produces a ready source command, not permission to
+replay SQL. A separate durable ready-to-executing CAS issues one execution
+permit. Repeated or stale tickets, substituted bodies, failed local writes, and
+another process instance cannot issue a second permit. A native idle observation
+can transfer the source instance while staging the next command in one local
+CAS; there is no separate adoption WAL commit. Ready and executing statements
+cannot be handed off. The native backend and its command sequence remain
+unchanged. Adopting a successful native BEGIN from a lost reply does not itself
+evaluate the statement. All control delivery continues using the existing
+authenticated catalog transport and shared bounded outcome journal. Expired
+control admissions can be renewed only from an exact native scope observation;
+the immutable command identity never changes.
+
+A different facade is not proof of process death. Nonexpired live commands
+remain owned by their original instance, even when another facade shares the
+physical session namespace. Explicit closure or expiry first fences native
+execution. Cleanup then joins native transaction-resolution authority, releases
+transaction membership and advances one close quantum at a time. Lease renewal
+is an exact compare-and-renew operation; observing its durable acknowledgement
+after the old expiry must not fence the successfully renewed command. No idle
+HTTP TTL is interpreted as permission to release an active native transaction's
+locks.
+
+The durable work index supports bounded, exclusive keyset pages. The existing
+local supervisor processes at most eight source owners per cooperative 20 ms
+slice, with independently bounded I/O. It never evaluates SQL and never treats a
+changed facade as an expiry proof. Source work remains indexed through uncertain
+control replies and cold reopen. HTTP connection GC and DISCARD/close cannot
+erase an unretired source owner. After native retirement, connection removal
+reclaims its source outbox in the same transaction. Native scope/binding fences
+reject delayed registration or backend replacement; the source does not add
+another unbounded tombstone family. Orphaned source records can still drive
+cleanup after their parent is gone. Removing the actual native replay fences
+still requires the authoritative retirement floor. Session control, settings and
+sequence-state publication carry the same restrictive command fence when an
+execution owner is attached, alongside existing SQL/RLS privileges.
+
+The native campaigns cover both catalog realms, local and Raft apply, three cold
+reopen phases, lost requests/replies, exact body retransmission, one-use
+permits, shared facades, admission-window eviction, lease renewal, unsealed
+transaction release, incremental session-lock cleanup, connection GC, native
+work pagination, and actual supervisor/authenticated-source dispatch. Scope-
+control RPCs do not mark the public SQL statement as submitted. Idle facade
+handoff, stale source CAS, rejected ready/executing takeover, orphan cleanup,
+and reclamation through the existing native fence also have explicit campaigns.
+A separate LSM/WAL campaign aborts every staged outbox record/index write for
+execution, retirement and reclamation.
+
+This is the source control boundary, not activation of public advisory
+functions. Public HTTP/pgwire entry points still need to create/pin these owners
+around SQL; all scoped writes must select the existing private decision path,
+ordered advisory scalars need their PostgreSQL NULL/void contracts, and legacy
+metadata effects, prepared-owner handoff, participant enrollment and retirement-
+floor GC remain. No original fixture is reclassified from this qualification
+alone.
+
+Debug qualification passes all 138 broader build steps, including native command
+fences, mounted sequence/session effects, public SQL/pgwire and standalone cold
+prepared recovery. The handoff/reclamation review passes all 71 steps with 19
+focused source/connection tests and five metadata-submission tests. The final
+late-renewal review passes all 61 steps and 20 source/connection tests, with no
+skips, failures or leaks. Scope cancellation remains irreversible even if an
+already dispatched renewal wins before its native fence. The existing HTTP
+runtime unit owner also selects these native campaigns; they are not E2E tests.
+Inventory remains 912 implemented, 138 rejected, 449 superseded and 87
+unresolved.
+
+The final lifetime qualification passes all 126 Debug build steps, including 21
+source/connection tests, 41 public SQL/pgwire native contracts, seven mounted
+sequence/session effects tests, five metadata-submission contracts, and the
+standalone cold prepared recovery test. Active command publication may cross the
+parent's idle TTL only with its exact unexpired source fence; ordinary expired
+connection access stays rejected. Independently proved BEGIN/terminal repairs
+remain possible after source retirement, preventing cleanup from being stranded.
