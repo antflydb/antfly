@@ -75,6 +75,11 @@ fn store(handle: *h.Handle, record: ?Record) !void {
 }
 
 fn recoverLocked(handle: *h.Handle) !void {
+    // Participants were admitted before preparing this decision. Replaying or
+    // publishing it must not recursively start a namespace's DDL coordinator.
+    const was_recovering = handle.sql_ddl_recovering;
+    handle.sql_ddl_recovering = true;
+    defer handle.sql_ddl_recovering = was_recovering;
     if (handle.sql_decision_uncertain) return error.SqlMutationOutcomeUnknown;
     if (!handle.sql_commit_recovery_needed) return;
     if (h.builtin.is_test) handle.sql_commit_recovery_scans +%= 1;
@@ -123,6 +128,11 @@ fn recoverLocked(handle: *h.Handle) !void {
 }
 
 fn commitLocked(handle: *h.Handle, requests: []const contract.TableCommitRequest, out_id: *?h.db_mod.types.TxnId) !catalog.MutationOutcome {
+    // Participants were admitted before preparing this decision. Replaying or
+    // publishing it must not recursively start a namespace's DDL coordinator.
+    const was_recovering = handle.sql_ddl_recovering;
+    handle.sql_ddl_recovering = true;
+    defer handle.sql_ddl_recovering = was_recovering;
     if (requests.len == 0) return .committed;
     try recoverLocked(handle);
     const io = handle.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;

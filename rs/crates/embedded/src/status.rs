@@ -180,6 +180,8 @@ pub struct Capabilities {
 /// contract.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PendingWorkStatus {
+    #[serde(default)]
+    pub background_publications: serde_json::Value,
     pub derived_target_sequence: u64,
     pub has_async_indexes: bool,
     pub portable_import_publication_in_progress: bool,

@@ -39,8 +39,10 @@ T = TypeVar("T", bound="GraphTraversal")
 
 @_attrs_define
 class GraphTraversal:
-    """Breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Direction defaults
-    to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge.
+    """Breadth-first traversal by exact table-qualified node identity. With include_paths, visited state and deduplication
+    are independent per start node, preserving paths between roots and overlapping root provenance. The first node in
+    each path identifies its root. Without include_paths, result nodes are deduplicated across starts. Direction
+    defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge.
 
         Attributes:
             start (GraphIdentityNodeSelector | GraphKeyNodeSelector | GraphResultRefNodeSelector): Select graph nodes using
@@ -55,14 +57,16 @@ class GraphTraversal:
                 - in: Incoming edges to the node
                 - both: Both outgoing and incoming edges
             edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
-            max_depth (int | Unset): Maximum traversal depth. Defaults to one hop to keep fan-out explicit. Default: 1.
+            max_depth (int | Unset): Maximum hop depth measured independently from each start. Defaults to one hop to keep
+                fan-out explicit. Default: 1.
             edge_weight (GraphEdgeWeightRange | Unset): Inclusive per-edge weight filter. At least one bound is required.
                 Bounds must be finite and non-negative; when both are present, min must not exceed max. This filters individual
                 stored edges and does not constrain the aggregate path objective.
             limit (int | Unset):  Default: 100.
-            deduplicate_nodes (bool | Unset): Return each node once across all starts. Set false with include_paths to
-                return each reaching path, including its start node. Depth, result, and work limits still bound path
-                enumeration. Default: True.
+            deduplicate_nodes (bool | Unset): With include_paths, return each node once per start, preserving a separate
+                path for every reaching root. Without include_paths, return each node once across all starts. Set false with
+                include_paths to enumerate reaching paths within a root. Depth, result, and shared request work limits still
+                bound enumeration. Default: True.
             include_paths (bool | Unset):  Default: False.
             include_documents (bool | Unset): Include each result node's stored document when it exists at the pinned
                 snapshot. A dangling graph identity omits document. When false, document is always omitted. Default: False.

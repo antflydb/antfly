@@ -17,7 +17,10 @@
 
 import unittest
 
-from benchmark_concurrency import recurrent_placement_observation
+from benchmark_concurrency import (
+    apply_token_burst_overrides,
+    recurrent_placement_observation,
+)
 
 
 class RecurrentPlacementTests(unittest.TestCase):
@@ -44,6 +47,32 @@ class RecurrentPlacementTests(unittest.TestCase):
             recurrent_placement_observation(
                 host.replace("operator_disabled", "unsupported_device"), False
             )["matched"]
+        )
+
+
+class AutomaticBurstTests(unittest.TestCase):
+    def test_omitted_options_leave_runtime_selection_and_width_unset(self):
+        env = {}
+        apply_token_burst_overrides(env, None, None)
+        self.assertEqual(env, {})
+
+    def test_explicit_disable_and_width_are_independent(self):
+        env = {}
+        apply_token_burst_overrides(env, False, None)
+        self.assertEqual(env, {"ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST": "0"})
+        env = {}
+        apply_token_burst_overrides(env, None, 4)
+        self.assertEqual(env, {"ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH": "4"})
+
+    def test_explicit_enable_is_recorded(self):
+        env = {}
+        apply_token_burst_overrides(env, True, 8)
+        self.assertEqual(
+            env,
+            {
+                "ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST": "1",
+                "ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH": "8",
+            },
         )
 
 

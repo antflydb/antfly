@@ -114,6 +114,7 @@ const private_fields = [_][]const u8{
     "_integrity",
     "_integrity_commands",
     "_json_null_fields",
+    "_leann_record",
     "_merge_artifacts",
     "_merge_checkpoint",
     "_merge_page",

@@ -200,6 +200,8 @@ pub const Slice = enum(u8) {
     lsm_read_working_set,
     /// Concurrent SQL execution and retained delivery state share host admission.
     sql_execution_working_set,
+    /// Shared scalar graph predicate membership across indexes and snapshots.
+    graph_predicate_cache,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -239,6 +241,7 @@ pub const Slice = enum(u8) {
             .lake_range_cache_queue => "lake.range_cache_queue",
             .lsm_read_working_set => "lsm.read_working_set",
             .sql_execution_working_set => "sql.execution_working_set",
+            .graph_predicate_cache => "graph.predicate_cache",
         };
     }
 };
@@ -478,6 +481,7 @@ pub const Options = struct {
             .lake_range_cache_queue = .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
             .lsm_read_working_set = .{ .soft_limit_bytes = 64 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
             .sql_execution_working_set = .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .graph_predicate_cache = .{ .soft_limit_bytes = 48 * 1024 * 1024, .hard_limit_bytes = 64 * 1024 * 1024 },
         }).values;
     }
 
@@ -520,6 +524,7 @@ pub const Options = struct {
             .lake_range_cache_queue = .{ .soft_action = .report, .hard_action = .reject_work },
             .lsm_read_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
             .sql_execution_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
+            .graph_predicate_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
         }).values;
     }
 };
@@ -1424,7 +1429,7 @@ pub const ResourceManager = struct {
             requester == .hbc_node_metadata_cache or
             requester == .relational_preparation_working_set or
             requester == .document_extraction_working_set or
-            requester == .lite_native_page_cache or requester == .lite_docstore_snapshot_cache;
+            requester == .lite_native_page_cache or requester == .lite_docstore_snapshot_cache or requester == .graph_predicate_cache;
         const slice_target = if (!requester_slice_reclaimable or slice_hard == 0)
             0
         else
@@ -1460,7 +1465,7 @@ pub const ResourceManager = struct {
         // table content. Include the requester's own search slice so one index
         // can reuse capacity retained by another; callbacks use non-blocking
         // owner locks and therefore skip an in-flight scratch handle safely.
-        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .relational_preparation_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache, .lite_native_page_cache, .lite_docstore_snapshot_cache };
+        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .relational_preparation_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache, .lite_native_page_cache, .lite_docstore_snapshot_cache, .graph_predicate_cache };
         for (candidates, 0..) |candidate_slice, candidate_index| {
             if (candidate_index == 0) {
                 if (targets.slice == 0) continue;
@@ -1476,7 +1481,7 @@ pub const ResourceManager = struct {
                 candidate_slice != .hbc_node_metadata_cache and
                 candidate_slice != .relational_preparation_working_set and
                 candidate_slice != .document_extraction_working_set and
-                candidate_slice != .lite_native_page_cache and candidate_slice != .lite_docstore_snapshot_cache) continue;
+                candidate_slice != .lite_native_page_cache and candidate_slice != .lite_docstore_snapshot_cache and candidate_slice != .graph_predicate_cache) continue;
             // Preserve weighted fairness on the first pass. If some owners
             // cannot use their share, offer the remaining debt once more to
             // available owners before rejecting otherwise admissible work.

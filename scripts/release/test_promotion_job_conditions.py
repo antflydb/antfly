@@ -63,6 +63,7 @@ def admitted(
     cancelled=False,
     publish="true",
     ancestor="skipped",
+    github_release="prerelease",
 ) -> bool:
     # Evaluate this workflow's boolean/equality subset, not arbitrary Actions expressions.
     # An explicit status function suppresses the default success() admission check.
@@ -77,6 +78,9 @@ def admitted(
         r"needs\.prepare-release-promotion\.outputs\.publish_(?:npm|pypi)",
         repr(publish),
         expression,
+    )
+    expression = expression.replace(
+        "needs.prepare-release-promotion.outputs.github_release", repr(github_release)
     )
     expression = (
         expression.replace("cancelled()", str(cancelled))
@@ -120,6 +124,32 @@ class PromotionJobConditionsTests(unittest.TestCase):
                             ancestor=ancestor,
                         )
                     )
+
+    def test_rc_registry_skips_allow_release_and_journal_completion(self):
+        results = dict.fromkeys(
+            (
+                "prepare-release-promotion",
+                "begin-release-channel",
+                "stage-container",
+                "promote-channel-aliases",
+                "publish-github-release",
+            ),
+            "success",
+        )
+        results.update(
+            {
+                "publish-cli-npm": "skipped",
+                "publish-cli-pypi": "skipped",
+                "prepare-zig-homebrew": "skipped",
+            }
+        )
+        for job in (
+            "promote-channel-aliases",
+            "publish-github-release",
+            "complete-release-channel",
+        ):
+            with self.subTest(job=job):
+                self.assertTrue(admitted(condition(job), results))
 
     def test_each_required_gate_must_succeed(self):
         for job, dependencies in JOBS.items():

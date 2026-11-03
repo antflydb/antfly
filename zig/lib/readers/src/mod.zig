@@ -41,6 +41,28 @@ fn readHttpStatusError(status: u16, capability_stale: bool) anyerror {
         error.ReadRequestFailed;
 }
 
+fn readAntflyHttpError(alloc: Allocator, status: u16, capability_stale: bool, body: []const u8) anyerror {
+    if (status == 400) {
+        if (document_failure.recognized(alloc, body)) |failure| {
+            if (failure.cause) |cause|
+                if (cause == error.ReadOutputTruncated) return error.ReadOutputTruncated;
+        }
+    }
+    return readHttpStatusError(status, capability_stale);
+}
+
+test "reader preserves native OCR truncation across HTTP without accepting arbitrary errors" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "{\"error\":\"OUTPUT_TRUNCATED\"}", "{\"error\":\"ReadOutputTruncated\"}" }) |body| {
+        try std.testing.expectEqual(error.ReadOutputTruncated, readAntflyHttpError(a, 400, false, body));
+        try std.testing.expectEqual(error.ReadTransientFailure, readAntflyHttpError(a, 503, false, body));
+    }
+    for ([_][]const u8{ "invalid", "{}", "{\"error\":\"private error\"}", "{\"error\":\"OUTPUT_TRUNCATED\",\"error\":\"Timeout\"}" }) |body|
+        try std.testing.expectEqual(error.ReadRequestFailed, readAntflyHttpError(a, 400, false, body));
+    try std.testing.expectEqual(error.ReadRequestFailed, readAntflyHttpError(a, 400, false, &@as([4097]u8, @splat(' '))));
+    try std.testing.expectEqual(error.InferenceCapabilitiesStale, readAntflyHttpError(a, 409, true, "{}"));
+}
+
 test "reader classifies retryable HTTP statuses" {
     try std.testing.expect(readHttpStatusError(429, false) == error.ReadTransientFailure);
     try std.testing.expect(readHttpStatusError(503, false) == error.ReadTransientFailure);
@@ -205,6 +227,9 @@ pub const BatchExecution = struct {
     requested_items: usize = 0,
     native_batches: usize = 0,
     native_items: usize = 0,
+    /// Actual successful decoder-step width, including peers in other requests.
+    /// Zero means unobserved; it must never be inferred from request cardinality.
+    max_native_step_items: usize = 0,
     serial_items: usize = 0,
     fallback_items: usize = 0,
     fallback_reason: ?[]const u8 = null,
@@ -651,9 +676,9 @@ const AntflyReaderState = struct {
                 headers[count] = .{ "X-Antfly-Capability-Revision", v };
                 count += 1;
             }
-            var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .cancellation = self.cancellation, .max_response_size = req.max_response_bytes });
+            var response = try self.http.post(url, .{ .json = body, .headers = headers[0..count], .timeout_ms = self.timeout_ms, .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms", .cancellation = self.cancellation, .max_response_size = req.max_response_bytes });
             defer response.deinit();
-            if (!response.ok()) return readHttpStatusError(response.status.code, responseCapabilityStale(response));
+            if (!response.ok()) return readAntflyHttpError(alloc, response.status.code, responseCapabilityStale(response), response.body orelse "");
             return documentBatchResult(alloc, response.body orelse return error.InvalidReadResultCount);
         }
         const images = try alloc.alloc(inference_api.ImageURL, req.images.len);
@@ -693,11 +718,12 @@ const AntflyReaderState = struct {
             .json = body,
             .headers = headers,
             .timeout_ms = self.timeout_ms,
+            .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .max_response_size = req.max_response_bytes,
             .cancellation = self.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
+        if (!resp.ok()) return readAntflyHttpError(alloc, resp.status.code, responseCapabilityStale(resp), resp.body orelse "");
 
         return decodeReadBatch(alloc, resp.body orelse return error.EmptyResponse, req.images.len);
     }
@@ -757,11 +783,12 @@ const AntflyReaderState = struct {
             .borrowed_body_segments = body.segments,
             .headers = header_buf[0..header_count],
             .timeout_ms = self.timeout_ms,
+            .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
             .max_response_size = req.max_response_bytes,
             .cancellation = self.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
+        if (!resp.ok()) return readAntflyHttpError(alloc, resp.status.code, responseCapabilityStale(resp), resp.body orelse "");
 
         var batch = try decodeReadBatch(alloc, resp.body orelse return error.EmptyResponse, req.images.len);
         errdefer batch.deinit(alloc);
@@ -787,6 +814,7 @@ fn batchExecutionFromWire(wire: ?inference_api.BatchExecutionReport, item_count:
         .requested_items = std.math.cast(usize, report.requested_items) orelse return error.InvalidReadExecutionReport,
         .native_batches = std.math.cast(usize, report.native_batches) orelse return error.InvalidReadExecutionReport,
         .native_items = std.math.cast(usize, report.native_items) orelse return error.InvalidReadExecutionReport,
+        .max_native_step_items = std.math.cast(usize, report.max_native_step_items orelse 0) orelse return error.InvalidReadExecutionReport,
         .serial_items = std.math.cast(usize, report.serial_items) orelse return error.InvalidReadExecutionReport,
         .fallback_items = std.math.cast(usize, report.fallback_items) orelse return error.InvalidReadExecutionReport,
         .fallback_reason = if (report.fallback_items > 0) "remote_reader_fallback" else null,
@@ -803,12 +831,14 @@ test "reader wire execution is observed, validated, and backward compatible" {
         .requested_items = 2,
         .native_batches = 1,
         .native_items = 2,
+        .max_native_step_items = 4,
         .serial_items = 0,
         .rejected_items = 0,
         .fallback_items = 0,
     }, 2);
     try std.testing.expectEqual(@as(usize, 2), native.native_items);
     try std.testing.expectEqual(@as(usize, 1), native.native_batches);
+    try std.testing.expectEqual(@as(usize, 4), native.max_native_step_items);
 
     const mixed = try batchExecutionFromWire(.{
         .requested_items = 2,
@@ -1275,12 +1305,12 @@ test "antfly reader sends batched images and request max tokens" {
     var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
     defer client.deinit();
 
-    const reader = try initReader(alloc, &client, .{
+    const reader = try initReaderWithOptions(alloc, &client, .{
         .provider = .antfly,
         .api_url = server.baseUrl(),
         .model = "reader",
         .max_tokens = 16,
-    });
+    }, .{ .timeout_ms = 120_000 });
     defer reader.deinit();
 
     var results: ?[]Result = null;
@@ -1544,6 +1574,8 @@ fn expectAntflyReaderBearer(req: httpx.testing_mod.RequestInfo) !void {
 
 fn expectAntflyReaderBatchRequest(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqual(httpx.Method.POST, req.method);
+    const remaining = try std.fmt.parseInt(u64, req.header("X-Antfly-Inference-Timeout-Ms") orelse return error.MissingHeader, 10);
+    try std.testing.expect(remaining > 30_000 and remaining <= 120_000);
 
     var parsed = try std.json.parseFromSlice(inference_api.ReadRequest, std.testing.allocator, req.body, .{
         .ignore_unknown_fields = true,

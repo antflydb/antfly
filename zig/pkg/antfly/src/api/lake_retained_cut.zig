@@ -836,6 +836,8 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
         const legacy_pin = try loadCached(wa, &artifacts, identity, legacy_token, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
         defer legacy_pin.deinit();
         try std.testing.expectEqual(@as(usize, 1), legacy_pin.descriptor.pending.count());
+        try std.testing.expect(legacy_pin.lease.?.item != native_pin.lease.?.item);
+        try std.testing.expectEqual(@as(usize, 125000), legacy_pin.overlay.?.row(try ingestion.rowId(wa, &.{"id"}, row, .canonical)).?.object.get("payload").?.array.items.len);
         try std.testing.expect(!legacy_pin.lease.?.item.cached);
         // The requested shared-decode reservation is 64 MiB. Reject it with
         // an explicit smaller limit to exercise the bounded private fallback,

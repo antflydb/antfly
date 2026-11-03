@@ -22,8 +22,8 @@ fn repeatBytesComptime(comptime bytes: []const u8, comptime count: usize) [bytes
     }
     return repeated;
 }
-const syntax = @import("syntax.zig");
-const text_encoding = @import("text_encoding.zig");
+const syntax = @import("pdf_syntax");
+const text_encoding = @import("pdf_text_encoding");
 const jbig2 = @import("jbig2.zig");
 const image_lib = @import("antfly_image");
 const font_lib = @import("antfly_font");

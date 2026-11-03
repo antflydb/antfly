@@ -32,6 +32,7 @@ const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const model_compatibility = @import("../models/compatibility.zig");
 const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
+const gliner_specialty = @import("../models/gliner_specialty_qualification.zig");
 const managed_receipt = @import("../registry/managed_receipt.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const c_file = @import("../util/c_file.zig");
@@ -3422,6 +3423,7 @@ pub const LoadedModel = struct {
     }
 
     pub fn supportsClassification(self: *LoadedModel) bool {
+        if (self.manifest.gliner_specialty_profile) |profile| return profile == .gliguard;
         return model_caps.modelSupportsCapability(
             @tagName(self.manifest.model_type),
             self.manifest.gliner_model_type,
@@ -3431,6 +3433,7 @@ pub const LoadedModel = struct {
     }
 
     pub fn supportsExtraction(self: *LoadedModel) bool {
+        if (self.manifest.gliner_specialty_profile) |profile| return profile == .pii;
         return model_caps.modelSupportsCapability(
             @tagName(self.manifest.model_type),
             self.manifest.gliner_model_type,
@@ -3440,6 +3443,7 @@ pub const LoadedModel = struct {
     }
 
     pub fn supportsRelationExtraction(self: *LoadedModel) bool {
+        if (self.manifest.gliner_specialty_profile != null) return false;
         return model_caps.modelSupportsCapability(
             @tagName(self.manifest.model_type),
             self.manifest.gliner_model_type,
@@ -4414,21 +4418,21 @@ pub const CompositeAssetsHandle = struct {
     }
 
     pub fn markStartupManaged(self: *CompositeAssetsHandle) !void {
+        try self.applyStartupPolicy(true);
+    }
+
+    pub fn applyStartupPolicy(self: *CompositeAssetsHandle, pin: bool) !void {
         const assets = self.assets orelse return;
         self.manager.lockLoadedModels();
         defer self.manager.unlockLoadedModels();
         // Startup policy selects the default request backend for this artifact.
         // Keep explicit backend acquisitions separate; never alias cache entries
         // with different placement constraints or artifact generations.
-        if (assets.preferred_backends.len == 1) {
-            const result = try self.manager.composite_startup_backends.getOrPut(self.manager.allocator, assets.model_dir);
-            if (!result.found_existing) {
-                errdefer _ = self.manager.composite_startup_backends.remove(assets.model_dir);
-                result.key_ptr.* = try self.manager.allocator.dupe(u8, assets.model_dir);
-            }
-            result.value_ptr.* = assets.preferred_backends[0];
-        }
-        assets.startup_managed = true;
+        if (assets.preferred_backends.len == 1)
+            try self.manager.setStartupLoadPolicyLocked(assets.model_dir, .{ .backend = assets.preferred_backends[0] });
+        // Explicit startup backend selection also applies to evictable loads.
+        // Cache identity must not depend on whether the model is pinned.
+        if (pin) assets.startup_managed = true;
     }
 
     pub fn release(self: *CompositeAssetsHandle) void {
@@ -4580,6 +4584,32 @@ const TeardownTicket = struct {
         domain.release();
     }
 };
+/// Emit the first denial and at most one diagnostic batch per second thereafter.
+/// The manager updates its diagnostic counters on every attempt, including
+/// suppressed retries. Access is serialized by admission_diagnostic_mutex.
+const AdmissionDenialLogGate = struct {
+    last_logged_ns: ?u64 = null,
+
+    fn shouldLog(self: *@This(), now_ns: u64) bool {
+        if (self.last_logged_ns) |last| {
+            if (now_ns -| last < std.time.ns_per_s) return false;
+        }
+        self.last_logged_ns = now_ns;
+        return true;
+    }
+};
+
+test "memory admission denial logging bounds a retry flood and resumes after the interval" {
+    var gate = AdmissionDenialLogGate{};
+    try std.testing.expect(gate.shouldLog(0));
+    for (1..271_168) |attempt|
+        try std.testing.expect(!gate.shouldLog(@intCast(attempt)));
+    try std.testing.expect(gate.shouldLog(std.time.ns_per_s));
+    try std.testing.expect(!gate.shouldLog(std.time.ns_per_s));
+    try std.testing.expect(!gate.shouldLog(0));
+    try std.testing.expect(gate.shouldLog(2 * std.time.ns_per_s));
+}
+
 pub const ModelManager = struct {
     pub const HostCacheReclaimer = struct {
         context: *anyopaque,
@@ -4812,6 +4842,7 @@ pub const ModelManager = struct {
     serving_policy: ?model_compatibility.Policy = null,
     admission_diagnostic_mutex: std.atomic.Mutex = .unlocked,
     admission_diagnostic: MemoryAdmissionDiagnostic = .{},
+    admission_denial_log_gate: AdmissionDenialLogGate = .{},
     admission_enabled: bool = false,
     admission_limit_overrides: runtime.tier.memory.Limits = .{},
     process_memory_limit_bytes: usize = 0,
@@ -4821,9 +4852,9 @@ pub const ModelManager = struct {
     tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
     loaded_aliases: std.StringHashMapUnmanaged(*LoadedModel),
-    /// Strict startup backend policies, keyed by resolved model directory.
+    /// Durable startup load policies, keyed by resolved model directory.
     /// Values are copied under load_lock; request lookup is O(1).
-    composite_startup_backends: std.StringHashMapUnmanaged(backends.BackendType) = .{},
+    startup_load_policies: std.StringHashMapUnmanaged(StartupLoadPolicy) = .{},
     runtime_epoch: u64,
     next_runtime_sequence: u64 = 1,
     /// Protects loaded-model maps and the in-flight registry. Expensive tokenizer,
@@ -6037,12 +6068,14 @@ pub const ModelManager = struct {
         spinLock(&self.admission_diagnostic_mutex);
         diagnostic.denied_count = self.admission_diagnostic.denied_count +| 1;
         self.admission_diagnostic = diagnostic;
+        const should_log = self.admission_denial_log_gate.shouldLog(diagnostic.last_denied_ns);
         self.admission_diagnostic_mutex.unlock();
-        if (builtin.is_test) return;
+        if (!should_log or builtin.is_test) return;
         std.log.warn(
-            "inference run admission denied pressure={s} request_count={d} admitted_host_bytes={d} admitted_backend_bytes={d} admitted_kv_bytes={d} admitted_scratch_bytes={d}",
+            "inference run admission denied pressure={s} denied_count={d} request_count={d} admitted_host_bytes={d} admitted_backend_bytes={d} admitted_kv_bytes={d} admitted_scratch_bytes={d}",
             .{
                 if (pressure) |value| @tagName(std.meta.activeTag(value)) else "unknown",
+                diagnostic.denied_count,
                 requests.len,
                 admitted.hostTotalBytes(),
                 admitted.backendTotalBytes(),
@@ -6758,9 +6791,10 @@ pub const ModelManager = struct {
     /// including required-backend and A4B policy keys. Never load cold assets
     /// or join a load flight while reading request-admission metadata.
     pub fn acquireCachedFromDir(self: *ModelManager, model_dir: []const u8) !?ModelHandle {
+        const defaults = self.defaultModelLoadPolicy(model_dir);
         var required_backend_scratch: [1]backends.BackendType = undefined;
         const effective_backends = try self.session_manager.requiredBackendCandidates(
-            self.session_manager.preferred_backends,
+            defaults.preferred_backends,
             &required_backend_scratch,
         );
         self.lockLoadedModels();
@@ -6769,7 +6803,7 @@ pub const ModelManager = struct {
             model_dir,
             effective_backends,
             true,
-            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
+            defaults.cache_policy,
         )) orelse return null;
         model.active_handles += 1;
         return .{ .manager = self, .model = model };
@@ -7107,9 +7141,9 @@ pub const ModelManager = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.composite_assets.deinit(self.allocator);
-        var startup_keys = self.composite_startup_backends.keyIterator();
+        var startup_keys = self.startup_load_policies.keyIterator();
         while (startup_keys.next()) |key| self.allocator.free(key.*);
-        self.composite_startup_backends.deinit(self.allocator);
+        self.startup_load_policies.deinit(self.allocator);
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -7663,18 +7697,79 @@ pub const ModelManager = struct {
         return hash.finalResult();
     }
 
-    fn defaultCompositeBackends(self: *ModelManager, model_dir: []const u8) []const backends.BackendType {
+    /// Startup selection is configuration, not cache residency. Copy policy
+    /// values under the lock; returned backend slices have static lifetime.
+    pub const StartupLoadPolicy = struct {
+        backend: ?backends.BackendType = null,
+        gliner_cuda_precision: ?session_factory.GlinerCudaPrecision = null,
+        a4b_request: ?backend_contracts.A4bInferenceRequest = null,
+    };
+
+    pub fn setStartupLoadPolicy(self: *ModelManager, model_dir: []const u8, policy: StartupLoadPolicy) !void {
         self.lockLoadedModels();
-        const configured = self.composite_startup_backends.get(model_dir);
-        self.unlockLoadedModels();
-        // Static slices outlive the lock and any later policy registration.
-        return switch (configured orelse return self.session_manager.preferred_backends) {
+        defer self.unlockLoadedModels();
+        try self.setStartupLoadPolicyLocked(model_dir, policy);
+    }
+
+    fn setStartupLoadPolicyLocked(self: *ModelManager, model_dir: []const u8, policy: StartupLoadPolicy) !void {
+        const entry = try self.startup_load_policies.getOrPut(self.allocator, model_dir);
+        if (!entry.found_existing) {
+            errdefer _ = self.startup_load_policies.remove(model_dir);
+            entry.key_ptr.* = try self.allocator.dupe(u8, model_dir);
+        }
+        entry.value_ptr.* = policy;
+    }
+
+    fn startupLoadPolicy(self: *ModelManager, model_dir: []const u8) StartupLoadPolicy {
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        return self.startup_load_policies.get(model_dir) orelse .{};
+    }
+
+    fn startupBackends(self: *ModelManager, policy: StartupLoadPolicy) []const backends.BackendType {
+        return switch (policy.backend orelse return self.session_manager.preferred_backends) {
             .native => &.{.native},
             .metal => &.{.metal},
             .cuda => &.{.cuda},
             .pjrt => &.{.pjrt},
             .wasm => &.{.wasm},
         };
+    }
+
+    fn defaultModelBackends(self: *ModelManager, model_dir: []const u8) []const backends.BackendType {
+        return self.startupBackends(self.startupLoadPolicy(model_dir));
+    }
+
+    /// Overrides describe only fields the caller selected. Placement is
+    /// independent of the model's persistent load contract.
+    const ModelLoadOverrides = struct {
+        preferred_backends: ?[]const backends.BackendType = null,
+        a4b_request: ?backend_contracts.A4bInferenceRequest = null,
+        gliner_cuda_precision: ?session_factory.GlinerCudaPrecision = null,
+    };
+
+    const ResolvedModelLoadPolicy = struct {
+        preferred_backends: []const backends.BackendType,
+        cache_policy: ModelLoadCachePolicy,
+    };
+
+    fn resolveModelLoadPolicy(self: *ModelManager, model_dir: []const u8, overrides: ModelLoadOverrides) ResolvedModelLoadPolicy {
+        const startup = self.startupLoadPolicy(model_dir);
+        const a4b_request = overrides.a4b_request orelse startup.a4b_request orelse self.session_manager.a4b_inference_request;
+        const precision = overrides.gliner_cuda_precision orelse startup.gliner_cuda_precision;
+        var policy = inheritedA4bCachePolicy(a4b_request, overrides.preferred_backends != null or startup.backend != null);
+        policy.gliner_cuda_precision = precision;
+        if (precision != null) policy.accept_default_alias = false;
+        return .{ .preferred_backends = overrides.preferred_backends orelse self.startupBackends(startup), .cache_policy = policy };
+    }
+
+    fn defaultModelLoadPolicy(self: *ModelManager, model_dir: []const u8) ResolvedModelLoadPolicy {
+        return self.resolveModelLoadPolicy(model_dir, .{});
+    }
+
+    fn acquireResolvedModel(self: *ModelManager, model_dir: []const u8, overrides: ModelLoadOverrides, cache_default_alias: bool, control: ?InferenceExecutionControl) !ModelHandle {
+        const resolved = self.resolveModelLoadPolicy(model_dir, overrides);
+        return self.loadFromDirCoordinated(model_dir, resolved.preferred_backends, cache_default_alias, resolved.cache_policy, control);
     }
 
     /// Lazy, single-flight component runtime. The handle pins both sessions,
@@ -7689,7 +7784,7 @@ pub const ModelManager = struct {
         return self.acquireCompositeRuntimeWithPreferredBackends(
             model_dir,
             component_paths,
-            self.defaultCompositeBackends(model_dir),
+            self.defaultModelBackends(model_dir),
             if (kind == .seq2seq) .rewriter else .transcriber,
             kind,
             control,
@@ -7707,7 +7802,7 @@ pub const ModelManager = struct {
         return self.acquireCompositeRuntimeWithPreferredBackends(
             model_dir,
             component_paths,
-            self.defaultCompositeBackends(model_dir),
+            self.defaultModelBackends(model_dir),
             model_type,
             kind,
             control,
@@ -7839,13 +7934,7 @@ pub const ModelManager = struct {
     /// Acquire a model for the duration of one operation. The returned handle
     /// prevents eviction until release.
     pub fn acquireFromDir(self: *ModelManager, model_dir: []const u8) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            self.session_manager.preferred_backends,
-            true,
-            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
-            null,
-        );
+        return self.acquireResolvedModel(model_dir, .{}, true, null);
     }
 
     pub fn acquireFromDirWithControl(
@@ -7853,13 +7942,7 @@ pub const ModelManager = struct {
         model_dir: []const u8,
         control: InferenceExecutionControl,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            self.session_manager.preferred_backends,
-            true,
-            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
-            control,
-        );
+        return self.acquireResolvedModel(model_dir, .{}, true, control);
     }
 
     pub fn acquireFromDirWithPreferredBackends(
@@ -7868,13 +7951,7 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            preferred_backends,
-            cache_default_alias,
-            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
-            null,
-        );
+        return self.acquireResolvedModel(model_dir, .{ .preferred_backends = preferred_backends }, cache_default_alias, null);
     }
 
     pub fn acquireFromDirWithPreferredBackendsAndControl(
@@ -7884,20 +7961,14 @@ pub const ModelManager = struct {
         cache_default_alias: bool,
         control: InferenceExecutionControl,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            preferred_backends,
-            cache_default_alias,
-            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
-            control,
-        );
+        return self.acquireResolvedModel(model_dir, .{ .preferred_backends = preferred_backends }, cache_default_alias, control);
     }
 
     /// Explicit GLiNER precision is immutable and part of both the resident
     /// variant and in-flight load identity. Later ordinary requests may reuse
     /// the default alias published by this startup preload.
     pub fn acquireFromDirWithGlinerCudaPrecision(self: *ModelManager, model_dir: []const u8, precision: session_factory.GlinerCudaPrecision) !ModelHandle {
-        return self.loadFromDirCoordinated(model_dir, &.{.cuda}, true, .{ .gliner_cuda_precision = precision, .accept_default_alias = false }, null);
+        return self.acquireResolvedModel(model_dir, .{ .preferred_backends = &.{.cuda}, .gliner_cuda_precision = precision }, true, null);
     }
 
     /// Acquire a model using an immutable A4B policy for this load. Explicit
@@ -7911,13 +7982,7 @@ pub const ModelManager = struct {
         model_dir: []const u8,
         a4b_request: backend_contracts.A4bInferenceRequest,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            self.session_manager.preferred_backends,
-            true,
-            .{ .a4b_request = a4b_request, .accept_default_alias = false },
-            null,
-        );
+        return self.acquireResolvedModel(model_dir, .{ .a4b_request = a4b_request }, true, null);
     }
 
     pub fn acquireFromDirWithA4bRequestAndControl(
@@ -7926,13 +7991,7 @@ pub const ModelManager = struct {
         a4b_request: backend_contracts.A4bInferenceRequest,
         control: InferenceExecutionControl,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            self.session_manager.preferred_backends,
-            true,
-            .{ .a4b_request = a4b_request, .accept_default_alias = false },
-            control,
-        );
+        return self.acquireResolvedModel(model_dir, .{ .a4b_request = a4b_request }, true, control);
     }
 
     pub fn acquireFromDirWithPreferredBackendsAndA4bRequest(
@@ -7942,13 +8001,7 @@ pub const ModelManager = struct {
         cache_default_alias: bool,
         a4b_request: backend_contracts.A4bInferenceRequest,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            preferred_backends,
-            cache_default_alias,
-            .{ .a4b_request = a4b_request, .accept_default_alias = false },
-            null,
-        );
+        return self.acquireResolvedModel(model_dir, .{ .preferred_backends = preferred_backends, .a4b_request = a4b_request }, cache_default_alias, null);
     }
 
     pub fn acquireFromDirWithPreferredBackendsAndA4bRequestAndControl(
@@ -7959,13 +8012,7 @@ pub const ModelManager = struct {
         a4b_request: backend_contracts.A4bInferenceRequest,
         control: InferenceExecutionControl,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(
-            model_dir,
-            preferred_backends,
-            cache_default_alias,
-            .{ .a4b_request = a4b_request, .accept_default_alias = false },
-            control,
-        );
+        return self.acquireResolvedModel(model_dir, .{ .preferred_backends = preferred_backends, .a4b_request = a4b_request }, cache_default_alias, control);
     }
 
     /// Compatibility API for offline tools that keep a raw model pointer. Such
@@ -8630,7 +8677,7 @@ pub const ModelManager = struct {
                     // separate pathname check leaves a replacement window.
                     try man.verifyBoundarySidecar("tokenizer.json", bytes);
                     break :blk try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(self.allocator, bytes, .{ .strict_unigram_normalizer = true });
-                } else if (man.gliner_architecture == .span and man.gliner_span_declared) blk: {
+                } else if (man.gliner_architecture == .span and (man.gliner_span_declared or man.gliner_specialty_profile != null)) blk: {
                     const path = man.tokenizer_json_path orelse return error.NoTokenizerFound;
                     const bytes = try c_file.readFileMax(self.allocator, path, 32 * 1024 * 1024);
                     defer self.allocator.free(bytes);
@@ -8639,7 +8686,9 @@ pub const ModelManager = struct {
                         if (digest.size_bytes != expected.size_bytes or !std.mem.eql(u8, &digest.sha256, &expected.sha256))
                             return error.GlinerDecisionArtifactMismatch;
                     } else return error.MissingGlinerDecisionIdentity;
-                    const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(self.allocator, bytes);
+                    const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(self.allocator, bytes, .{
+                        .strict_unigram_normalizer = man.gliner_specialty_profile != null,
+                    });
                     gliner_span_tokenizer_digest = digest;
                     break :blk tokenizer;
                 } else try loadHuggingFaceTokenizerFromManifest(self.allocator, &man);
@@ -10457,7 +10506,55 @@ fn estimateModelLoadAdmission(
         session_factory.metalDebertaFastPathAdmissionAmounts(man)
     else
         runtime.tier.memory.AdmissionAmounts{};
-    return nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
+    var plan = try nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
+    if (backend_runtime.backend == .metal) {
+        const host_source_bytes = metalQualifiedSpecialtyF32HostSourceBytes(man, weights);
+        try addMetalResidentHostSource(&plan, host_source_bytes);
+    }
+    return plan;
+}
+
+/// Exact specialty sessions borrow their immutable F32 safetensors while
+/// installing Metal mirrors. The lazy tier cache retains those source pages
+/// after construction, so reserve them with the model rather than letting the
+/// first request discover host pressure through a cache credit that cannot
+/// evict another idle model. Size is only a cheap admission prefilter; session
+/// construction still authenticates the complete weight digest and F32 tensor
+/// inventory before execution.
+fn metalQualifiedSpecialtyF32HostSourceBytes(
+    man: manifest_mod.ModelManifest,
+    artifact_bytes: usize,
+) usize {
+    const declared = man.gliner_specialty_profile orelse return 0;
+    const artifact_kind = man.nativeWeightArtifactKind() orelse return 0;
+    if (man.gliner_architecture != .span or
+        man.gliner_span_encoder_family != .deberta or
+        artifact_kind != .safetensors or
+        man.safetensors_index_path != null)
+    {
+        return 0;
+    }
+    const size_profile = gliner_specialty.profileForWeightSize(
+        std.math.cast(u64, artifact_bytes) orelse return 0,
+    ) orelse return 0;
+    return if (size_profile == declared) artifact_bytes else 0;
+}
+
+fn addMetalResidentHostSource(plan: *ModelLoadAdmissionPlan, bytes: usize) !void {
+    if (bytes == 0) return;
+    const resident_host = std.math.add(
+        usize,
+        plan.resident.host_weight_bytes,
+        bytes,
+    ) catch return error.ResourceLimitExceeded;
+    // Preserve the existing import staging above the newly resident source.
+    const peak_host = std.math.add(
+        usize,
+        plan.peak.host_weight_bytes,
+        bytes,
+    ) catch return error.ResourceLimitExceeded;
+    plan.resident.host_weight_bytes = resident_host;
+    plan.peak.host_weight_bytes = peak_host;
 }
 
 fn a4bGpuModelLoadAdmission(
@@ -13122,6 +13219,106 @@ test "gpu model admission classifies weights and persistent scratch" {
     try std.testing.expectEqual(extra_backend_resident.backend_scratch_bytes, metal.resident.backend_scratch_bytes);
 }
 
+test "qualified F32 GLiNER specialty Metal admission retains host source without broadening generic models" {
+    const pii_bytes: usize = @intCast(gliner_specialty.pii_weight.size_bytes);
+    const guard_bytes: usize = @intCast(gliner_specialty.gliguard_weight.size_bytes);
+    const specialty = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .safetensors_path = "model.safetensors",
+        .gliner_architecture = .span,
+        .gliner_span_encoder_family = .deberta,
+        .gliner_specialty_profile = .pii,
+    };
+    try std.testing.expectEqual(pii_bytes, metalQualifiedSpecialtyF32HostSourceBytes(specialty, pii_bytes));
+    try std.testing.expectEqual(@as(usize, 0), metalQualifiedSpecialtyF32HostSourceBytes(specialty, guard_bytes));
+
+    var guard = specialty;
+    guard.gliner_specialty_profile = .gliguard;
+    try std.testing.expectEqual(guard_bytes, metalQualifiedSpecialtyF32HostSourceBytes(guard, guard_bytes));
+
+    var generic = specialty;
+    generic.gliner_specialty_profile = null;
+    try std.testing.expectEqual(@as(usize, 0), metalQualifiedSpecialtyF32HostSourceBytes(generic, pii_bytes));
+    var legacy_decide = specialty;
+    legacy_decide.gliner_specialty_profile = null;
+    legacy_decide.gliner_span_declared = true;
+    try std.testing.expectEqual(@as(usize, 0), metalQualifiedSpecialtyF32HostSourceBytes(legacy_decide, pii_bytes));
+    var reduced = specialty;
+    reduced.safetensors_path = null;
+    reduced.gguf_path = "model.gguf";
+    try std.testing.expectEqual(@as(usize, 0), metalQualifiedSpecialtyF32HostSourceBytes(reduced, pii_bytes));
+
+    var plan = try nativeModelLoadAdmission(1024, .metal, .{ .backend_scratch_bytes = 64 });
+    const old_peak_host = plan.peak.host_weight_bytes;
+    try addMetalResidentHostSource(&plan, pii_bytes);
+    try std.testing.expectEqual(pii_bytes, plan.resident.host_weight_bytes);
+    try std.testing.expectEqual(old_peak_host + pii_bytes, plan.peak.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 64), plan.resident.backend_scratch_bytes);
+
+    var overflow = ModelLoadAdmissionPlan{
+        .peak = .{ .host_weight_bytes = std.math.maxInt(usize) },
+        .resident = .{},
+    };
+    try std.testing.expectError(error.ResourceLimitExceeded, addMetalResidentHostSource(&overflow, 1));
+    try std.testing.expectEqual(@as(usize, 0), overflow.resident.host_weight_bytes);
+    try std.testing.expectEqual(std.math.maxInt(usize), overflow.peak.host_weight_bytes);
+}
+
+test "specialty Metal host baseline evicts prior model and avoids lazy cache double charge" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.initWithRuntimeEpoch(
+        allocator,
+        .{ .allocator = allocator, .preferred_backends = &.{.metal} },
+        0x51ec,
+    );
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+
+    // Build a lifecycle-complete idle model, then replace its fixture CPU
+    // lease with the GPU-host residency used by a Metal specialty source.
+    var pii_probe = TeardownTestProbe{};
+    const pii = try teardownTestModel(&manager, &pii_probe);
+    pii.resource_lease.?.release();
+    pii.resource_lease = try manager.acquireAmountsWithEviction(
+        .gpu,
+        .{ .host_limit_bytes = 64 },
+        .{ .host_weight_bytes = 64 },
+    );
+    pii.active_handles = 0;
+    pii.last_used_ns = 1;
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "specialty-pii-metal"), pii);
+
+    // A second qualified model cannot share this deliberately tiny host
+    // domain. Acquiring its model-owned source reservation must evict PII
+    // before any request-time lazy tensor asks the tier cache for credit.
+    var guard_lease = try manager.acquireAmountsWithEviction(
+        .gpu,
+        .{ .host_limit_bytes = 64 },
+        .{ .host_weight_bytes = 64 },
+    );
+    defer guard_lease.release();
+    try std.testing.expect(pii_probe.closed);
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 64), manager.admissionController().snapshot().host_weight_bytes);
+
+    // The session tier cache receives the same resident amount as its baseline.
+    // Materializing the complete borrowed F32 source therefore owns no second
+    // aggregate credit and remains admissible after the eviction transition.
+    var cache = runtime.tier.cache.SharedCache.init(.{ .host_limit_bytes = 64 });
+    defer cache.deinitAdmission();
+    try cache.configureAdmission(
+        allocator,
+        manager.admissionController(),
+        .gpu,
+        .{ .host_limit_bytes = 64 },
+        .{ .host_limit_bytes = 64 },
+    );
+    try cache.reserve(.host, 64);
+    try std.testing.expectEqual(@as(usize, 64), manager.admissionController().snapshot().host_weight_bytes);
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, cache.admissionAmounts());
+    cache.noteRelease(.host, 64);
+}
+
 test "projector residency follows its request-scoped lifecycle" {
     const allocator = std.testing.allocator;
     var dir = std.testing.tmpDir(.{});
@@ -15064,13 +15261,17 @@ test "memory admission diagnostics retain pressure and recover after release" {
     try std.testing.expectEqual(@as(u64, 30), denied.requested_host_bytes);
     try std.testing.expectEqual(@as(u64, 80), denied.admitted_host_bytes);
     try std.testing.expectEqual(@as(u64, 100), denied.host_limit_bytes);
+    for (0..64) |_| {
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireAmountsWithEviction(.cpu, limits, .{ .host_scratch_bytes = 30 }));
+    }
+    try std.testing.expectEqual(@as(u64, 65), manager.memoryAdmissionDiagnostic().denied_count);
     held.release();
     var recovered = try manager.acquireAmountsWithEviction(.cpu, limits, .{ .host_scratch_bytes = 30 });
     recovered.release();
     try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
     // The last denial remains observable after recovery; its timestamp/count
     // distinguish it from the current request and survive DB snapshot refresh.
-    try std.testing.expectEqual(denied.denied_count, manager.memoryAdmissionDiagnostic().denied_count);
+    try std.testing.expectEqual(@as(u64, 65), manager.memoryAdmissionDiagnostic().denied_count);
 }
 
 /// Planning does not construct a device. Execution validates its actual identity
@@ -15358,4 +15559,172 @@ test "integrated CUDA combined override constrains simultaneous CPU and GPU leas
     var cpu = try controller.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = limit / 2 + 1 }, false);
     defer cpu.release();
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.gpu, .{}, .{ .backend_weight_bytes = limit / 2 + 1 }, false));
+}
+
+test "startup load policy survives LRU eviction and explicit acquisitions stay separate" {
+    const allocator = std.testing.allocator;
+    var first = std.testing.tmpDir(.{});
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{});
+    defer second.cleanup();
+    try writeCancellationTestModel(first.dir, allocator);
+    try writeCancellationTestModel(second.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", first.sub_path[0..] });
+    defer allocator.free(root);
+    const peer = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", second.sub_path[0..] });
+    defer allocator.free(peer);
+    // A policy-free reload cannot use the global preference on this CPU fixture.
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.cuda} });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    manager.configureModelCache(0, 1);
+    try manager.setStartupLoadPolicy(root, .{ .backend = .native });
+    var loaded = try manager.acquireFromDir(root);
+    const first_id = loaded.get().runtime_id;
+    try std.testing.expect(!loaded.get().pinned);
+    try std.testing.expectEqual(backends.BackendType.native, loaded.get().session.backend());
+    loaded.release();
+    var other = try manager.acquireFromDirWithPreferredBackends(peer, &.{.native}, false);
+    other.release();
+    var reloaded = try manager.acquireFromDirWithControl(root, .{});
+    defer reloaded.release();
+    try std.testing.expect(first_id != reloaded.get().runtime_id);
+    try std.testing.expectEqual(backends.BackendType.native, reloaded.get().session.backend());
+    var metadata = (try manager.acquireCachedFromDir(root)).?;
+    defer metadata.release();
+    try std.testing.expectEqual(reloaded.get().runtime_id, metadata.get().runtime_id);
+    // An explicitly different backend cannot consume the configured alias.
+    manager.lockLoadedModels();
+    const explicit_cuda = try manager.lookupLoadedModelLocked(root, &.{.cuda}, true, inheritedA4bCachePolicy(null, true));
+    manager.unlockLoadedModels();
+    try std.testing.expect(explicit_cuda == null);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.native}, manager.defaultModelBackends(root));
+}
+
+test "startup load policy owns directory keys and preserves precision and A4B selection" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    var dir = [_]u8{ 'm', 'o', 'd', 'e', 'l' };
+    try manager.setStartupLoadPolicy(&dir, .{ .backend = .cuda, .gliner_cuda_precision = .bf16 });
+    dir[0] = 'X';
+    const policy = manager.startupLoadPolicy("model");
+    try std.testing.expectEqual(backends.BackendType.cuda, policy.backend.?);
+    try std.testing.expectEqual(session_factory.GlinerCudaPrecision.bf16, policy.gliner_cuda_precision.?);
+    const default_precision = manager.defaultModelLoadPolicy("model");
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.cuda}, default_precision.preferred_backends);
+    try std.testing.expectEqual(session_factory.GlinerCudaPrecision.bf16, default_precision.cache_policy.gliner_cuda_precision.?);
+    try std.testing.expect(!default_precision.cache_policy.accept_default_alias);
+    // Updating policy never aliases the caller's buffer or drops key ownership.
+    try manager.setStartupLoadPolicy("model", .{ .backend = .native, .a4b_request = .{ .residency_mode = .streamed, .memory_budget_mb = 4096 } });
+    const updated = manager.startupLoadPolicy("model");
+    try std.testing.expect(updated.gliner_cuda_precision == null);
+    try std.testing.expectEqual(backend_contracts.A4bResidencyMode.streamed, updated.a4b_request.?.residency_mode);
+    try std.testing.expectEqual(@as(u32, 4096), updated.a4b_request.?.memory_budget_mb);
+    try std.testing.expectEqualDeep(updated.a4b_request, manager.defaultModelLoadPolicy("model").cache_policy.a4b_request);
+}
+
+fn loadPolicySelectionTestModel(runtime_id: RuntimeId) LoadedModel {
+    const Stub = struct {
+        var probe: TeardownTestProbe = .{};
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .cuda;
+        }
+        const vtable = blk: {
+            var table = TeardownTestProbe.vtable;
+            table.backend = backend;
+            break :blk table;
+        };
+    };
+    var model = admissionEvictionTestModel(0);
+    model.session = .{ .ptr = &Stub.probe, .vtable = &Stub.vtable };
+    model.runtime_id = runtime_id;
+    return model;
+}
+
+fn deinitLoadPolicySelectionTestManager(manager: *ModelManager) void {
+    // These are borrowed metadata-only models. No driver/session is entered.
+    var loaded = manager.loaded.keyIterator();
+    while (loaded.next()) |key| manager.allocator.free(key.*);
+    manager.loaded.deinit(manager.allocator);
+    var aliases = manager.loaded_aliases.keyIterator();
+    while (aliases.next()) |key| manager.allocator.free(key.*);
+    manager.loaded_aliases.deinit(manager.allocator);
+    var policies = manager.startup_load_policies.keyIterator();
+    while (policies.next()) |key| manager.allocator.free(key.*);
+    manager.startup_load_policies.deinit(manager.allocator);
+    manager.in_flight_loads.deinit(manager.allocator);
+}
+
+fn expectLoadPolicySelection(handle: ModelHandle, expected: RuntimeId) !void {
+    var owned = handle;
+    defer owned.release();
+    try std.testing.expectEqual(expected, owned.get().runtime_id);
+}
+
+test "explicit load policy placement preserves configured A4B variants with and without aliases" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.cuda} });
+    defer deinitLoadPolicySelectionTestManager(&manager);
+    const configured_request = backend_contracts.A4bInferenceRequest{ .residency_mode = .resident, .memory_budget_mb = 20480, .load_workers = 8, .load_staging_mb = 512 };
+    const override_request = backend_contracts.A4bInferenceRequest{ .residency_mode = .resident, .memory_budget_mb = 24576, .load_workers = 4 };
+    try manager.setStartupLoadPolicy("model", .{ .backend = .cuda, .a4b_request = configured_request });
+    var configured = loadPolicySelectionTestModel(1);
+    var unqualified = loadPolicySelectionTestModel(2);
+    var overridden = loadPolicySelectionTestModel(3);
+    try manager.loaded.put(a, try backendVariantCacheKey(a, "model", .cuda, configured_request), &configured);
+    try manager.loaded.put(a, try backendVariantCacheKey(a, "model", .cuda, null), &unqualified);
+    try manager.loaded.put(a, try backendVariantCacheKey(a, "model", .cuda, override_request), &overridden);
+    try manager.loaded_aliases.put(a, try a.dupe(u8, "model"), &configured);
+    for (0..2) |phase| {
+        if (phase == 1) {
+            const alias = manager.loaded_aliases.fetchRemove("model").?;
+            a.free(alias.key);
+        }
+        try expectLoadPolicySelection(try manager.acquireFromDir("model"), 1);
+        try expectLoadPolicySelection(try manager.acquireFromDirWithControl("model", .{}), 1);
+        try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackends("model", &.{.cuda}, false), 1);
+        try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackendsAndControl("model", &.{.cuda}, false, .{}), 1);
+        try expectLoadPolicySelection((try manager.acquireCachedFromDir("model")).?, 1);
+        // A real policy override remains exact, regardless of the default alias.
+        try expectLoadPolicySelection(try manager.acquireFromDirWithA4bRequest("model", override_request), 3);
+        try expectLoadPolicySelection(try manager.acquireFromDirWithA4bRequestAndControl("model", override_request, .{}), 3);
+        try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackendsAndA4bRequest("model", &.{.cuda}, false, override_request), 3);
+        try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackendsAndA4bRequestAndControl("model", &.{.cuda}, false, override_request, .{}), 3);
+    }
+    const automatic = manager.resolveModelLoadPolicy("model", .{});
+    const explicit = manager.resolveModelLoadPolicy("model", .{ .preferred_backends = &.{.cuda} });
+    try std.testing.expectEqualDeep(automatic.cache_policy, explicit.cache_policy);
+    const auto_flight = try manager.loadFlightKey("model", automatic.preferred_backends, false, automatic.cache_policy);
+    defer a.free(auto_flight);
+    const explicit_flight = try manager.loadFlightKey("model", explicit.preferred_backends, false, explicit.cache_policy);
+    defer a.free(explicit_flight);
+    try std.testing.expectEqualStrings(auto_flight, explicit_flight);
+}
+
+test "explicit load policy placement retains configured GLiNER precision and honors an explicit precision override" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.cuda} });
+    defer deinitLoadPolicySelectionTestManager(&manager);
+    try manager.setStartupLoadPolicy("model", .{ .backend = .cuda, .gliner_cuda_precision = .bf16 });
+    var configured = loadPolicySelectionTestModel(1);
+    var unqualified = loadPolicySelectionTestModel(2);
+    var overridden = loadPolicySelectionTestModel(3);
+    try manager.loaded.put(a, try backendVariantCacheKeyWithPrecision(a, "model", .cuda, null, .bf16), &configured);
+    try manager.loaded.put(a, try backendVariantCacheKeyWithPrecision(a, "model", .cuda, null, null), &unqualified);
+    try manager.loaded.put(a, try backendVariantCacheKeyWithPrecision(a, "model", .cuda, null, .fp32), &overridden);
+    try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackends("model", &.{.cuda}, false), 1);
+    try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackendsAndControl("model", &.{.cuda}, false, .{}), 1);
+    try expectLoadPolicySelection(try manager.acquireFromDirWithGlinerCudaPrecision("model", .fp32), 3);
+}
+
+test "explicit load policy resolves global model and call precedence before any model is resident" {
+    var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{ .native, .cuda }, .a4b_inference_request = .{ .memory_budget_mb = 16384 } });
+    defer manager.deinit();
+    try manager.setStartupLoadPolicy("model", .{ .backend = .cuda, .a4b_request = .{ .memory_budget_mb = 20480 } });
+    try std.testing.expectEqual(@as(u32, 16384), manager.resolveModelLoadPolicy("other", .{}).cache_policy.a4b_request.?.memory_budget_mb);
+    const explicit = manager.resolveModelLoadPolicy("model", .{ .preferred_backends = &.{.metal} });
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.metal}, explicit.preferred_backends);
+    try std.testing.expectEqual(@as(u32, 20480), explicit.cache_policy.a4b_request.?.memory_budget_mb);
+    const override = manager.resolveModelLoadPolicy("model", .{ .a4b_request = .{ .memory_budget_mb = 24576 } });
+    try std.testing.expectEqual(@as(u32, 24576), override.cache_policy.a4b_request.?.memory_budget_mb);
 }

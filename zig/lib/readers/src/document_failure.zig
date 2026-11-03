@@ -38,7 +38,7 @@ const terminal = .{
     error.CloudflareAuthenticationFailed,     error.InvalidExtractorResponse,
     error.UnsupportedExtractionSchemaVersion, error.InvalidInferenceRequest,
     error.InferenceEndpointAccessDenied,      error.DocumentArtifactNotFound,
-    error.DocumentArtifactExpired,
+    error.DocumentArtifactExpired,            error.ReadOutputTruncated,
 };
 const transient = .{
     error.CloudflareRateLimited,        error.InferenceUpstreamRateLimited,
@@ -59,6 +59,8 @@ pub fn recognized(a: A, body: []const u8) ?Failure {
     if (body.len > 4096) return null;
     var parsed = std.json.parseFromSlice(struct { @"error": []const u8 = "" }, a, body, .{ .ignore_unknown_fields = true, .duplicate_field_behavior = .@"error" }) catch return null;
     defer parsed.deinit();
+    // /read's image endpoint predates the native error-name envelope.
+    if (std.mem.eql(u8, parsed.value.@"error", "OUTPUT_TRUNCATED")) return fromError(error.ReadOutputTruncated);
     inline for (terminal ++ transient) |err| if (std.mem.eql(u8, parsed.value.@"error", @errorName(err))) return fromError(err);
     return null;
 }

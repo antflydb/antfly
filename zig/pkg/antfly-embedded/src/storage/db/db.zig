@@ -5276,6 +5276,9 @@ pub const DB = struct {
             .text_merge_runtime = null,
         };
         self.core.index_manager.setRelationalBaseRows(self.async_context.relational_base_rows);
+        // The async context outlives every index and tracks the attached
+        // enrichment runtime, so it is the re-embedder's stable context.
+        self.core.index_manager.dense_reembedder = .{ .ctx = self.async_context, .embed_fn = reembedDenseForIndexManager };
         self.executor.* = try derived_executor_mod.init(
             self.runtime_alloc,
             executor_config,
@@ -8701,6 +8704,7 @@ pub const DB = struct {
             };
             return self.batchInternal(.{ .sync_level = .write }, profile, control_opts);
         }
+        if (req.leann_record != null) return self.applyLeannRecordBatch(req, opts);
         if (req.merge_proof_adoption != null) return self.applyMergeProofAdoptionBatch(req, opts);
         if (req.artifact_catalog != null and req.online_source == null and req.merge_checkpoint == null) return self.applyArtifactCatalogBatch(req, opts);
         if (req.artifact_publication != null) return self.applyArtifactPublicationBatch(req, opts);
@@ -21400,6 +21404,9 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.index_manager.syncAll(force);
+        // Transient LEANN (local mode): stored vectors the just-synced graphs
+        // cover become stubs, under the apply lock that orders primary writes.
+        try self.core.index_manager.elideLocalLeannVectors();
     }
 
     pub const PreparedMergeArtifacts = local_mutation.PreparedMergeArtifacts;
@@ -25562,7 +25569,7 @@ pub const DB = struct {
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
-            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
+            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
             scope: ?@import("online_source_contract.zig").Scope = null,
         }, alloc, request_json, .{});
         defer request.deinit();
@@ -25681,6 +25688,23 @@ pub const DB = struct {
                 var read = try self.core.store.beginProbeTxn();
                 defer read.abort();
                 try @import("relational_integrity_json.zig").write(try @import("empty_generation_handoff.zig").loadInstallReceipt(&read), &stream);
+            },
+            .leann_plan => {
+                const proposals = try self.planLeannRecords(alloc);
+                defer index_manager_mod.IndexManager.freeLeannProposals(alloc, proposals);
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                const a = arena.allocator();
+                const out = try a.alloc(types.LeannPlanStatus.Proposal, proposals.len);
+                for (proposals, out) |p, *o| {
+                    const encoded = try a.alloc([]const u8, p.records.len);
+                    for (p.records, encoded) |record, *e| {
+                        const buf = try a.alloc(u8, std.base64.standard.Encoder.calcSize(record.len));
+                        e.* = std.base64.standard.Encoder.encode(buf, record);
+                    }
+                    o.* = .{ .index_name = p.index_name, .records_base64 = encoded };
+                }
+                try stream.write(types.LeannPlanStatus{ .proposals = out });
             },
             .graph_endpoint_cleanup => {
                 if (try self.prepareGraphEndpointCleanupBatch(alloc)) |owned| {
@@ -26369,6 +26393,84 @@ pub const DB = struct {
             if (upload.action != .finalize) return error.InvalidBatchRequest;
             try @import("artifact_publication_transport.zig").stageCompletion(txn, upload.namespace, upload.publication_digest, upload.manifest_root, prepared.created_index, entry.index);
         }
+    }
+
+    /// Applies a committed LEANN record: persists it, keyed by index and Raft
+    /// index, together with the ordered apply receipt, then lets the index
+    /// manager apply persisted records in log order. A failure to apply
+    /// (for example a generation whose chunks are still arriving) does not
+    /// fail the Raft apply: the record is durable and the next drain resumes.
+    fn applyLeannRecordBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
+        try types.validateLeannRecordCommand(req);
+        const command = req.leann_record orelse return error.InvalidBatchRequest;
+        const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
+        if (entry.term == 0 or entry.index == 0 or opts.artifact_upload_finalize != null or
+            opts.extra_store_writes.len != 0 or opts.extra_store_deletes.len != 0) return error.InvalidBatchRequest;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        // Hot-standby mirrors run standalone, where LEANN stays replica-local.
+        if (self.local_execution.replication_async_batch_mirror != null) return error.UnsupportedLeannReplication;
+        if (!self.core.index_manager.leann_replication) return error.UnsupportedLeannReplication;
+
+        var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!opts.bypass_replication_write_gate) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
+        }
+        const record_key = try internal_keys.leannRecordKeyAlloc(self.alloc, command.index_name, entry.index);
+        defer self.alloc.free(record_key);
+
+        {
+            var mutation = self.core.snapshot_admission.acquireMutation();
+            defer mutation.release();
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(record_key, command.record);
+            // Elide records replace covered stored vectors by stubs here, at
+            // the same log position on every replica.
+            try self.core.index_manager.elideLeannRecordTxn(&txn, command.index_name, command.record);
+            var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_buf);
+            try txn.put(marker.key, marker.value);
+            var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
+            if (opts.replication_applied_lsn_marker) |lsn| {
+                const standby = replicationAppliedSequenceWrite(lsn, &standby_buf);
+                try txn.put(standby.key, standby.value);
+            }
+            try txn.commit();
+        }
+        self.core.index_manager.drainLeannRecords(self.core.store) catch |err| {
+            std.log.warn("leann record drain deferred index={s} raft_index={d} err={s}", .{ command.index_name, entry.index, @errorName(err) });
+        };
+    }
+
+    /// Re-embeds documents for transient LEANN indexes through the attached
+    /// enrichment runtime's document embedder. The runtime is looked up per
+    /// call, so reconfiguring or detaching it needs no extra bookkeeping.
+    fn reembedDenseForIndexManager(
+        ctx: *anyopaque,
+        alloc: std.mem.Allocator,
+        requests: []const enrichment_types.GeneratedEnrichmentRequest,
+        dims: u32,
+        out: []f32,
+        found: []bool,
+    ) anyerror!void {
+        const context: *AsyncContext = @ptrCast(@alignCast(ctx));
+        const runtime = context.enrichment_runtime orelse return error.ReembedUnavailable;
+        try enrichment_runtime_mod.reembedDenseDocuments(runtime, alloc, requests, dims, out, found);
+    }
+
+    /// Leader only: plans the next LEANN record of every replicated LEANN
+    /// index. The caller proposes each proposal's records in order as
+    /// `BatchRequest.leann_record` commands. Free with
+    /// `IndexManager.freeLeannProposals`.
+    pub fn planLeannRecords(self: *DB, alloc: std.mem.Allocator) ![]index_manager_mod.IndexManager.LeannProposal {
+        return self.core.index_manager.drainAndPlanLeannRecords(self.core.store, alloc);
     }
 
     fn applyMergeProofAdoptionBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
@@ -35728,7 +35830,15 @@ pub const DB = struct {
                 state.scanned_entries += 1;
                 try state.updateOwnedKey(&state.last_matching_key, key);
 
-                const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(state.alloc, value) catch |err| {
+                const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(state.alloc, value) catch |err| blk: {
+                    if (err == error.VectorElided and artifact_ref.source == null) {
+                        // Transient LEANN stub: re-embed the document.
+                        const stub = (try enrichment_artifact_codec.elidedDenseEmbedding(value)).?;
+                        break :blk state.db.core.index_manager.reembedElidedDocument(state.alloc, artifact_ref.name, artifact_ref.document_id, stub.dims) catch |reembed_err| switch (reembed_err) {
+                            error.NotFound => return .@"continue",
+                            else => return reembed_err,
+                        };
+                    }
                     if (isRecoverableEmbeddingArtifactError(err)) {
                         return .@"continue";
                     }
@@ -36409,7 +36519,25 @@ pub const DB = struct {
                     try self.drainScheduledTextMerges();
                     try wait.check();
                 }
+                try self.waitForLeannGraphCoverage(wait);
             },
+        }
+    }
+
+    /// Replicated LEANN graphs change only when the leader's planned records
+    /// commit, after derived replay has finished. `full_index` means the
+    /// written vectors are searchable, so wait for those records too. Never
+    /// called from Raft apply (`wait_for_sync_level` is off there), which
+    /// would block the entries this waits for.
+    fn waitForLeannGraphCoverage(self: *DB, wait: derived_executor_mod.VisibilityWait) !void {
+        const targets = try self.core.index_manager.captureLeannCoverageTargets(self.alloc);
+        defer index_manager_mod.IndexManager.freeLeannCoverageTargets(self.alloc, targets);
+        if (targets.len == 0) return;
+        const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
+        while (!self.core.index_manager.leannCoverageReached(targets)) {
+            try wait.check();
+            if (self.async_context.background_closing.load(.acquire)) return error.Canceled;
+            try io.sleep(.fromMilliseconds(5), .awake);
         }
     }
 
@@ -44556,6 +44684,11 @@ pub const DB = struct {
         };
     }
 
+    const GraphFilterMemory = struct {
+        local_budget: @import("../../graph/work_budget.zig").WorkBudget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(.{}),
+        tracked: @import("../../graph/work_budget.zig").RetainedAllocator = undefined,
+    };
+
     const AlgebraicDocFilterRequest = struct {
         req: types.SearchRequest,
         index: ?*@import("algebraic/index.zig").Index = null,
@@ -44563,6 +44696,8 @@ pub const DB = struct {
         exclude_doc_ids: [][]u8 = &.{},
         resolved_doc_filter: ?*doc_set.ResolvedDocFilter = null,
         resolved_doc_filter_alloc: ?Allocator = null,
+        graph_memory: ?*GraphFilterMemory = null,
+        graph_memory_alloc: ?Allocator = null,
 
         pub fn deinit(self: *@This()) void {
             if (self.index) |index| {
@@ -44573,6 +44708,10 @@ pub const DB = struct {
                 const alloc = self.resolved_doc_filter_alloc.?;
                 filter.deinit(alloc);
                 alloc.destroy(filter);
+            }
+            if (self.graph_memory) |memory| {
+                std.debug.assert(memory.tracked.live_bytes == 0);
+                self.graph_memory_alloc.?.destroy(memory);
             }
             self.* = undefined;
         }
@@ -46020,6 +46159,7 @@ pub const DB = struct {
         try self.requireGraphEndpointCleanupReady();
         const predicate_aware = graphRequestRequiresAdmission(req, named.query.params.node_filter);
         var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name, named.query.params.node_filter);
+        admission.req.graph_work_budget = budgets.work;
         defer admission.deinit();
         var execution = GraphPredicateExecutionContext{
             .db = self,
@@ -46167,6 +46307,7 @@ pub const DB = struct {
     ) !types.GraphSearchResult {
         const predicate_aware = graphRequestRequiresAdmission(req, named.query.params.node_filter);
         var admission = GraphNodeAdmissionCache.init(self, alloc, req, named.query.index_name, named.query.params.node_filter);
+        admission.req.graph_work_budget = budgets.work;
         defer admission.deinit();
         var execution = GraphPredicateExecutionContext{
             .db = self,
@@ -46254,12 +46395,68 @@ pub const DB = struct {
         }
     };
 
+    /// Resolve analyzed graph predicates with retrieval's native index planner.
+    /// Stored-document matching cannot reproduce an index's analyzer. Preserve
+    /// any pre-resolved row authorization when intersecting the new predicate.
+    fn graphRequestWithIndexedFilterAlloc(self: *DB, req: types.SearchRequest) !AlgebraicDocFilterRequest {
+        var needs_index = false;
+        for ([_][]const u8{ req.filter_query_json, req.exclusion_query_json }) |json| {
+            if (json.len == 0) continue;
+            var local_budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(req.graph_execution_limits);
+            var workspace = @import("../../graph/work_budget.zig").RetainedAllocator{ .backing = self.alloc, .budget = req.graph_work_budget orelse &local_budget };
+            var parsed = std.json.parseFromSlice(std.json.Value, workspace.allocator(), json, .{}) catch |err| return if (err == error.OutOfMemory and workspace.denied) error.GraphWorkBudgetExceeded else err;
+            defer parsed.deinit();
+            needs_index = needs_index or try db_query_search.patternFilterContainsMatch(parsed.value, 0);
+        }
+        if (!needs_index) return .{ .req = req };
+        const memory = try self.alloc.create(GraphFilterMemory);
+        memory.* = .{ .local_budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(req.graph_execution_limits) };
+        memory.tracked = .{ .backing = self.alloc, .budget = req.graph_work_budget orelse &memory.local_budget };
+        var native = AlgebraicDocFilterRequest{ .req = req, .graph_memory = memory, .graph_memory_alloc = self.alloc };
+        errdefer native.deinit();
+        self.prepareGraphIndexedFilter(&native, req) catch |err| return if (err == error.OutOfMemory and memory.tracked.denied) error.GraphWorkBudgetExceeded else err;
+        return native;
+    }
+
+    fn prepareGraphIndexedFilter(self: *DB, native: *AlgebraicDocFilterRequest, req: types.SearchRequest) !void {
+        const a = native.graph_memory.?.tracked.allocator();
+        const filter = try a.create(doc_set.ResolvedDocFilter);
+        filter.* = .{};
+        native.resolved_doc_filter = filter;
+        native.resolved_doc_filter_alloc = a;
+        const executor = db_query_search.StructuredFilterResolverExecutor{
+            .ctx = self,
+            .text_index_entry = textIndexEntryCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .identity_read_generation = req.identity_read_generation,
+        };
+        if (req.filter_query_json.len > 0) filter.include = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.filter_query_json);
+        if (req.exclusion_query_json.len > 0) filter.exclude = try db_query_search.graphIndexedPredicateAlloc(a, req, executor, req.exclusion_query_json);
+        if (req.resolved_doc_filter) |raw| {
+            const prior: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(raw));
+            var include = (try doc_set.intersectAlloc(a, &prior.include, &filter.include)) orelse return error.UnsupportedQueryRequest;
+            errdefer include.deinit(a);
+            const exclude = (try doc_set.unionAlloc(a, &prior.exclude, &filter.exclude)) orelse return error.UnsupportedQueryRequest;
+            filter.include.deinit(a);
+            filter.exclude.deinit(a);
+            filter.include = include;
+            filter.exclude = exclude;
+        }
+        native.req.filter_query_json = "";
+        native.req.exclusion_query_json = "";
+        native.req.resolved_doc_filter = filter;
+        native.req.resolved_doc_filter_owned = false;
+    }
+
     fn filterGraphKeysWithOrdinalsAlloc(
         self: *DB,
         alloc: Allocator,
-        req: types.SearchRequest,
+        original_req: types.SearchRequest,
         keys: []const []const u8,
     ) !GraphKeyAdmission {
+        var indexed_filter = try self.graphRequestWithIndexedFilterAlloc(original_req);
+        defer indexed_filter.deinit();
+        const req = indexed_filter.req;
         const ordinals = try self.lookupLiveDocOrdinalsNoLock(
             alloc,
             keys,
@@ -46376,6 +46573,8 @@ pub const DB = struct {
         external_targets: bool,
         node_filter: graph_pattern_mod.NodeFilter,
         prepared_filters: db_query_graph.PreparedPatternFilterCache,
+        indexed_node_filter: ?AlgebraicDocFilterRequest = null,
+        indexed_request_filter: ?AlgebraicDocFilterRequest = null,
         decisions: std.StringHashMapUnmanaged(bool) = .empty,
 
         fn init(
@@ -46403,6 +46602,8 @@ pub const DB = struct {
             while (it.next()) |key| self.alloc.free(key.*);
             self.decisions.deinit(self.alloc);
             self.prepared_filters.deinit();
+            if (self.indexed_node_filter) |*filter| filter.deinit();
+            if (self.indexed_request_filter) |*filter| filter.deinit();
             self.* = undefined;
         }
 
@@ -46420,6 +46621,8 @@ pub const DB = struct {
             nodes: []const GraphNodeRef,
         ) anyerror![]bool {
             const self: *GraphNodeAdmissionCache = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const control = @import("../../search/query.zig").ExecutionControl{ .cancellation = self.req.cancellation, .deadline_ns = self.req.execution_deadline_ns };
+            try control.check();
             const result = try result_alloc.alloc(bool, nodes.len);
             errdefer result_alloc.free(result);
 
@@ -46445,9 +46648,10 @@ pub const DB = struct {
             }
 
             if (missing_keys.items.len > 0) {
+                if (self.indexed_request_filter == null) self.indexed_request_filter = try self.db.graphRequestWithIndexedFilterAlloc(self.req);
                 const missing_mask = try self.db.filterGraphKeysAlloc(
                     result_alloc,
-                    self.req,
+                    self.indexed_request_filter.?.req,
                     missing_keys.items,
                 );
                 defer result_alloc.free(missing_mask);
@@ -46474,19 +46678,32 @@ pub const DB = struct {
                         try query_positions.append(result_alloc, i);
                     }
                     if (query_keys.items.len > 0) {
-                        const loaded = try loadStoredSearchDocumentsMany(
-                            self.db,
-                            result_alloc,
-                            query_keys.items,
-                            null,
-                        );
-                        defer freeOptionalOwnedBytes(result_alloc, loaded);
-                        const prepared = try self.prepared_filters.getOrPrepare(filter_query_json);
-                        for (query_keys.items, query_positions.items, loaded) |key, position, maybe_stored| {
-                            missing_mask[position] = if (maybe_stored) |stored|
-                                try prepared.matchesStored(result_alloc, key, stored)
-                            else
-                                false;
+                        if (self.indexed_node_filter == null) {
+                            var filter_req = self.req;
+                            filter_req.filter_query_json = filter_query_json;
+                            filter_req.exclusion_query_json = "";
+                            filter_req.resolved_doc_filter = null;
+                            self.indexed_node_filter = try self.db.graphRequestWithIndexedFilterAlloc(filter_req);
+                        }
+                        if (self.indexed_node_filter.?.resolved_doc_filter != null) {
+                            const mask = try self.db.filterGraphKeysAlloc(result_alloc, self.indexed_node_filter.?.req, query_keys.items);
+                            defer result_alloc.free(mask);
+                            for (query_positions.items, mask) |position, allowed| missing_mask[position] = allowed;
+                        } else {
+                            const loaded = try loadStoredSearchDocumentsMany(
+                                self.db,
+                                result_alloc,
+                                query_keys.items,
+                                null,
+                            );
+                            defer freeOptionalOwnedBytes(result_alloc, loaded);
+                            const prepared = try self.prepared_filters.getOrPrepare(filter_query_json);
+                            for (query_keys.items, query_positions.items, loaded) |key, position, maybe_stored| {
+                                missing_mask[position] = if (maybe_stored) |stored|
+                                    try prepared.matchesStored(result_alloc, key, stored)
+                                else
+                                    false;
+                            }
                         }
                     }
                 }
@@ -55136,6 +55353,19 @@ fn replayPendingDerivedBatches(
             .index_name = index_ref.name,
             .last_log_ns = monotonicTimeNs(),
         };
+        const replay_state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
+        const replay_lane: usize = switch (index_ref.kind) {
+            .full_text => 0,
+            .dense_vector => 1,
+            .sparse_vector => 2,
+            .graph => 3,
+            .algebraic => 4,
+        };
+        const adaptive_budget = replay_state.replay_budget.budget(replay_lane);
+        const replay_started = monotonicTimeNs();
+        var replay_completed = false;
+        defer if (options.bounded_replay and !replay_completed)
+            replay_state.replay_budget.observe(replay_lane, adaptive_budget, monotonicTimeNs() - replay_started, 0, true);
         const stats = try derived_worker.catchUpIndexWithOptions(
             self.alloc,
             resources.replay_source,
@@ -55154,11 +55384,11 @@ fn replayPendingDerivedBatches(
                 .persist_progress_fn = PersistReplayProgress.run,
                 .max_records_per_window = @min(
                     if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxRecords() else derived_worker.catch_up_max_records_per_window_default,
-                    if (options.bounded_replay) derived_worker.catch_up_background_max_records else std.math.maxInt(usize),
+                    if (options.bounded_replay) adaptive_budget.records else std.math.maxInt(usize),
                 ),
                 .max_chunk_bytes = @min(
                     if (progress_hook != null and use_dense_catch_up) denseCatchUpStartupMaxChunkBytes() else derived_worker.catch_up_max_chunk_bytes_default,
-                    if (options.bounded_replay) derived_worker.catch_up_background_max_chunk_bytes else std.math.maxInt(u64),
+                    if (options.bounded_replay) adaptive_budget.bytes else std.math.maxInt(u64),
                 ),
                 .max_windows_per_call = options.max_windows_per_index,
                 .deadline_ns = options.deadline_ns,
@@ -55192,6 +55422,9 @@ fn replayPendingDerivedBatches(
             try finishReplayCapture(&replay_ctx, index_ref, target_sequence);
             try self.core.saveAppliedSequence(index_ref.name, target_sequence);
         } else try abortReplayCapture(&replay_ctx, index_ref);
+        if (options.bounded_replay)
+            replay_state.replay_budget.observe(replay_lane, adaptive_budget, monotonicTimeNs() - replay_started, stats.scanned_entries, false);
+        replay_completed = true;
     }
     if (options.truncate_replay) try truncateReplayJournalIfSafe(self);
 }
@@ -55677,6 +55910,10 @@ fn denseEmbeddingArtifactRepairReasonFromRaw(
     raw: []const u8,
 ) !?types.ArtifactRepairReason {
     const dims_usize: usize = @intCast(dims);
+    // A transient LEANN stub is healthy: the graph holds its vector.
+    if (enrichment_artifact_codec.elidedDenseEmbedding(raw) catch null) |stub| {
+        return if (stub.dims == dims) null else .corrupt_artifact;
+    }
     if (enrichment_artifact_codec.denseEmbeddingVectorView(raw)) |maybe_view| {
         if (maybe_view) |view| {
             return if (view.len == dims_usize) null else .corrupt_artifact;
@@ -115656,6 +115893,113 @@ test "db reverse graph probe rejects a deleted or replaced index incarnation" {
     try std.testing.expectEqualSlices(bool, &.{false}, incoming);
 }
 
+test "db graph indexed admission reuses compressed membership and honors cancellation and memory" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("graph-filter-budget");
+    defer tmp.cleanup();
+    var db = try DB.open(a, std.mem.span(tmp.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    const writes = try a.alloc(types.BatchWrite, 8192);
+    defer a.free(writes);
+    var initialized: usize = 0;
+    defer for (writes[0..initialized]) |write| a.free(write.key);
+    for (writes, 0..) |*write, i| {
+        const key = if (i < 2) try a.dupe(u8, if (i == 0) "a" else "b") else try std.fmt.allocPrint(a, "row-{d}", .{i});
+        write.* = .{ .key = key, .value = "{\"allowed\":[\"standard\"]}" };
+        initialized += 1;
+    }
+    try db.batch(.{ .writes = writes, .sync_level = .full_index });
+    const req = types.SearchRequest{ .filter_query_json = "{\"match\":{\"path\":\"allowed\",\"text\":\"standard\"}}" };
+    const entry = db.core.index_manager.textIndex(null).?;
+    const snapshot = entry.acquireSnapshot();
+    defer snapshot.release();
+    const first = try db.filterGraphKeysAlloc(a, req, &.{"a"});
+    defer a.free(first);
+    try std.testing.expect(first[0]);
+    const misses = snapshot.graph_predicates.misses;
+    const second = try db.filterGraphKeysAlloc(a, req, &.{"b"});
+    defer a.free(second);
+    try std.testing.expect(second[0]);
+    try std.testing.expectEqual(misses, snapshot.graph_predicates.misses);
+    try std.testing.expect(snapshot.graph_predicates.hits > 0);
+    // A graph request retains the prepared top-level predicate across hops.
+    {
+        var stop = std.atomic.Value(bool).init(false);
+        var gate_req = req;
+        gate_req.cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&stop);
+        var gate = DB.GraphNodeAdmissionCache.init(&db, a, gate_req, "unused", .{});
+        defer gate.deinit();
+        const one = try gate.iface().filterKeysAlloc(a, &.{"a"}, false);
+        defer a.free(one);
+        const warm_hits = snapshot.graph_predicates.hits;
+        const memory = gate.indexed_request_filter.?.graph_memory.?;
+        const retained = memory.tracked.live_bytes;
+        const two = try gate.iface().filterKeysAlloc(a, &.{"b"}, false);
+        defer a.free(two);
+        try std.testing.expect(one[0] and two[0]);
+        try std.testing.expectEqual(warm_hits, snapshot.graph_predicates.hits);
+        try std.testing.expectEqual(retained, memory.tracked.live_bytes);
+        stop.store(true, .release);
+        try std.testing.expectError(error.Canceled, gate.iface().filterKeysAlloc(a, &.{"b"}, false));
+        try std.testing.expectError(error.Canceled, gate.iface().filterKeysAlloc(a, &.{"row-3"}, false));
+    }
+    // Broad membership remains compressed; the old document-number array
+    // alone used four bytes per match before ordinal conversion and copies.
+    try std.testing.expect(snapshot.graph_predicates.bytes < writes.len * @sizeOf(u32));
+    var low_budget = @import("../../graph/work_budget.zig").WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 16 });
+    var bounded = req;
+    bounded.graph_work_budget = &low_budget;
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, db.filterGraphKeysAlloc(a, bounded, &.{"a"}));
+    try std.testing.expectEqual(@as(usize, 0), low_budget.retained_state_bytes);
+    var canceled = std.atomic.Value(bool).init(true);
+    var stopped = req;
+    stopped.cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled);
+    try std.testing.expectError(error.Canceled, db.filterGraphKeysAlloc(a, stopped, &.{"a"}));
+    // Even a warm predicate cache must observe execution controls.
+    var node_req = stopped;
+    node_req.filter_query_json = "";
+    var admission = DB.GraphNodeAdmissionCache.init(&db, a, node_req, "unused", .{ .filter_query_json = req.filter_query_json });
+    defer admission.deinit();
+    try std.testing.expectError(error.Canceled, admission.iface().filterKeysAlloc(a, &.{"a"}, false));
+    var expired = req;
+    expired.execution_deadline_ns = 1;
+    try std.testing.expectError(error.Timeout, db.filterGraphKeysAlloc(a, expired, &.{"a"}));
+    var before = try db.graphRequestWithIndexedFilterAlloc(req);
+    defer before.deinit();
+    var identity = try db.resolveDocSetForIdsAlloc(a, &.{"a"});
+    defer identity.deinit(a);
+    const ordinal = identity.ordinals[0];
+    try std.testing.expect(before.resolved_doc_filter.?.include.containsOrdinal(ordinal));
+    try db.batch(.{ .deletes = &.{"a"}, .sync_level = .full_index });
+    var after = try db.graphRequestWithIndexedFilterAlloc(req);
+    defer after.deinit();
+    try std.testing.expect(!after.resolved_doc_filter.?.include.containsOrdinal(ordinal));
+}
+
+test "db graph analyzed admission intersects resolved row permissions" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("graph-admission");
+    defer tmp.cleanup();
+    var db = try DB.open(a, std.mem.span(tmp.path().ptr), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"allowed_plans\":[\"standard\",\"enterprise\"]}" },
+        .{ .key = "b", .value = "{\"allowed_plans\":[\"standard\"]}" },
+        .{ .key = "c", .value = "{\"allowed_plans\":[\"standard\"]}" },
+        .{ .key = "d", .value = "{\"allowed_plans\":[\"enterprise\"]}" },
+    }, .sync_level = .full_index });
+    var row_permissions = try db.resolvedDocFilterForIdsAlloc(true, &.{ "a", "b", "d" }, &.{}, null);
+    defer row_permissions.deinit(a);
+    const mask = try db.filterGraphKeysAlloc(a, .{
+        .resolved_doc_filter = &row_permissions,
+        .filter_query_json = "{\"match\":{\"path\":\"allowed_plans\",\"text\":\"standard\"}}",
+    }, &.{ "a", "b", "c", "d", "missing" });
+    defer a.free(mask);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, false, false, false }, mask);
+}
+
 test "db graph search filters result nodes and hidden traversal intermediates" {
     const alloc = std.testing.allocator;
 
@@ -120037,6 +120381,136 @@ test "db manual text producers merge capacity without optional workers" {
     }, .{ .limit = 40 });
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 30), result.hits.len);
+}
+
+test "db text merge stop does not deadlock against a producer's assisted fallback" {
+    // [P1] regression: runAssistedOnce()'s fallback to runOnce() used to take
+    // lifecycle_mutex after already releasing it (its concurrent dispatch had
+    // failed) while the calling producer was still counted in
+    // active_producers. stop() holds lifecycle_mutex for its entire body,
+    // including the tail wait for active_producers to drain, so a stop()
+    // that won the lock in that gap would park waiting on this producer
+    // while the producer parked waiting on the very lock stop() held --
+    // deadlock. This test deterministically lands stop() in that gap via a
+    // test-only hook and asserts both sides still complete.
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("text-merge-stop-race");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .text_merge = .{
+            .enabled = true,
+            .max_pending_segments = 2,
+            .resume_pending_segments = 1,
+            .max_pending_bytes = 0,
+            .backpressure_max_wait_ms = 5_000,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!runtime.isStarted());
+
+    // Occupy the entire segment admission budget so the producer below must
+    // wait and attempt manual assistance instead of being admitted outright.
+    var held = try runtime.acquireProducerPermit("ft_v1", 2, 0);
+    defer held.release();
+
+    // Force runAssistedOnce()'s concurrent dispatch to behave as though the
+    // executor had no spare concurrency, so the producer below deterministically
+    // takes the fallback path this test targets instead of racing a real
+    // thread pool.
+    text_merge_runtime_mod.test_force_concurrency_unavailable.store(true, .release);
+    text_merge_runtime_mod.test_block_before_fallback_run_once.store(true, .release);
+    text_merge_runtime_mod.test_fallback_run_once_entered.store(false, .release);
+    text_merge_runtime_mod.test_release_before_fallback_run_once.store(false, .release);
+    defer {
+        text_merge_runtime_mod.test_force_concurrency_unavailable.store(false, .release);
+        text_merge_runtime_mod.test_block_before_fallback_run_once.store(false, .release);
+        text_merge_runtime_mod.test_fallback_run_once_entered.store(false, .release);
+        text_merge_runtime_mod.test_release_before_fallback_run_once.store(true, .release);
+    }
+
+    const Producer = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        result: anyerror!text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = undefined,
+        completed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.result = self.runtime.acquireProducerPermit("ft_v1", 1, 0);
+            self.completed.store(true, .release);
+        }
+    };
+    var producer = Producer{ .runtime = runtime };
+    var producer_thread = try std.testing.io.concurrent(Producer.run, .{&producer});
+    var producer_joined = false;
+    defer if (!producer_joined) {
+        text_merge_runtime_mod.test_release_before_fallback_run_once.store(true, .release);
+        producer_thread.await(std.testing.io);
+    };
+
+    // Wait for the producer's assisted fallback to park right after it
+    // released lifecycle_mutex but before it calls runOnce().
+    const fallback_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+    while (!text_merge_runtime_mod.test_fallback_run_once_entered.load(.acquire) and
+        monotonicTimeNs() < fallback_deadline)
+    {
+        sleepNs(1 * std.time.ns_per_ms);
+    }
+    if (!text_merge_runtime_mod.test_fallback_run_once_entered.load(.acquire)) return error.TestTimeout;
+
+    const Stop = struct {
+        runtime: *text_merge_runtime_mod.TextMergeRuntime,
+        completed: std.atomic.Value(bool) = .init(false),
+        stopped: bool = false,
+
+        fn run(self: *@This()) void {
+            self.stopped = self.runtime.stop();
+            self.completed.store(true, .release);
+        }
+    };
+    var stop = Stop{ .runtime = runtime };
+    var stop_thread = try std.testing.io.concurrent(Stop.run, .{&stop});
+    var stop_joined = false;
+    defer if (!stop_joined) {
+        text_merge_runtime_mod.test_release_before_fallback_run_once.store(true, .release);
+        stop_thread.await(std.testing.io);
+    };
+
+    // Give stop() ample time to win the race for lifecycle_mutex and park
+    // waiting on this still-in-flight producer -- the exact window the [P1]
+    // finding identified. It must not have returned yet.
+    sleepNs(20 * std.time.ns_per_ms);
+    try std.testing.expect(!stop.completed.load(.acquire));
+
+    // Release the producer's parked fallback into runOnce(). Pre-fix this
+    // deadlocks forever against the lifecycle_mutex stop() is holding.
+    text_merge_runtime_mod.test_release_before_fallback_run_once.store(true, .release);
+
+    const join_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+    var both_done = false;
+    while (monotonicTimeNs() < join_deadline) {
+        if (producer.completed.load(.acquire) and stop.completed.load(.acquire)) {
+            both_done = true;
+            break;
+        }
+        sleepNs(1 * std.time.ns_per_ms);
+    }
+    if (!both_done) return error.TestTimeout;
+
+    producer_thread.await(std.testing.io);
+    producer_joined = true;
+    stop_thread.await(std.testing.io);
+    stop_joined = true;
+
+    // No future and no assisted merge was ever registered on this runtime.
+    try std.testing.expect(!stop.stopped);
+    try std.testing.expectError(error.TextMergeRuntimeShutdown, producer.result);
 }
 
 test "db text kernel admits natural segments below hard segment limit" {
@@ -125949,6 +126423,14 @@ test "db dense auto bulk replays packed external embedding strings" {
 }
 
 test "db bulk ingest keeps full text merge maintenance live" {
+    try testBulkIngestTextMergeAdmission(false);
+}
+
+test "db text merge structural pause rejects manual turns" {
+    try testBulkIngestTextMergeAdmission(true);
+}
+
+fn testBulkIngestTextMergeAdmission(comptime paused: bool) !void {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -125957,6 +126439,7 @@ test "db bulk ingest keeps full text merge maintenance live" {
     defer cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
         .text_merge = .{
             .enabled = true,
             .idle_interval_ms = 10_000,
@@ -125972,9 +126455,12 @@ test "db bulk ingest keeps full text merge maintenance live" {
     });
 
     const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
-    // Keep background execution deterministic; runOnce below proves that the
-    // dense bulk deferral flag no longer suppresses text maintenance.
-    try std.testing.expect(runtime.pause());
+    // Manual owners can drive bulk-ingest maintenance without a background
+    // worker. A structural pause must instead fence even explicit turns.
+    if (paused) {
+        try runtime.start();
+        try std.testing.expect(runtime.pause());
+    }
 
     try db.beginBulkIngestSession();
     errdefer db.abortBulkIngestSession();
@@ -125995,8 +126481,14 @@ test "db bulk ingest keeps full text merge maintenance live" {
     try std.testing.expect(before.pending_segments > 0);
     try std.testing.expect(db.async_context.text_merge_deferred.load(.acquire));
 
-    try std.testing.expect(try runtime.runOnce());
-    try runtime.resumeAfterPause();
+    if (paused) {
+        // Available merge debt must not acquire an inline index pointer after
+        // pause() has returned to a structural mutation caller.
+        try std.testing.expect(!try runtime.runOnce());
+        try runtime.resumeAfterPause();
+    } else {
+        try std.testing.expect(try runtime.runOnce());
+    }
 
     try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
     try std.testing.expect(!db.async_context.text_merge_deferred.load(.acquire));
@@ -138058,7 +138550,13 @@ test "db graph endpoint cleanup pages cancellation stops between commits" {
         }
     };
     var capture = Capture{};
-    try std.testing.expectError(error.EnrichmentWaitCanceled, db.batchInternal(.{ .writes = &.{.{ .key = "unrelated", .value = "{}" }}, .sync_level = .full_index }, null, .{ .committed_batch_effects_observer = .{ .ptr = &capture, .apply = Capture.observe }, .visibility_cancellation = .fromAtomic(&capture.canceled) }));
+    // batchInternal's primary_committed tracking now remaps a post-commit
+    // visibility-layer cancellation (the primary write already landed; only
+    // the graph-endpoint-cleanup effects observer was canceled) to
+    // error.CommitVisibilityNotSatisfied, rather than surfacing the raw
+    // error.EnrichmentWaitCanceled, so a caller never mistakes this for a
+    // reason to replay the whole batch.
+    try std.testing.expectError(error.CommitVisibilityNotSatisfied, db.batchInternal(.{ .writes = &.{.{ .key = "unrelated", .value = "{}" }}, .sync_level = .full_index }, null, .{ .committed_batch_effects_observer = .{ .ptr = &capture, .apply = Capture.observe }, .visibility_cancellation = .fromAtomic(&capture.canceled) }));
     try std.testing.expectEqual(@as(usize, 2), capture.calls);
     try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
     const committed_key = try encodeStoreLookupKeyAlloc(&db, alloc, "unrelated");
@@ -144408,6 +144906,115 @@ test "capi native memory standalone external maintenance completes managed text 
     try std.testing.expectEqualStrings("source", result.hits[0].id);
 }
 
+test "db applies leader-planned leann records through ordered apply" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("leann-replication");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{
+        .ttl_cleanup = .{ .enabled = false },
+        .index_backends = .{ .leann_replication = true },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "leann_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":4,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"leann_idx\",\"algorithm\":\"leann\",\"leann\":{\"max_degree\":8}}",
+    });
+
+    const n = 300;
+    var writes: [n]types.BatchWrite = undefined;
+    var keys: [n][]u8 = undefined;
+    var values: [n][]u8 = undefined;
+    for (0..n) |i| {
+        keys[i] = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i});
+        const c: f32 = @floatFromInt(i % 4);
+        values[i] = try std.fmt.allocPrint(alloc, "{{\"_embeddings\":{{\"leann_idx\":[{d},{d},{d},{d}]}}}}", .{ c, c + 0.01 * @as(f32, @floatFromInt(i)), 1.0, @as(f32, @floatFromInt(i % 7)) });
+        writes[i] = .{ .key = keys[i], .value = values[i] };
+    }
+    defer for (keys, values) |k, v| {
+        alloc.free(k);
+        alloc.free(v);
+    };
+    // A leader planner commits records while the write waits: full_index
+    // returns only once committed records put every vector in the graph.
+    const Planner = struct {
+        db: *DB,
+        alloc: std.mem.Allocator,
+        raft_index: u64 = 0,
+        stop: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.loop() catch |err| {
+                self.err = err;
+            };
+        }
+
+        fn loop(self: *@This()) !void {
+            while (!self.stop.load(.acquire)) {
+                const proposals = try self.db.planLeannRecords(self.alloc);
+                defer index_manager_mod.IndexManager.freeLeannProposals(self.alloc, proposals);
+                if (proposals.len == 0) {
+                    @import("antfly_platform").time.yieldNow();
+                    continue;
+                }
+                for (proposals) |p| for (p.records) |record| {
+                    self.raft_index += 1;
+                    try graphTestApplyOrdered(self.db, .{ .leann_record = .{ .index_name = p.index_name, .record = record } }, .{ .term = 1, .index = self.raft_index });
+                };
+            }
+        }
+    };
+    var planner = Planner{ .db = &db, .alloc = alloc };
+    const thread = try std.Thread.spawn(.{}, Planner.run, .{&planner});
+    var joined = false;
+    defer if (!joined) {
+        planner.stop.store(true, .release);
+        thread.join();
+    };
+    try db.batch(.{ .writes = &writes, .sync_level = .full_index });
+    {
+        const e = db.core.index_manager.denseIndex("leann_idx").?;
+        const st = e.index.leann.?.stats();
+        try std.testing.expectEqual(@as(u64, 0), st.pending);
+        try std.testing.expectEqual(@as(u64, n), st.live);
+    }
+    planner.stop.store(true, .release);
+    thread.join();
+    joined = true;
+    if (planner.err) |err| return err;
+    const raft_index = planner.raft_index;
+    try std.testing.expect(raft_index > 0);
+    const entry = db.core.index_manager.denseIndex("leann_idx").?;
+    const leann_store = entry.index.leann.?;
+    try std.testing.expect(leann_store.isReplicated());
+    try std.testing.expectEqual(@as(u64, n), entry.index.stats().active_count);
+    try std.testing.expectEqual(raft_index, leann_store.appliedRaftIndex());
+
+    // Replaying an applied entry is a no-op.
+    const before = try leann_store.replicated.?.replica.encodeState(alloc);
+    defer alloc.free(before);
+    const proposals = try db.planLeannRecords(alloc);
+    defer index_manager_mod.IndexManager.freeLeannProposals(alloc, proposals);
+    try std.testing.expectEqual(@as(usize, 0), proposals.len);
+    const after = try leann_store.replicated.?.replica.encodeState(alloc);
+    defer alloc.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+
+    var results = try entry.index.searchWithRequest(.{ .query = &[_]f32{ 2, 2.5, 1, 6 }, .k = 1 });
+    defer results.deinit();
+    try std.testing.expectEqual(@as(usize, 1), results.items.items.len);
+}
+
+test "db rejects leann records when leann replication is off" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("leann-replication-off");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try std.testing.expectError(error.UnsupportedLeannReplication, graphTestApplyOrdered(&db, .{ .leann_record = .{ .index_name = "x", .record = "L" } }, .{ .term = 1, .index = 1 }));
+}
+
 test "db managed index repair settles partial OCR publication failure and retries after reopen" {
     const a = std.testing.allocator;
     var tmp = try TestDirectory.init("review-partial-ocr");
@@ -144831,4 +145438,88 @@ test "db manual text producers merge capacity without optional workers visibilit
 
 comptime {
     if (@import("builtin").is_test) _ = @import("mutation_commit_disposition_test.zig");
+}
+
+test "transient leann re-embedding renders templates through content parts like the producer" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        parts_calls: usize = 0,
+        batch_calls: usize = 0,
+        saw_parts: usize = 0,
+
+        fn embedDense(_: *anyopaque, a: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
+            const v = try a.alloc(f32, dims);
+            @memset(v, 1);
+            return v;
+        }
+
+        fn embedDenseBatch(raw: *anyopaque, a: Allocator, _: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batch_calls += 1;
+            const out = try a.alloc([]const f32, texts.len);
+            for (out) |*v| {
+                const vec = try a.alloc(f32, dims);
+                @memset(vec, 2);
+                v.* = vec;
+            }
+            return out;
+        }
+
+        fn embedDenseParts(raw: *anyopaque, a: Allocator, _: []const u8, parts: []const template_mod.ContentPart, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.parts_calls += 1;
+            self.saw_parts += parts.len;
+            const v = try a.alloc(f32, dims);
+            @memset(v, 3);
+            return v;
+        }
+
+        fn interface(self: *@This()) embedder_mod.DenseEmbedder {
+            return .{ .ptr = self, .dense_embed_fn = embedDense, .dense_embed_batch_fn = embedDenseBatch, .dense_embed_parts_fn = embedDenseParts, .deinit_fn = null };
+        }
+    };
+
+    var path_tmp = try TestDirectory.init("leann-reembed-parts");
+    defer path_tmp.cleanup();
+    var probe = Probe{};
+    var db = try DB.open(alloc, path_tmp.path(), .{
+        .enrichment = .{ .owner_id = "reembed-probe", .dense_embedder = probe.interface() },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }}, .sync_level = .write });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+
+    const dims = 3;
+    var out: [dims]f32 = undefined;
+    var found = [_]bool{false};
+    // A template goes through content parts, exactly like the producer.
+    const templated = [_]enrichment_types.GeneratedEnrichmentRequest{.{
+        .kind = .dense_embedding,
+        .index_name = "leann_idx",
+        .embedding_name = "model",
+        .doc_key = "doc:a",
+        .source_field = "",
+        .source_template = "{{body}}",
+        .expected_dims = dims,
+    }};
+    try enrichment_runtime_mod.reembedDenseDocuments(runtime, alloc, &templated, dims, &out, &found);
+    try std.testing.expect(found[0]);
+    try std.testing.expectEqual(@as(usize, 1), probe.parts_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.batch_calls);
+    try std.testing.expectEqual(@as(f32, 3), out[0]);
+
+    // A plain source field stays on the batched text path.
+    found[0] = false;
+    const field = [_]enrichment_types.GeneratedEnrichmentRequest{.{
+        .kind = .dense_embedding,
+        .index_name = "leann_idx",
+        .embedding_name = "model",
+        .doc_key = "doc:a",
+        .source_field = "body",
+        .expected_dims = dims,
+    }};
+    try enrichment_runtime_mod.reembedDenseDocuments(runtime, alloc, &field, dims, &out, &found);
+    try std.testing.expect(found[0]);
+    try std.testing.expectEqual(@as(usize, 1), probe.batch_calls);
+    try std.testing.expectEqual(@as(f32, 2), out[0]);
 }

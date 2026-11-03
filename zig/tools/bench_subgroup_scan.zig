@@ -80,7 +80,7 @@ pub fn main(init: std.process.Init) !void {
     var segment = try vi.posting_segment.VerifiedReader.init(alloc, segment_bytes);
     defer segment.deinit();
     const metadata_bytes = (try segment.getValue(0, .index_metadata)) orelse return error.MissingMetadata;
-    if (metadata_bytes.len != vi.hbc.IndexMetadata.encoded_size) return error.InvalidMetadata;
+    if (!vi.hbc.IndexMetadata.isSupportedEncodedLen(metadata_bytes.len)) return error.InvalidMetadata;
     const metadata = vi.hbc.IndexMetadata.decode(metadata_bytes);
     const directory_bytes = (try segment.getNestedContainer(0, .quantized_directory)) orelse return error.MissingDirectory;
     var directory = try vi.quantized_directory.VerifiedReader.init(alloc, directory_bytes);

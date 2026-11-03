@@ -106,8 +106,11 @@ def verify_identity(
         "commit": commit,
         "version": document["version"],
         "python_version": document["registry_versions"]["python"],
-        "npm_tag": channel["npm_tag"],
+        "npm_tag": channel["npm_tag"] or "",
         "tag": tag,
+        # Authenticate prerelease inputs too, but never admit them to registry
+        # preparation, dispatch, or credential-bearing publication jobs.
+        "publish": str(document["channel"] == "stable").lower(),
     }
 
 

@@ -22,7 +22,9 @@ const receipt = @import("../registry/managed_receipt.zig");
 pub const recipe = "embeddinggemma2-f32-mean-v6-webm-presentation";
 /// CUDA also uses BF16-specific token scaling and media preparation. Version
 /// this complete execution recipe independently of the qualified F32 route.
-pub const cuda_recipe = "embeddinggemma2-cuda-bf16-mean-v2-audio-frontend";
+/// Portable MMA broadens BF16 tiled attention beyond the earlier SM89 route;
+/// invalidate earlier CUDA pins rather than mixing scalar/tiled vector recipes.
+pub const cuda_recipe = "embeddinggemma2-cuda-bf16-mean-v3-portable-mma";
 
 pub fn forBackend(artifact_identity: [64]u8, backend: @import("../backends/backends.zig").BackendType) [64]u8 {
     if (backend != .cuda) return artifact_identity;
@@ -391,4 +393,13 @@ test "embedding identity revalidation transfers ownership after cancelled hashin
     try std.testing.expectEqualDeep(Probe.updated, try follower.await(std.testing.io));
     try std.testing.expectEqualDeep(Probe.updated, try validation.refreshWith(&probe, .{ .io = std.testing.io }));
     try std.testing.expectEqual(@as(usize, 2), probe.snapshots.load(.seq_cst));
+}
+
+test "embeddinggemma2 CUDA portable attention recipe invalidates earlier pinned vector identities" {
+    const artifacts: [64]u8 = @splat('a');
+    const previous = "cfba458ec5aabb915c019c759e32cc36ecddf1edc804e8fcdb40b41be39d0f69";
+    const current = forCudaPolicy(artifacts, .{});
+    try std.testing.expect(!std.mem.eql(u8, previous, &current));
+    try std.testing.expectEqual(artifacts, forBackend(artifacts, .native));
+    try std.testing.expectEqual(current, forCudaPolicy(artifacts, .{}));
 }

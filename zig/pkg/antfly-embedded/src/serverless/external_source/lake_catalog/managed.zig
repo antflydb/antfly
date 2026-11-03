@@ -71,7 +71,7 @@ pub const Managed = struct {
         try self.context.ensureActive();
         var client = self.client;
         client.allocator = a;
-        return client.getObject(self.bucket, key_, .{ .max_response_bytes = limit, .cancellation = self.token() }) catch |err| switch (err) {
+        return client.getObject(self.bucket, key_, .{ .skip_metadata_probe = true, .max_response_bytes = limit, .cancellation = self.token() }) catch |err| switch (err) {
             error.ObjectNotFound, error.FileNotFound => null,
             else => {
                 try self.context.ensureActive();
@@ -103,7 +103,7 @@ pub const Managed = struct {
         var data = (try self.get(a, r.metadata_key, types.max_metadata_bytes)) orelse return error.InvalidLakeCatalog;
         defer data.deinit(a);
         if (!std.mem.eql(u8, &types.digestHex(data.body), r.metadata_hash)) return error.InvalidLakeCatalog;
-        const version = head.metadata.etag orelse return error.LakeCatalogConditionalWritesRequired;
+        const version = (head.metadata.writeRevision() orelse return error.LakeCatalogConditionalWritesRequired).token();
         const location = try a.dupe(u8, r.metadata_location);
         errdefer a.free(location);
         const body = try a.dupe(u8, data.body);
@@ -364,7 +364,7 @@ pub const Managed = struct {
         defer a.free(head);
         var current = try self.get(a, head, 64 * 1024);
         defer if (current) |*value| value.deinit(a);
-        const expected_matches = if (current) |value| if (r.previous_version) |expected| if (value.metadata.etag) |actual| std.mem.eql(u8, expected, actual) else false else false else r.previous_version == null;
+        const expected_matches = if (current) |value| if (r.previous_version) |expected| if (value.metadata.writeRevision()) |actual| std.mem.eql(u8, expected, actual.token()) else false else false else r.previous_version == null;
         if (!expected_matches) switch (try self.resolve(a, r.commit_id, r.request_hash)) {
             .committed => return,
             .unknown => return error.LakeCommitOutcomeUnknown,
@@ -373,7 +373,7 @@ pub const Managed = struct {
         var client = self.client;
         client.allocator = a;
         try self.context.ensureActive();
-        var result = client.putObject(self.bucket, head, bytes, .{ .if_match_etag = r.previous_version, .if_none_match = r.previous_version == null, .content_type = "application/json", .cancellation = self.token() }) catch |err| {
+        var result = client.compareAndPut(self.bucket, head, bytes, if (current) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .content_type = "application/json", .cancellation = self.token() }) catch |err| {
             // A canceled caller can inspect this same intent after restart.
             try self.context.ensureActive();
             return switch (try self.resolve(a, r.commit_id, r.request_hash)) {

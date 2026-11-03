@@ -233,6 +233,9 @@ pub const HttpHandler = struct {
     progress: *catalog_mod.ProgressStore,
     query: *query_mod.QueryRuntime,
     query_cache: ?*query_mod.QueryCache = null,
+    /// Native indexed hosts opt into bounded fresh transforms. The stack owns
+    /// only the derived cache; each batch owns its pinned base and WAL cut.
+    live_read_options: ?query_mod.LiveSession.Options = null,
     managed_query_embedder: ?*managed_embedder.ManagedEmbedder = null,
     embedding_provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -4551,7 +4554,7 @@ pub const HttpHandler = struct {
             const traversal_overflow = bounded and traversal_nodes.len > remaining;
 
             for (traversal_nodes) |node| {
-                if (named_query.query.params.deduplicate) {
+                if (named_query.query.params.deduplicate and !named_query.query.params.include_paths) {
                     if (!try seen.putIfAbsent(self.alloc, .{ .table = node.target_table, .key = node.key }, {})) continue;
                 }
 
@@ -5117,7 +5120,13 @@ pub const HttpHandler = struct {
         else
             null;
         defer freeFields(self.alloc, projected_fields);
+        var seen = graph_node_identity.BorrowedMap(void){};
+        defer seen.deinit(self.alloc);
         for (nodes) |node| {
+            const ref = graph_node_identity.Ref{ .table = node.table, .key = node.key };
+            if (seen.contains(ref)) continue;
+            try seen.ensureTotalCapacity(self.alloc, hits.items.len + 1);
+            seen.putAssumeCapacityNoClobber(ref, {});
             // This request cache owns one source-table snapshot. Same-table
             // qualifiers are safe; external qualified nodes cannot be
             // hydrated from this snapshot.
@@ -5808,40 +5817,55 @@ pub const HttpHandler = struct {
         return docs;
     }
 
-    fn resolveTableBatchMutationsAlloc(self: *HttpHandler, namespace: []const u8, req: db_types.BatchRequest) ![]api_types.DocumentMutation {
-        const latest_docs = try self.allocLatestDocumentsAlloc(namespace);
+    fn resolveTableBatchMutationsAlloc(self: *HttpHandler, namespace: []const u8, req: db_types.BatchRequest, cancellation: CancellationToken) ![]api_types.DocumentMutation {
+        try cancellation.check();
+        var live: ?*query_mod.LiveSession = null;
+        defer if (live) |session| session.deinit();
+        if (req.transforms.len > 0) if (self.live_read_options) |options| {
+            var configured = options;
+            configured.cancellation = cancellation;
+            configured.io = self.io;
+            live = query_mod.LiveSession.open(self.alloc, self.query, self.api.wal, namespace, configured) catch |err| switch (err) {
+                // Old published layouts retain their original materializer.
+                // Integrity, capacity and transport failures never fall back.
+                error.HostedDocumentFactsRequired => null,
+                else => return err,
+            };
+        };
+        // Full replacements and deletes do not depend on any existing body.
+        const latest_docs = if (req.transforms.len > 0 and live == null)
+            try self.allocLatestDocumentsAlloc(namespace)
+        else
+            try self.alloc.alloc(query_materializer.Document, 0);
         defer query_materializer.freeDocuments(self.alloc, latest_docs);
 
         var deletes = std.ArrayListUnmanaged(api_types.DocumentMutation).empty;
         defer freeDocumentMutationList(self.alloc, &deletes);
         for (req.deletes) |doc_id| {
-            try deletes.append(self.alloc, .{
-                .kind = .delete,
-                .doc_id = try self.alloc.dupe(u8, doc_id),
-                .body = null,
-            });
+            try self.appendClonedBatchMutation(&deletes, .delete, doc_id, null);
         }
 
         var upserts = std.ArrayListUnmanaged(api_types.DocumentMutation).empty;
         defer freeDocumentMutationList(self.alloc, &upserts);
         for (req.writes) |write| {
-            try upserts.append(self.alloc, .{
-                .kind = .upsert,
-                .doc_id = try self.alloc.dupe(u8, write.key),
-                .body = try self.alloc.dupe(u8, write.value),
-            });
+            try self.appendClonedBatchMutation(&upserts, .upsert, write.key, write.value);
         }
 
         for (req.transforms) |transform| {
-            const existing_body = findMaterializedDocumentBody(latest_docs, transform.key);
+            try cancellation.check();
+            const fetched = if (live) |session| try session.lookupAlloc(transform.key) else null;
+            defer if (fetched) |body| self.alloc.free(body);
+            const existing_body = if (live != null) fetched else findMaterializedDocumentBody(latest_docs, transform.key);
             const resolved = try db_transform.resolveDocumentTransform(self.alloc, existing_body, transform) orelse continue;
             errdefer self.alloc.free(resolved);
 
             removeDocumentMutationById(self.alloc, &deletes, transform.key);
             removeDocumentMutationById(self.alloc, &upserts, transform.key);
+            const owned_id = try self.alloc.dupe(u8, transform.key);
+            errdefer self.alloc.free(owned_id);
             try upserts.append(self.alloc, .{
                 .kind = .upsert,
-                .doc_id = try self.alloc.dupe(u8, transform.key),
+                .doc_id = owned_id,
                 .body = resolved,
             });
         }
@@ -5863,6 +5887,14 @@ pub const HttpHandler = struct {
         upserts.clearRetainingCapacity();
 
         return mutations;
+    }
+
+    fn appendClonedBatchMutation(self: *HttpHandler, list: *std.ArrayListUnmanaged(api_types.DocumentMutation), kind: api_types.MutationKind, id: []const u8, body: ?[]const u8) !void {
+        const owned_id = try self.alloc.dupe(u8, id);
+        errdefer self.alloc.free(owned_id);
+        const owned_body = if (body) |bytes| try self.alloc.dupe(u8, bytes) else null;
+        errdefer if (owned_body) |bytes| self.alloc.free(bytes);
+        try list.append(self.alloc, .{ .kind = kind, .doc_id = owned_id, .body = owned_body });
     }
 
     fn tableApi(self: *HttpHandler, cancellation: CancellationToken) public_table_http.TableApi {
@@ -5933,8 +5965,11 @@ pub const HttpHandler = struct {
         };
         defer self.alloc.free(namespace);
 
-        const mutations = self.resolveTableBatchMutationsAlloc(namespace, req) catch |err| switch (err) {
+        const mutations = self.resolveTableBatchMutationsAlloc(namespace, req, request.cancellation) catch |err| switch (err) {
             error.InvalidArgument => return error.InvalidBatchRequest,
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.WalReadBudgetExceeded, error.WalVisibilityUnavailable, error.WalSnapshotExpired => return error.Backpressured,
             else => {
                 std.log.err("serverless public table batch mutation resolution failed table={s} namespace={s} err={}", .{ table_name, namespace, err });
                 return error.InternalFailure;
@@ -6765,7 +6800,7 @@ const PublicGraphRequestCache = struct {
         defer cursor.deinit();
         while (try cursor.next()) |record| {
             if (initialized == count) return error.InvalidDocumentFactsRoot;
-            const fact = try document_facts_reader.Fact.decode(record.value);
+            const fact = try @import("../build/document_facts.zig").decodeRecord(record);
             try self.reserveRetained(record.key.len);
             out[initialized] = .{ .doc_id = try alloc.dupe(u8, record.key), .body = .{ .fact = fact }, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns };
             initialized += 1;
@@ -9011,6 +9046,28 @@ fn lowerTableIngestMutationsAlloc(
         };
     }
     return mutations;
+}
+
+test "serverless multiprovider replacement batches need no read services and unwind every allocation" {
+    const Runner = struct {
+        fn run(a: Allocator) !void {
+            // No query/catalog/WAL service is installed: replacements must
+            // depend only on the admitted request's owned input bytes.
+            var handler: HttpHandler = undefined;
+            handler.alloc = a;
+            handler.live_read_options = null;
+            const mutations = try handler.resolveTableBatchMutationsAlloc("unused", .{
+                .writes = &.{ .{ .key = "a", .value = "{\"v\":1}" }, .{ .key = "b", .value = "{\"v\":2}" } },
+                .deletes = &.{ "c", "d" },
+            }, .none);
+            defer freeDocumentMutations(a, mutations);
+            try std.testing.expectEqual(@as(usize, 4), mutations.len);
+            try std.testing.expectEqual(api_types.MutationKind.delete, mutations[0].kind);
+            try std.testing.expectEqualStrings("c", mutations[0].doc_id);
+            try std.testing.expectEqualStrings("{\"v\":2}", mutations[3].body.?);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless public table mutation admission lowers embedded object documents without copying" {
@@ -13144,7 +13201,7 @@ test "serverless http handler serves the table public lifecycle and consistency 
     try std.testing.expectEqual(@as(?catalog_types.DocumentPublishMode, .append_mutation_tail), parsed_query_default.value.publication.head_document_publish_mode);
     try std.testing.expectEqual(@as(?catalog_types.DocumentPublishMode, .append_mutation_tail), parsed_query_default.value.publication.next_document_publish_mode);
     try std.testing.expectEqual(@as(bool, false), parsed_query_default.value.publication.pending_materialization_families.full_text);
-    try std.testing.expectEqualStrings("rebuild", @tagName(parsed_query_default.value.publication.artifact_actions.dense_vector));
+    try std.testing.expectEqualStrings("reuse", @tagName(parsed_query_default.value.publication.artifact_actions.dense_vector));
     try std.testing.expectEqual(@as(usize, 1), parsed_query_default.value.publication.full_text_index_actions.len);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed_query_default.value.publication.full_text_index_actions[0].name);
     try std.testing.expectEqual(@as(usize, 1), parsed_query_default.value.publication.vector_index_actions.len);
@@ -13169,7 +13226,7 @@ test "serverless http handler serves the table public lifecycle and consistency 
     try std.testing.expectEqual(@as(?catalog_types.DocumentPublishMode, .append_mutation_tail), parsed_query_latest.value.publication.head_document_publish_mode);
     try std.testing.expectEqual(@as(?catalog_types.DocumentPublishMode, .append_mutation_tail), parsed_query_latest.value.publication.next_document_publish_mode);
     try std.testing.expectEqual(@as(bool, false), parsed_query_latest.value.publication.pending_materialization_families.full_text);
-    try std.testing.expectEqualStrings("rebuild", @tagName(parsed_query_latest.value.publication.artifact_actions.dense_vector));
+    try std.testing.expectEqualStrings("reuse", @tagName(parsed_query_latest.value.publication.artifact_actions.dense_vector));
     try std.testing.expectEqual(@as(usize, 1), parsed_query_latest.value.publication.vector_index_actions.len);
     try std.testing.expectEqualStrings("semantic_idx", parsed_query_latest.value.publication.vector_index_actions[0].name);
     try std.testing.expectEqual(@as(usize, 2), parsed_query_latest.value.documents.len);
@@ -14298,6 +14355,20 @@ test "serverless http handler serves published graph query endpoints" {
     try std.testing.expectEqual(@as(usize, 2), neighbors_from_search.nodes.len);
     try std.testing.expectEqualStrings("doc-b", neighbors_from_search.nodes[0].key);
     try std.testing.expectEqualStrings("doc-c", neighbors_from_search.nodes[1].key);
+
+    // A seed is also a reachable endpoint. Keep both doc-a -> doc-b ->
+    // doc-c and doc-b -> doc-c when paths are requested with node dedup.
+    var overlapping = try handler.handle(.{ .method = .post, .path = "/tables/docs/query", .body =
+        \\{"graph_queries":{"walk":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a","doc-b"]},"edge_types":["cites"],"max_depth":2,"include_paths":true,"deduplicate_nodes":true}}}}
+    });
+    defer overlapping.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), overlapping.status);
+    var parsed_overlapping = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, overlapping.body);
+    defer parsed_overlapping.deinit();
+    const overlapping_nodes = parsed_overlapping.value.responses.?[0].graph_results.?.map.get("walk").?.graph_nodes_result.nodes;
+    try std.testing.expectEqual(@as(usize, 3), overlapping_nodes.len);
+    try std.testing.expectEqualStrings("doc-a", overlapping_nodes[1].path.?[0].key);
+    try std.testing.expectEqualStrings("doc-b", overlapping_nodes[2].path.?[0].key);
 
     // Exercise actual public admission and execution: rejected edges must not
     // enter traversal, path ranking, or MATCH, and literals remain lossless.

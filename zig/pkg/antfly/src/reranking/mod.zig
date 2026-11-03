@@ -32,6 +32,7 @@ const request_admission = @import("antfly_local_sources").common_request_admissi
 const common_cancellation = @import("antfly_cancellation");
 const provider_limits = @import("antfly_local_sources").common_provider_limits;
 const credential_identity = @import("antfly_local_sources").common_credential_source_identity;
+const repair_failure = @import("antfly_local_sources").storage_db_repair_failure;
 const google_auth = @import("antfly_google").auth;
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
     @import("antfly_local_sources").storage_db_template_stub
@@ -302,6 +303,10 @@ pub const Options = struct {
     runtime: ?*Runtime = null,
     limits: *provider_limits.Registry = &provider_limits.process_registry,
     execution_context: ?inference_request_context.RequestContext = null,
+    /// Bounds how long a local `antfly` provider admission refusal (the
+    /// request never ran) is retried before giving up, like the enrichment
+    /// and probe paths. Null uses `repair_failure.default_admission_retry_budget_ns`.
+    admission_retry_budget_ns: ?u64 = null,
 };
 
 const remote_rerank_max_response_bytes: usize = 4 << 20;
@@ -406,37 +411,65 @@ pub fn rerankContentWithOptions(
                         );
                         if (!capabilities.input_modalities.image) return error.RerankerMediaUnsupported;
                     }
-                    const scores = managed_embedder.AntflyProviderBoundary.call(
-                        "rerank_documents_with_context",
-                        local.boundary_dispatch,
-                        rerank_parts,
-                        .{ local.ptr, alloc, cfg.model, query, content.parts.?, request_context },
-                    ) catch |err| return switch (err) {
-                        // The linked host reports the rerank core's 400/413 as
-                        // InvalidArguments: this model cannot score these
-                        // documents, a query error like the remote path's 400.
-                        error.InvalidArguments => error.RerankerMediaUnsupported,
-                        else => err,
+                    const scores = admit_media: {
+                        var attempt: u32 = 1;
+                        var remaining_budget_ns: u64 = options.admission_retry_budget_ns orelse repair_failure.default_admission_retry_budget_ns;
+                        while (true) {
+                            try repair_failure.checkAdmissionDispatch(request_context);
+                            if (managed_embedder.AntflyProviderBoundary.call(
+                                "rerank_documents_with_context",
+                                local.boundary_dispatch,
+                                rerank_parts,
+                                .{ local.ptr, alloc, cfg.model, query, content.parts.?, request_context },
+                            )) |value| break :admit_media value else |err| {
+                                // The linked host reports the rerank core's 400/413 as
+                                // InvalidArguments: this model cannot score these
+                                // documents, a query error like the remote path's 400.
+                                if (err == error.InvalidArguments) return error.RerankerMediaUnsupported;
+                                // An admission refusal means the request never ran:
+                                // retry it with a bounded wait, like the enrichment
+                                // and probe paths, instead of failing the query
+                                // immediately on a transient model-loading race.
+                                if (!repair_failure.isAdmissionRefusal(err)) return err;
+                                const delay_ns = (try repair_failure.nextAdmissionRetryDelayNs(request_context, attempt, &remaining_budget_ns)) orelse return err;
+                                try repair_failure.admissionRetryWaitNs(request_context, delay_ns);
+                                attempt += 1;
+                            }
+                        }
                     };
                     errdefer alloc.free(scores);
                     try validateScores(scores, documents.len);
                     try request_context.check();
                     return scores;
                 }
-                const scores = if (linked_context_reranker) |rerank|
-                    try managed_embedder.AntflyProviderBoundary.call(
-                        "rerank_texts_with_context",
-                        local.boundary_dispatch,
-                        rerank,
-                        .{ local.ptr, alloc, cfg.model, query, documents, request_context },
-                    )
-                else
-                    try managed_embedder.AntflyProviderBoundary.call(
-                        "rerank_texts",
-                        local.boundary_dispatch,
-                        linked_reranker.?,
-                        .{ local.ptr, alloc, cfg.model, query, documents },
-                    );
+                const scores = admit_text: {
+                    var attempt: u32 = 1;
+                    var remaining_budget_ns: u64 = options.admission_retry_budget_ns orelse repair_failure.default_admission_retry_budget_ns;
+                    while (true) {
+                        try repair_failure.checkAdmissionDispatch(request_context);
+                        const attempt_result = if (linked_context_reranker) |rerank|
+                            managed_embedder.AntflyProviderBoundary.call(
+                                "rerank_texts_with_context",
+                                local.boundary_dispatch,
+                                rerank,
+                                .{ local.ptr, alloc, cfg.model, query, documents, request_context },
+                            )
+                        else
+                            managed_embedder.AntflyProviderBoundary.call(
+                                "rerank_texts",
+                                local.boundary_dispatch,
+                                linked_reranker.?,
+                                .{ local.ptr, alloc, cfg.model, query, documents },
+                            );
+                        if (attempt_result) |value| break :admit_text value else |err| {
+                            // Same admission-refusal exemption as the media path above.
+                            if (!repair_failure.isAdmissionRefusal(err)) return err;
+                            const delay_ns = (try repair_failure.nextAdmissionRetryDelayNs(request_context, attempt, &remaining_budget_ns)) orelse return err;
+                            try repair_failure.admissionRetryWaitNs(request_context, delay_ns);
+                            attempt += 1;
+                        }
+                    }
+                };
                 errdefer alloc.free(scores);
                 try validateScores(scores, documents.len);
                 try request_context.check();
@@ -1142,13 +1175,73 @@ test "reranking runtime routes antfly provider to local antfly" {
     }, "query", &.{ "doc1", "doc2" }));
     try std.testing.expectEqual(@as(usize, 1), state.context_calls);
 
-    for ([_]anyerror{ error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable }) |err| {
-        state.failure = err;
-        try std.testing.expectError(err, rerankDocumentsWithOptions(alloc, &client, cfg, .{
-            .antfly_provider = local,
-            .execution = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
-        }, "query", &.{ "doc1", "doc2" }));
-    }
+    // Not an admission refusal: no attempt never ran, so this fails fast with
+    // no retry.
+    state.failure = error.ConcurrencyUnavailable;
+    try std.testing.expectError(error.ConcurrencyUnavailable, rerankDocumentsWithOptions(alloc, &client, cfg, .{
+        .antfly_provider = local,
+        .execution = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+    }, "query", &.{ "doc1", "doc2" }));
+
+    // An admission refusal retries, but still surfaces the original error once
+    // its (here, tiny) retry budget is spent rather than retrying forever.
+    state.failure = error.ResourceTemporarilyUnavailable;
+    const calls_before_exhausted = state.context_calls;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, rerankDocumentsWithOptions(alloc, &client, cfg, .{
+        .antfly_provider = local,
+        .execution = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+        .admission_retry_budget_ns = 1,
+    }, "query", &.{ "doc1", "doc2" }));
+    try std.testing.expectEqual(calls_before_exhausted + 1, state.context_calls);
+}
+
+test "reranking runtime retries antfly admission refusals and recovers within budget" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const State = struct {
+        calls: usize = 0,
+        failures_remaining: usize,
+
+        fn dense(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return try a.alloc([]f32, 0);
+        }
+        fn sparse(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            return try a.alloc(db_embedder.SparseEmbedding, 0);
+        }
+        fn rerankWithContext(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, documents: []const []const u8, context: inference_request_context.RequestContext) anyerror![]f32 {
+            const state: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            state.calls += 1;
+            if (state.failures_remaining > 0) {
+                state.failures_remaining -= 1;
+                return error.ResourceTemporarilyUnavailable;
+            }
+            const scores = try a.alloc(f32, documents.len);
+            @memset(scores, 0.5);
+            return scores;
+        }
+    };
+
+    var state = State{ .failures_remaining = 2 };
+    const local = managed_embedder.AntflyProvider{
+        .ptr = &state,
+        .embed_dense_texts = State.dense,
+        .embed_sparse_texts = State.sparse,
+        .rerank_texts_with_context = State.rerankWithContext,
+    };
+    const cfg = Config{ .provider = .antfly, .model = "local-reranker", .field = "body" };
+    // No deadline: only the admission-retry budget bounds the wait, which
+    // defaults to generous headroom above the two short backoffs below spend.
+    const scores = try rerankDocumentsWithOptions(alloc, &client, cfg, .{
+        .antfly_provider = local,
+    }, "query", &.{ "doc1", "doc2" });
+    defer alloc.free(scores);
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), scores[0], 0.0001);
 }
 
 test "reranking runtime authentication owns wire credentials and stable quota sources" {
@@ -1498,4 +1591,35 @@ test "reranking runtime sends image documents to linked rerankers that accept im
 
     local.rerank_documents_with_context = null;
     try std.testing.expectError(error.RerankerMediaUnsupported, rerankContentWithOptions(alloc, &client, cfg, .{ .antfly_provider = local }, "invoice total", content));
+}
+
+test "reranking runtime review retry must not dispatch after deadline" {
+    const a = std.testing.allocator;
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    const Fake = struct {
+        calls: usize = 0,
+        fn dense(_: *anyopaque, al: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return al.alloc([]f32, 0);
+        }
+        fn sparse(_: *anyopaque, al: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+            return al.alloc(db_embedder.SparseEmbedding, 0);
+        }
+        fn rerank(raw: *anyopaque, al: std.mem.Allocator, _: []const u8, _: []const u8, docs: []const []const u8) anyerror![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 1) return error.ResourceTemporarilyUnavailable;
+            const scores = try al.alloc(f32, docs.len);
+            @memset(scores, 0.5);
+            return scores;
+        }
+    };
+    var fake = Fake{};
+    const started = platform_time.monotonicNs();
+    const result = rerankDocumentsWithOptions(a, &client, .{ .provider = .antfly, .model = "fake", .field = "body" }, .{
+        .antfly_provider = .{ .ptr = &fake, .embed_dense_texts = Fake.dense, .embed_sparse_texts = Fake.sparse, .rerank_texts = Fake.rerank },
+        .execution = .{ .deadline_ns = started + 50 * std.time.ns_per_ms },
+    }, "query", &.{"doc"});
+    if (result) |scores| a.free(scores) else |err| std.debug.print("review deadline error={s} calls={d} elapsed_ms={d}\n", .{ @errorName(err), fake.calls, (platform_time.monotonicNs() - started) / std.time.ns_per_ms });
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }

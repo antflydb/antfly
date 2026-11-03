@@ -18,6 +18,8 @@ const embedded = @import("embedded_surface");
 pub const db = embedded.db;
 pub const api = embedded.api;
 pub const host_environment = embedded.host_environment;
+pub const object_database = embedded.object_database;
+pub const object_commit_log = embedded.object_commit_log;
 pub const object_storage = embedded.object_storage;
 pub const lsm_backend = embedded.lsm_backend;
 pub const storage_backend = embedded.storage_backend;
@@ -30,6 +32,8 @@ test "pkg antfly embedded root compiles" {
     _ = api;
     _ = host_environment;
     _ = object_storage;
+    _ = object_database.Context;
+    _ = object_commit_log.Log;
     _ = lsm_backend;
     _ = storage_backend;
     _ = db_types;

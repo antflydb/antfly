@@ -4820,6 +4820,14 @@ components:
         native_items:
           type: integer
           minimum: 0
+        max_native_step_items:
+          type: integer
+          minimum: 0
+          description: |
+            Largest successfully executed native decoder step observed by these
+            items, including peers from other requests. Zero or absent means
+            unobserved, one means singleton execution. This is measured at
+            execution, never inferred from native_items or request cardinality.
         serial_items:
           type: integer
           minimum: 0

@@ -26,6 +26,9 @@ import requests
 from conftest import (
     ANTFLY_PUBLIC_API_ROOT,
     DEFAULT_ANTFLY_BIN,
+    EMBEDDINGGEMMA2_MODEL,
+    INFERENCE_PUBLIC_API_ROOT,
+    StandaloneAntflyServer,
     StatefulAntflyServer,
     internal_service_headers,
     lookup_key_path,
@@ -211,6 +214,83 @@ def _metadata_admin_base_url(stateful_api) -> str:
     return ""
 
 
+def _is_standalone(stateful_api) -> bool:
+    return getattr(stateful_api, "mode", "cluster") == "standalone"
+
+
+def _require_cluster(stateful_api, reason: str) -> None:
+    # Standalone has no metadata admin API, so scenarios that drive the
+    # internal create, reseed, or cutover admin routes stay cluster-only.
+    if _is_standalone(stateful_api):
+        pytest.skip(f"cluster-only CDC scenario: {reason}")
+
+
+def _public_replication_status_records(stateful_api) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    try:
+        tables = stateful_api._check(stateful_api._request("GET", "/tables"))
+    except (requests.RequestException, AssertionError):
+        return records
+    for table in tables if isinstance(tables, list) else []:
+        name = table.get("name") if isinstance(table, dict) else None
+        if not name:
+            continue
+        response = stateful_api._request("GET", f"/tables/{name}/sources/managed")
+        if response.status_code != 200:
+            continue
+        progress = response.json().get("progress")
+        if isinstance(progress, list):
+            records.extend(record for record in progress if isinstance(record, dict))
+    return records
+
+
+def _status_counters_from_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Standalone has no metadata status endpoint; derive its CDC counters from
+    the same status records the public managed-sources API returns."""
+
+    def count(predicate) -> int:
+        return sum(1 for record in records if predicate(record))
+
+    def max_of(field: str) -> int:
+        return max((int(record.get(field, 0) or 0) for record in records), default=0)
+
+    lag_max = max_of("lag_millis")
+    return {
+        "projected_replication_source_statuses_streaming": count(
+            lambda r: r.get("phase") == "streaming"
+        ),
+        "projected_replication_source_statuses_with_consecutive_failures": count(
+            lambda r: int(r.get("consecutive_failures", 0) or 0) > 0
+        ),
+        "projected_replication_source_consecutive_failures_max": max_of(
+            "consecutive_failures"
+        ),
+        "projected_replication_source_lag_millis_max": lag_max,
+        "projected_replication_source_observed_lag_millis_max": lag_max,
+        "projected_replication_source_statuses_with_source_commit_timestamp": count(
+            lambda r: int(r.get("last_source_commit_at_ms", 0) or 0) > 0
+        ),
+        "projected_replication_source_last_change_applied_at_ms_max": max_of(
+            "last_change_applied_at_ms"
+        ),
+        "projected_replication_source_statuses_exact_cutover": count(
+            lambda r: int(r.get("cutover_authority_id", 0) or 0) != 0
+        ),
+        "projected_replication_source_statuses_non_exact_cutover": count(
+            lambda r: int(r.get("cutover_authority_id", 0) or 0) == 0
+        ),
+        "projected_replication_source_statuses_exported_snapshot": count(
+            lambda r: r.get("cutover_mode") == "exported_snapshot"
+        ),
+        "projected_replication_source_statuses_with_success_timestamp": count(
+            lambda r: int(r.get("last_success_at_ms", 0) or 0) > 0
+        ),
+        "projected_replication_source_statuses_with_change_timestamp": count(
+            lambda r: int(r.get("last_change_applied_at_ms", 0) or 0) > 0
+        ),
+    }
+
+
 def _metadata_admin_snapshot(stateful_api) -> str:
     base_url = _metadata_admin_base_url(stateful_api)
     if not base_url:
@@ -252,7 +332,7 @@ def _metadata_replication_statuses(stateful_api) -> str:
 def _metadata_replication_status_records(stateful_api) -> list[dict[str, Any]]:
     base_url = _metadata_admin_base_url(stateful_api)
     if not base_url:
-        return []
+        return _public_replication_status_records(stateful_api)
     try:
         response = requests.get(
             f"{base_url}/metadata/v1/admin/snapshot",
@@ -284,6 +364,10 @@ def _metadata_replication_status_records_for_source(
 def _metadata_status(stateful_api) -> dict[str, Any]:
     base_url = _metadata_admin_base_url(stateful_api)
     if not base_url:
+        if _is_standalone(stateful_api):
+            return _status_counters_from_records(
+                _public_replication_status_records(stateful_api)
+            )
         return {}
     try:
         response = requests.get(f"{base_url}/metadata/v1/status", timeout=5)
@@ -397,6 +481,11 @@ def _create_table_public(
 def _create_table_via_metadata_admin(
     stateful_api, table_name: str, payload: dict[str, Any]
 ) -> None:
+    if _is_standalone(stateful_api):
+        # Standalone has no internal metadata route; the public create runs
+        # the same catalog derivation against its single local owner.
+        _create_table_public(stateful_api, table_name, payload)
+        return
     base_url = _metadata_admin_base_url(stateful_api)
     if not base_url:
         raise AssertionError(
@@ -423,6 +512,12 @@ def _create_table_via_metadata_admin(
 
 
 def _metadata_table_id(stateful_api, table_name: str) -> int | None:
+    if _is_standalone(stateful_api):
+        public_tables = stateful_api._check(stateful_api._request("GET", "/tables"))
+        for public_table in public_tables:
+            if public_table.get("name") == table_name:
+                return int(public_table["table_id"])
+        return None
     payload = _metadata_admin_snapshot_json(stateful_api)
     for table in payload.get("tables", []):
         if isinstance(table, dict) and table.get("name") == table_name:
@@ -443,12 +538,15 @@ def _metadata_table_id(stateful_api, table_name: str) -> int | None:
     return None
 
 
-@pytest.fixture(scope="function")
-def cdc_stateful_api(pg_cdc_source):
+@pytest.fixture(scope="function", params=["cluster", "standalone"])
+def cdc_stateful_api(request, pg_cdc_source):
     # Keep the provider fixture alive until after the managed server stops so
     # its exact-cutover slots are inactive and can be removed deterministically.
     del pg_cdc_source
+    mode = request.param
     base_url = os.environ.get("ANTFLY_STATEFUL_URL")
+    if base_url and mode == "standalone":
+        pytest.skip("ANTFLY_STATEFUL_URL selects one external server")
     server = None
     default_root = os.environ.get("ANTFLY_STATEFUL_API_ROOT")
     if not base_url:
@@ -458,7 +556,10 @@ def cdc_stateful_api(pg_cdc_source):
         if not os.path.exists(binary):
             pytest.skip(f"Public API binary not found: {binary}")
         port = find_free_port()
-        server = StatefulAntflyServer(binary, "127.0.0.1", port)
+        if mode == "standalone":
+            server = StandaloneAntflyServer(binary, "127.0.0.1", port)
+        else:
+            server = StatefulAntflyServer(binary, "127.0.0.1", port)
         base_url = server.url
         if default_root is None and os.path.basename(binary) == "antfly":
             default_root = ANTFLY_PUBLIC_API_ROOT
@@ -477,6 +578,7 @@ def cdc_stateful_api(pg_cdc_source):
             self.s = session
             self.url = base_url.rstrip("/")
             self._server = server_ref
+            self.mode = mode
 
         def _raise_request_error(self, err: requests.RequestException) -> None:
             raise_request_error_with_logs(err, self._server)
@@ -1262,16 +1364,44 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
         f"{_metadata_admin_snapshot(stateful_api)}"
     )
 
+    # Document recovery and the metadata replication status both replay from
+    # durable state after restart, but through separate paths (the data
+    # group's storage recovery vs. the metadata group's Raft log replay).
+    # `recovered_doc` only proves the data group has caught up; the metadata
+    # group can still be a few log entries behind at that exact instant,
+    # especially under load. Poll here instead of reading the status once,
+    # the same way the pre-restart checks above poll for status records to
+    # appear.
+    def matching_statuses_caught_up() -> list[dict[str, Any]] | None:
+        statuses = _metadata_replication_status_records(stateful_api)
+        matching = [
+            status
+            for status in statuses
+            if int(status.get("table_id", 0)) == table_id
+            and int(status.get("source_ordinal", -1)) == 0
+        ]
+        if not matching:
+            return None
+        if not any(
+            status.get("prepared_checkpoint") == prepared_checkpoint_before_restart
+            and status.get("stream_checkpoint") == stream_checkpoint_before_restart
+            for status in matching
+        ):
+            return None
+        return matching
+
+    matching_after_restart = wait_until(
+        matching_statuses_caught_up,
+        timeout_s=30.0,
+        interval_s=0.25,
+    )
     statuses_after_restart = _metadata_replication_status_records(stateful_api)
-    matching_after_restart = [
-        status
-        for status in statuses_after_restart
-        if int(status.get("table_id", 0)) == table_id
-        and int(status.get("source_ordinal", -1)) == 0
-    ]
     assert matching_after_restart, (
-        "missing replication status after restart\n"
-        f"{_metadata_admin_snapshot(stateful_api)}"
+        "replication status after restart never caught up to the "
+        "pre-restart checkpoint\n"
+        f"before=(prepared={prepared_checkpoint_before_restart!r}, "
+        f"stream={stream_checkpoint_before_restart!r}) "
+        f"after={statuses_after_restart!r}"
     )
     assert any(
         status.get("prepared_checkpoint") == prepared_checkpoint_before_restart
@@ -1368,6 +1498,7 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
 def test_stateful_postgres_cdc_exact_cutover_isolates_preexisting_logical_slot(
     stateful_api, pg_cdc_source
 ):
+    _require_cluster(stateful_api, "drives exact-cutover admin state")
     table_name = f"cdc_existing_slot_docs_{time.time_ns()}"
     _run_psql(
         f"create publication {pg_cdc_source['publication_name']} for table {pg_cdc_source['table_name']};"
@@ -1519,6 +1650,7 @@ def test_stateful_postgres_cdc_exact_cutover_isolates_preexisting_logical_slot(
 def test_stateful_postgres_cdc_required_exact_cutover_isolates_logical_name_collision(
     stateful_api, pg_cdc_source
 ):
+    _require_cluster(stateful_api, "drives exact-cutover admin state")
     table_name = f"cdc_exact_cutover_docs_{time.time_ns()}"
     _run_psql(
         f"create publication {pg_cdc_source['publication_name']} for table {pg_cdc_source['table_name']};"
@@ -1624,6 +1756,7 @@ def test_stateful_postgres_cdc_required_exact_cutover_isolates_logical_name_coll
 def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
     stateful_api, pg_cdc_source
 ):
+    _require_cluster(stateful_api, "uses the metadata reseed admin route")
     table_name = f"cdc_reseed_exact_cutover_docs_{time.time_ns()}"
     _run_psql(
         f"create publication {pg_cdc_source['publication_name']} for table {pg_cdc_source['table_name']};"
@@ -1783,6 +1916,7 @@ def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
 def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_terminal(
     stateful_api, pg_cdc_source
 ):
+    _require_cluster(stateful_api, "inspects metadata admin status")
     table_name = f"cdc_recovery_docs_{time.time_ns()}"
     create_payload = {
         "num_shards": 1,
@@ -1914,3 +2048,188 @@ def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_
         status.get("last_error") == "ForeignReplicationSlotMissing"
         for status in failed_statuses
     ), f"slot loss was not surfaced explicitly\n{failed_statuses!r}"
+
+
+def test_standalone_accepts_postgres_replication_sources(pg_cdc_source):
+    # Standalone runs the CDC coordinators: a source is accepted, reports
+    # cdc_supported, and its snapshot row arrives. The parametrized
+    # cdc_stateful_api fixture runs the full scenarios against standalone too.
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    if not os.path.exists(binary):
+        pytest.skip(f"Public API binary not found: {binary}")
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    table_name = f"cdc_standalone_{time.time_ns()}"
+    try:
+        response = requests.post(
+            f"{server.api_url}/tables/{table_name}",
+            json={
+                "replication_sources": [
+                    {
+                        "type": "postgres",
+                        "dsn": _pg_dsn(),
+                        "postgres_table": pg_cdc_source["table_name"],
+                        "key_template": "id",
+                        "slot_name": pg_cdc_source["slot_name"],
+                        "publication_name": pg_cdc_source["publication_name"],
+                    }
+                ]
+            },
+            timeout=30,
+        )
+        assert response.status_code == 200, response.text
+
+        def snapshot_arrived():
+            doc = requests.get(
+                server.api_url + lookup_key_path(table_name, "user-1"), timeout=30
+            )
+            return doc.status_code == 200 and doc.json().get("name") == "Alice"
+
+        assert wait_until(snapshot_arrived, timeout_s=60, interval_s=0.5), (
+            "snapshot row never arrived"
+        )
+        managed = requests.get(
+            f"{server.api_url}/tables/{table_name}/sources/managed", timeout=30
+        ).json()
+        assert managed["cdc_supported"] is True, managed
+        assert managed["progress"], managed
+        assert managed["progress"][0]["last_error"] == "", managed
+    finally:
+        server.stop()
+
+
+@pytest.mark.real_model
+@pytest.mark.parametrize("cdc_stateful_api", ["standalone"], indirect=True)
+def test_standalone_postgres_cdc_snapshot_completes_with_embeddings_index(
+    cdc_stateful_api, pg_cdc_source, embeddinggemma2_model_available
+):
+    # Regression coverage for the snapshot/embedding deadlock: a table with
+    # both Postgres CDC replication_sources and an embeddings index used to
+    # hang forever on its first snapshot. The snapshot backfill opens a
+    # bulk-ingest window for the whole batch loop and applied every batch
+    # inside it waiting for full_index visibility, but the dense embedder's
+    # replay session is admission-gated against that very same open window
+    # (dense_publication_admission.zig) and can never become ready while it
+    # stays open -- and the window never closes because the batch loop is
+    # stuck waiting on it. Standalone-only: the cluster e2e harness has no
+    # inference service and rejects embeddings indexes at create.
+    _ = embeddinggemma2_model_available
+    stateful_api = cdc_stateful_api
+
+    # A cold model load (safetensors parse plus backend init) can take
+    # longer than the ordinary request timeouts used below; warm it before
+    # timing anything that depends on it, the same way the quickstart real-
+    # model tests do.
+    base_url = stateful_api.url.removesuffix(ANTFLY_PUBLIC_API_ROOT)
+    warmup = stateful_api.s.post(
+        f"{base_url}{INFERENCE_PUBLIC_API_ROOT}/embed",
+        json={"model": EMBEDDINGGEMMA2_MODEL, "input": "warmup"},
+        timeout=120,
+    )
+    assert warmup.ok, (warmup.status_code, warmup.text)
+
+    table_name = f"cdc_embeddings_{time.time_ns()}"
+    index_name = "name_idx"
+    create_payload = {
+        "num_shards": 1,
+        "replication_sources": [
+            {
+                "type": "postgres",
+                "dsn": _pg_dsn(),
+                "postgres_table": pg_cdc_source["table_name"],
+                "key_template": "id",
+                "slot_name": pg_cdc_source["slot_name"],
+                "publication_name": pg_cdc_source["publication_name"],
+            }
+        ],
+        "indexes": {
+            index_name: {
+                "type": "embeddings",
+                "template": "{{name}}",
+                "embedder": {
+                    "provider": "antfly",
+                    "model": EMBEDDINGGEMMA2_MODEL,
+                },
+            }
+        },
+    }
+    _create_table_public(stateful_api, table_name, create_payload)
+
+    # Before the fix, this never comes back: the snapshot batch loop is
+    # blocked waiting on enrichment visibility that the open bulk-ingest
+    # window itself prevents.
+    snapshot_doc = wait_until(
+        lambda: _lookup_doc_if(
+            stateful_api,
+            table_name,
+            "user-1",
+            lambda doc: doc.get("name") == "Alice",
+        ),
+        timeout_s=60.0,
+        interval_s=0.5,
+    )
+    assert snapshot_doc is not None, (
+        "CDC snapshot into a table with an embeddings index did not complete\n"
+        f"{_server_logs(stateful_api)}\n"
+        f"{_metadata_replication_statuses(stateful_api)}"
+    )
+
+    def hit_ids(query: str) -> list[str] | None:
+        try:
+            result = stateful_api.query_table(
+                table_name,
+                {
+                    "semantic_search": query,
+                    "indexes": [index_name],
+                    "fields": ["name"],
+                    "limit": 5,
+                },
+            )
+        except requests.RequestException:
+            return None
+        responses = result.get("responses", [])
+        if not responses:
+            return None
+        return [hit.get("_id") for hit in responses[0].get("hits", {}).get("hits", [])]
+
+    # The snapshot row's embedding materializes asynchronously once the
+    # bulk-ingest window closes (it is written and plainly readable
+    # immediately; only the embedding lags). Confirm it actually becomes
+    # searchable, not just written.
+    assert wait_until(
+        lambda: "user-1" in (hit_ids("Alice") or []),
+        timeout_s=30.0,
+        interval_s=0.5,
+    ), (
+        "snapshot-backfilled row never became searchable through the embeddings index\n"
+        f"{_server_logs(stateful_api)}"
+    )
+
+    managed = stateful_api._check(
+        stateful_api._request("GET", f"/tables/{table_name}/sources/managed")
+    )
+    assert managed["cdc_supported"] is True, managed
+    assert managed["progress"][0]["last_error"] == "", managed
+
+    # A streamed insert after the snapshot embeds before the write returns,
+    # same as any other write, because streaming apply never opens a
+    # bulk-ingest window.
+    _run_psql(f"""
+        insert into {pg_cdc_source["table_name"]} (id, name, tier)
+        values ('user-2', 'Bob', 'silver');
+        """)
+
+    assert wait_until(
+        lambda: "user-2" in (hit_ids("Bob") or []),
+        timeout_s=30.0,
+        interval_s=0.5,
+    ), (
+        "streamed insert into a table with an embeddings index never became searchable\n"
+        f"{_server_logs(stateful_api)}"
+    )
+
+    # No `on_delete` configured on this source: a deleted Postgres row
+    # deletes the document by default, since the table is a full mirror.
+    _run_psql(f"delete from {pg_cdc_source['table_name']} where id = 'user-2';")
+    _wait_until_absent(
+        stateful_api, table_name, "user-2", timeout_s=30.0, interval_s=0.25
+    )

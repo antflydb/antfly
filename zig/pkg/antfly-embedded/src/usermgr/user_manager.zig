@@ -98,6 +98,7 @@ pub const PermissionType = enum {
 };
 
 pub const Permission = struct {
+    deny_mutation: bool = false,
     resource: []u8,
     resource_type: ResourceType,
     type: PermissionType,
@@ -1613,6 +1614,7 @@ fn clonePermissions(alloc: Allocator, permissions: []const Permission) ![]Permis
     errdefer for (out[0..filled]) |*perm| perm.deinit(alloc);
     for (permissions, 0..) |perm, i| {
         out[i] = try Permission.initOwned(alloc, perm.resource_type, perm.resource, perm.type);
+        out[i].deny_mutation = perm.deny_mutation;
         filled += 1;
     }
     return out;

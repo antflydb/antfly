@@ -31,8 +31,17 @@
 # Zig and Rust dirs are removed when idle for GC_MAX_AGE_DAYS (default 3) or
 # larger than GC_MAX_GB (default 20). Anything written in the last
 # GC_ACTIVE_MINUTES (default 30) is assumed to belong to a running build and
-# is skipped. Native compiler/build-driver activity also skips this run entirely;
-# a long optimization pass can leave all cache directory mtimes unchanged.
+# is skipped -- kept as an extra guard, but not relied on alone: a 1.5-2 hour
+# release build can go that long without touching the top of its own cache
+# dir. Before touching a worktree's Zig/Rust caches, cache_gc.sh also checks
+# (via scripts/cache_gc_activity.sh) whether a zig/maker/cargo/rustc process
+# is actually working in that worktree (by cwd or --cache-dir/--prefix/
+# --global-cache-dir argument) and skips only that worktree if so, leaving
+# every other worktree's caches to be cleaned normally. The Zig global
+# cache, Go build cache, uv cache, and Node (pnpm/npm) caches are shared
+# across every worktree, so instead they are skipped entirely -- not just
+# deferred -- whenever a matching process is running anywhere on the
+# machine, regardless of which worktree it is in.
 #
 # Usage: scripts/cache_gc.sh            (or: make gc)
 #        DRY_RUN=1 scripts/cache_gc.sh  (or: make gc DRY_RUN=1)
@@ -40,23 +49,56 @@
 set -uo pipefail
 
 source "$(dirname "$0")/cache_gc_activity.sh"
-if native_builds_active; then
-    echo "Native build active or process inspection unavailable; skipping cache cleanup."
-    exit 0
-fi
 
 DRY_RUN="${DRY_RUN:-0}"
 GC_MAX_AGE_DAYS="${GC_MAX_AGE_DAYS:-3}"
 GC_MAX_GB="${GC_MAX_GB:-20}"
 GC_ACTIVE_MINUTES="${GC_ACTIVE_MINUTES:-30}"
 
-repo_root="$(cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && pwd)"
+repo_root="${CACHE_GC_REPO_ROOT:-$(cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")" && pwd)}"
 user_cache="${XDG_CACHE_HOME:-$HOME/.cache}"
 zig_global_cache="${ZIG_GLOBAL_CACHE_DIR:-$user_cache/zig}"
 max_kb=$((GC_MAX_GB * 1024 * 1024))
 freed_kb=0
+skip_log=""
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# One worktree root per line: the main checkout plus every `git worktree
+# add`-ed tree, wherever it lives. CACHE_GC_WORKTREES lets a test stand in
+# a fake tree without a real repo.
+worktree_roots() {
+	if [ -n "${CACHE_GC_WORKTREES:-}" ]; then
+		printf '%s\n' "$CACHE_GC_WORKTREES"
+	else
+		git -C "$repo_root" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}'
+	fi
+}
+
+# The most specific (longest) worktree root containing $1, if any. A
+# worktree under .worktrees/ sits inside the main checkout's own root, so
+# the longest match -- not just "a" match -- is what tells a nested
+# worktree's cache apart from the main checkout's.
+owning_worktree() {
+	local path="$1" best="" root
+	while IFS= read -r root; do
+		[ -n "$root" ] || continue
+		case "$path" in
+		"$root" | "$root"/*)
+			[ "${#root}" -gt "${#best}" ] && best="$root"
+			;;
+		esac
+	done < <(worktree_roots)
+	printf '%s\n' "$best"
+}
+
+# Record and print why something was left alone, in both dry-run and real
+# mode -- this runs before the DRY_RUN branch in run(), not after it.
+note_skip() {
+	local what="$1" reason="$2"
+	echo "  skip ($reason): $what"
+	skip_log="${skip_log}${skip_log:+$'\n'}$what -- $reason"
+}
 
 size_kb() { du -sk "$1" 2>/dev/null | awk '{print $1}'; }
 
@@ -91,9 +133,7 @@ gc_dir() {
 	kb="$(size_kb "$dir")"
 	kb="${kb:-0}"
 	if is_active "$dir"; then
-		if [ "$kb" -gt "$max_kb" ]; then
-			echo "  skip (in use, $(human "$kb")): $dir"
-		fi
+		note_skip "$dir" "written in last ${GC_ACTIVE_MINUTES}m, $(human "$kb")"
 		return 0
 	fi
 	if [ "$kb" -gt "$max_kb" ]; then
@@ -111,6 +151,11 @@ gc_dir() {
 
 echo "==> Zig build caches under $repo_root"
 while IFS= read -r -d '' dir; do
+	wt="$(owning_worktree "$dir")"
+	if reason="$(build_active_in "${wt:-$dir}")"; then
+		note_skip "$dir" "active build, $reason"
+		continue
+	fi
 	gc_dir "$dir"
 done < <(find "$repo_root" \
 	\( -name node_modules -o -name .git -o -name target \) -prune -o \
@@ -124,14 +169,23 @@ for base in "$user_cache" "${TMPDIR:-/tmp}" /tmp; do
 	while IFS= read -r -d '' dir; do
 		[ "$dir" = "$zig_global_cache" ] && continue
 		[ -d "$dir/o" ] && [ -d "$dir/h" ] || continue
+		if reason="$(build_active_in "$dir")"; then
+			note_skip "$dir" "active build, $reason"
+			continue
+		fi
 		gc_dir "$dir"
 	done < <(find "$base" -mindepth 1 -maxdepth 3 -type d \
 		\( -name 'antfly-*' -o -name .zig-cache -o -name zig-local \) -prune -print0 2>/dev/null)
 done
 
 echo "==> Zig global cache ($zig_global_cache)"
-# Keep p/ (fetched packages); only compiled output is disposable.
-if [ -d "$zig_global_cache" ]; then
+# Keep p/ (fetched packages); only compiled output is disposable. This
+# cache is shared by every worktree's builds, so a zig/maker process
+# anywhere -- not just one whose cwd or --cache-dir is here -- blocks the
+# whole category rather than just deferring individual subdirs.
+if reason="$(shared_cache_busy zig)"; then
+	note_skip "$zig_global_cache" "shared cache, $reason"
+elif [ -d "$zig_global_cache" ]; then
 	for sub in o h z tmp; do
 		gc_dir "$zig_global_cache/$sub"
 	done
@@ -139,6 +193,11 @@ fi
 
 echo "==> Rust target dirs"
 while IFS= read -r -d '' dir; do
+	wt="$(owning_worktree "$dir")"
+	if reason="$(build_active_in "${wt:-$dir}")"; then
+		note_skip "$dir" "active build, $reason"
+		continue
+	fi
 	if have cargo-sweep; then
 		echo "  cargo sweep --time $GC_MAX_AGE_DAYS: $(dirname "$dir")"
 		run cargo sweep --time "$GC_MAX_AGE_DAYS" "$(dirname "$dir")" >/dev/null
@@ -150,25 +209,40 @@ done < <(find "$repo_root" \
 # Cargo trims ~/.cargo/registry and git checkouts automatically (1.88+).
 
 echo "==> Go build cache"
-if have go; then
+# GOCACHE is one directory shared by every worktree's `go build`/`go test`.
+if reason="$(shared_cache_busy go)"; then
+	note_skip "go build cache" "shared cache, $reason"
+elif have go; then
 	echo "  go clean -cache ($(go env GOCACHE))"
 	run go clean -cache
 fi
 
 echo "==> Python (uv) cache"
-if have uv; then
+if reason="$(shared_cache_busy uv)"; then
+	note_skip "uv cache" "shared cache, $reason"
+elif have uv; then
 	echo "  uv cache prune ($(uv cache dir 2>/dev/null))"
 	run uv cache prune --quiet
 fi
 
 echo "==> Node caches"
-if have pnpm; then
-	echo "  pnpm store prune"
-	run pnpm store prune >/dev/null
+if reason="$(shared_cache_busy node)"; then
+	note_skip "pnpm/npm cache" "shared cache, $reason"
+else
+	if have pnpm; then
+		echo "  pnpm store prune"
+		run pnpm store prune >/dev/null
+	fi
+	if have npm; then
+		echo "  npm cache verify"
+		run npm cache verify >/dev/null
+	fi
 fi
-if have npm; then
-	echo "  npm cache verify"
-	run npm cache verify >/dev/null
+
+if [ -n "$skip_log" ]; then
+	echo
+	echo "==> Skipped (active builds)"
+	printf '%s\n' "$skip_log"
 fi
 
 echo

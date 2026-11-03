@@ -38,6 +38,15 @@ protocol would be stale at allocation time and would couple failure domains.
 Distributed placement and request routing use advertised capacity; every target
 process still performs authoritative local admission.
 
+Graph predicate membership uses the `graph.predicate_cache` slice, shared by
+all indexes and retained snapshots attached to the process owner. Its defaults
+are 48 MiB soft and 64 MiB hard, in addition to each snapshot's local ceiling.
+Builders reserve before cloning; entries keep their credit until the final
+reader releases physical storage. Optional admission stops under pressure, and
+required allocations can reclaim unpinned entries across snapshots. Snapshot
+teardown unregisters and joins its reclaimer before destroying the cache. A
+missing process owner disables caching while predicate evaluation still runs.
+
 The Apache-licensed inference package also cannot import Antfly's internal
 storage `ResourceManager`. The standalone ABI bridge preserves that boundary:
 inference exposes generic reserve/retain/release callbacks, while the full

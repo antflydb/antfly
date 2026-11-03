@@ -116,7 +116,7 @@ Each page becomes a unit under its source document. List them:
 curl -fsS -X POST http://127.0.0.1:8080/db/v1/tables/scans/query \
   -H 'Content-Type: application/json' \
   -d '{
-    "fields": ["unit_type", "extraction_status", "text", "provenance.page_number"],
+    "fields": ["unit_type", "extraction_status", "extraction_warning", "text", "provenance.page_number"],
     "hierarchy": {"children": {"parent": {"level": "source", "id": "scan-1"}, "level": "unit"}},
     "order_by": [{"field": "_hierarchy.position"}]
   }'
@@ -156,6 +156,11 @@ Any reader or vision-capable generator can take LightOnOCR's place:
 The reader decides accuracy, cost, and speed, and `mode` decides how often you pay for it. LightOnOCR-3 0.8B is the default choice: it keeps table and reading-order structure, but it generates text token by token, so a page costs far more than native extraction. Handwriting, photos, and degraded scans go through the same OCR path; when they read poorly, switch to the 4B checkpoint, Apple Vision, or a hosted vision model rather than changing anything else in the pipeline. `mode: "auto"` sends only the pages that need it to the reader, which keeps born-digital PDFs cheap; use `always` when a document's text layer is present but untrustworthy, for example a scanner's own OCR layer. Raise `render.dpi` for small print, at the cost of memory and time per page. A hosted generator moves the cost to per-request pricing and sends page images to that provider.
 
 If the reader fails, for example because the model is not installed, the page reports `extraction_status: "failed_ocr"`. Fix the cause and reprocess the artifact to retry.
+
+Read `extraction_warning` for the cause. `ReadOutputTruncated` means the reader
+reached its token budget before completing the page; the
+[LightOn guide](/docs/guides/models/lightonocr3#read-documents-during-ingestion)
+shows an explicit dense-page budget and explains memory admission failures.
 
 ## Use Agent Skills
 

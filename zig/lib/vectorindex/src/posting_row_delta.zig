@@ -330,6 +330,13 @@ pub const Origin = struct {
     }
 };
 
+/// AFRC flag bits (u32 at header offset 76).
+const flag_omitted_l2_dots: u32 = 1 << 0;
+/// Extended RaBitQ columns present; bits per dimension in bits 8..15.
+/// Builds that predate this flag reject such chunks rather than misread them.
+const flag_ex_codes: u32 = 1 << 1;
+const ex_bits_shift: u5 = 8;
+
 pub const Chunk = struct {
     alloc: Allocator,
     refs: std.atomic.Value(u32) = .init(1),
@@ -364,30 +371,43 @@ pub const Chunk = struct {
             return error.PostingScoringOriginMismatch;
         const count_u64 = get(u64, bytes, 56);
         const flags = get(u32, bytes, 76);
+        const omitted = flags & flag_omitted_l2_dots != 0;
+        const ex_bits: u32 = if (flags & flag_ex_codes != 0) (flags >> ex_bits_shift) & 0xff else 0;
         if (@intFromPtr(bytes.ptr) % 8 != 0 or count_u64 == 0 or count_u64 > std.math.maxInt(u32) or
             get(u64, bytes, 40) == 0 or get(u64, bytes, 48) == 0 or
-            get(u64, bytes, 64) != bytes.len - header_len or flags > 1 or
-            (flags == 1 and origin.metric != 0)) return error.InvalidPostingRows;
+            get(u64, bytes, 64) != bytes.len - header_len or
+            flags & ~(flag_omitted_l2_dots | flag_ex_codes | (@as(u32, 0xff) << ex_bits_shift)) != 0 or
+            (flags & flag_ex_codes != 0) != (ex_bits != 0) or ex_bits > 8 or
+            (omitted and origin.metric != 0)) return error.InvalidPostingRows;
         const count: usize = @intCast(count_u64);
         const width = @import("antfly_vector").rabitq.codeWidth(origin.centroid.len);
-        const row_bytes = try std.math.add(usize, 20 + @as(usize, if (flags == 1) 0 else 4), try std.math.mul(usize, width, 8));
+        const ex_width = if (ex_bits != 0) proto.RaBitQuantizedVectorSet.exWordsPerRow(origin.centroid.len, ex_bits) else 0;
+        const row_bytes = try std.math.add(usize, 20 + @as(usize, if (omitted) 0 else 4) + @as(usize, if (ex_bits != 0) 8 else 0), try std.math.mul(usize, width + ex_width, 8));
         if (try std.math.mul(usize, count, row_bytes) != bytes.len - header_len)
             return error.InvalidPostingRows;
         var cursor: usize = header_len;
+        // Column order keeps every column naturally aligned: u64 ids, codes
+        // and extended codes, then the u32/f32 columns, then the f32 pairs.
+        const member_ids = takeColumn(u64, bytes, &cursor, count);
+        const codes = takeColumn(u64, bytes, &cursor, count * width);
+        const ex_codes = takeColumn(u64, bytes, &cursor, count * ex_width);
         const view = directory.View{
             .metric = origin.metric,
             .centroid = origin.centroid,
             .centroid_norm = origin.centroid_norm,
-            .member_ids = takeColumn(u64, bytes, &cursor, count),
-            .codes = takeColumn(u64, bytes, &cursor, count * width),
+            .member_ids = member_ids,
+            .codes = codes,
             .code_counts = takeColumn(u32, bytes, &cursor, count),
             .centroid_distances = takeColumn(f32, bytes, &cursor, count),
             .quantized_dot_products = takeColumn(f32, bytes, &cursor, count),
-            .centroid_dot_products = takeColumn(f32, bytes, &cursor, if (flags == 1) 0 else count),
-            .omitted_l2_centroid_dots = flags == 1,
+            .centroid_dot_products = takeColumn(f32, bytes, &cursor, if (omitted) 0 else count),
+            .omitted_l2_centroid_dots = omitted,
             .count = count,
             .width = width,
             .projections = null,
+            .ex_bits = ex_bits,
+            .ex_codes = ex_codes,
+            .ex_factors = takeColumn(f32, bytes, &cursor, if (ex_bits != 0) count * 2 else 0),
         };
         var ids = std.AutoHashMapUnmanaged(u64, void).empty;
         defer ids.deinit(alloc);
@@ -429,12 +449,15 @@ pub const Chunk = struct {
         const count = ids.len;
         const width = @import("antfly_vector").rabitq.codeWidth(origin.centroid.len);
         const omitted = origin.metric == 0 and set.centroid_dot_products.len == 0;
+        const has_ex = set.hasEx();
         if (serial == 0 or revision == 0 or count == 0 or count > std.math.maxInt(u32) or
             count != set.getCount() or set.codes.width != width or set.codes.data.len != count * width or
             set.code_counts.len != count or set.centroid_distances.len != count or
-            set.quantized_dot_products.len != count or (!omitted and set.centroid_dot_products.len != count))
+            set.quantized_dot_products.len != count or (!omitted and set.centroid_dot_products.len != count) or
+            (set.ex_bits != 0 and !has_ex))
             return error.InvalidPostingRows;
-        const row_bytes = try std.math.add(usize, 20 + @as(usize, if (omitted) 0 else 4), try std.math.mul(usize, width, 8));
+        const ex_width = if (has_ex) proto.RaBitQuantizedVectorSet.exWordsPerRow(origin.centroid.len, set.ex_bits) else 0;
+        const row_bytes = try std.math.add(usize, 20 + @as(usize, if (omitted) 0 else 4) + @as(usize, if (has_ex) 8 else 0), try std.math.mul(usize, width + ex_width, 8));
         const len = try std.math.add(usize, header_len, try std.math.mul(usize, count, row_bytes));
         if (len > max_encoded_bytes) return error.PostingRowBackpressure;
         const bytes = try alloc.alignedAlloc(u8, .@"8", len);
@@ -447,9 +470,13 @@ pub const Chunk = struct {
         put(u64, bytes, 56, count);
         put(u64, bytes, 64, len - header_len);
         put(u32, bytes, 72, origin.checksum);
-        put(u32, bytes, 76, if (omitted) 1 else 0);
+        var flags: u32 = if (omitted) flag_omitted_l2_dots else 0;
+        if (has_ex) flags |= flag_ex_codes | (set.ex_bits << ex_bits_shift);
+        put(u32, bytes, 76, flags);
         var cursor: usize = header_len;
-        inline for (.{ std.mem.sliceAsBytes(ids), std.mem.sliceAsBytes(set.codes.data), std.mem.sliceAsBytes(set.code_counts), std.mem.sliceAsBytes(set.centroid_distances), std.mem.sliceAsBytes(set.quantized_dot_products), std.mem.sliceAsBytes(set.centroid_dot_products) }) |column| {
+        const ex_codes: []const u64 = if (has_ex) set.ex_codes else &.{};
+        const ex_factors: []const f32 = if (has_ex) set.ex_factors else &.{};
+        inline for (.{ std.mem.sliceAsBytes(ids), std.mem.sliceAsBytes(set.codes.data), std.mem.sliceAsBytes(ex_codes), std.mem.sliceAsBytes(set.code_counts), std.mem.sliceAsBytes(set.centroid_distances), std.mem.sliceAsBytes(set.quantized_dot_products), std.mem.sliceAsBytes(set.centroid_dot_products), std.mem.sliceAsBytes(ex_factors) }) |column| {
             @memcpy(bytes[cursor..][0..column.len], column);
             cursor += column.len;
         }
@@ -493,9 +520,44 @@ pub const Run = struct {
         set.centroid_distances = set.centroid_distances[first..end];
         set.quantized_dot_products = set.quantized_dot_products[first..end];
         if (set.centroid_dot_products.len != 0) set.centroid_dot_products = set.centroid_dot_products[first..end];
+        if (view.ex_bits != 0) {
+            const ew = proto.RaBitQuantizedVectorSet.exWordsPerRow(view.centroid.len, view.ex_bits);
+            set.ex_codes = set.ex_codes[first * ew .. end * ew];
+            set.ex_factors = set.ex_factors[first * 2 .. end * 2];
+        }
         return .{ .member_ids = view.member_ids[first..end], .quantized = .{ .rabit = set } };
     }
 };
+
+/// Bits of the extended codes every run carries, or 0 if any run lacks
+/// them (or they differ), in which case aggregates drop them.
+fn commonExBits(runs: []const Run) u32 {
+    var bits: u32 = 0;
+    for (runs, 0..) |run, i| {
+        const b = run.chunk.view.ex_bits;
+        if (b == 0 or (i > 0 and b != bits)) return 0;
+        bits = b;
+    }
+    return bits;
+}
+
+/// Copies run rows' extended columns into `set` when every run has them.
+fn copyExRows(alloc: Allocator, set: *proto.RaBitQuantizedVectorSet, runs: []const Run, rows: usize, dims: usize) !void {
+    const bits = commonExBits(runs);
+    if (bits == 0) return;
+    const ew = proto.RaBitQuantizedVectorSet.exWordsPerRow(dims, bits);
+    set.ex_codes = try alloc.alloc(u64, rows * ew);
+    set.ex_factors = try alloc.alloc(f32, rows * 2);
+    set.ex_bits = bits;
+    var offset: usize = 0;
+    for (runs) |run| {
+        const source = run.scan().quantized.rabit;
+        const end = offset + run.len;
+        @memcpy(set.ex_codes[offset * ew .. end * ew], source.ex_codes);
+        @memcpy(set.ex_factors[offset * 2 .. end * 2], source.ex_factors);
+        offset = end;
+    }
+}
 
 /// This is a bounded leaf view, not a chain of full predecessor snapshots.
 /// Retaining old queries/durable manifests retains only referenced chunks.
@@ -592,6 +654,7 @@ pub const Snapshot = struct {
             if (set.centroid_dot_products.len != 0) @memcpy(set.centroid_dot_products[offset..end], source.centroid_dot_products);
             offset = end;
         }
+        try copyExRows(alloc, &set, self.runs, self.row_count, origin.centroid.len);
         return set;
     }
 
@@ -631,15 +694,24 @@ pub const Snapshot = struct {
                 count += 1;
                 next += 1;
             }
+            const set = chunk.view.asProto();
+            const Sink = switch (@typeInfo(@TypeOf(output))) {
+                .pointer => |ptr| ptr.child,
+                else => @TypeOf(output),
+            };
             const Output = struct {
                 ids: []const u64,
+                set: *const proto.RaBitQuantizedVectorSet,
                 sink: @TypeOf(output),
                 pub fn write(self_: @This(), row: usize, distance: f32, bound: f32) void {
-                    self_.sink.write(self_.ids[row], distance, bound);
+                    // Sinks that refine with extended codes need the row.
+                    if (comptime @hasDecl(Sink, "writeRow"))
+                        self_.sink.writeRow(self_.set, row, self_.ids[row], distance, bound)
+                    else
+                        self_.sink.write(self_.ids[row], distance, bound);
                 }
             };
-            const set = chunk.view.asProto();
-            try quantizer.estimatePreparedDistancesInRangesTo(&set, prepared, cancellation, ranges[0..count], Output{ .ids = chunk.view.member_ids, .sink = output });
+            try quantizer.estimatePreparedDistancesInRangesTo(&set, prepared, cancellation, ranges[0..count], Output{ .ids = chunk.view.member_ids, .set = &set, .sink = output });
         }
     }
 
@@ -872,6 +944,7 @@ pub const Repack = struct {
             if (set.centroid_dot_products.len != 0) @memcpy(set.centroid_dot_products[offset..end], source.centroid_dot_products);
             offset = end;
         }
+        try copyExRows(a, &set, base.runs, base.row_count, origin.centroid.len);
         return .{ .base = pinned, .compact = try Chunk.buildWithOrigin(a, base.runs[0].chunk.origin, serial, base.revision, ids, &set) };
     }
 
@@ -1718,4 +1791,79 @@ test "posting row representation microbenchmark" {
             });
         };
     }
+}
+
+fn testExChunk(alloc: Allocator, serial: u64, revision: u64, ids: []const u64, bits: u8) !*Chunk {
+    const dims = 8;
+    const vectors = try alloc.alloc(f32, ids.len * dims);
+    defer alloc.free(vectors);
+    for (vectors, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 13 + serial * 5) % 29)) / 29 - 0.4;
+    var quantizer = try @import("antfly_vector").quantizer.RaBitQuantizer.init(alloc, dims, 42, .cosine);
+    defer quantizer.deinit();
+    quantizer.ex_bits = bits;
+    var set = try quantizer.quantize(&@as([dims]f32, @splat(0.05)), vectors, ids.len);
+    defer set.deinit(alloc);
+    return Chunk.build(alloc, test_identity, serial, revision, ids, &set);
+}
+
+test "posting row chunks carry extended codes through scans, repacks and scoring" {
+    const a = std.testing.allocator;
+    const chunk = try testExChunk(a, 1, 1, &.{ 10, 20, 30, 40, 50 }, 4);
+    defer chunk.release();
+    try std.testing.expectEqual(@as(u32, 4), chunk.view.ex_bits);
+    // Reopening the sealed bytes yields the same columns.
+    const reopened = try Chunk.open(a, chunk.bytes, .{ .leased = .{ .ptr = undefined, .release = struct {
+        fn release(_: *anyopaque) void {}
+    }.release } }, chunk.origin);
+    defer reopened.release();
+    try std.testing.expectEqualSlices(u64, chunk.view.ex_codes, reopened.view.ex_codes);
+    try std.testing.expectEqualSlices(f32, chunk.view.ex_factors, reopened.view.ex_factors);
+
+    var base = try Snapshot.init(a, test_identity, 1, 100, &.{.{ .chunk = chunk, .start = 1, .len = 3 }});
+    defer base.deinit();
+    const slice = base.runs[0].scan().quantized.rabit;
+    try std.testing.expect(slice.hasEx());
+    const full = chunk.view.asProto();
+    try std.testing.expectEqualSlices(u8, full.exCode(1), slice.exCode(0));
+
+    var materialized = try base.materialize(a);
+    defer materialized.deinit(a);
+    try std.testing.expect(materialized.hasEx());
+    try std.testing.expectEqualSlices(u8, full.exCode(3), materialized.exCode(2));
+
+    // Mixing a chunk without extended codes drops them from aggregates.
+    const plain = try testExChunk(a, 2, 2, &.{60}, 0);
+    defer plain.release();
+    var mixed = try base.mutate(1, 2, 101, &.{}, plain);
+    defer mixed.deinit();
+    var mixed_set = try mixed.materialize(a);
+    defer mixed_set.deinit(a);
+    try std.testing.expect(!mixed_set.hasEx() and mixed_set.ex_codes.len == 0);
+
+    // Row-aware sinks receive each chunk set and row.
+    const Sink = struct {
+        rows: [8]usize = undefined,
+        ex: [8]bool = undefined,
+        count: usize = 0,
+        pub fn writeRow(self: *@This(), set: *const proto.RaBitQuantizedVectorSet, row: usize, id: u64, distance: f32, bound: f32) void {
+            _ = id;
+            _ = distance;
+            _ = bound;
+            self.rows[self.count] = row;
+            self.ex[self.count] = set.hasEx();
+            self.count += 1;
+        }
+        pub fn write(_: *@This(), _: u64, _: f32, _: f32) void {
+            unreachable;
+        }
+    };
+    var quantizer = try @import("antfly_vector").quantizer.RaBitQuantizer.init(a, 8, 42, .cosine);
+    defer quantizer.deinit();
+    var scratch = try @import("antfly_vector").quantizer.RaBitQuantizer.EstimateScratch.init(a, 8);
+    defer scratch.deinit(a);
+    var sink = Sink{};
+    try mixed.scoreTo(&quantizer, &@as([8]f32, @splat(0.2)), &scratch, null, &sink);
+    try std.testing.expectEqual(@as(usize, 4), sink.count);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3, 0 }, sink.rows[0..4]);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true, false }, sink.ex[0..4]);
 }

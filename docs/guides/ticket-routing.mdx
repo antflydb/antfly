@@ -124,6 +124,8 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/tickets \
 
 Every `INSERT` and `UPDATE` on the Postgres table now flows in, resolved tickets included, with their `team` and `resolution` columns intact. The source table needs `subject`, `body`, `status`, `team`, and `resolution` columns for the rest of this guide; a missing `body` gives the reranker empty text to score and no error. Antfly snapshots the existing rows first, so `status.phase` in the table detail moves from `snapshot` to `streaming`; once it does, confirm the rows arrived:
 
+The rows from that initial snapshot are queryable and filterable as soon as they land, but their `subject_body` embeddings fill in a moment after, once the snapshot's internal write batching closes — unlike a row that arrives after `status.phase` is already `streaming`, which embeds before the write that produced it returns. If a semantic query right after the snapshot comes back thin, give the embedding worker a few seconds and query again; `status.phase` reaching `streaming` is a good point to check.
+
 ```bash
 antfly query --table tickets --full-text-search 'status:resolved' --fields subject,team --limit 3
 ```

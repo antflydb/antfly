@@ -145,9 +145,9 @@ pub const ObjectProgressStore = struct {
 
     pub fn deinit(self: *ObjectProgressStore) void {
         if (self.owns_client) self.client.deinit();
-        if (self.fs_client) |fs| self.alloc.destroy(fs);
-        if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
-        if (self.s3_client) |s3| self.alloc.destroy(s3);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.fs_client) |fs| self.alloc.destroy(fs);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.s3_client) |s3| self.alloc.destroy(s3);
         self.alloc.free(self.bucket);
         self.alloc.free(self.prefix);
         self.* = undefined;
@@ -231,10 +231,8 @@ pub const ObjectProgressStore = struct {
         const content_type = try head_coordination.contentTypeAlloc(self.alloc, proposed);
         defer self.alloc.free(content_type);
 
-        var result = self.client.putObject(self.bucket, key, payload, .{
+        var result = self.client.compareAndPut(self.bucket, key, payload, if (current) |entry| entry.revision else null, .{
             .content_type = content_type,
-            .if_none_match = current == null,
-            .if_match_etag = if (current) |entry| entry.etag else null,
         }) catch |err| switch (err) {
             error.PreconditionFailed => {
                 if (fence) |required| {
@@ -462,7 +460,7 @@ pub const ObjectProgressStore = struct {
         const key = try enrichmentStageKeyAlloc(self.alloc, self.prefix, namespace, stage, "STATE");
         defer self.alloc.free(key);
         const current = try self.tryReadStageProgressCurrent(key);
-        defer if (current) |*entry| if (entry.etag) |etag| self.alloc.free(etag);
+        defer if (current) |*entry| if (entry.revision) |revision| freeRevision(self.alloc, revision);
         return if (current) |entry| entry.value else null;
     }
 
@@ -479,7 +477,7 @@ pub const ObjectProgressStore = struct {
         defer self.mutex.unlock();
 
         const current = try self.tryReadStageProgressCurrent(key);
-        defer if (current) |*entry| if (entry.etag) |etag| self.alloc.free(etag);
+        defer if (current) |*entry| if (entry.revision) |revision| freeRevision(self.alloc, revision);
         var current_value = if (current) |entry| entry.value else null;
         defer if (current_value) |*value| value.deinit(self.alloc);
         if (!stageProgressOptionalEql(current_value, expected)) return false;
@@ -492,15 +490,13 @@ pub const ObjectProgressStore = struct {
         // not silently degrade an existing-object update to an unconditional
         // PUT when a backend omits it.
         if (current) |entry| {
-            if (entry.etag == null) return error.MissingObjectEtag;
+            if (entry.revision == null) return error.MissingObjectEtag;
         }
 
         const payload = try desired.encodeAlloc(self.alloc);
         defer self.alloc.free(payload);
-        var result = self.client.putObject(self.bucket, key, payload, .{
+        var result = self.client.compareAndPut(self.bucket, key, payload, if (current) |entry| entry.revision else null, .{
             .content_type = "text/plain",
-            .if_none_match = current == null,
-            .if_match_etag = if (current) |entry| entry.etag else null,
         }) catch |err| switch (err) {
             error.PreconditionFailed => return false,
             else => return err,
@@ -514,16 +510,14 @@ pub const ObjectProgressStore = struct {
         defer self.mutex.unlock();
 
         const current = try self.tryReadCurrent(self.alloc, key);
-        defer if (current) |*entry| if (entry.etag) |etag| self.alloc.free(etag);
+        defer if (current) |*entry| if (entry.revision) |revision| freeRevision(self.alloc, revision);
         if ((if (current) |entry| entry.value else null) != expected) return false;
 
         const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{value});
         defer self.alloc.free(payload);
 
-        var result = self.client.putObject(self.bucket, key, payload, .{
+        var result = self.client.compareAndPut(self.bucket, key, payload, if (current) |entry| entry.revision else null, .{
             .content_type = "text/plain",
-            .if_none_match = current == null,
-            .if_match_etag = if (current) |entry| entry.etag else null,
         }) catch |err| switch (err) {
             error.PreconditionFailed => return false,
             else => return err,
@@ -539,28 +533,28 @@ pub const ObjectProgressStore = struct {
 
     fn tryReadValue(self: *ObjectProgressStore, key: []const u8) !?u64 {
         const current = try self.tryReadCurrent(self.alloc, key);
-        defer if (current) |*entry| if (entry.etag) |etag| self.alloc.free(etag);
+        defer if (current) |*entry| if (entry.revision) |revision| freeRevision(self.alloc, revision);
         return if (current) |entry| entry.value else null;
     }
 
     const CurrentValue = struct {
         value: u64,
-        etag: ?[]u8,
+        revision: ?objectstore.ObjectRevision,
     };
 
     const CurrentStageProgress = struct {
         value: progress_store.EnrichmentStageProgress,
-        etag: ?[]u8,
+        revision: ?objectstore.ObjectRevision,
     };
 
     const CurrentHead = struct {
         record: head_coordination.Record,
         owned_owner_id: ?[]u8 = null,
-        etag: ?[]u8 = null,
+        revision: ?objectstore.ObjectRevision = null,
 
         pub fn deinit(self: *CurrentHead, alloc: std.mem.Allocator) void {
             if (self.owned_owner_id) |owner_id| alloc.free(owner_id);
-            if (self.etag) |etag| alloc.free(etag);
+            if (self.revision) |revision| freeRevision(alloc, revision);
             self.* = undefined;
         }
     };
@@ -574,7 +568,7 @@ pub const ObjectProgressStore = struct {
     }
 
     fn tryReadHeadCurrentMaybeEtagWithCancellation(self: *ObjectProgressStore, key: []const u8, require_etag: bool, cancellation: CancellationToken) !?CurrentHead {
-        var result = self.client.getObject(self.bucket, key, .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = transportCancellationRequested } }) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true, .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = transportCancellationRequested } }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -583,7 +577,7 @@ pub const ObjectProgressStore = struct {
         // HEAD visibility and fencing must use an ETag verified against the
         // same body. Some adapters omit it from GET; a bare STAT would race
         // publication, so read again conditionally before trusting its ETag.
-        if (require_etag and result.metadata.etag == null) {
+        if (require_etag and result.metadata.writeRevision() == null) {
             var metadata = try self.client.statObjectWithOptions(self.bucket, key, .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = transportCancellationRequested } });
             defer metadata.deinit(self.alloc);
             const etag = metadata.etag orelse return error.MissingObjectEtag;
@@ -634,24 +628,24 @@ pub const ObjectProgressStore = struct {
         return .{
             .record = record,
             .owned_owner_id = owned_owner_id,
-            .etag = if (result.metadata.etag) |etag| try self.alloc.dupe(u8, etag) else null,
+            .revision = if (result.metadata.writeRevision()) |revision| try revision.clone(self.alloc) else null,
         };
     }
 
     fn tryReadCurrent(self: *ObjectProgressStore, alloc: std.mem.Allocator, key: []const u8) !?CurrentValue {
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         defer result.deinit(alloc);
         return .{
             .value = try std.fmt.parseInt(u64, std.mem.trim(u8, result.body, " \t\r\n"), 10),
-            .etag = if (result.metadata.etag) |value| try alloc.dupe(u8, value) else null,
+            .revision = if (result.metadata.writeRevision()) |value| try value.clone(alloc) else null,
         };
     }
 
     fn tryReadStageProgressCurrent(self: *ObjectProgressStore, key: []const u8) !?CurrentStageProgress {
-        var result = self.client.getObject(self.bucket, key, .{ .max_response_bytes = progress_store.EnrichmentStageProgress.max_encoded_bytes }) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = progress_store.EnrichmentStageProgress.max_encoded_bytes }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -660,7 +654,7 @@ pub const ObjectProgressStore = struct {
         errdefer value.deinit(self.alloc);
         return .{
             .value = value,
-            .etag = if (result.metadata.etag) |etag| try self.alloc.dupe(u8, etag) else null,
+            .revision = if (result.metadata.writeRevision()) |revision| try revision.clone(self.alloc) else null,
         };
     }
 
@@ -976,6 +970,11 @@ fn enrichmentStageHeadOffsetKeyAlloc(
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
+}
+
+fn freeRevision(alloc: std.mem.Allocator, revision: objectstore.ObjectRevision) void {
+    var owned = revision;
+    owned.deinit(alloc);
 }
 
 test "serverless enrichment stage cursor object CAS preserves key across heads and permits fenced wrap" {

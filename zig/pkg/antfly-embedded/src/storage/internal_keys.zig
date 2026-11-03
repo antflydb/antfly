@@ -262,6 +262,16 @@ pub fn isInternalMetadataKey(key: []const u8) bool {
     return key[0] == replay_namespace or key[0] == identity_namespace;
 }
 
+/// Physical DB records other than authored primary/relational rows. This also
+/// recognizes the reserved textual families used by transaction receipts,
+/// columnar state and older metadata protocols.
+pub fn isControlRecordKey(key: []const u8) bool {
+    return isInternalMetadataKey(key) or
+        (isInternalUserKey(key) and !isStoredDocumentRowKey(key)) or
+        std.mem.startsWith(u8, key, "\x00\x00__") or
+        std.mem.startsWith(u8, key, "\x00antfly/");
+}
+
 pub fn isInternalUserKey(key: []const u8) bool {
     return key.len > 0 and key[0] == user_namespace;
 }
@@ -3626,6 +3636,32 @@ pub fn graphArtifactHasRelationshipId(key: []const u8) bool {
 /// Durable endpoint cleanup is owner-local control state. Source snapshots
 /// must drain it before copying a range; native whole-store recovery retains it.
 pub const graph_endpoint_cleanup_prefix = "\x00\x00__metadata__:graph_endpoint_cleanup:v1:";
+
+/// Committed LEANN records awaiting (or retained for) ordered application:
+/// prefix, u16 big-endian index-name length, index name, u64 big-endian Raft
+/// index. Keys of one index sort in log order.
+pub const leann_record_prefix = "\x00\x00__metadata__:leann_record:v1:";
+
+pub fn leannRecordKeyAlloc(alloc: std.mem.Allocator, index_name: []const u8, raft_index: u64) ![]u8 {
+    if (index_name.len > std.math.maxInt(u16)) return error.InvalidIndexName;
+    const out = try alloc.alloc(u8, leann_record_prefix.len + 2 + index_name.len + 8);
+    @memcpy(out[0..leann_record_prefix.len], leann_record_prefix);
+    std.mem.writeInt(u16, out[leann_record_prefix.len..][0..2], @intCast(index_name.len), .big);
+    @memcpy(out[leann_record_prefix.len + 2 ..][0..index_name.len], index_name);
+    std.mem.writeInt(u64, out[out.len - 8 ..][0..8], raft_index, .big);
+    return out;
+}
+
+/// Range bounds covering every record of one index.
+pub fn leannRecordIndexPrefixAlloc(alloc: std.mem.Allocator, index_name: []const u8) ![]u8 {
+    const full = try leannRecordKeyAlloc(alloc, index_name, 0);
+    return alloc.realloc(full, full.len - 8);
+}
+
+pub fn leannRecordRaftIndex(key: []const u8) ?u64 {
+    if (key.len < leann_record_prefix.len + 10 or !std.mem.startsWith(u8, key, leann_record_prefix)) return null;
+    return std.mem.readInt(u64, key[key.len - 8 ..][0..8], .big);
+}
 pub fn graphEndpointCleanupKeyAlloc(alloc: Allocator, endpoint: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(endpoint, &digest, .{});

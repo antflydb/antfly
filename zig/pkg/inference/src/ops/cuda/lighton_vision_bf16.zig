@@ -22,6 +22,38 @@ const buffer = @import("buffer.zig");
 const cublas = @import("cublaslt.zig");
 const cudnn = @import("cudnn_sdpa.zig");
 
+/// Generic BF16 execution starts at Ampere; the embedded PTX requires CUDA 13.
+/// Specialized fused GEMMs retain their own narrower device checks.
+pub fn deviceSupported(device: @import("lighton_device_policy.zig").Device) bool {
+    return device.portableKernels();
+}
+
+pub fn validRowGeometry(rows: usize, batch: usize) bool {
+    return rows > 0 and rows <= 65536 and batch > 0 and batch <= 16 and
+        rows % batch == 0 and rows / batch <= cudnn.max_ocr_vision_sequence;
+}
+
+test "LightOnOCR3 BF16 vision device contract includes Ampere and Blackwell" {
+    try std.testing.expect(!deviceSupported(.{ .major = 8, .minor = 0, .driver_version = 12090 }));
+    try std.testing.expect(!deviceSupported(.{ .major = 7, .minor = 0, .driver_version = 13000 }));
+    try std.testing.expect(deviceSupported(.{ .major = 8, .minor = 0, .driver_version = 13000 }));
+    try std.testing.expect(deviceSupported(.{ .major = 9, .minor = 0, .driver_version = 13000 }));
+    try std.testing.expect(deviceSupported(.{ .major = 12, .minor = 0, .driver_version = 13000 }));
+    try std.testing.expect(validRowGeometry(7656, 1));
+    try std.testing.expect(validRowGeometry(12996 * 4, 4));
+    try std.testing.expect(validRowGeometry(65536, 4));
+    try std.testing.expect(!validRowGeometry(16385, 1));
+    try std.testing.expect(!validRowGeometry(12996 * 8, 8));
+    try std.testing.expect(!validRowGeometry(1, 0));
+    // Direct module users must obey the same contract as the selector.
+    var ctx: context.CudaContext = undefined;
+    ctx.info.compute_major = 8;
+    ctx.info.compute_minor = 0;
+    ctx.info.driver_version = 12090;
+    var module = Module{};
+    try std.testing.expectError(error.UnsupportedDevice, module.init(&ctx));
+}
+
 pub const Precision = enum {
     f32,
     bf16_vision,
@@ -100,6 +132,7 @@ pub const Module = struct {
 
     pub fn init(self: *Module, ctx: *context.CudaContext) !void {
         if (self.module != null) return;
+        if (!deviceSupported(.{ .major = ctx.info.compute_major, .minor = ctx.info.compute_minor, .driver_version = ctx.info.driver_version })) return error.UnsupportedDevice;
         try ctx.makeCurrent();
         var module: driver.CUmodule = null;
         const image = @embedFile("lighton_vision_bf16.ptx") ++ "\x00";
@@ -148,7 +181,7 @@ pub const Module = struct {
     /// stream consumer. Nothing in this module owns page or decoder state.
     pub fn block(self: *Module, ctx: *context.CudaContext, blas: *cublas.CublasLt, attention: *cudnn.Module, key: cudnn.Key, arena: buffer.DeviceBuffer, layout: Layout, gemm_workspace: buffer.DeviceBuffer, request: Request) !void {
         const r = request;
-        if (r.rows == 0 or r.rows > 65536 or r.batch == 0 or r.batch > 16 or r.rows % r.batch != 0 or r.rows / r.batch > 4096 or !std.math.isFinite(r.epsilon) or r.epsilon <= 0 or !std.math.isFinite(r.theta) or r.theta <= 0) return error.InvalidShape;
+        if (!validRowGeometry(r.rows, r.batch) or !std.math.isFinite(r.epsilon) or r.epsilon <= 0 or !std.math.isFinite(r.theta) or r.theta <= 0) return error.InvalidShape;
         const expected = try Layout.init(r.rows, r.hidden, r.intermediate, layout.lengths[8]);
         if (!std.meta.eql(expected, layout)) return error.InvalidShape;
         const h_bytes = layout.lengths[0];

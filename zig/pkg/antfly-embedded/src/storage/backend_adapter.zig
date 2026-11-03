@@ -35,6 +35,12 @@ pub fn Store(
             return .{ .impl = impl };
         }
 
+        pub fn writeSerialization(self: *@This()) @import("backend_erased.zig").WriteSerialization {
+            if (comptime @hasDecl(Impl, "writeSerialization"))
+                return self.impl.writeSerialization();
+            return .unsupported;
+        }
+
         pub fn capabilities(self: *@This()) backend_types.Capabilities {
             return ops.capabilities(self.impl);
         }

@@ -19,9 +19,9 @@ const image = @import("antfly_image");
 const darwin_render = if (builtin.os.tag == .macos) @import("darwin_render.zig") else struct {};
 const CompatibilityRenderSession = if (builtin.os.tag == .macos) darwin_render.SharedSession else struct {};
 
-pub const text_encoding = @import("text_encoding.zig");
+pub const text_encoding = @import("pdf_text_encoding");
 pub const reader = @import("reader.zig");
-pub const syntax = @import("syntax.zig");
+pub const syntax = @import("pdf_syntax");
 pub const render = @import("render.zig");
 /// Native layout producers use the same immutable faces and metrics as the
 /// rasterizer, avoiding platform font dependencies and layout/render drift.

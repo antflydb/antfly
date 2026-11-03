@@ -783,6 +783,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     runtime_abi_mod.addImport("httpx", httpx_mod);
     runtime_abi_mod.addImport("antfly_platform", platform_mod);
+    pgwire_test_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     const inference_api_source = inference_runtime_build.addInferenceApiOverride(b, openapi_build, b.path("../scripts"), openapi_codegen);
     // Model kernels have a serving-latency contract independently of Debug
     // storage/API validation. CI can qualify that mixed product without
@@ -798,9 +799,10 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     pdf_facade.addImport("pdf_native_contract", pdf_native_contract);
     pdf_facade.addImport("antfly_font", font_mod);
     pdf_facade.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
-    const facade_syntax = b.createModule(.{ .root_source_file = b.path("lib/pdf/src/syntax.zig"), .target = target, .optimize = optimize });
-    const facade_text = b.createModule(.{ .root_source_file = b.path("lib/pdf/src/text_encoding.zig"), .target = target, .optimize = optimize });
-    facade_text.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
+    // Raw readers and native facades share these leaf modules, including
+    // source fixtures that legitimately use both paths in one compilation.
+    const facade_syntax = pdf_mod.import_table.get("pdf_syntax").?;
+    const facade_text = pdf_mod.import_table.get("pdf_text_encoding").?;
     pdf_facade.addImport("pdf_syntax", facade_syntax);
     pdf_facade.addImport("pdf_text_encoding", facade_text);
 
@@ -986,6 +988,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     });
     cache_budget_mod.addImport("antfly_platform", platform_mod);
+    // Pgwire cursor allocation checkpoints use the shared cache budget owner.
+    pgwire_test_mod.addImport("antfly_cache_budget", cache_budget_mod);
     const runtime_fs_mod = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/fs.zig"),
         .target = target,
@@ -1431,6 +1435,10 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     sql_test_mod.addImport("antfly_sql_regex", sql_regex_mod);
     sql_test_mod.addImport("antfly_hash", hash_mod);
     sql_test_mod.addImport("bloom", bloom_mod);
+    // The SQL memory budget borrows the storage resource manager's host
+    // admission, which imports the shared cache budget.
+    sql_test_mod.addImport("antfly_cache_budget", cache_budget_mod);
+    pgwire_test_mod.addImport("antfly_cache_budget", cache_budget_mod);
     sql_test_mod.link_libc = link_libc;
     const refinement_bench_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/sql_refinement_bench_root.zig"),

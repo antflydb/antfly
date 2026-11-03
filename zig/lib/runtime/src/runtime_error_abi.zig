@@ -24,6 +24,13 @@ const std = @import("std");
 
 pub const abi_version: u32 = 1;
 
+test "OCR truncation preserves terminal identity across runtime callbacks" {
+    const transported = statusFromError(error.ReadOutputTruncated);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
+    try std.testing.expectEqual(error.ReadOutputTruncated, errorFromStatus(transported));
+    try std.testing.expect(errorHasStableDetail(error.ReadOutputTruncated));
+}
+
 test "FK publication progress and corrupt retirement proofs retain distinct boundary semantics" {
     const pending = statusFromError(error.GenerationAdmissionAcknowledgementPending);
     const changed = statusFromError(error.GenerationRetirementChanged);
@@ -948,6 +955,13 @@ pub const Detail = enum(c_int) {
     pioneer_credential_missing,
     unsupported_pioneer_schema,
     unsupported_pioneer_input,
+    standalone_replication_sources_unsupported,
+    ha_catalog_replication_sources_unsupported,
+    // Append-only: numeric Detail values are part of the stable C ABI.
+    embed_admission_refused,
+    read_output_truncated,
+    invalid_document_extraction_config,
+    document_extraction_model_required,
 };
 
 pub const Status = extern struct {
@@ -965,6 +979,8 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.InvalidDocumentExtractionConfig => status(.invalid_argument, .invalid_document_extraction_config),
+        error.DocumentExtractionModelRequired => status(.invalid_argument, .document_extraction_model_required),
         error.ReadTransientFailure => status(.retryable, .read_transient_failure),
         error.ReadRequestFailed => status(.invalid_argument, .read_request_failed),
         error.InvalidGcsUrl => status(.invalid_argument, .invalid_gcs_url),
@@ -991,6 +1007,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.PioneerCredentialMissing => status(.invalid_argument, .pioneer_credential_missing),
         error.UnsupportedPioneerSchema => status(.invalid_argument, .unsupported_pioneer_schema),
         error.UnsupportedPioneerInput => status(.invalid_argument, .unsupported_pioneer_input),
+        error.StandaloneReplicationSourcesUnsupported => status(.invalid_argument, .standalone_replication_sources_unsupported),
+        error.HACatalogReplicationSourcesUnsupported => status(.invalid_argument, .ha_catalog_replication_sources_unsupported),
         error.CloudflareAuthenticationFailed => status(.unauthorized, .cloudflare_authentication_failed),
         error.InvalidExtractorResponse => status(.invalid_argument, .invalid_extractor_response),
         error.UnsupportedExtractionSchemaVersion => status(.invalid_argument, .unsupported_extraction_schema_version),
@@ -1816,6 +1834,14 @@ pub fn statusFromError(err: anyerror) Status {
         error.ReadScopeResetUnsupported => status(.unsupported, .read_scope_reset_unsupported),
         error.ReadSnapshotForkUnsupported => status(.unsupported, .read_snapshot_fork_unsupported),
         error.SourceVisitorFailed => status(.internal, .source_visitor_failed),
+        // A local provider's admission refusal (the request never ran)
+        // distinct from a real provider transient failure. Keep this
+        // retryable like EmbedTransientFailure so callers that only check
+        // the Code still back off, while callers that need the distinct
+        // identity (the enrichment retry-budget exemption) can tell them
+        // apart by name.
+        error.EmbedAdmissionRefused => status(.retryable, .embed_admission_refused),
+        error.ReadOutputTruncated => status(.invalid_argument, .read_output_truncated),
         else => status(.internal, .none),
     };
 }
@@ -1880,6 +1906,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .pioneer_credential_missing => "PioneerCredentialMissing",
         .unsupported_pioneer_schema => "UnsupportedPioneerSchema",
         .unsupported_pioneer_input => "UnsupportedPioneerInput",
+        .standalone_replication_sources_unsupported => "StandaloneReplicationSourcesUnsupported",
+        .ha_catalog_replication_sources_unsupported => "HACatalogReplicationSourcesUnsupported",
         .cloudflare_authentication_failed => "CloudflareAuthenticationFailed",
         .invalid_extractor_response => "InvalidExtractorResponse",
         .unsupported_extraction_schema_version => "UnsupportedExtractionSchemaVersion",
@@ -2704,6 +2732,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .runtime_failed => "RuntimeFailed",
         .runtime_stopping => "RuntimeStopping",
         .runtime_already_ready => "RuntimeAlreadyReady",
+        .embed_admission_refused => "EmbedAdmissionRefused",
+        .read_output_truncated => "ReadOutputTruncated",
+        .invalid_document_extraction_config => "InvalidDocumentExtractionConfig",
+        .document_extraction_model_required => "DocumentExtractionModelRequired",
     };
 }
 
@@ -3192,6 +3224,8 @@ test "durable document policy errors retain identity across native runtime bound
         error.PioneerCredentialMissing,
         error.UnsupportedPioneerSchema,
         error.UnsupportedPioneerInput,
+        error.StandaloneReplicationSourcesUnsupported,
+        error.HACatalogReplicationSourcesUnsupported,
         error.CloudflareAuthenticationFailed,
         error.InvalidExtractorResponse,
         error.UnsupportedExtractionSchemaVersion,
@@ -3223,5 +3257,13 @@ test "reader failures preserve retry semantics and GCS failures preserve scope s
     try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.GcsConnectionNotFoundOrOutOfScope).code);
     inline for (.{ error.ReadTransientFailure, error.ReadRequestFailed, error.InvalidGcsUrl, error.GcsConnectionNotFoundOrOutOfScope, error.AmbiguousGcsConnection, error.InvalidConnectionCredentials }) |expected| {
         try std.testing.expectEqual(expected, errorFromStatus(statusFromError(expected)));
+    }
+}
+
+test "invalid persisted extraction policy retains identity across storage callbacks" {
+    inline for (.{ error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired }) |expected| {
+        const transported = comptime statusFromError(expected);
+        try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
+        try std.testing.expectEqual(expected, errorFromStatus(transported));
     }
 }

@@ -600,6 +600,7 @@ func corpusRawRequestContext(ctx context.Context, client *http.Client, method, e
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "antfly-grepstein/1")
 	if token := os.Getenv("ANTFLY_API_KEY"); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

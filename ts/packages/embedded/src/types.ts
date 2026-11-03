@@ -215,6 +215,7 @@ export interface Capabilities {
 }
 
 export interface PendingWorkStatus {
+  background_publications?: unknown;
   derived_target_sequence: number;
   has_async_indexes: boolean;
   portable_import_publication_in_progress: boolean;
@@ -239,7 +240,22 @@ export interface ReplayGeneratedEnrichmentsResult {
   replayed: number;
 }
 
+/** Logical key/value payload, excluding physical headers. */
+export interface LiveByteCategory {
+  records: number;
+  key_bytes: number;
+  value_bytes: number;
+}
+
+export interface LiveByteAccounting {
+  metadata_catalog: LiveByteCategory;
+  index_catalog: LiveByteCategory;
+  control_documents: LiveByteCategory;
+  documents: LiveByteCategory;
+}
+
 export interface CheckReport {
+  live_accounting?: LiveByteAccounting | null;
   valid: boolean;
   file_size: number;
   valid_prefix_size: number;

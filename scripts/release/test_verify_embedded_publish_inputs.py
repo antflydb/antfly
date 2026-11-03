@@ -59,6 +59,7 @@ class EmbeddedPublishTests(unittest.TestCase):
         self.assertIn('workflows: ["Release build"]', workflow)
         self.assertIn("github.event.workflow_run.conclusion == 'success'", workflow)
         self.assertIn('echo "publish=false"', workflow)
+        self.assertNotIn('echo "publish=true"', workflow)
         prepare = workflow.split("  prepare-cargo:")[1].split("  publish-cargo:")[0]
         publish = workflow.split("  publish-cargo:")[1].split("  publish-pypi:")[0]
         self.assertNotIn("id-token: write", prepare)
@@ -241,6 +242,7 @@ class EmbeddedPublishTests(unittest.TestCase):
                     "python_version": "0.3.0",
                     "npm_tag": "latest",
                     "tag": "v0.3.0",
+                    "publish": "true",
                 },
             )
             combined = copy.deepcopy(document)
@@ -292,7 +294,8 @@ class EmbeddedPublishTests(unittest.TestCase):
             self.assertEqual(outputs["tag"], "v0.3.0-rc.1")
             self.assertEqual(outputs["version"], "0.3.0-rc.1")
             self.assertEqual(outputs["python_version"], "0.3.0rc1")
-            self.assertEqual(outputs["npm_tag"], "next")
+            self.assertEqual(outputs["npm_tag"], "")
+            self.assertEqual(outputs["publish"], "false")
             with self.assertRaises((ValueError, SystemExit)):
                 verify_identity(
                     producer(controller),

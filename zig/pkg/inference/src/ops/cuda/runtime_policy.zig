@@ -26,6 +26,8 @@ pub const Policy = struct {
     trace_limit: usize = 4096,
     workspace_bytes: usize = 0,
     prefill_profile: bool = false,
+    split_attention: ?bool = null,
+    split_attention_chunk: ?usize = null,
 
     pub fn resolve() Policy {
         const workspace_mb = env.getenvUsize("ANTFLY_INFERENCE_CUDA_CUBLASLT_WORKSPACE_MB") orelse
@@ -40,7 +42,24 @@ pub const Policy = struct {
             .trace_limit = env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_TRACE_LIMIT") orelse 4096,
             .workspace_bytes = std.math.mul(usize, workspace_mb, 1024 * 1024) catch 0,
             .prefill_profile = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PROFILE_PREFILL_OPS", false),
+            .split_attention = if (env.getenv("ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION") != null)
+                env.getenvBool("ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION")
+            else
+                null,
+            .split_attention_chunk = env.getenvUsize("ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK"),
         };
+    }
+
+    // Full document contexts make serial per-key decode disproportionately
+    // expensive. Keep the paged F16/F32 route on the GPU, with bounded split
+    // scratch and the existing kernel's storage/shape eligibility checks.
+    // Other model families retain their own independently qualified defaults.
+    pub fn splitAttentionEnabled(self: Policy, lighton: bool, compute_major: i32) bool {
+        return self.split_attention orelse (lighton and compute_major >= 8);
+    }
+
+    pub fn splitAttentionChunk(self: Policy, lighton: bool) usize {
+        return self.split_attention_chunk orelse if (lighton) 32 else 128;
     }
 
     pub fn cacheBytes(self: Policy, training: bool) usize {
@@ -52,6 +71,22 @@ pub const Policy = struct {
         return self.max_temp_buffers orelse if (training) @as(usize, 4096) else 256;
     }
 };
+
+test "LightOnOCR3 split attention defaults preserve explicit disable and other model policies" {
+    const defaults = Policy{};
+    try std.testing.expect(defaults.splitAttentionEnabled(true, 8));
+    try std.testing.expect(defaults.splitAttentionEnabled(true, 12));
+    try std.testing.expect(!defaults.splitAttentionEnabled(true, 7));
+    try std.testing.expect(!defaults.splitAttentionEnabled(false, 12));
+    try std.testing.expectEqual(@as(usize, 32), defaults.splitAttentionChunk(true));
+    try std.testing.expectEqual(@as(usize, 128), defaults.splitAttentionChunk(false));
+    const disabled = Policy{ .split_attention = false, .split_attention_chunk = 0 };
+    try std.testing.expect(!disabled.splitAttentionEnabled(true, 12));
+    try std.testing.expectEqual(@as(usize, 0), disabled.splitAttentionChunk(true));
+    const explicit = Policy{ .split_attention = true, .split_attention_chunk = 64 };
+    try std.testing.expect(explicit.splitAttentionEnabled(false, 8));
+    try std.testing.expectEqual(@as(usize, 64), explicit.splitAttentionChunk(true));
+}
 
 test "LightOnOCR3 CUDA resolved buffer policy retains zero limits overflow and training defaults" {
     const defaults = Policy{};

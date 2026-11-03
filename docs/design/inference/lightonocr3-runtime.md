@@ -151,15 +151,22 @@ attention layers. Each recurrent layer retains its own state. Up to 128 physical
 rows use recurrent and attention packets of at most 64. Client concurrency,
 admitted live pages and physical GPU rows remain separate limits.
 
-The experimental `--decode-graph` switch replays two dependent decode tokens
-inside the reader epoch. It supports 2–64 pages, or up to 128 when the
+The native CUDA runtime automatically selects bounded two-token graph replay
+inside the reader epoch when its driver, artifacts, libraries, arithmetic and
+ownership support capture. `ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH=0` disables
+that selection; the benchmark `--decode-graph` switch explicitly requests it. It supports 2–64 pages, or up to 128 when the
 physical-128 reader mode is enabled. Eligibility and available memory determine
 whether a claim replays a graph. It retains the precision of the selected profile
 and independently admits graph metadata and scratch under operator limits.
 Benchmark with `--require-lighton-model-graph` to require actual replay.
+Omitting the profile wrapper's graph option preserves runtime selection; use
+`--decode-graph` or `--no-decode-graph` for an explicit comparison. The concurrency
+benchmark likewise leaves token-burst selection and width unset unless requested;
+`--no-gpu-token-burst` supplies the explicit single-step control.
 
-The DGX Spark presets enable four-token chains for pure decode cohorts through
-128 pages. `ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST=0` restores single-step decoding;
+Reader profiles enable bounded four-token device chains for pure decode cohorts
+when the backend supplies the required kernels. The DGX Spark presets also allow
+through 128 pages. `ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST=0` restores single-step decoding;
 widths 2–8 remain bounded by each page's original generation budget. Prepared
 vision features stay on GPU through prompt assembly.
 `ANTFLY_LIGHTONOCR3_DISABLE_DEVICE_VISION=1` restores the host feature handoff
@@ -211,6 +218,45 @@ directly. Its extra workspace has an independent memory reservation and does not
 increase operator limits. These modes remain experimental. CUDA LightOn
 throughput is below the installed vLLM reference; the Florence canonical GEMM
 option remains opt-in while an older rare output mismatch is investigated.
+
+## PDF ingestion qualification
+
+Token defaults, renderer caps, and memory policy must be compared independently.
+Use the exact same document bytes, page selection, reference transcriptions, model
+revision, binary, hardware, concurrency, and OCR routing thresholds in each run.
+Record the binary digest/source commit and effective resource configuration.
+
+For the rc.8 PDF-routing pilot, the comparison requires the original 66-page,
+15-document manifest, including the 35 pages routed to OCR. Those pilot fixtures
+and results are external to this repository. The protocol below is a rerun plan,
+not a claim that those pages have been qualified on the current runtime.
+
+1. Run the complete selection with the current default of 4096 output tokens,
+   automatic memory budgets, and the original render configuration. Record the
+   effective automatic budgets; do not reuse the pilot's explicit overrides as
+   the baseline. Check whether the set routed to OCR changed.
+2. Repeat with only `ocr.reader.max_tokens: 8192` changed. Compare completion and
+   output quality, not just the number of nonempty pages. For pages still
+   truncated at 8192, capture diagnostic generation output separately to inspect
+   repetition; do not publish that partial output as successful ingestion.
+3. From the same baseline, change only the render cap to
+   `max_dimension: 2048` and `max_pixels: 4194304`. Compare small print,
+   handwriting, and table structure against the uncapped output and references.
+   If render in-flight memory must change too, make that a separate run.
+4. From the same baseline, change only the memory budgets. Record which
+   constraint blocked each page, peak process/device memory, and competing
+   workload latency. Additional combined/backend capacity can admit a page
+   while reducing headroom for concurrent work.
+5. Run any chosen combined configuration over the complete selection. Keep
+   results from each run separate; do not combine successes from partial reruns.
+
+For every page retain OCR routing, extraction status/warning, rendered dimensions,
+selected text, reference-based accuracy, wall time, and available memory/usage
+counters. Distinguish completed-but-empty output from failures. Keep the two
+`InvalidPdfAnnotations` pages in every comparison and inspect their PDF structure
+as a separate rendering issue. Compare one-character and other trivial outputs
+against the reference before counting them as useful OCR. Metal and CUDA results
+must be qualified independently.
 
 ## Measurements (as of 2026-10-27)
 

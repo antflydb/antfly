@@ -577,7 +577,7 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
     const metadata_incarnation = (try service.metadataIncarnation()) orelse
         return error.MissingMetadataIncarnation;
     try context.ensureActive();
-    const receipt = try service.proposeTransitionCommandWithReceipt(.{ .compare_and_replace_table = .{
+    const receipt = try proposeCatalogWithContext(service, context, .{ .compare_and_replace_table = .{
         .expected = expected,
         .replacement = replacement,
         .relation_guard = relation_guard,
@@ -3498,6 +3498,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
     };
     if (has_lake_catalog) return metadata_topology_protocol.lake_index_catalog_version;
     const requires_v11 = switch (command) {
+        .apply_sql_completion_reference => return metadata_topology_protocol.sql_completion_reference_version,
         .apply_store_root_enrollment, .ack_initial_fk_retirement => return metadata_topology_protocol.store_root_enrollment_version,
         .apply_fk_generation_publication => return metadata_topology_protocol.fk_generation_publication_version,
         // Initial CREATE carries the v2 reservation and retirement scope in
@@ -5543,7 +5544,7 @@ pub fn replicationCutoverRetirementMatches(
         );
 }
 
-fn isExpectedCdcRoundError(err: anyerror) bool {
+pub fn isExpectedCdcRoundError(err: anyerror) bool {
     return switch (err) {
         error.UnknownReplicationSource,
         error.UnsupportedReplicationSource,
@@ -5817,6 +5818,17 @@ pub const MetadataService = struct {
     store_status_backfill_marker_cache: StoreStatusBackfillMarkerCache = .{},
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
+    // Resume points for the snapshot and streaming backfill coordinators,
+    // carried across rounds on this leader so a source stuck past its
+    // round's quantum does not starve sources later in the table/source
+    // list every round (see replication_backfill.SourceRoundCursor).
+    // In-memory scheduling state only: it resets on restart or on a
+    // leadership change (a new MetadataService), which is fine -- the
+    // worst case is one extra round at the old resume order, not lost
+    // replication work. Guarded by `cdc_runtime_mutex`, the same lock that
+    // already serializes this leader's other CDC round state.
+    cdc_snapshot_cursor: metadata_replication_backfill.SourceRoundCursor = .{},
+    cdc_streaming_cursor: metadata_replication_backfill.SourceRoundCursor = .{},
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
@@ -6324,19 +6336,23 @@ pub const MetadataService = struct {
         self: *MetadataService,
         command: metadata_storage.TransitionCommand,
     ) !MetadataProposalReceipt {
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null);
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null, null);
     }
 
     pub fn proposeTransitionCommandWithReceiptInTerm(self: *MetadataService, command: metadata_storage.TransitionCommand, expected_term: u64) !MetadataProposalReceipt {
         if (expected_term == 0) return error.NotLeader;
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term, null);
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term, null, null);
     }
 
     pub fn proposeTopologyActivationWithReceipt(self: *MetadataService, bytes: []const u8, readiness: TableTopologyProtocolReadiness) !MetadataProposalReceipt {
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(.{ .activate_topology_protocol = bytes }, readiness.term, try topologyActivationAdmission(self, bytes, readiness));
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(.{ .activate_topology_protocol = bytes }, readiness.term, try topologyActivationAdmission(self, bytes, readiness), null);
     }
 
-    fn proposeTransitionCommandWithReceiptInExpectedTerm(self: *MetadataService, command: metadata_storage.TransitionCommand, expected_term: ?u64, activation_admission: ?CoordinatedDecoderAdmission) !MetadataProposalReceipt {
+    pub fn proposeTransitionCommandWithReceiptObserved(self: *MetadataService, command: metadata_storage.TransitionCommand, submitted: ?*bool) !MetadataProposalReceipt {
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null, submitted);
+    }
+
+    fn proposeTransitionCommandWithReceiptInExpectedTerm(self: *MetadataService, command: metadata_storage.TransitionCommand, expected_term: ?u64, activation_admission: ?CoordinatedDecoderAdmission, submitted: ?*bool) !MetadataProposalReceipt {
         const decoder = activation_admission orelse try prepareCoordinatedDecoderAdmission(self, &.{command});
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
@@ -6362,6 +6378,9 @@ pub const MetadataService = struct {
         var dispatch_error: ?anyerror = null;
         self.raft.host.host.proposeWithReceipt(self.metadata_group_id, encoded, &accepted_index) catch |err| {
             dispatch_error = err;
+        };
+        if (accepted_index != null) if (submitted) |observed| {
+            observed.* = true;
         };
         const index = try acceptedMetadataProposalIndex(accepted_index, dispatch_error);
         try self.raft.host.host.trackProposalReceipt(
@@ -8395,19 +8414,18 @@ pub const MetadataService = struct {
         write_source.backend_runtime = runtime;
         _ = write_source.withSecretStore(self.secret_store);
         _ = write_source.withDestinationAuthorization(self.destination_authorizer);
-        var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
+        var cursors = loadCdcCursors(self);
+        defer storeCdcCursors(self, cursors);
+
+        const summary = metadata_replication_backfill.runSnapshotRound(self.alloc, self, .{
             .alloc = self.alloc,
-            .runner = .{
-                .alloc = self.alloc,
-                .io = runtime.io() orelse std.Options.debug_io,
-                .registry = &self.cdc_backfill_registry,
-                .write_source = write_source.source(),
-                .secret_store = self.secret_store,
-                .work_permit = cdcWorkPermit(self),
-                .destination_authorizer = self.destination_authorizer,
-            },
-        };
-        const summary = coordinator.runRound(self) catch |err| {
+            .io = runtime.io() orelse std.Options.debug_io,
+            .registry = &self.cdc_backfill_registry,
+            .write_source = write_source.source(),
+            .secret_store = self.secret_store,
+            .work_permit = cdcWorkPermit(self),
+            .destination_authorizer = self.destination_authorizer,
+        }, metadata_replication_backfill.default_runtime_quantum_ns, &cursors.snapshot) catch |err| {
             if (!isExpectedCdcRoundError(err)) return err;
             std.log.warn("metadata cdc snapshot round skipped: {s}", .{@errorName(err)});
             return;
@@ -8425,19 +8443,15 @@ pub const MetadataService = struct {
                 },
             );
         }
-        var streaming = metadata_replication_backfill.StreamingReplicationCoordinator{
+        const stream_summary = metadata_replication_backfill.runStreamingRound(self.alloc, self, .{
             .alloc = self.alloc,
-            .runner = .{
-                .alloc = self.alloc,
-                .io = runtime.io() orelse std.Options.debug_io,
-                .registry = &self.cdc_backfill_registry,
-                .write_source = write_source.source(),
-                .secret_store = self.secret_store,
-                .work_permit = cdcWorkPermit(self),
-                .destination_authorizer = self.destination_authorizer,
-            },
-        };
-        const stream_summary = streaming.runRound(self) catch |err| {
+            .io = runtime.io() orelse std.Options.debug_io,
+            .registry = &self.cdc_backfill_registry,
+            .write_source = write_source.source(),
+            .secret_store = self.secret_store,
+            .work_permit = cdcWorkPermit(self),
+            .destination_authorizer = self.destination_authorizer,
+        }, metadata_replication_backfill.default_runtime_quantum_ns, &cursors.streaming) catch |err| {
             if (!isExpectedCdcRoundError(err)) return err;
             std.log.warn("metadata cdc streaming round skipped: {s}", .{@errorName(err)});
             return;
@@ -8561,6 +8575,12 @@ pub const MetadataHttpService = struct {
     store_status_backfill_marker_cache: StoreStatusBackfillMarkerCache = .{},
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
+    // See MetadataService.cdc_snapshot_cursor / cdc_streaming_cursor: the
+    // same persisted-resume-point fix, guarded by the same
+    // `cdc_runtime_mutex` this struct already uses for its other CDC round
+    // state.
+    cdc_snapshot_cursor: metadata_replication_backfill.SourceRoundCursor = .{},
+    cdc_streaming_cursor: metadata_replication_backfill.SourceRoundCursor = .{},
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
@@ -8960,7 +8980,7 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         command: metadata_storage.TransitionCommand,
     ) !MetadataProposalReceipt {
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null);
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null, null);
     }
 
     pub fn proposeTransitionCommandsWithReceipt(
@@ -9022,11 +9042,15 @@ pub const MetadataHttpService = struct {
         expected_term: u64,
     ) !MetadataProposalReceipt {
         if (expected_term == 0) return error.NotLeader;
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term, null);
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term, null, null);
     }
 
     pub fn proposeTopologyActivationWithReceipt(self: *MetadataHttpService, bytes: []const u8, readiness: TableTopologyProtocolReadiness) !MetadataProposalReceipt {
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(.{ .activate_topology_protocol = bytes }, readiness.term, try topologyActivationAdmission(self, bytes, readiness));
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(.{ .activate_topology_protocol = bytes }, readiness.term, try topologyActivationAdmission(self, bytes, readiness), null);
+    }
+
+    pub fn proposeTransitionCommandWithReceiptObserved(self: *MetadataHttpService, command: metadata_storage.TransitionCommand, submitted: ?*bool) !MetadataProposalReceipt {
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null, submitted);
     }
 
     fn proposeTransitionCommandWithReceiptInExpectedTerm(
@@ -9034,6 +9058,7 @@ pub const MetadataHttpService = struct {
         command: metadata_storage.TransitionCommand,
         expected_term: ?u64,
         activation_admission: ?CoordinatedDecoderAdmission,
+        submitted: ?*bool,
     ) !MetadataProposalReceipt {
         const decoder = activation_admission orelse try prepareCoordinatedDecoderAdmission(self, &.{command});
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
@@ -9063,6 +9088,9 @@ pub const MetadataHttpService = struct {
         var dispatch_error: ?anyerror = null;
         self.raft.host.http_host.proposeWithReceipt(self.metadata_group_id, encoded, &accepted_index) catch |err| {
             dispatch_error = err;
+        };
+        if (accepted_index != null) if (submitted) |observed| {
+            observed.* = true;
         };
         const index = try acceptedMetadataProposalIndex(accepted_index, dispatch_error);
         try self.raft.host.http_host.host.trackProposalReceipt(
@@ -13177,19 +13205,18 @@ pub const MetadataHttpService = struct {
         );
         _ = hosted_write_source.withDestinationAuthorization(self.destination_authorizer);
         const write_source = self.cdc_write_source_override orelse hosted_write_source.source();
-        var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
+        var cursors = loadCdcCursors(self);
+        defer storeCdcCursors(self, cursors);
+
+        const summary = metadata_replication_backfill.runSnapshotRound(self.alloc, self, .{
             .alloc = self.alloc,
-            .runner = .{
-                .alloc = self.alloc,
-                .io = runtime.io() orelse std.Options.debug_io,
-                .registry = &self.cdc_backfill_registry,
-                .write_source = write_source,
-                .secret_store = self.secret_store,
-                .work_permit = cdcWorkPermit(self),
-                .destination_authorizer = self.destination_authorizer,
-            },
-        };
-        const summary = coordinator.runRound(self) catch |err| {
+            .io = runtime.io() orelse std.Options.debug_io,
+            .registry = &self.cdc_backfill_registry,
+            .write_source = write_source,
+            .secret_store = self.secret_store,
+            .work_permit = cdcWorkPermit(self),
+            .destination_authorizer = self.destination_authorizer,
+        }, metadata_replication_backfill.default_runtime_quantum_ns, &cursors.snapshot) catch |err| {
             if (!isExpectedCdcRoundError(err)) return err;
             if (comptime builtin.is_test) {
                 std.debug.print("metadata http cdc snapshot round skipped: {s}\n", .{@errorName(err)});
@@ -13210,19 +13237,15 @@ pub const MetadataHttpService = struct {
                 },
             );
         }
-        var streaming = metadata_replication_backfill.StreamingReplicationCoordinator{
+        const stream_summary = metadata_replication_backfill.runStreamingRound(self.alloc, self, .{
             .alloc = self.alloc,
-            .runner = .{
-                .alloc = self.alloc,
-                .io = runtime.io() orelse std.Options.debug_io,
-                .registry = &self.cdc_backfill_registry,
-                .write_source = write_source,
-                .secret_store = self.secret_store,
-                .work_permit = cdcWorkPermit(self),
-                .destination_authorizer = self.destination_authorizer,
-            },
-        };
-        const stream_summary = streaming.runRound(self) catch |err| {
+            .io = runtime.io() orelse std.Options.debug_io,
+            .registry = &self.cdc_backfill_registry,
+            .write_source = write_source,
+            .secret_store = self.secret_store,
+            .work_permit = cdcWorkPermit(self),
+            .destination_authorizer = self.destination_authorizer,
+        }, metadata_replication_backfill.default_runtime_quantum_ns, &cursors.streaming) catch |err| {
             if (!isExpectedCdcRoundError(err)) return err;
             std.log.warn("metadata http cdc streaming round skipped: {s}", .{@errorName(err)});
             return;
@@ -14923,6 +14946,28 @@ test "metadata cdc provider quantum is bounded by observed lease remainder" {
         @as(u64, 5_000 * std.time.ns_per_ms / 3),
         try cdcProviderQuantumNs(5_000, 3_000),
     );
+}
+
+const CdcRoundCursors = struct {
+    snapshot: metadata_replication_backfill.SourceRoundCursor,
+    streaming: metadata_replication_backfill.SourceRoundCursor,
+};
+
+/// Read both round cursors under `cdc_runtime_mutex`, the same lock that
+/// already guards this leader's other CDC round state
+/// (`cdc_job_in_flight`, `cdc_next_round_at_ms`, ...).
+fn loadCdcCursors(service: anytype) CdcRoundCursors {
+    service.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
+    defer service.cdc_runtime_mutex.unlock(std.Options.debug_io);
+    return .{ .snapshot = service.cdc_snapshot_cursor, .streaming = service.cdc_streaming_cursor };
+}
+
+/// Persist both round cursors after a round, under the same lock.
+fn storeCdcCursors(service: anytype, cursors: CdcRoundCursors) void {
+    service.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
+    defer service.cdc_runtime_mutex.unlock(std.Options.debug_io);
+    service.cdc_snapshot_cursor = cursors.snapshot;
+    service.cdc_streaming_cursor = cursors.streaming;
 }
 
 fn cdcWorkPermit(service: anytype) metadata_replication_backfill.WorkPermit {
@@ -23278,4 +23323,13 @@ test "metadata.lake index object table engine requires its own decoder capabilit
     const table: metadata_table_manager.TableRecord = .{ .table_id = 9, .name = "objects", .storage = .{ .engine = .object }, .min_ranges = 0, .desired_replica_count = 0 };
     try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
     try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_table_topology = .{ .create = .{ .table = table, .ranges = &.{}, .expected_transition_generation = 0 } } }));
+}
+
+pub fn proposeCatalogWithContext(service: anytype, context: api_operation.RequestContext, command: metadata_storage.TransitionCommand) @TypeOf(service.proposeTransitionCommandWithReceipt(command)) {
+    try context.ensureActive();
+    if (comptime @hasDecl(@TypeOf(service.*), "proposeTransitionCommandWithReceiptObserved"))
+        return service.proposeTransitionCommandWithReceiptObserved(command, context.sql_completion_submission);
+    // Foreign/test services without an admission witness remain conservative.
+    context.markSQLSubmission();
+    return service.proposeTransitionCommandWithReceipt(command);
 }

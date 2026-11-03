@@ -574,6 +574,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi native marker sweep",
         "capi native unbounded writer admits reusable pool before a large request",
         "capi native allocator proof",
+        "capi native recovery agenda",
+        "capi native logical generations",
         "capi native close bounds proof work",
         "capi native text queries",
         "capi native replacement wait",
@@ -646,7 +648,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .root_module = lake_test_mod,
         // Compile reader/cursor regressions, not unrelated server fixture tests
         // reachable through shared schema and credential modules.
-        .filters = selectTestFilters(b, &.{ "lake SQL", "Parquet ", "parquet ", "Iceberg ", "iceberg ", "external source inventory", "external lake identities", "external lake pruning", "lake host resolver" }),
+        .filters = selectTestFilters(b, &.{ "lake SQL", "lake catalog", "Parquet ", "parquet ", "Iceberg ", "iceberg ", "external source inventory", "external lake identities", "external lake pruning", "lake host resolver" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("embedded-lake-test", "Test lake readers and SQL cursors without the server")
