@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "status": "Not qualified: original-importer Debug input 7 still failed after 513.534 seconds with LiteReplayBacklogExceeded. The fair-admission candidate passes its native and SDK gates, but the full consumer gate found a generation-control false-uncertainty diagnostic. A phase-aware native publication fix and pre-commit batch-response encoding are implemented and awaiting validation before optimized final qualification. #1431 remains open.",
+  "status": "Local correctness gates green at 985c49c1b2, production runtime 101aa00910: 756 native, 282 physical C API, 87 consumer/lifecycle, 24 generation/posting tests, plus 209 SDK tests against the identical Debug library. Optimized frozen-input, original-importer contention and sustained qualification on wolfspider are next. The earlier unchanged-importer Debug failure remains unresolved evidence; #1431 stays open.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
-  "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
+  "runtime_commit": "101aa00910f48f98f0529871b77d10f49fc38ba9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
   "constraints": [
     "Original importer unchanged",
@@ -7018,5 +7018,101 @@
     "optimized_final_host_started": false,
     "original_importer_unchanged": true,
     "parallel_pr": "#1479 independently implements a different fairness queue; reconcile overlapping implementations before landing both."
+  },
+  "comment_followup_current_validation_20261103": {
+    "source_commit": "985c49c1b26922560e9cd53d3fe0fc3eb945419d",
+    "runtime_commit": "101aa00910f48f98f0529871b77d10f49fc38ba9",
+    "debug_library_sha256": "f1e4e09e384bbc859cd7ff5cf0751df1068adf14bb706b988a5f0bb10e0b51b0",
+    "whole_producer_command_completed": true,
+    "whole_producer_command_exit_code": 0,
+    "command": "ANTFLY_TEST_FAIL_ON_ERROR_LOGS=1 zig build capi-contract-test lite-native-test antfly-generation-publication-test capi capi-smoke capi-exports-check -Doptimize=debug -j1",
+    "cache_policy": "Worktree .zig-cache, .zig-cache/global and zig/zig-out; no temporary build caches.",
+    "native": {
+      "passed": 756,
+      "skipped": 5,
+      "failed": 0,
+      "leaked": 0,
+      "expected_error_logs": 9,
+      "unexpected_error_logs": 0
+    },
+    "physical_capi_curated": {
+      "passed": 282,
+      "skipped": 3,
+      "failed": 0,
+      "leaked": 0,
+      "expected_error_logs": 2,
+      "unexpected_error_logs": 0
+    },
+    "consumer_lifecycle": {
+      "passed": 87,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "expected_error_logs": 1,
+      "unexpected_error_logs": 0
+    },
+    "generation_and_posting": {
+      "passed": 24,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "expected_error_logs": 3,
+      "unexpected_error_logs": 0
+    },
+    "native_root_anchors": {
+      "passed": 11,
+      "failed": 0
+    },
+    "backup_preflight": {
+      "passed": 2,
+      "failed": 0
+    },
+    "writer_admission_real_processes": {
+      "passed": 6,
+      "failed": 0
+    },
+    "python_sql_catalog_concurrency_outcomes": {
+      "passed": 209,
+      "failed": 0,
+      "seconds": 131.61,
+      "library_sha256": "f1e4e09e384bbc859cd7ff5cf0751df1068adf14bb706b988a5f0bb10e0b51b0",
+      "identical_to_final_debug_library": true
+    },
+    "focused_faults": {
+      "native_publication_and_queued_groups": 7,
+      "raw_batch_allocation_before_increment": 1,
+      "failed": 0,
+      "leaked": 0
+    },
+    "abi": {
+      "public_exports": 134,
+      "internal_exports": 0,
+      "c_smoke_and_executable_shared_library_linkage": "passed"
+    },
+    "scope": "Configured nonzero admission budgets, safe zero-timeout local serialization, fair OFD admission, completed-proof retention, three SQL COMMIT dispositions and SDK propagation, uncertainty quarantine/reopen, native publication-state certification, prepared posting retry, and batch response allocation before mutation.",
+    "platform": "macOS ARM64 runtime; Linux x86_64 and ARM64 range-lock cross-compilation only.",
+    "performance_qualification": "Pending. No optimized final-host build or measurement has started.",
+    "external_gates": "Aggregate CI requires human approval; full factory belongs to Beads.",
+    "deferred_proposals": "Broker/election and retaining leases across public calls need measured benefits and explicit lifecycle/fairness contracts."
+  },
+  "failed_debug_input7_document_family_census_20261103": {
+    "scope": "The closed v12 failed input-7 database; not a matched-progress comparison with a completed control.",
+    "file_bytes": 1250070528,
+    "logical_live_bytes": 763599676,
+    "logical_live_records": 1768917,
+    "authored_document_logical_bytes": 442273154,
+    "control_document_logical_bytes": 174363573,
+    "index_catalog_logical_bytes": 146960136,
+    "metadata_catalog_logical_bytes": 2813,
+    "replay_entry_records": 318,
+    "replay_entry_value_bytes": 16547136,
+    "txn_prefixed_control_records": 838,
+    "txn_prefixed_control_logical_bytes": 81149,
+    "identity_namespace_records": 688646,
+    "identity_namespace_logical_bytes": 48874887,
+    "family_partition_matches_catalog_totals": true,
+    "interpretation": "Control documents are not synonymous with pending replay: this category also includes identity, TTL/reverse-index, metadata and derived records. The transaction figure covers the actual __txn_* prefix families. These aggregates do not explain the original approximately 430 MB compact-size difference; matched settled before/after family and physical-header accounting is still required.",
+    "generation_publication_errors_in_saved_import_logs": 0,
+    "qualification_policy": "Family census runs only on quiescent files before and after compaction, with identical read-only parsing for every revision; exports contain numeric aggregates and hashes only."
   }
 }

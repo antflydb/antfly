@@ -18,7 +18,8 @@
 
 This diagnostic validates the pages it visits, but does not replace native
 integrity checking. Values stay on disk; only aggregate lengths are emitted.
-An inode shared lock prevents reuse/shrink while the captured roots are read.
+Run only after writers stop. The captured checkpoint is read under an inode
+shared lock; this diagnostic does not register native reader epochs.
 """
 
 from __future__ import annotations
