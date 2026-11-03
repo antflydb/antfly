@@ -17,3 +17,7 @@ usage guide is [EmbeddingGemma 2](../../../../guides/models/embeddinggemma2.mdx)
   independent F32 reference, full SciFact retrieval, production HTTP contracts,
   sustained load, overload and cancellation/deadline recovery. Qualified scope
   is native F32 text queries on this ARM host.
+- [CPU image production qualification on GB10, 2026-11-03](2026-11-03-cpu-image-qualification.md):
+  independent image/caption references, CPU/GPU retrieval compatibility,
+  image serving load/recovery/overload, byte/pixel boundaries, and the VP8L
+  decoder correction found by the campaign.

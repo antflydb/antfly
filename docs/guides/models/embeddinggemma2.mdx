@@ -62,13 +62,22 @@ antfly inference embed "$MODEL_DIR" --group \
   --text 'Reset a forgotten password.' --image reset.png
 ```
 
-## CPU query services
+## CPU services
 
 Native F32 text-query serving is [qualified on the ARM GB10 reference host](../../design/inference/history/embeddinggemma2/2026-11-03-cpu-production-qualification.md).
 The report records concurrency, latency, memory and resource limits; use those
 measurements when sizing a separate CPU service. Select the `native` backend
 for CPU preloads and pin the CPU service's returned identity. The CPU and CUDA
 recipes have different identities, so a CUDA identity pin rejects CPU results.
+
+[CPU image serving is also qualified on GB10](../../design/inference/history/embeddinggemma2/2026-11-03-cpu-image-qualification.md),
+including JPEG, PNG, first-frame GIF, lossless WebP and uncompressed BMP fixtures.
+The ten-minute two-client image soak achieved about 0.44 images/sec with 4.75 s
+p95 latency. A fresh worker's first image took about 20 s after model preload;
+prewarm with an image before routing traffic that needs warm-image latency.
+Use the report's image-specific sizes, concurrency and memory envelope when
+sizing a CPU image service. These measurements do not qualify x86 or hard pod
+CPU/memory limits.
 
 ## Pin the model in an index
 
