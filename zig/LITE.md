@@ -1626,6 +1626,10 @@ database producer publication, index catch-up, integrity and reopening using
 public synthetic text. The required model is `fastino/gliner2.5-base-v1`; missing
 models fail the gate rather than skip it. Explicit database drains must enable
 `local_runtime=True` and generated replay so they can service those producers.
+For a candidate that changes extractor planning, add `--history-windows` to
+exercise a public 1,025-word history turn and a larger composition-profile
+document before full imports. Record historical libraries' geometry rejections
+as qualification failures rather than treating them as missing-model setup.
 
 Issue #1431 qualification includes the full unchanged-importer corpus against
 both current main and the original pinned reference, plus three original

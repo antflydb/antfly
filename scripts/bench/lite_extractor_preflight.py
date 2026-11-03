@@ -33,7 +33,7 @@ MODEL = "fastino/gliner2.5-base-v1"
 TEXT = "John Smith works at Microsoft in Seattle."
 
 
-def run(library, directory):
+def run(library, directory, history_windows=False):
     af = sdk(str(Path(library).resolve()))
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
@@ -45,6 +45,7 @@ def run(library, directory):
         "include_spans": True,
         "long_document": {"mode": "window"},
     }
+    window_cases = []
     # Standalone success alone does not test the database's producer wiring.
     with af.Inference.open(call_timeout_ms=120000) as inference:
         result = inference.extract(
@@ -66,6 +67,52 @@ def run(library, directory):
                 for entity in entities
             ):
                 raise RuntimeError("Synthetic extraction did not find " + label)
+        if history_windows:
+            history_schema = {
+                "entities": [
+                    "concept",
+                    "technology",
+                    "tool",
+                    "project",
+                    "organization",
+                    "person",
+                    "goal",
+                    "problem",
+                    "practice",
+                    "constraint",
+                    "metric",
+                ],
+                "relations": [],
+            }
+            unit = "configuration visibility admission maintenance acknowledgement "
+            for name, text in (
+                ("short_final_window", unit * 205),
+                ("composition_document", (unit * 3200)[:190000]),
+            ):
+                began = time.monotonic()
+                result = inference.extract(
+                    {
+                        "schema_version": 2,
+                        "model": MODEL,
+                        "schema": history_schema,
+                        "options": options,
+                        "inputs": [{"content": text}],
+                    }
+                )
+                windows = result["data"][0]["long_document"]["window_count"]
+                if windows < 2:
+                    raise RuntimeError(
+                        "Long history fixture did not exercise windowing"
+                    )
+                window_cases.append(
+                    {
+                        "case": name,
+                        "bytes": len(text.encode()),
+                        "words": len(text.split()),
+                        "windows": windows,
+                        "seconds": time.monotonic() - began,
+                    }
+                )
     config = {
         "name": "knowledge",
         "type": "graph",
@@ -123,6 +170,7 @@ def run(library, directory):
         "model": MODEL,
         "library_sha256": library_sha256,
         "standalone_entities_verified": True,
+        "history_window_cases": window_cases,
         "database_processed_requests": enrichment["processed_requests"],
         "database_errors": enrichment["error_count"],
         "graph_coverage_produced": graph["coverage_produced_count"],
@@ -135,8 +183,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", required=True)
     parser.add_argument("--directory", type=Path, required=True)
+    parser.add_argument(
+        "--history-windows",
+        action="store_true",
+        help="also require bounded multi-window history extraction",
+    )
     args = parser.parse_args()
-    report = run(args.library, args.directory)
+    report = run(args.library, args.directory, args.history_windows)
     (args.directory / "result.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report), flush=True)
 

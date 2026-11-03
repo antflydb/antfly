@@ -191,6 +191,15 @@ independent of document length.
   per window. The default was chosen because attention cost is quadratic in
   window length: 1024-word windows measured ~2.1x faster end to end than the
   former 4096/128 default on real corpus sections.
+- Word-window sizes are ceilings. Serving selects a preparation token ceiling
+  from profiles compatible with the complete request's features and item count,
+  and replans source windows against the tokenizer's complete schema/text
+  prompt. Workspace sizing, qualification and execution share that ceiling.
+  A larger legacy context cannot be borrowed from a profile with incompatible
+  geometry: an early window must not eliminate the composition profile and
+  leave a short final window below the legacy profile's token minimum. All
+  source words retain their offsets; the unchanged gate still requires one
+  reviewed profile to cover every actual window before the first model call.
 - `Limits.window_batch_size` (default **4**) groups a document's windows into
   one forward pass, except for schemas with classification or JointIE, which
   run one window per call. An `error.OutOfMemory` on a group retries the same

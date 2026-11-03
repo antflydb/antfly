@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Not qualified: current Debug correctness, replay/backfill, original fourth-input semantic checks and Beads/Gas City components pass. First final-host attempt stopped on a missing GLiNER model. Corrected local extractor preflight passes; final-host rerun, full factory (Beads-owned) and aggregate CI remain.",
+  "status": "Not qualified: corrected model-backed final control imports and primary checks passed, but index settling reproduced GlinerBoundaryPaddedSequenceLimitExceeded. Final runs stopped. A locally reproduced profile-planning fix is in Debug validation; candidate full imports, contention, soaks, Beads-owned factory and aggregate CI remain.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -4663,7 +4663,8 @@
     ],
     "original_importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
     "original_207_library_sha256": "ef3c87e963330323b13a99973fc1268d697226c0212fdbdba0a3edcb82c97b7b",
-    "factory_owner": "Beads task; user explicitly left full agent factory qualification to that task."
+    "factory_owner": "Beads task; user explicitly left full agent factory qualification to that task.",
+    "qualification_controller": "Final controller includes original 207 and integrated main controls. Contention includes repeated status_only opens and a persistent SQL reader, with actual successful reads while writers are active."
   },
   "final_d759_attempt": {
     "source_commit": "d75999ee48c3956f8dbe516194950e61d8b58447",
@@ -4696,6 +4697,160 @@
       "seconds": 20.579830540926196
     },
     "earlier_probe_failure": "InferenceInvocationMemoryUnavailable was caused by a synthetic preflight omitting local_runtime=True; corrected preflight passes. Not attributed to a native runtime defect.",
-    "scope": "Public synthetic extraction, actual database graph producer and coverage, replay catch-up, integrity and reopen. Required before corpus qualification for every library."
+    "scope": "Public synthetic extraction, actual database graph producer and coverage, replay catch-up, integrity and reopen. Required before corpus qualification for every library.",
+    "final_host_release": {
+      "candidate": {
+        "passed": true,
+        "library_sha256": "5958d662af90a97f08ce370b8957303f167913e900e02464d9cbe93a8aecb5a5",
+        "seconds": 13.595643541775644
+      },
+      "integrated_main": {
+        "passed": true,
+        "library_sha256": "e2e2df564c1dde5f9450f08b50049229fc3e8076e2a5bae37b05794ac24215e7",
+        "seconds": 2.104798583779484
+      },
+      "original_207": {
+        "passed": true,
+        "library_sha256": "ef3c87e963330323b13a99973fc1268d697226c0212fdbdba0a3edcb82c97b7b",
+        "seconds": 5.386728084180504
+      },
+      "timing_policy": "Setup preflight timings; not performance measurements. Includes standalone and database extraction; initial host setup may compile model kernels."
+    },
+    "harness_synthetic_checks": {
+      "repeated_status_reader": {
+        "successful_reads_during_writes": 3,
+        "busy": 0,
+        "passed": true
+      },
+      "settling_and_accounting": {
+        "passed": true,
+        "primary_rows": 1,
+        "tables": 6,
+        "before_after_compaction_primary_hashes_equal": true
+      },
+      "policy": "Two cold-process namespace drains, close writer handles, capture settled primary/logical fields, compact, then independently verify primary equality and live byte accounting. Cross-version payload comparisons use equivalent settled states."
+    }
+  },
+  "final_1431_model_ready_attempt": {
+    "qualification_source_commit": "0f4aa78849",
+    "runtime_source_commit": "806695b4fbeb391aad4c9fb6dd4d6c2d016d212d",
+    "pinned_main_control_commit": "f2b3baaee1cb508005451843c17fa07f2e069d4b",
+    "status": "Not qualified; control index settling failed and remaining phases were stopped.",
+    "first_imports": {
+      "main-f2b3-release-a": {
+        "total_import_seconds": 5.36988891614601,
+        "completed": 1,
+        "all_successful": true
+      },
+      "207cd9ca3b-a": {
+        "total_import_seconds": 5.5674030422233045,
+        "completed": 1,
+        "all_successful": true
+      },
+      "final-1431-release-a": {
+        "total_import_seconds": 4.9818023750558496,
+        "completed": 1,
+        "all_successful": true
+      },
+      "main-f2b3-release-b": {
+        "total_import_seconds": 5.194622542243451,
+        "completed": 1,
+        "all_successful": true
+      },
+      "207cd9ca3b-b": {
+        "total_import_seconds": 5.389330000150949,
+        "completed": 1,
+        "all_successful": true
+      },
+      "final-1431-release-b": {
+        "total_import_seconds": 4.995607582852244,
+        "completed": 1,
+        "all_successful": true
+      }
+    },
+    "control_full_import": {
+      "total_import_seconds": 370.599523501005,
+      "completed": 15,
+      "all_successful": true,
+      "primary": {
+        "complete": true,
+        "tables": 45,
+        "rows": 464359,
+        "integrity": true
+      },
+      "provenance": {
+        "library_sha256": "e2e2df564c1dde5f9450f08b50049229fc3e8076e2a5bae37b05794ac24215e7",
+        "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c"
+      }
+    },
+    "control_settling_public_errors": [
+      "GlinerBoundaryPaddedSequenceLimitExceeded",
+      "InferenceProviderFailure",
+      "EnrichmentWorkerFailed"
+    ],
+    "original_reference": "Interrupted during input 7 after the control settling failure. Not a completed latency or throughput sample.",
+    "candidate_scope": "Only paired first imports completed; candidate full corpus/contention/soaks did not run.",
+    "frozen_before": {
+      "files": 39,
+      "bytes": 1296826481,
+      "sha256": "a618da0dcf7fc60a5473bd1099c9dc86f9d997fb7c2c61a330a66ae720e66bec",
+      "protocol": "sorted relative UTF-8 path length/path, file length, SHA256 digest"
+    },
+    "frozen_after": {
+      "files": 39,
+      "bytes": 1296826481,
+      "sha256": "a618da0dcf7fc60a5473bd1099c9dc86f9d997fb7c2c61a330a66ae720e66bec",
+      "protocol": "sorted relative UTF-8 path length/path, file length, SHA256 digest"
+    },
+    "frozen_unchanged": true,
+    "stopped_utc": "2026-11-03T03:37:43Z",
+    "new_main_tip_observed": "3b712f22430e7dd22d8c762f2f7d53a047613b68",
+    "control_label_policy": "f2b3 is the frozen integrated-main control, not the newer main tip. Do not relabel these measurements."
+  },
+  "gliner_window_profile_local_followup": {
+    "before_fix_public_repro": {
+      "bytes": 12915,
+      "words": 1025,
+      "public_synthetic": true,
+      "succeeded": false,
+      "error": "InvalidArgumentError",
+      "message": "ANTFLY_INVALID_ARGUMENT: EXTRACTION_LIMIT_EXCEEDED: GLiNER boundary extraction exceeds the qualified padded_sequence_tokens limit",
+      "seconds": 11.032604541978799
+    },
+    "additional_public_repro": {
+      "bytes": 190000,
+      "words": 15080,
+      "unit": "public synthetic technical prose",
+      "library_sha256": "865453e86d373a1ed72a40866591965b5bc6d245e14e69736356f43d93f46e57",
+      "succeeded": false,
+      "error": "InvalidArgumentError",
+      "message": "ANTFLY_INVALID_ARGUMENT: EXTRACTION_LIMIT_EXCEEDED: GLiNER boundary extraction exceeds the qualified request_items (batch size) limit",
+      "seconds": 12.252330499934033
+    },
+    "investigation": "Preparation takes a context maximum across reviewed profiles with different geometry. A 1024-source-word window includes an additional terminal word and can discard the composition profile; later windows then fail the remaining profile minimum. A larger synthetic document reproduces a cross-row geometry rejection.",
+    "candidate_change": "Choose a conservative context among profiles compatible with the complete feature union and public request item count, shared by workspace geometry, qualification and execution. No published profile bounds are widened; final coherent-row admission is unchanged.",
+    "validation": "31 distinct qualification tests pass across the model-free suite and installed pinned-geometry rerun, including both new regressions. Rebuilt C API model execution and end-to-end qualification remain pending.",
+    "focused_debug_regressions": {
+      "selected": 2,
+      "passed": 2,
+      "skipped": 0,
+      "scope": [
+        "whole-request feature/count-compatible context preparation and unchanged fail-closed admission",
+        "large composition document and identical bounded workspace geometry"
+      ]
+    },
+    "qualification_debug_suite": {
+      "selected": 31,
+      "passed": 29,
+      "conditional_model_geometry_skips": 2,
+      "unexpected_error_logs": 0,
+      "scope": "Closed table and identity, feature/geometry, Unicode, cancellation and allocation-failure regressions. Installed geometry gates rerun separately."
+    },
+    "pinned_model_geometry": {
+      "selected": 2,
+      "passed": 2,
+      "skipped": 0,
+      "scope": "Pinned tokenizer/config, single-window and long-document geometry; no learned operations."
+    }
   }
 }
