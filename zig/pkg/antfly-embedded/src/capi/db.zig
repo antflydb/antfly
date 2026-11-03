@@ -1060,12 +1060,16 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
         var guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = access, .connection = connection };
         const io = handleLockIo();
         const effective_deadline = deadline orelse (std.Io.Clock.awake.now(io).nanoseconds + @as(i96, connection.options.busy_timeout_ms) * std.time.ns_per_ms);
-        if (pinned) connection.mutex.lockUncancelable(io) else connection.mutex.lockUntil(io, effective_deadline) catch |err| {
+        // Zero preserves the established process-local serialization policy;
+        // it refuses foreign path waits. A configured nonzero budget bounds
+        // both local lanes and all cross-process admissions in this call.
+        const bounded = !pinned and connection.options.busy_timeout_ms != 0;
+        if (!bounded) connection.mutex.lockUncancelable(io) else connection.mutex.lockUntil(io, effective_deadline) catch |err| {
             guard.entry_error = capi.mapError(err);
             return guard;
         };
         guard.connection_mutex_held = true;
-        connection.admission_deadline_ns = if (pinned) null else effective_deadline;
+        connection.admission_deadline_ns = if (bounded) effective_deadline else null;
         defer connection.admission_deadline_ns = null;
         // Local waits have consumed this same deadline. A detached proof may
         // still finish late and take an uncontended lease on its stable tip;

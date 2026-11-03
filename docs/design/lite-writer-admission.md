@@ -52,9 +52,11 @@ protections remain required independently of turn ordering.
 
 ## Admission budget and lifetime
 
-Public handle admission uses one remaining waiting budget across the connection
+A configured nonzero busy timeout supplies one remaining budget across the connection
 lane, shared process/path lane, path lock, retries, and suspended-call resumes.
-Active preparation and inference preserve the unspent admission balance. This is
+Zero retains the established process-local serialization policy and refuses
+foreign path waits without sleeping. Active preparation and inference preserve
+the unspent admission balance. This is
 an admission waiting limit; execution and mandatory cancellation teardown have
 their own lifetimes.
 

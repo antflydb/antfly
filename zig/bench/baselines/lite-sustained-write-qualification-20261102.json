@@ -6895,5 +6895,20 @@
       "typescript_typecheck": "passed"
     },
     "next": "Complete corrected focused gates and COMMIT fault tests before final optimized qualification."
+  },
+  "commit_outcome_integration_20261103": {
+    "source_commit": "7ffdbd7c03",
+    "status": "Stopped full native contract compilation after the broad SDK run exposed a zero-timeout local-gate regression. No qualification artifact frozen from that command.",
+    "sdk_python": {
+      "passed": 45,
+      "failed": 164,
+      "root_cause": "All failures were Busy refusals during ordinary zero-timeout local serialization, plus one sandbox-blocked HTTP loopback fixture. Restore the established zero-timeout process-local serialization policy; nonzero budgets continue to cover every local/foreign wait.",
+      "log": "ignored local sdk-fair-admission-full-sql.log"
+    },
+    "sdk_rust_outcome_test": "1 passed",
+    "sdk_go_outcome_test": "1 passed",
+    "sdk_typescript_metadata": "2 passed, typecheck passed",
+    "sdk_python_outcome_mapping": "4 passed",
+    "next": "Run focused COMMIT fault, zero/nonzero timeout and owner-reopen regressions, then repeat the broad native and SDK gates."
   }
 }

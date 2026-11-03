@@ -7688,3 +7688,54 @@ test "capi native uncertain owner remains fenced while reopen reconstructs a fre
         try std.testing.expectError(error.OutcomeUnknown, owner.refresh());
     }
 }
+
+test "capi native allocator proof zero timeout preserves process local serialization" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    inline for (.{ false, true }) |connection_lane| {
+        var fixture = try AdmissionFollowupFixture.init(if (connection_lane) "zero-connection-lane" else "zero-path-lane", 0, .batch);
+        defer fixture.deinit();
+        const mutex = if (connection_lane) &fixture.connection.mutex else &fixture.connection.gate.mutex;
+        const io = h.handleLockIo();
+        const Probe = struct {
+            fixture: *AdmissionFollowupFixture,
+            finished: std.atomic.Value(bool) = .init(false),
+            result: h.capi.ErrorCode = .internal,
+            fn run(self: *@This()) void {
+                self.result = self.fixture.call(.batch);
+                self.finished.store(true, .release);
+            }
+        };
+        mutex.lockUncancelable(io);
+        var held = true;
+        defer if (held) mutex.unlock(io);
+        var probe: Probe = .{ .fixture = &fixture };
+        const thread = try std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 }, Probe.run, .{&probe});
+        var joined = false;
+        defer {
+            if (held) {
+                mutex.unlock(io);
+                held = false;
+            }
+            if (!joined) thread.join();
+        }
+        // Wait for enrollment or refusal, instead of assuming a sleep lets
+        // the caller reach its local gate. Old zero-timeout serialization must
+        // retain the queued admission while the holder is still active.
+        const deadline = std.Io.Clock.awake.now(io).nanoseconds + 5 * std.time.ns_per_s;
+        var queued = false;
+        while (!probe.finished.load(.acquire)) {
+            mutex.state.lockUncancelable(io);
+            queued = mutex.head != null;
+            mutex.state.unlock(io);
+            if (queued or std.Io.Clock.awake.now(io).nanoseconds >= deadline) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        const refused_early = probe.finished.load(.acquire);
+        mutex.unlock(io);
+        held = false;
+        thread.join();
+        joined = true;
+        try std.testing.expect(queued and !refused_early);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, probe.result);
+    }
+}
