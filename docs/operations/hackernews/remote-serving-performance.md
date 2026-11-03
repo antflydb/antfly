@@ -112,6 +112,20 @@ visible.
 5. Reproduce and fix tail outliers with phase, queue/lock and maintenance
    evidence. Preserve cancellation, GC safety and restart/owner-loss behavior.
 
+## Snapshot discovery contract
+
+The raw-prefix matrix deliberately retains fresh Parquet file discovery. Even
+with stored source and warm text indexes, a cached listing cannot prove that an
+arbitrary prefix has not gained files. Do not remove those checks to improve a
+benchmark. The [Parquet manifest protocol](../../plans/lake-ingestion-and-publication.md)
+provides a small fresh commit head and immutable file-list chunks instead.
+
+The HN Iceberg setup now explicitly declares `object_mutability: immutable`, as
+required by its writer's new-file-URI contract. The commit pointer remains fresh;
+a matching authenticated publication can reuse immutable file/navigation proofs.
+This enables an existing fast path and does not freeze the mutable commit head.
+Prefix and committed-snapshot timings must be labeled as different contracts.
+
 ## Credential rotation and publication identity
 
 Durable publication identity must describe configured source authority and the
