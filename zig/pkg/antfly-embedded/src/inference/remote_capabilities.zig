@@ -1002,7 +1002,21 @@ fn parseImageTransform(object: std.json.ObjectMap) !?work.ImageTransform {
 fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !ExactWireCapabilities {
     const modality_values = try requiredStringArray(object, "input_modalities");
     const mime_values = try requiredStringArray(object, "accepted_mime_types");
-    try validateStringSet(modality_values, &.{ "text", "image", "audio", "document" });
+    // Hosted v4 endpoints can accept video even though the local work ABI
+    // cannot represent video inputs yet. Resolve the supported subset without
+    // admitting video locally or treating misspelled/unknown modalities as valid.
+    const wire_modalities: []const []const u8 = if (version >= 4)
+        &.{ "text", "image", "audio", "document", "video" }
+    else
+        &.{ "text", "image", "audio", "document" };
+    try validateStringSet(modality_values, wire_modalities);
+    const remote_video = version >= 4 and hasString(modality_values, "video");
+    const modalities = work.Modalities{
+        .text = hasString(modality_values, "text"),
+        .image = hasString(modality_values, "image"),
+        .audio = hasString(modality_values, "audio"),
+        .document = hasString(modality_values, "document"),
+    };
     if (mime_values.items.len == 0) return error.InvalidInferenceCapabilities;
     var mime_types = work.MimeTypes{};
     for (mime_values.items) |value| {
@@ -1014,8 +1028,20 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
         if (std.mem.startsWith(u8, parsed.essence, "image/") and
             !work.supportsEncodedImageMimeEssence(parsed.essence))
             return error.InvalidInferenceCapabilities;
+        // Keep the descriptor internally consistent with the projected local
+        // modalities. Validate the wire spelling before dropping remote-only
+        // video MIME types, and reject undeclared video instead of hiding drift.
+        if (std.mem.startsWith(u8, parsed.essence, "video/")) {
+            if (!remote_video) return error.InvalidInferenceCapabilities;
+            continue;
+        }
         try mime_types.add(value.string);
     }
+    // A descriptor claiming locally supported inputs must still expose a
+    // locally usable MIME type after projection. Video-only models are handled
+    // as unavailable by parseModelCapabilities rather than admitted as text.
+    if (@as(u8, @bitCast(modalities)) != 0 and mime_types.count() == 0)
+        return error.InvalidInferenceCapabilities;
     const input_granularity: work.InputGranularity = std.meta.stringToEnum(
         work.InputGranularity,
         try requiredString(object, "input_granularity"),
@@ -1062,12 +1088,7 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
         break :blk value.bool;
     } else false;
     return .{
-        .modalities = .{
-            .text = hasString(modality_values, "text"),
-            .image = hasString(modality_values, "image"),
-            .audio = hasString(modality_values, "audio"),
-            .document = hasString(modality_values, "document"),
-        },
+        .modalities = modalities,
         .mime_types = mime_types,
         .input_granularity = input_granularity,
         .output = output,
@@ -1620,6 +1641,71 @@ test "remote Antfly capability v4 preserves extensible MIME and task limits" {
             .schema_bytes = 8193,
         }),
     );
+}
+
+const hosted_video_catalog = @embedFile("testdata/hosted_embeddinggemma2_v4_catalog.json");
+const hosted_video_model = "google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b";
+
+test "remote Antfly capability v4 projects hosted video catalog onto supported local inputs" {
+    const capabilities = (try parseModelCapabilities(std.testing.allocator, hosted_video_catalog, hosted_video_model, .embed)).?;
+    try std.testing.expectEqual(work.Modalities{ .text = true, .image = true, .audio = true }, capabilities.input_modalities);
+    try capabilities.validateInvocation(.embed, .{ .item_count = 1, .modalities = .{ .text = true }, .max_text_bytes_per_item = 8192 });
+    try capabilities.validateMimeType("text/plain");
+    try capabilities.validateMimeType("image/png");
+    try capabilities.validateMimeType("audio/wav");
+    for ([_][]const u8{ "video/mp4", "video/quicktime", "video/webm", "video/mp2t" }) |mime| {
+        try std.testing.expectError(error.UnsupportedInferenceMimeType, capabilities.validateMimeType(mime));
+    }
+    try std.testing.expectEqual(@as(usize, 64), capabilities.batch.max_items);
+    try std.testing.expectEqual(@as(?usize, 104857600), capabilities.batch.max_encoded_media_bytes);
+    try std.testing.expectEqual(@as(?u64, 33554432), capabilities.batch.max_decoded_pixels);
+    try std.testing.expectEqual(@as(usize, 16), capabilities.batch.max_media_parts_per_item);
+    try std.testing.expectEqual(work.BatchMode.serial_compatibility, capabilities.batch.mode);
+    try std.testing.expect(capabilities.framed_attachments);
+    try std.testing.expect(capabilities.numeric_responses_v1);
+    try std.testing.expectError(error.InferenceTextBytesExceeded, capabilities.validateInvocation(.embed, .{ .item_count = 1, .modalities = .{ .text = true }, .max_text_bytes_per_item = 8193 }));
+    try std.testing.expectError(error.InferenceBatchTooLarge, capabilities.validateInvocation(.embed, .{ .item_count = 65, .modalities = .{ .text = true } }));
+    try std.testing.expectError(error.InferenceEncodedBytesExceeded, capabilities.validateInvocation(.embed, .{ .item_count = 1, .modalities = .{ .image = true }, .encoded_media_bytes = 104857601 }));
+}
+
+fn hostedVideoCatalogWithField(alloc: std.mem.Allocator, payload: []const u8, name: []const u8, value_json: []const u8) ![]u8 {
+    var catalog = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer catalog.deinit();
+    var replacement = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+    defer replacement.deinit();
+    const descriptor = catalog.value.object.getPtr("embedders").?.object.getPtr(hosted_video_model).?.object.getPtr("inference_capabilities").?;
+    descriptor.object.getPtr(name).?.* = replacement.value;
+    return try std.json.Stringify.valueAlloc(alloc, catalog.value, .{});
+}
+
+test "remote Antfly capability projection does not admit a video only model" {
+    const modalities = try hostedVideoCatalogWithField(std.testing.allocator, hosted_video_catalog, "input_modalities", "[\"video\"]");
+    defer std.testing.allocator.free(modalities);
+    const payload = try hostedVideoCatalogWithField(std.testing.allocator, modalities, "accepted_mime_types", "[\"video/mp4\"]");
+    defer std.testing.allocator.free(payload);
+    try std.testing.expectEqual(@as(?work.InferenceCapabilities, null), try parseModelCapabilities(std.testing.allocator, payload, hosted_video_model, .embed));
+}
+
+test "remote Antfly capability projection preserves strict descriptor validation" {
+    const cases = [_]struct { name: []const u8, value: []const u8, err: anyerror = error.InvalidInferenceCapabilities }{
+        .{ .name = "version", .value = "3" },
+        .{ .name = "version", .value = "5", .err = error.UnsupportedInferenceCapabilitiesVersion },
+        .{ .name = "accepted_mime_types", .value = "[\"video/mp4\"]" },
+        .{ .name = "input_modalities", .value = "[\"text\",\"imagge\",\"video\"]" },
+        .{ .name = "input_modalities", .value = "[\"text\",\"video\",\"video\"]" },
+        .{ .name = "input_modalities", .value = "[\"text\",\"image\",\"audio\"]" },
+        .{ .name = "input_modalities", .value = "[\"text\",42,\"video\"]" },
+        .{ .name = "accepted_mime_types", .value = "[\"text/plain\",\"video/\"]" },
+        .{ .name = "accepted_mime_types", .value = "[\"text/plain\",\"video/MP4\"]" },
+        .{ .name = "accepted_mime_types", .value = "[\"text/plain\",\"video/mp4; codecs=h264\"]" },
+        .{ .name = "output", .value = "\"generated_text\"" },
+        .{ .name = "task_limits", .value = "{\"max_text_bytes_per_item\":-1,\"max_input_tokens_per_item\":null,\"max_output_tokens_per_item\":null,\"max_candidates_per_request\":null,\"max_schema_bytes\":1048576}" },
+    };
+    for (cases) |case| {
+        const payload = try hostedVideoCatalogWithField(std.testing.allocator, hosted_video_catalog, case.name, case.value);
+        defer std.testing.allocator.free(payload);
+        try std.testing.expectError(case.err, parseModelCapabilities(std.testing.allocator, payload, hosted_video_model, .embed));
+    }
 }
 
 test "remote Antfly capability v4 negotiates framed attachment transport" {
