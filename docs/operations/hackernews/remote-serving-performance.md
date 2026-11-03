@@ -263,3 +263,53 @@ snapshot tail latency, followed by same-region Cloud and full-archive sizing.
 Raw-prefix discovery must retain fresh authority checks. Also qualify upgrades
 with the documented republish transition and managed credentials across an access-token
 lifetime before release/deployment signoff.
+
+## Bounded cold-serving and publication follow-up
+
+Text-directory readers, source navigation and the existing background warmer
+now share decoded navigation leases and authenticated, coalesced range waves.
+Independent missing ranges use the existing bounded scheduler; denied optional
+admission retains the required serial read path. Warming keeps its existing
+four-publication/four-lane, 64-page, two-level and two-second bounds. A failed
+warming attempt releases its slot and can retry after a five-second backoff;
+only completed attempts are remembered as successful hints. Every consumer
+still checks its current cancellation and reader authority.
+
+Source census and costing trees use the existing publication packing machinery,
+including incremental batch flushes. Artifact recovery preserves a backend's
+optional batch-put hook. Native object storage deliberately has no such hook;
+forwarding it benefits hosted backends and is not evidence of a native GCS
+bottleneck. Packing reuses existing artifact references and collection rules.
+
+Publication also keeps a bounded attempt-local copy of successfully written,
+authenticated small artifacts: at most 8 MiB, 512 entries and 256 KiB per body.
+It is enabled only for a synchronized, refundable working-set allocator and
+participates in that allocator's pressure reclamation. It can avoid reading a
+just-written immutable page back from remote storage. Required-output allocation
+can release a pinned hint and fall back to the backend. Missing hints, unknown
+allocators and optional allocation failures retain ordinary authenticated reads.
+Provider content verification, retention witnesses and durable commit checks
+remain required; these hints do not prove remote durability. Cancellation,
+range budgets and successful-delete invalidation apply equally to cached reads.
+
+`poc.py` reports `publication_io` from before table registration through all
+index-readiness checks, before validation/search traffic. The ending metrics
+sample waits for health exposition refresh, outside query timing, so this
+interval can include background work and is longer than `ready_seconds`.
+It identifies fresh registration versus resumed work. Missing or reset counters
+are unavailable rather than zero. Logical input/output body bytes exclude
+transport overhead; failed attempts and nested batch/single calls can overlap.
+Do not add nested counters or equate them with GCS billing or physical object
+write amplification. Separately compiled runtime owners remain outside these
+API-owner counters. Retained-object inventories include query/GC artifacts and
+must not be substituted for publication-only measurements.
+
+A Debug replay of the unchanged 10,000-row fixture completed 1,000 uninterrupted
+archive warm searches and 1,000 repetitions of each of five metadata filters.
+The archive maximum was 59.58 ms; the maximum among 6,024 observed archive/filter
+requests was 420.82 ms. No request reached the 750 ms slow-profile threshold.
+This does not reproduce or explain the original 3,926.98 ms local outlier.
+`archive_warm_metrics` is captured immediately after the uninterrupted burst so
+later restart/composed phases cannot overwrite its diagnostic snapshot. Keep
+Debug diagnosis separate from final ReleaseFast comparisons and preserve failed
+attempts alongside successful replacements.
