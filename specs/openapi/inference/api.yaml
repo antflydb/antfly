@@ -3054,7 +3054,9 @@ components:
         - text
       properties:
         audio:
-          $ref: '#/components/schemas/AudioReadMetadata'
+          allOf:
+            - $ref: '#/components/schemas/AudioReadMetadata'
+          nullable: true
         source_id:
           type: string
           description: Original document source ID.

@@ -23806,7 +23806,7 @@ export interface components {
             label?: string;
         };
         InferenceReadResult: {
-            audio?: components["schemas"]["InferenceAudioReadMetadata"];
+            audio?: components["schemas"]["InferenceAudioReadMetadata"] | null;
             /** @description Original document source ID. */
             source_id?: string;
             /** @description One-based original page or slide number. */

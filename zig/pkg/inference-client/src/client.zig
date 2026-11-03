@@ -56,7 +56,7 @@ pub const Reading = struct {
     }
 
     pub fn audio(self: *const Reading) ?api.AudioReadMetadata {
-        return self.object().audio;
+        return self.object().audio.valueOrNull();
     }
 
     pub fn deinit(self: *Reading) void {

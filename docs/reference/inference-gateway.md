@@ -414,6 +414,15 @@ IDs and temporal evidence. Composed readers bind `transcribers/<name>` with
 `input: audio`; hosted network calls require `allow_remote: true` throughout
 the composition. Provider credentials stay in deployment configuration.
 
+Durable `/read/jobs` submissions use the same model resolution and recognition
+defaults as synchronous `/read`, including `readers/`, `transcribers/`, and
+`generators/` targets. Request options, including explicit `false`, override
+configured defaults. Both read and extraction jobs accept typed `audio_options`.
+The effective backend selector and request options are persisted before dispatch.
+Hosted provider configurations stay runtime-owned, and the document executor pins
+model identities for replay. Non-audio read results carry `audio: null`; audio
+reads carry metadata with nullable duration and optional temporal evidence.
+
 Hosted recognition does not currently provide token measurements. Configure
 `max_total_tokens` on each hosted transcriber (or its document binding) using the
 provider/deployment's hard per-call token bound. A missing or zero bound rejects

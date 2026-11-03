@@ -965,13 +965,13 @@ pub fn readResponseJsonAlloc(a: Allocator, model: []const u8, cfg: Config, respo
         .origin = "transcription",
         .text = text,
         .status = response.status orelse if (text.len == 0) "unresolved" else "complete",
-        .audio = .{
+        .audio = .{ .value = .{
             .duration_ms = response.duration_ms,
             .language = .fromNullable(options.language orelse response.language),
             .language_source = if (options.language != null) "forced" else if (response.language != null and (cfg.provider == .openai or cfg.provider == .cloudflare)) "detected" else "unknown",
             .segments = .fromNullable(if (alignment) segments.items else null),
             .speakers = .fromNullable(if (options.diarization orelse false) speakers.items else null),
-        },
+        } },
     }};
     return std.json.Stringify.valueAlloc(a, inference_api.ReadResponse{ .object = "list", .model = model, .data = &items, .usage = null }, .{});
 }
@@ -993,21 +993,21 @@ test "audio read hosted adapters preserve temporal evidence and reject unsupport
     defer parsed.deinit();
     const item = parsed.value.data[0];
     try std.testing.expectEqualStrings("truncated", item.status.?);
-    try std.testing.expectEqualStrings("forced", item.audio.?.language_source.?);
-    try std.testing.expectEqual(@as(i64, 65000), item.audio.?.segments.valueOrNull().?[0].start_ms);
-    try std.testing.expectEqual(@as(i64, 5), item.audio.?.segments.valueOrNull().?[0].text_end);
+    try std.testing.expectEqualStrings("forced", item.audio.valueOrNull().?.language_source.?);
+    try std.testing.expectEqual(@as(i64, 65000), item.audio.valueOrNull().?.segments.valueOrNull().?[0].start_ms);
+    try std.testing.expectEqual(@as(i64, 5), item.audio.valueOrNull().?.segments.valueOrNull().?[0].text_end);
     try std.testing.expect(parsed.value.usage == null);
     const unknown = try readResponseJsonAlloc(a, "speech", cfg, .{ .text = "" }, .{});
     defer a.free(unknown);
     var empty = try std.json.parseFromSlice(inference_api.ReadResponse, a, unknown, .{});
     defer empty.deinit();
     try std.testing.expectEqualStrings("unresolved", empty.value.data[0].status.?);
-    try std.testing.expect(empty.value.data[0].audio.?.duration_ms == null);
+    try std.testing.expect(empty.value.data[0].audio.valueOrNull().?.duration_ms == null);
     try std.testing.expectError(error.InvalidInferenceResponse, readResponseJsonAlloc(a, "speech", cfg, .{ .text = "", .duration_ms = -1 }, .{}));
 }
 
 pub fn fromReadObjectAlloc(alloc: Allocator, first: inference_api.types.ReadObject) !Response {
-    const metadata = first.audio;
+    const metadata = first.audio.valueOrNull();
     var response = Response{
         .text = try alloc.dupe(u8, first.text),
         .duration_ms = if (metadata) |value| value.duration_ms else null,

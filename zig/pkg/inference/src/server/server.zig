@@ -21086,7 +21086,7 @@ pub const Node = struct {
             .completion_tokens = null,
             .truncated = if (row.status) |status| std.mem.eql(u8, status, "truncated") else false,
             .unresolved = if (row.status) |status| std.mem.eql(u8, status, "unresolved") else text.len == 0,
-            .audio_json = try std.json.Stringify.valueAlloc(a, row.audio.?, .{}),
+            .audio_json = try std.json.Stringify.valueAlloc(a, row.audio.valueOrNull().?, .{}),
         };
     }
 

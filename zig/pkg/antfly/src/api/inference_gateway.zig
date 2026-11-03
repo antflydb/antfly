@@ -519,6 +519,16 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
         const cfg = connection.inference orelse return error.InvalidInferenceRequest;
         if (!std.mem.eql(u8, cfg.provider, "antfly")) return executeVendorConnection(server, ctx, task, a, request, named, target, connection, fallback, observation, execution_options);
     };
+    if (task == .read) if (try tasks.planReading(a, named, target, request)) |plan| {
+        if (plan.local_only and server.cfg.local_inference_connection_target == null) return error.ModelNotFound;
+        const encoded = try std.json.Stringify.valueAlloc(a, plan.request, .{});
+        var read_options = execution_options;
+        // Named adapters expose complete reading envelopes. Raw/connection
+        // requests retain the caller's existing response transport, including
+        // an installed streaming delegate for framed media.
+        if (target == .configured) read_options.response_delivery = .buffered;
+        return forward(server, ctx, plan.connection orelse if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id, "read", encoded, fallback, observation, read_options);
+    };
     if (target == .local and target.local.explicit and server.cfg.local_inference_connection_target == null) return error.ModelNotFound;
     if (target != .configured) {
         const destination = if (target == .connection) target.connection.connection else if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id;
@@ -568,41 +578,6 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
         const encoded = try std.json.Stringify.valueAlloc(a, forwarded, .{});
         if (cfg.api_url.len > 0) return forwardEndpoint(server, ctx, cfg.api_url, null, "chunk", encoded, false, observation, execution_options);
         return forward(server, ctx, if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id, "chunk", encoded, false, observation, execution_options);
-    }
-    const hosted_asr = task == .read and target.configured.task == .transcribe and
-        (try named.transcribers.?.getConfig(target.configured.name)).provider != .antfly;
-    if (hosted_asr) {
-        const asr = @import("antfly_transcribing");
-        const cfg = try named.transcribers.?.getConfig(target.configured.name);
-        var options = if (request.object.get("audio_options")) |value| (if (value == .null) @import("inference_api").AudioReadOptions{} else std.json.parseFromValueLeaky(@import("inference_api").AudioReadOptions, a, value, .{}) catch return error.InvalidInferenceRequest) else @import("inference_api").AudioReadOptions{};
-        const defaults = asr.requestDefaults(cfg);
-        inline for (.{ "language", "timestamps", "diarization" }) |field| {
-            @field(options, field) = @field(options, field) orelse @field(defaults, field);
-        }
-        // Reject unsupported caller options before choosing a runtime, even
-        // when the deployment currently has no document executor available.
-        try asr.validateReadOptions(cfg, options);
-        inline for (.{ "prompt", "max_tokens" }) |field| {
-            if (request.object.get(field)) |value| if (value != .null) return error.UnsupportedAudioReadCapability;
-        }
-        // Hosted recognizers are deployment-owned leaves in the runtime's
-        // document service. Preserve the complete source/retention envelope.
-        const id = try target.idAlloc(a);
-        const encoded = try tasks.readingBody(a, .{ .provider = .antfly, .model = id }, request);
-        var read_options = execution_options;
-        read_options.response_delivery = .buffered;
-        return forward(server, ctx, if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id, "read", encoded, fallback, observation, read_options);
-    }
-    if (task == .read) {
-        const cfg = try named.readConfig(target);
-        if (cfg.provider == .antfly) {
-            const encoded = if (target.configured.task == .transcribe) try tasks.audioReadingBody(a, try named.transcribers.?.getConfig(target.configured.name), request) else try tasks.readingBody(a, cfg, request);
-            // Reads are completed JSON results. Keep the full document envelope
-            // available to ordinary and batch callers, including artifact handles.
-            var read_options = execution_options;
-            read_options.response_delivery = .buffered;
-            return forward(server, ctx, try std.fmt.allocPrint(a, "{s}/{s}", .{ target.configured.task.namespace(), target.configured.name }), "read", encoded, fallback, observation, read_options);
-        }
     }
     if (task == .transcribe) {
         const cfg = try named.transcribers.?.getConfig(target.configured.name);

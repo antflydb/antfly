@@ -21318,6 +21318,52 @@ test "httpx inference gateway document jobs persist before dispatch and publish 
     var submitted_json = try std.json.parseFromSlice(std.json.Value, a, submitted.body.?, .{});
     defer submitted_json.deinit();
     try store.cancel(work, submitted_json.value.object.get("id").?.string, "anonymous");
+
+    // Job submission shares synchronous read planning, including namespaces
+    // that collide, hosted leaves, caller overrides and recognition defaults.
+    try config.readers.registerConfig("same", .{ .provider = .antfly, .model = "ocr-backend" });
+    try config.transcribers.registerConfig("same", .{ .provider = .antfly, .model = "whisper-backend", .language_code = "fr", .timestamps = true });
+    try config.registry.registerGeneratorConfig("same", .{ .provider = .antfly, .model = "gemma-backend", .url = "" });
+    try config.transcribers.registerConfig("hosted", .{ .provider = .openai, .model = "whisper-1", .language_code = "fr", .timestamps = true, .max_total_tokens = 100 });
+    const Case = struct { selector: []const u8, backend: []const u8, connection: []const u8, language: bool = false };
+    for ([_]Case{
+        .{ .selector = "readers/same", .backend = "ocr-backend", .connection = "readers/same" },
+        .{ .selector = "transcribers/same", .backend = "whisper-backend", .connection = "transcribers/same", .language = true },
+        .{ .selector = "generators/same", .backend = "gemma-backend", .connection = "generators/same" },
+        .{ .selector = "transcribers/hosted", .backend = "transcribers/hosted", .connection = common_config.local_inference_connection_id, .language = true },
+    }, 0..) |case, index| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/read/jobs");
+        defer request.deinit();
+        const body = try std.json.Stringify.valueAlloc(a, .{ .request = .{
+            .model = case.selector,
+            .audio = "AAAA",
+            .audio_options = .{ .timestamps = false, .diarization = false },
+        } }, .{});
+        defer a.free(body);
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.documentReadCreate(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 202), response.status.code);
+        const status = try std.json.parseFromSliceLeaky(std.json.Value, work, response.body.?, .{});
+        const job_id = status.object.get("id").?.string;
+        const queued = try store.load(work, job_id, "anonymous");
+        try std.testing.expectEqualStrings(case.connection, queued.connection);
+        const saved = try store.read(work, queued.inputs[0], 1024 * 1024);
+        const effective = try std.json.parseFromSliceLeaky(std.json.Value, work, saved, .{});
+        try std.testing.expectEqualStrings(case.backend, effective.object.get("model").?.string);
+        const options = effective.object.get("audio_options").?.object;
+        try std.testing.expect(!options.get("timestamps").?.bool);
+        try std.testing.expect(!options.get("diarization").?.bool);
+        if (case.language) try std.testing.expectEqualStrings("fr", options.get("language").?.string);
+        try server.scheduleDocumentsOnce();
+        const expected = index + 2;
+        const deadline = research_jobs.nowMillis() + 5000;
+        while (target.calls.load(.acquire) < expected and research_jobs.nowMillis() < deadline) try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+        try std.testing.expectEqual(expected, target.calls.load(.acquire));
+        try std.testing.expectEqual(.succeeded, (try store.load(work, job_id, "anonymous")).state);
+    }
 }
 
 test "httpx inference gateway typed consumers retain errors and legacy original array positions" {

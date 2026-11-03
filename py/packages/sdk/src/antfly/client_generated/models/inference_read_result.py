@@ -29,8 +29,7 @@ class InferenceReadResult:
     """
     Attributes:
         text (str): Extracted text from the image Example: Invoice Total: $123.45.
-        audio (InferenceAudioReadMetadata | Unset): Recognition evidence for the audio track only. Video frames are not
-            captioned. Absent segments and speakers make no alignment or speaker claim.
+        audio (InferenceAudioReadMetadata | None | Unset):
         source_id (str | Unset): Original document source ID.
         number (int | Unset): One-based original page or slide number.
         kind (InferenceReadResultKind | Unset):
@@ -56,7 +55,7 @@ class InferenceReadResult:
     """
 
     text: str
-    audio: InferenceAudioReadMetadata | Unset = UNSET
+    audio: InferenceAudioReadMetadata | None | Unset = UNSET
     source_id: str | Unset = UNSET
     number: int | Unset = UNSET
     kind: InferenceReadResultKind | Unset = UNSET
@@ -75,14 +74,19 @@ class InferenceReadResult:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.inference_audio_read_metadata import InferenceAudioReadMetadata
         from ..models.inference_read_result_fields_type_0 import InferenceReadResultFieldsType0
         from ..models.inference_read_result_raster_to_source_type_0 import InferenceReadResultRasterToSourceType0
 
         text = self.text
 
-        audio: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.audio, Unset):
+        audio: dict[str, Any] | None | Unset
+        if isinstance(self.audio, Unset):
+            audio = UNSET
+        elif isinstance(self.audio, InferenceAudioReadMetadata):
             audio = self.audio.to_dict()
+        else:
+            audio = self.audio
 
         source_id = self.source_id
 
@@ -206,12 +210,22 @@ class InferenceReadResult:
         d = dict(src_dict)
         text = d.pop("text")
 
-        _audio = d.pop("audio", UNSET)
-        audio: InferenceAudioReadMetadata | Unset
-        if isinstance(_audio, Unset):
-            audio = UNSET
-        else:
-            audio = InferenceAudioReadMetadata.from_dict(_audio)
+        def _parse_audio(data: object) -> InferenceAudioReadMetadata | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                audio_type_1 = InferenceAudioReadMetadata.from_dict(data)
+
+                return audio_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(InferenceAudioReadMetadata | None | Unset, data)
+
+        audio = _parse_audio(d.pop("audio", UNSET))
 
         source_id = d.pop("source_id", UNSET)
 

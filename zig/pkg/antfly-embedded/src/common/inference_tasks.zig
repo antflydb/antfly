@@ -504,9 +504,8 @@ pub fn generatedGenerator(a: std.mem.Allocator, cfg: generating.GeneratorConfig,
 
 /// Preserve the complete read surface (including documents and retained
 /// artifacts) through configured aliases. Only deployment defaults are projected.
-pub fn audioReadingBody(a: std.mem.Allocator, cfg: transcribing.Config, request: Json) ![]u8 {
+fn audioReadingRequest(a: std.mem.Allocator, cfg: transcribing.Config, model: []const u8, request: Json) !Json {
     var forwarded = request;
-    try forwarded.object.put(a, "model", .{ .string = cfg.model orelse return error.ModelRequired });
     var options = forwarded.object.get("audio_options") orelse Json{ .object = .empty };
     if (options == .null) options = .{ .object = .empty };
     if (options != .object) return error.InvalidInferenceRequest;
@@ -515,21 +514,39 @@ pub fn audioReadingBody(a: std.mem.Allocator, cfg: transcribing.Config, request:
         if (@field(defaults, field)) |value| try options.object.put(a, field, try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{}));
     };
     try forwarded.object.put(a, "audio_options", options);
-    return readingBody(a, .{ .provider = .antfly, .model = cfg.model }, forwarded);
+    return readingRequest(a, .{ .provider = .antfly, .model = model }, forwarded);
 }
 
 pub fn readingBody(a: std.mem.Allocator, cfg: readers.Config, request: Json) ![]u8 {
-    if (cfg.provider != .antfly or request != .object) return error.UnsupportedInferenceFeature;
+    return std.json.Stringify.valueAlloc(a, try readingRequest(a, cfg, request), .{});
+}
+
+fn normalizeReadingRequest(a: std.mem.Allocator, model: []const u8, request: Json) !Json {
+    if (request != .object) return error.InvalidInferenceRequest;
     var forwarded = request;
-    try forwarded.object.put(a, "model", .{ .string = cfg.model orelse return error.ModelRequired });
+    try forwarded.object.put(a, "model", .{ .string = model });
+    const forms = @as(usize, @intFromBool(forwarded.object.contains("images"))) + @intFromBool(forwarded.object.contains("documents")) + @intFromBool(forwarded.object.contains("audio"));
+    if (forms != 1) return error.InvalidInferenceRequest;
     if (forwarded.object.getPtr("images")) |images| {
-        if (images.* != .array) return error.InvalidInferenceRequest;
+        if (images.* != .array or images.array.items.len == 0 or images.array.items.len > 64) return error.InvalidInferenceRequest;
         for (images.array.items) |*image| if (image.* == .string) {
             var normalized: Json = .{ .object = .empty };
             try normalized.object.put(a, "url", image.*);
             image.* = normalized;
         };
     }
+    if (forwarded.object.get("documents")) |documents| {
+        if (documents != .array or documents.array.items.len == 0 or documents.array.items.len > 64) return error.InvalidInferenceRequest;
+    }
+    if (forwarded.object.get("audio")) |audio| {
+        if (audio != .string or audio.string.len == 0) return error.InvalidInferenceRequest;
+    }
+    return forwarded;
+}
+
+fn readingRequest(a: std.mem.Allocator, cfg: readers.Config, request: Json) !Json {
+    if (cfg.provider != .antfly) return error.UnsupportedInferenceFeature;
+    var forwarded = try normalizeReadingRequest(a, cfg.model orelse return error.ModelRequired, request);
     inline for (.{ "prompt", "max_tokens" }) |name| {
         const value = forwarded.object.get(name);
         if (value == null or value.? == .null) if (@field(cfg, name)) |fallback| {
@@ -547,7 +564,60 @@ pub fn readingBody(a: std.mem.Allocator, cfg: readers.Config, request: Json) ![]
     const count = if (body.images) |images| images.len else if (body.documents) |documents| documents.len else 1;
     if (count == 0 or count > 64) return error.InvalidInferenceRequest;
     if (body.max_tokens) |tokens| if (tokens < 1 or tokens > readers.max_output_tokens) return error.InvalidInferenceRequest;
-    return std.json.Stringify.valueAlloc(a, forwarded, .{});
+    return forwarded;
+}
+
+/// One forwarding plan for synchronous reads and durable submissions. The
+/// caller supplies its default runtime connection only after resolution; named
+/// Antfly aliases keep their credential/endpoint scope. Hosted ASR is executed
+/// as a deployment-owned leaf by that default runtime's document service.
+/// JSON edits use the invocation allocator. Strings may borrow the request or
+/// config view; callers serialize the plan before that invocation ends.
+pub const ReadingPlan = struct {
+    request: Json,
+    connection: ?[]const u8 = null,
+    local_only: bool = false,
+};
+
+/// Null selects an existing vendor image adapter, which does not implement the
+/// document checkpoint protocol. Durable callers reject that capability before
+/// storing a job. No media is fetched and no provider is invoked while planning.
+pub fn planReading(a: std.mem.Allocator, view: gateway.View, target: gateway.Target, request: Json) !?ReadingPlan {
+    switch (target) {
+        .local => |local| return .{
+            // Forward inline media by reference. Parsing the complete typed
+            // request here would duplicate base64 payloads on the bounded
+            // invocation arena; the destination validates the task contract.
+            .request = try normalizeReadingRequest(a, local.model, request),
+            .local_only = local.explicit,
+        },
+        .connection => |connection| return .{
+            .request = try normalizeReadingRequest(a, connection.model, request),
+            .connection = connection.connection,
+        },
+        .configured => |selected| {
+            if (selected.task == .transcribe) {
+                const cfg = try view.transcribers.?.getConfig(selected.name);
+                const hosted = cfg.provider != .antfly;
+                const id = try target.idAlloc(a);
+                const forwarded = try audioReadingRequest(a, cfg, if (hosted) id else cfg.model orelse return error.ModelRequired, request);
+                if (hosted) {
+                    const options = try std.json.parseFromValueLeaky(@import("inference_api").AudioReadOptions, a, forwarded.object.get("audio_options").?, .{});
+                    try transcribing.validateReadOptions(cfg, options);
+                    inline for (.{ "prompt", "max_tokens" }) |field| {
+                        if (forwarded.object.get(field)) |value| if (value != .null) return error.UnsupportedAudioReadCapability;
+                    }
+                }
+                return .{ .request = forwarded, .connection = if (hosted) null else id };
+            }
+            const cfg = try view.readConfig(target);
+            if (cfg.provider != .antfly) return null;
+            return .{
+                .request = try readingRequest(a, cfg, request),
+                .connection = try target.idAlloc(a),
+            };
+        },
+    }
 }
 
 /// Keep native dictation options intact while applying named transcription
@@ -1026,4 +1096,69 @@ test "provider registry media transport retains long task envelope without weake
     try std.testing.expectEqual(@as(u64, 30_000), embedding.config.timeouts.read_ms);
     const borrowed = Executor{ .view = undefined, .http = &ordinary, .context = .{ .io = std.testing.io, .deadline_ns = null } };
     try std.testing.expect((try borrowed.providerHttp()) == &ordinary);
+}
+
+test "provider registry gateway reading plans preserve namespaces defaults and document routing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var providers = @import("provider_registry.zig").Registry.init(a);
+    defer providers.deinit();
+    var reading = readers.Registry.init(a);
+    defer reading.deinit();
+    var asr = transcribing.Registry.init(a);
+    defer asr.deinit();
+    // Identical aliases must never select a different configuration namespace.
+    try reading.registerConfig("same", .{ .provider = .antfly, .model = "ocr" });
+    try asr.registerConfig("same", .{ .provider = .antfly, .model = "whisper", .language_code = "fr", .timestamps = true });
+    try providers.registerGeneratorConfig("same", .{ .provider = .antfly, .model = "gemma", .url = "https://runtime/ai/v1" });
+    try asr.registerConfig("hosted", .{ .provider = .openai, .model = "whisper-1", .language_code = "fr", .timestamps = true });
+    const view = gateway.View{ .providers = &providers, .readers = &reading, .transcribers = &asr };
+    const Case = struct { id: []const u8, model: []const u8, connection: ?[]const u8, local_only: bool = false };
+    for ([_]Case{
+        .{ .id = "readers/same", .model = "ocr", .connection = "readers/same" },
+        .{ .id = "transcribers/same", .model = "whisper", .connection = "transcribers/same" },
+        .{ .id = "generators/same", .model = "gemma", .connection = "generators/same" },
+        .{ .id = "transcribers/hosted", .model = "transcribers/hosted", .connection = null },
+        .{ .id = "local/owner/model", .model = "owner/model", .connection = null, .local_only = true },
+        .{ .id = "connections/runtime/models/owner/model", .model = "owner/model", .connection = "runtime" },
+    }) |case| {
+        const request = try std.json.parseFromSliceLeaky(Json, a,
+            \\{"model":"ignored","documents":[{"id":"recording","url":"fixture","media_type":"audio/wav"}],"audio_options":{"timestamps":false},"retain_artifact":true}
+        , .{});
+        const plan = (try planReading(a, view, try view.resolve(.read, case.id, &.{}), request)).?;
+        try std.testing.expectEqualStrings(case.model, plan.request.object.get("model").?.string);
+        if (case.connection) |connection| try std.testing.expectEqualStrings(connection, plan.connection.?) else try std.testing.expect(plan.connection == null);
+        try std.testing.expectEqual(case.local_only, plan.local_only);
+        try std.testing.expect(plan.request.object.get("retain_artifact").?.bool);
+        try std.testing.expectEqual(@as(usize, 1), plan.request.object.get("documents").?.array.items.len);
+        const options = plan.request.object.get("audio_options").?.object;
+        try std.testing.expect(!options.get("timestamps").?.bool);
+        if (std.mem.startsWith(u8, case.id, "transcribers/")) try std.testing.expectEqualStrings("fr", options.get("language").?.string);
+    }
+    const invalid = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"audio":"AAAA","audio_options":{"diarization":true}}
+    , .{});
+    try std.testing.expectError(error.UnsupportedAudioReadCapability, planReading(a, view, try view.resolve(.read, "transcribers/hosted", &.{}), invalid));
+}
+
+test "provider registry gateway raw reading plans borrow large inline media" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const audio = try a.alloc(u8, 64 * 1024);
+    @memset(audio, 'A');
+    var providers = @import("provider_registry.zig").Registry.init(a);
+    defer providers.deinit();
+    const view = gateway.View{ .providers = &providers };
+    for ([_][]const u8{ "local/owner/model", "connections/runtime/models/owner/model" }) |id| {
+        var request: Json = .{ .object = .empty };
+        try request.object.put(a, "model", .{ .string = id });
+        try request.object.put(a, "audio", .{ .string = audio });
+        var storage: [4096]u8 = undefined;
+        var scratch = std.heap.FixedBufferAllocator.init(&storage);
+        const plan = (try planReading(scratch.allocator(), view, try view.resolve(.read, id, &.{}), request)).?;
+        try std.testing.expect(plan.request.object.get("audio").?.string.ptr == audio.ptr);
+        try std.testing.expectEqual(audio.len, plan.request.object.get("audio").?.string.len);
+    }
 }

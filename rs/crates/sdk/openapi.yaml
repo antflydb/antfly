@@ -51940,7 +51940,9 @@ components:
         - text
       properties:
         audio:
-          $ref: '#/components/schemas/InferenceAudioReadMetadata'
+          allOf:
+            - $ref: '#/components/schemas/InferenceAudioReadMetadata'
+          nullable: true
         source_id:
           type: string
           description: Original document source ID.

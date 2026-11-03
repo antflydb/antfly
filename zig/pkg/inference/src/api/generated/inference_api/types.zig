@@ -4170,7 +4170,7 @@ pub const PromptCacheConfig = struct {
 };
 
 pub const ReadObject = struct {
-    audio: ?AudioReadMetadata = null,
+    audio: OpenApiOptionalNullable(AudioReadMetadata) = .absent,
     /// Original document source ID.
     source_id: ?[]const u8 = null,
     /// One-based original page or slide number.
@@ -4205,7 +4205,7 @@ pub const ReadObject = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "audio", "audio", true },
+        .{ "audio", "audio", false },
         .{ "source_id", "source_id", true },
         .{ "number", "number", true },
         .{ "kind", "kind", true },
@@ -4236,9 +4236,16 @@ pub const ReadObject = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.audio) |value| {
-            try jw.objectField("audio");
-            try jw.write(value);
+        switch (self.audio) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("audio");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("audio");
+                try jw.write(value);
+            },
         }
         if (self.source_id) |value| {
             try jw.objectField("source_id");
@@ -4463,7 +4470,7 @@ pub const ReadResponse = struct {
 };
 
 pub const ReadResult = struct {
-    audio: ?AudioReadMetadata = null,
+    audio: OpenApiOptionalNullable(AudioReadMetadata) = .absent,
     /// Original document source ID.
     source_id: ?[]const u8 = null,
     /// One-based original page or slide number.
@@ -4495,7 +4502,7 @@ pub const ReadResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "audio", "audio", true },
+        .{ "audio", "audio", false },
         .{ "source_id", "source_id", true },
         .{ "number", "number", true },
         .{ "kind", "kind", true },
@@ -4524,9 +4531,16 @@ pub const ReadResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.audio) |value| {
-            try jw.objectField("audio");
-            try jw.write(value);
+        switch (self.audio) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("audio");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("audio");
+                try jw.write(value);
+            },
         }
         if (self.source_id) |value| {
             try jw.objectField("source_id");

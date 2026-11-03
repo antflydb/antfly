@@ -660,6 +660,20 @@ def test_native_region_with_unknown_geometry_round_trips():
     assert region.to_dict() == raw
 
 
+@pytest.mark.parametrize("kind", ["page", "slide", "image"])
+def test_document_read_decodes_null_audio_metadata(kind):
+    payload = {
+        "object": "list",
+        "model": "document-reader",
+        "data": [{"object": "read", "index": 0, "kind": kind, "text": "Hello", "audio": None}],
+    }
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(lambda _: httpx.Response(200, json=payload)))
+    result = client.read({"model": "document-reader", "images": [{"url": "fixture"}]})
+    assert result.data[0].audio is None
+    assert result.to_dict() == payload
+
+
 def test_direct_document_read_preserves_page_identity_and_artifact():
     request = {
         "model": "balanced",
@@ -797,12 +811,27 @@ def test_untimed_audio_read_decodes_actual_null_metadata(model, duration_ms):
     from antfly.client_generated.models import InferenceReadRequest
 
     payload = {
-        "object": "list", "model": model, "usage": None,
-        "data": [{"object": "read", "index": 0, "kind": "audio",
-                  "coordinate_space": "none", "origin": "transcription",
-                  "status": "complete", "text": "hello",
-                  "audio": {"duration_ms": duration_ms, "language": None,
-                            "language_source": "unknown", "segments": None, "speakers": None}}],
+        "object": "list",
+        "model": model,
+        "usage": None,
+        "data": [
+            {
+                "object": "read",
+                "index": 0,
+                "kind": "audio",
+                "coordinate_space": "none",
+                "origin": "transcription",
+                "status": "complete",
+                "text": "hello",
+                "audio": {
+                    "duration_ms": duration_ms,
+                    "language": None,
+                    "language_source": "unknown",
+                    "segments": None,
+                    "speakers": None,
+                },
+            }
+        ],
     }
     client = AntflyClient("http://test")
     install_transport(client, httpx.MockTransport(lambda _: httpx.Response(200, json=payload)))
