@@ -985,6 +985,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_transaction_lifecycle_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
     for ([_][]const u8{
         "SQL prepared transaction native visibility receipts retain cold partial progress and terminal repair",
+        "SQL prepared transaction named lock participant survives bounded cold handoff and resolution without its source",
         "SQL command scope database holds survive cold snapshots and block rename and drop until retirement",
         "distributed txn private COMMIT visibility adoption is monotone across cold reopen and retains repair proof",
         "distributed txn external coordinator freezes authority and resumes every lost phase reply",
@@ -1078,6 +1079,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed txn external coordinator freezes authority and resumes every lost phase reply",
             "distributed txn private COMMIT visibility adoption is monotone across cold reopen and retains repair proof",
             "SQL prepared transaction native visibility receipts retain cold partial progress and terminal repair",
+            "SQL prepared transaction named lock participant survives bounded cold handoff and resolution without its source",
             "SQL command scope database holds survive cold snapshots and block rename and drop until retirement",
             "stable distributed transaction retry resumes a durable commit decision",
             "distributed txn retries an ambiguous coordinator decision under the same id",

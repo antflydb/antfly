@@ -168,7 +168,8 @@ const std = @import("std");
 // unreleased SQL profile reserves floors above 78; historical notes above
 // describe its development sequence before this rebasing. Published transition
 // tag 81 remains SQL completion references; private SQL tags begin at 82.
-pub const current_version: u16 = 154;
+pub const current_version: u16 = 155;
+pub const sql_prepared_lock_handoff_version: u16 = 155;
 /// The unreleased combined catalog profile also decodes trigger-return contracts.
 /// Keep new declarations above the older scalar-only routine capability floor.
 pub const sql_trigger_function_version: u16 = 151;

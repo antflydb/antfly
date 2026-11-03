@@ -97,7 +97,14 @@ pub const Identity = struct {
 
     pub fn minimumDecoderVersion(self: Identity) u16 {
         const protocol = @import("../metadata/topology_protocol.zig");
-        return if (self.lock_scope != null) protocol.sql_lock_authority_version else if (self.requiresConnectionDecoder()) protocol.sql_connection_transactions_version else protocol.sql_prepared_transactions_version;
+        return if (self.lock_scope != null and self.kind == .named) protocol.sql_prepared_lock_handoff_version else if (self.lock_scope != null) protocol.sql_lock_authority_version else if (self.requiresConnectionDecoder()) protocol.sql_connection_transactions_version else protocol.sql_prepared_transactions_version;
+    }
+    pub fn preparedLockLease(self: Identity, a: A, group: u64) !local.storage_pessimistic_lock_ledger.Lease {
+        if (self.kind != .named or self.lock_scope == null or self.session == null) return error.InvalidCatalogMutation;
+        var incarnation: [16]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&incarnation, &self.metadata_incarnation);
+        const decision_owner = try self.owner(a);
+        return local.storage_pessimistic_lock_authority.preparedLease(.{ .home = .metadata, .group = group, .incarnation = incarnation }, self.database_id, self.session.?.owner_node_id, .{ .operation = decision_owner.operation_id, .admission = decision_owner.admission_digest });
     }
     pub fn requiresConnectionDecoder(self: Identity) bool {
         return self.kind == .session_commit or (self.session != null and self.session.?.standalone);
@@ -180,7 +187,7 @@ pub fn manifestDigest(a: A, manifest: []const Participant, incarnation: [32]u8) 
 
 pub const CommitProgress = enum { resolving, indexing, ready, repair_required };
 
-pub const Phase = enum { preparing, prepared, decided, active, resolved, retired };
+pub const Phase = enum { preparing, locking, prepared, decided, active, resolved, retired };
 pub const DecisionInput = struct { version: u64, sync_level: local.storage_db_types.SyncLevel = .write };
 pub const Decision = struct { status: enum { committed, aborted }, version: u64, sync_level: local.storage_db_types.SyncLevel = .write };
 pub const Record = struct {
@@ -194,12 +201,16 @@ pub const Record = struct {
     resolutions: u64 = 0,
     visibility: u64 = 0,
     visibility_repairs: u64 = 0,
+    locks_released: bool = false,
     decision: ?Decision = null,
 
     pub fn mask(self: Record) u64 {
         return if (self.participants.len == 64) std.math.maxInt(u64) else (@as(u64, 1) << @as(u6, @intCast(self.participants.len))) - 1;
     }
 
+    pub fn hasPreparedLocks(self: Record) bool {
+        return self.identity.kind == .named and self.identity.lock_scope != null;
+    }
     pub fn visibilityMask(self: Record) u64 {
         return if (self.identity.kind == .session_commit and self.decision != null and self.decision.?.status == .committed and self.decision.?.sync_level != .write) self.mask() else 0;
     }
@@ -216,11 +227,14 @@ pub const Record = struct {
         if ((self.visibility | self.visibility_repairs) & ~self.visibilityMask() != 0 or self.visibility_repairs & ~self.visibility != 0) return error.InvalidCatalogRecord;
         if (self.phase != .resolved and self.phase != .retired and self.visibility != 0) return error.InvalidCatalogRecord;
         if (self.phase == .retired and self.visibility != self.visibilityMask()) return error.InvalidCatalogRecord;
+        if (self.locks_released and (!self.hasPreparedLocks() or (self.phase != .resolved and self.phase != .retired))) return error.InvalidCatalogRecord;
+        if (self.phase == .retired and self.hasPreparedLocks() and !self.locks_released) return error.InvalidCatalogRecord;
         switch (self.phase) {
-            .preparing, .prepared => {
+            .preparing, .locking, .prepared => {
                 if (self.decision != null or self.activations != 0 or self.resolutions != 0) return error.InvalidCatalogRecord;
                 if (self.phase == .prepared and (!self.was_prepared or self.votes != all)) return error.InvalidCatalogRecord;
-                if (self.phase == .preparing and self.was_prepared) return error.InvalidCatalogRecord;
+                if (self.phase != .prepared and self.was_prepared) return error.InvalidCatalogRecord;
+                if (self.phase == .locking and (!self.hasPreparedLocks() or self.votes != all)) return error.InvalidCatalogRecord;
             },
             .decided, .active, .resolved, .retired => {
                 const decision = self.decision orelse return error.InvalidCatalogRecord;
@@ -242,6 +256,9 @@ pub const Record = struct {
 pub const Action = union(enum) {
     vote: u64,
     prepare,
+    lock_handoff,
+    lock_release,
+    lock_released,
     commit: DecisionInput,
     abort: u64,
     activate: u64,
@@ -255,7 +272,7 @@ pub fn advance(a: A, record: Record, expected_revision: u64, owner: Owner, actio
     if (!(try record.identity.owner(a)).eql(owner)) return error.ExternalTransactionDecisionChanged;
     if (record.revision != expected_revision) return error.CatalogGenerationChanged;
     var next = record;
-    next.revision = std.math.add(u64, record.revision, 1) catch return error.CatalogRevisionExhausted;
+    next.revision = if (action == .lock_handoff or action == .lock_release) record.revision else std.math.add(u64, record.revision, 1) catch return error.CatalogRevisionExhausted;
     const all = record.mask();
     switch (action) {
         .vote => |members| {
@@ -263,13 +280,19 @@ pub fn advance(a: A, record: Record, expected_revision: u64, owner: Owner, actio
             next.votes |= members;
         },
         .prepare => {
-            if (record.phase != .preparing) return error.InvalidPreparedTransactionPhase;
-            // One trusted coordinator attests its complete durable vote cohort.
-            // Partial progress is not a prerequisite for recovery, which aborts
-            // every frozen participant when preparation cannot finish.
+            if (record.phase != .preparing and record.phase != .locking) return error.InvalidPreparedTransactionPhase;
             next.votes = all;
-            next.was_prepared = true;
-            next.phase = .prepared;
+            // The metadata home is a real lock participant, not a fabricated
+            // table route. Its bounded native transfer must precede PREPARED.
+            next.phase = if (record.hasPreparedLocks() and record.phase == .preparing) .locking else .prepared;
+            next.was_prepared = next.phase == .prepared;
+        },
+        .lock_handoff => {
+            if (record.phase != .locking) return error.InvalidPreparedTransactionPhase;
+        },
+        .lock_release, .lock_released => {
+            if (record.phase != .resolved or !record.hasPreparedLocks() or record.locks_released) return error.InvalidPreparedTransactionPhase;
+            if (action == .lock_released) next.locks_released = true;
         },
         .commit => |decision| {
             if (record.phase != .prepared or decision.version <= record.identity.begin_timestamp or (record.identity.kind == .session_commit and decision.sync_level != record.identity.commit_sync_level)) return error.InvalidPreparedTransactionPhase;
@@ -277,7 +300,7 @@ pub fn advance(a: A, record: Record, expected_revision: u64, owner: Owner, actio
             next.phase = if (all == 0) .resolved else .decided;
         },
         .abort => |version| {
-            if ((record.phase != .preparing and record.phase != .prepared) or (record.identity.kind == .session_commit and record.phase == .prepared) or version <= record.identity.begin_timestamp) return error.InvalidPreparedTransactionPhase;
+            if ((record.phase != .preparing and record.phase != .locking and record.phase != .prepared) or (record.identity.kind == .session_commit and record.phase == .prepared) or version <= record.identity.begin_timestamp) return error.InvalidPreparedTransactionPhase;
             next.decision = .{ .status = .aborted, .version = version };
             next.phase = if (all == 0) .resolved else .decided;
         },
@@ -301,7 +324,7 @@ pub fn advance(a: A, record: Record, expected_revision: u64, owner: Owner, actio
             next.visibility_repairs |= progress.repair;
         },
         .handoff => {
-            if (record.phase != .resolved or record.visibility != record.visibilityMask()) return error.InvalidPreparedTransactionPhase;
+            if (record.phase != .resolved or record.visibility != record.visibilityMask() or (record.hasPreparedLocks() and !record.locks_released)) return error.InvalidPreparedTransactionPhase;
             next.phase = .retired;
         },
     }
@@ -316,7 +339,7 @@ pub fn recoveryDecision(record: Record, now_ns: u64) ?enum { abort, commit } {
     return switch (record.phase) {
         .preparing => if (now_ns >= record.identity.expires_at_unix_ns) .abort else null,
         .prepared => if (record.identity.kind == .session_commit) .commit else null,
-        .decided, .active, .resolved, .retired => null,
+        .locking, .decided, .active, .resolved, .retired => null,
     };
 }
 
@@ -639,6 +662,11 @@ pub fn plan(a: A, txn: anytype, group: u64, catalog_revision: u64, request: Muta
             break :blk next;
         },
     };
+    // Native lock job cursors own intermediate progress. The exact command
+    // outcome still commits with each quantum, but its immutable participant
+    // manifest is written only when the registry's logical phase changes.
+    if (request.operation == .advance and (request.operation.advance.action == .lock_handoff or request.operation.advance.action == .lock_release))
+        return .{ .writes = writes.items, .deletes = deletes.items, .result = .{ .revision = catalog_revision, .identity = null, .removed = 0 } };
     const bytes = try std.json.Stringify.valueAlloc(a, record, .{});
     if (bytes.len > max_bytes) return error.CatalogCommandTooLarge;
     try writes.append(a, .{ .key = try operationKey(a, group, record.identity.operation_id), .value = bytes });

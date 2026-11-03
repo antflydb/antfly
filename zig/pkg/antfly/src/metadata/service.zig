@@ -3728,6 +3728,8 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    // This native home participant has a newer decoder than command fences.
+    if (command == .apply_sql_prepared_transaction) return metadata_topology_protocol.sql_prepared_lock_handoff_version;
     const command_fence = switch (command) {
         .apply_system_catalog, .apply_sql_sequence_counter, .apply_sql_prepared_transaction, .apply_sql_lock_scope, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_schema_validation, .apply_table_retirement => |bytes| @import("schema_reader_wire.zig").requiresSqlCommandFence(bytes),
         else => false,
@@ -3743,7 +3745,6 @@ fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCom
     };
     if (native_index_names) return metadata_topology_protocol.sql_native_index_namespace_version;
     if (command == .apply_sql_lock_scope) return metadata_topology_protocol.sql_lock_authority_version;
-    if (command == .apply_sql_prepared_transaction) return metadata_topology_protocol.sql_lock_authority_version;
     if (command == .apply_system_catalog and @import("schema_reader_wire.zig").requiresSqlTriggerFunction(command.apply_system_catalog)) return metadata_topology_protocol.sql_trigger_function_version;
     const type_retirement = switch (command) {
         .apply_restore_staging => |bytes| @import("schema_reader_wire.zig").requiresTypeRetirement(bytes),
@@ -4282,7 +4283,7 @@ pub fn ensureQueryPopulationDecoderWithContext(service: anytype, bytes: []const 
 }
 
 pub fn ensureSqlPreparedCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
-    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_lock_authority_version);
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_prepared_lock_handoff_version);
 }
 
 pub fn ensureSqlAuthorizationCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
@@ -24422,7 +24423,7 @@ test "SQL command fence decoder admission dominates legacy catalog and counter f
         .{ .apply_sql_sequence_counter = guarded },
         .{ .apply_sql_prepared_transaction = guarded },
         .{ .apply_sql_lock_scope = guarded },
-    }) |command| try std.testing.expectEqual(metadata_topology_protocol.sql_command_fence_version, baseRequiredCoordinatedDecoderVersion(command));
+    }) |command| try std.testing.expectEqual(if (command == .apply_sql_prepared_transaction) metadata_topology_protocol.sql_prepared_lock_handoff_version else metadata_topology_protocol.sql_command_fence_version, baseRequiredCoordinatedDecoderVersion(command));
     try std.testing.expectEqual(metadata_topology_protocol.sql_lock_authority_version, baseRequiredCoordinatedDecoderVersion(.{ .apply_sql_lock_scope = "{\"admission\":{\"command_fence\":null}}" }));
 }
 

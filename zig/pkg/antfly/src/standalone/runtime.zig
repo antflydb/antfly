@@ -18894,27 +18894,51 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
             try scopeMutate(a, api, backend, 83, .{ .effect = .{ .command = scope_frame, .effect = .{ .backend = backend, .sequence = 1, .nonce = @splat(25), .action = .{ .try_acquire = .{ .resource = @splat(26), .mode = .{ .advisory = .exclusive }, .scope = .session } } } } });
             try scopeMutate(a, api, backend, 84, .{ .fence = .close });
         }
-        fn scopedWrite(backing: std.mem.Allocator, api: *antfly.public_api.ApiHttpServer) !void {
+        fn scopedWrite(backing: std.mem.Allocator, api: *antfly.public_api.ApiHttpServer, named: bool) !void {
             var arena = std.heap.ArenaAllocator.init(backing);
             defer arena.deinit();
             const a = arena.allocator();
             const cut = try scopeRead(a, api, null);
-            const backend: scope_types.locks.Backend = .{ .incarnation = cut.incarnation, .id = @splat(0xed), .fence = 1 };
-            const connection_id: [32]u8 = @splat('f');
+            const backend: scope_types.locks.Backend = .{ .incarnation = cut.incarnation, .id = @splat(@as(u8, if (named) 0xee else 0xed)), .fence = 1 };
+            const connection_id: [32]u8 = @splat(@as(u8, if (named) 'd' else 'f'));
             const command_frame: scope_types.scopes.Command = .{ .sequence = 1, .nonce = @splat(31), .executor = @splat(32) };
             const registration: scope_types.scopes.Registration = .{ .lease = .{ .backend = backend, .database = 1, .node = 0, .principal = try scope_types.principalDigest(a, .bootstrap), .expires_at_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60000 }, .connection = connection_id, .nonce = @splat(33), .standalone = true };
-            try scopeMutate(a, api, backend, 91, .{ .register = registration });
-            try scopeMutate(a, api, backend, 92, .{ .begin = command_frame });
+            try scopeMutate(a, api, backend, if (named) 101 else 91, .{ .register = registration });
+            try scopeMutate(a, api, backend, if (named) 102 else 92, .{ .begin = command_frame });
             const frame: @import("../system_catalog/command_fence.zig").Fence = .{ .backend = backend, .command = command_frame, .database = 1, .principal = registration.lease.principal, .standalone = true };
             const session = try api.txn_sessions.beginForPrincipalWithSettings(backing, .{ .sync_level = .full_index, .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 0, null, &.{}, connection_id);
+            if (named) {
+                try scopeMutate(a, api, backend, 103, .{ .bind = .{ .command = command_frame, .transaction = session.txn_id } });
+                try scopeMutate(a, api, backend, 104, .{ .effect = .{ .command = command_frame, .effect = .{ .backend = backend, .sequence = 1, .nonce = @splat(35), .action = .{ .try_acquire = .{ .resource = @splat(36), .mode = .{ .advisory = .exclusive }, .scope = .{ .transaction = .{ .id = session.txn_id, .subtransaction = 0 } } } } } } });
+            }
             var identity: ?antfly.public_api.http_server.AuthenticatedIdentity = null;
             const encoded_session = std.fmt.bytesToHex(session.txn_id, .lower);
             var adapter: @import("../api/sql_execution.zig").Adapter = .{ .server = api, .identity = &identity, .context = .{ .sql_command_fence = &frame }, .session_id = &encoded_session, .connection_id = connection_id };
             defer adapter.releaseExecutionOwners();
-            var compiled = try @import("antfly_local_sources").sql_compiler.compile(backing, "INSERT INTO lock_probe(id,v) VALUES ('scoped',2)", .{});
+            var compiled = try @import("antfly_local_sources").sql_compiler.compile(backing, if (named) "INSERT INTO lock_probe(id,v) VALUES ('scoped_named',3)" else "INSERT INTO lock_probe(id,v) VALUES ('scoped',2)", .{});
             defer compiled.deinit();
             var result = try adapter.execute(backing, &compiled, &.{}, .{}, null);
             defer result.deinit();
+            if (named) {
+                adapter.releaseExecutionOwners();
+                var prepare = try @import("antfly_local_sources").sql_compiler.compile(backing, "PREPARE TRANSACTION 'local_scoped'", .{});
+                defer prepare.deinit();
+                var prepared_result = try adapter.execute(backing, &prepare, &.{}, .{}, null);
+                defer prepared_result.deinit();
+                try std.testing.expectEqualStrings("PREPARE TRANSACTION", prepared_result.output.command_tag);
+                var sql_state = (try api.txn_sessions.getSqlState(backing, session.txn_id)).?;
+                defer sql_state.deinit(backing);
+                try std.testing.expect(sql_state.terminal_prepare);
+                const completed = try scopeRead(a, api, backend);
+                try std.testing.expect(completed.scope.?.transaction == null);
+                try scopeMutate(a, api, backend, 105, .{ .fence = .close });
+                for (0..4) |i| {
+                    if ((try scopeRead(a, api, backend)).scope.?.state == .retired) break;
+                    try scopeMutate(a, api, backend, @intCast(106 + i), .close_step);
+                }
+                try std.testing.expectEqual(.retired, (try scopeRead(a, api, backend)).scope.?.state);
+                return;
+            }
             var coordinator: @import("../api/sql_session.zig").Coordinator = .{ .server = api, .identity = &identity, .context = .{ .sql_command_fence = &frame }, .sync_level = .full_index };
             const decision = try @import("../api/sql_session.zig").Coordinator.commit(&coordinator, .{ .principal = "", .database = "default", .namespace = "public" }, session.txn_id);
             try std.testing.expectEqual(.committed, decision.outcome);
@@ -19000,7 +19024,8 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
         try std.testing.expectEqual(@as(u64, 0), api.localSessionNodeId());
         if (phase == 0) {
             try Helper.command(alloc, api, null, "CREATE TABLE lock_probe(id TEXT PRIMARY KEY, v INTEGER)", "CREATE TABLE");
-            try Helper.scopedWrite(alloc, api);
+            try Helper.scopedWrite(alloc, api, false);
+            try Helper.scopedWrite(alloc, api, true);
             for ([_][]const u8{ "commit", "abort" }) |kind| {
                 var begun = try Helper.sql(alloc, api, null, "BEGIN");
                 defer begun.deinit();
@@ -19022,12 +19047,13 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
             try Helper.rows(alloc, api, &.{"scoped"});
             try Helper.command(alloc, api, null, "COMMIT PREPARED 'local_commit'", "COMMIT PREPARED");
             try Helper.command(alloc, api, null, "ROLLBACK PREPARED 'local_abort'", "ROLLBACK PREPARED");
-            try Helper.rows(alloc, api, &.{ "commit", "scoped" });
+            try Helper.command(alloc, api, null, "COMMIT PREPARED 'local_scoped'", "COMMIT PREPARED");
+            try Helper.rows(alloc, api, &.{ "commit", "scoped", "scoped_named" });
             const reloads = metadata.lifecycle_projection_reloads;
             try Helper.finishScope(alloc, api);
             try std.testing.expectEqual(reloads, metadata.lifecycle_projection_reloads);
         } else {
-            try Helper.rows(alloc, api, &.{ "commit", "scoped" });
+            try Helper.rows(alloc, api, &.{ "commit", "scoped", "scoped_named" });
             // A retired GID can be reused without adopting the old admission.
             var begun = try Helper.sql(alloc, api, null, "BEGIN");
             defer begun.deinit();

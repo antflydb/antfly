@@ -903,6 +903,22 @@ pub fn step(backing: A, txn: anytype, ns: Namespace, effect: Effect, context: an
     return receipt;
 }
 
+/// A prepared home executes exactly one close effect. Its resolved metadata
+/// owner must authorize reclamation in the SAME writer as final handoff. No
+/// membership scan or per-transaction permanent tombstone is needed.
+pub fn reclaimPrepared(backing: A, txn: anytype, ns: Namespace, lease: Lease, transaction: [16]u8, authority: anytype) !void {
+    try lease.validate(ns);
+    if (ns.home != .metadata or lease.expires_at_ms != std.math.maxInt(u64)) return error.InvalidLockOwner;
+    try authority.requirePreparedResolution(txn, ns, lease, transaction);
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const owner = try readOwner(arena.allocator(), txn, ns, lease.backend) orelse return;
+    if (!std.meta.eql(owner.lease, lease) or owner.state != .retired or owner.next_effect != 2 or owner.resources != 0 or owner.transaction_resources != 0 or owner.mixed_resources != 0 or owner.transaction != null or owner.job != null or owner.waiting != null) return error.InvalidLockRecord;
+    var buffer: [256]u8 = undefined;
+    try txn.delete(try key(&buffer, ns, .receipt, lease.backend, @splat(0), 1));
+    try txn.delete(try key(&buffer, ns, .owner, lease.backend, @splat(0), 0));
+}
+
 // In-memory transaction adapter qualifies ledger invariants and rollback on a
 // failed staged write. Production native writer/replication gates separately
 // qualify concrete storage atomicity and durable owner authorization.

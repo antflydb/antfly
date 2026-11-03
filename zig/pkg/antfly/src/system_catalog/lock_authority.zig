@@ -41,7 +41,7 @@ pub const Request = struct {
         fence: scopes.Fence,
         bind: struct { command: scopes.Command, transaction: [16]u8 },
         release: scopes.Transaction,
-        /// Exact unadmitted private purpose, retained locally before dispatch.
+        /// Exact unadmitted purpose, retained locally before dispatch.
         /// Native journal absence/rejection, not that local claim, authorizes cleanup.
         release_unadmitted: prepared.Mutation,
         effect: EffectInput,
@@ -71,8 +71,7 @@ pub const Request = struct {
             .bind => |value| try value.command.validate(),
             .release_unadmitted => |original| {
                 try original.validate();
-                if (original.operation != .admit or original.operation.admit.identity.kind != .session_commit or
-                    !std.mem.eql(u8, &original.incarnation, &self.incarnation) or original.standalone != self.standalone or original.database_id != self.database) return error.InvalidCatalogMutation;
+                if (original.operation != .admit or !std.mem.eql(u8, &original.incarnation, &self.incarnation) or original.standalone != self.standalone or original.database_id != self.database) return error.InvalidCatalogMutation;
                 const ref = original.operation.admit.identity.lock_scope orelse return error.InvalidCatalogMutation;
                 if (!ref.backend.eql(self.backend)) return error.InvalidCatalogMutation;
             },
@@ -118,6 +117,7 @@ pub const Context = struct {
     standalone: bool,
     maintenance: bool = false,
     unadmitted: ?prepared.Mutation = null,
+    prepared_operation: ?[16]u8 = null,
     fn requireOwner(self: Context, value: scopes.Record) !void {
         if (value.registration.standalone != self.standalone or value.registration.lease.database != self.database) return error.Forbidden;
         if (self.maintenance and self.actor.session_user.kind == .bootstrap and self.actor.current_role == null) return;
@@ -209,9 +209,19 @@ pub const Context = struct {
         try self.requireOwner(value);
         if (value.transaction != null) return error.LockOwnerBusy;
     }
-    pub fn requirePreparedHandoff(_: Context, _: anytype, _: scopes.ledger.Namespace, _: scopes.Record, _: scopes.ledger.Lease, _: scopes.ledger.Lease, _: [16]u8) !void {
-        // Named handoff is activated only with an independently enrolled cohort.
-        return error.InvalidLockScope;
+    pub fn requirePreparedHandoff(self: Context, txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Record, from: scopes.ledger.Lease, to: scopes.ledger.Lease, id: [16]u8) !void {
+        try self.requireOwner(value);
+        const transaction = value.transaction orelse return error.InvalidLockScope;
+        const found = try self.record(txn, ns, value, transaction.decision orelse return error.InvalidLockScope);
+        if (!found.hasPreparedLocks() or (found.phase != .locking and !(found.phase == .resolved and found.decision.?.status == .aborted)) or
+            !std.meta.eql(from, value.registration.lease) or !std.mem.eql(u8, &found.identity.txn_id, &id) or
+            !std.meta.eql(to, try found.identity.preparedLockLease(self.a, ns.group))) return error.InvalidLockScope;
+    }
+    pub fn requirePreparedResolution(self: Context, txn: anytype, ns: scopes.ledger.Namespace, lease: scopes.ledger.Lease, id: [16]u8) !void {
+        const found = try prepared.readOperation(self.a, txn, ns.group, self.prepared_operation orelse return error.InvalidLockScope) orelse return error.InvalidLockScope;
+        if (!found.hasPreparedLocks() or found.phase != .resolved or found.identity.database_id != self.database or
+            !std.mem.eql(u8, &found.identity.txn_id, &id) or !std.meta.eql(lease, try found.identity.preparedLockLease(self.a, ns.group))) return error.InvalidLockScope;
+        try found.identity.session.?.requireRealm(self.standalone);
     }
 };
 pub fn apply(a: A, txn: anytype, group: u64, request: Request) !void {

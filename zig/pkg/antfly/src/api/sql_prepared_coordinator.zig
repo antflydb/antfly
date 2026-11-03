@@ -141,6 +141,14 @@ pub const Registry = struct {
                 _ = try self.snapshot(a, .{ .operation = record.identity.operation_id });
                 continue;
             };
+            if (action == .lock_handoff or action == .lock_release) {
+                // The native quantum may atomically publish its completion.
+                // Its phase comes from the accepting owner, never an assumed
+                // local postimage of a background job.
+                const cut = try self.snapshot(a, .{ .operation = record.identity.operation_id });
+                if (cut.records.len != 1 or cut.records[0].revision < record.revision or !(try cut.records[0].identity.owner(a)).eql(owner)) return error.MetadataMutationOutcomeUnknown;
+                return cut.records[0];
+            }
             // Reconstruct the deterministic postimage from the exact command's
             // durable success, including retirement of its operation row.
             return registry.advance(a, record, record.revision, owner, action);
@@ -220,6 +228,9 @@ pub const Registry = struct {
         const ref = identity.lock_scope orelse return true;
         const types = @import("../system_catalog/lock_authority.zig");
         const anchor = try self.snapshot(a, .{ .operation = identity.operation_id });
+        if (identity.kind == .named) for (anchor.receipts) |receipt| {
+            if (receipt.status == .prepared and receipt.owner.eql(try identity.owner(a))) return true;
+        };
         var context = self.context;
         context.setting_admin = true;
         const query: types.Query = .{ .incarnation = anchor.incarnation, .standalone = anchor.standalone, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database = identity.database_id, .backend = ref.backend };
@@ -437,7 +448,9 @@ fn recoverEmptyCohort(source: *Registry, a: A, before: registry.Record, now_ns: 
             .commit => .{ .commit = .{ .version = version, .sync_level = record.identity.commit_sync_level } },
         });
     }
-    if (record.phase == .resolved) record = try Registry.advance(source, a, record, .handoff);
+    if (record.phase == .locking) record = try Registry.advance(source, a, record, .lock_handoff);
+    if (record.phase == .resolved and record.hasPreparedLocks() and !record.locks_released) record = try Registry.advance(source, a, record, .lock_release);
+    if (record.phase == .resolved and (!record.hasPreparedLocks() or record.locks_released)) record = try Registry.advance(source, a, record, .handoff);
     return record;
 }
 
@@ -551,7 +564,7 @@ pub fn execute(root: *execution.Adapter, session: *sql_session.Session, a: A, co
         if (record.identity.database_id != source.database_id) return error.SqlPreparedTransactionWrongDatabase;
         try local.api_operation.requireNativeServiceAccess(record.identity.native_service, root.context.native_service);
         if (!source.native_admin and actor.principal().kind != .bootstrap and !record.identity.principal.eql(actor.principal())) return error.Forbidden;
-        if (record.phase == .preparing) return error.SqlPreparedTransactionNotFound;
+        if (record.phase == .preparing or record.phase == .locking) return error.SqlPreparedTransactionNotFound;
         const committed = command.action == .commit;
         if (record.phase == .prepared) {
             const version = try distributed.commitVersion(record.identity.begin_timestamp);
@@ -628,7 +641,7 @@ pub fn execute(root: *execution.Adapter, session: *sql_session.Session, a: A, co
     var operation_id: [16]u8 = undefined;
     try server.embedding_provider_runtime.io.randomSecure(&operation_id);
     const now = @import("antfly_platform").time.realtimeNs();
-    const identity: registry.Identity = .{ .session = .{ .owner_node_id = server.localSessionNodeId(), .connection_id = state.connection_id, .standalone = cut.standalone }, .gid = command.gid, .database_id = source.database_id, .native_service = root.context.native_service, .principal = actor.principal(), .txn_id = id, .operation_id = operation_id, .metadata_incarnation = std.fmt.bytesToHex(cut.incarnation, .lower), .begin_timestamp = info.begin_timestamp, .expires_at_unix_ns = try std.math.add(u64, now, 5 * std.time.ns_per_min), .plan_digest = try registry.planDigest(encoded), .manifest_digest = try registry.manifestDigest(scratch, cohort.manifest, std.fmt.bytesToHex(cut.incarnation, .lower)) };
+    const identity: registry.Identity = .{ .lock_scope = if (root.context.sql_command_fence) |fence| .{ .backend = fence.backend, .command = fence.command } else null, .session = .{ .owner_node_id = server.localSessionNodeId(), .connection_id = state.connection_id, .standalone = cut.standalone }, .gid = command.gid, .database_id = source.database_id, .native_service = root.context.native_service, .principal = actor.principal(), .txn_id = id, .operation_id = operation_id, .metadata_incarnation = std.fmt.bytesToHex(cut.incarnation, .lower), .begin_timestamp = info.begin_timestamp, .expires_at_unix_ns = try std.math.add(u64, now, 5 * std.time.ns_per_min), .plan_digest = try registry.planDigest(encoded), .manifest_digest = try registry.manifestDigest(scratch, cohort.manifest, std.fmt.bytesToHex(cut.incarnation, .lower)) };
     const seal: transactions.ExternalPreparationSeal = .{ .admission_head = cut.head, .admitted_at_ns = now, .standalone = cut.standalone, .identity = identity, .actor = actor, .participants = cohort.manifest };
     var plan = (try server.txn_sessions.sealExternalEncodedExecutionPlan(server.alloc, id, seal, encoded)) orelse return error.SqlTransactionNotActive;
     defer plan.deinit();

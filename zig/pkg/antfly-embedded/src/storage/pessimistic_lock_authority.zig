@@ -465,6 +465,122 @@ pub fn releaseTransaction(backing: A, txn: anytype, ns: ledger.Namespace, backen
     } else if (!std.meta.eql(value.released_transaction, @as(?Transaction, expected))) return error.LockOwnerChanged;
     return true;
 }
+/// Stable non-expiring metadata participant. Its identity is derived solely
+/// from the immutable external owner, so source retirement cannot orphan it.
+pub fn preparedLease(ns: ledger.Namespace, database: u64, node: u64, decision: DecisionRef) !ledger.Lease {
+    try decision.validate();
+    var digest: [32]u8 = undefined;
+    var h = std.crypto.hash.Blake3.init(.{});
+    h.update("antfly/prepared-lock-owner/v1");
+    h.update(&decision.operation);
+    h.update(&decision.admission);
+    h.final(&digest);
+    const value: ledger.Lease = .{ .backend = .{ .incarnation = ns.incarnation, .id = digest[0..16].*, .fence = 1 }, .database = database, .node = node, .principal = decision.admission, .expires_at_ms = std.math.maxInt(u64) };
+    try value.validate(ns);
+    return value;
+}
+
+/// Transfer at most one indexed transaction resource. A sealed native decision
+/// owns the job even if its source command has expired or its reply was lost.
+pub fn prepareStep(backing: A, txn: anytype, ns: ledger.Namespace, backend: locks.Backend, command: Command, expected: Transaction, destination: ledger.Lease, authority: anytype) !bool {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var value = try load(a, txn, ns, backend);
+    if (!std.meta.eql(value.transaction, @as(?Transaction, expected))) {
+        if (std.meta.eql(value.released_transaction, @as(?Transaction, expected))) {
+            const prepared = try ledger.readOwner(a, txn, ns, destination.backend) orelse return error.InvalidLockRecord;
+            if (!std.meta.eql(prepared.lease, destination) or prepared.state != .prepared or !std.meta.eql(prepared.transaction, @as(?[16]u8, expected.id))) return error.InvalidLockRecord;
+            return true;
+        }
+        return error.LockOwnerChanged;
+    }
+    if (expected.decision == null or value.releasing or value.next_command != command.sequence) return error.InvalidLockScope;
+    try authority.requirePreparedHandoff(txn, ns, value, value.registration.lease, destination, expected.id);
+    const owner = try ledger.readOwner(a, txn, ns, backend) orelse return error.InvalidLockRecord;
+    if (owner.waiting != null) return error.LockOwnerBusy;
+    const context: PrepareContext(@TypeOf(authority)) = .{ .authority = authority, .value = value, .ns = ns, .destination = destination, .transaction = expected.id };
+    if (owner.job) |job| {
+        if (job.effect.action != .control or job.effect.action.control != .prepare or !std.meta.eql(job.effect.action.control.prepare.destination, destination) or !std.mem.eql(u8, &job.effect.action.control.prepare.transaction, &expected.id)) return error.LockOwnerBusy;
+        const receipt = try ledger.step(a, txn, ns, job.effect, context);
+        if (receipt.outcome != .completed) return false;
+    } else {
+        var nonce: [32]u8 = undefined;
+        var h = std.crypto.hash.Blake3.init(.{});
+        h.update("antfly/lock-scope-prepare/v1");
+        h.update(&value.registration.nonce);
+        h.update(&expected.decision.?.admission);
+        h.final(&nonce);
+        _ = try ledger.apply(a, txn, ns, .{ .backend = backend, .sequence = owner.next_effect, .nonce = nonce[0..16].*, .action = .{ .control = .{ .prepare = .{ .transaction = expected.id, .destination = destination } } } }, context);
+        return false;
+    }
+    value.transaction = null;
+    value.released_transaction = expected;
+    value.command = null;
+    value.completed = command;
+    value.next_command += 1;
+    try write(a, txn, ns, value);
+    return true;
+}
+fn PrepareContext(comptime Authority: type) type {
+    return struct {
+        authority: Authority,
+        value: Record,
+        ns: ledger.Namespace,
+        destination: ledger.Lease,
+        transaction: [16]u8,
+        pub fn requireEffect(self: @This(), txn: anytype, lease: ledger.Lease, effect: ledger.Effect) !void {
+            if (!std.meta.eql(lease, self.value.registration.lease) or effect.action != .control or effect.action.control != .prepare or !std.meta.eql(effect.action.control.prepare.destination, self.destination) or !std.mem.eql(u8, &effect.action.control.prepare.transaction, &self.transaction)) return error.InvalidLockEffect;
+            try self.requirePrepare(txn, lease, self.destination, self.transaction);
+        }
+        pub fn requireObservation(self: @This(), txn: anytype, lease: ledger.Lease, effect: ledger.Effect) !void {
+            try self.requireEffect(txn, lease, effect);
+        }
+        pub fn requirePrepare(self: @This(), txn: anytype, from: ledger.Lease, to: ledger.Lease, id: [16]u8) !void {
+            try self.authority.requirePreparedHandoff(txn, self.ns, self.value, from, to, id);
+        }
+    };
+}
+
+/// Independently authorize every cleanup quantum against the external decision.
+/// Never borrow a live source scope or release grants from an expired vote.
+pub fn releasePreparedStep(backing: A, txn: anytype, ns: ledger.Namespace, lease: ledger.Lease, transaction: [16]u8, authority: anytype) !bool {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try authority.requirePreparedResolution(txn, ns, lease, transaction);
+    const owner = try ledger.readOwner(a, txn, ns, lease.backend) orelse return error.InvalidLockRecord;
+    if (!std.meta.eql(owner.lease, lease)) return error.LockOwnerChanged;
+    if (owner.state == .retired) return true;
+    if (owner.state != .prepared or !std.meta.eql(owner.transaction, @as(?[16]u8, transaction)) or owner.waiting != null) return error.InvalidLockRecord;
+    const context: PreparedResolutionContext(@TypeOf(authority)) = .{ .authority = authority, .ns = ns, .lease = lease, .transaction = transaction };
+    if (owner.job) |job| {
+        if (job.effect.action != .control or job.effect.action.control != .close) return error.InvalidLockRecord;
+        return (try ledger.step(a, txn, ns, job.effect, context)).outcome == .completed;
+    }
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&transaction, &digest, .{});
+    _ = try ledger.apply(a, txn, ns, .{ .backend = lease.backend, .sequence = owner.next_effect, .nonce = digest[0..16].*, .action = .{ .control = .close } }, context);
+    return false;
+}
+fn PreparedResolutionContext(comptime Authority: type) type {
+    return struct {
+        authority: Authority,
+        ns: ledger.Namespace,
+        lease: ledger.Lease,
+        transaction: [16]u8,
+        pub fn requireEffect(self: @This(), txn: anytype, lease: ledger.Lease, effect: ledger.Effect) !void {
+            if (!std.meta.eql(lease, self.lease) or effect.action != .control or effect.action.control != .close) return error.InvalidLockEffect;
+            try self.authority.requirePreparedResolution(txn, self.ns, lease, self.transaction);
+        }
+        pub fn requireObservation(self: @This(), txn: anytype, lease: ledger.Lease, effect: ledger.Effect) !void {
+            try self.requireEffect(txn, lease, effect);
+        }
+        pub fn requirePrepare(_: @This(), _: anytype, _: ledger.Lease, _: ledger.Lease, _: [16]u8) !void {
+            return error.InvalidLockEffect;
+        }
+    };
+}
 fn ResolutionContext(comptime Authority: type) type {
     return struct {
         authority: Authority,

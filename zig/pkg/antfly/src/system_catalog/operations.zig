@@ -282,7 +282,7 @@ pub fn mutateSqlPrepared(svc: anytype, alloc: std.mem.Allocator, context: operat
     try request.validate();
     if (request.standalone) return error.InvalidCatalogMutation;
     try @import("../metadata/service.zig").ensureSqlPreparedCapabilityWithContext(svc, context);
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_lock_authority_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_prepared_lock_handoff_version);
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const previous = try store.sqlPreparedOutcome(alloc, svc.metadata_group_id, request);

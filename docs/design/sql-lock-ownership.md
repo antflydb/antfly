@@ -583,3 +583,77 @@ metadata-submission, native lock fault and command-fence gates pass together.
 `make generate`, `make fmt`, license, source-boundary and original-inventory
 checks pass. The original inventory remains **87 unresolved cases**; these
 recovery prerequisites do not independently close a public locking case.
+
+
+## Named prepared lock home
+
+Named transactions with a command scope enlist the metadata lock home in the
+existing prepared registry. After every table participant has durably voted,
+the registry enters `locking`; it cannot publish PREPARED or its session receipt
+until the native home has finished transferring transaction grants. This frozen
+vote does not expire into an abort because its source command died. Recovery uses
+the same work index and immutable external owner, never SQL replay or a second
+decision registry.
+
+The destination lease is derived from the exact operation and admission digest.
+It has a stable backend fence, database and node identity and does not expire.
+It can therefore survive the source connection's retirement. Each native
+handoff processes at most one indexed transaction resource. Intermediate quanta
+write only the native cursor and exact delivery outcome; they do not rewrite the
+registry's frozen participant manifest or increment its logical phase revision.
+The audited native campaign asserts zero registry writes/deletes for these
+quanta. The accepting writer
+rechecks the sealed transaction, original scope, source lease and destination
+identity on every quantum. Session grants stay with the original backend.
+Publishing PREPARED, completing the original command and releasing its bound
+transaction happen in the same native transaction as the final transfer.
+
+A resolved decision does not retire its metadata record until the lock home has
+released its grants. An abort before handoff releases only the sealed source
+transaction. An abort during an incoming transfer completes that exact transfer
+before retiring the destination, preserving continuous ownership. Cleanup after
+a completed handoff reads the prepared registry and destination directly; it
+never borrows a live source command. Final metadata handoff reclaims the retired
+non-expiring destination and its sole close receipt in that same native writer.
+No per-transaction destination tombstone is added. An old home command cannot
+recreate the reclaimed destination once its metadata operation is retired;
+reader snapshots pinned before deletion retain their immutable view.
+The prepared registry's durable database reference also fences rename and drop
+after the originating connection has closed; neither operation may bypass a
+frozen prepared owner merely because its live-scope counter reached zero. Every quantum remains independently fenced
+by the immutable decision. Mixed session/transaction advisory ownership of one
+key is a known preparation rejection. An exact retained rejection can authorize
+unadmitted named-transaction cleanup without waiting for connection expiry.
+
+The coordinator permits a bounded eight phase/lock quanta per recovery pass and
+rotates through the existing work cursor between passes. Its observed native
+postimage determines whether the final quantum completed; a caller cannot infer
+that a background job finished from a local phase calculation. Decoder version
+155 protects both publication and mutation delivery, including commands which
+also carry an older command fence.
+
+Qualification covers twelve native clustered/standalone scenarios: commit,
+abort before handoff, abort during transfer, abort after preparation, rejected
+mixed-scope admission and source reuse by a newer transaction. They exercise
+exact replay, cold reopen between quanta, snapshot contention, source retirement
+and failed native writes at each transfer, cleanup and reclamation boundary.
+Resolving an older prepared participant preserves the newer transaction's
+binding and both session and transaction grants on the original backend.
+
+The combined Debug qualification passed **170/170 steps and 112 selected tests**.
+After adding reclamation, manifest-write suppression and the database rename
+barrier, the three affected native/standalone gates passed **107/107 steps and
+29 tests**. The final source-reuse extension passed **61/61 steps and 19 tests**.
+All runs had no skips, failures or leaks. The standalone SQL campaign prepares
+real row participants with a transaction advisory grant, retires the source,
+reopens, commits the prepared row and reopens again. The independent PostgreSQL
+18 oracles pass **134 lifetime/conflict/database-retirement assertions** and
+**31 wait/cancellation assertions**. Generation, formatting, license,
+source-boundary and original-inventory checks pass.
+
+The public advisory/scalar and HTTP/pgwire source activation work remains open;
+no original inventory case is closed by this native handoff alone. Authoritative
+retirement-floor reclamation for connection tombstones is still separate work;
+the prepared destination does not add a new per-transaction tombstone family.
+The original inventory remains **912 implemented, 138 rejected, 449 superseded
+and 87 unresolved**.

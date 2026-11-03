@@ -258,6 +258,54 @@ def check():
             contender.execute("SELECT pg_advisory_unlock_all()")
             equal(scalar(contender, "SELECT pg_try_advisory_lock(43)"), False)
             holder.execute("SELECT pg_advisory_unlock_all()")
+        # The original connection is gone, but its prepared owner still
+        # serializes database name/retirement operations on another database.
+        holder.execute("CREATE DATABASE prepared_retirement_probe")
+        options = psycopg.conninfo.conninfo_to_dict(holder.info.dsn)
+        options["dbname"] = "prepared_retirement_probe"
+        with psycopg.connect(**options, autocommit=True) as owner:
+            owner.execute("BEGIN")
+            owner.execute("SELECT pg_advisory_xact_lock(7)")
+            owner.execute("PREPARE TRANSACTION 'retirement_owner'")
+        prior_timeout = scalar(holder, "SHOW statement_timeout")
+        holder.execute("SET statement_timeout = '75ms'")
+        try:
+            for statement in (
+                "ALTER DATABASE prepared_retirement_probe RENAME TO prepared_retirement_done",
+                "DROP DATABASE prepared_retirement_probe",
+            ):
+                try:
+                    holder.execute(statement)
+                except psycopg.Error as error:
+                    equal(error.sqlstate, "57014")
+                else:
+                    raise AssertionError(
+                        "database retirement bypassed its prepared owner"
+                    )
+        finally:
+            holder.execute(
+                "SELECT set_config('statement_timeout', %s, false)", (prior_timeout,)
+            )
+            with psycopg.connect(**options, autocommit=True) as owner:
+                owner.execute("ROLLBACK PREPARED 'retirement_owner'")
+        holder.execute(
+            "ALTER DATABASE prepared_retirement_probe RENAME TO prepared_retirement_done"
+        )
+        equal(
+            scalar(
+                holder,
+                "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'prepared_retirement_probe')",
+            ),
+            False,
+        )
+        holder.execute("DROP DATABASE prepared_retirement_done")
+        equal(
+            scalar(
+                holder,
+                "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'prepared_retirement_done')",
+            ),
+            False,
+        )
     print(
         f"Verified {assertions} PostgreSQL lock matrix, MVCC, key-update, reentrance and savepoint assertions"
     )

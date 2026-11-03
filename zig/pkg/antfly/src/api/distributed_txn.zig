@@ -1282,11 +1282,13 @@ pub const ExternalPreparation = struct {
         try record.validate(a);
         if (!(try record.identity.owner(a)).eql(owner)) return error.ExternalTransactionDecisionChanged;
         if (record.phase == .prepared) return record;
+        if (record.phase == .locking) return recoverExternalTransaction(a, worker, authority, identity.operation_id, 0, options);
         if (record.phase != .preparing) return error.InvalidPreparedTransactionPhase;
         var slots: [external_registry.max_participants]ExternalFanoutTask.Slot = undefined;
         try runExternalFanout(a, worker, record, self, .begin, &slots, options);
         try runExternalFanout(a, worker, record, self, .vote, &slots, options);
         record = try authority.advance(authority.ptr, a, record, .prepare);
+        if (record.phase == .locking) record = try recoverExternalTransaction(a, worker, authority, identity.operation_id, 0, options);
         try record.validate(a);
         if (!(try record.identity.owner(a)).eql(owner) or record.phase != .prepared) return error.ExternalTransactionDecisionChanged;
         return record;
@@ -1382,8 +1384,8 @@ fn runExternalFanout(a: std.mem.Allocator, worker: ParticipantWorker, record: Ex
 }
 
 /// Resumes solely from metadata and native journals, without loading, parsing,
-/// or re-executing SQL. A bounded pass crosses at most the four remaining
-/// barriers. Prepared votes have no timeout; only an unfinished admission may
+/// or re-executing SQL. A bounded pass crosses at most eight native phase or
+/// lock quanta. Prepared votes have no timeout; only an unfinished admission may
 /// be aborted by expiry. Every failed delivery remains explicit recovery debt.
 pub fn recoverExternalTransaction(a: std.mem.Allocator, worker: ParticipantWorker, authority: ExternalAuthority, operation_id: [16]u8, now_ns: u64, options: ExecuteOptions) !ExternalRecord {
     var record = (try authority.read(authority.ptr, a, operation_id)) orelse return error.SqlPreparedTransactionNotFound;
@@ -1398,11 +1400,12 @@ pub fn recoverExternalTransaction(a: std.mem.Allocator, worker: ParticipantWorke
         });
     } else if (record.phase == .preparing) return record;
     var slots: [external_registry.max_participants]ExternalFanoutTask.Slot = undefined;
-    for (0..4) |_| {
+    for (0..8) |_| {
         try record.validate(a);
         if (!(try record.identity.owner(a)).eql(owner)) return error.ExternalTransactionDecisionChanged;
         switch (record.phase) {
             .preparing, .prepared, .retired => return record,
+            .locking => record = try authority.advance(authority.ptr, a, record, .lock_handoff),
             .decided, .active => {
                 const operation: ExternalFanoutTask.Operation = if (record.decision.?.status == .committed and record.phase == .decided) .activate else .resolve;
                 const failure: ?anyerror = failure: {
@@ -1417,6 +1420,10 @@ pub fn recoverExternalTransaction(a: std.mem.Allocator, worker: ParticipantWorke
                 if (failure) |err| return err;
             },
             .resolved => {
+                if (record.hasPreparedLocks() and !record.locks_released) {
+                    record = try authority.advance(authority.ptr, a, record, .lock_release);
+                    continue;
+                }
                 if (record.visibility != record.visibilityMask()) {
                     const failure: ?anyerror = failure: {
                         runExternalFanout(a, worker, record, null, .visibility, &slots, options) catch |err| break :failure err;
@@ -1470,6 +1477,7 @@ pub fn recoverExternalTransaction(a: std.mem.Allocator, worker: ParticipantWorke
             },
         }
     }
+    if (record.phase == .prepared or record.phase == .retired) return record;
     return error.CommitDecisionUnknown;
 }
 

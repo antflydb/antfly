@@ -26211,7 +26211,7 @@ pub const RaftApplyStore = struct {
             const database = (try reader.lookup(.database, 0, mutation.database)) orelse return;
             break :block (try reader.lookup(.namespace, database.id, mutation.name)) orelse return;
         };
-        if (mutation.kind == .database and mutation.action == .drop and
+        if (mutation.kind == .database and
             try PreparedTransactions.databaseCount(reader.view.alloc, reader.view.txn, reader.view.group_id, target.id) != 0) return error.TableTransitionActive;
         if (mutation.kind == .database) {
             // No scope can precede metadata identity initialization. Preserve
@@ -40660,7 +40660,7 @@ pub const RaftApplyStore = struct {
                 var scratch = std.heap.ArenaAllocator.init(self.alloc);
                 defer scratch.deinit();
                 const receipt = (try PreparedTransactions.readReceipt(scratch.allocator(), txn, group, ack.owner.operation_id)) orelse break :blk topology_protocol.sql_prepared_transactions_version;
-                break :blk if (receipt.lock_scope != null) topology_protocol.sql_lock_authority_version else if (receipt.kind == .session_commit or receipt.session.standalone) topology_protocol.sql_connection_transactions_version else topology_protocol.sql_prepared_transactions_version;
+                break :blk if (receipt.lock_scope != null and receipt.kind == .named) topology_protocol.sql_prepared_lock_handoff_version else if (receipt.lock_scope != null) topology_protocol.sql_lock_authority_version else if (receipt.kind == .session_commit or receipt.session.standalone) topology_protocol.sql_connection_transactions_version else topology_protocol.sql_prepared_transactions_version;
             },
         };
         if (minimum_decoder > topology_protocol.sql_prepared_transactions_version) _ = try self.standbyRelationActivationTxn(txn, group, minimum_decoder);
@@ -40688,12 +40688,75 @@ pub const RaftApplyStore = struct {
         if (lock_owner.waiting != null or lock_owner.job != null or lock_owner.transaction != null) return error.CatalogPublicationProofPending;
         if (release) _ = try SqlLocks.scopes.releaseTransaction(a, txn, ns, scope.registration.lease.backend, transaction, authority);
     }
+    fn preparedLockReadyTxn(a: std.mem.Allocator, txn: anytype, group: u64, record: PreparedTransactions.Record, released: bool) !bool {
+        const lease = try record.identity.preparedLockLease(a, group);
+        const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = lease.backend.incarnation };
+        if (try SqlLocks.scopes.ledger.readOwner(a, txn, ns, lease.backend)) |owner| {
+            if (!std.meta.eql(owner.lease, lease)) return error.InvalidCatalogRecord;
+            if (released) return owner.state == .retired;
+            if (owner.state != .prepared or !std.meta.eql(owner.transaction, @as(?[16]u8, record.identity.txn_id))) return false;
+        } else if (!released or record.was_prepared) return false;
+        const ref = record.identity.lock_scope.?;
+        const scope = try SqlLocks.scopes.read(a, txn, ns, ref.backend) orelse return error.InvalidCatalogRecord;
+        if (scope.next_command > ref.command.sequence) return true;
+        if (!released or scope.transaction != null) return false;
+        const owner = try record.identity.owner(a);
+        return std.meta.eql(scope.released_transaction, @as(?SqlLocks.scopes.Transaction, .{ .id = record.identity.txn_id, .decision = .{ .operation = owner.operation_id, .admission = owner.admission_digest } }));
+    }
+
+    /// Exactly one indexed native quantum, in the prepared command's writer.
+    /// Readiness is rechecked before publishing its follow-up registry phase.
+    fn advancePreparedLocksTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: PreparedTransactions.Mutation) !void {
+        if (request.operation != .advance) return;
+        const change = request.operation.advance;
+        if (change.action != .lock_handoff and change.action != .lock_release) return;
+        const record = try PreparedTransactions.readOperation(a, txn, group, change.owner.operation_id) orelse return error.InvalidCatalogRecord;
+        const ref = record.identity.lock_scope.?;
+        const lease = try record.identity.preparedLockLease(a, group);
+        const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
+        const expected: SqlLocks.scopes.Transaction = .{ .id = record.identity.txn_id, .decision = .{ .operation = change.owner.operation_id, .admission = change.owner.admission_digest } };
+        const context: SqlLocks.Context = .{ .a = a, .actor = request.actor, .database = record.identity.database_id, .standalone = request.standalone, .maintenance = true, .prepared_operation = change.owner.operation_id };
+        const completed = if (change.action == .lock_handoff)
+            try SqlLocks.scopes.prepareStep(a, txn, ns, ref.backend, ref.command, expected, lease, context)
+        else release: {
+            const destination = try SqlLocks.scopes.ledger.readOwner(a, txn, ns, lease.backend);
+            if (destination == null) {
+                // Aborting before the home ever voted needs no fabricated
+                // prepared owner. Release only the sealed source transaction.
+                break :release try SqlLocks.scopes.releaseTransaction(a, txn, ns, ref.backend, expected, context);
+            }
+            if (destination.?.state == .incoming) {
+                // Abort raced a partially transferred vote. Finish the exact
+                // transfer before closing it; no grant becomes unowned.
+                _ = try SqlLocks.scopes.prepareStep(a, txn, ns, ref.backend, ref.command, expected, lease, context);
+                break :release false;
+            }
+            break :release try SqlLocks.scopes.releasePreparedStep(a, txn, ns, lease, record.identity.txn_id, context);
+        };
+        if (!completed) return;
+        var followup = request;
+        followup.operation.advance.expected_revision = record.revision;
+        followup.operation.advance.action = if (change.action == .lock_handoff) .prepare else .lock_released;
+        const plan = try self.planSqlPreparedTxn(a, txn, group, followup);
+        try plan.apply(txn);
+    }
     fn planSqlPreparedTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: PreparedTransactions.Mutation) !PreparedTransactions.Plan {
         const meta = try system_catalog_storage.readMeta(a, txn, group);
         const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group, .meta = meta };
         if (request.operation == .acknowledge_receipt) try self.completeSqlLockReceiptTxn(a, txn, group, request, false);
+        if (request.operation == .advance) {
+            const change = request.operation.advance;
+            if (try PreparedTransactions.readOperation(a, txn, group, change.owner.operation_id)) |record| {
+                if (record.hasPreparedLocks()) {
+                    if (change.action == .handoff and !record.locks_released) return error.CatalogPublicationProofPending;
+                    if ((change.action == .prepare and record.phase == .locking) or change.action == .lock_released) {
+                        if (!try preparedLockReadyTxn(a, txn, group, record, change.action == .lock_released)) return error.CatalogPublicationProofPending;
+                    }
+                }
+            }
+        }
         if (request.operation == .advance and request.operation.advance.action == .handoff) {
-            if (try PreparedTransactions.readOperation(a, txn, group, request.operation.advance.owner.operation_id)) |record| if (record.identity.lock_scope) |ref| {
+            if (try PreparedTransactions.readOperation(a, txn, group, request.operation.advance.owner.operation_id)) |record| if (!(record.hasPreparedLocks() and record.locks_released)) if (record.identity.lock_scope) |ref| {
                 const scope = try SqlLocks.scopes.read(a, txn, .{ .home = .metadata, .group = group, .incarnation = request.incarnation }, ref.backend) orelse return error.InvalidCatalogRecord;
                 if (scope.transaction != null and scope.next_command <= ref.command.sequence) return error.CatalogPublicationProofPending;
             };
@@ -40714,11 +40777,11 @@ pub const RaftApplyStore = struct {
                         // A private commit may bind its first transaction in
                         // this same native admission. No earlier RPC can leave
                         // an orphan binding if the decision admission fails.
-                        if (identity.kind != .session_commit) return error.CatalogGenerationChanged;
                         if (current.released_transaction) |released| if (std.mem.eql(u8, &released.id, &identity.txn_id)) return error.CatalogGenerationChanged;
                     }
                     const lock_owner = try SqlLocks.scopes.ledger.readOwner(a, txn, ns, ref.backend) orelse return error.InvalidCatalogRecord;
                     if (lock_owner.waiting != null or lock_owner.job != null) return error.CatalogPublicationProofPending;
+                    if (identity.kind == .named and lock_owner.mixed_resources != 0) return error.MixedAdvisoryPrepareUnsupported;
                 } else if (identity.lock_scope != null) return error.CatalogGenerationChanged;
             };
             if (try view.byId(.database, request.database_id) == null) return error.DatabaseNotFound;
@@ -40811,6 +40874,14 @@ pub const RaftApplyStore = struct {
                 // Release the bound scope before deleting its final decision
                 // receipt, in the same native writer transaction as this ACK.
                 try self.completeSqlLockReceiptTxn(a, txn, group, request, true);
+                if (request.operation == .advance and request.operation.advance.action == .handoff) {
+                    const record = try PreparedTransactions.readOperation(a, txn, group, request.operation.advance.owner.operation_id) orelse return error.InvalidCatalogRecord;
+                    if (record.hasPreparedLocks()) {
+                        const lease = try record.identity.preparedLockLease(a, group);
+                        const context: SqlLocks.Context = .{ .a = a, .actor = request.actor, .database = record.identity.database_id, .standalone = request.standalone, .maintenance = true, .prepared_operation = record.identity.operation_id };
+                        try SqlLocks.scopes.ledger.reclaimPrepared(a, txn, .{ .home = .metadata, .group = group, .incarnation = request.incarnation }, lease, record.identity.txn_id, context);
+                    }
+                }
                 try planned.apply(txn);
                 if (request.operation == .admit) if (request.operation.admit.identity.lock_scope) |ref| {
                     const identity = request.operation.admit.identity;
@@ -40820,6 +40891,7 @@ pub const RaftApplyStore = struct {
                     try SqlLocks.scopes.bindTransaction(a, txn, ns, ref.backend, ref.command, identity.txn_id, context);
                     try SqlLocks.scopes.seal(a, txn, ns, ref.backend, ref.command, .{ .operation = owner.operation_id, .admission = owner.admission_digest }, context);
                 };
+                try self.advancePreparedLocksTxn(a, txn, group, request);
                 try journal.append(a, ordinal, request.admission, hash, .{ .success = planned.result });
             },
         }
@@ -68791,4 +68863,228 @@ test "SQL command scope database holds survive cold snapshots and block rename a
             try std.testing.expectEqual(.retired, (try Helper.snapshot(&store, a, database, backend)).scope.?.state);
         }
     }
+}
+
+test "SQL prepared transaction named lock participant survives bounded cold handoff and resolution without its source" {
+    const L = @import("../../system_catalog/lock_authority.zig");
+    const T = SessionCommitRegistryFixture;
+    const P = T.P;
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Mode = enum { commit, abort_early, abort_incoming, abort_prepared, reject_mixed, reuse_source };
+    const frame: L.scopes.Command = .{ .sequence = 1, .nonce = @splat(3), .executor = @splat(4) };
+    const source: L.locks.Backend = .{ .incarnation = @splat(0x11), .id = @splat(2), .fence = 1 };
+    const contender: L.locks.Backend = .{ .incarnation = @splat(0x11), .id = @splat(8), .fence = 1 };
+    const Helper = struct {
+        fn read(store: *RaftApplyStore, backing: std.mem.Allocator, value: P.Identity) !P.Snapshot {
+            return std.json.parseFromSliceLeaky(P.Snapshot, backing, try store.sqlPreparedRead(backing, T.group, .{ .operation = value.operation_id }, .{ .setting_admin = true }), .{});
+        }
+        fn send(store: *RaftApplyStore, backing: std.mem.Allocator, request: P.Mutation) !void {
+            const predicted = try std.json.parseFromSliceLeaky(P.outcomes.Outcome, backing, try store.prepareSqlPreparedTransaction(backing, T.group, request), .{});
+            _ = try predicted.result();
+            const bytes = try std.json.Stringify.valueAlloc(backing, request, .{});
+            try store.applyStandaloneCommand(T.group, .{ .apply_sql_prepared_transaction = bytes });
+            try store.applyStandaloneCommand(T.group, .{ .apply_sql_prepared_transaction = bytes });
+            const result = (try std.json.parseFromSliceLeaky(?P.outcomes.Outcome, backing, try store.sqlPreparedOutcome(backing, T.group, request), .{})).?;
+            _ = try result.result();
+        }
+        fn change(store: *RaftApplyStore, backing: std.mem.Allocator, value: P.Identity, nonce: u8, action: P.Action) !void {
+            const cut = try read(store, backing, value);
+            const request: P.Mutation = .{ .admission = .{ .nonce = @splat(nonce), .head = cut.head }, .incarnation = cut.incarnation, .standalone = value.session.?.standalone, .database_id = value.database_id, .actor = .{ .session_user = .bootstrap, .credential = "" }, .operation = .{ .advance = .{ .owner = try value.owner(backing), .expected_revision = cut.records[0].revision, .action = action } } };
+            if (action == .lock_handoff or action == .lock_release) {
+                var read_txn = try store.store.beginReadTxn();
+                defer read_txn.abort();
+                const meta = try system_catalog_storage.readMeta(backing, &read_txn, T.group);
+                const quantum = try P.plan(backing, &read_txn, T.group, meta.revision, request);
+                try std.testing.expectEqual(@as(usize, 0), quantum.writes.len);
+                try std.testing.expectEqual(@as(usize, 0), quantum.deletes.len);
+            }
+            try send(store, backing, request);
+        }
+        fn scopeRead(store: *RaftApplyStore, backing: std.mem.Allocator, value: P.Identity, backend: L.locks.Backend, effect: ?L.scopes.ledger.Effect) !L.Snapshot {
+            return std.json.parseFromSliceLeaky(L.Snapshot, backing, try store.sqlLockRead(backing, T.group, .{ .incarnation = backend.incarnation, .standalone = value.session.?.standalone, .database = value.database_id, .actor = .{ .session_user = .bootstrap, .credential = "" }, .backend = backend, .effect = effect }, .{ .setting_admin = true }), .{});
+        }
+        fn scope(store: *RaftApplyStore, backing: std.mem.Allocator, value: P.Identity, backend: L.locks.Backend, nonce: u8, op: @FieldType(L.Request, "operation")) !void {
+            const cut = try scopeRead(store, backing, value, backend, null);
+            const request: L.Request = .{ .admission = .{ .nonce = @splat(nonce), .head = cut.head }, .incarnation = backend.incarnation, .standalone = value.session.?.standalone, .database = value.database_id, .actor = .{ .session_user = .bootstrap, .credential = "" }, .backend = backend, .operation = op };
+            try store.applyStandaloneCommand(T.group, .{ .apply_sql_lock_scope = try std.json.Stringify.valueAlloc(backing, request, .{}) });
+            _ = try (try std.json.parseFromSliceLeaky(?L.outcomes.Outcome, backing, try store.sqlLockOutcome(backing, T.group, request), .{})).?.result();
+        }
+        fn probe(store: *RaftApplyStore, backing: std.mem.Allocator, value: P.Identity, resource: u8, expected: L.scopes.ledger.Outcome, nonce: u8) !void {
+            const cut = try scopeRead(store, backing, value, contender, null);
+            const effect: L.scopes.ledger.Effect = .{ .backend = contender, .sequence = cut.owner.?.next_effect, .nonce = @splat(nonce), .action = .{ .try_acquire = .{ .resource = @splat(resource), .mode = .{ .advisory = .exclusive }, .scope = .session } } };
+            try scope(store, backing, value, contender, nonce, .{ .effect = .{ .command = frame, .effect = effect } });
+            const actual = try scopeRead(store, backing, value, contender, effect);
+            try std.testing.expectEqual(expected, actual.receipt.?.outcome);
+        }
+    };
+    for ([_]bool{ false, true }) |standalone| for ([_]Mode{ .commit, .abort_early, .abort_incoming, .abort_prepared, .reject_mixed, .reuse_source }) |mode| {
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/prepared-lock-{any}-{s}", .{ tmp.sub_path, standalone, @tagName(mode) });
+        var identity = try T.identity(a, .named, 93, "held-locks");
+        identity.session = .{ .owner_node_id = if (standalone) 0 else 9, .connection_id = @splat('a'), .standalone = standalone };
+        identity.lock_scope = .{ .backend = source, .command = frame };
+        const lease = try identity.preparedLockLease(a, T.group);
+        var rejected_admission: ?P.Mutation = null;
+        var decided = false;
+        var finished = false;
+        for (0..24) |pass| {
+            var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+            defer store.deinit();
+            if (pass == 0) {
+                try store.applyStandaloneCommand(T.group, .{ .initialize_metadata_incarnation = T.seed });
+                if (standalone) try store.replaceStandaloneCatalog(T.group, try store.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
+                try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = if (mode == .commit) topology_protocol.sql_prepared_lock_handoff_version - 1 else topology_protocol.current_version, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+                const registration: L.scopes.Registration = .{ .lease = .{ .backend = source, .database = 1, .node = identity.session.?.owner_node_id, .principal = try L.principalDigest(a, .bootstrap), .expires_at_ms = 1000 }, .connection = identity.session.?.connection_id.?, .nonce = @splat(5), .standalone = standalone };
+                try Helper.scope(&store, a, identity, source, 10, .{ .register = registration });
+                try Helper.scope(&store, a, identity, source, 11, .{ .begin = frame });
+                try Helper.scope(&store, a, identity, source, 12, .{ .bind = .{ .command = frame, .transaction = identity.txn_id } });
+                for (0..4) |i| try Helper.scope(&store, a, identity, source, @intCast(13 + i), .{ .effect = .{ .command = frame, .effect = .{ .backend = source, .sequence = i + 1, .nonce = @splat(@as(u8, @intCast(13 + i))), .action = .{ .try_acquire = .{ .resource = @splat(@as(u8, @intCast(20 + i))), .mode = .{ .advisory = .exclusive }, .scope = if (i == 3) .session else .{ .transaction = .{ .id = identity.txn_id, .subtransaction = 0 } } } } } } });
+                var other = registration;
+                other.lease.backend = contender;
+                other.connection = @splat('b');
+                other.nonce = @splat(8);
+                try Helper.scope(&store, a, identity, contender, 30, .{ .register = other });
+                try Helper.scope(&store, a, identity, contender, 31, .{ .begin = frame });
+                var admission = T.admission(identity);
+                admission.standalone = standalone;
+                admission.admission.head = (try Helper.read(&store, a, identity)).head;
+                if (mode == .commit) {
+                    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.prepareSqlPreparedTransaction(a, T.group, admission));
+                    try store.applyStandaloneCommand(T.group, .{ .apply_sql_prepared_transaction = try std.json.Stringify.valueAlloc(a, admission, .{}) });
+                    try std.testing.expectEqual(@as(usize, 0), (try Helper.read(&store, a, identity)).records.len);
+                    try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+                }
+                if (mode == .reject_mixed) {
+                    try Helper.scope(&store, a, identity, source, 29, .{ .effect = .{ .command = frame, .effect = .{ .backend = source, .sequence = 5, .nonce = @splat(29), .action = .{ .try_acquire = .{ .resource = @splat(20), .mode = .{ .advisory = .exclusive }, .scope = .session } } } } });
+                    admission.admission.head = (try Helper.read(&store, a, identity)).head;
+                    try std.testing.expectError(error.MixedAdvisoryPrepareUnsupported, Helper.send(&store, a, admission));
+                    try store.applyStandaloneCommand(T.group, .{ .apply_sql_prepared_transaction = try std.json.Stringify.valueAlloc(a, admission, .{}) });
+                    const rejected = (try std.json.parseFromSliceLeaky(?P.outcomes.Outcome, a, try store.sqlPreparedOutcome(a, T.group, admission), .{})).?;
+                    try std.testing.expectEqual(.MixedAdvisoryPrepareUnsupported, rejected.rejected);
+                    rejected_admission = admission;
+                    continue;
+                }
+                try Helper.send(&store, a, admission);
+                if (mode != .reuse_source) try Helper.scope(&store, a, identity, source, 32, .{ .fence = .{ .expired = .{ .expected_expiry = 1000, .observed_at_ms = 1001 } } });
+                if (mode == .abort_early) {
+                    try Helper.change(&store, a, identity, 33, .{ .abort = 30 });
+                    decided = true;
+                } else {
+                    try Helper.change(&store, a, identity, 33, .prepare);
+                    try std.testing.expectEqual(.locking, (try Helper.read(&store, a, identity)).records[0].phase);
+                    try std.testing.expectError(error.CatalogPublicationProofPending, Helper.change(&store, a, identity, 34, .prepare));
+                }
+                continue;
+            }
+            const before = try Helper.read(&store, a, identity);
+            if (mode == .reject_mixed) {
+                try std.testing.expectEqual(@as(usize, 0), before.records.len);
+                try std.testing.expectEqual(@as(usize, 0), before.receipts.len);
+                const scope = (try Helper.scopeRead(&store, a, identity, source, null)).scope.?;
+                if (scope.transaction != null) {
+                    try Helper.scope(&store, a, identity, source, @intCast(150 + pass), .{ .release_unadmitted = rejected_admission.? });
+                    continue;
+                }
+                try Helper.scope(&store, a, identity, source, 210, .{ .fence = .close });
+                for (0..8) |i| {
+                    if ((try Helper.scopeRead(&store, a, identity, source, null)).scope.?.state == .retired) break;
+                    try Helper.scope(&store, a, identity, source, @intCast(211 + i), .close_step);
+                }
+                try std.testing.expectEqual(.retired, (try Helper.scopeRead(&store, a, identity, source, null)).scope.?.state);
+                for (0..3) |i| try Helper.probe(&store, a, identity, @intCast(20 + i), .granted, @intCast(240 + i));
+                finished = true;
+                break;
+            }
+            const record = before.records[0];
+            const revision = (try store.systemCatalogMeta(a, T.group)).revision;
+            try std.testing.expectError(error.TableTransitionActive, store.validateSystemCatalog(T.group, .{ .expected_revision = revision, .mutation = .{ .action = .rename, .kind = .database, .name = "default", .new_name = "renamed_database" } }));
+            try std.testing.expectError(error.TableTransitionActive, store.validateSystemCatalog(T.group, .{ .expected_revision = revision, .mutation = .{ .action = .drop, .kind = .database, .name = "default" } }));
+            if (!decided) {
+                for (0..3) |i| try Helper.probe(&store, a, identity, @intCast(20 + i), .contended, @intCast(40 + pass * 4 + i));
+                if (record.phase == .locking) {
+                    try std.testing.expectEqual(@as(?P.Decision, null), record.decision);
+                    try std.testing.expect(P.recoveryDecision(record, std.math.maxInt(u64)) == null);
+                    try Helper.change(&store, a, identity, @intCast(150 + pass), .lock_handoff);
+                    if (mode == .abort_incoming and pass == 1) {
+                        try Helper.change(&store, a, identity, 199, .{ .abort = 30 });
+                        decided = true;
+                    }
+                    if (pass == 2) {
+                        const snapshot = try store.snapshotBuilder().buildSnapshot(a, T.group);
+                        var clone = try RaftApplyStore.init(alloc, .{ .root_dir = try std.fmt.allocPrint(a, "{s}-snapshot", .{root}) });
+                        defer clone.deinit();
+                        if (standalone) try clone.replaceStandaloneCatalog(T.group, try clone.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
+                        try RaftApplyStore.installSnapshotFromRaft(&clone, a, T.group, 10, snapshot);
+                        for (0..3) |i| try Helper.probe(&clone, a, identity, @intCast(20 + i), .contended, @intCast(240 + i));
+                    }
+                    continue;
+                }
+                try std.testing.expectEqual(.prepared, record.phase);
+                const origin = (try Helper.scopeRead(&store, a, identity, source, null)).scope.?;
+                try std.testing.expect(origin.transaction == null and origin.next_command > frame.sequence);
+                if (mode == .reuse_source) {
+                    const next: L.scopes.Command = .{ .sequence = 2, .nonce = @splat(8), .executor = @splat(9) };
+                    try Helper.scope(&store, a, identity, source, 226, .{ .begin = next });
+                    try Helper.scope(&store, a, identity, source, 227, .{ .bind = .{ .command = next, .transaction = @splat(94) } });
+                    // The prepared owner is distinct even to its old backend.
+                    for ([_]u8{ 20, 25 }, 0..) |resource, ordinal| {
+                        const current = try Helper.scopeRead(&store, a, identity, source, null);
+                        const effect: L.scopes.ledger.Effect = .{ .backend = source, .sequence = current.owner.?.next_effect, .nonce = @splat(@as(u8, @intCast(228 + ordinal))), .action = .{ .try_acquire = .{ .resource = @splat(resource), .mode = .{ .advisory = .exclusive }, .scope = .{ .transaction = .{ .id = @splat(94), .subtransaction = 0 } } } } };
+                        try Helper.scope(&store, a, identity, source, @intCast(228 + ordinal), .{ .effect = .{ .command = next, .effect = effect } });
+                        try std.testing.expectEqual(if (resource == 20) L.scopes.ledger.Outcome.contended else .granted, (try Helper.scopeRead(&store, a, identity, source, effect)).receipt.?.outcome);
+                    }
+                } else {
+                    for (0..6) |i| {
+                        if ((try Helper.scopeRead(&store, a, identity, source, null)).scope.?.state == .retired) break;
+                        try Helper.scope(&store, a, identity, source, @intCast(210 + i), .close_step);
+                    }
+                    try std.testing.expectEqual(.retired, (try Helper.scopeRead(&store, a, identity, source, null)).scope.?.state);
+                }
+                // Prepared locks belong to the independent native home even
+                // after the source has retired its session grants.
+                for (0..3) |i| try Helper.probe(&store, a, identity, @intCast(20 + i), .contended, @intCast(230 + i));
+                if (mode != .reuse_source) try Helper.probe(&store, a, identity, 23, .granted, 235);
+                try Helper.change(&store, a, identity, 220, if (mode == .commit or mode == .reuse_source) .{ .commit = .{ .version = 30 } } else .{ .abort = 30 });
+                decided = true;
+                continue;
+            }
+            try std.testing.expectEqual(.resolved, record.phase);
+            if (!record.locks_released) {
+                try std.testing.expectError(error.CatalogPublicationProofPending, Helper.change(&store, a, identity, @intCast(170 + pass), .handoff));
+                try Helper.change(&store, a, identity, @intCast(150 + pass), .lock_release);
+                continue;
+            }
+            for (0..3) |i| try Helper.probe(&store, a, identity, @intCast(20 + i), .granted, @intCast(240 + i));
+            {
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                if (try L.scopes.ledger.readOwner(a, &read, .{ .home = .metadata, .group = T.group, .incarnation = source.incarnation }, lease.backend)) |owner| try std.testing.expectEqual(.retired, owner.state);
+            }
+            try Helper.change(&store, a, identity, 250, .handoff);
+            try std.testing.expectEqual(@as(usize, 0), (try Helper.read(&store, a, identity)).records.len);
+            {
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectEqual(@as(?L.scopes.ledger.Owner, null), try L.scopes.ledger.readOwner(a, &read, .{ .home = .metadata, .group = T.group, .incarnation = source.incarnation }, lease.backend));
+            }
+            if (mode == .reuse_source) {
+                const current = try Helper.scopeRead(&store, a, identity, source, null);
+                try std.testing.expectEqual(@as(u64, 2), current.scope.?.next_command);
+                try std.testing.expectEqualDeep(L.scopes.Transaction{ .id = @splat(94) }, current.scope.?.transaction.?);
+                try std.testing.expectEqual(@as(u32, 2), current.owner.?.resources);
+                try std.testing.expectEqual(@as(u32, 1), current.owner.?.transaction_resources);
+                try std.testing.expectEqual(@as([16]u8, @splat(94)), current.owner.?.transaction.?);
+            }
+            // An old home command cannot recreate a reclaimed destination.
+            const old: P.Mutation = .{ .admission = .{ .nonce = @splat(251), .head = (try Helper.read(&store, a, identity)).head }, .incarnation = source.incarnation, .standalone = standalone, .database_id = 1, .actor = .{ .session_user = .bootstrap, .credential = "" }, .operation = .{ .advance = .{ .owner = try identity.owner(a), .expected_revision = record.revision, .action = .lock_handoff } } };
+            try std.testing.expectError(error.SqlPreparedTransactionNotFound, Helper.send(&store, a, old));
+            finished = true;
+            break;
+        }
+        try std.testing.expect(finished);
+    };
 }

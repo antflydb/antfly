@@ -106,6 +106,7 @@ pub const Rejection = enum {
     CatalogCommandTooLarge,
     TableTransitionActive,
     SqlDatabaseInUse,
+    MixedAdvisoryPrepareUnsupported,
     TableNotFound,
     InvalidTableDefinitionReplacement,
     ExternalTransactionDecisionChanged,

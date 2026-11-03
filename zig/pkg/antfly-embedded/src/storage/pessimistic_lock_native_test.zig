@@ -313,6 +313,7 @@ const scope_decision: scopes.DecisionRef = .{ .operation = @splat(7), .admission
 /// The production receiver must join the same checks to its external registry.
 const ScopeAuthority = struct {
     allowed: bool = true,
+    prepared: bool = false,
     pub fn requireRegistration(self: @This(), _: anytype, _: ledger.Namespace, value: scopes.Registration) !void {
         if (!self.allowed or !std.meta.eql(value, scope_registration)) return error.Forbidden;
     }
@@ -343,8 +344,15 @@ const ScopeAuthority = struct {
         try self.requireCommand(txn, namespace, value, scope_command);
         if (value.transaction != null) return error.LockOwnerBusy;
     }
-    pub fn requirePreparedHandoff(_: @This(), _: anytype, _: ledger.Namespace, _: scopes.Record, _: ledger.Lease, _: ledger.Lease, _: [16]u8) !void {
-        return error.Forbidden;
+    pub fn requirePreparedHandoff(self: @This(), txn: anytype, namespace: ledger.Namespace, value: scopes.Record, from: ledger.Lease, to: ledger.Lease, id: [16]u8) !void {
+        if (!self.prepared) return error.Forbidden;
+        try self.requireSeal(txn, namespace, value, scope_decision);
+        if (!std.mem.eql(u8, try txn.get("scope-test/preparing"), &transaction) or !std.meta.eql(from, value.registration.lease) or !std.meta.eql(to, try scopes.preparedLease(namespace, source.database, source.node, scope_decision)) or !std.mem.eql(u8, &id, &transaction)) return error.Forbidden;
+    }
+    pub fn requirePreparedResolution(self: @This(), txn: anytype, namespace: ledger.Namespace, lease: ledger.Lease, id: [16]u8) !void {
+        if (!self.prepared or !self.allowed or !std.meta.eql(lease, try scopes.preparedLease(namespace, source.database, source.node, scope_decision)) or !std.mem.eql(u8, &id, &transaction)) return error.Forbidden;
+        const proof = txn.get("scope-test/resolved") catch |err| return if (err == error.NotFound) error.LockOwnerBusy else err;
+        if (!std.mem.eql(u8, proof, &transaction)) return error.LockOwnerBusy;
     }
 };
 const scope_authority: ScopeAuthority = .{};
@@ -596,4 +604,169 @@ test "pessimistic locks native LSM active resolution wakes immediate work preser
     }
     // COMMIT releases transaction holdings, not an independent session ref.
     try std.testing.expectEqual(ledger.Outcome.contended, (try apply(&store, effect(destination, 1, 1), cb)).outcome);
+}
+
+test "pessimistic locks native LSM scoped prepared handoff and cleanup abort every partial write and retain cold independent ownership" {
+    const path = try pathFor("scoped-prepare-faults");
+    defer a.free(path);
+    defer cleanup(path);
+    const authority: ScopeAuthority = .{ .prepared = true };
+    const expected: scopes.Transaction = .{ .id = transaction, .decision = scope_decision };
+    const prepared_lease = try scopes.preparedLease(ns, source.database, source.node, scope_decision);
+    const Helper = struct {
+        fn hash(store: *DocStore) ![32]u8 {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var item = try cursor.seekAtOrAfter("");
+            var h = std.crypto.hash.Blake3.init(.{});
+            while (item) |pair| : (item = try cursor.next()) {
+                var lengths: [16]u8 = undefined;
+                std.mem.writeInt(u64, lengths[0..8], pair.key.len, .little);
+                std.mem.writeInt(u64, lengths[8..16], pair.value.len, .little);
+                h.update(&lengths);
+                h.update(pair.key);
+                h.update(pair.value);
+            }
+            var out: [32]u8 = undefined;
+            h.final(&out);
+            return out;
+        }
+    };
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    try registerScope(&store);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try scopes.bindTransaction(a, &txn, ns, source.backend, scope_command, transaction, authority);
+        for (1..4) |i| {
+            var acquire = effect(source, @intCast(i), @intCast(i));
+            if (i != 3) acquire.action.try_acquire.scope = .{ .transaction = .{ .id = transaction, .subtransaction = 0 } };
+            _ = try scopes.applyEffect(a, &txn, ns, source.backend, scope_command, acquire, authority);
+        }
+        try txn.put("scope-test/admission", &scope_decision.admission);
+        try txn.put("scope-test/preparing", &transaction);
+        try scopes.seal(a, &txn, ns, source.backend, scope_command, scope_decision, authority);
+        try txn.commit();
+    }
+    var transferred = false;
+    for (0..8) |_| {
+        const before = try Helper.hash(&store);
+        var reached_end = false;
+        for (0..32) |fail_after| {
+            var txn = try store.beginWriteTxn();
+            var fault: FaultTxn = .{ .txn = &txn, .remaining = fail_after };
+            const attempt = scopes.prepareStep(a, &fault, ns, source.backend, scope_command, expected, prepared_lease, authority);
+            var failure: ?anyerror = null;
+            if (attempt) |_| {
+                reached_end = true;
+            } else |err| failure = err;
+            txn.abort();
+            if (failure) |err| try std.testing.expectEqual(error.InjectedLockWriteFailure, err);
+            try std.testing.expectEqual(before, try Helper.hash(&store));
+            if (reached_end) {
+                try std.testing.expect(fail_after != 0);
+                break;
+            }
+        }
+        try std.testing.expect(reached_end);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            transferred = try scopes.prepareStep(a, &txn, ns, source.backend, scope_command, expected, prepared_lease, authority);
+            try txn.commit();
+        }
+        store.close();
+        store = try DocStore.open(a, path, .{});
+        if (transferred) break;
+    }
+    try std.testing.expect(transferred);
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        const owner = (try ledger.readOwner(a, &txn, ns, prepared_lease.backend)).?;
+        try std.testing.expectEqual(.prepared, owner.state);
+        try std.testing.expectEqual(@as(u32, 2), owner.resources);
+        try std.testing.expectEqual(@as(u32, 1), (try ledger.readOwner(a, &txn, ns, source.backend)).?.resources);
+        try std.testing.expectEqual(expected, (try scopes.read(a, &txn, ns, source.backend)).?.released_transaction.?);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.LockOwnerBusy, scopes.releasePreparedStep(a, &txn, ns, prepared_lease, transaction, authority));
+    }
+    // Retiring the source closes its remaining session grant, while the
+    // destination remains non-expiring and independently decision-owned.
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try scopes.fence(a, &txn, ns, source.backend, .close, authority);
+        try txn.commit();
+    }
+    for (0..6) |_| if (try closeScope(&store)) break;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put("scope-test/resolved", &transaction);
+        try txn.commit();
+    }
+    var released = false;
+    for (0..8) |_| {
+        const before = try Helper.hash(&store);
+        var reached_end = false;
+        for (0..32) |fail_after| {
+            var txn = try store.beginWriteTxn();
+            var fault: FaultTxn = .{ .txn = &txn, .remaining = fail_after };
+            const attempt = scopes.releasePreparedStep(a, &fault, ns, prepared_lease, transaction, authority);
+            var failure: ?anyerror = null;
+            if (attempt) |_| {
+                reached_end = true;
+            } else |err| failure = err;
+            txn.abort();
+            if (failure) |err| try std.testing.expectEqual(error.InjectedLockWriteFailure, err);
+            try std.testing.expectEqual(before, try Helper.hash(&store));
+            if (reached_end) {
+                try std.testing.expect(fail_after != 0);
+                break;
+            }
+        }
+        try std.testing.expect(reached_end);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            released = try scopes.releasePreparedStep(a, &txn, ns, prepared_lease, transaction, authority);
+            try txn.commit();
+        }
+        store.close();
+        store = try DocStore.open(a, path, .{});
+        if (released) break;
+    }
+    try std.testing.expect(released);
+    const before_reclaim = try Helper.hash(&store);
+    for (0..2) |fail_after| {
+        var txn = try store.beginWriteTxn();
+        var fault: FaultTxn = .{ .txn = &txn, .remaining = fail_after };
+        const attempt = ledger.reclaimPrepared(a, &fault, ns, prepared_lease, transaction, authority);
+        txn.abort();
+        try std.testing.expectError(error.InjectedLockWriteFailure, attempt);
+        try std.testing.expectEqual(before_reclaim, try Helper.hash(&store));
+    }
+    {
+        var pinned = try store.beginReadTxn();
+        defer pinned.abort();
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try ledger.reclaimPrepared(a, &txn, ns, prepared_lease, transaction, authority);
+        try txn.commit();
+        // Existing readers retain their immutable view across reclamation.
+        try std.testing.expectEqual(.retired, (try ledger.readOwner(a, &pinned, ns, prepared_lease.backend)).?.state);
+    }
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(?ledger.Owner, null), try ledger.readOwner(a, &txn, ns, prepared_lease.backend));
+    try std.testing.expectEqual(.retired, (try scopes.read(a, &txn, ns, source.backend)).?.state);
 }
