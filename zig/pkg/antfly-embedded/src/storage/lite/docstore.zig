@@ -5902,7 +5902,7 @@ test "lite group commit hands leadership to a bounded queued group" {
     try testQueuedMutationGroups(.normal);
 }
 
-test "lite group commit upgrades mixed lease groups to authored validation" {
+test "lite group commit keeps mixed queued lease and authored publications separate" {
     try testQueuedMutationGroups(.mixed);
 }
 
@@ -5916,8 +5916,10 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "queued-group-commit.aflite");
     defer alloc.free(path);
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .externally_locked = true, .reclamation = .{ .page_reuse = false, .enabled = false } });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .externally_locked = true, .reclamation = .{ .page_reuse = mode == .mixed, .enabled = false } });
     defer store.close();
+    const sequence = store.file.activeCheckpoint().commit_sequence;
+    const metadata = store.file.activeCheckpoint().logical.metadata;
     const Gate = struct {
         started: std.atomic.Value(bool) = .init(false),
         proceed: std.atomic.Value(bool) = .init(false),
@@ -5927,11 +5929,10 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
         gate: *Gate,
         id: usize,
         artifact_lease: bool,
-        lease_transaction: bool,
         result: anyerror!void = {},
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(self.lease_transaction, file.artifact_lease_transaction);
+            try std.testing.expectEqual(self.artifact_lease, file.artifact_lease_transaction);
             if (self.id == 0) {
                 self.gate.started.store(true, .release);
                 while (!self.gate.proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
@@ -5957,7 +5958,7 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
         for (threads[0..spawned]) |thread| thread.join();
     }
     for (&workers, 0..) |*worker, i| {
-        worker.* = .{ .store = &store, .gate = &gate, .id = i, .artifact_lease = i != 0 and (mode == .leases or (mode == .mixed and i % 2 == 1)), .lease_transaction = i != 0 and mode == .leases };
+        worker.* = .{ .store = &store, .gate = &gate, .id = i, .artifact_lease = i != 0 and (mode == .leases or (mode == .mixed and i % 2 == 1)) };
         threads[i] = try std.Thread.spawn(.{}, Worker.run, .{worker});
         spawned += 1;
         if (i == 0) while (!gate.started.load(.acquire)) @import("antfly_platform").time.yieldNow();
@@ -5987,7 +5988,13 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
     for (threads[0..spawned]) |thread| thread.join();
     spawned = 0;
     for (workers) |worker| try worker.result;
-    try std.testing.expectEqual(@as(u64, 2), store.file.activeCheckpoint().commit_sequence);
+    // Mixed requests were queued in alternating order. Each type boundary
+    // ends a group, while homogeneous queues still coalesce into one group.
+    const groups: u64 = if (mode == .mixed) workers.len else 2;
+    try std.testing.expectEqual(sequence + groups, store.file.activeCheckpoint().commit_sequence);
+    // Alias bookkeeping beside authored index writes must not change the
+    // logical metadata witness used by detached source publication.
+    try std.testing.expectEqualSlices(u8, &metadata, &store.file.activeCheckpoint().logical.metadata);
     for (0..workers.len) |i| {
         var buf: [32]u8 = undefined;
         const lease = i != 0 and (mode == .leases or (mode == .mixed and i % 2 == 1));
@@ -6000,6 +6007,7 @@ fn testQueuedMutationGroups(mode: enum { normal, mixed, leases }) !void {
         defer alloc.free(value);
         try std.testing.expectEqualStrings("committed", value);
     }
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
 test "lite failed commit group discards every root and allows a clean retry" {
