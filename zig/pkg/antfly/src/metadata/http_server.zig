@@ -2087,7 +2087,7 @@ pub const MetadataHttpServer = struct {
         // administrator. Never infer an admin grant from request JSON.
         const authority = @import("../system_catalog/setting_authority.zig");
         const admin_grant = parsed.value.requiresAdministrativeGrant();
-        const fk_publication_read = parsed.value == .fk_generation_publication_status or parsed.value == .fk_generation_publication_work or parsed.value == .fk_generation_publication_decision or parsed.value == .fk_generation_publication_source_decision or parsed.value == .fk_initial_create_prepare or parsed.value == .fk_initial_child_decision or parsed.value == .fk_initial_create_status or parsed.value == .fk_generation_table_locked or parsed.value == .fk_initial_create_work or parsed.value == .fk_initial_parent_decision;
+        const fk_publication_read = parsed.value == .sql_completion_ready or parsed.value == .sql_completion_reference or parsed.value == .fk_publication_completion or parsed.value == .fk_generation_publication_status or parsed.value == .fk_generation_publication_work or parsed.value == .fk_generation_publication_decision or parsed.value == .fk_generation_publication_source_decision or parsed.value == .fk_initial_create_prepare or parsed.value == .fk_initial_child_decision or parsed.value == .fk_initial_create_status or parsed.value == .fk_generation_table_locked or parsed.value == .fk_initial_create_work or parsed.value == .fk_initial_parent_decision;
         // The status stamp contains no principal or policy body, but it still
         // requires a real service token. In migration mode the host accepts
         // tokenless legacy internal calls; this operation must not use that
@@ -2116,7 +2116,7 @@ pub const MetadataHttpServer = struct {
         var context = systemCatalogRequestContext(ctx, forwarding.remaining_ms);
         context.setting_admin = admin_grant;
         context.row_policy_install_authority = parsed.value == .policy_install_snapshot or parsed.value == .policy_publication_status or parsed.value == .policy_publication_work or parsed.value == .policy_publication_mutate or parsed.value == .policy_publication_begin;
-        context.fk_generation_publication_authority = fk_publication_read or parsed.value == .fk_generation_publication_begin or parsed.value == .fk_generation_publication_mutate or parsed.value == .fk_initial_create_begin or parsed.value == .fk_initial_create_mutate;
+        context.fk_generation_publication_authority = fk_publication_read or parsed.value == .sql_completion_reference_mutate or parsed.value == .fk_generation_publication_begin or parsed.value == .fk_generation_publication_mutate or parsed.value == .fk_initial_create_begin or parsed.value == .fk_initial_create_mutate;
         const callback = self.source.vtable.system_catalog orelse return ctx.status(426).text("catalog upgrade required");
         const identity_reader = if (!parsed.value.isMutation())
             self.source.vtable.catalog_identity orelse return ctx.status(426).text("catalog identity upgrade required")
@@ -2125,8 +2125,14 @@ pub const MetadataHttpServer = struct {
         const read_identity = if (identity_reader) |read| read(self.source.ptr) catch |err|
             return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err)) else null;
         self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
+        var submitted = false;
+        context.sql_completion_submission = &submitted;
+        // Default to unknown before invoking an owner. Any later allocation
+        // failure must not preserve a stale not-proposed response header.
+        try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
+        if (parsed.value.isMutation() and !parsed.value.tracksSQLSubmission()) context.markSQLSubmission();
         const response = callback(self.source.ptr, ctx.allocator, context, parsed.value) catch |err| {
-            if (err == error.MetadataMutationOutcomeUnknown) try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
+            if (!submitted or err == error.MetadataMutationNotApplied) try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
             return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err));
         };
         defer ctx.allocator.free(response);
@@ -8373,4 +8379,43 @@ test "public execution routing budgets translate the ingress executor clock" {
     @import("../request_deadline.zig").tighten(&ctx, 50);
     try clock.advance(50 * std.time.ns_per_ms);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, MetadataHttpServer.applyRoutingBudget(&ctx));
+}
+
+test "SQL pgwire native metadata handler distinguishes preflight from accepted failures" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        mode: enum { preflight, accepted, not_applied } = .preflight,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn catalog(ptr: *anyopaque, _: std.mem.Allocator, context: operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const fixture: *@This() = @ptrCast(@alignCast(ptr));
+            if (fixture.mode != .preflight) context.markSQLSubmission();
+            if (fixture.mode == .not_applied) return error.MetadataMutationNotApplied;
+            return error.DeadlineExceeded;
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = MetadataHttpServer.init(a, .{}, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .admin_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.freeSnapshot, .system_catalog = Fixture.catalog } });
+    const body = try std.json.Stringify.valueAlloc(a, @import("../system_catalog/server_call.zig").Call{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "submission" } } }, .{});
+    defer a.free(body);
+    for ([_]@FieldType(Fixture, "mode"){ .preflight, .accepted, .not_applied }) |mode| {
+        fixture.mode = mode;
+        var request = try httpx.Request.init(a, .POST, "/internal/v1/system-catalog");
+        defer request.deinit();
+        try request.setBody(body);
+        try request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+        try request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+        try request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        var response = try server.metadataSystemCatalog(&context);
+        defer response.deinit();
+        try std.testing.expect(response.status.code >= 400);
+        try std.testing.expectEqualStrings(if (mode == .accepted) routes.Routes.raft_mutation_outcome_unknown else routes.Routes.raft_mutation_outcome_not_proposed, response.headers.get(routes.Routes.raft_mutation_outcome_header).?);
+    }
 }

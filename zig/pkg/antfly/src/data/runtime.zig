@@ -26390,6 +26390,7 @@ const RemoteMetadataSource = struct {
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
+                .tracks_sql_submission = true,
                 .supports_query_definitions = true,
                 .supports_resolver_catalog_read = true,
                 .supports_resolver_authority = true,
@@ -28188,7 +28189,7 @@ const RemoteMetadataSource = struct {
                     if (now >= deadline) return error.DeadlineExceeded;
                     bounded.remaining_ms = @intCast(@min(bounded.remaining_ms, @max(1, (deadline - now) / std.time.ns_per_ms)));
                 }
-                const bytes = try client.forwardSystemCatalog(base_uri, ctx.input, bounded, ctx.request.setting_admin);
+                const bytes = try client.forwardSystemCatalogObserved(base_uri, ctx.input, bounded, ctx.request.setting_admin, ctx.request.sql_completion_submission);
                 defer client.alloc.free(bytes);
                 return ctx.alloc.dupe(u8, bytes) catch return error.MetadataMutationOutcomeUnknown;
             }

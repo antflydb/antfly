@@ -1147,6 +1147,17 @@ pub const NamespaceBatch = struct {
     }
 };
 
+/// Coordination required by consumers that read and modify shared keys inside
+/// a write transaction. Gates are backend-owned and shared by all store views.
+pub const WriteSerialization = union(enum) {
+    unsupported,
+    /// Opening a write transaction acquires coordination retained until its
+    /// commit or abort. Serializing individual callbacks is insufficient.
+    intrinsic,
+    /// Callers hold this shared gate for the whole read/modify/write operation.
+    gate: *std.atomic.Mutex,
+};
+
 pub const Store = struct {
     allocator: Allocator,
     ptr: *anyopaque,
@@ -1156,6 +1167,11 @@ pub const Store = struct {
     /// The backend owns this gate and must outlive all stores/transactions.
     /// Reads and computation outside a write transaction remain concurrent.
     write_gate: ?*std.atomic.Mutex = null,
+    write_serialization: WriteSerialization = .unsupported,
+
+    pub fn writeSerialization(self: *const Store) WriteSerialization {
+        return if (self.write_gate != null) .intrinsic else self.write_serialization;
+    }
 
     pub const ReplayCallback = *const fn (*anyopaque, u64, []const u8) anyerror!void;
 
@@ -2428,6 +2444,12 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
     return .{
         .allocator = wrapper_box_allocator,
         .ptr = box_ptr,
+        .write_serialization = if (Handle == Store)
+            handle.writeSerialization()
+        else if (@hasDecl(Handle, "writeSerialization"))
+            box_ptr.handle.writeSerialization()
+        else
+            .unsupported,
         .vtable = &.{
             .deinit = vt.deinit,
             .capabilities = vt.capabilities,
