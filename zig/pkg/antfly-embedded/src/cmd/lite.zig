@@ -974,7 +974,7 @@ fn batchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
     var owned = try batch_api.parseBatchRequest(allocator, body);
     defer owned.deinit(allocator);
 
-    try db.batch(owned.req);
+    try db.batch(db_mod.types.fromPublicMutation(owned.req));
     return try batch_api.encodeBatchResponse(allocator, owned.result());
 }
 

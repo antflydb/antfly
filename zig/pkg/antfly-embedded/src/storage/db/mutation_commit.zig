@@ -3076,6 +3076,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             local_coverage_guard.release();
             if (opts.primary_committed) |committed| committed.* = true;
+            if (opts.prepared_commit_disposition) |disposition| disposition.markPrimaryCommitted();
             if (graph_publication) |*lease| lease.release();
             if (!transaction_applied.applied) {
                 // Recovery may have committed this participant before the
@@ -3281,13 +3282,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             generated_memo.reuse_stored_artifacts = if (opts.restore_staging) |admission| !admission.rewrite else false;
             defer generated_memo.deinit();
             while (true) {
-                self.batchInternalPrepared(req, profile, opts, &generated_memo, allocator_guard) catch |err| switch (err) {
-                    error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
-                        if (retry_count >= max_prepared_generation_retries) return err;
-                        retry_count += 1;
-                        continue;
-                    },
-                    else => return err,
+                var disposition: execution_resources.PreparedCommitDisposition = .{};
+                var attempt_options = opts;
+                attempt_options.prepared_commit_disposition = &disposition;
+                self.batchInternalPrepared(req, profile, attempt_options, &generated_memo, allocator_guard) catch |err| {
+                    if (!disposition.permitsPreparationRetry(err) or retry_count >= max_prepared_generation_retries) return err;
+                    retry_count += 1;
+                    continue;
                 };
                 // Completion errors happen after commit. Keep this outside the
                 // preparation retry handler so they cannot replay the user batch.

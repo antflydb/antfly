@@ -21,10 +21,18 @@ const Context = local.serverless_query_lake_read_context.Context;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const Callbacks = struct {
+    allocator: A,
+
     context: Context,
     cancellation: Cancellation,
     clock: c.values.Clock,
     lease: c.values.Lease,
+    fn headroom(raw: *const anyopaque) callconv(.c) c.memory.Value {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        var available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(self.allocator);
+        if (comptime @hasDecl(@import("root"), "lakeExecutionProbeHeadroom")) available = @import("root").lakeExecutionProbeHeadroom(available);
+        return .fromOptional(available);
+    }
     fn check(raw: *anyopaque) c.Outcome(void) {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.context.ensureActive() catch |err| return .{ .failure = .fromError(err) };
@@ -55,8 +63,8 @@ const Callbacks = struct {
 /// The returned operation owns no borrowed handles after this call returns.
 /// Publication authority remains with the caller throughout construction.
 pub fn build(a: A, io: std.Io, table: local.common_topology_records.TableRecord, source_options: c.SourceOptions, store: c.values.StoreDescriptor, context: Context, cancellation: Cancellation, clock: c.values.Clock, lease: c.values.Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, policy: c.values.BuildPolicy, build_limits: c.BuildLimits, artifact_cause: *?anyerror) ![]u8 {
-    var callbacks: Callbacks = .{ .context = context, .cancellation = cancellation, .clock = clock, .lease = lease };
-    var request: c.Request = .{ .allocator = a, .table = table, .source = source_options, .store = store, .io = c.native.IoBorrow.init(&io), .cancellation = cancellation, .control = .{ .ptr = &callbacks, .check = Callbacks.check, .now = Callbacks.now, .snapshot = Callbacks.snapshot, .save_checkpoint = Callbacks.save, .discard_checkpoint = Callbacks.discard }, .embedding_options = embedding_options, .policy = policy, .build_limits = build_limits };
+    var callbacks: Callbacks = .{ .allocator = a, .context = context, .cancellation = cancellation, .clock = clock, .lease = lease };
+    var request: c.Request = .{ .allocator = a, .allocator_headroom = .{ .context = &callbacks, .query = Callbacks.headroom }, .table = table, .source = source_options, .store = store, .io = c.native.IoBorrow.init(&io), .cancellation = cancellation, .control = .{ .ptr = &callbacks, .check = Callbacks.check, .now = Callbacks.now, .snapshot = Callbacks.snapshot, .save_checkpoint = Callbacks.save, .discard_checkpoint = Callbacks.discard }, .embedding_options = embedding_options, .policy = policy, .build_limits = build_limits };
     // Clients/caches embed the creator's executor and cannot cross error domains.
     // Only the checked AntflyProvider and secret-store capabilities are borrowed.
     if (request.embedding_options) |*options| {

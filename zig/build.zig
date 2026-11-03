@@ -256,6 +256,7 @@ pub fn create(b: *std.Build) ?Artifacts {
 
     production_antfly_imports = @import("build_support/antfly/dependencies.zig").finalizeMediaClients(b, production_antfly_imports);
     @import("pkg/antfly/build/lake_execution_tests.zig").add(b, target, optimize, antfly_imports, vopr_mod, lmdb_engine_mod);
+    @import("pkg/antfly/build/read_session_tests.zig").add(b, target, optimize, antfly_imports, vopr_mod, lmdb_engine_mod);
 
     // The public package has the same storage boundary as the linked server:
     // LMDB is retained only by explicitly configured test/benchmark modules.

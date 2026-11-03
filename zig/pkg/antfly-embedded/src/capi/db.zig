@@ -4718,7 +4718,7 @@ pub fn antfly_db_batch_json(
     var owned = batch_api.parseBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
 
-    handle.database().*.batch(owned.req) catch |err| return if (err == error.CommitVisibilityNotSatisfied)
+    handle.database().*.batch(db_mod.types.fromPublicMutation(owned.req)) catch |err| return if (err == error.CommitVisibilityNotSatisfied)
         capi.mapErrorContext(err, "batch primary write committed; derived visibility is pending; do not retry the batch")
     else
         capi.mapError(err);

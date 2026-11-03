@@ -133,7 +133,7 @@ test "opaque owner retained relational read crosses checked archive boundary" {
 
 test "opaque owner conditional writes retain version and digest fences" {
     const alloc = std.testing.allocator;
-    const batch = @import("antfly_local_sources").api_batch;
+    const batch = @import("antfly_local_sources").api_internal_batch;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
@@ -435,7 +435,7 @@ test "opaque owner source artifact transfer resumes across replicas without dono
     const alloc = std.testing.allocator;
     const transfer = @import("antfly_local_sources").storage_db_source_artifact_transfer;
     const contract = @import("antfly_local_sources").api_local_query_contract;
-    const batch = @import("antfly_local_sources").api_batch;
+    const batch = @import("antfly_local_sources").api_internal_batch;
     const source = @import("antfly_local_sources").storage_db_online_source_contract;
     const Call = struct {
         fn transport(ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, request: transfer.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
@@ -635,7 +635,7 @@ test "opaque owner source artifact transfer resumes across replicas without dono
 test "opaque owner online source controls and status survive compiled boundary restart" {
     const alloc = std.testing.allocator;
     const contract = @import("antfly_local_sources").api_local_query_contract;
-    const batch = @import("antfly_local_sources").api_batch;
+    const batch = @import("antfly_local_sources").api_internal_batch;
     const source = @import("antfly_local_sources").storage_db_online_source_contract;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1021,7 +1021,7 @@ test "opaque portable and native restore preserve bounded range through captured
     const handoff = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
     const transition = @import("antfly_local_sources").storage_db_relational_transition_contract;
     const seal = @import("antfly_local_sources").storage_db_native_backup_seal_contract;
-    const batch_wire = @import("antfly_local_sources").api_batch;
+    const batch_wire = @import("antfly_local_sources").api_internal_batch;
     const Driver = struct {
         owner: *client.Owner,
         index: u64 = 0,

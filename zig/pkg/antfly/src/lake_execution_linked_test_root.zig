@@ -17,5 +17,7 @@
 pub const antfly_sources = @import("source_owner_physical.zig");
 test {
     _ = @import("api/lake_execution_native_test.zig");
+    _ = @import("api/lake_execution_memory_test.zig");
+    _ = @import("api/lake_execution_s3_test.zig");
     _ = @import("api/lake_execution_errors.zig");
 }

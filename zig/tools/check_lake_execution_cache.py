@@ -185,7 +185,7 @@ def main():
                 path = changed[phase]
                 source = path.read_text()
                 marker = (
-                    'return .of("antfly_lake_execute_v2", Function, Request, Response);'
+                    'return .of("antfly_lake_execute_v3", Function, Request, Response);'
                 )
                 if source.count(marker) != 1:
                     raise RuntimeError("contract probe marker changed")
@@ -193,7 +193,7 @@ def main():
                     source.replace(
                         marker,
                         marker.replace(
-                            "antfly_lake_execute_v2",
+                            "antfly_lake_execute_v3",
                             "antfly_lake_execute_cache_probe_v1",
                         ),
                     )

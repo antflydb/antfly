@@ -665,7 +665,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    test_imports.configure(b, restore_owner_test_mod, true, true);
+    var restore_source_imports = test_imports;
+    restore_source_imports.runtime = @import("lake_execution_tests.zig").sourceImports(b, antfly_imports);
+    restore_source_imports.configure(b, restore_owner_test_mod, true, true);
     const restore_owner_tests = b.addTest(.{
         .root_module = restore_owner_test_mod,
         .filters = &.{ "restore owner verified decoder", "restore decoder", "relational integrity portable decoder resumes bounded row pages across LSM reopen", "mapped restore admission" },
@@ -5925,6 +5927,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     transcribing_db_test_stub_mod.addImport("httpx", httpx_mod);
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
     db_test_mod.addImport("vopr", vopr_mod);
+
+    const opaque_read_session_step = b.step("opaque-read-session-test", "Run source and independently compiled statement and read-session lifetime regressions");
+    if (b.top_level_steps.get("opaque-read-session-abi-integration-test")) |integration|
+        opaque_read_session_step.dependOn(&integration.step);
+
+    const mutation_resource_frame_tests = b.addTest(.{
+        .name = "mutation-resource-frame-tests",
+        .root_module = db_test_mod,
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("mutation-resource-frame-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024),
+        .filters = &.{"prepared commit disposition"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("mutation-resource-frame-test", "Verify committed disposition, partial preparation cleanup and durable replay")
+        .dependOn(&addFilteredTestRunArtifact(b, mutation_resource_frame_tests).step);
 
     const db_split_workload_default_filters = [_][]const u8{
         "db split sim default workload stays green",

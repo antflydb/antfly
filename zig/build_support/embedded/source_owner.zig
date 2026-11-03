@@ -33,6 +33,7 @@ pub fn cloneModule(b: *std.Build, original: *std.Build.Module) *std.Build.Module
     copy.link_objects = original.link_objects.clone(b.allocator) catch @panic("OOM");
     copy.cached_graph = .{ .modules = &.{}, .names = &.{} };
     if (isStorageIndependent(original)) registerStorageIndependent(copy);
+    if (isReadSessionProvider(original)) registerReadSessionProvider(copy);
     return copy;
 }
 
@@ -123,6 +124,9 @@ pub fn finalize(b: *std.Build) void {
         binding.local.link_libc = binding.consumer.link_libc;
     }
     @import("../antfly/test_partitions.zig").add(b);
+    // A Module can feed production and builtin.is_test compilations. Fork only
+    // affected graphs, after every late storage owner option has been applied.
+    finalizeReadSessionModules(b);
     // Static consumers compile with unresolved engine calls. Provider code is
     // a final-link input, never a prerequisite for their LLVM object emission.
     if (storage_provider) |provider| {
@@ -232,4 +236,196 @@ pub fn forkContext(original: *std.Build.Module, consumer: *std.Build.Module) voi
         if (root == local) consumer.addImport("antfly_source_root", copied);
     }
     adopt(consumer);
+}
+
+var read_session_providers: std.ArrayList(*std.Build.Module) = .empty;
+
+/// A fixture's provider module shares its importing consumer's canonical types.
+/// Registration is explicit and survives source-owner graph cloning.
+pub fn registerReadSessionProvider(module: *std.Build.Module) void {
+    if (isReadSessionProvider(module)) return;
+    read_session_providers.append(module.owner.allocator, module) catch @panic("OOM");
+}
+
+fn isReadSessionProvider(module: *std.Build.Module) bool {
+    for (read_session_providers.items) |item| if (item == module) return true;
+    return false;
+}
+
+const session_backend_key = "read_session_backend";
+const session_types_key = "read_session_types";
+
+/// Inert graph markers carry no physical file imports. Their final profile is
+/// selected per Compile step; configureBase runs too early to select an owner.
+pub fn configureReadSessionModules(module: *std.Build.Module) void {
+    if (module.import_table.contains(session_backend_key)) return;
+    const b = module.owner;
+    const file = b.addWriteFiles().add("read_session_unbound.zig", "pub const unbound = true;\n");
+    module.addImport(session_backend_key, b.createModule(.{ .root_source_file = file, .target = module.resolved_target, .optimize = module.optimize }));
+    module.addImport(session_types_key, b.createModule(.{ .root_source_file = file, .target = module.resolved_target, .optimize = module.optimize }));
+}
+
+const SessionCompileVisit = struct {
+    root: *std.Build.Module,
+    testing: bool,
+    engine_options: ?*std.Build.Module,
+    source_options: ?*std.Build.Module,
+};
+var session_compile_roots: std.AutoHashMapUnmanaged(SessionCompileVisit, *std.Build.Module) = .empty;
+const SessionBackend = struct {
+    backend: *std.Build.Module,
+    types: *std.Build.Module,
+    source_types: ?*std.Build.Module,
+    canonical: *std.Build.Module,
+    source: bool,
+};
+var session_backends: std.ArrayList(SessionBackend) = .empty;
+
+fn knownSessionBackend(module: *std.Build.Module) ?SessionBackend {
+    for (session_backends.items) |item| if (item.backend == module) return item;
+    return null;
+}
+
+fn canonicalSessionRoot(module: *std.Build.Module) *std.Build.Module {
+    // Server files belong to their existing local source catalog. Embedded
+    // roots own their files directly and expose antfly_sources aliases there.
+    return module.import_table.get("antfly_local_sources") orelse
+        module.import_table.get("antfly_source_root") orelse module;
+}
+
+fn sessionTypesBridge(module: *std.Build.Module, canonical: *std.Build.Module, source: bool) *std.Build.Module {
+    const b = module.owner;
+    const alias = if (source) "read_session_source_types" else "read_session_types";
+    const catalog_alias = if (source) "storage_read_session_source_types" else "storage_read_session_types";
+    const text = b.fmt("const root = @import(\"read_session_types_root\");\npub const types = if (@hasDecl(root, \"{s}\")) root.{s} else root.antfly_sources.{s};\n", .{ catalog_alias, catalog_alias, alias });
+    const root = b.addWriteFiles().add(b.fmt("{s}_bridge.zig", .{alias}), text);
+    const bridge = b.createModule(.{ .root_source_file = root, .target = canonical.resolved_target, .optimize = canonical.optimize });
+    bridge.addImport("read_session_types_root", canonical);
+    return bridge;
+}
+
+fn createSessionBackend(module: *std.Build.Module, canonical: *std.Build.Module, source: bool) SessionBackend {
+    const b = module.owner;
+    const backend = b.createModule(.{
+        .root_source_file = b.path(if (source) "pkg/antfly-embedded/src/storage/read_session_source.zig" else "pkg/antfly-embedded/src/storage/read_session_client.zig"),
+        .target = canonical.resolved_target,
+        .optimize = canonical.optimize,
+    });
+    const types = sessionTypesBridge(module, canonical, false);
+    backend.addImport(session_types_key, types);
+    const source_types = if (source) sessionTypesBridge(module, canonical, true) else null;
+    if (source_types) |physical| backend.addImport("read_session_source_types", physical);
+    return .{ .backend = backend, .types = types, .source_types = source_types, .canonical = canonical, .source = source };
+}
+
+const SessionContext = struct { canonical: *std.Build.Module, source: bool };
+const SessionGraph = struct {
+    b: *std.Build,
+    testing: bool,
+    visited: std.AutoHashMapUnmanaged(*std.Build.Module, SessionContext) = .empty,
+    replacements: std.ArrayList(@import("../module_rewrite.zig").Replacement) = .empty,
+    backends: std.ArrayList(SessionBackend) = .empty,
+
+    fn replacement(self: *@This(), old: *std.Build.Module, target: *std.Build.Module) void {
+        if (old == target) return;
+        for (self.replacements.items) |item| if (item.source == old) {
+            if (item.target != target) @panic("read session module shared by incompatible source ownership contexts");
+            return;
+        };
+        self.replacements.append(self.b.allocator, .{ .source = old, .target = target }) catch @panic("OOM");
+    }
+
+    fn backend(self: *@This(), module: *std.Build.Module, context: SessionContext) SessionBackend {
+        for (self.backends.items) |item| if (item.canonical == context.canonical and item.source == context.source) return item;
+        const item = createSessionBackend(module, context.canonical, context.source);
+        self.backends.append(self.b.allocator, item) catch @panic("OOM");
+        return item;
+    }
+
+    fn collect(self: *@This(), module: *std.Build.Module, inherited: ?SessionContext) void {
+        if (isStorageIndependent(module)) return;
+        const configured = module.import_table.contains("storage_engine_options");
+        const provider = isReadSessionProvider(module);
+        const context: ?SessionContext = if (configured)
+            .{ .canonical = canonicalSessionRoot(module), .source = self.testing or !usesSharedStorageEngine(module) }
+        else if (provider)
+            inherited
+        else
+            null;
+        if (context) |selected| {
+            if (self.visited.get(module)) |previous| {
+                if (previous.canonical != selected.canonical or previous.source != selected.source)
+                    @panic("read session provider reused by incompatible source catalogs");
+                return;
+            }
+            self.visited.put(self.b.allocator, module, selected) catch @panic("OOM");
+            configureReadSessionModules(module);
+            const old_backend = module.import_table.get(session_backend_key).?;
+            const current = knownSessionBackend(old_backend);
+            if (current == null or current.?.canonical != selected.canonical or current.?.source != selected.source) {
+                const chosen = self.backend(module, selected);
+                self.replacement(old_backend, chosen.backend);
+                self.replacement(module.import_table.get(session_types_key).?, chosen.types);
+            }
+        } else {
+            // Unconfigured contract/library modules still lead to configured
+            // consumers. Remember them without interpreting any engine policy.
+            if (self.visited.contains(module)) return;
+            self.visited.put(self.b.allocator, module, .{ .canonical = module, .source = false }) catch @panic("OOM");
+        }
+        var imports = module.import_table.iterator();
+        while (imports.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, session_backend_key) or
+                std.mem.eql(u8, entry.key_ptr.*, session_types_key)) continue;
+            self.collect(entry.value_ptr.*, context orelse inherited);
+        }
+    }
+};
+
+fn trackSessionCopy(original: *std.Build.Module, copy: *std.Build.Module) void {
+    if (isStorageIndependent(original)) registerStorageIndependent(copy);
+    if (isReadSessionProvider(original)) registerReadSessionProvider(copy);
+    adopt(copy);
+}
+
+fn bindSessionCompile(b: *std.Build, artifact: *std.Build.Step.Compile) void {
+    if (isStorageIndependent(artifact.root_module)) return;
+    const root = artifact.root_module;
+    const key: SessionCompileVisit = .{
+        .root = root,
+        .testing = artifact.kind.isTest(),
+        .engine_options = root.import_table.get("storage_engine_options"),
+        .source_options = root.import_table.get("storage_source_options"),
+    };
+    if (session_compile_roots.get(key)) |bound| {
+        artifact.root_module = bound;
+        return;
+    }
+    var graph: SessionGraph = .{ .b = b, .testing = key.testing };
+    graph.collect(root, null);
+    if (graph.replacements.items.len == 0) {
+        session_compile_roots.put(b.allocator, key, root) catch @panic("OOM");
+        return;
+    }
+    var rewrite: @import("../module_rewrite.zig").Rewriter = .{ .b = b, .replacements = graph.replacements.items, .on_copy = trackSessionCopy };
+    artifact.root_module = rewrite.rewrite(root);
+    for (graph.backends.items) |item| {
+        var bound = item;
+        bound.canonical = rewrite.copies.get(item.canonical) orelse item.canonical;
+        bound.types.addImport("read_session_types_root", bound.canonical);
+        if (bound.source_types) |physical| physical.addImport("read_session_types_root", bound.canonical);
+        session_backends.append(b.allocator, bound) catch @panic("OOM");
+    }
+    session_compile_roots.put(b.allocator, key, artifact.root_module) catch @panic("OOM");
+}
+
+fn visitSessionCompiles(b: *std.Build, step: *std.Build.Step, seen: *std.AutoHashMap(*std.Build.Step, void)) void {
+    if ((seen.getOrPut(step) catch @panic("OOM")).found_existing) return;
+    if (step.cast(std.Build.Step.Compile)) |artifact| bindSessionCompile(b, artifact);
+    for (step.dependencies.items) |dependency| visitSessionCompiles(b, dependency, seen);
+}
+
+fn finalizeReadSessionModules(b: *std.Build) void {
+    var seen: std.AutoHashMap(*std.Build.Step, void) = .init(b.allocator);
+    for (b.top_level_steps.values()) |root| visitSessionCompiles(b, &root.step, &seen);
 }

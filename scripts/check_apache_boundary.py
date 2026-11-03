@@ -68,6 +68,18 @@ SOURCE_MODULES = {
     "storage_ordinals": ("zig/pkg/antfly-embedded/src/storage/ordinals/root.zig",),
     "storage_ordinal_options": (),
     "storage_engine_options": (),
+    "read_session_backend": (
+        "zig/pkg/antfly-embedded/src/storage/read_session_source.zig",
+        "zig/pkg/antfly-embedded/src/storage/read_session_client.zig",
+    ),
+    # Generated bridges expose these exact checked-in value namespaces from
+    # the consumer's existing source catalog. Audit both backend profiles.
+    "read_session_types": (
+        "zig/pkg/antfly-embedded/src/storage/read_session_types.zig",
+    ),
+    "read_session_source_types": (
+        "zig/pkg/antfly-embedded/src/storage/read_session_source_types.zig",
+    ),
     "storage_engine_errors": ("zig/pkg/inference/src/host/engine_errors.zig",),
     "antfly_apple_native": ("zig/lib/apple_native/src/mod.zig",),
     "root": tuple(SOURCE_ROOT + name for name in ENTRYPOINTS) + PACKAGE_ENTRYPOINTS,

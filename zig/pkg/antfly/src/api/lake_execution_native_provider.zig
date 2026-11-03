@@ -21,6 +21,16 @@ const c = @import("lake_execution_native_contract.zig");
 const Store = @import("lake_index_store.zig").Store;
 const Context = local.serverless_query_lake_read_context.Context;
 const A = std.mem.Allocator;
+// Only the independently compiled qualification archive supplies this hook.
+// Production roots compile these inline helpers away entirely.
+inline fn probeNow() u64 {
+    if (comptime @hasDecl(@import("root"), "lakeExecutionProbeStage")) return @import("antfly_platform").time.monotonicNs();
+    return 0;
+}
+inline fn probeStage(comptime name: []const u8, started: u64) void {
+    if (comptime @hasDecl(@import("root"), "lakeExecutionProbeStage")) @import("root").lakeExecutionProbeStage(name, probeNow() - started);
+}
+
 const Callbacks = struct {
     host: c.Control,
     lock: std.atomic.Mutex = .unlocked,
@@ -66,11 +76,13 @@ fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, cause: *c.Fail
     const context: Context = .{ .io = io, .checkpoint = .{ .ptr = callbacks, .check = Callbacks.check } };
     try context.ensureActive();
     try request.cancellation.check();
+    const store_started = probeNow();
     var store = if (request.store.config) |config|
         try Store.openRetainedNative(a, config, request.store.secrets, request.store.locator, false, request.store.deployment, request.store.local_base_dir)
     else
         try Store.openNative(a, null, request.store.secrets, false, request.store.deployment, request.store.local_base_dir);
     defer store.deinit();
+    probeStage("store_open_ns", store_started);
     if (store.locator.protocol != request.store.locator.protocol or store.locator.tls != request.store.locator.tls or
         !std.mem.eql(u8, store.locator.root, request.store.locator.root) or !std.mem.eql(u8, store.locator.bucket, request.store.locator.bucket) or
         !std.mem.eql(u8, store.locator.prefix, request.store.locator.prefix)) return error.NativeArtifactStoreLocationChanged;
@@ -80,8 +92,17 @@ fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, cause: *c.Fail
     source_options.read_only = true;
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, request.table.schema_json)) orelse return error.InvalidExternalTableBinding;
     defer binding.deinit(a);
-    var source = try local.serverless_query_lake_serving.ServingSource.openWithContext(a, .{ .storage_mode = .relational, .external_base_source = binding }, source_options.lakeOptions(), context);
+    // Each writer family revisits source metadata and ranges. Keep reuse in
+    // this operation's owner, charged to its existing working-set quota. No
+    // persistent cache or borrowed caller I/O survives this synchronous call.
+    var read_cache = local.serverless_query_lake_serving_cache.Cache.initWithMemoryLimit(a, @min(64 * 1024 * 1024, request.build_limits.max_working_set_bytes / 8));
+    defer read_cache.deinit();
+    defer if (comptime @hasDecl(@import("root"), "lakeExecutionProbeCache")) @import("root").lakeExecutionProbeCache(read_cache.snapshot(), &read_cache);
+    const source_started = probeNow();
+    var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = binding }, source_options.lakeOptions(), context, &read_cache);
     defer source.deinit();
+    try source.attachCache(&read_cache, binding.binding, context);
+    probeStage("source_open_ns", source_started);
     const Embedder = local.inference_managed_embedder;
     var runtime = Embedder.ProviderRuntime.init(a, io);
     defer runtime.deinit();
@@ -93,6 +114,8 @@ fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, cause: *c.Fail
     }
     var artifact_reads = @import("lake_index_artifact_recovery.zig").Reads.init(store.artifactStore());
     var handle = artifact_reads.store();
+    const physical_started = probeNow();
+    defer probeStage("physical_ns", physical_started);
     return @import("lake_execution_build_impl.zig").buildWithReuse(a, &handle, request.table, &source, store.identity, context, request.cancellation, .{ .ptr = callbacks, .now_ms = Callbacks.now }, .{ .ptr = callbacks, .snapshot = Callbacks.snapshot, .save_checkpoint = Callbacks.save, .discard_checkpoint = Callbacks.discard }, embedding_options, .{ .store = &store, .table_id = request.table.table_id, .recipe = local.metadata_lake_index_catalog.desiredFingerprint(request.table), .context = context }, request.policy) catch |err| {
         if (artifact_reads.cause()) |artifact_error| cause.* = .fromError(artifact_error);
         return err;
@@ -100,12 +123,14 @@ fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, cause: *c.Fail
 }
 pub fn execute(request: c.Request) c.Response {
     var callbacks: Callbacks = .{ .host = request.control };
+    var backing = c.memory.BorrowedAllocator.init(request.allocator, request.allocator_headroom) catch |err| return .{ .failure = .fromError(err) };
     var receiver = request.io.receive() catch |err| return .{ .failure = .fromError(err) };
     var cause: c.Failure = .{};
     // Headroom/admission inspects allocator identity. Keep the quota in this
     // owner instead of asking physical writers to interpret a foreign quota.
-    var working = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(request.allocator, request.build_limits) catch |err| return .{ .failure = .fromError(err) };
+    var working = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(backing.allocator(), request.build_limits) catch |err| return .{ .failure = .fromError(err) };
     defer working.deinit();
+    defer if (comptime @hasDecl(@import("root"), "lakeExecutionProbeQuota")) @import("root").lakeExecutionProbeQuota(working.quota.peak_bytes);
     var local_request = request;
     local_request.allocator = working.allocator();
     const bytes = attempt(local_request, &callbacks, receiver.io(), &cause) catch |err| {
@@ -134,5 +159,5 @@ fn get() callconv(.c) *const c.Endpoint {
     return &endpoint;
 }
 pub fn exportOperations() void {
-    @export(&get, .{ .name = "antfly_lake_execute_v2", .visibility = .hidden });
+    @export(&get, .{ .name = "antfly_lake_execute_v3", .visibility = .hidden });
 }

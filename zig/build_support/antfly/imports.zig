@@ -485,6 +485,9 @@ pub const AntflyRootImports = struct {
         mod.addImport("sql_parser", self.sql_parser);
         mod.addImport("antfly_decisions", self.decisions);
         self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
+        // Source/client selection belongs to the final Compile context, after
+        // native_storage has applied its implementation-owner override.
+        @import("../embedded/source_owner.zig").configureReadSessionModules(mod);
         mod.addOptions("build_options", self.build_options);
         mod.addImport("lake_execution_options", self.lake_execution_options);
         const lake_backend = mod.owner.createModule(.{ .root_source_file = mod.owner.path("pkg/antfly/src/api/lake_execution_backend.zig"), .target = mod.resolved_target, .optimize = mod.optimize });

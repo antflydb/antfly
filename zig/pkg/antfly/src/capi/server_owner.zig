@@ -34,7 +34,7 @@ pub const aggregations_mod = handles.aggregations_mod;
 pub const search_agg_mod = handles.search_agg_mod;
 pub const geo_mod = handles.geo_mod;
 pub const lite_backend = handles.lite_backend;
-pub const batch_api = handles.batch_api;
+pub const batch_api = antfly.capi_dependencies.api_internal_batch;
 pub const query_api = handles.query_api;
 pub const tables_api = handles.tables_api;
 pub const table_reads_api = handles.table_reads_api;
@@ -5340,21 +5340,7 @@ pub const StorageRelationalRead = struct {
 
     pub fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !View.Page {
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
-        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
-        errdefer page.deinit();
-        const owned = page.arena.allocator();
-        const rows = try owned.alloc(View.Row, page.rows.len);
-        for (page.rows, rows) |row, *out| out.* = .{
-            .id = row.key,
-            .version = row.version,
-            .schema_version = session.reader.active.version(),
-            .value = row.typed orelse .null,
-            .typed_cells = row.typed_cells,
-            .sql_nulls = row.sql_nulls,
-            .expected_content_digest = row.expected_content_digest,
-        };
-        const after = if (page.more) try owned.dupe(u8, session.reader.after.items) else null;
-        return .{ .arena = page.arena, .rows = rows, .after = after };
+        return session.nextViewPage(alloc, limit);
     }
 
     pub fn close(ptr: *anyopaque) void {
@@ -6418,7 +6404,7 @@ pub fn storageOwnerRestoreControlJson(owner_ptr: ?*anyopaque, request: *const ke
             var scoped = batch;
             scoped.restore_staging_scope = self.scope;
             scoped.restore_staging_plan_id = self.plan_id;
-            self.batch_json = try antfly.capi_dependencies.api_batch.encodeBatchRequest(self.alloc, scoped);
+            self.batch_json = try antfly.capi_dependencies.api_internal_batch.encodeBatchRequest(self.alloc, scoped);
         }
     };
     var capture: Capture = .{ .alloc = handle.alloc, .scope = input.value.scope.digest(), .plan_id = input.value.scope.plan_id };

@@ -56,39 +56,10 @@ pub const GeoShapeRelation = enum {
     contains,
 };
 
-pub const SyncLevel = enum {
-    propose,
-    write,
-    full_text,
-    enrichments,
-    full_index,
-};
-
-pub fn parsePublicSyncLevelText(text: []const u8) ?SyncLevel {
-    if (std.mem.eql(u8, text, "propose")) return .propose;
-    if (std.mem.eql(u8, text, "write")) return .write;
-    if (std.mem.eql(u8, text, "full_text")) return .full_text;
-    if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, text, "full_index")) return .full_index;
-    return null;
-}
-
-pub fn parsePublicSyncLevelJson(value: std.json.Value) ?SyncLevel {
-    return switch (value) {
-        .string => |text| parsePublicSyncLevelText(text),
-        else => null,
-    };
-}
-
-pub fn publicSyncLevelText(level: SyncLevel) []const u8 {
-    return switch (level) {
-        .propose => "propose",
-        .write => "write",
-        .full_text => "full_text",
-        .enrichments => "enrichments",
-        .full_index => "full_index",
-    };
-}
+pub const SyncLevel = @import("mutation_values.zig").SyncLevel;
+pub const parsePublicSyncLevelText = @import("mutation_values.zig").parsePublicSyncLevelText;
+pub const parsePublicSyncLevelJson = @import("mutation_values.zig").parsePublicSyncLevelJson;
+pub const publicSyncLevelText = @import("mutation_values.zig").publicSyncLevelText;
 
 test "public sync level text accepts full_index and rejects removed aknn alias" {
     try std.testing.expect(parsePublicSyncLevelText("aknn") == null);
@@ -413,6 +384,12 @@ pub const BatchRequest = struct {
         try jw.endObject();
     }
 };
+
+/// Promote a borrowed public view without copying or granting private authority.
+/// The caller retains every buffer through the synchronous mutation call.
+pub fn fromPublicMutation(req: @import("mutation_values.zig").PublicBatchRequest) BatchRequest {
+    return .{ .writes = req.writes, .deletes = req.deletes, .transforms = req.transforms, .graph_writes = req.graph_writes, .graph_deletes = req.graph_deletes, .sync_level = req.sync_level };
+}
 
 pub fn validateMergeArtifacts(req: BatchRequest) !void {
     if (req.merge_artifacts.len == 0) return;

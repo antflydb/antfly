@@ -2819,17 +2819,8 @@ pub const BoundTableReadSource = struct {
     }
 
     fn nextRelationalPage(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("antfly_local_sources").api_table_read_source.RelationalReadView.Page {
-        const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
-        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
-        errdefer page.deinit();
-        const owned = page.arena.allocator();
-        const rows = try owned.alloc(View.Row, page.rows.len);
-        for (page.rows, rows) |row, *output| output.* = .{ .id = row.key, .version = row.version, .schema_version = session.reader.active.version(), .value = row.typed orelse .null, .typed_cells = row.typed_cells, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest };
-        // Reader.after is an opaque physical continuation. It advances even
-        // when a bounded page contains only filtered or expired records.
-        const after = if (page.more) try owned.dupe(u8, session.reader.after.items) else null;
-        return .{ .arena = page.arena, .rows = rows, .after = after };
+        return session.nextViewPage(alloc, limit);
     }
 
     fn closeRelationalRead(ptr: *anyopaque) void {

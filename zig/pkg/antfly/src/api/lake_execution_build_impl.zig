@@ -15,6 +15,7 @@
 
 //! Complete physical lake publication execution. Owned by serverless in compiled products.
 const std = @import("std");
+const probe = @import("lake_execution_probe_hooks.zig");
 const local = @import("antfly_local_sources");
 const catalog = local.metadata_lake_index_catalog;
 const records = local.common_topology_records;
@@ -360,19 +361,25 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     const identity_unchanged = previous_identity != null and current.value.published != null and std.meta.eql(current.value.published.?.signature, signature) and relocatableFormats(current.value.published.?.declarations);
     var captured_rows: ?*@import("lake_row_payloads.zig").Capture = null;
     defer if (captured_rows) |capture| capture.deinit();
+    const identity_started = probe.start();
     var row_identity = if (identity_unchanged) previous_identity else @import("lake_row_identity_build.zig").build(a, na, table, &scoped, &provider, signature.source, base_source, navigation.ref, previous_identity, cancellation, &captured_rows) catch |err| switch (err) {
         // An optional identity declaration is not an enforced SQL constraint.
         // Insufficient identity evidence keeps ordinary complete construction.
         error.NullLogicalRowKey, error.DuplicateLogicalRowKey, error.LogicalRowIdentityAdmissionDeclined => null,
         else => return err,
     };
+    probe.finish("identity", identity_started);
     var fragments: ?*@import("lake_row_fragments.zig").Build = null;
     defer if (fragments) |value| value.deinit();
     if (!identity_unchanged) if (row_identity) |identity| {
         // Legacy sidecars/enrichment dependencies retain the physical builder.
         const configs = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{});
         const reusable_inputs = @import("lake_row_input_recipes.zig").nativeFragmentsEligible(configs);
-        if (reusable_inputs) fragments = try @import("lake_row_fragments.zig").prepareWithCapture(a, &scoped, table, source, &provider, identity, previous_identity, captured_rows);
+        if (reusable_inputs) {
+            const started_probe = probe.start();
+            defer probe.finish("fragments", started_probe);
+            fragments = try @import("lake_row_fragments.zig").prepareWithCapture(a, &scoped, table, source, &provider, identity, previous_identity, captured_rows);
+        }
     };
     var fragment_replay: ?replay_api.Replay = null;
     defer if (fragment_replay) |*value| value.deinit();
@@ -487,21 +494,45 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     const legacy_json = try std.json.Stringify.valueAlloc(na, legacy_indexes, .{});
     var manifest = if (relocated) rebuild.ReconciledManifest{ .artifacts = try a.alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, 0) } else try rebuild.reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(a, &scoped, provider.provider(), base_source, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = legacy_json }, reusable, cancellation, .{ .published_generation = attempt.generation, .edge_generation = attempt.generation, .computed_at_ms = started }, .{}, scope);
     defer manifest.deinit(a);
-    if (!relocated) if (fragments) |value| try @import("lake_row_fragments.zig").prepareCapturedSpool(value, &provider, &scoped, captured_rows);
+    if (!relocated) if (fragments) |value| {
+        const started_probe = probe.start();
+        defer probe.finish("spool", started_probe);
+        try @import("lake_row_fragments.zig").prepareCapturedSpool(value, &provider, &scoped, captured_rows);
+    };
     const builders = @import("lake_index_publication_builders.zig");
     native_provider.skip_indexes = provider.skip_indexes;
     const built = if (relocated) builders.Result{} else (try builders.build(.{ .a = a, .out = na, .table = table, .store = &scoped, .provider = native_provider, .base = base_source, .reusable = reusable, .candidates = native_candidates, .contributions = previous_contributions, .index = &contribution_index, .token = cancellation })) orelse serial: {
-        const native = @import("lake_index_native_aggregates.zig").buildIndexed(a, na, table, native_provider.source, &scoped, native_provider, cancellation, reusable, previous_contributions, &contribution_index) catch |err| return constructionFailure(err, "aggregate_build", attempt.generation);
+        const native = measured: {
+            const started_probe = probe.start();
+            defer probe.finish("aggregate", started_probe);
+            break :measured @import("lake_index_native_aggregates.zig").buildIndexed(a, na, table, native_provider.source, &scoped, native_provider, cancellation, reusable, previous_contributions, &contribution_index) catch |err| return constructionFailure(err, "aggregate_build", attempt.generation);
+        };
         // Aggregate construction already completes the entire set before this
         // boundary. Publishing every growing prefix writes quadratic directory
         // bytes and metadata commits without saving any earlier build work.
         native_provider.checkpointBatch(native.declarations) catch |err| return constructionFailure(err, "aggregate_checkpoint", attempt.generation);
-        const ordered = @import("lake_index_native_rows.zig").buildIncremental(a, na, table, native_provider.source, &scoped, native_provider, cancellation, reusable, native_candidates) catch |err| return constructionFailure(err, "ordered_build", attempt.generation);
+        const ordered = measured: {
+            const started_probe = probe.start();
+            defer probe.finish("ordered", started_probe);
+            break :measured @import("lake_index_native_rows.zig").buildIncremental(a, na, table, native_provider.source, &scoped, native_provider, cancellation, reusable, native_candidates) catch |err| return constructionFailure(err, "ordered_build", attempt.generation);
+        };
         for (ordered) |declaration| native_provider.checkpoint(declaration) catch |err| return constructionFailure(err, "ordered_checkpoint", attempt.generation);
-        const text = @import("lake_index_native_text.zig").buildIncremental(a, na, table, native_provider.source, base_source, &scoped, native_provider, cancellation, reusable, native_candidates) catch |err| return constructionFailure(err, "text_build", attempt.generation);
+        const text = measured: {
+            const started_probe = probe.start();
+            defer probe.finish("text", started_probe);
+            break :measured @import("lake_index_native_text.zig").buildIncremental(a, na, table, native_provider.source, base_source, &scoped, native_provider, cancellation, reusable, native_candidates) catch |err| return constructionFailure(err, "text_build", attempt.generation);
+        };
         for (text) |declaration| native_provider.checkpoint(declaration) catch |err| return constructionFailure(err, "text_checkpoint", attempt.generation);
-        const sparse = @import("lake_index_native_sparse.zig").buildIncremental(a, na, table, native_provider.source, base_source, &scoped, native_provider, cancellation, reusable, native_candidates) catch |err| return constructionFailure(err, "sparse_build", attempt.generation);
-        const dense = @import("lake_index_native_dense.zig").buildIncremental(a, na, table, native_provider.source, base_source, &scoped, native_provider, cancellation, reusable, native_candidates) catch |err| return constructionFailure(err, "dense_build", attempt.generation);
+        const sparse = measured: {
+            const started_probe = probe.start();
+            defer probe.finish("sparse", started_probe);
+            break :measured @import("lake_index_native_sparse.zig").buildIncremental(a, na, table, native_provider.source, base_source, &scoped, native_provider, cancellation, reusable, native_candidates) catch |err| return constructionFailure(err, "sparse_build", attempt.generation);
+        };
+        const dense = measured: {
+            const started_probe = probe.start();
+            defer probe.finish("dense", started_probe);
+            break :measured @import("lake_index_native_dense.zig").buildIncremental(a, na, table, native_provider.source, base_source, &scoped, native_provider, cancellation, reusable, native_candidates) catch |err| return constructionFailure(err, "dense_build", attempt.generation);
+        };
         break :serial builders.Result{ .native = native, .ordered = ordered, .text = text, .sparse = sparse, .dense = dense };
     };
     if (built.contribution_root) |root| {

@@ -14,14 +14,17 @@ rejected mutation outlining experiment are recorded in
 
 | Item | Current state |
 | --- | --- |
-| P0 measurement tools | Both-product CPU profiling, tested Mach-O map reader, pinned compiler time-report collector, scoped Linux memory snapshots implemented; full baseline qualification and server map still pending |
+| P0 measurement tools | Both-product CPU profiling, tested Mach-O map reader, pinned compiler time-report collector and scoped Linux memory snapshots implemented. Alternating frozen-ref cold/warm product harness and ARC workflow now retain both installed binaries, provenance and process samples; normal-runner qualification and server map remain pending |
 | P1a opaque PDF session | Retained state, stable allocator/deadline adapters, operation cancellation, directly charged PNG output and compiled source-free tests implemented |
 | Media build isolation | Fixed automatic storage/inference linking into media-only tests; provider/client/contract cache matrix passed |
 | P1b/P1c production migration | [Opt-in template migration](history/template-pdf-owner-2026-11-02.md) passes native regressions: server −6.72 MB, library +347 KB. User accepted the template tradeoff; now default. No build-time/memory gain established. [Retained analysis, raster/batch and fork-cache migration](history/retained-pdf-owner-2026-11-02.md) passes focused tests, eleven Debug cache phases, both Debug products and 13 HTTP regressions; optimized product size/cost screening remains. [Image operations](history/image-owner-2026-11-02.md) now pass source/native fixture equivalence and nine focused Debug cache phases; final combined Debug products pass all 225 steps. Optimized size/cost qualification remains |
 | P6 Q8K specialization | [Repeatable isolated loop screens](history/q8-projection-loops-2026-11-02.md) pass numerical checks and reduce estimated emitted work; mixed small-row timing prevents rollout |
-| P2 lake execution | [Whole-attempt provider/client](history/lake-execution-owner-2026-11-02.md) implemented behind an opt-in flag; native/source and combined Debug integration pass. Five production cache phases pass: implementation edits rebuild serverless only; client edits rebuild API only |
+| P2 lake execution | [Whole-attempt provider/client](history/lake-execution-owner-2026-11-02.md) remains opt-in. Creator-issued capacity restores parallel admission across owners while retaining both hard quotas. Final same-executable auto/unknown/low probes pass; real S3 passes 10 tests with no skips or leaks. Five production cache phases pass. Optimized costs and normal-runner runtime qualification remain |
 | P4 local query layout coupling | [Query capability migration](history/query-execution-capability-2026-11-02.md) co-locates complete execution with private DB; focused and combined Debug tests pass; all seven strict cache phases pass, including a real DB-layout edit preserving dispatcher/opaque-consumer caches. Other private engine boundaries remain |
-| P3/P5/P7 redesigns | Open; acceptance gates remain unchanged |
+| P3 public mutation boundary | Public values, validation and owning decoder are independent of private commands. Seven cache phases pass; HTTP and transaction regressions pass, including allocation failures and exact numeric tokens. Transactions transfer typed owned values without stringify/reparse. A separate compiled codec owner remains measurement-gated |
+| P4 read sessions and restore | Retained sessions, relational Reader, boxed QueryReadLease, document reader and restore materialization pass 128 combined Debug steps, including five retained-read fixtures and both native SQL linkage probes. Typed NUMERIC/SQLARRAY values survive close; private spill/pattern/page metadata is rejected before export. Frozen pre-Reader cache matrix passes 6/6; final retained-read matrix is pending. Statement capture fences, retained covers/query cuts and general DB lifecycle coupling remain |
+| P5 prepared mutations | [Lifetime inventory and commit disposition](mutation-resource-frame.md) completed. A real post-commit duplicate-application bug is fixed; 67 regression steps and a failing negative control qualify it. Broad cleanup/effect outlining remains profile-gated; partial Debug declaration data does not establish a payoff |
+| P7 durable gates | Public mutation and media/lake/query cache probes implemented; frozen pre-Reader session production matrix passes 6/6. Final retained-read matrix retains an exact source-only archive and checks actual API/kernel/native consumers. Owner archive guard, real S3 fixtures, non-test runtime comparison and PR qualification workflow implemented. Final combined candidate qualification remains |
 
 P1a and the measurement tools do not establish smaller production binaries or
 faster complete builds. The first-phase native product regression passed with
@@ -29,6 +32,13 @@ both installed product sizes unchanged. The later opt-in template slice shrinks 
 library; the user accepted that template tradeoff and it now defaults on.
 Retained PDF operations have independent cache qualification; no cold-build
 speedup is claimed.
+
+The current uncommitted redesign is newer than the frozen `7bedd1eb66`
+product screen. Do not attribute that screen to the public mutation, session or
+commit-disposition changes. Earlier Release attempts failed with missing cache
+files and produced no comparable product pair. The harness now maintains active
+cache leases and rejects eviction, missing memory captures and failed builds;
+those failed attempts establish no compile-time, size or memory improvement.
 
 ## Decision
 
@@ -145,6 +155,8 @@ whole-product builds were used to obtain these findings.
 ## P0: make experiments decisive
 
 **Files:** `.github/workflows/profile-zig-build.yml`,
+`.github/workflows/profile-zig-products-paired.yml`,
+`scripts/measure_paired_zig_products.py`,
 `scripts/diagnose-zig-build-memory.sh`, `scripts/report_zig_archive_work.py`,
 `scripts/report_zig_binary_size.py`, `zig/tools/capi_exports.py`; new report
 collectors/parsers where needed.
@@ -185,6 +197,16 @@ least three controlled baseline/candidate pairs in alternating order on the
 normal runner. Start with native CPU for local screening, ARM64 Linux musl for
 the original memory failure, and the actual release backend profiles for
 acceptance. GPU/default-Metal results do not inherit CPU-only qualification.
+
+The paired workflow implements this CPU-only capture protocol with frozen
+commits, the normal scheduler and three alternating pairs by default. Its
+collector builds both products together, records per-compiler and same-poll
+aggregate RSS, and retains content-addressed installed binaries plus available
+CAPI maps. Exact compiler/stdlib/SDK hashes and raw samples accompany failures
+as well as successes. Memory-capture failures cannot become valid speedups.
+Its completion flag means the captures succeeded; it never automatically
+accepts an architecture or enables a product default. Local `--jobs 1` screens
+are explicitly distinct from normal-runner qualification.
 
 **Exit:** the same frozen baseline reproduces within recorded variance, both
 final artifacts have attribution, and the collector separates semantic work
@@ -333,12 +355,19 @@ and ordered indexes, workload limits and object-store failure paths.
 `api/public_table_http.zig`, `api/distributed_txn.zig`, `api/transactions.zig`,
 server write/Raft adapters and CAPI batch entry points.
 
-`OwnedBatchRequest` currently contains public writes plus ownership for private
+Before P3a, `OwnedBatchRequest` contained public writes plus ownership for private
 merge, restore, policy, topology, artifact and transaction controls. It imports
-`selected_root.zig`. `parseBatchRequestWithOptions` selects public/internal and
+`selected_root.zig`. `parseBatchRequestWithOptions` selected public/internal and
 local-owner behavior with runtime booleans. Exposing that type through one new
 library would preserve coupling; making the booleans comptime could instead
 duplicate the large parser in owners needing both modes.
+
+P3a is now implemented: `api/batch.zig` owns the public decoder and
+`api/batch_internal.zig` owns the privileged decoder. Public admission uses
+`mutation_validation.zig`; typed promotion preserves internal authority as
+unset. Private-command and physical-transform edits leave the public parser
+cached. This is a source-dependency improvement, not yet a measured whole-product
+speedup or justification for another native archive.
 
 1. **P3a:** introduce a storage-implementation-free public mutation value/view
    contract, reusing existing concrete mutation values. Separate private command
@@ -392,15 +421,18 @@ borrow or its compilation dependency.
 The current query increment co-locates parsing/execution/encoding in the storage
 kernel and leaves a storage-free capability dispatcher. This removes the query
 owner's DB borrow; it does not complete the global P4 exit gate. The engine still
-returns concrete DB values for open/query-cut/restore/managed-open operations and
-transports relational/document sessions and typed-page pointers.
+returns concrete DB values for open/query-cut/restore/managed-open operations and retains
+legacy Reader and other lifecycle layout checks.
 
-The next bounded migration is owner-issued relational statement/read-session
-handles with whole typed-page and batch-lookup operations plus explicit page
-release. Preserve statement generation, fences, cancellation, IO and donor drain.
-Then migrate one DB lifecycle consumer (restore or query-cut carrier) to owner
-open/close and complete operations. Keep legacy descriptor checks until every
-concrete consumer has moved.
+Owner-issued relational/document session and statement handles now preserve
+generation, fences, cancellation, IO, donor drain and explicit whole-page release.
+Owner-side disposable restore materialization also avoids exporting its DB.
+The frozen pre-Reader cache receipt in the
+[session history](history/opaque-read-session-and-restore-decoder-2026-11-02.md)
+passes six strict phases, including actual private fields and shared-value
+invalidation. Next migrate raw Reader/QueryReadLease callers to complete page
+and lookup operations and qualify their additional cache boundary. Keep legacy
+descriptor checks until every concrete consumer has moved.
 
 Migrate one native-borrow family at a time to owner-issued handles and concrete
 operation values. Start with complete operations whose client does not need
@@ -558,6 +590,17 @@ JSON DOM versus retained raw values, packed tensors, output ownership and
 concurrent requests. Passing a raster directly can avoid an intermediate PNG
 round trip; repeated reparsing, an extra full raster, or retaining an entire
 request longer can negate that gain.
+
+Allocator identity is not a resource capability across compiled owners. Lake
+qualification found that foreign allocator vtables hid known headroom and
+silently disabled parallel writer admission. The boundary now carries a
+creator-issued, checked query for current optional capacity; the provider takes
+the minimum with its own remaining quota. Both hard allocation limits remain.
+Unknown capacity keeps conservative admission, and the borrowed query ends with
+the complete operation. This restores scheduling information without inspecting
+foreign allocator state or querying capacity on every allocation. Audit SQL
+spill/admission boundaries separately before generalizing this mechanism: their
+unknown-parent policies differ from lake's strict working-set policy.
 
 The map also shows repeated 256 KB zero-filled thread signal-stack regions and
 about 1.46 MB of audio-recipe BSS. These are leads for a separate TLS/runtime

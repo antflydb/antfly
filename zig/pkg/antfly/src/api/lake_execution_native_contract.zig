@@ -18,6 +18,7 @@
 const std = @import("std");
 const local = @import("antfly_local_sources");
 pub const native = @import("antfly_runtime_abi").native_abi;
+pub const memory = @import("lake_execution_memory.zig");
 pub const values = @import("lake_execution_values.zig");
 pub const BuildLimits = @import("../serverless/build/lake_build_limits.zig").Limits;
 pub const SourceOptions = @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions;
@@ -57,6 +58,7 @@ pub const Control = struct {
 };
 pub const Request = struct {
     allocator: A,
+    allocator_headroom: ?memory.Capability = null,
     table: local.common_topology_records.TableRecord,
     store: values.StoreDescriptor,
     source: SourceOptions,
@@ -79,16 +81,16 @@ pub const Response = struct {
 const Function = *const fn (Request) Response;
 pub fn signature() native.CallContract {
     @setEvalBranchQuota(100_000);
-    return .of("antfly_lake_execute_v2", Function, Request, Response);
+    return .of("antfly_lake_execute_v3", Function, Request, Response);
 }
-const layout_types = .{ Failure, Control, Request, Response, values.StoreDescriptor, SourceOptions, values.BuildPolicy, BuildLimits, @import("antfly_cancellation").CancellationToken, execution.ProgressSink, execution.Progress, execution.Phase, Outcome(void), Outcome(u64), Outcome(local.common_topology_records.TableRecord), A.VTable, local.common_topology_records.TableRecord, catalog.Publication, catalog.StoreLocator, catalog.StoreLocator.Protocol, local.common_config.Config, local.common_secrets.FileStore, Embedder.InitOptions, Embedder.AntflyProvider, LimitsRegistry, @typeInfo(@FieldType(SourceOptions, "retained_catalog_metadata")).optional.child, @typeInfo(@FieldType(values.StoreDescriptor, "cloud_vacuum")).optional.child };
+const layout_types = .{ memory.Value, memory.Capability, Failure, Control, Request, Response, values.StoreDescriptor, SourceOptions, values.BuildPolicy, BuildLimits, @import("antfly_cancellation").CancellationToken, execution.ProgressSink, execution.Progress, execution.Phase, Outcome(void), Outcome(u64), Outcome(local.common_topology_records.TableRecord), A.VTable, local.common_topology_records.TableRecord, catalog.Publication, catalog.StoreLocator, catalog.StoreLocator.Protocol, local.common_config.Config, local.common_secrets.FileStore, Embedder.InitOptions, Embedder.AntflyProvider, LimitsRegistry, @typeInfo(@FieldType(SourceOptions, "retained_catalog_metadata")).optional.child, @typeInfo(@FieldType(values.StoreDescriptor, "cloud_vacuum")).optional.child };
 pub const layouts = blk: {
     @setEvalBranchQuota(100_000);
     var result: [layout_types.len]native.TypeContract = undefined;
     for (layout_types, 0..) |T, i| result[i] = .of(T);
     break :blk result;
 };
-pub const endpoint_version: u32 = 2;
+pub const endpoint_version: u32 = 3;
 pub const Endpoint = extern struct {
     version: u32 = endpoint_version,
     contract: native.CallContract,
@@ -102,7 +104,7 @@ pub fn validate(endpoint: *const Endpoint) !void {
     for (endpoint.layout.*, layouts) |actual, expected| if (!actual.matches(expected)) return error.InvalidArgument;
 }
 pub fn execute(request: Request) !Response {
-    const get = @extern(*const fn () callconv(.c) *const Endpoint, .{ .name = "antfly_lake_execute_v2" });
+    const get = @extern(*const fn () callconv(.c) *const Endpoint, .{ .name = "antfly_lake_execute_v3" });
     const endpoint = get();
     try validate(endpoint);
     var response: Response = undefined;

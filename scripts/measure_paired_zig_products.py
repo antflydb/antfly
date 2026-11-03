@@ -463,6 +463,8 @@ def main():
                     str(collector),
                     "--zig-dir",
                     str(tree / "zig"),
+                    "--prefix",
+                    str(tree / "zig/zig-out"),
                     "--out-dir",
                     str(logs),
                     "--target",

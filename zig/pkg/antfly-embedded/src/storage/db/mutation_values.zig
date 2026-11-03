@@ -89,3 +89,48 @@ pub const DocumentTransform = struct {
 pub const TransactionWrite = BatchWrite;
 pub const GraphEdgeWrite = @import("graph_edge_types.zig").GraphEdgeWrite;
 pub const GraphEdgeDelete = @import("graph_edge_types.zig").GraphEdgeDelete;
+
+pub const SyncLevel = enum {
+    propose,
+    write,
+    full_text,
+    enrichments,
+    full_index,
+};
+
+pub fn parsePublicSyncLevelText(text: []const u8) ?SyncLevel {
+    if (std.mem.eql(u8, text, "propose")) return .propose;
+    if (std.mem.eql(u8, text, "write")) return .write;
+    if (std.mem.eql(u8, text, "full_text")) return .full_text;
+    if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
+    if (std.mem.eql(u8, text, "full_index")) return .full_index;
+    return null;
+}
+
+pub fn parsePublicSyncLevelJson(value: std.json.Value) ?SyncLevel {
+    return switch (value) {
+        .string => |text| parsePublicSyncLevelText(text),
+        else => null,
+    };
+}
+
+pub fn publicSyncLevelText(level: SyncLevel) []const u8 {
+    return switch (level) {
+        .propose => "propose",
+        .write => "write",
+        .full_text => "full_text",
+        .enrichments => "enrichments",
+        .full_index => "full_index",
+    };
+}
+
+/// Borrowed public mutation view. It cannot represent replication, transaction,
+/// schema, policy or owner-maintenance authority. Buffers live through the call.
+pub const PublicBatchRequest = struct {
+    writes: []const BatchWrite = &.{},
+    deletes: []const []const u8 = &.{},
+    transforms: []const DocumentTransform = &.{},
+    graph_writes: []const GraphEdgeWrite = &.{},
+    graph_deletes: []const GraphEdgeDelete = &.{},
+    sync_level: SyncLevel = .write,
+};

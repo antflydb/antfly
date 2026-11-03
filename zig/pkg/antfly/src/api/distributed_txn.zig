@@ -76,12 +76,12 @@ test "distributed txn range guard wire preserves absent and exact counters" {
                 freeTxnPrepareRequest(alloc, &unexpected);
                 return error.TestExpectedError;
             } else |err| if (err != error.InvalidTxnRequest) return err;
-            const batch_bytes = try @import("antfly_local_sources").api_batch.encodeBatchRequest(alloc, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 3 } }, .range_guards = &proofs });
+            const batch_bytes = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 3 } }, .range_guards = &proofs });
             defer alloc.free(batch_bytes);
-            var batch = try @import("antfly_local_sources").api_batch.parseInternalBatchRequest(alloc, batch_bytes);
+            var batch = try @import("antfly_local_sources").api_internal_batch.parseInternalBatchRequest(alloc, batch_bytes);
             defer batch.deinit(alloc);
             try std.testing.expectEqualDeep(&proofs, batch.req.range_guards);
-            if (@import("antfly_local_sources").api_batch.parseBatchRequest(alloc, batch_bytes)) |value| {
+            if (@import("antfly_local_sources").api_internal_batch.parseBatchRequest(alloc, batch_bytes)) |value| {
                 var unexpected = value;
                 unexpected.deinit(alloc);
                 return error.TestExpectedError;
@@ -2397,7 +2397,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     const guarded = req.req.range_guards.len != 0;
-    const row_semantics = @import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
+    const row_semantics = @import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
     if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
@@ -2748,7 +2748,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     const has_guards = range_guards_owner != null and range_guards_owner.?.value.len != 0;
     if (has_guards and !wrapped) return error.InvalidTxnRequest;
     if (wrapped and !row_semantics and !has_guards) return error.InvalidTxnRequest;
-    if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics) return error.InvalidTxnRequest;
+    if (@import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics) return error.InvalidTxnRequest;
     return .{
         .route_fence = if (route_fence) |fence| fence.value else null,
         .txn_id = txn_id,
@@ -2970,7 +2970,7 @@ test "distributed txn restore plan identity survives begin resolve and private b
     unscoped.restore_staging_plan_id = @splat(0);
     try std.testing.expectError(error.InvalidTxnRequest, encodeTxnBeginRequest(alloc, unscoped));
 
-    const batch = @import("antfly_local_sources").api_batch;
+    const batch = @import("antfly_local_sources").api_internal_batch;
     const mutation: db_mod.types.BatchRequest = .{ .restore_staging_scope = scope, .restore_staging_plan_id = plan, .transaction = .{ .resolve = .{ .txn_id = begin.txn_id, .status = .committed, .commit_version = 2 } } };
     const bytes = try batch.encodeBatchRequest(alloc, mutation);
     defer alloc.free(bytes);

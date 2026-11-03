@@ -18,7 +18,7 @@
 //! treating local timings as a throughput or release-runner guarantee.
 const std = @import("std");
 const time = @import("antfly_platform").time;
-const batch = @import("antfly_local_sources").api_batch;
+const batch = @import("antfly_local_sources").api_internal_batch;
 const types = @import("antfly_local_sources").storage_db_types;
 const query_contract = @import("antfly_local_sources").api_local_query_contract;
 const client = @import("storage/kernel_owner_client.zig");

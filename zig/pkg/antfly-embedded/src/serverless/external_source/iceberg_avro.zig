@@ -452,8 +452,12 @@ fn decodeBlockAlloc(
         },
         .zstandard => blk: {
             var in: std.Io.Reader = .fixed(encoded_block);
-            var window: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
-            var decompress: std.compress.zstd.Decompress = .init(&in, &window, .{});
+            // Keep the 8 MiB decoder workspace off the call stack. This
+            // function also serves null-codec blocks, and a shared Debug
+            // frame otherwise exceeds macOS main/thread stack budgets.
+            const window = try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+            defer alloc.free(window);
+            var decompress: std.compress.zstd.Decompress = .init(&in, window, .{});
             const decoded = try decompress.reader.allocRemaining(alloc, .limited(max_decoded_block_bytes + 1));
             errdefer alloc.free(decoded);
             if (decoded.len > max_decoded_block_bytes) return error.AvroBlockTooLarge;
@@ -1830,4 +1834,32 @@ test "external lake manifest list skips standard nested partition summaries" {
     defer entry.deinit(a);
     try std.testing.expectEqual(@as(u64, 123), entry.manifest_length);
     try std.testing.expect(reader.eof());
+}
+
+test "iceberg avro manifest decoding fits a bounded worker stack" {
+    const alloc = std.testing.allocator;
+    var plain = try buildManifestListFixture(alloc, "null", true);
+    defer plain.deinit(alloc);
+    var compressed = try buildManifestListFixture(alloc, "zstandard", true);
+    defer compressed.deinit(alloc);
+    const Worker = struct {
+        inputs: [2][]const u8,
+        failure: ?anyerror = null,
+        fn check(self: *@This()) !void {
+            for (self.inputs) |input| {
+                var list = try parseManifestListAlloc(std.testing.allocator, input);
+                defer list.deinit(std.testing.allocator);
+                try std.testing.expectEqual(@as(usize, 2), list.entries.len);
+            }
+        }
+        fn run(self: *@This()) void {
+            self.check() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var worker: Worker = .{ .inputs = .{ plain.items, compressed.items } };
+    const thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, Worker.run, .{&worker});
+    thread.join();
+    if (worker.failure) |err| return err;
 }
