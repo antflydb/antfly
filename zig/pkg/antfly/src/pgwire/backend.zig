@@ -18,7 +18,7 @@
 //! Parameters remain typed values, never interpolated into SQL text.
 const std = @import("std");
 
-pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange, enumeration, bytea };
+pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange, enumeration, bytea, void };
 pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
 pub const Column = struct {
     defaulted: bool = false,

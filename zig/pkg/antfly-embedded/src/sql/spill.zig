@@ -799,7 +799,9 @@ const Encoder = struct {
     fn cell(self: *Encoder, value: Datum) anyerror!void {
         try value.validateTemporal();
         try self.append(&.{@intFromBool(value.sql_null)});
-        if (value.bytes()) |bytes| {
+        if (value.isVoid()) {
+            try self.append(&.{16});
+        } else if (value.bytes()) |bytes| {
             try self.append(&.{15});
             try self.text(bytes);
         } else if (value.enumeration()) |atom| {
@@ -1259,6 +1261,10 @@ const Decoder = struct {
                     else => error.InvalidSqlSpill,
                 };
                 value.* = Datum.typedArray(array);
+            } else if (self.position < self.bytes.len and self.bytes[self.position] == 16) {
+                self.position += 1;
+                if (flag != 0) return error.InvalidSqlSpill;
+                value.* = Datum.voidValue();
             } else if (self.position < self.bytes.len and self.bytes[self.position] == 15) {
                 self.position += 1;
                 if (flag != 0) return error.InvalidSqlSpill;
@@ -2908,7 +2914,7 @@ pub const Sequential = struct {
         return true;
     }
     fn tag(value: Datum) u8 {
-        if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null or value.enumeration() != null or value.bytes() != null) return 255;
+        if (value.isVoid() or value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null or value.enumeration() != null or value.bytes() != null) return 255;
         return switch (value.value) {
             .null => 0,
             .bool => 1,
@@ -10979,4 +10985,32 @@ test "SQL adaptive payload cache lazy growth publication retires concurrent subs
     try std.testing.expectEqual(capacity, permanent.load(.acquire));
     try std.testing.expectEqual(capacity, state.owner.unsubscribe(&link));
     linked = false;
+}
+
+test "SQL advisory void survives scalar clones and all columnar spill versions" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const owned = arena.allocator();
+            const rows = [_]Row{
+                .{ .values = &.{ .voidValue(), .{}, .json(.{ .string = "" }) }, .keys = &.{}, .ordinal = 1 },
+                .{ .values = &.{ .{}, .voidValue(), .json(.{ .string = "text" }) }, .keys = &.{}, .ordinal = 2 },
+            };
+            const clone = try @import("operators.zig").cloneDatum(owned, rows[0].values[0]);
+            try std.testing.expect(clone.isVoid() and !clone.sql_null);
+            inline for (.{ .v1, .v2 }) |version| {
+                const bytes = try encodeColumnarBlockVersionAlloc(owned, &rows, 1 << 20, version);
+                const block = try decodeColumnarBlockInArena(owned, bytes, 1 << 20);
+                for (rows, 0..) |row, row_index| for (row.values, 0..) |expected, column| {
+                    const actual = try block.cell(row_index, column);
+                    try std.testing.expectEqual(expected.sql_null, actual.sql_null);
+                    try std.testing.expectEqual(expected.isVoid(), actual.isVoid());
+                    if (!actual.sql_null) try std.testing.expectEqualStrings(expected.value.string, actual.value.string);
+                };
+            }
+        }
+    };
+    try Harness.run(std.testing.allocator);
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{});
 }

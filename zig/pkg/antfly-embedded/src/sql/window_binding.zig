@@ -251,6 +251,10 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
     input_compiled.statement = .{ .select = input_statement };
     const input = try alloc.create(describe.BoundStatement);
     input.* = try describe.bindInternal(alloc, pinned_backend, &input_compiled, inferred);
+    for (builder.sorts.items) |sort| {
+        for (sort.partition) |slot_| if (input.columns[slot_].type == .void) return error.SqlUndefinedFunction;
+        for (sort.order) |slot_| if (input.columns[slot_].type == .void) return error.SqlUndefinedFunction;
+    }
     const parameters = @constCast(input.parameter_types);
     const columns = try alloc.alloc(scalar.Column, input.columns.len + builder.specs.items.len);
     for (input.columns, columns[0..input.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = column.enum_view, .domain_view = scalar.domainViewOf(column) };
@@ -318,6 +322,10 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
             else => {},
         }
         if (call.filter != null and @backingInt(kind) < @backingInt(Kind.count)) return error.UnsupportedSqlShape;
+        if (input_type == .void) switch (kind) {
+            .min, .max, .sum, .avg, .bool_and, .bool_or => return error.SqlUndefinedFunction,
+            else => {},
+        };
         const sum_type = @import("operators.zig").Aggregate.sumType(.{ .kind = input_type, .element_type = input_element });
         const average_type = @import("operators.zig").Aggregate.averageType(.{ .kind = input_type, .element_type = input_element });
         const integer_numeric_result = input_type == .integer and (kind == .avg or (kind == .sum and sum_type.element_type == .numeric));
@@ -393,6 +401,9 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
         };
     }
     const order_programs = try alloc.alloc(scalar.Program, orders.len);
-    for (orders, order_programs) |node_, *program| program.* = try scalar.bindWithSettings(alloc, node_, columns, parameters, .{ .invocation = backend.parameter_invocation }, backend.settings_view);
+    for (orders, order_programs) |node_, *program| {
+        program.* = try scalar.bindWithSettings(alloc, node_, columns, parameters, .{ .invocation = backend.parameter_invocation }, backend.settings_view);
+        if (program.output_type.kind == .void) return error.SqlUndefinedFunction;
+    }
     return .{ .input = input, .statement = input_statement, .specs = specs, .sorts = builder.sorts.items, .outputs = output_programs, .orders = order_programs, .order_outputs = order_outputs, .names = names };
 }

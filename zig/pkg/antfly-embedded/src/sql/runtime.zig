@@ -281,7 +281,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     if (compiled.statement == .copy_to or compiled.statement == .copy_from) return error.UnsupportedSqlShape;
     if (compiled.statement == .explain) {
         const explanation = compiled.statement.explain;
-        const inner: compiler.Compiled = .{ .arena = undefined, .statement = explanation.statement.*, .parameter_count = compiled.parameter_count, .uses_sequences = compiled.uses_sequences, .uses_current_setting = compiled.uses_current_setting };
+        const inner: compiler.Compiled = .{ .arena = undefined, .statement = explanation.statement.*, .parameter_count = compiled.parameter_count, .uses_sequences = compiled.uses_sequences, .uses_advisory = compiled.uses_advisory, .uses_current_setting = compiled.uses_current_setting };
         // Analyze is explicitly read-only: reject mutation plans before binding,
         // cursor capture, parameter preparation, or native admission.
         if (explanation.analyze and inner.statement != .select) return error.SqlAnalyzeRequiresReadOnly;
@@ -1496,7 +1496,7 @@ pub const Context = struct {
                     for (selected[first..][0..inputs.items.len], output) |row, *cells| cells.* = try scratch.dupe(Datum, row.values[0..fields.items.len]);
                     var stateful = false;
                     for (self.binding.scalars.projections) |optional| if (optional) |*program| {
-                        stateful = stateful or program.uses_sequences;
+                        stateful = stateful or program.orderedEffects();
                     };
                     if (stateful) {
                         for (inputs.items, output) |input, cells_| for (deferred, 0..) |needed, column| {
@@ -1572,7 +1572,7 @@ pub const Context = struct {
         if (rows.len != cells.len) return error.InvalidSqlBackendResponse;
         var ordered = false;
         for (self.binding.scalars.projections) |optional| if (optional) |*program| {
-            ordered = ordered or @import("decision_eval.zig").hasSequences(program);
+            ordered = ordered or @import("decision_eval.zig").hasOrderedEffects(program);
         };
         if (ordered) {
             const output = try alloc.alloc([]const Datum, rows.len);
@@ -1908,7 +1908,7 @@ pub const Context = struct {
         while (end < statement.rows.len) {
             var stateful = defaults_have_effects;
             if (self.binding.scalars.insert_rows.len != 0) for (self.binding.scalars.insert_rows[end]) |optional| {
-                if (optional) |program| stateful = stateful or program.uses_sequences;
+                if (optional) |program| stateful = stateful or program.orderedEffects();
             };
             if (stateful and end != first) break;
             var bytes: usize = 0;

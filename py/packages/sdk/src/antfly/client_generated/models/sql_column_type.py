@@ -17,6 +17,7 @@ class SQLColumnType(StrEnum):
     TSTZRANGE = "tstzrange"
     UNKNOWN = "unknown"
     UUID = "uuid"
+    VOID = "void"
 
     def __str__(self) -> str:
         return str(self.value)

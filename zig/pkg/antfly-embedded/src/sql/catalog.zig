@@ -136,6 +136,7 @@ pub const Column = struct {
         if (self.temporal_kind != null and (self.type != .datetime or self.element_type != null or self.numeric_modifier != null)) return error.InvalidSqlBackendResponse;
         const Kind = @import("../common/sql_builtin_type.zig").Type;
         const identity: ?Kind = self.element_type orelse switch (self.type) {
+            .void => return error.SqlInvalidTableDefinition,
             .integer => Kind.int64,
             .number => Kind.float64,
             .string => Kind.text,
@@ -705,6 +706,7 @@ pub const Table = struct {
             .name = column_.name,
             .path = column_.path,
             .column_type = switch (column_.type) {
+                .void => return error.SqlInvalidTableDefinition,
                 .enumeration, .bytea => return error.UnsupportedSqlShape,
                 .string, .uuid => .string,
                 .integer => .integer,
@@ -1727,6 +1729,7 @@ pub const Backend = struct {
     notice_sink: ?notices.Sink = null,
     sequence_resolver: ?@import("sequence_effects.zig").Resolver = null,
     sequence_provider: ?@import("sequence_effects.zig").Provider = null,
+    advisory_provider: ?@import("advisory_effects.zig").Provider = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
     ptr: *anyopaque,
     vtable: *const VTable,

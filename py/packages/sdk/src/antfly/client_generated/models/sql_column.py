@@ -23,9 +23,10 @@ class SQLColumn:
     """
     Attributes:
         name (str): Display label. Labels need not be unique; rows use matching ordinal positions.
-        type_ (SQLColumnType): Logical SQL result type. Integer values and numbers with element_type numeric are decimal
-            strings to preserve exact precision in every client. Bytea results use PostgreSQL hex text (a backslash followed
-            by x and lowercase hex digits) in JSON and opaque bytes in PostgreSQL binary format.
+        type_ (SQLColumnType): Logical SQL result type. The void pseudotype uses an empty string for a non-NULL value
+            and cannot be stored in table columns. Integer values and numbers with element_type numeric are decimal strings
+            to preserve exact precision in every client. Bytea results use PostgreSQL hex text (a backslash followed by x
+            and lowercase hex digits) in JSON and opaque bytes in PostgreSQL binary format.
         named_type (SQLNamedTypeIdentity | Unset): Server-resolved immutable SQL type identity. Origin survives restore
             remapping of local IDs and wire OIDs.
         temporal_kind (SQLTemporalKind | Unset): Exact temporal identity for datetime-family SQL values. Omission means

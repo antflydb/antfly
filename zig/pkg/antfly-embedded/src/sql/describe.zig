@@ -1309,6 +1309,12 @@ pub fn assignDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, s
 /// Physical assignment keeps the older coarse wrapper and cannot acquire an
 /// interval domain merely because its JSON representation is a string.
 pub fn coerceDatumTyped(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, descriptor: @import("scalar.zig").Type) !@import("scalar.zig").Datum {
+    if (raw.isVoid() and descriptor.kind != .void) return error.SqlTypeMismatch;
+    if (descriptor.kind == .void) {
+        if (descriptor.element_type != null or descriptor.temporal_kind != null or descriptor.numeric_modifier != null or descriptor.enum_view != null or descriptor.enum_reference != null or descriptor.domainView() != null or descriptor.domainReference() != null) return error.SqlTypeMismatch;
+        return coerceVoid(raw);
+    }
+
     if (descriptor.enum_view) |view| {
         if (descriptor.kind != .enumeration or descriptor.element_type != null or descriptor.temporal_kind != null) return error.SqlTypeMismatch;
         try raw.validateTemporal();
@@ -1337,7 +1343,23 @@ pub fn coerceDatumTyped(alloc: std.mem.Allocator, raw: @import("scalar.zig").Dat
     return coerceDatum(alloc, raw, descriptor.kind orelse return error.UnknownSqlParameterType, descriptor.element_type);
 }
 
+fn coerceVoid(raw: @import("scalar.zig").Datum) !@import("scalar.zig").Datum {
+    try raw.validateTemporal();
+    if (raw.sql_null) {
+        if (raw.value != .null or raw.numeric != null or raw.array != null or raw.extension_kind != .none) return error.SqlTypeMismatch;
+        return raw;
+    }
+    if (raw.isVoid()) return raw;
+    if (raw.numeric != null or raw.array != null or raw.extension_kind != .none or raw.value != .string) return error.SqlTypeMismatch;
+    return @import("scalar.zig").Datum.voidValue();
+}
+
 pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, kind: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !@import("scalar.zig").Datum {
+    if (kind == .void) {
+        if (element_type != null) return error.SqlTypeMismatch;
+        return coerceVoid(raw);
+    }
+    if (raw.isVoid()) return error.SqlTypeMismatch;
     if (kind == .bytea) {
         try raw.validateTemporal();
         if (element_type != null) return error.SqlTypeMismatch;
@@ -1431,6 +1453,7 @@ pub fn coerceAlloc(alloc: std.mem.Allocator, raw: Json, kind: ast.ColumnType) !J
 pub fn coerce(raw: Json, kind: ast.ColumnType) !Json {
     if (raw == .null) return .null;
     return switch (kind) {
+        .void => if (raw == .string) .{ .string = "" } else error.SqlTypeMismatch,
         .numrange, .daterange, .tsrange, .tstzrange => error.SqlTypeMismatch,
         .array, .enumeration, .bytea => error.SqlTypeMismatch,
         .integer => switch (raw) {

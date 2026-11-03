@@ -48,6 +48,7 @@ pub const Error = std.mem.Allocator.Error || error{
     SqlInvalidTextRepresentation,
     SqlNumericOutOfRange,
     SqlInvalidFunctionDefinition,
+    SqlInvalidTableDefinition,
     SqlTriggerDeclaredArguments,
     SqlTriggerSqlLanguage,
 };
@@ -261,6 +262,7 @@ pub const Compiled = struct {
     parameter_count: u32,
     uses_current_setting: bool = false,
     uses_sequences: bool = false,
+    uses_advisory: bool = false,
 
     pub fn deinit(self: *Compiled) void {
         self.arena.deinit();
@@ -366,7 +368,7 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
             else => error.UnsupportedSqlShape,
         }, "unexpected trailing SQL; only one supported statement is allowed");
     }
-    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_sequences = parser.uses_sequences };
+    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_sequences = parser.uses_sequences, .uses_advisory = parser.uses_advisory };
 }
 
 fn lexicalError(kind: lexer.LexErrorKind) Error {
@@ -561,6 +563,7 @@ const Parser = struct {
     parameter_count: u32 = 0,
     uses_current_setting: bool = false,
     uses_sequences: bool = false,
+    uses_advisory: bool = false,
     relation_depth: usize = 0,
     into_target: ?*?ast.RelationPopulation = null,
 
@@ -914,6 +917,7 @@ const Parser = struct {
             const name_value = if (namespace) |scope| try std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ scope, function_name }) else function_name;
             if ((namespace == null or std.mem.eql(u8, namespace.?, "pg_catalog")) and std.mem.eql(u8, function_name, "current_setting")) self.uses_current_setting = true;
             if (namespace == null or std.mem.eql(u8, namespace.?, "pg_catalog")) {
+                if (@import("advisory_effects.zig").function(function_name) != null) self.uses_advisory = true;
                 inline for (.{ "nextval", "currval", "lastval", "setval" }) |sequence_function| {
                     if (std.mem.eql(u8, function_name, sequence_function)) self.uses_sequences = true;
                 }
@@ -2404,6 +2408,7 @@ const Parser = struct {
             .{ "tsrange", ast.ColumnType.tsrange },      .{ "tstzrange", ast.ColumnType.tstzrange },
             .{ "timestamptz", ast.ColumnType.datetime }, .{ "json", ast.ColumnType.json },
             .{ "jsonb", ast.ColumnType.json },           .{ "bytea", ast.ColumnType.bytea },
+            .{ "void", ast.ColumnType.void },
         };
         inline for (pairs) |pair| if (std.ascii.eqlIgnoreCase(t.text, pair[0])) return pair[1];
         if (std.ascii.eqlIgnoreCase(t.text, "double")) {
@@ -2449,6 +2454,7 @@ const Parser = struct {
             if (self.peek(.lbracket)) return self.fail(error.UnsupportedSqlShape, "named array columns require an executable array domain");
             return .{ .name = name_value, .type = .enumeration, .named_type = unresolved };
         };
+        if (declared.type == .void) return self.fail(error.SqlInvalidTableDefinition, "a stored column cannot have pseudo-type void");
         if (declared.temporal_kind != null) return self.fail(error.UnsupportedSqlShape, "persistent temporal subtype requires native storage support");
         return .{ .name = name_value, .type = declared.type, .element_type = declared.element_type, .numeric_modifier = declared.numeric_modifier };
     }

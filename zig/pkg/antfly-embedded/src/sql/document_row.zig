@@ -678,6 +678,7 @@ pub const Projection = struct {
 
 fn coerce(alloc: std.mem.Allocator, value: Json, kind: ast.ColumnType) !Json {
     return switch (kind) {
+        .void => error.SqlInvalidTableDefinition,
         .numrange, .daterange, .tsrange, .tstzrange => if (value == .null) .null else range: {
             if (value != .string) return error.SqlTypeMismatch;
             const ranges = @import("range_value.zig");

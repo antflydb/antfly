@@ -223,6 +223,7 @@ pub fn indexInstructionIdentity(alloc: std.mem.Allocator, program: *const scalar
         .column = "",
         .expression = lowered.expression,
         .result_type = switch (lowered.type) {
+            .void => return error.SqlInvalidTableDefinition,
             .enumeration, .bytea => return error.UnsupportedSqlShape,
             .string, .uuid => .string,
             .integer => .integer,

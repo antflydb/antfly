@@ -1545,6 +1545,7 @@ const Builder = struct {
                 column.nullable = column.nullable or other.nullable;
                 column.untyped_null = column.untyped_null and other.untyped_null;
             }
+            if (!set.all or set.kind != .@"union") for (columns) |column| if (column.type == .void) return error.SqlUndefinedFunction;
             return self.node(columns, .{ .set = .{ .kind = set.kind, .all = set.all, .left = left, .right = right } });
         }
         if (statement.source) |relation_node| return self.relation(relation_node, ctes, depth + 1);
@@ -1729,6 +1730,7 @@ const Builder = struct {
                 try self.constraints.append(self.alloc, .{ .expression = column.origin.?, .type_mismatch = error.SqlRecursiveTypeMismatch });
             } else if (!other.untyped_null and column.type != other.type and !(column.type == .number and other.type == .integer)) return error.SqlTypeMismatch;
         }
+        if (!set.all) for (columns) |column| if (column.type == .void) return error.SqlUndefinedFunction;
         const result = try self.node(columns, if (self.shape_only) .singleton else .{ .recursive = .{ .id = id, .seed = seed, .step = step, .all = set.all } });
         try self.recursive_nodes.put(self.alloc, cte.query, result);
         return self.recursiveAlias(result, alias);

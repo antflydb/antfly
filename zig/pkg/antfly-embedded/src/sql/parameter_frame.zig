@@ -801,6 +801,22 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
         if (input == .datum and (input.datum.array != null or input.datum.numeric != null or input.datum.patterns() != null or input.datum.value != .null)) return error.SqlTypeMismatch;
         return .{};
     }
+    if (descriptor.kind == .void) {
+        if (input == .array_envelope) return error.SqlTypeMismatch;
+        const raw = switch (input) {
+            .text => |bytes| bytes,
+            .binary => |bytes| bytes,
+            .datum => |datum| if (datum.isVoid()) return datum else if (datum.extension_kind == .none and datum.array == null and datum.numeric == null and datum.value == .string) datum.value.string else return error.SqlTypeMismatch,
+            else => return error.SqlTypeMismatch,
+        };
+        try work.consume(raw.len +| 1);
+        if (raw.len > limits.bytes) return error.SqlProgramLimitExceeded;
+        if (input == .binary) {
+            if (raw.len != 0) return error.InvalidSqlBinaryRepresentation;
+        } else if (!std.unicode.utf8ValidateSlice(raw) or std.mem.indexOfScalar(u8, raw, 0) != null) return error.SqlInvalidCharacterEncoding;
+        return scalar.Datum.voidValue();
+    }
+    if (input == .datum and input.datum.isVoid()) return error.SqlTypeMismatch;
     if (descriptor.kind == .bytea) {
         if (input == .array_envelope) return error.SqlTypeMismatch;
         const owned = try a.create(@import("bytea_value.zig").Value);
@@ -1616,4 +1632,20 @@ test "SQL bytea frames own text binary and typed ingress across every allocation
     };
     try Probe.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "SQL advisory void parameter frames retain identity and reject invalid payloads" {
+    const a = std.testing.allocator;
+    for ([_]Input{ .{ .text = "ignored" }, .{ .binary = "" }, .{ .datum = .voidValue() }, .{ .datum = .json(.{ .string = "ignored" }) }, .sql_null }) |input| {
+        var frame = try Frame.prepare(a, &.{.{ .kind = .void }}, &.{input}, .{});
+        defer frame.deinit();
+        try std.testing.expectEqual(input == .sql_null, frame.values[0].sql_null);
+        try std.testing.expectEqual(input != .sql_null, frame.values[0].isVoid());
+    }
+    try std.testing.expectError(error.InvalidSqlBinaryRepresentation, Frame.prepare(a, &.{.{ .kind = .void }}, &.{.{ .binary = "x" }}, .{}));
+    for ([_][]const u8{ "\xff", "\x00" }) |bad| try std.testing.expectError(error.SqlInvalidCharacterEncoding, Frame.prepare(a, &.{.{ .kind = .void }}, &.{.{ .text = bad }}, .{}));
+    try std.testing.expectError(error.SqlTypeMismatch, Frame.prepare(a, &.{.{ .kind = .string, .element_type = .text }}, &.{.{ .datum = .voidValue() }}, .{}));
+    var corrupt = scalar.Datum.voidValue();
+    corrupt.sql_null = true;
+    try std.testing.expectError(error.SqlTypeMismatch, Frame.prepare(a, &.{.{ .kind = .void }}, &.{.{ .datum = corrupt }}, .{}));
 }

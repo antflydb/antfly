@@ -13712,7 +13712,7 @@ pub const SQLColumn = struct {
     }
 };
 
-/// Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client. Bytea results use PostgreSQL hex text (a backslash followed by x and lowercase hex digits) in JSON and opaque bytes in PostgreSQL binary format.
+/// Logical SQL result type. The void pseudotype uses an empty string for a non-NULL value and cannot be stored in table columns. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client. Bytea results use PostgreSQL hex text (a backslash followed by x and lowercase hex digits) in JSON and opaque bytes in PostgreSQL binary format.
 pub const SQLColumnType = enum {
     string,
     uuid,
@@ -13729,6 +13729,7 @@ pub const SQLColumnType = enum {
     tstzrange,
     enumeration,
     bytea,
+    void,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -13747,6 +13748,7 @@ pub const SQLColumnType = enum {
             .tstzrange => "tstzrange",
             .enumeration => "enumeration",
             .bytea => "bytea",
+            .void => "void",
         };
         try jw.write(s);
     }
@@ -13772,6 +13774,7 @@ pub const SQLColumnType = enum {
             .{ "tstzrange", .tstzrange },
             .{ "enumeration", .enumeration },
             .{ "bytea", .bytea },
+            .{ "void", .void },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

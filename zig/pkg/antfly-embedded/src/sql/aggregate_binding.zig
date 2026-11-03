@@ -526,6 +526,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
         column.* = .{ .name = try std.fmt.allocPrint(alloc, "$constant_{d}", .{index}), .type = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier, .enum_view = definition.enum_view, .domain_view = scalar.domainViewOf(definition), .temporal_kind = definition.temporal_kind, .nullable = definition.nullable };
     }
     for (columns[0..groups.len], input.projections[0..groups.len]) |*column, program| {
+        if (program.?.output_type.kind == .void) return error.SqlUndefinedFunction;
         column.type = program.?.output_type.kind orelse .string;
         column.element_type = program.?.output_type.element_type;
         column.numeric_modifier = program.?.output_type.numeric_modifier;
@@ -577,6 +578,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
         }
         const kind = if (node.call.within_group != null) operators.Aggregate.Kind.count else aggregateKind(node.call.name).?;
         const input_type = if (index) |slot| input.projections[slot].?.output_type.kind else null;
+        if (input_type == .void and node.call.distinct) return error.SqlUndefinedFunction;
         if (node.call.within_group != null and orderedKind(node.call.name).? == .continuous) if (input_type) |typed| {
             if (typed != .integer and typed != .number) return error.UndefinedSqlFunction;
         };
@@ -734,7 +736,10 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
         };
     }
     const orders = try alloc.alloc(scalar.Program, order_nodes.len);
-    for (order_nodes, orders) |node, *program| program.* = try scalar.bindWithSettings(alloc, node, columns, parameters, bind_limits, settings);
+    for (order_nodes, orders) |node, *program| {
+        program.* = try scalar.bindWithSettings(alloc, node, columns, parameters, bind_limits, settings);
+        if (program.output_type.kind == .void) return error.SqlUndefinedFunction;
+    }
     const having_program = if (having) |node| try scalar.bindExpectedWithSettings(alloc, node, columns, parameters, .boolean, bind_limits, settings) else null;
     if (having_program) |program| if (program.output_type.kind != null and program.output_type.kind != .boolean) return error.SqlTypeMismatch;
     for (builder.filters.items) |slot| if (slot) |index| {

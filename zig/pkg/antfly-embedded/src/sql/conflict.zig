@@ -370,9 +370,9 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
     for (binding.assignments) |optional| if (optional) |*program| {
         has_decisions = has_decisions or decision_eval.hasExternal(program);
     };
-    var ordered = if (binding.predicate) |*program| decision_eval.hasSequences(program) else false;
+    var ordered = if (binding.predicate) |*program| decision_eval.hasOrderedEffects(program) else false;
     for (binding.assignments) |optional| if (optional) |*program| {
-        ordered = ordered or decision_eval.hasSequences(program);
+        ordered = ordered or decision_eval.hasOrderedEffects(program);
     };
     var decision_arena = std.heap.ArenaAllocator.init(context.alloc);
     defer decision_arena.deinit();

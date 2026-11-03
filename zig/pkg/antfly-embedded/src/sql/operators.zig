@@ -597,6 +597,7 @@ pub const Aggregate = struct {
     };
 
     pub fn validate(kind: Kind, input_type: ?ast.ColumnType) !void {
+        if (input_type == .void and kind != .count) return if (kind == .array_agg) error.SqlArrayTypeNotFound else error.SqlUndefinedFunction;
         if ((kind == .sum or kind == .avg) and input_type != null and input_type != .integer and input_type != .number) return error.SqlTypeMismatch;
         if ((kind == .bool_and or kind == .bool_or) and input_type != null and input_type != .boolean) return error.SqlTypeMismatch;
         if (kind == .pattern_set and input_type != null and input_type != .string) return error.SqlTypeMismatch;
@@ -3447,6 +3448,7 @@ pub const Grouped = struct {
 
 pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
     try value.validateTemporal();
+    if (value.isVoid()) return value;
     if (value.bytes()) |bytes| {
         const owned = try alloc.create(@import("bytea_value.zig").Value);
         errdefer alloc.destroy(owned);

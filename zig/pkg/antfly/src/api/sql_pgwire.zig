@@ -1171,6 +1171,7 @@ const Job = struct {
             copy_filter = .{ .predicate = source.statement.copy_from.predicate.?, .parameter_count = source.parameter_count, .descriptors = self.request.copy_source_descriptors, .inputs = self.request.copy_source_inputs };
             effective.uses_current_setting = effective.uses_current_setting or source.uses_current_setting;
             effective.uses_sequences = effective.uses_sequences or source.uses_sequences;
+            effective.uses_advisory = effective.uses_advisory or source.uses_advisory;
         };
         const compiled = &effective;
         const write = self.kind == .execute and compiled.statement.requiresWriteAdmission();
@@ -2753,4 +2754,39 @@ test "SQL pgwire native trusted credential and identity allocation failures rele
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{ &server, token });
+}
+
+test "SQL pgwire native void public results retain OID nullness and both wire formats" {
+    const Harness = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn run(a: std.mem.Allocator) !void {
+            var marker: u8 = 0;
+            const backend: catalog.Backend = .{ .ptr = &marker, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = checkpoint } };
+            var compiled = try compiler.compile(a, "SELECT 'ignored'::void AS v, NULL::void AS n, coalesce(NULL::void, 'ignored'::void) AS c, 'ignored'::void || 'suffix' AS t", .{});
+            defer compiled.deinit();
+            var result = try native.execute(a, backend, &compiled, &.{}, .{ .native_result = true });
+            defer result.deinit();
+            var public = try native.execute(a, backend, &compiled, &.{}, .{});
+            defer public.deinit();
+            var owner: NativeResultCells = .{ .result = result };
+            try std.testing.expectEqual(@as(usize, 1), result.output.rowCount());
+            for (result.output.columns, 0..) |column, index| {
+                const kind = try wireType(column.type);
+                try std.testing.expectEqual(if (index < 3) wire.Type.void else wire.Type.string, kind);
+                try std.testing.expectEqual(@as(u32, if (index < 3) 2278 else 25), try wire_values.oid(kind));
+                const cell = try NativeResultCells.read(&owner, a, 0, index);
+                try std.testing.expectEqual(index == 1, cell.sql_null);
+                try std.testing.expectEqual(public.output.sql_nulls.?[0][index], cell.sql_null);
+                if (cell.sql_null) continue;
+                for ([_]u16{ 0, 1 }) |format| {
+                    var storage: [6]u8 = undefined;
+                    var output: std.Io.Writer = .fixed(&storage);
+                    try wire_values.encodeCellInto(a, &output, .{ .name = column.name, .type = kind }, format, cell, storage.len);
+                    try std.testing.expectEqualStrings(if (index < 3) "" else "suffix", output.buffered());
+                }
+            }
+        }
+    };
+    try Harness.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

@@ -1744,10 +1744,10 @@ pub const Stream = struct {
                     external = external or decisions.hasExternal(p);
                 };
                 // Stateful effects must follow row order across predicates and outputs.
-                if (self.context.binding.scalars.predicate) |*p| if (decisions.hasSequences(p)) {
+                if (self.context.binding.scalars.predicate) |*p| if (decisions.hasOrderedEffects(p)) {
                     external = false;
                 };
-                for (self.context.binding.scalars.projections) |optional| if (optional) |*p| if (decisions.hasSequences(p)) {
+                for (self.context.binding.scalars.projections) |optional| if (optional) |*p| if (decisions.hasOrderedEffects(p)) {
                     external = false;
                 };
                 const page_cells = if (external) chunk_cells else null;

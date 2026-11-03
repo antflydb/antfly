@@ -129,6 +129,7 @@ pub fn parameterFromOid(value: u32) !Parameter {
 
 pub fn oid(kind: Type) !u32 {
     return switch (kind) {
+        .void => 2278,
         .bytea => 17,
         .boolean => 16,
         .integer => 20,
@@ -387,6 +388,7 @@ fn encodeColumnUnchecked(a: std.mem.Allocator, writer: *std.Io.Writer, column: C
 pub fn fromOid(value: u32) !Type {
     return switch (value) {
         0 => .unknown,
+        2278 => .void,
         1082, 1083, 1266, 1114 => .datetime,
         3906 => .numrange,
         3912 => .daterange,
@@ -407,7 +409,7 @@ pub fn fromOid(value: u32) !Type {
 
 pub fn typeSize(kind: Type) i16 {
     return switch (kind) {
-        .enumeration => 4,
+        .enumeration, .void => 4,
         .boolean => 1,
         .uuid => 16,
         .integer, .number, .datetime => 8,
@@ -440,6 +442,10 @@ pub fn decodeNativeWithContext(alloc: std.mem.Allocator, param_oid: u32, format:
     const src = @import("antfly_local_sources");
     const descriptor = try parameterFromOid(param_oid);
     if (format > 1) return error.UnsupportedParameterFormat;
+    if (descriptor.kind == .void) {
+        _ = try decodeWithContext(alloc, param_oid, format, bytes, parent);
+        return src.sql_scalar.Datum.voidValue();
+    }
     if (descriptor.kind == .bytea) {
         const bytes_owned = try decodeByteaAlloc(alloc, format, bytes, parent);
         errdefer alloc.free(bytes_owned);
@@ -514,6 +520,11 @@ pub fn decodeWithContext(alloc: std.mem.Allocator, param_oid: u32, format: u16, 
     }
     const kind = try fromOid(param_oid);
     if (format > 1) return error.UnsupportedParameterFormat;
+    if (kind == .void) {
+        if (format == 1 and bytes.len != 0) return error.InvalidSqlBinaryRepresentation;
+        if (format == 0 and (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null)) return error.SqlInvalidCharacterEncoding;
+        return .{ .string = "" };
+    }
     const range_sources = @import("antfly_local_sources");
     if (range_sources.sql_range_value.kindFromType(kind)) |range_kind| {
         var range_context: range_sources.sql_range_value.Context = .{ .alloc = alloc, .parent = context, .max_input_bytes = context.max_input_bytes, .max_output_bytes = context.max_output_bytes };
@@ -642,6 +653,11 @@ pub fn integer(value: std.json.Value) !i64 {
 }
 
 pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json.Value) ![]const u8 {
+    if (kind == .void) {
+        if (format > 1) return error.UnsupportedResultFormat;
+        if (value != .string or value.string.len != 0) return error.InvalidResult;
+        return alloc.dupe(u8, "");
+    }
     if (kind == .bytea) {
         var output: std.Io.Writer.Allocating = .init(alloc);
         errdefer output.deinit();
@@ -671,7 +687,7 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
         else => if (value == .string) try alloc.dupe(u8, value.string) else try std.json.Stringify.valueAlloc(alloc, value, .{}),
     };
     return switch (kind) {
-        .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea => unreachable,
+        .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea, .void => unreachable,
         .array => error.InvalidResult,
         .boolean => if (value == .bool) try alloc.dupe(u8, &.{@intFromBool(value.bool)}) else error.InvalidResult,
         .integer => try encodeInteger(alloc, try integer(value)),
@@ -720,6 +736,11 @@ fn encodeRangeInto(a: std.mem.Allocator, writer: *std.Io.Writer, value: @import(
 }
 
 pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, format: u16, value: std.json.Value) !void {
+    if (kind == .void) {
+        if (format > 1) return error.UnsupportedResultFormat;
+        if (value != .string or value.string.len != 0) return error.InvalidResult;
+        return;
+    }
     if (kind == .bytea) {
         if (value != .string or format > 1) return error.InvalidResult;
         const bytes = try @import("antfly_local_sources").sql_scalar.Bytea.parseAlloc(a, value.string, 16 * 1024 * 1024);
@@ -737,7 +758,7 @@ pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
     if (format > 1) return error.UnsupportedResultFormat;
     if (format == 0) {
         switch (kind) {
-            .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea => unreachable,
+            .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea, .void => unreachable,
             .boolean => {
                 if (value != .bool) return error.InvalidResult;
                 try writer.writeAll(if (value.bool) "t" else "f");
@@ -761,7 +782,7 @@ pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
         return;
     }
     switch (kind) {
-        .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea => unreachable,
+        .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea, .void => unreachable,
         .array => return error.InvalidResult,
         .boolean => {
             if (value != .bool) return error.InvalidResult;
@@ -1627,4 +1648,27 @@ test "pgwire bytea parameters and result cells preserve opaque binary and canoni
         try std.testing.expectEqualSlices(u8, if (format == 0) "\\x00ff806869" else raw, out.written());
         try std.testing.expectError(error.ProgramLimitExceeded, encodeCellInto(alloc, &out.writer, .{ .name = "bytes", .type = .bytea }, format, .{ .bytea = input.bytes().?, .sql_null = false }, 1));
     }
+}
+
+test "pgwire void OID and zero byte text binary results preserve nonnull identity" {
+    const a = std.testing.allocator;
+    const scalar = @import("antfly_local_sources").sql_scalar;
+    try std.testing.expectEqual(Type.void, try fromOid(2278));
+    try std.testing.expectEqual(@as(u32, 2278), try parameterOid(try parameterFromOid(2278)));
+    try std.testing.expectEqual(@as(i16, 4), typeSize(.void));
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    for ([_]u16{ 0, 1 }) |format| {
+        const datum = try decodeNative(none.allocator(), 2278, format, if (format == 0) "ignored" else "");
+        try std.testing.expect(datum.isVoid() and !datum.sql_null);
+        var output: std.Io.Writer = .fixed(&.{});
+        try encodeInto(none.allocator(), &output, .void, format, datum.value);
+        try encodeCellInto(none.allocator(), &output, .{ .name = "v", .type = .void }, format, .{ .value = datum.value, .sql_null = false }, 0);
+        try std.testing.expectEqual(@as(usize, 0), output.buffered().len);
+        const encoded = try encode(a, .void, format, scalar.Datum.voidValue().value);
+        defer a.free(encoded);
+        try std.testing.expectEqual(@as(usize, 0), encoded.len);
+        try std.testing.expectError(error.InvalidResult, encodeInto(none.allocator(), &output, .void, format, .{ .string = "x" }));
+    }
+    try std.testing.expectError(error.InvalidSqlBinaryRepresentation, decodeNative(none.allocator(), 2278, 1, "x"));
+    try std.testing.expectError(error.SqlInvalidCharacterEncoding, decodeNative(none.allocator(), 2278, 0, "\xff"));
 }

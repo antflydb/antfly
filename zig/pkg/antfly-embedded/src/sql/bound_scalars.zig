@@ -514,6 +514,19 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
             for (select.order_by, orders) |order, *program| if (order.expression) |expression| {
                 program.* = try builder.program(expression, null);
             };
+            for (select.order_by, orders) |order, program| {
+                if (program) |bound| {
+                    if (bound.output_type.kind == .void) return error.SqlUndefinedFunction;
+                    continue;
+                }
+                if (order.position) |position| {
+                    if (position != 0 and position <= programs.len) if (programs[position - 1]) |bound| if (bound.output_type.kind == .void) return error.SqlUndefinedFunction;
+                } else {
+                    for (select.columns, programs) |projection, bound| {
+                        if (std.mem.eql(u8, order.field, projection.alias orelse projection.field)) if (bound) |item| if (item.output_type.kind == .void) return error.SqlUndefinedFunction;
+                    }
+                }
+            }
             out.orders = orders;
         },
         .update => |update| {

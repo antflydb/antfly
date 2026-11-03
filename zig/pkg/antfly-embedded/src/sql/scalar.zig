@@ -38,7 +38,7 @@ pub const PatternSet = struct {
 pub const Datum = struct {
     /// Immutable temporal payload owned by the pinned invocation/row region.
     /// The JSON null placeholder is never a temporal value or SQL NULL.
-    extension_kind: enum(u8) { none, patterns, temporal, range, enumeration, bytea } = .none,
+    extension_kind: enum(u8) { none, patterns, temporal, range, enumeration, bytea, void } = .none,
     // One tagged, pointer-sized extension; the discriminator fits existing
     // tail padding. Constructors/accessors are the only interpretation boundary.
     extension: ?*const anyopaque = null,
@@ -53,6 +53,12 @@ pub const Datum = struct {
     /// A missing JSON source member is distinct from a present JSON/SQL NULL.
     missing: bool = false,
 
+    pub fn voidValue() Datum {
+        return .{ .extension_kind = .void, .value = .{ .string = "" }, .sql_null = false };
+    }
+    pub fn isVoid(self: Datum) bool {
+        return self.extension_kind == .void;
+    }
     pub fn fromJson(value: Json) Datum {
         return .{ .value = value, .sql_null = value == .null };
     }
@@ -102,7 +108,8 @@ pub const Datum = struct {
         return result;
     }
     pub fn validateTemporal(self: Datum) !void {
-        if ((self.extension_kind == .none) != (self.extension == null)) return error.SqlTypeMismatch;
+        if ((self.extension_kind == .none or self.isVoid()) != (self.extension == null)) return error.SqlTypeMismatch;
+        if (self.isVoid() and (self.sql_null or self.numeric != null or self.array != null or self.value != .string or self.value.string.len != 0)) return error.SqlTypeMismatch;
         if (self.bytes() != null) {
             if (self.sql_null or self.numeric != null or self.array != null or self.value != .null) return error.SqlTypeMismatch;
         }
@@ -527,7 +534,7 @@ pub fn assignmentSourceIdentity(kind: ast.ColumnType, element: ?arrays.ElementTy
         .string => .text,
         .uuid => .uuid,
         .json => .jsonb,
-        .datetime, .array, .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea => null,
+        .datetime, .array, .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea, .void => null,
     };
 }
 /// Preparation-only named identity lookup. Implementations return immutable
@@ -555,7 +562,7 @@ pub const BindLimits = struct {
     input_steps: usize = @import("resource_limits.zig").preparation_bytes,
 };
 const decisions = @import("../functions/decisions.zig");
-pub const DecisionDemand = struct { instruction: u32, function: decisions.Function, args: []const Json };
+pub const DecisionDemand = struct { instruction: u32, destination: ?*?Datum = null, function: decisions.Function, args: []const Json };
 pub const ColumnRead = enum { value, identity, missing };
 pub const ColumnLoader = struct {
     context: *anyopaque,
@@ -569,6 +576,29 @@ pub const OutputColumnLoader = struct {
     context: *anyopaque,
     read: *const fn (*anyopaque, Allocator, u32) anyerror!?[]const u8,
     normalized: ?*const fn (*anyopaque, u32) anyerror!?NormalizedOutput = null,
+};
+/// One invocation's suspended-call cache. Child frames have stable addresses
+/// and are created only for executed routine calls with external effects.
+pub const CallFrames = struct {
+    const Key = struct { parent: usize, instruction: u32 };
+    pub const Frame = struct { id: usize, program: *const Program, values: []?Datum };
+    frames: std.AutoHashMapUnmanaged(Key, *Frame) = .empty,
+    pub fn child(self: *CallFrames, a: Allocator, parent: usize, instruction: u32, program: *const Program) !*Frame {
+        const key: Key = .{ .parent = parent, .instruction = instruction };
+        const entry = try self.frames.getOrPut(a, key);
+        if (entry.found_existing) {
+            if (entry.value_ptr.*.program != program) return error.InvalidSqlProgram;
+            return entry.value_ptr.*;
+        }
+        errdefer _ = self.frames.remove(key);
+        const frame = try a.create(Frame);
+        errdefer a.destroy(frame);
+        const values = try a.alloc(?Datum, program.instructions.len);
+        @memset(values, null);
+        frame.* = .{ .id = self.frames.count(), .program = program, .values = values };
+        entry.value_ptr.* = frame;
+        return frame;
+    }
 };
 pub const EvalLimits = struct {
     /// Invocation-owned I/O for volatile functions. Never cache this in a
@@ -595,6 +625,11 @@ pub const EvalLimits = struct {
     effect_work: ?*@import("numeric_value.zig").Context = null,
     effect_bytes: ?*usize = null,
     sequence_provider: ?@import("sequence_effects.zig").Provider = null,
+    advisory_provider: ?@import("advisory_effects.zig").Provider = null,
+    advisory_values: ?[]?Datum = null,
+    call_frames: ?*CallFrames = null,
+    call_frame_id: usize = 0,
+    advisory_demand: ?*?@import("advisory_effects.zig").Demand = null,
     sequence_values: ?[]?Datum = null,
     sequence_demand: ?*?@import("sequence_effects.zig").Demand = null,
     /// Successful volatile calls survive a suspended demand, without sharing
@@ -721,6 +756,17 @@ pub const Function = enum {
     upper_inc,
     lower_inf,
     upper_inf,
+    pg_advisory_lock,
+    pg_advisory_lock_shared,
+    pg_try_advisory_lock,
+    pg_try_advisory_lock_shared,
+    pg_advisory_unlock,
+    pg_advisory_unlock_shared,
+    pg_advisory_unlock_all,
+    pg_advisory_xact_lock,
+    pg_advisory_xact_lock_shared,
+    pg_try_advisory_xact_lock,
+    pg_try_advisory_xact_lock_shared,
     nextval,
     currval,
     lastval,
@@ -731,6 +777,7 @@ pub const Function = enum {
     soundex,
     difference,
     pub fn volatility(self: Function) Volatility {
+        if (@import("advisory_effects.zig").function(@tagName(self)) != null) return .@"volatile";
         return switch (self) {
             .@"$routine", .ai_decide, .ai_choice, .ai_score, .ai_probability, .gen_random_uuid, .uuidv7, .nextval, .currval, .lastval, .setval => .@"volatile",
             .now, .transaction_timestamp, .@"$current_timestamp", .@"$current_date", .@"$current_user", .current_setting, .date_part, .extract, .date_trunc, .to_jsonb, .jsonb_build_object, .concat, .concat_ws => .stable,
@@ -1208,10 +1255,25 @@ const ConstantPool = struct {
 };
 
 pub const Program = struct {
+    pub fn orderedEffects(self: Program) bool {
+        return self.uses_sequences or self.uses_advisory or self.uses_nested_ordered_effects;
+    }
+    pub fn externalEffects(self: Program) bool {
+        if (self.bound_external_effects) |effects| return effects;
+        if (self.orderedEffects() or self.uses_nested_effects) return true;
+        for (self.instructions) |instruction| if (instruction.operation == .call and decisions.descriptor(@tagName(instruction.operation.call.function)) != null) return true;
+        return false;
+    }
+    /// Bound once with the immutable instruction vector. Hand-built programs
+    /// retain the scanning fallback, while row execution has an O(1) check.
+    bound_external_effects: ?bool = null,
     domain_registry: ?domain_values.Registry = null,
     decimal_plan: ?@import("decimal_program.zig").Plan = null,
     arena: *std.heap.ArenaAllocator,
     uses_sequences: bool = false,
+    uses_advisory: bool = false,
+    uses_nested_effects: bool = false,
+    uses_nested_ordered_effects: bool = false,
     sequence_references: std.AutoHashMapUnmanaged(u32, @import("sequence_effects.zig").Reference) = .empty,
     instructions: []const Instruction,
     root: u32,
@@ -1898,7 +1960,7 @@ pub fn assignNumeric(alloc: Allocator, datum: Datum, source_identity: ?arrays.El
 pub fn normalizeParameterType(descriptor: Type) !Type {
     try validateParameterType(descriptor);
     var result = descriptor;
-    if (result.kind != null and result.kind != .datetime and result.kind != .enumeration and result.kind != .bytea and @import("range_value.zig").kindFromType(result.kind.?) == null and result.element_type == null) result.element_type = try parameterElementType(result);
+    if (result.kind != null and result.kind != .datetime and result.kind != .enumeration and result.kind != .bytea and result.kind != .void and @import("range_value.zig").kindFromType(result.kind.?) == null and result.element_type == null) result.element_type = try parameterElementType(result);
     return result;
 }
 
@@ -1967,11 +2029,18 @@ fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []c
     const parameter_types = try binder.alloc.alloc(?ast.ColumnType, parameter_descriptors.len);
     for (parameter_types, parameter_descriptors) |*kind, descriptor| kind.* = descriptor.kind;
     const required_columns = try binder.dependencies.toOwnedSlice(binder.alloc);
+    const external_effects = binder.uses_sequences or binder.uses_advisory or binder.uses_nested_effects or for (instructions) |instruction| {
+        if (instruction.operation == .call and decisions.descriptor(@tagName(instruction.operation.call.function)) != null) break true;
+    } else false;
     var program: Program = .{
+        .bound_external_effects = external_effects,
         .domain_registry = domain_registry,
         .arena = arena,
         .instructions = instructions,
         .uses_sequences = binder.uses_sequences,
+        .uses_advisory = binder.uses_advisory,
+        .uses_nested_effects = binder.uses_nested_effects,
+        .uses_nested_ordered_effects = binder.uses_nested_ordered_effects,
         .sequence_references = binder.sequence_references,
         .root = root,
         .output_type = output_type,
@@ -2860,6 +2929,7 @@ fn arrayElementType(kind: ast.ColumnType) !arrays.ElementType {
         .number => .float64,
         .boolean => .boolean,
         .json => .jsonb,
+        .void => error.SqlArrayTypeNotFound,
         .datetime, .array, .numrange, .daterange, .tsrange, .tstzrange, .enumeration, .bytea => error.UnsupportedSqlShape,
     };
 }
@@ -3396,6 +3466,10 @@ test "SQL scalar regex functions preserve PostgreSQL values OIDs NULLs and error
 }
 
 fn arity(function: Function, count: usize) !void {
+    if (@import("advisory_effects.zig").function(@tagName(function))) |advisory| {
+        if (!advisory.validArity(count)) return error.SqlUndefinedFunction;
+        return;
+    }
     if (rangeConstructor(function) != null) {
         if (count != 2 and count != 3) return error.SqlUndefinedFunction;
         return;
@@ -3409,6 +3483,7 @@ fn arity(function: Function, count: usize) !void {
         return;
     }
     const valid = switch (function) {
+        .pg_advisory_lock, .pg_advisory_lock_shared, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_advisory_unlock_all, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared => unreachable,
         .@"$routine" => false,
         .numrange, .daterange, .tsrange, .tstzrange, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => unreachable,
         .convert_from, .convert_to => count == 2,
@@ -3466,6 +3541,9 @@ const Binder = struct {
     explicit_arrays: std.AutoHashMapUnmanaged(*const ast.Scalar, arrays.ElementType) = .empty,
     instructions: std.ArrayList(Instruction) = .empty,
     uses_sequences: bool = false,
+    uses_advisory: bool = false,
+    uses_nested_effects: bool = false,
+    uses_nested_ordered_effects: bool = false,
     sequence_references: std.AutoHashMapUnmanaged(u32, @import("sequence_effects.zig").Reference) = .empty,
     translations: std.AutoHashMapUnmanaged(u32, *const TextTranslation) = .empty,
     dependencies: std.ArrayList(u32) = .empty,
@@ -3614,6 +3692,10 @@ const Binder = struct {
                     rebound.* = .{ .cast = value };
                     break :blk try self.infer(rebound, depth + 1);
                 }
+                if (cast.type == .void or source.kind == .void) {
+                    if (cast.type != source.kind and cast.type != .string and source.kind != .string and source.kind != null) return error.SqlCannotCoerce;
+                    break :blk .{ .kind = cast.type, .element_type = if (cast.type == .string) .text else null, .nullable = source.nullable };
+                }
                 if (cast.type == .bytea or source.kind == .bytea) {
                     if (cast.type != source.kind and cast.type != .string and source.kind != .string and source.kind != null) return error.SqlCannotCoerce;
                     break :blk .{ .kind = cast.type, .nullable = source.nullable };
@@ -3699,6 +3781,10 @@ const Binder = struct {
                 const json_domain = jsonUnknownOperandDomain(left, right, binary.left, binary.right);
                 if (json_domain == null and ((left.kind == .json and right.kind == .string) or
                     (right.kind == .json and left.kind == .string))) return error.SqlUndefinedFunction;
+                if (left.kind == .void or right.kind == .void) {
+                    if (binary.op == .concat and ((left.kind == .void and right.kind == .string) or (right.kind == .void and left.kind == .string))) break :blk .{ .kind = .string, .element_type = .text, .nullable = left.nullable or right.nullable };
+                    return error.SqlUndefinedFunction;
+                }
                 const merged = (try enumBinaryDomain(binary, left, right)) orelse json_domain orelse try common(left, right);
                 switch (binary.op) {
                     .add, .subtract, .multiply, .divide, .modulo => {
@@ -3730,6 +3816,15 @@ const Binder = struct {
                     break :blk (try self.resolveCallable(call.name, call.args, call.operator, depth + 1)).output;
                 };
                 try arity(function, call.args.len);
+                if (@import("advisory_effects.zig").function(@tagName(function))) |advisory| {
+                    for (call.args) |arg| {
+                        const input = try self.infer(arg, depth + 1);
+                        const unknown = arg.* == .literal and arg.literal == .string;
+                        if (input.kind != null and input.kind != .integer and !unknown) return error.SqlUndefinedFunction;
+                        if (call.args.len == 2 and input.kind == .integer and input.element_type == .int64) return error.SqlUndefinedFunction;
+                    }
+                    break :blk .{ .kind = if (advisory.booleanResult()) .boolean else .void, .nullable = call.args.len != 0 };
+                }
                 if (@import("sequence_effects.zig").function(@tagName(function)) != null) {
                     for (call.args, 0..) |arg, ordinal| {
                         const input = try self.infer(arg, depth + 1);
@@ -3954,6 +4049,7 @@ const Binder = struct {
                     }
                     if (element.kind == null and unknown_text) element.kind = .string;
                     if (element.kind == .array) break :blk .{ .kind = .array, .nullable = false, .element_type = element.element_type, .numeric_modifier = try self.commonModifier(call.args, depth) };
+                    if (element.kind == .void) return error.SqlArrayTypeNotFound;
                     var kind = try arrayElementType(element.kind orelse .string);
                     if (element.kind == .number and element.element_type != null) kind = element.element_type.?;
                     if (element.kind == .integer) {
@@ -4112,6 +4208,7 @@ const Binder = struct {
                             continue;
                         }
                         const actual = try self.infer(arg, depth + 1);
+                        if (function == .nullif and actual.kind == .void) return error.SqlUndefinedFunction;
                         merged = if (!common_started) actual else try common(merged, actual);
                         common_started = true;
                     },
@@ -4119,6 +4216,7 @@ const Binder = struct {
                         _ = try self.infer(arg, depth + 1);
                     },
                 }
+                if ((function == .greatest or function == .least) and merged.kind == .void) return error.SqlUndefinedFunction;
                 if (function == .nullif) {
                     const left = try self.infer(call.args[0], depth + 1);
                     const right = try self.infer(call.args[1], depth + 1);
@@ -4226,6 +4324,7 @@ const Binder = struct {
                 var merged = try self.infer(list.operand, depth + 1);
                 for (list.values) |item| {
                     const item_type = try self.infer(item, depth + 1);
+                    if (merged.kind == .void or item_type.kind == .void) return error.SqlUndefinedFunction;
                     try arrayOperator(merged, item_type);
                     merged = enumUnknownOperandDomain(merged, item_type, list.operand, item) orelse try common(merged, item_type);
                 }
@@ -4307,6 +4406,8 @@ const Binder = struct {
             try self.instructions.append(self.alloc, .{ .type = .{ .kind = .boolean, .element_type = .boolean, .nullable = false }, .operation = .{ .literal = .{ .bool = context == .explicit } } });
         }
         const result: u32 = @intCast(self.instructions.items.len);
+        self.uses_nested_effects = self.uses_nested_effects or function.program.externalEffects();
+        self.uses_nested_ordered_effects = self.uses_nested_ordered_effects or function.program.orderedEffects();
         try self.instructions.append(self.alloc, .{ .type = function.output, .operation = .{ .call = .{ .function = .@"$routine", .args = args, .routine = function } } });
         return result;
     }
@@ -4386,6 +4487,8 @@ const Binder = struct {
             const function = functionId(call.name) catch |err| {
                 if (err == error.SqlUndefinedFunction and self.limits.routines == null and (self.limits.invocation == null or self.limits.invocation.?.routine_resolver == null)) return err;
                 const routine = try self.resolveCallable(call.name, call.args, call.operator, depth + 1);
+                self.uses_nested_effects = self.uses_nested_effects or routine.program.externalEffects();
+                self.uses_nested_ordered_effects = self.uses_nested_ordered_effects or routine.program.orderedEffects();
                 const args = try self.alloc.alloc(u32, call.args.len);
                 for (call.args, args, routine.arguments) |arg, *out, target| {
                     const cast = try self.alloc.create(ast.Scalar);
@@ -4394,6 +4497,15 @@ const Binder = struct {
                 }
                 break :blk .{ .call = .{ .function = .@"$routine", .args = args, .routine = routine } };
             };
+            if (@import("advisory_effects.zig").function(@tagName(function)) != null) {
+                const args = try self.alloc.alloc(u32, call.args.len);
+                for (call.args, args) |arg, *out| {
+                    const coercion = try self.alloc.create(ast.Scalar);
+                    coercion.* = .{ .cast = .{ .operand = arg, .type = .integer, .element_type = if (call.args.len == 2) .int32 else .int64, .coercion = .function, .context = .implicit } };
+                    out.* = try self.compileTypedContext(coercion, .integer, coercion.cast.element_type, null, depth + 1);
+                }
+                break :blk .{ .call = .{ .function = function, .args = args } };
+            }
             if (@import("sequence_effects.zig").function(@tagName(function)) != null) {
                 try arity(function, call.args.len);
                 const args = try self.alloc.alloc(u32, call.args.len);
@@ -4831,6 +4943,11 @@ const Binder = struct {
                 if (binary.op == .json_get or binary.op == .json_text) break :blk .{ .binary = .{ .op = binary.op, .left = try self.compile(binary.left, .json, depth + 1), .right = try self.compile(binary.right, .string, depth + 1) } };
                 const left_type = try self.infer(binary.left, depth + 1);
                 const right_type = try self.infer(binary.right, depth + 1);
+                if (binary.op == .concat and (left_type.kind == .void or right_type.kind == .void)) {
+                    const converted = try self.alloc.create(ast.Scalar);
+                    converted.* = .{ .cast = .{ .operand = if (left_type.kind == .void) binary.left else binary.right, .type = .string, .element_type = .text } };
+                    break :blk .{ .binary = .{ .op = .concat, .left = try self.compile(if (left_type.kind == .void) converted else binary.left, .string, depth + 1), .right = try self.compile(if (right_type.kind == .void) converted else binary.right, .string, depth + 1) } };
+                }
                 if (try temporalArithmetic(binary.op, left_type, right_type)) |_| break :blk .{ .binary = .{
                     .op = binary.op,
                     .left = try self.compileTypedContext(binary.left, left_type.kind, left_type.element_type, left_type.temporal_kind, depth + 1),
@@ -4881,6 +4998,7 @@ const Binder = struct {
         const index: u32 = @intCast(self.instructions.items.len);
         try self.instructions.append(self.alloc, instruction);
         if (instruction.operation == .call and @import("sequence_effects.zig").function(@tagName(instruction.operation.call.function)) != null) self.uses_sequences = true;
+        if (instruction.operation == .call and @import("advisory_effects.zig").function(@tagName(instruction.operation.call.function)) != null) self.uses_advisory = true;
         if (!self.allow_unresolved and self.uses_sequences and instruction.operation == .call and @import("sequence_effects.zig").function(@tagName(instruction.operation.call.function)) != null and expression.* == .call and expression.call.args.len != 0) {
             const name = expression.call.args[0];
             if (name.* == .literal and name.literal == .string) {
@@ -5338,6 +5456,14 @@ const Evaluator = struct {
                     if (cast.type != .enumeration) return error.InvalidSqlProgram;
                     break :blk try @import("describe.zig").coerceDatumTyped(self.alloc, datum, .{ .kind = .enumeration, .enum_view = view });
                 }
+                if (cast.type == .void) {
+                    if (!datum.isVoid() and datum.value != .string) return error.SqlCannotCoerce;
+                    break :blk Datum.voidValue();
+                }
+                if (datum.isVoid()) {
+                    if (cast.type != .string) return error.SqlCannotCoerce;
+                    break :blk Datum.json(.{ .string = "" });
+                }
                 if (datum.bytes()) |bytes| {
                     if (cast.type == .bytea) break :blk datum;
                     if (cast.type != .string) return error.SqlCannotCoerce;
@@ -5574,7 +5700,21 @@ const Evaluator = struct {
                     // alias another program's suspended-effect cache.
                     callee.limits.volatile_values = null;
                     callee.limits.sequence_values = null;
+                    callee.limits.advisory_values = null;
                     callee.limits.decision_values = null;
+                    if (routine.program.externalEffects()) {
+                        if (self.limits.call_frames) |frames| {
+                            const count = frames.frames.count();
+                            const frame = try frames.child(self.alloc, self.limits.call_frame_id, index, routine.program);
+                            if (frames.frames.count() != count) try self.charge(@sizeOf(CallFrames.Frame) +| frame.values.len *| @sizeOf(?Datum));
+                            callee.limits.call_frame_id = frame.id;
+                            callee.limits.volatile_values = frame.values;
+                            callee.limits.sequence_values = frame.values;
+                            callee.limits.advisory_values = frame.values;
+                            callee.limits.decision_values = frame.values;
+                        }
+                    }
+
                     defer {
                         self.bytes = callee.bytes;
                         self.input_bytes = callee.input_bytes;
@@ -5583,6 +5723,19 @@ const Evaluator = struct {
                     break :blk try callee.runDatum(routine.program.root, depth + 1);
                 }
                 if (call.function == .@"$routine") return error.InvalidSqlProgram;
+                if (@import("advisory_effects.zig").function(@tagName(call.function))) |advisory| {
+                    if (self.limits.advisory_values) |values| if (values[index]) |value| break :blk value;
+                    for (call.args) |arg| if (self.literalNull(arg)) break :blk .{};
+                    const args = try self.alloc.alloc(Datum, call.args.len);
+                    var null_argument = false;
+                    for (call.args, args) |arg, *value| {
+                        value.* = try self.runDatum(arg, depth + 1);
+                        null_argument = null_argument or value.sql_null;
+                    }
+                    if (null_argument) break :blk .{};
+                    if (self.limits.advisory_demand) |pending| pending.* = .{ .instruction = index, .destination = if (self.limits.advisory_values) |values| &values[index] else null, .function = advisory, .args = args };
+                    return error.AdvisoryNotEvaluated;
+                }
                 if (@import("sequence_effects.zig").function(@tagName(call.function))) |sequence_function| {
                     if (self.limits.sequence_values) |values| if (values[index]) |value| break :blk value;
                     // PostgreSQL simplifies strict calls with a constant NULL
@@ -5596,7 +5749,7 @@ const Evaluator = struct {
                         null_argument = null_argument or value.sql_null;
                     }
                     if (null_argument) break :blk .{};
-                    if (self.limits.sequence_demand) |pending| pending.* = .{ .instruction = index, .function = sequence_function, .reference = self.program.sequence_references.get(index), .args = args };
+                    if (self.limits.sequence_demand) |pending| pending.* = .{ .instruction = index, .destination = if (self.limits.sequence_values) |values| &values[index] else null, .function = sequence_function, .reference = self.program.sequence_references.get(index), .args = args };
                     return error.SequenceNotEvaluated;
                 }
 
@@ -5799,7 +5952,7 @@ const Evaluator = struct {
                         if (value.sql_null) break :blk .{};
                         out.* = value.value;
                     }
-                    if (self.limits.decision_demand) |demand| demand.* = .{ .instruction = index, .function = desc.function, .args = args };
+                    if (self.limits.decision_demand) |demand| demand.* = .{ .instruction = index, .destination = if (self.limits.decision_values) |values| @constCast(&values[index]) else null, .function = desc.function, .args = args };
                     return error.DecisionNotEvaluated;
                 }
                 if (call.function == .@"$current_user") {
@@ -6232,6 +6385,11 @@ const Evaluator = struct {
             _ = try builtin_cast.checkedInteger(result.value.integer, kind);
         };
         if (!result.sql_null and result.value == .float and instruction.type.element_type == .float32) result.value = .{ .float = try builtin_cast.floatValue(f32, result.value) };
+        if (instruction.type.kind == .void and !result.sql_null and !result.isVoid()) {
+            if (result.value != .string or result.value.string.len != 0 or result.extension_kind != .none or result.numeric != null or result.array != null) return error.SqlTypeMismatch;
+            result = Datum.voidValue();
+        }
+        if (result.isVoid() and instruction.type.kind != .void) return error.SqlTypeMismatch;
         try result.validateTemporal();
         if (instruction.type.enum_view != null) {
             result = try @import("describe.zig").coerceDatumTyped(self.alloc, result, instruction.type);
@@ -6358,6 +6516,7 @@ const Evaluator = struct {
         if (value == .null) return .null;
         return switch (kind) {
             .numrange, .daterange, .tsrange, .tstzrange => error.InvalidSqlProgram,
+            .void => if (value == .string) .{ .string = "" } else error.SqlTypeMismatch,
             .array, .enumeration, .bytea => error.SqlTypeMismatch,
             .integer => switch (value) {
                 .integer => value,
@@ -7736,6 +7895,7 @@ pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budg
     try work.consume(1);
     try left.validateTemporal();
     try right.validateTemporal();
+    if (left.isVoid() or right.isVoid()) return error.SqlUndefinedFunction;
     if (left.sql_null or right.sql_null) return if (left.sql_null == right.sql_null) .eq else if (left.sql_null) .gt else .lt;
     if (left.bytes()) |bytes| {
         const other = right.bytes() orelse return error.SqlTypeMismatch;

@@ -325,6 +325,15 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // consistent failure/leak attribution, this keeps compile-only anonymous
     // reachability anchors out of runtime selection.
     const run_sql_tests = addFilteredTestRunArtifact(b, sql_tests);
+    const advisory_effect_tests = b.addTest(.{
+        .name = "sql-advisory-effect-tests",
+        .root_module = sql_test_mod,
+        .filters = &.{"SQL advisory"},
+    });
+    const run_advisory_effects = addFilteredTestRunArtifact(b, advisory_effect_tests);
+    run_advisory_effects.addArg("--require-no-skips");
+    b.step("sql-advisory-effects-test", "Verify typed void and ordered lazy advisory effects")
+        .dependOn(&run_advisory_effects.step);
     const prepared_control_tests = b.addTest(.{
         .name = "sql-prepared-control-tests",
         .root_module = sql_test_mod,

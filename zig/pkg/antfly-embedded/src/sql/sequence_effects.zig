@@ -44,6 +44,7 @@ pub const Provider = struct {
 };
 pub const Demand = struct {
     instruction: u32,
+    destination: ?*?scalar.Datum = null,
     function: Function,
     reference: ?Reference,
     args: []const scalar.Datum,

@@ -375,10 +375,10 @@ pub const Candidates = struct {
         if (source.count() > max_rows) return error.SqlResultTooLarge;
         var ordered = source == .one;
         for (self.arms) |arm| {
-            if (arm.predicate) |*program| ordered = ordered or decision_eval.hasSequences(program);
+            if (arm.predicate) |*program| ordered = ordered or decision_eval.hasOrderedEffects(program);
             switch (arm.action) {
                 .insert, .update => |items| for (items) |assignment| {
-                    if (assignment.program) |*program| ordered = ordered or decision_eval.hasSequences(program);
+                    if (assignment.program) |*program| ordered = ordered or decision_eval.hasOrderedEffects(program);
                 },
                 .delete, .nothing => {},
             }

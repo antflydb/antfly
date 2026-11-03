@@ -5,10 +5,10 @@ at `1bb04dd0b9` (2026-10-27). This is an implementation and qualification
 backlog, not a completion claim. PostgreSQL is the SQL standard and independent
 oracle.
 
-## Current original-case qualification (2026-11-01)
+## Current original-case qualification (2026-11-02)
 
-The ledger records **911 implemented / 138 rejected / 449 superseded /
-88 unresolved**, including **64 unresolved DDL/catalog cases**. The immutable
+The ledger records **912 implemented / 138 rejected / 449 superseded /
+87 unresolved**, including **64 unresolved DDL/catalog cases**. The immutable
 inventory still contains the same 1,586 originals. The ledger is authoritative;
 counts in earlier checkpoints below describe their recorded historical state.
 

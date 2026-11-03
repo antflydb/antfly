@@ -21,7 +21,7 @@ const decisions = @import("../functions/decisions.zig");
 pub fn limitsFor(backend: @import("catalog.zig").Backend) scalar.EvalLimits {
     const checkpoint = if (backend.scalar_control) |control| control.checkpoint else null;
     const context = if (backend.scalar_control) |control| control.ptr else null;
-    return .{ .sequence_provider = backend.sequence_provider, .execution_io = backend.execution_io, .clock_values = backend.clock_values, .regex_execution = backend.regex_execution, .regex_checkpoint = checkpoint, .regex_context = context, .checkpoint = checkpoint, .checkpoint_context = context };
+    return .{ .sequence_provider = backend.sequence_provider, .advisory_provider = backend.advisory_provider, .execution_io = backend.execution_io, .clock_values = backend.clock_values, .regex_execution = backend.regex_execution, .regex_checkpoint = checkpoint, .regex_context = context, .checkpoint = checkpoint, .checkpoint_context = context };
 }
 /// Single-source reads route by their bound physical identity. Mutations route
 /// by the target. Multi-source reads use the provider's general routing policy;
@@ -189,7 +189,7 @@ fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionPr
     // SQL sequence effects are ordered per row, not by demand wave or output
     // column. Keep AI batching for ordinary programs and use the same lazy VM
     // for the smaller effect-bearing subset.
-    if (rows.len > 1) for (programs) |program| if (hasSequences(program)) {
+    if (rows.len > 1) for (programs) |program| if (hasOrderedEffects(program)) {
         const result = try a.alloc(scalar.Datum, rows.len);
         for (rows, programs, result, 0..) |cells, item, *out, ordinal|
             out.* = (try evaluateInvocationsCore(a, provider, &.{item}, &.{cells}, parameters, if (prepared) |bound| bound[ordinal..][0..1] else null, base_limits))[0];
@@ -203,6 +203,11 @@ fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionPr
         row.* = try a.alloc(?scalar.Datum, program.instructions.len);
         @memset(row.*, null);
     }
+    const nested = for (programs) |program| {
+        if (program.uses_nested_effects) break true;
+    } else false;
+    const frames: []scalar.CallFrames = if (nested) try a.alloc(scalar.CallFrames, rows.len) else &.{};
+    for (frames) |*frame| frame.* = .{};
     const work = try a.alloc(@import("numeric_value.zig").Context, rows.len);
     const bytes = try a.alloc(usize, rows.len);
     @memset(bytes, 0);
@@ -211,28 +216,43 @@ fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionPr
     while (remaining > 0) {
         var requests: std.ArrayList(decisions.Request) = .empty;
         var demands: std.ArrayList(struct { row: usize, demand: scalar.DecisionDemand }) = .empty;
-        var sequence_progress = false;
+        var effect_progress = false;
         for (rows, programs, 0..) |cells, program, i| {
             if (ready[i]) continue;
             var sequence_demand: ?@import("sequence_effects.zig").Demand = null;
+            var advisory_demand: ?@import("advisory_effects.zig").Demand = null;
             var demand: ?scalar.DecisionDemand = null;
             var limits = base_limits;
             limits.effect_work = &work[i];
+            if (nested) limits.call_frames = &frames[i];
             limits.effect_bytes = &bytes[i];
             limits.sequence_demand = &sequence_demand;
             limits.sequence_values = values[i];
+            limits.advisory_demand = &advisory_demand;
+            limits.advisory_values = values[i];
             limits.volatile_values = values[i];
             limits.decision_values = values[i];
             limits.decision_demand = &demand;
             const evaluated = if (prepared) |bound| bound[i].evaluate(a, cells, limits) else program.evaluate(a, cells, parameters, limits);
             const value = evaluated catch |err| {
+                if (err == error.AdvisoryNotEvaluated) {
+                    const pending = advisory_demand orelse return error.InvalidSqlProgram;
+                    const active = limits.advisory_provider orelse return error.AdvisoryProviderUnavailable;
+                    try work[i].poll();
+                    const issued = try active.invoke(active.ptr, a, pending.function, pending.args);
+                    issued.validateTemporal() catch return error.InvalidSqlBackendResponse;
+                    if (issued.sql_null or issued.missing or (if (pending.function.booleanResult()) issued.extension_kind != .none or issued.numeric != null or issued.array != null or issued.value != .bool else !issued.isVoid())) return error.InvalidSqlBackendResponse;
+                    (pending.destination orelse &values[i][pending.instruction]).* = issued;
+                    effect_progress = true;
+                    continue;
+                }
                 if (err == error.SequenceNotEvaluated) {
                     const pending = sequence_demand orelse return error.InvalidSqlProgram;
                     const active = limits.sequence_provider orelse return error.SequenceProviderUnavailable;
-                    try work[i].charge(0);
+                    try work[i].poll();
                     const issued = try active.invoke(active.ptr, a, pending.function, pending.reference, pending.args);
-                    values[i][pending.instruction] = scalar.Datum.json(.{ .integer = issued });
-                    sequence_progress = true;
+                    (pending.destination orelse &values[i][pending.instruction]).* = scalar.Datum.json(.{ .integer = issued });
+                    effect_progress = true;
                     continue;
                 }
                 if (err != error.DecisionNotEvaluated) return err;
@@ -250,12 +270,13 @@ fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionPr
             remaining -= 1;
         }
         if (requests.items.len == 0) {
-            if (remaining != 0 and sequence_progress) continue;
+            if (remaining != 0 and effect_progress) continue;
             if (remaining != 0) return error.InvalidSqlProgram;
             break;
         }
+        for (demands.items) |pending| try work[pending.row].poll();
         const results = try provider.?.evaluateBatch(a, requests.items);
-        for (demands.items, results) |pending, result| values[pending.row][pending.demand.instruction] = scalar.Datum.json(try decisions.selectResult(pending.demand.function, result));
+        for (demands.items, results) |pending, result| (pending.demand.destination orelse &values[pending.row][pending.demand.instruction]).* = scalar.Datum.json(try decisions.selectResult(pending.demand.function, result));
     }
     return output;
 }
@@ -267,7 +288,7 @@ pub fn evaluateProgramsBatch(a: std.mem.Allocator, provider: ?decisions.Decision
 pub fn evaluateProgramsBatchWithLimits(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value, limits: scalar.EvalLimits) ![]const []const scalar.Datum {
     const output = try a.alloc([]scalar.Datum, rows.len);
     for (output) |*row| row.* = try a.alloc(scalar.Datum, programs.len);
-    if (hasSequencePrograms(programs)) {
+    if (hasOrderedEffectPrograms(programs)) {
         for (rows, output) |cells, result| for (programs, result) |*program, *value| {
             value.* = try evaluateWithLimits(a, provider, program, cells, parameters, limits);
         };
@@ -277,8 +298,8 @@ pub fn evaluateProgramsBatchWithLimits(a: std.mem.Allocator, provider: ?decision
     }
     return output;
 }
-pub fn hasSequencePrograms(programs: []const scalar.Program) bool {
-    for (programs) |*program| if (hasSequences(program)) return true;
+pub fn hasOrderedEffectPrograms(programs: []const scalar.Program) bool {
+    for (programs) |*program| if (hasOrderedEffects(program)) return true;
     return false;
 }
 pub fn hasExternalPrograms(programs: []const scalar.Program) bool {
@@ -304,14 +325,12 @@ pub fn evaluatePreparedWithLimits(a: std.mem.Allocator, provider: ?decisions.Dec
     return (try evaluateInvocationsCore(a, provider, &.{prepared.program}, &.{cells}, &.{}, &.{prepared}, limits))[0];
 }
 
-pub fn hasSequences(program: *const scalar.Program) bool {
-    return program.uses_sequences;
+pub fn hasOrderedEffects(program: *const scalar.Program) bool {
+    return program.orderedEffects();
 }
 
 pub fn hasExternal(program: *const scalar.Program) bool {
-    if (hasSequences(program)) return true;
-    for (program.instructions) |instruction| if (instruction.operation == .call and decisions.descriptor(@tagName(instruction.operation.call.function)) != null) return true;
-    return false;
+    return program.externalEffects();
 }
 
 const Mock = struct {
@@ -460,10 +479,10 @@ test "SQL decisions bind all builtins and validate prepared question parameters 
 /// Native cursor pages and inference pages have independent lifetimes.
 pub fn rowPage(a: std.mem.Allocator, bound: @import("bound_scalars.zig").Bound, rows: []const @import("catalog.zig").Row, row_limit: usize, byte_limit: usize) ![]const []const scalar.Datum {
     var cells: std.ArrayList([]const scalar.Datum) = .empty;
-    var ordered = if (bound.predicate) |*program| hasSequences(program) else false;
+    var ordered = if (bound.predicate) |*program| hasOrderedEffects(program) else false;
     inline for (.{ bound.projections, bound.orders, bound.assignments }) |programs| {
         for (programs) |optional| if (optional) |*program| {
-            ordered = ordered or hasSequences(program);
+            ordered = ordered or hasOrderedEffects(program);
         };
     }
     // Stateful effects cannot be evaluated column-major across relation rows.
@@ -558,7 +577,7 @@ pub const SortedProjection = struct {
             }
             const values = try a.alloc([]scalar.Datum, inputs.items.len);
             for (selected[first..][0..inputs.items.len], values) |row, *out| out.* = try a.dupe(scalar.Datum, row.values[0..self.outputs.len]);
-            if (hasSequencePrograms(self.outputs)) {
+            if (hasOrderedEffectPrograms(self.outputs)) {
                 for (inputs.items, values) |input, row| for (self.outputs, self.deferred, 0..) |*program, deferred, column| {
                     if (deferred) row[column] = try evaluateWithLimits(a, context.backend.decision_provider, program, input, context.parameters, limitsFor(context.backend));
                 };
@@ -827,4 +846,331 @@ test "SQL sequence statement binding retains authority without parameters" {
     try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
     try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
     try std.testing.expectEqualStrings("1", result.output.rows[0][1].string);
+}
+
+test "SQL advisory effects retain void identity strict NULLs lazy demand and row ordering" {
+    const a = std.testing.allocator;
+    const Effects = @import("advisory_effects.zig");
+    const Owner = struct {
+        calls: std.ArrayList(i64) = .empty,
+        fn invoke(raw: *anyopaque, alloc: std.mem.Allocator, function: Effects.Function, args: []const scalar.Datum) !scalar.Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.calls.append(alloc, if (args.len == 0) 0 else args[0].value.integer);
+            return if (function.booleanResult()) scalar.Datum.json(.{ .bool = true }) else scalar.Datum.voidValue();
+        }
+    };
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var owner: Owner = .{};
+    const limits: scalar.EvalLimits = .{ .advisory_provider = .{ .ptr = &owner, .invoke = Owner.invoke } };
+    for ([_][]const u8{ "pg_advisory_lock(1)", "coalesce(pg_advisory_lock(2), NULL)", "CASE WHEN false THEN pg_advisory_lock(99) ELSE pg_advisory_lock(3) END", "pg_advisory_unlock_all()" }) |query| {
+        var parsed = try @import("compiler.zig").compileScalar(a, query, .{});
+        defer parsed.deinit();
+        var program = try scalar.bind(a, parsed.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(.void, program.output_type.kind.?);
+        try std.testing.expect(program.orderedEffects());
+        const result = try evaluateWithLimits(scratch, null, &program, &.{}, &.{}, limits);
+        try std.testing.expect(result.isVoid() and !result.sql_null);
+        try std.testing.expectEqualStrings("", result.value.string);
+    }
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 0 }, owner.calls.items);
+    for ([_][]const u8{ "pg_advisory_lock(NULL::bigint)", "CASE WHEN true THEN NULL ELSE pg_advisory_lock(99) END" }) |query| {
+        var parsed = try @import("compiler.zig").compileScalar(a, query, .{});
+        defer parsed.deinit();
+        var program = try scalar.bind(a, parsed.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expect((try evaluateWithLimits(scratch, null, &program, &.{}, &.{}, limits)).sql_null);
+    }
+    try std.testing.expectEqual(@as(usize, 4), owner.calls.items.len);
+    var parsed = try @import("compiler.zig").compileScalar(a, "pg_try_advisory_lock(v)", .{});
+    defer parsed.deinit();
+    var program = try scalar.bind(a, parsed.expression, &.{.{ .name = "v", .type = .integer }}, &.{}, .{});
+    defer program.deinit();
+    const rows = try evaluateBatchWithLimits(scratch, null, &program, &.{ &.{scalar.Datum.json(.{ .integer = 10 })}, &.{scalar.Datum.json(.{ .integer = 20 })} }, &.{}, limits);
+    try std.testing.expect(rows[0].value.bool and rows[1].value.bool);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 0, 10, 20 }, owner.calls.items);
+    try std.testing.expectError(error.AdvisoryProviderUnavailable, evaluateWithLimits(scratch, null, &program, &.{scalar.Datum.json(.{ .integer = 30 })}, &.{}, .{}));
+}
+
+test "SQL advisory void is a logical pseudotype with PostgreSQL operator array and storage rejection" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    for ([_][]const u8{ "'ignored'::void", "coalesce(NULL::void, 'ignored'::void)" }) |query| {
+        var parsed = try @import("compiler.zig").compileScalar(a, query, .{});
+        defer parsed.deinit();
+        var program = try scalar.bind(a, parsed.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expect((try program.evaluate(region.allocator(), &.{}, &.{}, .{})).isVoid());
+    }
+    for ([_][]const u8{ "pg_advisory_lock(1) = pg_advisory_lock(1)", "pg_advisory_lock(1) < pg_advisory_lock(1)", "pg_advisory_lock(1.5)", "pg_advisory_lock(1::bigint, 2)" }) |query| {
+        var parsed = try @import("compiler.zig").compileScalar(a, query, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.SqlUndefinedFunction, scalar.bind(a, parsed.expression, &.{}, &.{}, .{}));
+    }
+    var array = try @import("compiler.zig").compileScalar(a, "ARRAY[pg_advisory_lock(1)]", .{});
+    defer array.deinit();
+    try std.testing.expectError(error.SqlArrayTypeNotFound, scalar.bind(a, array.expression, &.{}, &.{}, .{}));
+    try std.testing.expectError(error.SqlInvalidTableDefinition, @import("compiler.zig").compile(a, "CREATE TABLE void_probe(v void)", .{}));
+}
+
+test "SQL advisory nested routine invocations isolate suspended advisory and sequence effects" {
+    const a = std.testing.allocator;
+    const Routine = @import("routine_bindings.zig");
+    const Effects = @import("advisory_effects.zig");
+    var body = try @import("compiler.zig").compileScalar(a, "pg_try_advisory_lock(v) AND pg_try_advisory_lock(v+1) AND lastval() > 0", .{});
+    defer body.deinit();
+    var callee = try scalar.bind(a, body.expression, &.{.{ .name = "v", .type = .integer }}, &.{}, .{});
+    defer callee.deinit();
+    var routine: Routine.Resolved = .{ .id = 9, .generation = 1, .arguments = &.{.{ .kind = .integer, .element_type = .int64 }}, .output = callee.output_type, .program = &callee };
+    const Owner = struct {
+        routine: *const Routine.Resolved,
+        calls: std.ArrayList(i64) = .empty,
+        sequences: usize = 0,
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, name: []const u8, args: []const Routine.Argument) !*const Routine.Resolved {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("wrapped", name);
+            try std.testing.expectEqual(@as(usize, 1), args.len);
+            return self.routine;
+        }
+        fn invoke(raw: *anyopaque, alloc: std.mem.Allocator, _: Effects.Function, args: []const scalar.Datum) !scalar.Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.calls.append(alloc, args[0].value.integer);
+            return scalar.Datum.json(.{ .bool = true });
+        }
+        fn sequence(raw: *anyopaque, _: std.mem.Allocator, _: @import("sequence_effects.zig").Function, _: ?@import("sequence_effects.zig").Reference, _: []const scalar.Datum) !i64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.sequences += 1;
+            return @intCast(self.sequences);
+        }
+        fn flush(_: *anyopaque) !void {}
+    };
+    var owner: Owner = .{ .routine = &routine };
+    var parsed = try @import("compiler.zig").compileScalar(a, "wrapped(10) AND pg_try_advisory_lock(20) AND wrapped(30)", .{});
+    defer parsed.deinit();
+    var program = try scalar.bind(a, parsed.expression, &.{}, &.{}, .{ .routines = .{ .ptr = &owner, .resolve = Owner.resolve } });
+    defer program.deinit();
+    try std.testing.expect(program.uses_nested_effects and program.orderedEffects());
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const result = try evaluateWithLimits(region.allocator(), null, &program, &.{}, &.{}, .{ .advisory_provider = .{ .ptr = &owner, .invoke = Owner.invoke }, .sequence_provider = .{ .ptr = &owner, .invoke = Owner.sequence, .flush = Owner.flush } });
+    try std.testing.expect(result.value.bool);
+    try std.testing.expectEqualSlices(i64, &.{ 10, 11, 20, 30, 31 }, owner.calls.items);
+    try std.testing.expectEqual(@as(usize, 2), owner.sequences);
+}
+
+test "SQL advisory public binding rejects void comparison domains before demanding effects" {
+    const compiler = @import("compiler.zig");
+    const runtime = @import("runtime.zig");
+    const Backend = @import("catalog.zig").Backend;
+    const Owner = struct {
+        calls: usize = 0,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn invoke(raw: *anyopaque, _: std.mem.Allocator, _: @import("advisory_effects.zig").Function, _: []const scalar.Datum) !scalar.Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .voidValue();
+        }
+    };
+    const a = std.testing.allocator;
+    var owner: Owner = .{};
+    const backend: Backend = .{ .ptr = &owner, .advisory_provider = .{ .ptr = &owner, .invoke = Owner.invoke }, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = Owner.checkpoint } };
+    for ([_][]const u8{
+        "SELECT pg_advisory_lock(1) AS v ORDER BY 1",
+        "SELECT pg_advisory_lock(1) AS v ORDER BY v",
+        "SELECT 1 ORDER BY pg_advisory_lock(1)",
+        "SELECT pg_advisory_lock(1) GROUP BY 1",
+        "SELECT count(DISTINCT pg_advisory_lock(1))",
+        "SELECT min(pg_advisory_lock(1))",
+        "SELECT pg_advisory_lock(1) UNION SELECT pg_advisory_lock(2)",
+        "SELECT pg_advisory_lock(1) IN (NULL)",
+        "SELECT nullif(pg_advisory_lock(1), NULL)",
+        "SELECT greatest(pg_advisory_lock(1))",
+        "SELECT least(pg_advisory_lock(1), pg_advisory_lock(2))",
+        "SELECT row_number() OVER (PARTITION BY pg_advisory_lock(1))",
+        "SELECT row_number() OVER (ORDER BY pg_advisory_lock(1))",
+        "SELECT min(pg_advisory_lock(1)) OVER ()",
+        "WITH RECURSIVE r(v) AS (SELECT pg_advisory_lock(1) UNION SELECT v FROM r) SELECT v FROM r",
+    }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(compiled.uses_advisory and !compiled.uses_sequences);
+        try std.testing.expectError(error.SqlUndefinedFunction, runtime.execute(a, backend, &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), owner.calls);
+    }
+    var compiled = try compiler.compile(a, "SELECT count(pg_advisory_lock(1))", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(a, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), owner.calls);
+    try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+}
+
+test "SQL advisory nested call frames keep ordinary AI batches concurrent and invocation owned" {
+    const Routine = @import("routine_bindings.zig");
+    const compiler = @import("compiler.zig");
+    const a = std.testing.allocator;
+    var parsed_body = try compiler.compileScalar(a, "ai_probability(v, 'first', 'local') > 0.5 AND ai_probability(v, 'second', 'local') > 0.5", .{});
+    defer parsed_body.deinit();
+    var body = try scalar.bind(a, parsed_body.expression, &.{.{ .name = "v", .type = .string, .element_type = .text }}, &.{}, .{});
+    defer body.deinit();
+    const routine: Routine.Resolved = .{ .id = 7, .generation = 1, .arguments = &.{.{ .kind = .string, .element_type = .text }}, .output = body.output_type, .program = &body };
+    const Resolver = struct {
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const Routine.Argument) !*const Routine.Resolved {
+            return @ptrCast(@alignCast(raw));
+        }
+    };
+    var parsed = try compiler.compileScalar(a, "wrapped(v) AND ai_probability(v, 'outer', 'local') > 0.5", .{});
+    defer parsed.deinit();
+    var program = try scalar.bind(a, parsed.expression, &.{.{ .name = "v", .type = .string, .element_type = .text }}, &.{}, .{ .routines = .{ .ptr = @constCast(&routine), .resolve = Resolver.resolve } });
+    defer program.deinit();
+    try std.testing.expect(program.uses_nested_effects and program.externalEffects());
+    try std.testing.expect(!program.orderedEffects());
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const rows = [_][]const scalar.Datum{ &.{.json(.{ .string = "one" })}, &.{.json(.{ .string = "two" })}, &.{.json(.{ .string = "three" })}, &.{.json(.{ .string = "four" })} };
+    var provider: Mock = .{};
+    for (0..2) |_| {
+        const results = try evaluateBatch(arena.allocator(), provider.provider(), &program, &rows, &.{});
+        for (results) |result| try std.testing.expect(result.value.bool);
+    }
+    try std.testing.expectEqual(@as(usize, 24), provider.calls);
+    try std.testing.expectEqual(@as(usize, 4), provider.max_batch);
+}
+
+test "SQL advisory effects stop at cancellation unknown delivery and malformed receipts" {
+    const Owner = struct {
+        calls: usize = 0,
+        mode: enum { cancel, unknown, malformed } = .cancel,
+        fn checkpoint(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.mode == .cancel and self.calls != 0) return error.Canceled;
+        }
+        fn invoke(raw: *anyopaque, _: std.mem.Allocator, _: @import("advisory_effects.zig").Function, _: []const scalar.Datum) !scalar.Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return switch (self.mode) {
+                .cancel => .json(.{ .bool = true }),
+                .unknown => error.MetadataMutationOutcomeUnknown,
+                .malformed => .voidValue(),
+            };
+        }
+    };
+    const a = std.testing.allocator;
+    var parsed = try @import("compiler.zig").compileScalar(a, "pg_try_advisory_lock(1) AND pg_try_advisory_lock(2)", .{});
+    defer parsed.deinit();
+    var program = try scalar.bind(a, parsed.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    for ([_]@FieldType(Owner, "mode"){ .cancel, .unknown, .malformed }) |mode| {
+        var owner: Owner = .{ .mode = mode };
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        try std.testing.expectError(switch (mode) {
+            .cancel => error.Canceled,
+            .unknown => error.MetadataMutationOutcomeUnknown,
+            .malformed => error.InvalidSqlBackendResponse,
+        }, evaluateWithLimits(arena.allocator(), null, &program, &.{}, &.{}, .{ .checkpoint = Owner.checkpoint, .checkpoint_context = &owner, .advisory_provider = .{ .ptr = &owner, .invoke = Owner.invoke } }));
+        try std.testing.expectEqual(@as(usize, 1), owner.calls);
+    }
+}
+
+test "SQL advisory all builtin overloads retain namespace coercion nullness and result contracts" {
+    const compiler = @import("compiler.zig");
+    const runtime = @import("runtime.zig");
+    const Effects = @import("advisory_effects.zig");
+    const Backend = @import("catalog.zig").Backend;
+    const Owner = struct {
+        expected: Effects.Function,
+        count: usize,
+        calls: usize = 0,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn invoke(raw: *anyopaque, _: std.mem.Allocator, function: Effects.Function, args: []const scalar.Datum) !scalar.Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.expected, function);
+            try std.testing.expectEqual(self.count, args.len);
+            self.calls += 1;
+            if (args.len == 1) try std.testing.expectEqual(@as(i64, -42), args[0].value.integer);
+            if (args.len == 2) {
+                try std.testing.expectEqual(@as(i64, std.math.minInt(i32)), args[0].value.integer);
+                try std.testing.expectEqual(@as(i64, std.math.maxInt(i32)), args[1].value.integer);
+            }
+            return if (function.booleanResult()) .json(.{ .bool = true }) else .voidValue();
+        }
+    };
+    const a = std.testing.allocator;
+    for (std.enums.values(Effects.Function)) |function| for ([_][]const u8{ "", "pg_catalog." }) |namespace| {
+        for ([_][]const u8{ "-42", "-2147483648,2147483647" }, 1..) |input, arity| {
+            if (function == .pg_advisory_unlock_all and arity != 1) continue;
+            var owner: Owner = .{ .expected = function, .count = if (function == .pg_advisory_unlock_all) 0 else arity };
+            const backend: Backend = .{ .ptr = &owner, .advisory_provider = .{ .ptr = &owner, .invoke = Owner.invoke }, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = Owner.checkpoint } };
+            const sql = try std.fmt.allocPrint(a, "SELECT {s}{s}({s})", .{ namespace, @tagName(function), if (function == .pg_advisory_unlock_all) "" else input });
+            defer a.free(sql);
+            var compiled = try compiler.compile(a, sql, .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend, &compiled, &.{}, .{ .native_result = true });
+            defer result.deinit();
+            try std.testing.expect(compiled.uses_advisory and !compiled.uses_sequences);
+            try std.testing.expectEqual(@as(usize, 1), owner.calls);
+            try std.testing.expectEqual(if (function.booleanResult()) @import("ast.zig").ColumnType.boolean else .void, result.output.columns[0].type);
+            const cell = result.output.native_rows.?[0][0];
+            try std.testing.expect(!cell.sql_null);
+            if (function.booleanResult()) try std.testing.expect(cell.value.bool) else try std.testing.expect(cell.isVoid());
+        }
+        if (function == .pg_advisory_unlock_all) continue;
+        for ([_][]const u8{ "NULL::bigint", "NULL::integer,7", "7,NULL::integer" }) |input| {
+            var owner: Owner = .{ .expected = function, .count = 0 };
+            const backend: Backend = .{ .ptr = &owner, .advisory_provider = .{ .ptr = &owner, .invoke = Owner.invoke }, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = Owner.checkpoint } };
+            const sql = try std.fmt.allocPrint(a, "SELECT {s}{s}({s})", .{ namespace, @tagName(function), input });
+            defer a.free(sql);
+            var compiled = try compiler.compile(a, sql, .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend, &compiled, &.{}, .{ .native_result = true });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 0), owner.calls);
+            try std.testing.expect(result.output.native_rows.?[0][0].sql_null);
+        }
+    };
+}
+
+test "SQL advisory typed void crosses derived materialized recursive window and ordered result paths" {
+    const runtime = @import("runtime.zig");
+    const compiler = @import("compiler.zig");
+    const Backend = @import("catalog.zig").Backend;
+    const Owner = struct {
+        calls: usize = 0,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn invoke(raw: *anyopaque, _: std.mem.Allocator, _: @import("advisory_effects.zig").Function, _: []const scalar.Datum) !scalar.Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .voidValue();
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, rows: usize, calls: usize }{
+        .{ .sql = "SELECT pg_advisory_lock(1) AS v UNION ALL SELECT pg_advisory_lock(2)", .rows = 2, .calls = 2 },
+        .{ .sql = "WITH r AS MATERIALIZED (SELECT pg_advisory_lock(1) AS v) SELECT v FROM r", .rows = 1, .calls = 1 },
+        .{ .sql = "SELECT first_value(pg_advisory_lock(1)) OVER () AS v", .rows = 1, .calls = 1 },
+        .{ .sql = "SELECT 'x'::void AS v FROM (VALUES (2), (1)) AS r(id) ORDER BY id", .rows = 2, .calls = 0 },
+        .{ .sql = "WITH RECURSIVE r(n,v) AS (SELECT 1, 'x'::void UNION ALL SELECT n+1,v FROM r WHERE n<3) SELECT v FROM r ORDER BY n", .rows = 3, .calls = 0 },
+    }) |case| {
+        var owner: Owner = .{};
+        const backend: Backend = .{ .ptr = &owner, .advisory_provider = .{ .ptr = &owner, .invoke = Owner.invoke }, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = Owner.checkpoint } };
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(a, backend, &compiled, &.{}, .{ .native_result = true });
+        defer result.deinit();
+        try std.testing.expectEqual(case.calls, owner.calls);
+        try std.testing.expectEqual(case.rows, result.output.rowCount());
+        try std.testing.expectEqual(@import("ast.zig").ColumnType.void, result.output.columns[0].type);
+        for (result.output.native_rows.?) |row| try std.testing.expect(row[0].isVoid() and !row[0].sql_null);
+    }
+    var owner: Owner = .{};
+    const backend: Backend = .{ .ptr = &owner, .advisory_provider = .{ .ptr = &owner, .invoke = Owner.invoke }, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = Owner.checkpoint } };
+    var explanation = try compiler.compile(a, "EXPLAIN SELECT pg_advisory_lock(1)", .{});
+    defer explanation.deinit();
+    var plan = try runtime.execute(a, backend, &explanation, &.{}, .{});
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owner.calls);
 }

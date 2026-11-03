@@ -4,6 +4,13 @@ This is an implementation record for explicit SQL locking. The PostgreSQL 18
 conflict matrices and lifetime rules are the semantic reference. The native
 journal described here is not yet activation of the unresolved SQL cases.
 
+Current status (2026-11-02): the native ledger, durable command-source permits,
+shared prepared-decision integration and independent prepared lock home are
+implemented and qualified. The ordered scalar/type layer is also implemented.
+Public HTTP/pgwire source activation, the native advisory effect provider and
+row/table participant enrollment remain open. The sections below retain earlier
+qualification records; the final sections describe the current implementation.
+
 ## Native resource contract
 
 `storage/pessimistic_lock_contract.zig` defines the eight table, four row and two
@@ -657,3 +664,72 @@ retirement-floor reclamation for connection tombstones is still separate work;
 the prepared destination does not add a new per-transaction tombstone family.
 The original inventory remains **912 implemented, 138 rejected, 449 superseded
 and 87 unresolved**.
+
+## Ordered advisory scalar execution and void identity
+
+The shared SQL engine now binds all eleven PostgreSQL advisory builtins, including
+both key overloads and the `pg_catalog` namespace. Arguments cross the existing
+integer coercion boundary; the two-key overload never silently narrows a BIGINT.
+Strict constant NULLs and unselected branches issue no demand. Each executed
+occurrence produces an owned, ordered demand; provider I/O remains outside the
+scalar VM and immutable prepared programs retain no connection pointers.
+
+Advisory and sequence demands execute in row order across predicates, projections,
+VALUES, mutation expressions and nested SQL routines. Each executed nested call
+has its own stable suspension frame, keyed by its parent invocation and instruction.
+Its receipts cannot overwrite a caller's equal-numbered instruction or cause a
+completed effect to execute again after suspension. Frames share the invocation's
+work, cancellation and byte budgets. Ordinary nested AI calls retain batch
+execution instead of inheriting sequence/advisory serialization. Bound programs
+cache their external-effect classification once; checking it during row execution
+is constant time. Hand-built internal programs retain the scanning fallback.
+
+The effect owner polls cancellation immediately before provider I/O. An uncertain
+provider result is returned to the enclosing owner without replaying the SQL or
+issuing its next effect. Advisory replies must have their declared non-NULL boolean
+or void identity; malformed replies cannot be memoized as successful results.
+
+`void` is an SQL pseudotype, not an alias for TEXT or JSON NULL. A payload-free
+Datum tag preserves it through prepared parameters, retained columns, scalar
+clones and both columnar spill versions. Retained columns use a reserved immediate
+extension value, without allocating an object for every void cell or growing the
+existing compact extension entries. Public OpenAPI/SDK descriptors expose `void`;
+pgwire uses OID 2278, type length 4 and zero payload bytes in text and binary results.
+SQL NULL still has its separate NULL marker. PostgreSQL text Bind input is ignored
+after encoding validation; binary Bind requires an empty payload and rejects
+nonempty bytes with SQLSTATE 22P03.
+
+Physical columns and stored view output cannot acquire the pseudotype. Arrays,
+comparison operators, grouping, DISTINCT aggregates, set deduplication and sort
+keys must reject unsupported void comparison domains before any effect runs.
+COALESCE, explicit text output, compatible text concatenation and COUNT retain
+PostgreSQL behavior. The independent scalar/void oracle supplements the existing
+lock lifetime and wait oracles; it does not substitute for native/public ownership
+qualification.
+
+The public HTTP/pgwire durable source lifecycle and native advisory provider are
+still required before closing `sql-0089`–`sql-0091`. This scalar/type cohort earns
+no original-case credits. The immutable original inventory remains **912
+implemented, 138 rejected, 449 superseded and 87 unresolved**.
+
+
+The broad Debug run passed all **131/131 build steps**. Its SQL owners passed
+**1,979 tests** (1,725 local and 254 server); four opt-in benchmark tests were
+skipped. The pgwire, native public result and durable sequence gates also passed,
+including **42 native-result tests** and **seven sequence tests**. The final
+focused advisory/type gate passes **11 tests**, with no skips, failures or leaks,
+including materialized CTEs, recursive UNION ALL, windows, ordered results and
+non-executing EXPLAIN. Nested AI calls retain batches of four across two fresh
+invocations; cancellation, unknown delivery and malformed receipts stop before
+another provider call. Allocation-failure campaigns cover retained cells, spill
+versions and public typed-result ownership.
+
+The isolated PostgreSQL oracles pass **177 scalar/void**, **134 lifetime/conflict**
+and **31 wait/cancellation** assertions. `make generate`, `make fmt`, generated Go
+SDK tests, license/boundary checks, control-catalog checks and original-inventory
+integrity pass. Latest `origin/main` at `24486f5f30` is included. These gates qualify
+the listed layers, not the still-unfinished public lock activation.
+
+The final affected Debug recheck passed **93/93 steps**, including all **42
+native-result** and **seven durable sequence** tests, without skips, failures or
+leaks, after the coercion and recursive-type review fixes.
