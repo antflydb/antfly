@@ -772,7 +772,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response", "httpx SQL original nullability relaxation" } });
     const sql_command_producer_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = &.{ "SQL command producer native", "HTTP connection", "HTTP sequence sessions", "SQL connection admission", "durable SQL session rejects duplicate savepoint ids", "durable SQL connection execution projection", "distributed txn session preserves numeric tokens" },
+        .filters = &.{ "SQL command producer native", "SQL execution lease borrowing", "HTTP connection", "HTTP sequence sessions", "SQL connection admission", "durable SQL session rejects duplicate savepoint ids", "durable SQL connection execution projection", "distributed txn session preserves numeric tokens" },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 28 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });

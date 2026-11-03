@@ -160,7 +160,7 @@ pub fn mutateSqlSequence(svc: anytype, alloc: std.mem.Allocator, context: operat
 pub fn prepareSqlCatalog(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("catalog_mutations.zig").Preparation) ![]u8 {
     if (!context.setting_admin) return error.Forbidden;
     if (std.mem.allEqual(u8, &request.nonce, 0)) return error.InvalidCatalogMutation;
-    if (!std.meta.eql(request.command_fence, if (context.sql_command_fence) |fence| fence.* else null)) return error.InvalidCatalogMutation;
+    try request.requireCommandFence(context.sql_command_fence);
     // Capability observation cannot substitute for the durable apply barrier.
     // Complete this control transition before capturing the user's command.
     try @import("../metadata/service.zig").ensureSqlCatalogCapabilityWithContext(svc, context);

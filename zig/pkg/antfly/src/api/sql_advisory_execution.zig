@@ -44,7 +44,7 @@ pub const Frame = struct {
         if (record.phase != .executing or record.recovery or record.control_effect != null or (record.pending != null and record.pending.?.operation != .renew) or record.ticket == null or
             record.registration.lease.expires_at_ms <= now_ms or !std.mem.eql(u8, record.principal, self.principal) or
             !std.mem.eql(u8, &record.instance, &self.instance)) return error.SqlConnectionBusy;
-        const expected: authority.scopes.CommandFence = .{ .backend = record.registration.lease.backend, .command = record.ticket.?.command, .database = record.registration.lease.database, .principal = record.registration.lease.principal, .standalone = record.registration.standalone };
+        const expected: authority.scopes.CommandFence = .{ .group = record.registration.group, .backend = record.registration.lease.backend, .command = record.ticket.?.command, .database = record.registration.lease.database, .principal = record.registration.lease.principal, .standalone = record.registration.standalone };
         if (!std.meta.eql(expected, self.fence) or !std.meta.eql(record.actor.session_user, self.actor.session_user) or
             !std.mem.eql(u8, record.actor.credential, self.actor.credential)) return error.SqlConnectionChanged;
     }
@@ -58,7 +58,7 @@ pub const Frame = struct {
         var owned = try std.json.parseFromSlice(authority.Snapshot, a, bytes, .{ .allocate = .alloc_always });
         errdefer owned.deinit();
         const cut = owned.value;
-        if (!std.mem.eql(u8, &cut.incarnation, &self.fence.backend.incarnation) or cut.standalone != self.fence.standalone or cut.next_work != null) return error.CatalogGenerationChanged;
+        if (!std.mem.eql(u8, &cut.incarnation, &self.fence.backend.incarnation) or cut.standalone != self.fence.standalone or cut.group != self.fence.group or cut.next_work != null) return error.CatalogGenerationChanged;
         const scope = cut.scope orelse return error.SqlConnectionNotFound;
         const owner = cut.owner orelse return error.InvalidSqlBackendResponse;
         const ns = self.namespace();
@@ -76,7 +76,7 @@ pub const Frame = struct {
         return owned;
     }
     fn namespace(self: Frame) ledger.Namespace {
-        return .{ .home = .metadata, .group = local.common_group_ids.main_metadata_group_id, .incarnation = self.fence.backend.incarnation };
+        return .{ .home = .metadata, .group = self.fence.group, .incarnation = self.fence.backend.incarnation };
     }
     fn request(self: Frame, head: u64, nonce: [16]u8, operation: @FieldType(authority.Request, "operation")) authority.Request {
         return .{ .admission = .{ .head = head, .nonce = nonce }, .incarnation = self.fence.backend.incarnation, .standalone = self.fence.standalone, .database = self.fence.database, .actor = self.actor, .backend = self.fence.backend, .operation = operation };
@@ -320,5 +320,16 @@ pub fn invoke(raw: *anyopaque, a: A, function: effects.Function, args: []const s
         .runtime = .{ .ptr = root, .now_ms = Hooks.now, .nonce = Hooks.nonce, .active = Hooks.active, .pause = Hooks.pause },
         .transaction = transaction,
     };
-    return Owner.invoke(&owner, a, function, args);
+    const warning: ?local.sql_catalog.notices.Notice = if (function.unlocks()) .{
+        .code = "01000",
+        .severity = .warning,
+        .message = if (function.shared()) "you don't own a lock of type ShareLock" else "you don't own a lock of type ExclusiveLock",
+    } else null;
+    if (warning) |notice| if (root.notice_sink) |sink| if (sink.reserve) |reserve|
+        try reserve(sink.ptr, 1, notice.message.len);
+    const result = try Owner.invoke(&owner, a, function, args);
+    if (warning) |notice| if (!result.sql_null and result.value == .bool and !result.value.bool) {
+        if (root.notice_sink) |sink| try sink.emit(sink.ptr, notice);
+    };
+    return result;
 }

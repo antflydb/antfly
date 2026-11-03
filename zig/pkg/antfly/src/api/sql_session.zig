@@ -31,14 +31,26 @@ pub const Coordinator = struct {
     /// Pgwire owns its connection overlay; HTTP instead resolves the durable
     /// session's current value inside the commit body's atomic publication.
     sync_level: ?@import("antfly_local_sources").storage_db_types.SyncLevel = null,
+    /// The outer SQL control or PREPARE owner may lend its execution lease.
+    /// Only that exact registry and transaction may reuse it; this coordinator
+    /// never releases a borrowed lease or silently treats a busy lock as owned.
+    borrowed_execution: ?*const transactions.SessionRegistry.CommitExecution = null,
+
+    fn execution(self: *Coordinator, id: sql.Id) !?transactions.SessionRegistry.CommitExecution {
+        if (self.borrowed_execution) |held| {
+            if (!held.matches(&self.server.txn_sessions, id)) return error.InvalidSqlBackendResponse;
+            return null;
+        }
+        return self.server.txn_sessions.tryAcquireCommitExecution(id) orelse error.SqlWriteCapacityUnavailable;
+    }
 
     /// Rollback must cross the same durable scope/decision barrier as commit.
     /// An existing sealed decision cannot be replaced by a local abort.
     pub fn rollback(ptr: *anyopaque, _: sql.Scope, id: sql.Id) !void {
         const self: *Coordinator = @ptrCast(@alignCast(ptr));
         try self.context.ensureActive();
-        const lease = self.server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
-        defer lease.release();
+        const lease = try self.execution(id);
+        defer if (lease) |held| held.release();
         var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
         defer state.deinit(self.server.alloc);
         if (state.terminal_abort) return;
@@ -173,8 +185,8 @@ pub const Coordinator = struct {
         const server = self.server;
         const alloc = server.alloc;
         try self.context.ensureActive();
-        const lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
-        defer lease.release();
+        const lease = try self.execution(id);
+        defer if (lease) |held| held.release();
         const info = server.txn_sessions.getInfo(id) orelse return error.SqlTransactionNotActive;
         var lake_validation: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = self.identity, .context = self.context };
         lake_validation.validateAcceptedSerializable(alloc, id) catch |err| {

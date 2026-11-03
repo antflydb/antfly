@@ -345,8 +345,12 @@ pub const Adapter = struct {
 
     fn disconnect(raw: *anyopaque, identity: wire.Identity, session_id: ?[]const u8) void {
         const self: *Adapter = @ptrCast(@alignCast(raw));
-        const encoded = session_id orelse return;
         const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        if (credential.native_connection) |connection| {
+            disconnectNative(self.server, credential, connection);
+            return;
+        }
+        const encoded = session_id orelse return;
         credential.session_cleanup_complete = false;
         const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return;
         const io = http.ApiHttpServer.configuredDurableIo(self.server.cfg) orelse return;
@@ -373,6 +377,63 @@ pub const Adapter = struct {
             }
         };
         var job = Cleanup{ .server = self.server, .principal = credential.sessionPrincipal(), .id = id, .completion_io = network_io, .credential = credential };
+        var future = io.concurrent(Cleanup.run, .{&job}) catch return;
+        job.done.waitUncancelable(network_io);
+        @import("protected_future.zig").wait(io, &future);
+    }
+
+    fn disconnectNative(server: *http.ApiHttpServer, credential: *Credential, connection: [32]u8) void {
+        credential.session_cleanup_complete = false;
+        const io = http.ApiHttpServer.configuredDurableIo(server.cfg) orelse return;
+        const network_io = server.sharedApiNetworkIo() orelse return;
+        const Cleanup = struct {
+            server: *http.ApiHttpServer,
+            credential: *Credential,
+            connection: [32]u8,
+            completion_io: std.Io,
+            done: std.Io.Event = .unset,
+            fn run(job: *@This()) void {
+                defer job.done.set(job.completion_io);
+                job.retire() catch {};
+            }
+            fn retire(job: *@This()) !void {
+                const producer = @import("sql_command_producer.zig");
+                const store = job.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+                const principal = job.credential.sessionPrincipal();
+                // The authenticated socket already owns this exact connection.
+                // Closing must remain possible after credential revocation.
+                for (0..16) |_| {
+                    var record = (try producer.load(store, job.server.alloc, job.connection)) orelse {
+                        try job.closeLogical();
+                        return;
+                    };
+                    defer record.deinit();
+                    if (record.value.phase == .retired) {
+                        try job.closeLogical();
+                        return;
+                    }
+                    if (!record.value.recovery) {
+                        producer.requestRecovery(store, principal, record.value) catch |err| switch (err) {
+                            error.SqlConnectionChanged => continue,
+                            else => return err,
+                        };
+                    } else try producer.advanceConnection(job.server, job.server.alloc, job.connection, .none);
+                }
+                // The source recovery marker is durable. Existing bounded
+                // upkeep owns unfinished decisions and release after this cut.
+                return error.SqlConnectionBusy;
+            }
+            fn closeLogical(job: *@This()) !void {
+                const store = job.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+                _ = @import("sql_connections.zig").mutate(store, .{ .close = job.connection }, job.credential.sessionPrincipal(), job.server.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) catch |err| switch (err) {
+                    error.SqlConnectionNotFound => 0,
+                    else => return err,
+                };
+                job.credential.native_connection = null;
+                job.credential.session_cleanup_complete = true;
+            }
+        };
+        var job: Cleanup = .{ .server = server, .credential = credential, .connection = connection, .completion_io = network_io };
         var future = io.concurrent(Cleanup.run, .{&job}) catch return;
         job.done.waitUncancelable(network_io);
         @import("protected_future.zig").wait(io, &future);
@@ -977,6 +1038,32 @@ const Credential = struct {
     trusted_issuer: ?[]u8 = null,
     trusted_expires: i64 = 0,
     session_cleanup_complete: bool = true,
+    /// A socket owns one native command identity, independently of its transaction.
+    native_connection: ?[32]u8 = null,
+
+    fn ensureNativeConnection(self: *Credential, server: *http.ApiHttpServer, identity_value: ?http.AuthenticatedIdentity, request: wire.Request) !?[32]u8 {
+        if (!server.source.vtable.supports_sql_command_ownership) return null;
+        if (self.native_connection) |id| return id;
+        const store = server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+        try self.validate();
+        var random: [16]u8 = undefined;
+        try server.embedding_provider_runtime.io.randomSecure(&random);
+        const id = @import("sql_resource_routing.zig").encode(server.localSessionNodeId(), random);
+        const principal = http.transactionPrincipal(identity_value) orelse return error.Unauthorized;
+        const now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+        _ = try @import("sql_connections.zig").mutate(store, .{ .create = .{
+            .id = id,
+            .principal = principal,
+            .owner_node_id = server.localSessionNodeId(),
+            .expires_at_ms = now_ms +| @import("sql_connection_record.zig").ttl_ms,
+            .database = request.database orelse "default",
+            .namespace = request.namespace orelse "public",
+            .baseline = request.setting_baseline orelse &.{},
+            .principal_instance = try http.sqlPrincipalInstance(server, identity_value),
+        } }, principal, server.localSessionNodeId(), now_ms);
+        self.native_connection = id;
+        return id;
+    }
 
     fn sessionPrincipal(self: *const Credential) []const u8 {
         // Durable Basic SQL sessions use the username across mixed-version
@@ -1184,7 +1271,18 @@ const Job = struct {
         var identity: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
         defer identity.?.deinit(server.alloc);
         var authority = Authority{ .credential = self.credential, .identity = &identity, .request = self.request };
-        const context = try authority.context();
+        var context = try authority.context();
+        var connection_lease: ?@import("sql_connection_admission.zig").Lease = null;
+        defer if (connection_lease) |*value| value.release(server.embedding_provider_runtime.io);
+        var command_scope: @import("sql_command_execution.zig").Request = .{};
+        var command_finished = false;
+        defer if (!command_finished) command_scope.finish() catch {};
+        const native_connection = if (self.kind == .execute) try self.credential.ensureNativeConnection(server, identity, self.request) else null;
+        if (native_connection) |id| {
+            connection_lease = try server.sql_connection_admission.acquire(server.alloc, server.embedding_provider_runtime.io, .init(id, self.credential.sessionPrincipal()));
+            if (try command_scope.start(server, context, identity, &connection_lease.?, .{ .statement = self.request.statement, .parameters = self.request.parameters, .database = self.request.database }))
+                context = command_scope.attach(context);
+        }
         var native_adapter = execution.Adapter{
             .copy_input = self.request.copy_input or compiled.statement == .copy_from,
             .copy_filter = copy_filter,
@@ -1200,6 +1298,7 @@ const Job = struct {
             .lake_visibility = @fromBackingInt(@intCast(@backingInt(self.request.lake_visibility))),
             .ddl_search_path = if (self.request.search_path) |*path| path else null,
             .session_id = self.request.session_id,
+            .connection_id = native_connection,
             .session_namespace = self.request.session_namespace,
             .setting_overlay = self.request.setting_overlay,
             .setting_baseline = self.request.setting_baseline,
@@ -1207,6 +1306,12 @@ const Job = struct {
             .expected_setting_epoch = self.request.setting_epoch,
         };
         defer native_adapter.releaseExecutionOwners();
+        if (native_connection) |id| {
+            var connection = try @import("sql_connections.zig").loadWithCommand(server.txn_sessions.durable.?, server.alloc, id, self.credential.sessionPrincipal(), server.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, context.sql_command_fence);
+            defer connection.deinit();
+            native_adapter.connection_revision = connection.value.revision;
+            native_adapter.connection_generation = connection.value.generation;
+        }
         if (self.request.diagnostics) |diagnostic| {
             if (diagnostic.notice_allocator != null) native_adapter.notice_sink = .{ .ptr = diagnostic, .emit = wire.Diagnostic.emitNotice, .reserve = wire.Diagnostic.reserveNotices };
         }
@@ -1322,6 +1427,9 @@ const Job = struct {
         for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(self.alloc, &enum_views, column.enum_view), .domain_view = try @import("antfly_local_sources").sql_scalar.ownDomainView(self.alloc, &domain_views, column.domain_view), .temporal_kind = column.temporal_kind };
         const native_owner = if (result.output.native_rows != null) try result.state.arena.allocator().create(NativeResultCells) else null;
         if (native_owner) |owner| owner.* = .{ .result = result };
+        native_adapter.releaseExecutionOwners();
+        command_scope.finish() catch return error.SqlMutationOutcomeUnknown;
+        command_finished = true;
         self.result = .{
             .columns = columns,
             .cells = if (native_owner) |owner| .{ .context = owner, .count = result.output.rowCount(), .width = columns.len, .read = NativeResultCells.read } else null,

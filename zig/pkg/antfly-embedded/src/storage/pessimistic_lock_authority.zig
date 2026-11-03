@@ -25,12 +25,14 @@ pub const max_active = 4096;
 const max_record_bytes = 4096;
 
 pub const Registration = struct {
+    group: u64 = @import("../common/group_ids.zig").main_metadata_group_id,
     lease: ledger.Lease,
     connection: [32]u8,
     nonce: [16]u8,
     standalone: bool,
     pub fn validate(self: Registration, ns: ledger.Namespace) !void {
         try self.lease.validate(ns);
+        if (self.group != ns.group) return error.InvalidLockOwner;
         if ((self.lease.node == 0) != self.standalone or std.mem.allEqual(u8, &self.nonce, 0) or std.mem.allEqual(u8, &self.connection, '0')) return error.InvalidLockOwner;
         for (self.connection) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.InvalidLockOwner;
     }
@@ -47,6 +49,7 @@ pub const Command = struct {
 /// Restrictive metadata-effect fence. This grants no SQL/catalog privileges;
 /// the accepting writer independently joins it to the live command scope.
 pub const CommandFence = struct {
+    group: u64 = @import("../common/group_ids.zig").main_metadata_group_id,
     backend: locks.Backend,
     command: Command,
     database: u64,
@@ -56,20 +59,20 @@ pub const CommandFence = struct {
     pub fn validate(self: CommandFence) !void {
         try self.backend.validate();
         try self.command.validate();
-        if (self.database == 0 or std.mem.allEqual(u8, &self.principal, 0)) return error.InvalidLockScope;
+        if (self.group == 0 or self.database == 0 or std.mem.allEqual(u8, &self.principal, 0)) return error.InvalidLockScope;
     }
-    pub fn requireCommand(self: CommandFence, _: anytype, _: ledger.Namespace, value: Record, command: Command) !void {
-        if (!self.backend.eql(value.registration.lease.backend) or !std.meta.eql(self.command, command) or
+    pub fn requireCommand(self: CommandFence, _: anytype, ns: ledger.Namespace, value: Record, command: Command) !void {
+        if (self.group != ns.group or self.group != value.registration.group or !self.backend.eql(value.registration.lease.backend) or !std.meta.eql(self.command, command) or
             self.database != value.registration.lease.database or self.standalone != value.registration.standalone or
             !std.mem.eql(u8, &self.principal, &value.registration.lease.principal)) return error.Forbidden;
     }
     /// Extend existing fixed-width request hashes without changing legacy
     /// requests. Never hash struct padding or native-endian integer bytes.
     pub fn hashInto(self: CommandFence, hash: anytype) void {
-        hash.update("antfly/sql-command-fence/v1");
+        hash.update("antfly/sql-command-fence/v2");
         hash.update(&self.backend.incarnation);
         hash.update(&self.backend.id);
-        inline for (.{ self.backend.fence, self.command.sequence, self.database }) |number| {
+        inline for (.{ self.group, self.backend.fence, self.command.sequence, self.database }) |number| {
             var bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &bytes, number, .little);
             hash.update(&bytes);
@@ -751,4 +754,42 @@ fn CloseContext(comptime Authority: type) type {
             try self.authority.requirePreparedHandoff(txn, self.ns, self.value, from, to, transaction);
         }
     };
+}
+
+test "pessimistic locks command fences and registrations bind the receiving metadata group" {
+    const a = std.testing.allocator;
+    const ns: ledger.Namespace = .{ .home = .metadata, .group = 2188, .incarnation = @splat(1) };
+    const registration: Registration = .{ .group = ns.group, .connection = @splat('a'), .nonce = @splat(2), .standalone = false, .lease = .{
+        .backend = .{ .incarnation = ns.incarnation, .id = @splat(3), .fence = 1 },
+        .database = 1,
+        .node = 7,
+        .principal = @splat(4),
+        .expires_at_ms = 1000,
+    } };
+    const command: Command = .{ .sequence = 1, .nonce = @splat(5), .executor = @splat(6) };
+    const record: Record = .{ .registration = registration, .command = command };
+    const guarded: CommandFence = .{ .group = ns.group, .backend = registration.lease.backend, .command = command, .database = 1, .principal = registration.lease.principal, .standalone = false };
+    try registration.validate(ns);
+    try guarded.requireCommand({}, ns, record, command);
+    var other_ns = ns;
+    other_ns.group += 1;
+    try std.testing.expectError(error.InvalidLockOwner, registration.validate(other_ns));
+    try std.testing.expectError(error.Forbidden, guarded.requireCommand({}, other_ns, record, command));
+    var other = guarded;
+    other.group += 1;
+    try std.testing.expectError(error.Forbidden, other.requireCommand({}, ns, record, command));
+    var first = std.crypto.hash.Blake3.init(.{});
+    var second = std.crypto.hash.Blake3.init(.{});
+    guarded.hashInto(&first);
+    other.hashInto(&second);
+    var x: [32]u8 = undefined;
+    var y: [32]u8 = undefined;
+    first.final(&x);
+    second.final(&y);
+    try std.testing.expect(!std.mem.eql(u8, &x, &y));
+    const bytes = try std.json.Stringify.valueAlloc(a, guarded, .{});
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(CommandFence, a, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(ns.group, parsed.value.group);
 }

@@ -1041,6 +1041,17 @@ pub const Stream = struct {
         const copy_read = if (compiled.statement == .copy_to) try describe.copyRead(arena, statement_backend, compiled) else null;
         const executable = if (copy_read) |*read| &read.compiled else compiled;
         const binding = try describe.bind(arena, if (copy_read) |read| read.binding_backend else statement_backend, executable, &.{});
+        // Advisory effects need the ordinary execution owner's lazy native
+        // transaction and completion cut. Decline before any producer/effect;
+        // the caller can select that owner without replaying SQL.
+        if (try @import("connection_effects.zig").required(self.budget.allocator(), binding)) {
+            if (binding.parameter_invocation) |invocation| invocation.deinitFrame();
+            if (self.settings) |view| view.deinit();
+            self.regex_execution.deinit();
+            self.arena.deinit();
+            alloc.destroy(self);
+            return null;
+        }
         if (statement_backend.execution_binding_validator) |validator| try validator.validate(validator.ptr, self.budget.allocator(), binding);
         statement_backend.execution_binding_validator = null;
         self.parameter_invocation = binding.parameter_invocation;
@@ -3204,4 +3215,25 @@ test "SQL owned streams release allocator capability after delivery decline and 
     var calls: usize = 0;
     try std.testing.expect((try Stream.openOwned(.{ .allocator = std.testing.allocator, .ptr = &calls, .release = Case.release }, fixture.backend(), &compiled, &.{}, .{})) == null);
     try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+test "SQL advisory stream admission declines every source shape before effects or cursor opens" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT pg_advisory_lock(n) FROM docs",
+        "SELECT n FROM docs WHERE pg_try_advisory_lock(n)",
+        "SELECT n FROM docs ORDER BY pg_try_advisory_lock(n)",
+        "SELECT count(pg_try_advisory_lock(n)) FROM docs",
+        "SELECT x.n FROM (SELECT n FROM docs WHERE pg_try_advisory_lock(n)) AS x",
+        "SELECT a.n FROM docs a JOIN docs b ON pg_try_advisory_lock(a.n)",
+        "SELECT n FROM docs WHERE pg_try_advisory_lock(n) UNION ALL SELECT n FROM docs",
+        "SELECT n, row_number() OVER (ORDER BY n) FROM docs ORDER BY pg_try_advisory_lock(n)",
+    }) |sql| {
+        var fixture: Fixture = .{};
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(@as(?*Stream, null), try Stream.open(a, fixture.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.opened);
+        try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    }
 }

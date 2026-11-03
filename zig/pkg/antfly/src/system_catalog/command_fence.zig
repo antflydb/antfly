@@ -24,6 +24,7 @@ pub const Fence = scopes.CommandFence;
 
 pub fn check(a: std.mem.Allocator, txn: anytype, group: u64, incarnation: [16]u8, fence: Fence) !void {
     try fence.validate();
+    if (fence.group != group) return error.CatalogGenerationChanged;
     if (!std.mem.eql(u8, &incarnation, &fence.backend.incarnation)) return error.CatalogGenerationChanged;
     var buffer: [160]u8 = undefined;
     const raw = txn.get(try std.fmt.bufPrint(&buffer, "\x00\x00__metadata__:topology_activation_v1:{d}", .{group})) catch |err| return switch (err) {

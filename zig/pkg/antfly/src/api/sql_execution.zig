@@ -635,7 +635,7 @@ pub const Adapter = struct {
         };
         if (compiled.statement == .prepared_transaction) {
             if (parameters.len != 0) return error.InvalidSqlParameters;
-            return @import("sql_prepared_coordinator.zig").execute(self, &session, alloc, compiled.statement.prepared_transaction) catch |err| {
+            return @import("sql_prepared_coordinator.zig").execute(self, &session, &coordinator, alloc, compiled.statement.prepared_transaction) catch |err| {
                 zig017_return_error = err;
                 return err;
             };
@@ -699,6 +699,9 @@ pub const Adapter = struct {
             else
                 null;
             defer if (control_lease) |held| held.release();
+            const prior_execution = coordinator.borrowed_execution;
+            defer coordinator.borrowed_execution = prior_execution;
+            coordinator.borrowed_execution = if (control_lease) |*held| held else null;
             const tag: []const u8 = switch (command) {
                 .begin => compiled.statement.begin.commandTag(),
                 .commit => "COMMIT",

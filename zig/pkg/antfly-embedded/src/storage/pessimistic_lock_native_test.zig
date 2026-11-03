@@ -306,7 +306,7 @@ test "pessimistic locks native LSM hard and soft cycle decisions use durable cur
 }
 
 const scopes = @import("pessimistic_lock_authority.zig");
-const scope_registration: scopes.Registration = .{ .lease = source, .connection = @splat('a'), .nonce = @splat(4), .standalone = false };
+const scope_registration: scopes.Registration = .{ .group = ns.group, .lease = source, .connection = @splat('a'), .nonce = @splat(4), .standalone = false };
 const scope_command: scopes.Command = .{ .sequence = 1, .nonce = @splat(5), .executor = @splat(6) };
 const scope_decision: scopes.DecisionRef = .{ .operation = @splat(7), .admission = @splat(8) };
 /// These fixtures use durable native authority rows, not source-provided flags.

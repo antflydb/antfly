@@ -4408,6 +4408,7 @@ const Binder = struct {
         const result: u32 = @intCast(self.instructions.items.len);
         self.uses_nested_effects = self.uses_nested_effects or function.program.externalEffects();
         self.uses_nested_ordered_effects = self.uses_nested_ordered_effects or function.program.orderedEffects();
+        self.uses_advisory = self.uses_advisory or function.program.uses_advisory;
         try self.instructions.append(self.alloc, .{ .type = function.output, .operation = .{ .call = .{ .function = .@"$routine", .args = args, .routine = function } } });
         return result;
     }
@@ -4489,6 +4490,7 @@ const Binder = struct {
                 const routine = try self.resolveCallable(call.name, call.args, call.operator, depth + 1);
                 self.uses_nested_effects = self.uses_nested_effects or routine.program.externalEffects();
                 self.uses_nested_ordered_effects = self.uses_nested_ordered_effects or routine.program.orderedEffects();
+                self.uses_advisory = self.uses_advisory or routine.program.uses_advisory;
                 const args = try self.alloc.alloc(u32, call.args.len);
                 for (call.args, args, routine.arguments) |arg, *out, target| {
                     const cast = try self.alloc.create(ast.Scalar);

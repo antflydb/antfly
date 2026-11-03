@@ -293,6 +293,7 @@ pub const Query = struct {
     }
 };
 pub const Snapshot = struct {
+    group: u64 = local.common_group_ids.main_metadata_group_id,
     incarnation: [16]u8,
     standalone: bool,
     head: u64,

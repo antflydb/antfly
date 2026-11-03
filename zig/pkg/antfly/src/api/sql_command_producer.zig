@@ -23,7 +23,6 @@ const connections = @import("sql_connection_record.zig");
 const transactions = @import("transactions.zig");
 const Call = @import("../system_catalog/server_call.zig").Call;
 const A = std.mem.Allocator;
-const native_group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
 pub const execution_lease_ms: u64 = 60000;
 pub const renew_before_ms: u64 = execution_lease_ms * 2 / 3;
 pub const Id = [16]u8;
@@ -59,7 +58,7 @@ pub const Record = struct {
     failure: ?authority.outcomes.Rejection = null,
 
     pub fn validate(self: Record, a: A) !void {
-        try self.registration.validate(.{ .home = .metadata, .group = native_group, .incarnation = self.registration.lease.backend.incarnation });
+        try self.registration.validate(.{ .home = .metadata, .group = self.registration.group, .incarnation = self.registration.lease.backend.incarnation });
         try self.actor.validate();
         if (self.revision == 0 or self.next_command == 0 or zero(self.instance) or self.principal.len > 4096 or !std.unicode.utf8ValidateSlice(self.principal) or
             !std.mem.eql(u8, &self.registration.lease.principal, &try authority.principalDigest(a, self.actor.session_user))) return error.InvalidSqlConnection;
@@ -122,7 +121,7 @@ pub const Record = struct {
         return .{ .admission = .{ .head = head, .nonce = nonce }, .incarnation = self.registration.lease.backend.incarnation, .standalone = self.registration.standalone, .database = self.registration.lease.database, .actor = self.actor, .backend = self.registration.lease.backend, .operation = operation };
     }
     fn fence(self: Record) authority.scopes.CommandFence {
-        return .{ .backend = self.registration.lease.backend, .command = self.ticket.?.command, .database = self.registration.lease.database, .principal = self.registration.lease.principal, .standalone = self.registration.standalone };
+        return .{ .group = self.registration.group, .backend = self.registration.lease.backend, .command = self.ticket.?.command, .database = self.registration.lease.database, .principal = self.registration.lease.principal, .standalone = self.registration.standalone };
     }
 };
 fn zero(bytes: anytype) bool {
@@ -623,9 +622,9 @@ pub const Port = struct {
         if (bytes.len > max_bytes) return error.InvalidSqlBackendResponse;
         var parsed = try std.json.parseFromSlice(authority.Snapshot, a, bytes, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
-        if (!std.mem.eql(u8, &parsed.value.incarnation, &value.registration.lease.backend.incarnation) or parsed.value.standalone != value.registration.standalone) return error.CatalogGenerationChanged;
+        if (!std.mem.eql(u8, &parsed.value.incarnation, &value.registration.lease.backend.incarnation) or parsed.value.standalone != value.registration.standalone or parsed.value.group != value.registration.group) return error.CatalogGenerationChanged;
         if (parsed.value.scope) |scope| {
-            try scope.validate(.{ .home = .metadata, .group = native_group, .incarnation = parsed.value.incarnation });
+            try scope.validate(.{ .home = .metadata, .group = value.registration.group, .incarnation = parsed.value.incarnation });
             if (!sameRegistration(scope.registration, value.registration)) return error.InvalidSqlBackendResponse;
             if (scope.registration.lease.expires_at_ms < value.registration.lease.expires_at_ms) return error.InvalidSqlBackendResponse;
             if (scope.registration.lease.expires_at_ms != value.registration.lease.expires_at_ms and !value.recovery) {
@@ -637,7 +636,7 @@ pub const Port = struct {
             // observed expiry changes no backend identity and cannot strand
             // the source's unconditional fence behind a stale local lease.
             const owner = parsed.value.owner orelse return error.InvalidSqlBackendResponse;
-            try owner.validate(.{ .home = .metadata, .group = native_group, .incarnation = parsed.value.incarnation });
+            try owner.validate(.{ .home = .metadata, .group = value.registration.group, .incarnation = parsed.value.incarnation });
             if (!std.meta.eql(owner.lease, scope.registration.lease)) return error.InvalidSqlBackendResponse;
         } else if (parsed.value.owner != null) return error.InvalidSqlBackendResponse;
         if (parsed.value.next_work != null) return error.InvalidSqlBackendResponse;
@@ -736,7 +735,7 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
             if (!std.meta.eql(scope.command, @as(?authority.scopes.Command, prior.ticket.?.command))) return error.InvalidSqlBackendResponse;
             const owner = cut.owner orelse return error.InvalidSqlBackendResponse;
             if (cut.receipt) |receipt| {
-                try receipt.requireFor(.{ .home = .metadata, .group = native_group, .incarnation = cut.incarnation }, effect);
+                try receipt.requireFor(.{ .home = .metadata, .group = prior.registration.group, .incarnation = cut.incarnation }, effect);
                 if (receipt.outcome == .completed) {
                     next.control_effect = null;
                     next.pending = if (prior.phase == .finishing) next.controlRequest(cut.head, nonce, .{ .finish = prior.ticket.?.command }) else null;

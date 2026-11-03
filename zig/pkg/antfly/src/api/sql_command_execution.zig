@@ -78,10 +78,10 @@ pub const Controller = struct {
             var observed = try std.json.parseFromSlice(authority.Snapshot, a, bytes, .{});
             defer observed.deinit();
             const cut = observed.value;
-            if (cut.standalone != self.standalone or std.mem.allEqual(u8, &cut.incarnation, 0) or cut.database_id == null or cut.database_id.? == 0 or
+            if (cut.group == 0 or cut.standalone != self.standalone or std.mem.allEqual(u8, &cut.incarnation, 0) or cut.database_id == null or cut.database_id.? == 0 or
                 cut.scope != null or cut.owner != null or cut.next_work != null or cut.receipt != null or cut.wait_resource != null) return error.InvalidSqlBackendResponse;
             try self.check();
-            const registration: authority.scopes.Registration = .{ .connection = self.connection, .nonce = try self.nonce(), .standalone = self.standalone, .lease = .{
+            const registration: authority.scopes.Registration = .{ .group = cut.group, .connection = self.connection, .nonce = try self.nonce(), .standalone = self.standalone, .lease = .{
                 .backend = .{ .incarnation = cut.incarnation, .id = try self.nonce(), .fence = 1 },
                 .database = cut.database_id.?,
                 .node = self.node,
@@ -280,9 +280,9 @@ pub const Native = struct {
     pub fn controller(self: *Native, connection: [32]u8, identity: ?@import("http_server.zig").AuthenticatedIdentity) !Controller {
         const server = self.server;
         const store = server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
-        var owned = (try source.load(store, server.alloc, connection)) orelse return error.SqlConnectionNotFound;
-        defer owned.deinit();
-        return .{ .store = store, .connection = connection, .principal = @import("http_server.zig").transactionPrincipal(identity) orelse "", .actor = try @import("sql_authorization_recovery.zig").actor(server, identity), .instance = try server.sql_connection_admission.executionInstance(server.embedding_provider_runtime.io), .node = server.localSessionNodeId(), .standalone = owned.value.registration.standalone, .port = .{ .ptr = self, .call = call }, .runtime = .{ .ptr = self, .now_ms = now, .nonce = nonce, .active = active, .pause = pause } };
+        var owned = try source.load(store, server.alloc, connection);
+        defer if (owned) |*value| value.deinit();
+        return .{ .store = store, .connection = connection, .principal = @import("http_server.zig").transactionPrincipal(identity) orelse "", .actor = try @import("sql_authorization_recovery.zig").actor(server, identity), .instance = try server.sql_connection_admission.executionInstance(server.embedding_provider_runtime.io), .node = server.localSessionNodeId(), .standalone = if (owned) |value| value.value.registration.standalone else server.cfg.deployment_mode == .standalone, .port = .{ .ptr = self, .call = call }, .runtime = .{ .ptr = self, .now_ms = now, .nonce = nonce, .active = active, .pause = pause } };
     }
     fn call(raw: *anyopaque, a: A, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
         const self: *Native = @ptrCast(@alignCast(raw));
@@ -323,11 +323,19 @@ pub const Request = struct {
     pub fn start(self: *Request, server: *@import("http_server.zig").ApiHttpServer, context: @import("antfly_local_sources").api_operation.RequestContext, identity: ?@import("http_server.zig").AuthenticatedIdentity, lease: *admission.Lease, body: anytype) !bool {
         if (self.loan != null) return error.InvalidSqlConnection;
         const store = server.txn_sessions.durable orelse return false;
-        var enrolled = (try source.load(store, server.alloc, lease.key.connection)) orelse return false;
-        enrolled.deinit();
-        try server.ensureSqlCommandUpkeep();
+        var enrolled = try source.load(store, server.alloc, lease.key.connection);
+        defer if (enrolled) |*value| value.deinit();
+        if (enrolled == null and !server.source.vtable.supports_sql_command_ownership) return false;
         self.native = .{ .server = server, .context = context };
         const owner = try self.native.controller(lease.key.connection, identity);
+        if (enrolled == null) {
+            var connection = try @import("sql_connections.zig").load(store, server.alloc, lease.key.connection, owner.principal, server.localSessionNodeId(), owner.now());
+            defer connection.deinit();
+            // Publish registration before taking a body. Lost registration
+            // replies may resume only native control, never execute SQL twice.
+            try owner.enroll(server.alloc, connection.value.database);
+        }
+        try server.ensureSqlCommandUpkeep();
         var writer = std.Io.Writer.Hashing(std.crypto.hash.Blake3).initHasher(std.crypto.hash.Blake3.init(.{}), &.{});
         try writer.writer.writeAll("antfly/sql-command-request/v1\x00");
         try std.json.Stringify.value(body, .{}, &writer.writer);

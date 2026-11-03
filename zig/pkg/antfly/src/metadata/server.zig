@@ -351,6 +351,7 @@ pub const MetadataServer = struct {
             // make remote restore work. Explicit host overrides stay intact.
             if (api_server_cfg.session_router == null) api_server_cfg.session_router = metadataSessionRouter(svc);
             if (api_server_cfg.session_executor == null) api_server_cfg.session_executor = svc.raft.host.http_host.request_executor;
+            api_server_cfg.prepared_transaction_group_id = svc.metadata_group_id;
             api_server_cfg.prepared_transaction_leadership = .{
                 .ptr = svc,
                 .vtable = &.{ .is_local_leader = struct {

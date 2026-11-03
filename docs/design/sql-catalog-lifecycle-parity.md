@@ -18569,3 +18569,15 @@ campaign's 23 scenarios. The native reuse contract checks that read-only control
 adds no database open and installation takes one guarded reopen. All selected
 gates report zero skipped tests and zero leaks. Generation and formatting pass.
 These checks strengthen existing case evidence; no inventory dispositions change.
+
+
+### Public advisory locking originals execute through native owners
+
+The three unchanged advisory originals (`sql-0089`, `sql-0090`, `sql-0091`)
+now have authenticated public HTTP execution and pgwire/cold-lifetime evidence.
+The six-test public locking Debug gate has no skips or leaks, including ordinary
+DDL after sync-setting/savepoint control and prepared transaction recovery.
+The inventory is **915 implemented / 138 rejected / 449 superseded / 84 unresolved**
+(**61 DDL/catalog unresolved**). The seven table/row locking originals remain
+unresolved; native conflict matrices and parser coverage alone do not close them.
+See [public advisory case closure](sql-lock-ownership.md#public-advisory-case-closure).

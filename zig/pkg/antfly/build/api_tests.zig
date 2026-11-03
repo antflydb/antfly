@@ -2278,6 +2278,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL LIKE declaration copies retain grants constraints isolation and cold owners",
             "mounted SQL LIKE full ownership lifetime retires borrowed defaults and fresh identities through cold owners",
             "mounted SQL original prepared transactions retain multi-owner intents across complete cold restart",
+            "mounted SQL original advisory locks",
             "mounted SQL native sync controls",
             "pgwire native sync controls",
             "pgwire transaction preparation",
@@ -2445,6 +2446,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // release/Linux bounds retain their independently measured profiles.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 21 else 12) else 7) * 1024 * 1024 * 1024,
     });
+    const sql_locking_tests = b.addTest(.{
+        .root_module = sql_owner_lifecycle_test_mod,
+        .filters = &.{ "mounted SQL original advisory locks", "mounted SQL native sync controls", "mounted SQL original prepared transactions", "pgwire transaction preparation" },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 21 else 12) else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_locking_run = addFilteredTestRunArtifact(b, sql_locking_tests);
+    sql_locking_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-locking-test", "Verify public SQL locking contention and native session/transaction lifetimes").dependOn(&sql_locking_run.step);
     const sql_sync_control_tests = b.addTest(.{
         .root_module = sql_owner_lifecycle_test_mod,
         .filters = &.{ "mounted SQL native sync controls", "pgwire native sync controls" },

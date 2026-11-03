@@ -4649,6 +4649,30 @@
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
+    },
+    "sql-qualified-advisory-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-locking-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-advisory-values-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/check_sql_advisory_values_postgres.py"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -6072,18 +6096,54 @@
     },
     {
       "id": "sql-0089",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original bigint advisory acquisition executes through authenticated public HTTP connections with native command ownership. Independent connections prove both key spaces, shared/exclusive contention, reentrance, exact void/boolean values and warnings, transaction/savepoint/DISCARD lifetimes, pgwire OIDs and disconnect cleanup, and cold logical-connection recovery. The broader six-test Debug gate also preserves ordinary DDL and prepared transactions under command traffic. PostgreSQL 18 independently qualifies overload, coercion, NULL/void, and lifetime semantics. This does not close the separate native table/row-lock cases.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_locking_integration_test.zig",
+          "test": "mounted SQL original advisory locks enforce public contention overloads transaction savepoint discard and cold lifetimes",
+          "gate": "sql-qualified-advisory-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_locking_integration_test.zig",
+          "test": "mounted SQL original advisory locks enforce public contention overloads transaction savepoint discard and cold lifetimes",
+          "gate": "sql-qualified-advisory-values-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0090",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original signed two-integer advisory acquisition executes through authenticated public HTTP connections with native command ownership. Independent connections prove both key spaces, shared/exclusive contention, reentrance, exact void/boolean values and warnings, transaction/savepoint/DISCARD lifetimes, pgwire OIDs and disconnect cleanup, and cold logical-connection recovery. The broader six-test Debug gate also preserves ordinary DDL and prepared transactions under command traffic. PostgreSQL 18 independently qualifies overload, coercion, NULL/void, and lifetime semantics. This does not close the separate native table/row-lock cases.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_locking_integration_test.zig",
+          "test": "mounted SQL original advisory locks enforce public contention overloads transaction savepoint discard and cold lifetimes",
+          "gate": "sql-qualified-advisory-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_locking_integration_test.zig",
+          "test": "mounted SQL original advisory locks enforce public contention overloads transaction savepoint discard and cold lifetimes",
+          "gate": "sql-qualified-advisory-values-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0091",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original advisory unlock and its boolean result executes through authenticated public HTTP connections with native command ownership. Independent connections prove both key spaces, shared/exclusive contention, reentrance, exact void/boolean values and warnings, transaction/savepoint/DISCARD lifetimes, pgwire OIDs and disconnect cleanup, and cold logical-connection recovery. The broader six-test Debug gate also preserves ordinary DDL and prepared transactions under command traffic. PostgreSQL 18 independently qualifies overload, coercion, NULL/void, and lifetime semantics. This does not close the separate native table/row-lock cases.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_locking_integration_test.zig",
+          "test": "mounted SQL original advisory locks enforce public contention overloads transaction savepoint discard and cold lifetimes",
+          "gate": "sql-qualified-advisory-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_locking_integration_test.zig",
+          "test": "mounted SQL original advisory locks enforce public contention overloads transaction savepoint discard and cold lifetimes",
+          "gate": "sql-qualified-advisory-values-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0092",

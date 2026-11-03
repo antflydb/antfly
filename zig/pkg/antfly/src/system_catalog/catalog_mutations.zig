@@ -25,6 +25,18 @@ pub const Preparation = struct {
     command_fence: ?@import("command_fence.zig").Fence = null,
     view: ?@import("views.zig").Request = null,
     relation: ?@import("relations.zig").Intent = null,
+
+    /// Remote preparation carries its original fence in the authenticated
+    /// request body. In-process callers additionally pin it in their context.
+    /// This read does not authorize an effect: native admission independently
+    /// joins this exact fence to the live command before applying the DDL.
+    pub fn requireCommandFence(self: Preparation, current: ?*const @import("command_fence.zig").Fence) !void {
+        if (self.command_fence) |fence| try fence.validate();
+        if (current) |fence| {
+            try fence.validate();
+            if (!std.meta.eql(self.command_fence, @as(?@import("command_fence.zig").Fence, fence.*))) return error.InvalidCatalogMutation;
+        }
+    }
 };
 pub const Admission = struct {
     request: outcomes.Admission,

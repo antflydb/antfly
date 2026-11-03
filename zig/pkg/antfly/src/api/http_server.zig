@@ -1742,6 +1742,7 @@ pub const ApiHttpServerConfig = struct {
     /// Global external decisions belong to the metadata leader, independently
     /// of which node leads a particular table's data group.
     prepared_transaction_leadership: ?@import("group_work_ownership.zig").Source = null,
+    prepared_transaction_group_id: u64 = @import("antfly_local_sources").common_group_ids.main_metadata_group_id,
     session_executor: ?http_common.RequestExecutor = null,
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
@@ -2039,6 +2040,9 @@ pub const StatusSource = struct {
         supports_sql_casts: bool = false,
         supports_sql_types: bool = false,
         supports_sql_authorization: bool = false,
+        /// Native connection command enrollment, fencing and durable cleanup.
+        /// Discovery still verifies the metadata decoder/capability barrier.
+        supports_sql_command_ownership: bool = false,
         /// Hosting requires native existence, definition CAS and policy authority.
         supports_object_tables: bool = false,
         supports_resolver_catalog_read: bool = false,
@@ -2848,6 +2852,7 @@ pub const StatusSource = struct {
             .supports_sql_casts = true,
             .supports_sql_types = true,
             .supports_sql_authorization = true,
+            .supports_sql_command_ownership = true,
             .supports_object_tables = true,
             .supports_resolver_catalog_read = true,
             .supports_resolver_authority = true,

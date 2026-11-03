@@ -2459,6 +2459,11 @@ pub const SessionRegistry = struct {
     pub const CommitExecution = struct {
         lock: *AtomicMutex,
         retirement: *@import("sql_retained_snapshot.zig").Retirement,
+        transaction_id: db_mod.types.TxnId,
+
+        pub fn matches(self: CommitExecution, registry: *SessionRegistry, id: db_mod.types.TxnId) bool {
+            return self.retirement == &registry.snapshot_retirement and self.lock == registry.commitLock(id) and std.mem.eql(u8, &self.transaction_id, &id);
+        }
 
         pub fn release(self: CommitExecution) void {
             self.lock.unlock();
@@ -2472,7 +2477,7 @@ pub const SessionRegistry = struct {
         // retry must yield through its caller's Io as well, including under
         // cooperative execution, and must remain cancellable.
         while (!lock.inner.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
-        return .{ .lock = lock, .retirement = &self.snapshot_retirement };
+        return .{ .lock = lock, .retirement = &self.snapshot_retirement, .transaction_id = txn_id };
     }
 
     /// Maintenance skips live requests instead of waiting on their execution.
@@ -2480,7 +2485,7 @@ pub const SessionRegistry = struct {
     pub fn tryAcquireCommitExecution(self: *SessionRegistry, txn_id: db_mod.types.TxnId) ?CommitExecution {
         const lock = self.commitLock(txn_id);
         if (!lock.inner.tryLock()) return null;
-        return .{ .lock = lock, .retirement = &self.snapshot_retirement };
+        return .{ .lock = lock, .retirement = &self.snapshot_retirement, .transaction_id = txn_id };
     }
 
     fn commitLock(self: *SessionRegistry, txn_id: db_mod.types.TxnId) *AtomicMutex {
@@ -10112,4 +10117,29 @@ test "durable SQL connection execution projection bounds reads and avoids unchan
     try store.putConnectionExecutionTxn(&probe, session);
     try std.testing.expectEqual(@as(usize, 0), probe.reads);
     try std.testing.expectEqual(@as(usize, 0), probe.writes);
+}
+
+test "SQL execution lease borrowing rejects another registry and colliding transaction identities" {
+    const a = std.testing.allocator;
+    var first_registry = SessionRegistry.init(null);
+    defer first_registry.deinit(a);
+    var other_registry = SessionRegistry.init(null);
+    defer other_registry.deinit(a);
+    const id: db_mod.types.TxnId = @splat(1);
+    const held = first_registry.tryAcquireCommitExecution(id) orelse return error.TestExpectedExecutionLease;
+    defer held.release();
+    try std.testing.expect(held.matches(&first_registry, id));
+    try std.testing.expect(!held.matches(&other_registry, id));
+    var colliding: db_mod.types.TxnId = @splat(2);
+    var found = false;
+    for (0..65536) |serial| {
+        std.mem.writeInt(u64, colliding[0..8], serial, .little);
+        if (first_registry.commitLock(colliding) == held.lock) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+    try std.testing.expect(!held.matches(&first_registry, colliding));
+    try std.testing.expect(first_registry.tryAcquireCommitExecution(colliding) == null);
 }

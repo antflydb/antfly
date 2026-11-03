@@ -1,15 +1,15 @@
 # SQL lock ownership
 
 This is an implementation record for explicit SQL locking. The PostgreSQL 18
-conflict matrices and lifetime rules are the semantic reference. The native
-journal described here is not yet activation of the unresolved SQL cases.
+conflict matrices and lifetime rules are the semantic reference.
 
-Current status (2026-11-03): the native ledger, durable command-source permits,
-shared prepared-decision integration and independent prepared lock home are
-implemented and qualified. The ordered scalar/type layer and native advisory
-execution owner are also implemented. SQL savepoints and connection DISCARD now
-publish their SQL metadata atomically with native advisory control. Public
-HTTP/pgwire source activation and row/table participant enrollment remain open.
+Current status (2026-11-03): public HTTP and pgwire advisory execution is active
+and qualified against the three unchanged original advisory statements. The
+native ledger, durable command-source permits, shared prepared-decision
+integration, independent prepared lock home, ordered scalar/type layer,
+savepoints and DISCARD share native lifetime authority. Distributed row/table
+participant enrollment remains open; the seven original table/row locking cases
+are not closed by advisory coverage.
 The sections below retain earlier qualification records; the final sections
 describe the current implementation.
 
@@ -1213,3 +1213,28 @@ must not certify a completed drop or erase the remaining logical binding. Run
 combined native and standalone contract gate. The separate
 `antfly-sql-command-producer-test` Debug gate passes all 49 source/controller
 regressions after the catalog atomicity change.
+
+
+## Public advisory case closure
+
+The native public locking Debug gate executes `sql-0089`, `sql-0090` and
+`sql-0091` unchanged through independent authenticated HTTP connections. It
+checks both key spaces, shared/exclusive conflicts, reference counts, NULL/void
+results and warnings, commit/rollback, savepoint rollback, DISCARD, pgwire result
+OIDs and disconnect cleanup, and cold logical-connection recovery. Its six tests
+also qualify existing prepared transactions and sync-setting lifetimes; there
+are no skips or leaks. The PostgreSQL 18 value oracle passes 221 assertions;
+the independent conflict and wait/deadlock oracles pass 134 and 31 assertions.
+
+Ingress pins the native metadata group from discovery instead of assuming the
+main group. Read-only remote DDL preparation preserves its authenticated body
+fence; the accepting mutation still independently checks the live command.
+Lock/prepared ownership control preserves bounded relation-publication scans,
+since it changes no relation source. The public sync campaign verifies catalog
+activation under command traffic without increasing its request deadline.
+Transaction control borrows only the exact outer execution lease, and completion
+loads durable state using the receiving allocator.
+
+Validation: `zig build antfly-api-sql-locking-test -Doptimize=Debug -j1`,
+`zig build antfly-sql-command-producer-test -Doptimize=Debug -j1`, and
+`zig build antfly-pessimistic-lock-authority-test -Doptimize=Debug -j1`.

@@ -281,7 +281,7 @@ pub fn drainSessionCompletion(server: *http.ApiHttpServer, txn_id: [16]u8, conte
     var quanta: u8 = 0;
     while (true) {
         try context.ensureActive();
-        var state = (try store.load(txn_id)) orelse return error.SqlTransactionNotActive;
+        var state = (try store.loadInto(server.alloc, txn_id)) orelse return error.SqlTransactionNotActive;
         defer state.deinit(server.alloc);
         if (!state.terminal_abort and state.terminal_commit == null) return error.SqlTransactionOutcomeUnknown;
         if (state.external_receipt_acknowledged) return;
@@ -349,7 +349,7 @@ fn recoverSessionWithContext(server: *http.ApiHttpServer, txn_id: [16]u8, bytes:
 /// One indexed owner and one native quantum per call; unresolved decisions
 /// remain held while the cursor advances so they cannot starve other owners.
 pub fn advanceLockWork(server: *http.ApiHttpServer, after: *?@import("../system_catalog/lock_authority.zig").scopes.Work) !bool {
-    const group = local.common_group_ids.main_metadata_group_id;
+    const group = server.cfg.prepared_transaction_group_id;
     if (server.cfg.prepared_transaction_leadership) |leadership| {
         if (!leadership.isLocalLeader(group)) return false;
     } else if (server.cfg.deployment_mode != .standalone) return false;
@@ -390,7 +390,7 @@ pub fn advanceLockWork(server: *http.ApiHttpServer, after: *?@import("../system_
 /// Scheduling follows the existing metadata-group leadership capability; the
 /// durable CAS and native owner checks remain authoritative across elections.
 pub fn advanceWork(server: *http.ApiHttpServer, after: *?[16]u8) !void {
-    const group = local.common_group_ids.main_metadata_group_id;
+    const group = server.cfg.prepared_transaction_group_id;
     if (server.cfg.prepared_transaction_leadership) |leadership| {
         if (!leadership.isLocalLeader(group)) return;
     } else if (server.cfg.deployment_mode != .standalone) return;
@@ -565,7 +565,7 @@ pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdenti
 /// Session ownership, current schema/RLS, predicates and FK/UNIQUE preparation
 /// use the ordinary transaction pipeline. Only the durable decision authority
 /// and the terminal SQL boundary differ from COMMIT.
-pub fn execute(root: *execution.Adapter, session: *sql_session.Session, a: A, command: ast.PreparedTransaction) !local.sql_runtime.Result {
+pub fn execute(root: *execution.Adapter, session: *sql_session.Session, coordinator: *@import("sql_session.zig").Coordinator, a: A, command: ast.PreparedTransaction) !local.sql_runtime.Result {
     const server = root.server;
     const tag = switch (command.action) {
         .prepare => "PREPARE TRANSACTION",
@@ -610,6 +610,9 @@ pub fn execute(root: *execution.Adapter, session: *sql_session.Session, a: A, co
     };
     const lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
     defer lease.release();
+    const prior_execution = coordinator.borrowed_execution;
+    defer coordinator.borrowed_execution = prior_execution;
+    coordinator.borrowed_execution = &lease;
     var sealed = false;
     errdefer if (!sealed) {
         if (session.owner.vtable.rollback(session.owner.ptr, session.scope, id)) |_| {

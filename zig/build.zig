@@ -1094,6 +1094,12 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     }) });
     b.step("antfly-pessimistic-lock-contract-test", "Verify PostgreSQL lock modes, reentrance and savepoint-owned grants").dependOn(&b.addRunArtifact(pessimistic_lock_tests).step);
+    const pessimistic_authority_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/pessimistic_lock_authority_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.step("antfly-pessimistic-lock-authority-test", "Verify native command namespaces and lock authority contracts").dependOn(&b.addRunArtifact(pessimistic_authority_tests).step);
     const pessimistic_ledger_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/storage/pessimistic_lock_ledger.zig"),
         .target = target,

@@ -2559,6 +2559,7 @@ test "SQL command producer native autocommit advisory reads lazily decide and re
         forward.io = server.embedding_provider_runtime.io;
         server.sql_connection_admission.instance = instance;
         var handler: @import("httpx_handler.zig").AntflyApiHandler = .{ .api_server = &server };
+        var receiver_allocator_checks: usize = 0;
         for (cases, 0..) |case, ordinal| {
             cancelled.store(false, .release);
             forward.cancel_effect.store(case.cancel, .release);
@@ -2580,6 +2581,20 @@ test "SQL command producer native autocommit advisory reads lazily decide and re
             defer response.deinit();
             if ((response.status.code == 200) != case.success) std.debug.print("implicit advisory {d}: {s}: {s}\n", .{ ordinal, case.sql, response.body orelse "" });
             try std.testing.expectEqual(case.success, response.status.code == 200);
+            if (case.success) {
+                var completion = try std.json.parseFromSlice(struct { transaction_id: ?[]const u8 = null }, a, response.body.?, .{ .ignore_unknown_fields = true });
+                defer completion.deinit();
+                if (completion.value.transaction_id) |encoded| {
+                    const txn_id = try @import("distributed_txn.zig").parseTxnIdHex(encoded);
+                    // Drain a real already acknowledged native decision with a
+                    // receiving allocator distinct from the store's allocator.
+                    // No fabricated preparation/ACK stands in for this cut.
+                    var receiver = http.ApiHttpServer.init(std.heap.c_allocator, .{ .session_store = &source, .session_maintenance_local_only = true }, .{ .ptr = &forward, .vtable = &.{ .status = Forward.status } }, null, null);
+                    defer receiver.deinit();
+                    try @import("sql_prepared_coordinator.zig").drainSessionCompletion(&receiver, txn_id, .{});
+                    receiver_allocator_checks += 1;
+                }
+            }
             if (case.first) |expected| {
                 var output = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
                 defer output.deinit();
@@ -2631,6 +2646,7 @@ test "SQL command producer native autocommit advisory reads lazily decide and re
             if (case.effects != effects_count - effects_before) std.debug.print("implicit advisory effect count at {d}: {s}\n", .{ ordinal, case.sql });
             try std.testing.expectEqual(case.effects, effects_count - effects_before);
         }
+        try std.testing.expect(receiver_allocator_checks > 0);
     }
 }
 
@@ -2737,4 +2753,26 @@ test "SQL command producer native sealed execution fences completion before the 
             try std.testing.expect(reusable.value.active_txn == null);
         }
     }
+}
+
+test "SQL command producer native catalog preparation preserves remote fences and rejects changed local owners" {
+    const Preparation = @import("../system_catalog/catalog_mutations.zig").Preparation;
+    const Fence = @import("../system_catalog/command_fence.zig").Fence;
+    const fence: Fence = .{ .group = 2188, .backend = .{ .incarnation = @splat(1), .id = @splat(2), .fence = 1 }, .command = .{ .sequence = 1, .nonce = @splat(3), .executor = @splat(4) }, .database = 1, .principal = @splat(5), .standalone = false };
+    const request: Preparation = .{ .request = .{ .mutation = .{ .kind = .table, .action = .create, .name = "rows" } }, .nonce = @splat(6), .command_fence = fence };
+    try request.requireCommandFence(null);
+    try request.requireCommandFence(&fence);
+    var changed = fence;
+    changed.command.executor = @splat(7);
+    try std.testing.expectError(error.InvalidCatalogMutation, request.requireCommandFence(&changed));
+    changed = fence;
+    changed.group += 1;
+    try std.testing.expectError(error.InvalidCatalogMutation, request.requireCommandFence(&changed));
+    var missing = request;
+    missing.command_fence = null;
+    try missing.requireCommandFence(null);
+    try std.testing.expectError(error.InvalidCatalogMutation, missing.requireCommandFence(&fence));
+    var malformed = request;
+    malformed.command_fence.?.group = 0;
+    try std.testing.expectError(error.InvalidLockScope, malformed.requireCommandFence(null));
 }

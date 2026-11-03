@@ -32317,7 +32317,11 @@ pub const RaftApplyStore = struct {
         // candidates, seals or roots. Their independent runtime/storage
         // capability floors do not replace final publication capability checks.
         return switch (command) {
-            .apply_sql_sequence_counter, .upsert_store_heartbeat, .apply_store_report_update, .apply_store_report_baseline => true,
+            // Command/transaction ownership and its outcome journal do not
+            // change relation sources. Resetting a bounded publication scan on
+            // every BEGIN/FINISH can prevent catalog activation indefinitely
+            // while a connected client is issuing statements.
+            .apply_sql_lock_scope, .apply_sql_prepared_transaction, .apply_sql_sequence_counter, .upsert_store_heartbeat, .apply_store_report_update, .apply_store_report_baseline => true,
             else => false,
         };
     }
@@ -40719,7 +40723,7 @@ pub const RaftApplyStore = struct {
             const database = (try view.lookup(.database, 0, name)) orelse return error.DatabaseNotFound;
             const journal: SqlLocks.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
             try context.ensureActive();
-            return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .incarnation = incarnation, .standalone = standalone, .head = try journal.head(a), .scope = null, .owner = null, .next_work = null, .database_id = database.id }, .{});
+            return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .group = group, .incarnation = incarnation, .standalone = standalone, .head = try journal.head(a), .scope = null, .owner = null, .next_work = null, .database_id = database.id }, .{});
         }
         const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = incarnation };
         const item: ?SqlLocks.scopes.WorkItem = if (query.work) |work| blk: {
@@ -40742,7 +40746,7 @@ pub const RaftApplyStore = struct {
         else
             null;
         try context.ensureActive();
-        return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .incarnation = incarnation, .standalone = standalone, .head = try outcomes.head(a), .scope = scope, .owner = owner, .next_work = work, .receipt = receipt, .wait_resource = wait_resource }, .{});
+        return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .group = group, .incarnation = incarnation, .standalone = standalone, .head = try outcomes.head(a), .scope = scope, .owner = owner, .next_work = work, .receipt = receipt, .wait_resource = wait_resource }, .{});
     }
     fn applySqlLockScopeTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, bytes: []const u8) !void {
         if (bytes.len > SqlLocks.max_bytes) return error.CatalogCommandTooLarge;
@@ -69006,7 +69010,7 @@ test "SQL command scope database holds survive cold snapshots and block rename a
                 database = resource.id;
             };
             try std.testing.expect(database != 0);
-            const registration: L.scopes.Registration = .{ .lease = .{ .backend = backend, .database = database, .node = 7, .principal = try L.principalDigest(a, .bootstrap), .expires_at_ms = 1000 }, .connection = @splat('a'), .nonce = @splat(3), .standalone = false };
+            const registration: L.scopes.Registration = .{ .group = group, .lease = .{ .backend = backend, .database = database, .node = 7, .principal = try L.principalDigest(a, .bootstrap), .expires_at_ms = 1000 }, .connection = @splat('a'), .nonce = @splat(3), .standalone = false };
             try Helper.submit(&store, a, database, backend, 11, .{ .register = registration });
             try Helper.submit(&store, a, database, backend, 13, .{ .register = registration });
             try std.testing.expectEqual(@as(u32, 1), try Helper.count(&store, database));
