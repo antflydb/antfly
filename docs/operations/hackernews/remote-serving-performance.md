@@ -457,3 +457,11 @@ checks; failures of required request allocations still propagate. Nine focused
 Debug navigation, warming, source-resolution and text-directory tests pass
 without leaks. The performance tables remain pinned to the recorded engine
 revision above; this memory-pressure fix is validated separately.
+
+Streaming read allowances are now renewed before page-store dispatch, including
+single-page and batched decoded-cache callbacks. Routing cursors can continue
+past their initial allowance using bounded per-page/per-wave admission; ordinary
+query stores retain cumulative limits on both cold reads and warm cache hits.
+The regression covers raw and decoded dispatch, exhausted prior allowances,
+single and batched reads, and cancellation. All 20 focused Debug navigation,
+publication and coalesced-I/O tests passed without failures or leaks.

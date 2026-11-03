@@ -275,6 +275,75 @@ test "external lake navigation cache allocation failures preserve required reads
     }
 }
 
+test "external lake streaming navigation renews allowances across raw and decoded cache dispatch" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("streaming-navigation-budget");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const scope = try stores.UploadScope.forPublication(@splat(4), 1, std.testing.io);
+    store.upload_scope = scope;
+    var reads: u64 = 0;
+    var writes: u64 = 16 * 1024 * 1024;
+    var storage: pages.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .coalesce_reads = true };
+    var roots: [2]tree.Ref = undefined;
+    for (&roots, [_][]const u8{ "one", "two" }) |*root, value| {
+        var builder: tree.SortedBuilder = .{ .alloc = a, .store = storage.store() };
+        defer builder.deinit();
+        try builder.add("key", value);
+        root.* = (try builder.finish()).?;
+    }
+    for ([_]bool{ false, true }) |decoded| {
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(8), .context = .{ .io = std.testing.io } };
+        var binding = cacheBinding(&cached);
+        if (!decoded) {
+            binding.decoded_read = null;
+            binding.decoded_many = null;
+        }
+        storage.read_cache = binding;
+        storage.streaming = true;
+        // Exhausted prior work cannot cap the next bounded streaming page.
+        // Repeating exercises both cold and warm decoded-cache dispatch.
+        for (0..2) |_| {
+            reads = 0;
+            var page_ = try tree.readNavigationPage(a, storage.store(), roots[0]);
+            page_.deinit(a);
+            try std.testing.expectEqual(@as(u64, tree.max_page_bytes) - roots[0].bytes, reads);
+        }
+        const batch = storage.store().read_many.?;
+        const total_bytes = @as(u64, roots[0].bytes) + roots[1].bytes;
+        for (0..2) |_| {
+            reads = 0;
+            var output: [2]tree.NavigationPage = undefined;
+            try batch.read(batch.ptr, a, &roots, &output);
+            for (&output) |*page_| page_.deinit(a);
+            try std.testing.expectEqual(@as(u64, tree.max_page_bytes) * roots.len - total_bytes, reads);
+        }
+        // Ordinary query budgets remain cumulative even on warm cache hits.
+        storage.streaming = false;
+        reads = roots[0].bytes;
+        var page_ = try tree.readNavigationPage(a, storage.store(), roots[0]);
+        page_.deinit(a);
+        try std.testing.expectEqual(@as(u64, 0), reads);
+        try std.testing.expectError(error.ArtifactReadBudgetExceeded, tree.readNavigationPage(a, storage.store(), roots[0]));
+        reads = total_bytes;
+        var output: [2]tree.NavigationPage = undefined;
+        try batch.read(batch.ptr, a, &roots, &output);
+        for (&output) |*value| value.deinit(a);
+        try std.testing.expectEqual(@as(u64, 0), reads);
+        try std.testing.expectError(error.ArtifactReadBudgetExceeded, batch.read(batch.ptr, a, &roots, &output));
+        storage.streaming = true;
+        const cancelled = std.atomic.Value(bool).init(true);
+        storage.cancellation = Token.fromAtomic(&cancelled);
+        try std.testing.expectError(error.Canceled, tree.readNavigationPage(a, storage.store(), roots[0]));
+        try std.testing.expectError(error.Canceled, batch.read(batch.ptr, a, &roots, &output));
+        storage.cancellation = .none;
+    }
+}
+
 test "external lake shared navigation leases reuse decoded pages and preserve authority budgets and shapes" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("shared-navigation-pages");
