@@ -9221,6 +9221,12 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             return try openWithOptions(backend, .{});
         }
 
+        /// Logical bytes this transaction would present to commit admission
+        /// (the same measure `admitPreparedCommit` checks).
+        pub fn stagedLogicalBytes(self: *const @This()) u64 {
+            return self.mutable.estimatedLogicalBytes() +| self.bulk_appends.estimatedLogicalBytes();
+        }
+
         pub fn openWithOptions(backend: *BackendType, options: backend_types.BatchOptions) !@This() {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);

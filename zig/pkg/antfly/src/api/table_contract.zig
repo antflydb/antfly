@@ -1526,6 +1526,27 @@ test "table contract preserves embeddings create request fields" {
     );
 }
 
+test "table contract admits leann dense index requests" {
+    const alloc = std.testing.allocator;
+    const config_json = try parseCreateIndexRequest(
+        alloc,
+        "embed_idx",
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":8,\"algorithm\":\"leann\",\"leann\":{\"max_degree\":16}}",
+    );
+    defer alloc.free(config_json);
+    try ant_json.testing.expectEqualJsonText(
+        alloc,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":8,\"algorithm\":\"leann\",\"leann\":{\"max_degree\":16}}",
+        config_json,
+    );
+    for ([_][]const u8{
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":8,\"algorithm\":\"faiss\"}",
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":8,\"algorithm\":\"leann\",\"leann\":16}",
+    }) |bad| {
+        try std.testing.expectError(error.InvalidCreateIndexRequest, parseCreateIndexRequest(alloc, "embed_idx", bad));
+    }
+}
+
 test "table contract admits and preserves multi-source index requests" {
     const cases = [_]struct {
         name: []const u8,
