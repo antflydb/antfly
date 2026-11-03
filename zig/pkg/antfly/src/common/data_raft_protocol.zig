@@ -40,29 +40,33 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 28;
-/// Version 28 carries externally decided votes, admission deadlines and
+pub const batch_protocol_version: u16 = 29;
+/// Version 29 carries externally decided votes, admission deadlines and
 /// irreversible read activation. Old members must never ignore these fields.
-pub const batch_external_transaction_protocol_version: u16 = 28;
-/// Version 27 admits metadata-authenticated whole-table deletion fencing and
+pub const batch_external_transaction_protocol_version: u16 = 29;
+/// Version 28 admits metadata-authenticated whole-table deletion fencing and
 /// retire-only FK controls under stable row policies. Older replicas must not
 /// ignore that marker or reinterpret it as an ordinary topology operation.
-pub const batch_sql_drop_control_protocol_version: u16 = 27;
-/// Version 25 carries one tagged private-index effect per entry, including
+pub const batch_sql_drop_control_protocol_version: u16 = 28;
+/// Version 26 carries one tagged private-index effect per entry, including
 /// fixed build/verification pages and terminal controls. It does not advertise
 /// complete public index-publication support. Cancellation GC carries fixed
 /// cursor/count or claim-prefix commitments, never borrowed selection pointers.
-pub const batch_index_owner_control_protocol_version: u16 = 25;
-/// Version 26 carries validation-only schema controls. Owner preparation runs
+pub const batch_index_owner_control_protocol_version: u16 = 26;
+/// Version 27 carries validation-only schema controls. Owner preparation runs
 /// off the progress lane and committed dispatch shares the ordinary apply
 /// boundary. Every applying member still needs the durable activation barrier.
-pub const batch_schema_owner_control_protocol_version: u16 = 26;
+pub const batch_schema_owner_control_protocol_version: u16 = 27;
 /// Origin-bearing replica snapshots belong to that same all-member barrier.
 /// Do not send a new envelope merely because the local binary can decode it.
 pub const native_snapshot_origin_protocol_version = batch_schema_owner_control_protocol_version;
 pub fn nativeSnapshotOriginEnabled(activated_protocol: u16) bool {
     return activated_protocol >= native_snapshot_origin_protocol_version;
 }
+/// Version 25 carries leader-planned LEANN records (`_leann_record`), which
+/// replicas persist and apply verbatim in log order. Older peers cannot
+/// treat them as empty batches.
+pub const batch_leann_record_protocol_version: u16 = 25;
 /// Version 24 commits curator review CAS, overrides and replay atomically.
 pub const batch_resolver_review_protocol_version: u16 = 24;
 /// Version 23 applies grouped-source private state and unit sources atomically.

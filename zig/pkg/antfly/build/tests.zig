@@ -3114,10 +3114,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_raft_queued_transport_tests = addFilteredTestRunArtifact(b, raft_queued_transport_tests);
     const graph_cleanup_runtime_tests = b.addTest(.{
         .root_module = data_implementation_module,
-        .filters = &.{ "graph endpoint cleanup routing", "raft batch round trips guarded graph owner replay afterimages" },
+        .filters = &.{"graph endpoint cleanup routing"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("graph-cleanup-runtime-test", "Run cleanup routing scalability and protocol regressions").dependOn(&addFilteredTestRunArtifact(b, graph_cleanup_runtime_tests).step);
+    // Wire tests belong to the consumer owner: the implementation owner
+    // intentionally excludes consumer suites through implementation_tests_only.
+    const graph_cleanup_wire_tests = b.addTest(.{
+        .root_module = data_consumer_module,
+        .filters = &.{"raft batch round trips guarded graph owner replay afterimages"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const graph_cleanup_runtime_step = b.step("graph-cleanup-runtime-test", "Run cleanup routing scalability and protocol regressions");
+    graph_cleanup_runtime_step.dependOn(&addFilteredTestRunArtifact(b, graph_cleanup_runtime_tests).step);
+    graph_cleanup_runtime_step.dependOn(&addFilteredTestRunArtifact(b, graph_cleanup_wire_tests).step);
+    const leann_replication_runtime_tests = b.addTest(.{
+        .root_module = data_implementation_module,
+        .filters = &.{"leann replication round"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("leann-replication-runtime-test", "Run LEANN leader replication routing and protocol regressions").dependOn(&addFilteredTestRunArtifact(b, leann_replication_runtime_tests).step);
 
     const data_runtime_vopr_tests = b.addTest(.{
         .root_module = data_implementation_module,
@@ -7994,6 +8009,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.filesystem_capacity.",
             "storage.generation_publication.",
             "storage.hbc_adapter.",
+            "storage.leann_store.",
+            "storage.leann_replica.",
+            "storage.leann_replicated.",
             "storage.hierarchy_navigation.",
             "storage.index_manager_vopr.",
             "storage.internal_keys.",

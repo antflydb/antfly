@@ -920,7 +920,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
 
         // Real kernel tickets pin the old physical owner even for a future
         // entry. The queue fixture supplies a trusted preparation directly:
-        // protocol 26 remains reserved, so this is not raw ASRL admission.
+        // schema-owner protocol remains separately gated; this is not raw ASRL admission.
         const QueueHost = struct {
             prepared: ?kernel_owner_source.ProvisionedKernelOwnerSource.PreparedRaftSchemaControl,
             pub fn prepare(self: *@This(), _: @import("../data/schema_apply_queue.zig").Key, _: *const std.atomic.Value(bool)) !kernel_owner_source.ProvisionedKernelOwnerSource.PreparedRaftSchemaControl {

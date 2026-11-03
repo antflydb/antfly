@@ -18,8 +18,10 @@ pub const go_rand = @import("go_rand.zig");
 pub const proto = @import("proto.zig");
 pub const quantizer = @import("quantizer.zig");
 pub const rabitq = @import("rabitq.zig");
+pub const rabitq_ex = @import("rabitq_ex.zig");
 pub const vector = @import("vector.zig");
 
 test {
     _ = @import("quantizer_recall_test.zig");
+    _ = @import("rabitq_ex.zig");
 }

@@ -1367,6 +1367,46 @@ test "executeChain falls back on timeout and retries within a link" {
     try std.testing.expectEqualStrings("fallback-success", fallback.content);
 }
 
+test "executeChain on_error retries only failures that are safe to repeat" {
+    // A timed-out generation may have run upstream, so an `on_error` link
+    // retries rate limits and unavailable upstreams but not timeouts; a link
+    // opts into retrying timeouts with `on_timeout`.
+    const alloc = std.testing.allocator;
+
+    const Fake = struct {
+        attempts: usize = 0,
+        first_error: anyerror,
+
+        fn create(ptr: *anyopaque, _: std.mem.Allocator, _: GeneratorConfig) !Generator {
+            return .{ .ptr = ptr, .vtable = &.{ .generate = generate } };
+        }
+
+        fn generate(ptr: *anyopaque, alloc_inner: std.mem.Allocator, _: []const u8, _: []const ChatMessage) !GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            if (self.attempts == 1) return self.first_error;
+            return .{ .content = try alloc_inner.dupe(u8, "retry-success"), .allocator = alloc_inner };
+        }
+    };
+
+    const chain = [_]ChainLink{.{
+        .generator = GeneratorConfig.fromOpenAI(.{ .model = "gpt-4.1" }),
+        .condition = .on_error,
+        .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 1 },
+    }};
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
+
+    var unavailable = Fake{ .first_error = error.ServiceUnavailable };
+    var retried = try executeChain(alloc, &chain, .{ .ptr = &unavailable, .vtable = &.{ .create = Fake.create } }, &messages);
+    defer retried.deinit();
+    try std.testing.expectEqualStrings("retry-success", retried.content);
+    try std.testing.expectEqual(@as(usize, 2), unavailable.attempts);
+
+    var timed_out = Fake{ .first_error = error.Timeout };
+    try std.testing.expectError(error.Timeout, executeChain(alloc, &chain, .{ .ptr = &timed_out, .vtable = &.{ .create = Fake.create } }, &messages));
+    try std.testing.expectEqual(@as(usize, 1), timed_out.attempts);
+}
+
 test "executeChain falls back on rate limit" {
     const alloc = std.testing.allocator;
 
