@@ -11601,16 +11601,19 @@ pub const Node = struct {
         if (!test_qualification) {
             // Reject exact artifact/backend/features before creating request
             // device state. Geometry is mandatory in executeQualified below.
-            _ = try @import("../extractors/gliner_boundary_qualification.zig").Gate.init(execution_options.identity.?, switch (backend) {
+            _ = try @import("../extractors/gliner_boundary_qualification.zig").Admission.initResolved(execution_options.identity.?, switch (backend) {
                 .metal => .metal,
                 .cuda => .cuda,
                 else => .native,
-            }, &request, control);
+            }, &request, execution_options.pipeline, control);
         }
         // This pass uses the held immutable tokenizer and exact prepared items
         // and windows under the existing request heap. Observe its real CPU
         // phase while keeping decoded-item and window counters quiet. No CB or
         // model work precedes physical workspace admission.
+        var boundary_preparations = boundary_executor.PreparationStore.init(scratch);
+        defer boundary_preparations.deinit();
+        execution_options.preparations = &boundary_preparations;
         const workspace_tokens = if (execution_options.metal_execution_policy == .optimized_v2) tokens: {
             failure.* = .{ .stage = "tokenizing" };
             observer.emit(.{ .phase = .tokenizing });
