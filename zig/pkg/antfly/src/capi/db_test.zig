@@ -1352,6 +1352,8 @@ test "capi SQL reserved receipt preserves every known mutation outcome without a
         const decoded = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, receipt.ptr.?[0..receipt.len], .{ .parse_numbers = false });
         defer decoded.deinit();
         try std.testing.expectEqualStrings(@tagName(outcome), decoded.value.object.get("mutation_outcome").?.string);
+        try std.testing.expectEqualStrings("applied", decoded.value.object.get("commit_outcome").?.string);
+        try std.testing.expectEqual(@as(usize, 0), decoded.value.object.get("rows").?.array.items.len);
         try std.testing.expectEqualStrings("18446744073709551615", decoded.value.object.get("rows_affected").?.number_string);
         try std.testing.expect(!decoded.value.object.get("error").?.object.get("retryable").?.bool);
     }
@@ -1366,6 +1368,7 @@ test "capi SQL unknown commit receipt retains native transaction identity withou
     const decoded = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, receipt.ptr.?[0..receipt.len], .{});
     defer decoded.deinit();
     try std.testing.expectEqualStrings("abababababababababababababababab", decoded.value.object.get("transaction_id").?.string);
+    try std.testing.expectEqualStrings("unknown", decoded.value.object.get("commit_outcome").?.string);
     try std.testing.expectEqualStrings("40003", decoded.value.object.get("error").?.object.get("code").?.string);
     try std.testing.expect(!decoded.value.object.get("error").?.object.get("retryable").?.bool);
 }

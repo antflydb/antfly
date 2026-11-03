@@ -19,11 +19,13 @@ export interface SqlDiagnostic {
   hint?: string;
   retryable?: boolean;
 }
+export type CommitOutcome = "applied" | "not_applied" | "unknown";
 export class SqlError extends Error {
   readonly sqlstate: string;
   constructor(
     readonly diagnostic: SqlDiagnostic,
-    readonly transactionId?: string
+    readonly transactionId?: string,
+    readonly commitOutcome?: CommitOutcome
   ) {
     super(`${diagnostic.code}: ${diagnostic.message}`);
     this.name = "SqlError";
@@ -41,6 +43,7 @@ export interface SqlResult<Row = Record<string, unknown>> {
   commandTag: string;
   /** Native write disposition; callers must not retry an uncertain write. */
   mutationOutcome?: string | null;
+  commitOutcome?: CommitOutcome | null;
   ddlReceipt?: Readonly<Record<string, unknown>> | null;
 }
 export interface WireResult {
@@ -50,5 +53,6 @@ export interface WireResult {
   rows_affected: number;
   command_tag: string;
   mutation_outcome?: string | null;
+  commit_outcome?: CommitOutcome | null;
   ddl_receipt?: Readonly<Record<string, unknown>> | null;
 }

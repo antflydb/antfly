@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Not qualified: unchanged original importer Debug input 7 still failed with LiteReplayBacklogExceeded after 513.534 seconds and 102 batch profiles, with zero native builds. All 65 private merges applied with no discards or EmptySegment failures; maintenance lease queue timeouts were zero. The incomplete database passed integrity with zero tail bytes. Broad native and composed C API/SDK gates pass, but optimized end-to-end and contention qualification remain pending.",
+  "status": "Not qualified: the unchanged original importer Debug input 7 still failed with LiteReplayBacklogExceeded after 513.534 seconds and 102 batch profiles, with zero native builds. All 65 private merges applied and maintenance queue timeouts were zero. Fair admission and shared wait budgets are pushed at df36bddaac; integration, commit outcome/recovery faults and optimized final qualification remain in progress. #1431 remains open.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -6877,5 +6877,23 @@
       "Unchanged importer and controlled optimized throughput, contention, storage and exact logical validation on wolfspider."
     ],
     "issue1431_resolved": false
+  },
+  "fair_admission_integration_20261103": {
+    "source_commit": "df36bddaac",
+    "command_completed": true,
+    "passed": 40,
+    "failed": 2,
+    "skipped": 0,
+    "leaked": 0,
+    "failures": "Two old tests demanded blocking flock worker threads while a queued holder now uses cancellable nonblocking OFD admission. Updated fixtures use legacy flock-only holders to preserve bounded executor fallback coverage.",
+    "native_gate": "Not run: combined command passed CAPI filters to native selection audit. Rerun as a separate command with native filters.",
+    "smoke": "First fixture cleanup fixed. Second run legitimately returned Busy with zero busy timeout during native maintenance; general smoke now has a finite wait budget, while zero-timeout refusal retains dedicated tests.",
+    "consumer_idle_fixture": "Pending: consumer runner depends on the failing physical owner.",
+    "local_sdk_checks": {
+      "python_outcome_mapping": 4,
+      "typescript_metadata": 2,
+      "typescript_typecheck": "passed"
+    },
+    "next": "Complete corrected focused gates and COMMIT fault tests before final optimized qualification."
   }
 }

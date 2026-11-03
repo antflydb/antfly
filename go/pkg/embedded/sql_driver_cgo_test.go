@@ -390,3 +390,22 @@ func TestSQLLargePreparedValuesAndTransaction(t *testing.T) {
 		t.Fatalf("large prepared value changed: got %d bytes, want %d", len(actual), len(payload))
 	}
 }
+
+func TestSQLCommitDisposition(t *testing.T) {
+	for _, disposition := range []string{"applied", "not_applied", "unknown", ""} {
+		body, err := json.Marshal(map[string]any{
+			"error":          map[string]any{"code": "40003", "message": "Reconcile", "retryable": false},
+			"transaction_id": "abab", "commit_outcome": disposition,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var diagnostic *SQLError
+		if !errors.As(sqlError(body, errors.New("native failure")), &diagnostic) {
+			t.Fatal("lost SQL diagnostic")
+		}
+		if diagnostic.CommitOutcome != disposition || diagnostic.TransactionID != "abab" || diagnostic.Code != "40003" {
+			t.Fatalf("lost commit outcome: %#v", diagnostic)
+		}
+	}
+}

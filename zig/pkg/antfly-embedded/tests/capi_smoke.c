@@ -201,7 +201,10 @@ static int run_signal_lifetime_smoke(void) {
                 snprintf(identity_path, sizeof(identity_path), "%s/identity", namespace_path);
                 remove(identity_path);
                 rmdir(namespace_path);
-            } else if (strncmp(entry->d_name, ".aflite-maintenance-", 20) == 0) {
+            } else if (strncmp(entry->d_name, ".aflite-maintenance-", 20) == 0 ||
+                       strncmp(entry->d_name, ".aflite-writer-queue-v1-", 24) == 0) {
+                /* Coordination inodes persist across ordinary owner close.
+                 * All handles in this fixture-owned directory are closed. */
                 snprintf(first_path, sizeof(first_path), "%s/%s", directory, entry->d_name);
                 remove(first_path);
             }
@@ -261,6 +264,9 @@ int main(void) {
     options.open_mode = ANTFLY_OPEN_MODE_WRITER;
     options.profile = ANTFLY_PROFILE_NATIVE;
     options.flags = ANTFLY_OPEN_FLAG_NO_SYNC;
+    /* This smoke exercises ordinary API composition alongside native
+     * maintenance. Zero-timeout refusal has dedicated admission tests. */
+    options.busy_timeout_ms = 5000;
 
     int missing_sentinel = 0;
     antfly_db *missing_handle = (antfly_db *)&missing_sentinel;

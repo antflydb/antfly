@@ -196,7 +196,8 @@ export class Database implements AsyncDisposable {
       const code = await callAsync(fn, handle, ...args, out);
       const body = takeBuffer(this.#native, out);
       const value = body.length ? JSON.parse(body.toString("utf8")) : undefined;
-      if (code && value?.error) throw new SqlError(value.error, value.transaction_id);
+      if (code && value?.error)
+        throw new SqlError(value.error, value.transaction_id, value.commit_outcome);
       checkCode(code);
       return value;
     });

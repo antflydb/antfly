@@ -84,16 +84,34 @@ survive serving-runtime replacement and expose long turns during qualification.
 
 ## Commit outcomes
 
-The required caller contract distinguishes applied, not applied, and unknown.
+SQL JSON responses expose `commit_outcome`: `applied`, `not_applied`, or
+`unknown`. The existing `mutation_outcome` separately describes derived visibility.
 Applied mutations may still have pending derived visibility. A refusal before the
 commit decision can report that the request was not applied. Once a decision may
 be durable, failures must preserve an unknown outcome and a stable reconciliation
 token until recovery establishes its state. Response allocation or visibility
 failure cannot turn an applied mutation into an ordinary retryable error.
 
-Diagnostics should preserve the actual failure class alongside this disposition.
+Every well-formed COMMIT reserves a refusal envelope before admission. Execution
+reserves a separate fallback before the decision; an uncertain response includes
+its native transaction ID. A committed response that cannot allocate its full
+result retains its applied disposition, affected-row count, command tag and empty
+row/column arrays. Python (including DB-API), Go, Rust and TypeScript error wrappers
+retain the disposition and reconciliation token. Absent fields from legacy or
+unstructured failures confer no permission to replay a mutation. Receipt
+allocation failure before admission is reported in the allocation-free native
+last-error detail; no SQL is executed.
+
+Existing uncertain handles remain fenced even at an unchanged checkpoint. A
+new open skips cached owners with uncertain serving or detached publication state
+and reconstructs the durable decision from disk. Old query/runtime references
+retain their original ownership until close.
+
+Diagnostics preserve the actual failure class alongside this disposition.
 Changing an internal error's spelling does not establish whether a mutation was
-applied. SDK error wrappers must retain the disposition and reconciliation token.
+applied. A `not_applied` disposition does not make every error retryable: failed
+SQL sessions still require rollback, and resource/constraint errors retain their
+original retry policy.
 
 ## Qualification
 

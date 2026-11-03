@@ -6087,24 +6087,51 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
         (if (@import("sql.zig").statementMayMutate(value.compiled.statement)) .mutation else .read_only)
     else |_|
         .read_only;
+    // Reserve the refusal envelope before COMMIT enters either local lane.
+    // Once execution starts, its separate reserved receipt protects uncertain
+    // and applied outcomes even if response allocation fails.
+    const is_commit = if (prepared) |value| value.compiled.statement == .commit else |_| false;
+    var refusal_receipt: ?[]u8 = if (is_commit) std.heap.c_allocator.alloc(u8, 2048) catch
+        return capi.recordError(.internal, "{\"commit_outcome\":\"not_applied\",\"error\":{\"code\":\"53200\",\"message\":\"COMMIT was not executed: receipt allocation failed.\",\"retryable\":false}}") else null;
+    defer if (refusal_receipt) |buffer| std.heap.c_allocator.free(buffer);
     const guard = enterWithAdmissionRetry(entry, handle_ptr, .exclusive, intent, true).?;
     defer guard.leaveAccess();
     if (guard.entry_error) |code| {
+        if (is_commit) out_buf.* = embeddedSqlNotAppliedReceipt(&refusal_receipt, .{
+            .code = switch (code) {
+                .busy => "55P03",
+                .cancelled => "57014",
+                .outcome_unknown => "40003",
+                .unsupported => "0A000",
+                else => "XX000",
+            },
+            .message = std.mem.span(capi.errorCodeDescription(@backingInt(code))),
+            .hint = "This COMMIT was not executed. Resolve the admission error before retrying.",
+            .retryable = code == .busy,
+        });
         return capi.ensureError(code, @src().fn_name);
     }
     const handle = guard.handle;
-    if (handle.parent_id != null) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": SQL sessions require a root database handle");
+    if (handle.parent_id != null) {
+        if (is_commit) out_buf.* = embeddedSqlNotAppliedReceipt(&refusal_receipt, antfly.capi_dependencies.sql_errors.describe(error.InvalidArgument));
+        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": SQL sessions require a root database handle");
+    }
     // Managed owners require Raft routing and credentials supplied by API SQL.
-    if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return capi.recordError(.unsupported, @src().fn_name ++ ": storage owner binding is already configured");
+    if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) {
+        if (is_commit) out_buf.* = embeddedSqlNotAppliedReceipt(&refusal_receipt, antfly.capi_dependencies.sql_errors.describe(error.UnsupportedSqlExecution));
+        return capi.recordError(.unsupported, @src().fn_name ++ ": storage owner binding is already configured");
+    }
     const result = if (prepared) |*value|
         executePreparedEmbeddedSql(handle, "default", request_json.bytes(), &budget, value, out_buf)
     else |err|
         embeddedSqlPreparationFailure(handle, request_json.bytes(), err);
     result catch |err| {
-        if (err == error.RowPolicyAuthenticationRequired) return capi.recordError(.unsupported, @src().fn_name ++ ": row policy requires an authenticated identity");
         const diagnostic = antfly.capi_dependencies.sql_errors.describe(err);
         if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("Embedded SQL execution internal failure err={s}", .{@errorName(err)});
-        if (out_buf.ptr == null) out_buf.* = stringifyJson(.{ .@"error" = diagnostic }) catch |encoding_error| return capi.mapErrorContext(encoding_error, @src().fn_name);
+        if (out_buf.ptr == null) {
+            if (is_commit) out_buf.* = embeddedSqlNotAppliedReceipt(&refusal_receipt, diagnostic) else out_buf.* = stringifyJson(.{ .@"error" = diagnostic }) catch |encoding_error| return capi.mapErrorContext(encoding_error, @src().fn_name);
+        }
+        if (err == error.RowPolicyAuthenticationRequired) return capi.recordError(.unsupported, @src().fn_name ++ ": row policy requires an authenticated identity");
         // Preserve request-owned parameter/column context before its arena is freed.
         return capi.recordError(@import("sql_cursor.zig").diagnosticCode(diagnostic), if (err == error.SqlUntranslatableCharacter and out_buf.ptr != null) out_buf.ptr.?[0..out_buf.len] else diagnostic.message);
     };
@@ -6174,7 +6201,6 @@ fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_j
     var row_policy_lease = try handle.database().*.local_execution.row_policy_gate.enterRaw();
     defer row_policy_lease.release();
     const sql = @import("sql.zig");
-    const Budget = EmbeddedSqlBudget;
     const temporary = budget.allocator();
     const parsed = &prepared.parsed;
     const compiled = &prepared.compiled;
@@ -6199,7 +6225,7 @@ fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_j
         if (controlled) |output| {
             var result = output;
             defer result.deinit();
-            out_buf.* = stringifyJson(result.output) catch |err| {
+            out_buf.* = encodeEmbeddedSqlOutput(handle.alloc, result.output) catch |err| {
                 if (result.output.mutation_outcome != null) {
                     out_buf.* = embeddedSqlCommitReceipt(&commit_receipt, result.output);
                     return;
@@ -6224,25 +6250,48 @@ fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_j
     if (session) |value| if (value.active) {
         result.output.mutation_outcome = null;
     };
-    var encoding_budget = Budget{ .backing = handle.alloc, .limit = 16 * 1024 * 1024 };
-    const bytes = std.json.Stringify.valueAlloc(encoding_budget.allocator(), result.output, .{}) catch |err| {
+    out_buf.* = encodeEmbeddedSqlOutput(handle.alloc, result.output) catch |err| {
         if (result.output.mutation_outcome != null) {
             // Encoding failure after commit must never invite a mutation retry.
-            // Preserve the authoritative commit outcome in a bounded envelope.
             out_buf.* = embeddedSqlCommitReceipt(&commit_receipt, result.output);
             return;
         }
+        return err;
+    };
+}
+
+var test_sql_response_allocator: if (builtin.is_test) ?Allocator else void = if (builtin.is_test) null else {};
+
+fn encodeEmbeddedSqlOutput(backing: Allocator, output: antfly.capi_dependencies.sql_runtime.Output) !capi.Buffer {
+    var encoding_budget = EmbeddedSqlBudget{
+        .backing = if (comptime builtin.is_test) test_sql_response_allocator orelse backing else backing,
+        .limit = 16 * 1024 * 1024,
+    };
+    const bytes = std.json.Stringify.valueAlloc(encoding_budget.allocator(), output, .{}) catch |err| {
         if (err == error.OutOfMemory and encoding_budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return err;
     };
     defer encoding_budget.allocator().free(bytes);
-    out_buf.* = dupBytes(bytes) catch |err| {
-        if (result.output.mutation_outcome != null) {
-            out_buf.* = embeddedSqlCommitReceipt(&commit_receipt, result.output);
-            return;
-        }
-        return err;
+    return dupBytes(bytes);
+}
+
+/// COMMIT failed before its decision began. Preserve the actual SQLSTATE;
+/// disposition is separate from whether a failed transaction may be retried.
+/// The reserved envelope also covers allocation failures during preparation.
+pub fn embeddedSqlNotAppliedReceipt(reserved: *?[]u8, diagnostic: antfly.capi_dependencies.sql_errors.Diagnostic) capi.Buffer {
+    const buffer = reserved.*.?;
+    @memset(buffer, ' ');
+    _ = std.fmt.bufPrint(buffer, "{f}", .{std.json.fmt(.{ .commit_outcome = "not_applied", .@"error" = diagnostic }, .{})}) catch {
+        // Future extended diagnostics may exceed the reserved envelope. Keep
+        // the failure class and authoritative disposition even in that case.
+        @memset(buffer, ' ');
+        _ = std.fmt.bufPrint(buffer, "{f}", .{std.json.fmt(.{
+            .commit_outcome = "not_applied",
+            .@"error" = .{ .code = diagnostic.code, .message = "COMMIT was not applied; inspect the native diagnostic.", .retryable = false },
+        }, .{})}) catch unreachable;
     };
+    reserved.* = null;
+    return .{ .ptr = buffer.ptr, .len = buffer.len };
 }
 
 pub fn embeddedSqlUnknownReceipt(reserved: *?[]u8, txn_id: db_mod.types.TxnId) capi.Buffer {
@@ -6251,6 +6300,7 @@ pub fn embeddedSqlUnknownReceipt(reserved: *?[]u8, txn_id: db_mod.types.TxnId) c
     const txn_hex = std.fmt.bytesToHex(txn_id, .lower);
     _ = std.fmt.bufPrint(buffer, "{f}", .{std.json.fmt(.{
         .transaction_id = @as([]const u8, &txn_hex),
+        .commit_outcome = "unknown",
         .@"error" = .{ .code = "40003", .message = "The mutation outcome is unknown. Reconcile the native transaction receipt; do not replay the statement.", .retryable = false },
     }, .{})}) catch unreachable;
     reserved.* = null;
@@ -6264,6 +6314,10 @@ pub fn embeddedSqlCommitReceipt(reserved: *?[]u8, output: antfly.capi_dependenci
     // fields enter this envelope; 512 bytes exceeds their maximum encoding.
     _ = std.fmt.bufPrint(buffer, "{f}", .{std.json.fmt(.{
         .mutation_outcome = output.mutation_outcome.?,
+        .commit_outcome = "applied",
+        .columns = [0]u64{},
+        .rows = [0]u64{},
+        .sql_nulls = null,
         .rows_affected = output.rows_affected,
         .command_tag = output.command_tag,
         .@"error" = .{ .code = "53200", .message = "The mutation committed but its full response could not be allocated.", .retryable = false },
@@ -11468,4 +11522,58 @@ test "capi native memory supersession uses filtered lexical indexes and durable 
     try std.testing.expectEqual(t.Lifecycle.superseded, record.lifecycle);
     const detail = try std.json.parseFromSliceLeaky(t.SupersessionProposalDetail, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_proposal, .{}, "", "pair"), .{});
     try std.testing.expectEqual(t.SupersessionRelation.supersedes, detail.proposal.verdict.?);
+}
+
+test "capi SQL COMMIT response allocation failure preserves the applied increment" {
+    var directory = try TestDirectory.init("commit-response-allocation");
+    defer directory.cleanup();
+    const root = try openDefaultDirectoryHandle(std.mem.span(directory.path().ptr));
+    const id = try publishHandle(root);
+    defer antfly_db_close(id);
+    const Sql = struct {
+        fn call(handle: *anyopaque, session: ?u64, statement: []const u8) !std.json.Parsed(std.json.Value) {
+            const request = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .statement = statement, .session_id = session }, .{});
+            defer std.testing.allocator.free(request);
+            var out: capi.Buffer = .{};
+            defer antfly_buffer_free(&out);
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice(request), &out));
+            return std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+        }
+        fn ok(handle: *anyopaque, session: ?u64, statement: []const u8) !void {
+            const result = try call(handle, session, statement);
+            result.deinit();
+        }
+    };
+    try Sql.ok(id, null, "CREATE TABLE numbers (n BIGINT)");
+    try Sql.ok(id, null, "INSERT INTO numbers (_id,n) VALUES ('counter',0)");
+    var session: u64 = 0;
+    try std.testing.expectEqual(capi.ErrorCode.ok, @import("sql_session.zig").antfly_db_sql_session_open(id, &session));
+    try Sql.ok(id, session, "BEGIN");
+    try Sql.ok(id, session, "UPDATE numbers SET n=n+1 WHERE _id='counter'");
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    test_sql_response_allocator = failing.allocator();
+    defer test_sql_response_allocator = null;
+    const response = try Sql.call(id, session, "COMMIT");
+    defer response.deinit();
+    test_sql_response_allocator = null;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqualStrings("applied", response.value.object.get("commit_outcome").?.string);
+    try std.testing.expectEqualStrings("53200", response.value.object.get("error").?.object.get("code").?.string);
+    try std.testing.expect(!response.value.object.get("error").?.object.get("retryable").?.bool);
+    try std.testing.expectEqual(@as(usize, 0), response.value.object.get("rows").?.array.items.len);
+    const row = try Sql.call(id, null, "SELECT n FROM numbers WHERE _id='counter'");
+    defer row.deinit();
+    try std.testing.expectEqualStrings("1", row.value.object.get("rows").?.array.items[0].array.items[0].string);
+}
+
+test "capi SQL COMMIT bounded refusal receipt retains its SQLSTATE when a diagnostic is oversized" {
+    const long_hint: [4096]u8 = @splat('h');
+    var reserved: ?[]u8 = try std.heap.c_allocator.alloc(u8, 2048);
+    defer if (reserved) |buffer| std.heap.c_allocator.free(buffer);
+    var response = embeddedSqlNotAppliedReceipt(&reserved, .{ .code = "XX000", .message = "An internal failure occurred.", .hint = &long_hint });
+    defer antfly_buffer_free(&response);
+    const decoded = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.ptr.?[0..response.len], .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("not_applied", decoded.value.object.get("commit_outcome").?.string);
+    try std.testing.expectEqualStrings("XX000", decoded.value.object.get("error").?.object.get("code").?.string);
 }

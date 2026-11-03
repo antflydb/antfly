@@ -1063,6 +1063,10 @@ pub const Owner = struct {
         if (self.pending_text_merge) |pending| if (needsOutcomeReconciliation(pending.root)) return error.OutcomeUnknown;
         var known_maintenance: ?*h.Handle = null;
         if (self.current) |current| {
+            // Existing handles remain fenced until they are closed. A new
+            // connection can reconstruct the durable decision with a fresh
+            // owner, without inheriting this wrapper's uncertain caches.
+            if (needsOutcomeReconciliation(current)) return error.OutcomeUnknown;
             if (current.lite_scheduling_owner == null) try self.bindGroupSourceState(current);
             var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer probe.close();
@@ -1725,6 +1729,13 @@ pub const Owner = struct {
     fn needsOutcomeReconciliation(root: *h.Handle) bool {
         const store = root.owned_lite_backend.?.native_docstore.?;
         return root.sql_decision_uncertain or store.file.checkpoint_publication_uncertain or store.secret_store_uncertain;
+    }
+
+    fn hasUncertainOutcome(self: *Owner) bool {
+        if (self.current) |root| if (needsOutcomeReconciliation(root)) return true;
+        if (self.maintenance_snapshot) |root| if (needsOutcomeReconciliation(root)) return true;
+        if (self.pending_text_merge) |pending| if (needsOutcomeReconciliation(pending.root)) return true;
+        return false;
     }
 
     fn noteMaintenanceFailure(self: *Owner, err: anyerror, table_id: u64, phase: MaintenanceFailurePhase) void {
@@ -3458,7 +3469,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
     const wrapper = try alloc.create(h.Handle);
     errdefer alloc.destroy(wrapper);
     const existing = for (gate.owners.items) |owner| {
-        if (compatible(owner.options, options)) break owner;
+        if (compatible(owner.options, options) and !owner.hasUncertainOutcome()) break owner;
     } else null;
     const owner = existing orelse try alloc.create(Owner);
     errdefer if (existing == null) alloc.destroy(owner);
@@ -5461,7 +5472,11 @@ test "capi native allocator proof path admission uses its bounded concurrent exe
     defer fixture.deinit();
     const connection = fixture.connection;
     const io = h.handleLockIo();
-    var held = try native.lockWriterPathWithIo(alloc, io, fixture.path);
+    // A queue participant waits without a blocking kernel task. Deliberately
+    // use a legacy flock-only holder to exercise the bounded executor fallback.
+    const lock_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.lock", .{fixture.path});
+    defer std.testing.allocator.free(lock_path);
+    const held = try std.Io.Dir.cwd().openFile(io, lock_path, .{ .mode = .read_write, .lock = .exclusive, .lock_nonblocking = true });
     const Probe = struct {
         retries: usize = 0,
         fn busy(ptr: *anyopaque) void {
@@ -5473,7 +5488,7 @@ test "capi native allocator proof path admission uses its bounded concurrent exe
     connection.test_path_lease_busy = .{ .ptr = &probe, .notify = Probe.busy };
     defer connection.test_path_lease_busy = null;
     const result = connection.acquire();
-    held.close();
+    held.close(io);
     if (result) |value| {
         var unexpected = value;
         unexpected.close();
@@ -5496,9 +5511,12 @@ test "capi native allocator proof maintenance capture joins the bounded lease qu
     const owner = fixture.connection.owner;
     owner.test_maintenance_wait_ns = 30 * std.time.ns_per_ms;
     defer owner.test_maintenance_wait_ns = null;
-    var held = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), fixture.path);
+    const io = h.handleLockIo();
+    const lock_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.lock", .{fixture.path});
+    defer std.testing.allocator.free(lock_path);
+    const held = try std.Io.Dir.cwd().openFile(io, lock_path, .{ .mode = .read_write, .lock = .exclusive, .lock_nonblocking = true });
     const turn = owner.maintenanceTurn();
-    held.close();
+    held.close(io);
     try std.testing.expectError(error.FileBusy, turn);
     try std.testing.expect(owner.path_lock_io.worker_threads.load(.acquire) != null);
 }
@@ -7628,4 +7646,45 @@ test "capi native allocator proof storage-only foreign tip avoids runtime refres
     defer lease.close();
     const current = try owner.refresh();
     try std.testing.expect((try current.owned_lite_backend.?.native_docstore.?.file.check()).valid);
+}
+
+test "capi native uncertain owner remains fenced while reopen reconstructs a fresh runtime" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    inline for (.{ "sql", "checkpoint", "secret" }) |kind| {
+        var fixture = try AdmissionFollowupFixture.init("uncertain-owner-reopen-" ++ kind, 5000, .batch);
+        defer fixture.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+        const owner = fixture.connection.owner;
+        const root = owner.current.?;
+        const store = root.owned_lite_backend.?.native_docstore.?;
+        owner.gate.mutex.lockUncancelable(h.handleLockIo());
+        var lease = try native.lockWriterPathWithIo(alloc, h.handleLockIo(), fixture.path);
+        if (comptime std.mem.eql(u8, kind, "sql")) root.sql_decision_uncertain = true else if (comptime std.mem.eql(u8, kind, "checkpoint")) store.file.checkpoint_publication_uncertain = true else store.secret_store_uncertain = true;
+        const refusal = owner.refresh();
+        lease.close();
+        owner.gate.mutex.unlock(h.handleLockIo());
+        defer {
+            owner.gate.mutex.lockUncancelable(h.handleLockIo());
+            root.sql_decision_uncertain = false;
+            store.file.checkpoint_publication_uncertain = false;
+            store.secret_store_uncertain = false;
+            owner.gate.mutex.unlock(h.handleLockIo());
+        }
+        try std.testing.expectError(error.OutcomeUnknown, refusal);
+        // Keep the original handle alive: reopen must not select its compatible
+        // cached owner, even though the on-disk checkpoint is unchanged.
+        const reopened = try open(fixture.path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 5000 }, false);
+        defer h.closeHandle(reopened);
+        try std.testing.expect(reopened.lite_connection.?.owner != owner);
+        const connection = reopened.lite_connection.?;
+        var held: ?native.PathWriterLock = try connection.acquire();
+        defer {
+            connection.detach();
+            if (held) |*owned| owned.close();
+            connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const recovered = try connection.refresh(&held, .read_only);
+        try std.testing.expect(!Owner.needsOutcomeReconciliation(recovered));
+        try std.testing.expectError(error.OutcomeUnknown, owner.refresh());
+    }
 }

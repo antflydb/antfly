@@ -25,10 +25,13 @@ from . import _ffi, errors
 
 
 class SQLStateError(RuntimeError):
-    def __init__(self, diagnostic: dict[str, Any], transaction_id: str | None = None) -> None:
+    def __init__(
+        self, diagnostic: dict[str, Any], transaction_id: str | None = None, commit_outcome: str | None = None
+    ) -> None:
         self.sqlstate = diagnostic["code"]
         self.diagnostic = diagnostic
         self.transaction_id = transaction_id
+        self.commit_outcome = commit_outcome
         super().__init__(f"{self.sqlstate}: {diagnostic['message']}")
 
 
@@ -37,7 +40,7 @@ def output(code: int, buffer: _ffi.AntflyBuffer) -> Any:
     result = json.loads(body) if body else None
     if code:
         if isinstance(result, dict) and "error" in result:
-            raise SQLStateError(result["error"], result.get("transaction_id"))
+            raise SQLStateError(result["error"], result.get("transaction_id"), result.get("commit_outcome"))
         errors.raise_for_code(code)
     return result
 

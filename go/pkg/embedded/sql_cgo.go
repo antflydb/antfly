@@ -29,6 +29,8 @@ import (
 
 // SQLError includes the engine's SQLSTATE diagnostic.
 type SQLError struct {
+	// Empty means a legacy response supplied no authoritative disposition.
+	CommitOutcome string `json:"commit_outcome,omitempty"`
 	TransactionID string `json:"transaction_id,omitempty"`
 	Code          string `json:"code"`
 	Message       string `json:"message"`
@@ -45,9 +47,11 @@ func sqlError(body []byte, err error) error {
 	var envelope struct {
 		Error         *SQLError `json:"error"`
 		TransactionID string    `json:"transaction_id"`
+		CommitOutcome string    `json:"commit_outcome"`
 	}
 	if json.Unmarshal(body, &envelope) == nil && envelope.Error != nil {
 		envelope.Error.TransactionID = envelope.TransactionID
+		envelope.Error.CommitOutcome = envelope.CommitOutcome
 		return envelope.Error
 	}
 	return err
