@@ -4172,6 +4172,7 @@ pub const Node = struct {
     native_checkpoint_active: std.atomic.Value(bool) = .init(false),
     config: NodeConfig,
     document_artifacts: @import("../documents/artifacts.zig").Store = .{},
+    fixed_chunk_runtime: lib_chunker.fixed_text.Runtime = .{},
     allocator: std.mem.Allocator,
     session_manager: backends_mod.SessionManager,
     model_manager: model_manager_mod.ModelManager,
@@ -4450,6 +4451,7 @@ pub const Node = struct {
 
     pub fn deinit(self: *Node) void {
         self.document_artifacts.deinit(self.allocator);
+        self.fixed_chunk_runtime.deinit();
         self.model_manager.setHostCacheReclaimer(null);
         self.media_index_cache.deinit();
         self.speaker_flights.deinit(self.allocator);
@@ -5260,7 +5262,16 @@ pub const Node = struct {
         defer self.metrics.decActive();
         var config = requested;
         config.model = "fixed";
-        const chunks = try lib_chunker.fixed_multimodal.chunkInput(allocator, input, config);
+        try config.validate();
+        const chunks = try switch (input) {
+            .text => |text| blk: {
+                var owned_io: ?std.Io.Threaded = null;
+                defer if (owned_io) |*io_impl| io_impl.deinit();
+                const io = self.inferenceIo(allocator, null, &owned_io);
+                break :blk self.fixed_chunk_runtime.chunkText(self.allocator, allocator, io, text, config.textConfig());
+            },
+            .binary, .source => lib_chunker.fixed_multimodal.chunkInput(allocator, input, config),
+        };
         errdefer lib_chunker.types.freeChunks(allocator, chunks);
         try ensureDirectEmbeddingDeadline(deadline_ns);
         return chunks;
@@ -14094,12 +14105,26 @@ pub const Node = struct {
             reserved_units = chunk_admission.units;
         }
 
-        const chunks = lib_chunker.fixed_multimodal.chunkInputBounded(
-            ctx.allocator,
-            input.value,
-            config,
-            chunk_admission.max_owned_output_bytes,
-        ) catch |err| switch (err) {
+        var prompt_tokens: usize = 0;
+        const chunks = (switch (input.value) {
+            .text => |text| blk: {
+                const result = self.fixed_chunk_runtime.chunkTextWithUsage(
+                    self.allocator,
+                    ctx.allocator,
+                    ctx.io,
+                    text,
+                    config.textConfig(),
+                ) catch |err| break :blk err;
+                prompt_tokens = result.prompt_tokens orelse estimateTextTokens(text);
+                break :blk result.chunks;
+            },
+            .binary, .source => lib_chunker.fixed_multimodal.chunkInputBounded(
+                ctx.allocator,
+                input.value,
+                config,
+                chunk_admission.max_owned_output_bytes,
+            ),
+        }) catch |err| switch (err) {
             error.ChunkOutputTooLarge => return ctx.status(413).json(.{
                 .@"error" = "CHUNK_OUTPUT_TOO_LARGE",
                 .message = "chunked binary output exceeds the admitted response limit",
@@ -14144,13 +14169,6 @@ pub const Node = struct {
                 .frame_delay_ms = if (chunk.frame_delay_ms) |v| @intCast(v) else null,
             };
         }
-
-        // Report usage in the tokens `target_tokens` is measured in; a
-        // whitespace word count undercounts unspaced scripts such as CJK.
-        const prompt_tokens = switch (input.value) {
-            .text => |text| lib_chunker.fixed_text.countTextTokens(ctx.allocator, text) catch estimateTextTokens(text),
-            .binary, .source => 0,
-        };
 
         return ctx.json(api.ChunkResponse{
             .object = "list",

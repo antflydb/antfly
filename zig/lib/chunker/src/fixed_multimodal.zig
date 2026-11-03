@@ -38,13 +38,7 @@ pub fn chunkInputBounded(
     try cfg.validate();
     return switch (input) {
         .source => error.ModelAwareChunkProviderRequired,
-        .text => |text| fixed_text.chunkText(alloc, text, .{
-            .target_tokens = cfg.text.target_tokens,
-            .overlap_tokens = cfg.text.overlap_tokens,
-            .max_chunks = cfg.max_chunks,
-            .separator = cfg.text.separator,
-            .min_chars = cfg.text.min_chars,
-        }),
+        .text => |text| fixed_text.chunkText(alloc, text, cfg.textConfig()),
         .binary => |binary| chunkBinary(alloc, binary, cfg, max_owned_output_bytes),
     };
 }

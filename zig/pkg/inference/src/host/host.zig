@@ -3969,11 +3969,20 @@ test "standalone chunk minimum content survives the real provider ABI" {
         http_request.body = http_body;
         var ctx = httpx.Context.init(a, io, &http_request);
         defer ctx.deinit();
+        // Warm requests must not allocate another owner-held vocabulary,
+        // including when the minimum rule rejects the whole source.
+        var no_cache_allocations = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        const owner_allocator = state.node.allocator;
+        if (state.node.fixed_chunk_runtime.tokenizer != null) state.node.allocator = no_cache_allocations.allocator();
+        defer state.node.allocator = owner_allocator;
         var http_response = try state.node.chunkText(&ctx);
         defer http_response.deinit();
         try std.testing.expectEqual(@as(u16, 200), http_response.status.code);
         var http_chunks = try std.json.parseFromSlice(std.json.Value, a, http_response.body.?, .{});
         defer http_chunks.deinit();
+        try std.testing.expectEqual(@as(usize, 0), no_cache_allocations.allocated_bytes);
+        const usage = http_chunks.value.object.get("usage").?.object;
+        try std.testing.expectEqual(@as(i64, @intCast(try inference_chunker.fixed_text.countTextTokens(a, case.text))), usage.get("prompt_tokens").?.integer);
         const data = http_chunks.value.object.get("data").?.array.items;
         try std.testing.expectEqual(chunks.value.len, data.len);
         for (chunks.value, direct, data) |abi_chunk, direct_chunk, http_chunk| {

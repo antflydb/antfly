@@ -190,15 +190,19 @@ pub const FixedChunkConfig = struct {
     text: FixedTextConfig = .{},
     audio: AudioChunkOptions = .{},
 
+    pub fn textConfig(self: @This()) FixedTextConfig {
+        var config = self.text;
+        config.max_chunks = self.max_chunks;
+        return config;
+    }
+
     pub fn validate(self: @This()) !void {
         if (self.max_chunks > max_chunk_results) return error.InvalidMaxChunks;
         if (self.threshold) |value| {
             if (!std.math.isFinite(value) or value < 0 or value > 1)
                 return error.InvalidChunkThreshold;
         }
-        var text = self.text;
-        text.max_chunks = self.max_chunks;
-        try text.validate();
+        try self.textConfig().validate();
         try self.audio.validate();
     }
 };
