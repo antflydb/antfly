@@ -64,3 +64,23 @@ completed result or a pending commit decode into `MutationOutcome<T>`
 [`antfly-postgres`](../postgres) depends on `antfly-sdk` for its generated types
 (e.g. `QueryResponses`, `QueryHit`) while keeping its own blocking HTTP
 client, since Postgres extensions cannot run an async runtime.
+
+## Source sync and private media
+
+`SourcesClient` targets the optional `antfly-source serve` companion, using its
+operator token on your application backend. It shares the Go ingestion engine
+rather than reimplementing provider enumeration or deletion tracking:
+
+```rust,ignore
+use antfly_sdk::SourcesClient;
+let sources = SourcesClient::new("https://sources.example.com", &source_operator_token)?;
+sources.put_secret("photos.secret", &secret_from_your_credential_flow).await?;
+sources.put_connection("photos", &connection_with_secret_references).await?;
+sources.put_source(&source_definition).await?;
+let job = sources.sync(false).await?;
+let status = sources.job(&job.id).await?;
+```
+
+Profile inspection, current-job recovery, cancellation, connection/secret
+revocation, and source removal use the same versioned protocol. See the
+[source-service setup and limits](../../../go/pkg/sources/README.md#media-and-runtime-source-registration).

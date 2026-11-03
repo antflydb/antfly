@@ -1,0 +1,62 @@
+import { describe, expect, it, vi } from "vitest";
+import { SourceServiceError, SourcesClient } from "../src/sources-client.js";
+
+describe("SourcesClient", () => {
+  it("uses the companion protocol and prevents credential forwarding through redirects", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ version: 1, id: "job", state: "running", started_at: 1 }), {
+        status: 202,
+      })
+    );
+    const client = new SourcesClient({
+      baseUrl: "https://sources.example",
+      token: "operator-token",
+      fetch: fetcher,
+    });
+    expect((await client.sync({ restart: true })).id).toBe("job");
+    const [url, init] = fetcher.mock.calls[0] ?? [];
+    expect(url).toBe("https://sources.example/v1/sync");
+    expect(init?.redirect).toBe("error");
+    expect(init?.headers).toEqual({
+      Authorization: "Bearer operator-token",
+      "Content-Type": "application/json",
+    });
+    expect(JSON.parse(init?.body as string)).toEqual({ restart: true });
+  });
+  it("preserves service errors without exposing tokens", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(
+        async () => new Response('{"version":1,"code":"sync_in_progress"}', { status: 409 })
+      );
+    const client = new SourcesClient({
+      baseUrl: "https://sources.example",
+      token: "operator-token",
+      fetch: fetcher,
+    });
+    await expect(client.sync()).rejects.toMatchObject({ status: 409, code: "sync_in_progress" });
+    await expect(client.sync()).rejects.toBeInstanceOf(SourceServiceError);
+  });
+  it("encodes identifiers and sends secrets only in request bodies", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => new Response('{"version":1,"state":"updated"}'));
+    const client = new SourcesClient({
+      baseUrl: "https://sources.example",
+      token: "operator-token",
+      fetch: fetcher,
+    });
+    await client.putSecret("bucket.secret", "private-value");
+    expect(fetcher.mock.calls[0]?.[0]).toBe("https://sources.example/v1/secrets/bucket.secret");
+    expect(fetcher.mock.calls[0]?.[1]?.body).toBe('{"value":"private-value"}');
+    await client.job("a/b");
+    expect(fetcher.mock.calls[1]?.[0]).toBe("https://sources.example/v1/jobs/a%2Fb");
+  });
+  it.each([
+    "http://remote.example",
+    "https://user:pass@example.com",
+    "https://example.com?token=x",
+  ])("rejects unsafe endpoint %s", (baseUrl) => {
+    expect(() => new SourcesClient({ baseUrl, token: "token" })).toThrow();
+  });
+});

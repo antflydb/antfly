@@ -26,7 +26,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 const ScopedMergeContentType = "application/vnd.antfly.scoped-merge.v1+json"
@@ -120,15 +119,15 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 	ids := make([]string, 0, len(documents))
 	for id, doc := range documents {
 		key, err := RecordKey(w.sourceID, configString(doc.Metadata, "identity"))
-		if err != nil || key != id || !w.inventory[id] || configString(doc.Metadata, "source_id") != w.sourceID || doc.Version != 1 || configString(doc.Metadata, "sha256") == "" {
+		if err != nil || key != id || !w.inventory[id] || configString(doc.Metadata, "source_id") != w.sourceID {
 			w.failed = true
 			return MergeResult{}, fmt.Errorf("record outside pinned source inventory")
 		}
-		digest := sha256.Sum256([]byte(doc.Content))
-		if !utf8.ValidString(doc.Content) || strings.ContainsRune(doc.Content, 0) || configString(doc.Metadata, "sha256") != hex.EncodeToString(digest[:]) {
+		if err := validateDocumentContent(doc); err != nil {
 			w.failed = true
-			return MergeResult{}, fmt.Errorf("source content digest does not match normalized text")
+			return MergeResult{}, err
 		}
+
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)

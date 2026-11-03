@@ -543,6 +543,14 @@ export { AntflyHTTPError, AntflyResponseError } from "./errors.js";
 export type { MemoryNumbers, MemoryPaths, MemorySchemas } from "./memory.js";
 export { parseMemoryJSON, stringifyMemoryJSON } from "./memory.js";
 export * from "./models.js";
+export {
+  type SourceConnection,
+  type SourceDefinition,
+  type SourceProfile,
+  SourceServiceError,
+  type SourceSyncJob,
+  SourcesClient,
+} from "./sources-client.js";
 export type {
   CatalogTablespaceBindingRequest,
   ChatGPTAccount,

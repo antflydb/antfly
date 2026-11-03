@@ -233,3 +233,25 @@ alongside `search_after`; `query()` exposes both.
 access. `request()` is the public authenticated transport for other `/db/v1/`
 and `/ai/v1/` operations. Use `close()` or a context manager to release the
 client's HTTP pool.
+
+## Source sync and private media
+
+Use `SourcesClient` against the optional `antfly-source serve` companion, with its
+own operator token, from an application backend. Acquisition and deletion tracking
+stay in the shared source engine:
+
+```python
+from antfly import SourcesClient
+
+with SourcesClient("https://sources.example.com", source_operator_token) as sources:
+    sources.put_secret("photos.secret", secret_from_your_credential_flow)
+    sources.put_connection("photos", connection_with_secret_references)
+    sources.put_source(source_definition)
+    job = sources.sync()
+    status = sources.job(job["id"])
+```
+
+`profile`, `current_job`, `cancel_job`, `revoke_connection`, `revoke_secret`, and
+`remove_source` expose the remaining lifecycle operations. Credential values are
+write-only; profiles contain references. See the [source-service setup and
+limits](../../../go/pkg/sources/README.md#media-and-runtime-source-registration).

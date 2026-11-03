@@ -458,3 +458,24 @@ Unsafe integer numbers are rejected because their original value is already lost
 `parseMemoryJSON` and `stringifyMemoryJSON` provide the same codec for external
 persistence or logging. The ordinary `client.api` surface retains its existing
 number types; native memory endpoints live on `client.memoryApi`.
+
+## Source sync and private media
+
+`SourcesClient` controls the optional `antfly-source serve` companion at its own
+base URL, using its operator token. Use it from an application backend. The shared
+engine owns source enumeration, version fencing, publication and deletion tracking.
+
+```ts
+import { SourcesClient } from "@antfly/sdk";
+const sources = new SourcesClient({ baseUrl: "https://sources.example.com", token: sourceOperatorToken });
+await sources.putSecret("photos.secret", secretFromYourCredentialFlow);
+await sources.putConnection("photos", connectionWithSecretReferences);
+await sources.putSource(sourceDefinition);
+const job = await sources.sync();
+const status = await sources.job(job.id);
+```
+
+The client also supports `profile`, `currentJob`, `cancelJob`, `revokeConnection`,
+`revokeSecret`, and `removeSource`. Connection credentials stay in a write-only
+keystore; media rows carry scoped, version-pinned fetch capabilities. See the
+[source-service setup and limits](../../../go/pkg/sources/README.md#media-and-runtime-source-registration).

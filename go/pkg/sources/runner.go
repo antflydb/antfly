@@ -46,6 +46,9 @@ type Profile struct {
 	Sources           []Source              `json:"sources"`
 }
 type Source struct {
+	// Publication defaults to text. Media rows require a revision-enforcing
+	// fetch resolver, supplied by the source service or an embedding application.
+	Publication          string          `json:"publication,omitempty"`
 	ID                   string          `json:"id"`
 	Alias                string          `json:"alias"`
 	Connection           string          `json:"connection"`
@@ -55,6 +58,7 @@ type Source struct {
 	PermissionTTLSeconds int             `json:"permission_ttl_seconds,omitempty"`
 }
 type Runner struct {
+	MediaReference        func(context.Context, Source, Request, Item) (MediaReference, error)
 	Profile               Profile
 	StateDir, CatalogPath string
 	Factory               Factory
@@ -228,6 +232,12 @@ func (r *Runner) validate() error {
 		if !canonicalID(s.ID) || seen[s.ID] || s.Table == "" || strings.ContainsAny(s.Table, "\x00\r\n") || s.Table == "." || s.Table == ".." || s.Permissions == nil {
 			return fmt.Errorf("source needs a unique UUID, destination and explicit permissions")
 		}
+		if s.Publication != "" && s.Publication != "text" && s.Publication != "media" {
+			return fmt.Errorf("publication must be text or media")
+		}
+		if s.Publication == "media" && r.MediaReference == nil {
+			return fmt.Errorf("media publication requires a revision-enforcing fetch resolver; use antfly-source serve")
+		}
 		seen[s.ID] = true
 		if _, ok := r.Profile.Connections[s.Connection]; !ok {
 			return fmt.Errorf("source connection is not configured")
@@ -334,6 +344,10 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err != nil {
 		return 0, "", err
 	}
+	connector, err = publicationConnector(connector, s)
+	if err != nil {
+		return 0, "", err
+	}
 	if c, ok := connector.(*CollaborationConnector); ok {
 		c.Baseline = state.Published
 		if r.Restart {
@@ -422,20 +436,36 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 			return 0, "", err
 		}
 		selected[item.ID] = true
-		data, err := connector.Read(ctx, request, item)
-		if err != nil {
-			return 0, "", err
-		}
-		total += int64(len(data))
-		if total > 10<<30 {
-			return 0, "", fmt.Errorf("source run exceeds 10 GiB")
-		}
 		item.Metadata = cloneSourceMetadata(item.Metadata)
 		item.Metadata["connection_id"] = s.Connection
-		doc, err := Normalize(s.ID, item, data, *s.Permissions, time.Now())
-		if err != nil {
-			return 0, "", err
+		var doc Document
+		if s.Publication == "media" {
+			if err := connector.CheckAccess(ctx, request, item); err != nil {
+				return 0, "", err
+			}
+			ref, err := r.MediaReference(ctx, s, request, item)
+			if err != nil {
+				return 0, "", err
+			}
+			doc, err = NormalizeMedia(s.ID, item, ref, *s.Permissions, time.Now())
+			if err != nil {
+				return 0, "", err
+			}
+		} else {
+			data, err := connector.Read(ctx, request, item)
+			if err != nil {
+				return 0, "", err
+			}
+			total += int64(len(data))
+			if total > 10<<30 {
+				return 0, "", fmt.Errorf("source run exceeds 10 GiB")
+			}
+			doc, err = Normalize(s.ID, item, data, *s.Permissions, time.Now())
+			if err != nil {
+				return 0, "", err
+			}
 		}
+
 		if _, exists := state.Owned[item.ID]; !exists && len(state.Owned) >= maxOwnedSourceObjects {
 			return 0, "", fmt.Errorf("source ownership exceeds budget; complete reconciliation before selecting more items")
 		}
@@ -487,14 +517,16 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		digest := sha256.Sum256(raw)
 		revision = hex.EncodeToString(digest[:])
 	}
-	if c, ok := connector.(*CollaborationConnector); ok {
+	_, isCollaboration := connector.(*CollaborationConnector)
+	_, isDriveMedia := connector.(*driveMediaConnector)
+	if isCollaboration || isDriveMedia {
 		ttl := s.PermissionTTLSeconds
 		if ttl == 0 {
 			ttl = 900
 		}
 		checkedAt := time.Now()
 		auditCtx, cancel := context.WithTimeout(ctx, time.Duration(ttl)*time.Second)
-		err := c.ValidateInventory(auditCtx, request, *state.Pending)
+		err := connector.ValidateInventory(auditCtx, request, *state.Pending)
 		cancel()
 		if err != nil {
 			return 0, "", err
@@ -591,4 +623,30 @@ func writeJSON(path string, value any, limit int64) error {
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+// Drive media uses the same inventory, access checks and revision-checked binary
+// reads as GoogleConnector, bypassing collaboration's text/OCR extraction.
+func publicationConnector(connector Connector, source Source) (Connector, error) {
+	if source.Publication != "media" {
+		return connector, nil
+	}
+	if c, ok := connector.(*CollaborationConnector); ok {
+		config, err := decodeSourceConfig[CollaborationConfig](source.Config)
+		if err != nil || c.ProviderName != ProviderGoogleWorkspace || config.Resource != "drive" {
+			return nil, fmt.Errorf("media publication supports S3, GCS and Drive sources")
+		}
+		return &driveMediaConnector{GoogleConnector: c.drive()}, nil
+	}
+	return connector, nil
+}
+
+type driveMediaConnector struct{ *GoogleConnector }
+
+func (c *driveMediaConnector) Enumerate(ctx context.Context, request Request) (Inventory, error) {
+	inventory, err := c.GoogleConnector.Enumerate(ctx, request)
+	for i := range inventory.Objects {
+		inventory.Objects[i].SourceKind = ProviderGoogleWorkspace
+	}
+	return inventory, err
 }

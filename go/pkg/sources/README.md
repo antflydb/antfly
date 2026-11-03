@@ -384,3 +384,190 @@ extraction, the qualification gate, and owner-side bucket/prefix/version rejecti
 These tests do not qualify real Google identity exchange or model-based OCR,
 embeddings, relationship extraction, or production GPU capacity. They are
 explicitly opt-in and do not make normal source-module tests build Antfly.
+
+## Media and runtime source registration
+
+Run the optional **source companion** when applications need runtime connections,
+private media, or source sync from TypeScript, Python, or Rust. It shares the same
+`Runner`, scoped merge, ownership journal, catalog, and deletion barriers as the
+one-shot CLI. It has its own listener and operator credential; it does not add
+routes to the Antfly database or require public inference.
+
+Start with a profile containing a fixed database destination and optional initial
+connections/sources. Credentials in that profile remain references:
+
+```json
+{
+  "version": 1,
+  "endpoint": "http://127.0.0.1:8080/db/v1",
+  "data_plane_token_env": "ANTFLY_WRITE_KEY",
+  "connections": {},
+  "sources": []
+}
+```
+
+Provision two **different**, random bootstrap secrets of at least 32 bytes in
+`ANTFLY_SOURCE_ADMIN_TOKEN` and `ANTFLY_SOURCE_MEDIA_KEY`. Retain the media key and
+state directory across restarts. Then run:
+
+```sh
+antfly-source serve --config sources.json --state-dir /var/lib/antfly-sources \
+  --listen 127.0.0.1:8082 --public-url https://sources.example.com
+```
+
+Put the listener behind TLS when accessed remotely. Antfly must be able to reach
+`public-url`, and its remote-content security policy must permit that host. Use
+one companion per operator/credential trust boundary. Its admin token can manage
+all configured sources; it is not an end-user or multi-tenant database token.
+Never expose that token or the source administration API to a browser.
+
+Applications can register and rotate credentials without changing process
+environment variables or Antfly configuration. `PUT /v1/secrets/{key}` accepts
+`{"value":"..."}` over the authenticated control API. Values are encrypted with
+AES-GCM in a separate keystore under the private state directory, using a
+domain-separated key derived from the bootstrap media key. There is no secret
+read endpoint. Profiles, catalogs, media rows, and API responses retain only
+references. Keep the bootstrap key separately from the state volume; changing it
+requires migrating the keystore and republishing media capabilities.
+
+A runtime S3 connection looks like:
+
+```json
+{
+  "provider": "s3",
+  "secret_refs": {
+    "access_key_id": "photos.access",
+    "secret_access_key": "photos.secret",
+    "session_token": "photos.session"
+  }
+}
+```
+
+Omit `session_token` for permanent keys. S3-compatible services additionally use
+`s3_endpoint` and the explicit `s3_insecure` development option. Google Drive uses
+`provider: "google_workspace"`, `services: ["drive"]`, and
+`secret_refs: {"credentials":"drive.oauth"}`. The referenced value is the same
+service-account or authorized-user JSON accepted by the existing factory; OAuth
+refresh remains in the Google client. Operator-managed `*_env` references still
+work. Do not specify both an env and secret reference for the same credential.
+An embedded application can supply `CredentialFactory` with its existing secret
+manager instead of using the companion's keystore.
+
+Register a media source with `PUT /v1/sources/{uuid}`:
+
+```json
+{
+  "id": "11111111-1111-4111-8111-111111111111",
+  "alias": "photos",
+  "connection": "photos",
+  "table": "files",
+  "publication": "media",
+  "config": {"bucket": "photos", "prefix": "originals/"},
+  "permissions": {"public": true, "readers": []}
+}
+```
+
+Drive media sources use `config: {"resource":"drive","folder_id":"..."}`.
+Binary images, PDF, and audio are published without OCR/text extraction. Media
+publication currently supports S3, GCS, and binary Drive objects with exact lengths
+of 1..32 MiB. Workspace document exports and unknown-length objects must use text
+publication. The byte limit matches the portable acquisition engine; this PR does
+not introduce unbounded download or streaming claims.
+
+Text sources keep their version-1 canonical format. Media rows use version 2,
+`kind: "media"`, empty `content`, and a `media` object matching the model-aware
+chunk API's source-reference contract:
+
+```json
+{
+  "type": "source",
+  "uri": "https://sources.example.com/v1/media/<id>/<signature>",
+  "mime_type": "image/jpeg",
+  "version": "\"<strong-etag>\"",
+  "version_kind": "strong_etag",
+  "length": 12345
+}
+```
+
+The canonical source URI, provider revision, permissions, and connection identity
+remain in the canonical document. Configure enrichments to read `grep.media` for
+model-aware chunking, or `grep.media.uri` for URL-based extraction/`remoteMedia`.
+Text-only consumers such as `antfly-grep` should continue selecting text sources.
+Publication readiness proves the canonical row is query-visible; downstream
+embedding/extraction completion is observed through Antfly's normal index status.
+
+Media URLs are **private bearer capabilities**, not public share links. They
+identify one source/configuration/object revision and contain no provider
+credentials. Every read rechecks the live registry, selected inventory, current
+provider authority, source version, and exact byte length. The companion serves
+strong ETags, `If-Match`, `HEAD`, and byte ranges. It currently acquires one bounded
+complete object per request before serving ranges, with at most four acquisitions
+in flight. Saturation returns `503` and `Retry-After`. It retains no plaintext
+media cache. Signed descriptors survive restart and are pruned after successful
+full syncs. Failed runs keep their pending/published generations for recovery.
+
+Listing cannot compute SHA-256 of bytes it has not read. Accordingly media rows
+omit the text normalizer's `metadata.sha256`; provider ETags/checksums remain
+separate metadata. The strong gateway ETag binds the pinned representation and
+is not advertised as a content hash. Text rows retain their verified text digest.
+
+### Shared control protocol and SDKs
+
+All control requests use `Authorization: Bearer <source-admin-token>` and JSON.
+The standalone contract lives in `specs/openapi/sources/api.yaml`; it is deliberately
+separate from the joined database OpenAPI and its generated clients.
+
+| Operation | Route |
+|---|---|
+| Inspect current profile | `GET /v1/profile` |
+| Put/revoke a secret | `PUT/DELETE /v1/secrets/{key}` |
+| Put/revoke a named connection | `PUT/DELETE /v1/connections/{name}` |
+| Put/remove a source | `PUT/DELETE /v1/sources/{uuid}` |
+| Start/resume sync | `POST /v1/sync` with `{"restart":false}` |
+| Inspect latest job after ambiguous submission | `GET /v1/jobs` |
+| Poll/cancel a job | `GET/DELETE /v1/jobs/{id}` |
+
+Sync returns `202` with a job receipt and `Location`; it continues if the HTTP
+caller disconnects. One full-profile sync runs at a time. Concurrent sync or
+reconfiguration returns `409`. Jobs end as `completed`, `failed`, `cancelled`, or
+`interrupted`; only the latest receipt is retained. After a process restart, poll
+the interrupted receipt and submit sync again to resume durable work. Use
+`restart: true` only to discard a failed pinned selection, retaining ownership.
+Do not blindly retry an ambiguous POST: inspect the current receipt first.
+
+Connection/secret revocation is allowed during sync, cancels that job, and blocks
+future acquisition. Requests already acquiring bytes may finish. Changing connection transport/reference settings or removing/changing a source
+also invalidates old capabilities; sync republishes their replacements. Rotating a
+secret value behind an unchanged reference uses the new credential on future reads. Missing objects within
+an active source are deleted only after an authoritative inventory and successful
+publication. Removing an entire source follows the existing non-destructive
+runner policy: the next sync retires its catalog binding, preserving owned rows
+and state for explicit recovery or operator cleanup. Restored connections can
+resume without losing that ledger.
+
+The TypeScript SDK exports `SourcesClient`, Python exports `SourcesClient`, and
+Rust exports `SourcesClient`/`SourceSyncJob`. Each targets the companion URL and
+leaves acquisition/reconciliation in Go. For example, in a backend:
+
+```ts
+import { SourcesClient } from "@antfly/sdk";
+
+const sources = new SourcesClient({
+  baseUrl: "https://sources.example.com",
+  token: process.env.ANTFLY_SOURCE_ADMIN_TOKEN!,
+});
+await sources.putSecret("photos.access", accessKeyFromYourCredentialFlow);
+await sources.putSecret("photos.secret", secretKeyFromYourCredentialFlow);
+await sources.putConnection("photos", {
+  provider: "s3",
+  secret_refs: { access_key_id: "photos.access", secret_access_key: "photos.secret" },
+});
+await sources.putSource(sourceDefinition);
+const job = await sources.sync();
+const status = await sources.job(job.id);
+```
+
+Python has equivalent snake-case methods (`put_secret`, `put_connection`,
+`put_source`, `sync`, `job`, `current_job`, `cancel_job`) on a context-managed client.
+Rust exposes the same methods asynchronously. Neither SDK retries sync implicitly
+or forwards its operator token through HTTP redirects.

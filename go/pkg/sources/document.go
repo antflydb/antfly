@@ -31,14 +31,16 @@ type Permissions struct {
 	Readers []string `json:"readers"`
 }
 type Document struct {
-	Version     int            `json:"version"`
-	URI         string         `json:"uri"`
-	Path        string         `json:"path"`
-	Content     string         `json:"content"`
-	Revision    string         `json:"revision"`
-	IndexedAt   int64          `json:"indexed_at"`
-	Permissions Permissions    `json:"permissions"`
-	Metadata    map[string]any `json:"metadata"`
+	Version     int             `json:"version"`
+	Kind        string          `json:"kind,omitempty"`
+	Media       *MediaReference `json:"media,omitempty"`
+	URI         string          `json:"uri"`
+	Path        string          `json:"path"`
+	Content     string          `json:"content"`
+	Revision    string          `json:"revision"`
+	IndexedAt   int64           `json:"indexed_at"`
+	Permissions Permissions     `json:"permissions"`
+	Metadata    map[string]any  `json:"metadata"`
 }
 type NormalizationError struct{ Code, Detail string }
 
@@ -93,4 +95,57 @@ func Normalize(sourceID string, item Item, data []byte, permissions Permissions,
 	metadata["source_id"] = sourceID
 	metadata["identity"] = item.ID
 	return Document{Version: 1, URI: parsed.String(), Path: path, Content: string(data), Revision: item.Revision, IndexedAt: now.Unix(), Permissions: permissions, Metadata: metadata}, nil
+}
+
+// MediaReference is the model-aware chunk source contract. Version is a quoted
+// strong ETag for the immutable bytes served at URI, not a content hash.
+type MediaReference struct {
+	Type        string `json:"type"`
+	URI         string `json:"uri"`
+	MIMEType    string `json:"mime_type"`
+	Version     string `json:"version"`
+	VersionKind string `json:"version_kind"`
+	Length      int64  `json:"length"`
+}
+
+// NormalizeMedia publishes an explicit media row without claiming that provider
+// metadata is a digest of bytes the normalizer has not read. Fetchers must enforce
+// the pinned source revision before returning any bytes.
+func NormalizeMedia(sourceID string, item Item, ref MediaReference, permissions Permissions, now time.Time) (Document, error) {
+	if item.Size != ref.Length {
+		return Document{}, fmt.Errorf("media length differs from pinned inventory")
+	}
+	doc, err := Normalize(sourceID, item, nil, permissions, now)
+	if err != nil {
+		return Document{}, err
+	}
+	doc.Version, doc.Kind, doc.Media = 2, "media", &ref
+	delete(doc.Metadata, "sha256")
+	if err := validateDocumentContent(doc); err != nil {
+		return Document{}, err
+	}
+	return doc, nil
+}
+
+func validateDocumentContent(doc Document) error {
+	if doc.Version == 1 && doc.Kind == "" && doc.Media == nil {
+		digest := sha256.Sum256([]byte(doc.Content))
+		if !utf8.ValidString(doc.Content) || strings.ContainsRune(doc.Content, 0) || configString(doc.Metadata, "sha256") != hex.EncodeToString(digest[:]) {
+			return fmt.Errorf("source content digest does not match normalized text")
+		}
+		return nil
+	}
+	_, hasTextDigest := doc.Metadata["sha256"]
+	if doc.Version != 2 || doc.Kind != "media" || doc.Media == nil || doc.Content != "" || hasTextDigest {
+		return fmt.Errorf("invalid canonical media document")
+	}
+	ref := doc.Media
+	u, err := url.Parse(ref.URI)
+	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" || (u.Scheme != "https" && u.Scheme != "http" && u.Scheme != "s3") || len(ref.URI) > 16384 || strings.ContainsAny(ref.URI, "\x00\r\n") {
+		return fmt.Errorf("invalid media URI")
+	}
+	if ref.Type != "source" || ref.Length < 1 || ref.Length > maxImportSourceObjectBytes || ref.MIMEType == "" || strings.ContainsAny(ref.MIMEType, "\x00\r\n") || len(ref.MIMEType) > 255 || ref.VersionKind != "strong_etag" || len(ref.Version) < 3 || len(ref.Version) > 4096 || ref.Version[0] != '"' || ref.Version[len(ref.Version)-1] != '"' || strings.ContainsAny(ref.Version[1:len(ref.Version)-1], "\"\x00\r\n") {
+		return fmt.Errorf("invalid pinned media reference")
+	}
+	return nil
 }

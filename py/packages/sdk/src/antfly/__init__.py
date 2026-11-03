@@ -331,3 +331,7 @@ __all__ += ["resource_reference", "trace_event"]
 from .exceptions import AntflyHTTPError, AntflyNotFoundError, AntflyResponseError
 
 __all__ += ["AntflyHTTPError", "AntflyNotFoundError", "AntflyResponseError"]
+
+from .sources import SourcesClient, SourceServiceError
+
+__all__ += ["SourcesClient", "SourceServiceError"]

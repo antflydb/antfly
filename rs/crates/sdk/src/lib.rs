@@ -1220,3 +1220,6 @@ mod tests {
         );
     }
 }
+
+pub mod sources;
+pub use sources::{SourceServiceError, SourceSyncJob, SourcesClient};
