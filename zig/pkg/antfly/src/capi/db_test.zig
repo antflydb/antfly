@@ -720,13 +720,20 @@ fn MaintenancePhaseDriver(comptime Owner: type) type {
     return struct {
         owner: Owner,
         started: *std.Io.Event,
+        retry_idle: bool = false,
         failure: ?anyerror = null,
         failed: std.atomic.Value(bool) = .init(false),
         fn advance(self: *@This()) !void {
             for (0..256) |_| {
                 const pending = try self.owner.maintenanceTurnForTest();
                 if (self.started.isSet()) return;
-                if (!pending) return error.TestMaintenancePhaseNotReached;
+                if (!pending and !self.retry_idle) return error.TestMaintenancePhaseNotReached;
+                if (self.retry_idle) {
+                    // Automatic shrinking owns a timed retry after a quiet
+                    // deferral, even when no source turn is immediately ready.
+                    self.owner.maintenance_storage_pending = true;
+                    try shared.handleLockIo().sleep(.fromMilliseconds(1), .awake);
+                }
             }
             return error.TestMaintenancePhaseNotReached;
         }
@@ -5633,6 +5640,7 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
                 store.maintenance_policy.options.enabled = true;
                 store.maintenance_policy.options.assessment_bytes = 4096;
                 store.maintenance_policy.options.minimum_reclaim_bytes = 4096;
+                store.maintenance_policy.options.retry_ms = 1;
                 store.maintenance_policy.next_assessment_size = 0;
                 if (phase != .verification) store.test_maintenance_hook = .{ .ptr = &gate, .notify = Gate.notify };
                 if (phase == .verification) {
@@ -5644,7 +5652,7 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
                 break :blk guard.connection.?.owner;
             };
             defer connection.test_after_allocator_capture = null;
-            var driver: MaintenancePhaseDriver(@TypeOf(connection)) = .{ .owner = connection, .started = &gate.started };
+            var driver: MaintenancePhaseDriver(@TypeOf(connection)) = .{ .owner = connection, .started = &gate.started, .retry_idle = phase != .verification };
             const before_capture = connection.current.?;
             const background = try std.Thread.spawn(.{}, @TypeOf(driver).run, .{&driver});
             var joined = false;
@@ -5652,7 +5660,10 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
                 gate.allowed.set(shared.handleLockIo());
                 background.join();
             };
-            try driver.wait();
+            driver.wait() catch |err| {
+                std.debug.print("reclamation phase fixture native={} phase={s}: {s}\n", .{ independent, @tagName(phase), @errorName(err) });
+                return err;
+            };
             // Capture after any short orphan/retirement publication preceding
             // the parked scan. Computation itself must not retire this runtime.
             const foreground_root = if (independent) blk: {
@@ -6679,7 +6690,14 @@ fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool, cursor: ?[
         var ttl = guard.handle.db.ttl_runtime.?.stats();
         owner.overlayTtlStats(&guard.handle.db, &ttl);
         try std.testing.expect(ttl.error_count > 0);
-        try std.testing.expect(owner.publication_stats.maintenance_errors > 0);
+        // This test drives the raw turn and catches its error above. The real
+        // worker records escaping errors at its outer loop; inspect the
+        // namespace-owned TTL failure here, alongside the settled resolvers.
+        const schedule = owner.maintenance_schedules.get(.{
+            .table_id = guard.handle.db.core.identity_namespace.table_id,
+            .incarnation = guard.handle.db.root_incarnation,
+        }) orelse return error.TestTtlScheduleMissing;
+        try std.testing.expectEqual(@as(?anyerror, error.InvalidGraphTtlCandidate), schedule.last_ttl_error);
     }
 }
 
