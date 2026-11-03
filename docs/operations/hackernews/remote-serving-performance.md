@@ -290,7 +290,10 @@ can release a pinned hint and fall back to the backend. Missing hints, unknown
 allocators and optional allocation failures retain ordinary authenticated reads.
 Provider content verification, retention witnesses and durable commit checks
 remain required; these hints do not prove remote durability. Cancellation,
-range budgets and successful-delete invalidation apply equally to cached reads.
+range budgets and delete invalidation apply equally to cached reads. Delete
+attempts invalidate hints even when a committed remote deletion returns a
+cancellation or transport error; a later read must discover absence through the
+backend rather than reuse a stale hint.
 
 `poc.py` reports `publication_io` from before table registration through all
 index-readiness checks, before validation/search traffic. The ending metrics

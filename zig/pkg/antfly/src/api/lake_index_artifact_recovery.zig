@@ -186,8 +186,9 @@ pub const Reads = struct {
     }
     fn delete_with_cancellation(raw: *anyopaque, id: []const u8, token: Cancellation) !void {
         const self: *Reads = @ptrCast(@alignCast(raw));
+        // A failed response does not prove that the remote mutation failed.
+        defer if (self.written) |*cache| cache.discard(key(id));
         try self.backend.deleteWithCancellation(id, token);
-        if (self.written) |*cache| cache.discard(key(id));
     }
     fn failure(self: *Reads, err: anyerror) anyerror {
         switch (err) {
@@ -264,8 +265,8 @@ pub const Reads = struct {
     }
     fn delete(raw: *anyopaque, id: []const u8) !void {
         const self: *Reads = @ptrCast(@alignCast(raw));
+        defer if (self.written) |*cache| cache.discard(key(id));
         try self.backend.vtable.delete(self.backend.ptr, id);
-        if (self.written) |*cache| cache.discard(key(id));
     }
     fn put_scoped(raw: *anyopaque, a: A, scope: stores.UploadScope, bytes: []const u8, cancellation: Cancellation) !stores.ArtifactMetadata {
         const self: *Reads = @ptrCast(@alignCast(raw));
@@ -358,6 +359,57 @@ test "external lake publication write cache preserves required reads reclamation
     defer second.deinit(a);
     try handle.delete(second.artifact_id);
     try std.testing.expectError(error.LakeIndexArtifactUnavailable, handle.getAlloc(second.artifact_id));
+}
+
+test "external lake publication write cache invalidates ambiguous deletes" {
+    const Fs = @import("../serverless/artifacts/fs_store.zig").FsStore;
+    const Backend = struct {
+        fn remove(raw: *anyopaque, id: []const u8) !void {
+            const fs: *Fs = @ptrCast(@alignCast(raw));
+            var original = fs.artifactStore();
+            try original.delete(id);
+            return error.Timeout;
+        }
+        fn removeWithCancellation(raw: *anyopaque, id: []const u8, token: Cancellation) !void {
+            const fs: *Fs = @ptrCast(@alignCast(raw));
+            var original = fs.artifactStore();
+            try original.deleteWithCancellation(id, token);
+            return error.Canceled;
+        }
+    };
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("publication-cache-ambiguous-delete");
+    defer directory.cleanup();
+    var fs = try Fs.init(a, directory.path());
+    defer fs.deinit();
+    var backend = fs.artifactStore();
+    var vtable = backend.vtable.*;
+    vtable.delete = Backend.remove;
+    vtable.delete_with_cancellation = Backend.removeWithCancellation;
+    backend.vtable = &vtable;
+    var quota = residency.Quota.init(a, 1024 * 1024);
+    defer quota.deinit();
+    for ([_][]const u8{ "ambiguous cancellation", "ambiguous timeout" }, 0..) |content, index| {
+        // The public API prefers cancellation-aware deletion when present;
+        // exercise the ordinary callback through a backend without that hook.
+        if (index == 1) vtable.delete_with_cancellation = null;
+        var adapter = Reads.init(backend);
+        adapter.enableWriteCache(quota.allocator(), 512 * 1024);
+        defer adapter.close();
+        var handle = adapter.store();
+        var metadata = try handle.putWithCancellation(content, .none);
+        defer metadata.deinit(a);
+        try std.testing.expect(adapter.written.?.entries.contains(Reads.key(metadata.artifact_id)));
+        if (index == 0) {
+            try std.testing.expectError(error.Canceled, handle.deleteWithCancellation(metadata.artifact_id, .none));
+        } else {
+            try std.testing.expectError(error.Timeout, handle.delete(metadata.artifact_id));
+        }
+        // The remote mutation committed despite its failed response. A later
+        // reader must discover that absence through the required backend path.
+        try std.testing.expect(!adapter.written.?.entries.contains(Reads.key(metadata.artifact_id)));
+        try std.testing.expectError(error.LakeIndexArtifactUnavailable, handle.getAlloc(metadata.artifact_id));
+    }
 }
 
 test "external lake publication write cache yields its pin when required output uses the same quota" {
