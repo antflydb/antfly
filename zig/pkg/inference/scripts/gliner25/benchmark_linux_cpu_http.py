@@ -25,10 +25,12 @@ This produces HTTP evidence, not automatic hardware/release qualification.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import sys
 import time
+import threading
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -99,6 +101,25 @@ def request(base, case, timeout):
     return {"duration_ns": duration, "output": output}
 
 
+def request_round(base, case, timeout, concurrency):
+    """One isolated arm: simultaneous clients, each response checked by request()."""
+    if concurrency == 1:
+        return request(base, case, timeout)
+    ready = threading.Barrier(concurrency + 1, timeout=timeout)
+
+    def client():
+        ready.wait()
+        return request(base, case, timeout)
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        pending = [pool.submit(client) for _ in range(concurrency)]
+        start = time.perf_counter_ns()
+        ready.wait()
+        samples = [future.result() for future in pending]
+        duration = time.perf_counter_ns() - start
+    return {"duration_ns": duration, "requests": samples}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--cases", type=Path, required=True)
@@ -109,11 +130,13 @@ def main():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--pairs", type=int, default=20)
     p.add_argument("--timeout", type=float, default=300)
+    p.add_argument("--concurrency", type=int, default=1)
     args = p.parse_args()
     if (
         not 0 <= args.warmup <= 10
         or not 2 <= args.pairs <= 100
         or not 0 < args.timeout <= 300
+        or not 1 <= args.concurrency <= 32
     ):
         p.error("invalid sampling or timeout limits")
     arms = {"baseline": args.baseline, "candidate": args.candidate}
@@ -155,6 +178,10 @@ def main():
         "arms": arms,
         "warmup": args.warmup,
         "pairs": args.pairs,
+        "concurrency": args.concurrency,
+        "round_scope": "single_request"
+        if args.concurrency == 1
+        else "synchronized_burst",
         "performance_release_qualified": False,
         "samples": [],
         "comparisons": {},
@@ -163,14 +190,16 @@ def main():
         for case in cases:
             for _ in range(args.warmup):
                 for url in arms.values():
-                    request(url, case, args.timeout)
+                    request_round(url, case, args.timeout, args.concurrency)
             pairs = []
             reference_pairs = []
             for pair in range(args.pairs):
                 order = list(arms) if pair % 2 == 0 else list(reversed(arms))
                 row = {"case_id": case["id"], "pair": pair, "order": order}
                 for arm in order:
-                    row[arm] = request(arms[arm], case, args.timeout)
+                    row[arm] = request_round(
+                        arms[arm], case, args.timeout, args.concurrency
+                    )
                 report["samples"].append(row)
                 pairs.append(
                     (row["candidate"]["duration_ns"], row["baseline"]["duration_ns"])
@@ -193,6 +222,27 @@ def main():
                 summary["candidate_over_reference"] = (
                     paired_benchmark.paired_log_ratio_ci(reference_pairs, samples=2000)
                 )
+            if args.concurrency > 1:
+                summary["client_latency_ns"] = {
+                    arm: paired_benchmark.distribution(
+                        sample["duration_ns"]
+                        for row in report["samples"]
+                        if row["case_id"] == case["id"]
+                        for sample in row[arm]["requests"]
+                    )
+                    for arm in arms
+                }
+                summary["requests_per_second"] = {
+                    arm: args.pairs
+                    * args.concurrency
+                    * 1e9
+                    / sum(
+                        row[arm]["duration_ns"]
+                        for row in report["samples"]
+                        if row["case_id"] == case["id"]
+                    )
+                    for arm in arms
+                }
             report["comparisons"][case["id"]] = summary
         if (
             artifacts != {path: sha256(path) for path in artifacts}

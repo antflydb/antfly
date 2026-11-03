@@ -1187,19 +1187,35 @@ test "boundary qualification real base tokenizer fits full encoded context" {
 
 test "boundary full context learned Metal base serving uses word and token capacity" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
-    try learnedFullContext(.metal);
+    try learnedFullContext(.metal, .both, false);
 }
 
 test "boundary full context learned CUDA base serving uses word and token capacity" {
     if (!@import("build_options").enable_cuda) return error.SkipZigTest;
-    try learnedFullContext(.cuda);
+    try learnedFullContext(.cuda, .both, false);
 }
 
-fn learnedFullContext(comptime backend: enum { metal, cuda }) !void {
+test "boundary full context learned native base word capacity" {
+    try learnedFullContext(.native, .words, false);
+}
+
+test "boundary full context learned native base token capacity" {
+    try learnedFullContext(.native, .tokens, false);
+}
+
+test "boundary full context learned native grouped words" {
+    try learnedFullContext(.native, .words, true);
+}
+
+fn learnedFullContext(comptime backend: enum { native, metal, cuda }, comptime extent: enum { words, tokens, both }, comptime grouped: bool) !void {
     const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const factory = @import("../architectures/session_factory.zig");
-    const session = if (backend == .metal) try factory.createMetalSession(a, directory) else try factory.createCudaSession(a, directory);
+    const session = switch (backend) {
+        .native => try factory.createNativeSession(a, directory),
+        .metal => try factory.createMetalSession(a, directory),
+        .cuda => try factory.createCudaSession(a, directory),
+    };
     defer session.close();
     const config = try factory.getGlinerBoundaryConfig(session);
     const identity = try factory.getGlinerBoundaryIdentity(session);
@@ -1209,40 +1225,50 @@ fn learnedFullContext(comptime backend: enum { metal, cuda }) !void {
     defer a.free(tokenizer_bytes);
     const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
     defer tok.tokenizer().deinitTokenizer();
-    const text = try a.alloc(u8, (config.max_len - 1) * 4);
+    const source_words = (config.max_len - 1) * (if (grouped) @as(usize, 4) else 1);
+    const text = try a.alloc(u8, source_words * 4);
     defer a.free(text);
-    for (0..config.max_len - 1) |i| @memcpy(text[i * 4 ..][0..4], "the ");
+    for (0..source_words) |i| @memcpy(text[i * 4 ..][0..4], "the ");
+    const schema_json = if (grouped)
+        "{\"entities\":[\"concept\"],\"entity_definitions\":{\"concept\":{\"description\":\"A concept\"}}}"
+    else
+        "{\"entities\":[\"concept\"]}";
+    const schema = try std.json.parseFromSlice(std.json.Value, a, schema_json, .{});
+    defer schema.deinit();
     const raw = try std.json.Stringify.valueAlloc(a, .{
         .schema_version = @as(u32, 2),
         .model = "base",
-        .schema = .{ .entities = .{"concept"} },
-        .options = .{ .long_document = .{ .mode = "window", .window_words = config.max_len } },
+        .schema = schema.value,
+        .options = .{ .long_document = .{ .mode = "window", .window_words = config.max_len, .overlap_words = if (grouped) @as(usize, 0) else 128 } },
         .inputs = .{.{ .content = text }},
     }, .{});
     defer a.free(raw);
     var request = try wire.parseJson(a, raw, .{});
     defer request.deinit();
     // Verify this is exactly the full body-word boundary before learned work.
-    var prepared = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = text, .schema = &request.items[0].compiled }}, .{});
+    var prepared = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = text[0 .. (config.max_len - 1) * 4], .schema = &request.items[0].compiled }}, .{});
     try std.testing.expectEqual(@as(usize, config.max_len), prepared.samples[0].body_word_count);
     const exact_tokens = prepared.sequence_length;
     prepared.deinit();
     const watchdog = try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a);
     defer watchdog.destroy();
     try watchdog.start(std.testing.io);
-    const control = Control{ .hard_cancellation = watchdog.boundary(), .deadline_ns = @import("antfly_platform").time.monotonicNs() + 180 * std.time.ns_per_s };
+    const control = Control{ .hard_cancellation = watchdog.boundary(), .deadline_ns = @import("antfly_platform").time.monotonicNs() + (if (backend == .native) @as(u64, 900) else 180) * std.time.ns_per_s };
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
-    const response = try executeQualified(&managed.backend, a, &config, tok.tokenizer(), &request, .{ .identity = identity, .control = control });
-    defer a.free(response);
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
-    defer parsed.deinit();
-    const root = parsed.value.object;
-    try std.testing.expectEqual(@as(i64, @intCast(exact_tokens)), root.get("usage").?.object.get("prompt_tokens").?.integer);
-    const rows = root.get("data").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), rows.len);
-    try std.testing.expectEqual(@as(i64, 1), rows[0].object.get("long_document").?.object.get("window_count").?.integer);
-    std.debug.print("full-context learned {s}: body_words={} prompt_tokens={} windows=1\n", .{ @tagName(backend), config.max_len, exact_tokens });
+    if (extent != .tokens) {
+        const response = try executeQualified(&managed.backend, a, &config, tok.tokenizer(), &request, .{ .identity = identity, .control = control });
+        defer a.free(response);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expectEqual(@as(i64, @intCast(exact_tokens * (if (grouped) @as(usize, 4) else 1))), root.get("usage").?.object.get("prompt_tokens").?.integer);
+        const rows = root.get("data").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqual(if (grouped) @as(i64, 4) else 1, rows[0].object.get("long_document").?.object.get("window_count").?.integer);
+        std.debug.print("full-context learned {s}: body_words={} prompt_tokens={} windows={}\n", .{ @tagName(backend), config.max_len, exact_tokens * (if (grouped) @as(usize, 4) else 1), if (grouped) @as(usize, 4) else 1 });
+    }
+    if (extent == .words) return;
 
     // Exercise the independent encoded-token boundary with the real tokenizer,
     // weights and default work budget too. Measure one word's token cost using
@@ -1254,11 +1280,11 @@ fn learnedFullContext(comptime backend: enum { metal, cuda }) !void {
     const overhead = probe.sequence_length - word_tokens;
     probe.deinit();
     const capacity = qualification.sequenceLimit(&config, (engine.Limits{}).max_sequence_tokens);
-    const source_words = (capacity - overhead) / word_tokens;
-    try std.testing.expect(source_words + 1 <= config.max_len);
-    const dense_text = try a.alloc(u8, source_words * word.len);
+    const dense_source_words = (capacity - overhead) / word_tokens;
+    try std.testing.expect(dense_source_words + 1 <= config.max_len);
+    const dense_text = try a.alloc(u8, dense_source_words * word.len);
     defer a.free(dense_text);
-    for (0..source_words) |i| @memcpy(dense_text[i * word.len ..][0..word.len], word);
+    for (0..dense_source_words) |i| @memcpy(dense_text[i * word.len ..][0..word.len], word);
     request.items[0].text = dense_text;
     var dense = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = dense_text, .schema = &request.items[0].compiled }}, .{});
     const dense_tokens = dense.sequence_length;
