@@ -210,3 +210,34 @@ func TestGoogleOpenSourceStreamsOriginalBeforeBodyIsAvailable(t *testing.T) {
 		t.Fatal("OpenSource buffered the body instead of returning a stream")
 	}
 }
+
+func TestStreamedDriveChecksumRequiredBeforeAcceptingBytes(t *testing.T) {
+	for _, expected := range []string{"5d41402abc4b2a76b9719d911017c592", "00000000000000000000000000000000"} {
+		t.Run(expected, func(t *testing.T) {
+			metadataReads := 0
+			client := &http.Client{Transport: previewDownloadTransport(func(r *http.Request) (*http.Response, error) {
+				payload := `{"version":"7"}`
+				if r.URL.Query().Get("alt") == "media" {
+					payload = "hello"
+				} else {
+					metadataReads++
+				}
+				return &http.Response{StatusCode: 200, ContentLength: int64(len(payload)), Header: make(http.Header), Body: io.NopCloser(strings.NewReader(payload))}, nil
+			})}
+			connector := &GoogleConnector{ProviderName: ProviderGoogleDrive, HTTPClient: client}
+			body, err := connector.OpenSource(t.Context(), Request{Config: SourceConfig(`{"folder_id":"folder"}`)}, Item{Path: "hello.txt", Size: 5, Revision: "7", Metadata: map[string]any{"file_id": "doc", "md5_checksum": expected}})
+			require.NoError(t, err)
+			data, err := io.ReadAll(body)
+			require.NoError(t, err)
+			require.Equal(t, "hello", string(data))
+			err = body.Close()
+			if expected[0] == '0' {
+				require.ErrorContains(t, err, "checksum mismatch")
+				require.Equal(t, 1, metadataReads)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, 2, metadataReads)
+			}
+		})
+	}
+}

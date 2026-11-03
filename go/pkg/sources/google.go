@@ -461,7 +461,7 @@ func (c *GoogleConnector) OpenSource(ctx context.Context, r Request, o Item) (io
 	// durable staging store. Native Workspace exports retain the bounded reader
 	// because their enumerated size is only an upper bound.
 	upper, _ := o.Metadata["size_is_upper_bound"].(bool)
-	if o.Size > 0 && !upper && configString(o.Metadata, "export_mime_type") == "" {
+	if o.Size > 0 && !upper && configString(o.Metadata, "export_mime_type") == "" && !strings.HasPrefix(configString(o.Metadata, "mime_type"), "application/vnd.google-apps.") {
 		return c.OpenMedia(ctx, r, o, MediaRange{Length: o.Size})
 	}
 	client, err := c.client(ctx, r)

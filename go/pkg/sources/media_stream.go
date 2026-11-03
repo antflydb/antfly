@@ -17,8 +17,11 @@ package sources
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"net/url"
@@ -74,11 +77,13 @@ func checkMediaAccess(ctx context.Context, connector Connector, media MediaConne
 }
 
 type mediaBody struct {
-	body      io.ReadCloser
-	remaining int64
-	verify    func() error
-	once      sync.Once
-	closeErr  error
+	checksum         hash.Hash
+	expectedChecksum string
+	body             io.ReadCloser
+	remaining        int64
+	verify           func() error
+	once             sync.Once
+	closeErr         error
 }
 
 func (b *mediaBody) Read(p []byte) (int, error) {
@@ -90,6 +95,9 @@ func (b *mediaBody) Read(p []byte) (int, error) {
 	}
 	n, err := b.body.Read(p)
 	b.remaining -= int64(n)
+	if b.checksum != nil {
+		_, _ = b.checksum.Write(p[:n])
+	}
 	if err == io.EOF && b.remaining != 0 {
 		err = io.ErrUnexpectedEOF
 	}
@@ -100,6 +108,10 @@ func (b *mediaBody) Close() error {
 		b.closeErr = b.body.Close()
 		if b.remaining != 0 {
 			b.closeErr = errors.Join(b.closeErr, io.ErrUnexpectedEOF)
+			return
+		}
+		if b.checksum != nil && hex.EncodeToString(b.checksum.Sum(nil)) != b.expectedChecksum {
+			b.closeErr = errors.Join(b.closeErr, fmt.Errorf("Drive source checksum mismatch"))
 			return
 		}
 		if b.verify != nil {
@@ -249,7 +261,14 @@ func (c *GoogleConnector) OpenMedia(ctx context.Context, r Request, item Item, s
 		response.Body.Close()
 		return nil, &RevisionChangedError{Expected: item.Revision, Actual: response.Header.Get("X-Goog-Generation")}
 	}
-	return &mediaBody{body: response.Body, remaining: span.Length, verify: verify}, nil
+	body := &mediaBody{body: response.Body, remaining: span.Length, verify: verify}
+	if c.ProviderName == ProviderGoogleDrive && !ranged {
+		if expected := configString(item.Metadata, "md5_checksum"); expected != "" {
+			body.checksum = md5.New()
+			body.expectedChecksum = expected
+		}
+	}
+	return body, nil
 }
 
 // parseMediaRanges bounds multipart work and validates ranges before provider
