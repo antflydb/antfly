@@ -368,14 +368,29 @@ test "capi SQL COMMIT uncertain checkpoint returns a token reconciled once after
         try std.testing.expectEqualStrings("unknown", result.value.object.get("commit_outcome").?.string);
         try std.testing.expectEqualStrings("40003", result.value.object.get("error").?.object.get("code").?.string);
         _ = try std.fmt.hexToBytes(&transaction, result.value.object.get("transaction_id").?.string);
+        try std.testing.expect(root.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain);
+        // The poisoned root and named-table LSMs must skip both WAL and index
+        // finalization. These four close errors are intentional fail-closed logs.
+        @import("../test_error_logs.zig").expectErrorLogs(4);
     }
     const reopened = try api.openLiteHandleAllocWithRuntime(std.testing.allocator, path, .{ .no_sync = true, .profile = .hosted }, false, std.testing.io, runtime.ptr());
     const id = try api.publishHandle(reopened);
     defer api.antfly_db_close(id);
     var status: u8 = 0;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_transaction_status(id, &transaction, &status));
-    try std.testing.expectEqual(@as(u8, 1), status);
+    // An unknown decision can reconcile as committed or aborted. The first
+    // native publication can precede the coordinator decision; never infer a
+    // commit merely because its selector write reached the file.
+    try std.testing.expect(status == 1 or status == 2);
     const row = try Fault.call(id, null, "SELECT n FROM numbers WHERE _id='counter'", .ok);
     defer row.deinit();
-    try std.testing.expectEqualStrings("1", row.value.object.get("rows").?.array.items[0].array.items[0].string);
+    try std.testing.expectEqualStrings(if (status == 1) "1" else "0", row.value.object.get("rows").?.array.items[0].array.items[0].string);
+    if (status == 2) {
+        // Retry only after the durable receipt establishes an abort. The
+        // non-idempotent increment must then appear exactly once.
+        try Fault.ok(id, null, "UPDATE numbers SET n=n+1 WHERE _id='counter'");
+    }
+    const final = try Fault.call(id, null, "SELECT n FROM numbers WHERE _id='counter'", .ok);
+    defer final.deinit();
+    try std.testing.expectEqualStrings("1", final.value.object.get("rows").?.array.items[0].array.items[0].string);
 }

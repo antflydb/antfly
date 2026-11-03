@@ -6910,5 +6910,27 @@
     "sdk_typescript_metadata": "2 passed, typecheck passed",
     "sdk_python_outcome_mapping": "4 passed",
     "next": "Run focused COMMIT fault, zero/nonzero timeout and owner-reopen regressions, then repeat the broad native and SDK gates."
+  },
+  "fair_admission_current_validation_20261103": {
+    "runtime_commit": "27a0172d21d1b1d24fec91c1df0dd1a7b7ce1b4b",
+    "debug_library_sha256": "93d3155c121eceffb0f9a016819907f2f6d7fd915928462c6a6ce181db2eedae",
+    "producer_command_exit_code": 0,
+    "python_sql_catalog_concurrency_outcomes": {
+      "passed": 209,
+      "failed": 0,
+      "seconds": 85.21,
+      "loopback_fixture": "passed"
+    },
+    "focused_native": {
+      "passed": 27,
+      "failed": 1,
+      "skipped": 0,
+      "leaked": 0,
+      "failure": "The new checkpoint-acknowledgement loss fixture assumed the first native publication committed the SQL decision. Reconciliation correctly reported aborted (2). Fixture now requires committed/aborted receipt status to match row state, and permits a single non-idempotent retry only after a proven abort. Four expected poisoned-LSM close errors are declared explicitly.",
+      "rerun": "pending"
+    },
+    "native_smoke_and_abi": "passed, 134 exports and executable/shared library consumers",
+    "platform": "macOS ARM64 runtime process fixtures; Linux x86_64 and ARM64 range-lock cross-compilation only",
+    "qualification": "Full native/contract gates and optimized final host measurements still required."
   }
 }
