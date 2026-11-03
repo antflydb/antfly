@@ -33,7 +33,9 @@ pub const Cache = struct {
     pages: std.atomic.Value(u64) = .init(0),
     nanoseconds: std.atomic.Value(u64) = .init(0),
     active: [4]?[32]u8 = @splat(null),
-    failed: [4]?struct { key: [32]u8, retry_ns: u64 } = @splat(null),
+    // Retry history belongs to publications, independently of reusable lanes.
+    failed: [256]?struct { key: [32]u8, retry_ns: u64 } = @splat(null),
+    failed_next: usize = 0,
     mutex: std.atomic.Mutex = .unlocked,
     keys: [256]?[32]u8 = @splat(null),
     next: usize = 0,
@@ -63,10 +65,20 @@ pub const Cache = struct {
         defer self.mutex.unlock();
         self.active[slot] = null;
         if (!completed) {
-            self.failed[slot] = .{ .key = key, .retry_ns = now_ns +| 5 * std.time.ns_per_s };
+            const retry = now_ns +| 5 * std.time.ns_per_s;
+            for (&self.failed) |*item| if (item.*) |*failure| {
+                if (std.mem.eql(u8, &failure.key, &key)) {
+                    failure.retry_ns = retry;
+                    return;
+                }
+            };
+            self.failed[self.failed_next] = .{ .key = key, .retry_ns = retry };
+            self.failed_next = (self.failed_next + 1) % self.failed.len;
             return;
         }
-        self.failed[slot] = null;
+        for (&self.failed) |*item| if (item.*) |failure| {
+            if (std.mem.eql(u8, &failure.key, &key)) item.* = null;
+        };
         self.keys[self.next] = key;
         self.next = (self.next + 1) % self.keys.len;
     }
@@ -286,8 +298,15 @@ test "external lake navigation warming retries failed hints after bounded backof
     cache.finishAt(slot, key, false, 2);
     try std.testing.expect(!cache.contains(key));
     try std.testing.expect(try cache.beginAt(key, 3) == null);
+    const other: [32]u8 = @splat(2);
+    const reused = (try cache.beginAt(other, 3)).?;
+    try std.testing.expectEqual(slot, reused);
+    cache.finishAt(reused, other, false, 4);
+    // Reusing an execution slot cannot erase another publication's backoff.
+    try std.testing.expect(try cache.beginAt(key, 5) == null);
     const retried = (try cache.beginAt(key, 2 + 5 * std.time.ns_per_s)).?;
     cache.finishAt(retried, key, true, 3 + 5 * std.time.ns_per_s);
     try std.testing.expect(cache.contains(key));
+    try std.testing.expect(try cache.beginAt(other, 3 + 5 * std.time.ns_per_s) == null);
     try std.testing.expect(try cache.beginAt(key, 10 * std.time.ns_per_s) == null);
 }

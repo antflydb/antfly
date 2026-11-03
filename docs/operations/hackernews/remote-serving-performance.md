@@ -272,7 +272,9 @@ Independent missing ranges use the existing bounded scheduler; denied optional
 admission retains the required serial read path. Warming keeps its existing
 four-publication/four-lane, 64-page, two-level and two-second bounds. A failed
 warming attempt releases its slot and can retry after a five-second backoff;
-only completed attempts are remembered as successful hints. Every consumer
+retry history holds at most 256 recent publication keys independently of the
+reusable execution slots. Only completed attempts are remembered as successful
+hints. Every consumer
 still checks its current cancellation and reader authority.
 
 Source census and costing trees use the existing publication packing machinery,
