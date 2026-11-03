@@ -164,6 +164,28 @@ artifact and `ANTFLY_GLINER_E2E_BENCH=1`, then run `inference-test -Dcuda=true
 -Doptimize=debug` with `'-Dtest-filter=boundary end-to-end CUDA benchmark'`.
 The benchmark is opt-in; its ordinary test run skips it.
 
+### Native head admission
+
+Native and browser group planning now checks the head's cumulative intermediate
+charges and shared-pool scratch limits before encoder dispatch. When a group is
+too large, batch size shrinks while each window retains its full context. Single
+native inputs use the same scalar head planner. A cached preparation rechecks the
+current head limits on every admission.
+
+The native base-model regression admits four 4096-word windows as two groups of
+two. Each admitted head group charges 221,478,338 bytes against the unchanged
+256 MiB limit. The planner covers optional content, record, count and abstention
+outputs. Planning and execution share checked byte charging, and Debug learned
+execution asserts that planned and actual charges agree.
+
+The [native head admission receipt](../../../../bench/baselines/gliner-native-head-admission-20261103.json)
+records **67 passing Debug checks with no skips**. Real published head weights
+completed a two-by-4096-word forward at the exact planned budget; zero pooled
+states isolate head execution from the encoder. All 16 optional-head combinations
+and pinned base all-task pipeline parity passed. The no-model-read regression
+also proves that impossible head caps fail before encoder dispatch. GPU execution
+and throughput were not remeasured for this native admission change.
+
 ## Current status
 
 | Artifact | Backbone | Precision | Backend | Status |

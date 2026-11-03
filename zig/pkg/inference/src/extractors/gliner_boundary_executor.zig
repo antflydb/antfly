@@ -289,6 +289,8 @@ fn prepareGroup(backend: compute.BackendKind, allocator: Allocator, config: *con
             }
             return err;
         };
+        if ((backend == .native or backend == .wasm) and prepared.query_width != 0)
+            _ = try @import("../architectures/gliner/boundary_head.zig").planShape(config, .{ .batch = prepared.samples.len, .text_length = prepared.word_width, .queries = prepared.query_width }, options.pipeline.head_limits);
         return prepared;
     }
 }
@@ -910,7 +912,7 @@ const QualificationGeometryTest = struct {
         }
     };
     fn config() model.Config {
-        return .{ .version = 3, .architecture_version = 1, .max_len = 32, .backbone = .small, .head = .{}, .encoder = .{
+        return .{ .version = 3, .architecture_version = 1, .max_len = 32, .backbone = .small, .head = .{ .candidate_pool = .shared, .candidate_attention_layers = 0, .query_attention_layers = 0 }, .encoder = .{
             .hidden_size = 64,
             .intermediate_size = 128,
             .num_hidden_layers = 1,
@@ -1898,4 +1900,69 @@ test "boundary qualification fragment fitting rejects invalid schema before sour
     try std.testing.expectError(error.BoundaryFragmentLimitExceeded, long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], .{ .identity = identity, .processor = .{ .max_fragment_bytes = 12 } }, &receiver));
     // Only two bounded schema attempts: initial window, then empty prefix.
     try std.testing.expect(tok.calls < 32);
+}
+
+test "boundary qualification native full-context groups fit head budgets before encoding" {
+    const a = std.testing.allocator;
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const config_path = try std.fs.path.join(a, &.{ directory, "config.json" });
+    defer a.free(config_path);
+    const encoder_path = try std.fs.path.join(a, &.{ directory, "encoder_config/config.json" });
+    defer a.free(encoder_path);
+    const bytes = try @import("../util/c_file.zig").readFile(a, config_path);
+    defer a.free(bytes);
+    const encoder_bytes = try @import("../util/c_file.zig").readFile(a, encoder_path);
+    defer a.free(encoder_bytes);
+    const config = try model.parseConfig(a, bytes, encoder_bytes);
+    const text = try a.alloc(u8, 4095 * 4 * 4);
+    defer a.free(text);
+    for (0..4095 * 4) |i| @memcpy(text[i * 4 ..][0..4], "the ");
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "base", .schema = .{ .entities = .{"concept"}, .entity_definitions = .{ .concept = .{ .description = "A concept" } } }, .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 4096), .overlap_words = @as(usize, 0) } }, .inputs = .{.{ .content = text }} }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    const Receiver = struct {
+        gate: qualification.Admission,
+        batch: usize = 0,
+        words: usize = 0,
+        pub fn observe(self: *@This(), size: usize, words: usize, windows: usize, prepared: *const processor.PreparedBatch) !void {
+            try self.gate.observe(size, words, windows, prepared);
+        }
+        pub fn observeWindowGroup(self: *@This(), prepared: *const processor.PreparedBatch) void {
+            self.batch = @max(self.batch, prepared.samples.len);
+            self.words = @max(self.words, prepared.word_width);
+        }
+    };
+    const identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+    var receiver = Receiver{ .gate = try qualification.Admission.init(identity, .native, &request, null) };
+    var tok = QualificationGeometryTest.TokenizerProbe{ .one_token_words = true };
+    var preparations = PreparationStore.init(a);
+    defer preparations.deinit();
+    var options = long_executor.Options{ .identity = identity, .preparations = &preparations };
+    const usage = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(@as(usize, 2), receiver.batch);
+    try std.testing.expectEqual(@as(usize, 4096), receiver.words);
+    const head = @import("../architectures/gliner/boundary_head.zig");
+    const planned = try head.planShape(&config, .{ .batch = receiver.batch, .text_length = receiver.words, .queries = 1 }, .{});
+    try std.testing.expect(planned.intermediate_bytes <= (head.Limits{}).max_intermediate_bytes);
+    try std.testing.expectError(error.ResourceLimitExceeded, head.planShape(&config, .{ .batch = 4, .text_length = 4096, .queries = 1 }, .{}));
+    try std.testing.expectEqual(@as(usize, 4), usage.window_count);
+    // An impossible head cap must fail before the empty backend can read any
+    // model weights. Cache reuse must re-check the current head limits.
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.deinitOwned();
+    var context = native.NativeCompute.init(a, &weights, null);
+    defer context.deinit();
+    const cb = compute.ComputeBackend{ .ptr = &context, .vtable = &native.vtable_impl };
+    options.pipeline.head_limits.max_intermediate_bytes = 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, long_executor.executeNative(&cb, a, &config, tok.tokenizer(), &request.items[0], options));
+    options.pipeline.head_limits = .{};
+    const recovered = try long_executor.planGeometry(.native, a, &config, tok.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(usage.prompt_tokens, recovered.prompt_tokens);
+    options.pipeline.head_limits.max_intermediate_bytes = 1;
+    request.items[0].options.long_document.mode = .reject;
+    request.items[0].text = text[0 .. 4095 * 4];
+    try std.testing.expectError(error.ResourceLimitExceeded, prepareGroup(.native, a, &config, tok.tokenizer(), request.items, .{ .identity = identity, .pipeline = options.pipeline }));
+    std.debug.print("native-head admission: windows={} words={} admitted_batch={} planned_bytes={}\n", .{ usage.window_count, receiver.words, receiver.batch, planned.intermediate_bytes });
 }

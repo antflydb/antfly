@@ -827,7 +827,7 @@ fn prepareWindowGroup(backend: compute.BackendKind, allocator: Allocator, config
             return err;
         };
         const admitted = switch (backend) {
-            .native, .wasm => checkNativeGroup(config, &prepared, planned.engine_options),
+            .native, .wasm => checkNativeGroup(config, &prepared, planned.engine_options, planned.options.pipeline.head_limits),
             .metal, .cuda => checkDeviceGroup(allocator, config, &prepared, item, planned.device_options),
             else => error.UnsupportedGlinerBoundaryBackend,
         };
@@ -843,8 +843,9 @@ fn prepareWindowGroup(backend: compute.BackendKind, allocator: Allocator, config
     }
 }
 
-fn checkNativeGroup(config: *const model.Config, prepared: *const processor.PreparedBatch, options: engine.Options) !void {
+fn checkNativeGroup(config: *const model.Config, prepared: *const processor.PreparedBatch, options: engine.Options, head_limits: head.Limits) !void {
     _ = try engine.plan(config, prepared, options);
+    if (prepared.query_width != 0) _ = try head.planShape(config, .{ .batch = prepared.samples.len, .text_length = prepared.word_width, .queries = prepared.query_width }, head_limits);
 }
 
 fn checkDeviceGroup(allocator: Allocator, config: *const model.Config, prepared: *const processor.PreparedBatch, item: *const wire.Item, options: device_request.Options) !void {
