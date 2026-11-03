@@ -45,6 +45,10 @@ pub const Config = struct {
     /// The encoder's weight matrices are stored quantized (e.g. a Q8_0 GGUF
     /// bundle), as opposed to dense F32/F16 safetensors or a dense GGUF export.
     gliner_quantized_weights: bool = false,
+    /// Internal qualified-serving policy. This is never parsed from model
+    /// JSON: the session loader enables it only after authenticating an exact
+    /// artifact whose reviewed Metal parity requires F32 encoder mirrors.
+    metal_require_f32_weight_mirrors: bool = false,
 };
 
 pub const GlinerCountLayer = enum { count_lstm, count_lstm_v2 };
@@ -110,6 +114,13 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     }
 
     return config;
+}
+
+test "DeBERTa PII specialty F32 mirror policy cannot be declared by model JSON" {
+    const config = try parseConfig(std.testing.allocator,
+        \\{"model_type":"deberta-v2","hidden_size":768,"metal_require_f32_weight_mirrors":true}
+    );
+    try std.testing.expect(!config.metal_require_f32_weight_mirrors);
 }
 
 pub fn isDebertaModel(model_type: []const u8) bool {
