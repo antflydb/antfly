@@ -23103,6 +23103,10 @@ components:
         - authorization
         - table
         - index
+        - database
+        - namespace
+        - tablespace
+        - query_source
       description: Catalog object affected by an exact recoverable operation.
     SQLCatalogOperationKind:
       type: string

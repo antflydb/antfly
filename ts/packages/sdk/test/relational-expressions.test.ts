@@ -8,6 +8,14 @@ describe("relational expression structural admission", () => {
   const validate = (expression: unknown) =>
     validateRelationalExpression(expression, "expression", { nodes: 0, literalBytes: 0 });
 
+  it.each(["length", "octet_length", "bit_length"])("admits unary %s expressions", (op) => {
+    const arg = { op: "literal", type: "string", value: "🐜" };
+    const expression = { op, args: [arg] };
+    expect(() => validate(expression)).not.toThrow();
+    expect(() => validate({ ...expression, args: [] })).toThrow(TypeError);
+    expect(() => validate({ ...expression, args: [arg, arg] })).toThrow(TypeError);
+  });
+
   it("requires exact schema-owned enum identities on literals and casts", () => {
     const literal = { op: "literal", type: "enumeration", named_type_id: 17, value: "z" };
     expect(() => validate(literal)).not.toThrow();

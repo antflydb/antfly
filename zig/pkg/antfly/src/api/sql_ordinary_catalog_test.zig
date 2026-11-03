@@ -1,0 +1,349 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const local = @import("antfly_local_sources");
+const http = @import("http_server.zig");
+const native = @import("../system_catalog/catalog_mutations.zig");
+const ordinary = @import("sql_ordinary_catalog.zig");
+const catalog = local.sql_catalog;
+const domain = local.system_catalog_domain;
+const storage = @import("../metadata/storage/raft_apply_store.zig");
+const L = @import("../system_catalog/lock_authority.zig");
+const Context = local.api_operation.RequestContext;
+const A = std.mem.Allocator;
+const group = local.common_group_ids.main_metadata_group_id;
+const a = std.testing.allocator;
+fn id(value: u64) [16]u8 {
+    var bytes: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, bytes[8..16], value, .big);
+    return bytes;
+}
+const Source = struct {
+    store: *storage.RaftApplyStore,
+    metadata_group_id: u64 = group,
+    replicated: bool = false,
+    index: u64 = 100,
+    attempts: usize = 0,
+    applied: usize = 0,
+    prepares: usize = 0,
+    observations: usize = 0,
+    locked: bool = false,
+    lose: enum { none, before, after } = .none,
+    hide: bool = false,
+    fail_result_after_apply: ?*std.testing.FailingAllocator = null,
+    fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+        return .{ .metadata_group_id = group, .metrics = .{} };
+    }
+    pub fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: Context, required: u16) !void {
+        try std.testing.expect((try self.store.topologyActivation(group)).?.version >= required);
+    }
+    pub fn validateTableTopologyProtocolReadinessWithContext(_: *@This(), _: Context, _: void) !void {}
+    pub fn ensureLinearizableReadWithContext(_: *@This(), _: Context) !void {}
+    pub fn lockCatalogMutation(self: *@This()) void {
+        std.debug.assert(!self.locked);
+        self.locked = true;
+    }
+    pub fn unlockCatalogMutation(self: *@This()) void {
+        std.debug.assert(self.locked);
+        self.locked = false;
+    }
+    pub fn projectedStore(self: *@This()) ?*storage.RaftApplyStore {
+        return self.store;
+    }
+    pub fn captureTableCreateGeneration(self: *@This(), alloc: A, table_id: u64) !u64 {
+        try self.store.ensureDerivedCatalogIndexes(group);
+        return self.store.captureTableCreateGeneration(alloc, group, table_id);
+    }
+    pub fn captureTableDropAdmission(self: *@This(), alloc: A, name: []const u8) !@import("../metadata/service.zig").TableDropAdmission {
+        var value = (try self.store.captureTableDropProjection(alloc, group, name)) orelse return error.TableNotFound;
+        defer value.deinit(alloc);
+        if (value.fence.active()) return error.TableTransitionActive;
+        const owned = try alloc.dupe(u8, value.table.name);
+        const groups = value.range_group_ids;
+        value.range_group_ids = &.{};
+        return .{ .table_id = value.table.table_id, .expected_name = owned, .expected_transition_generation = value.fence.generation, .range_membership = value.fence.membership(value.table.table_id), .range_group_ids = groups };
+    }
+    pub fn verifyTableCreateProjection(self: *@This(), alloc: A, table: @import("../metadata/table_manager.zig").TableRecord, ranges: []const @import("../metadata/table_manager.zig").RangeRecord) !void {
+        try self.store.verifyTableCreateProjectionExact(alloc, group, table, ranges);
+    }
+    pub fn verifyTableDropProjection(self: *@This(), alloc: A, table_id: u64) !void {
+        const table = try self.store.getTable(alloc, group, table_id);
+        if (table) |record| {
+            @import("../metadata/table_manager.zig").freeTable(alloc, record);
+            return error.TableTransitionActive;
+        }
+    }
+    fn apply(self: *@This(), alloc: A, command: storage.TransitionCommand) !void {
+        if (!self.replicated) return self.store.applyStandaloneCommand(group, command);
+        const wire = try storage.encodeTransitionCommand(alloc, command);
+        defer alloc.free(wire);
+        self.index += 1;
+        const entries = try @import("../raft/state_machine/mod.zig").encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = self.index, .entry_type = .normal, .data = wire }});
+        defer alloc.free(entries);
+        try self.store.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = self.index, .entries_bytes = entries });
+    }
+    pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: storage.TransitionCommand) !u64 {
+        try std.testing.expect(self.locked);
+        self.attempts += 1;
+        const loss = self.lose;
+        self.lose = .none;
+        if (loss == .before) return error.MetadataMutationOutcomeUnknown;
+        try self.apply(a, command);
+        self.applied += 1;
+        if (self.fail_result_after_apply) |allocator| {
+            allocator.fail_index = allocator.alloc_index;
+            allocator.resize_fail_index = allocator.resize_index;
+        }
+        if (loss == .after) return error.MetadataMutationOutcomeUnknown;
+        return self.index;
+    }
+    pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: Context) !void {
+        try std.testing.expect(!self.locked);
+    }
+    fn call(raw: *anyopaque, alloc: A, context: Context, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return switch (input) {
+            .sql_catalog_prepare => |request| blk: {
+                self.prepares += 1;
+                try std.testing.expect(!self.locked);
+                break :blk @import("../system_catalog/operations.zig").prepareSqlCatalog(self, alloc, context, request);
+            },
+            .sql_catalog_mutate => |command| @import("../system_catalog/operations.zig").mutateSqlCatalog(self, alloc, context, command),
+            .sql_catalog_outcome => |request| blk: {
+                self.observations += 1;
+                if (self.hide) return error.MetadataMutationOutcomeUnknown;
+                break :blk self.store.sqlCatalogOutcome(alloc, group, request);
+            },
+            .resolve => |target| std.json.Stringify.valueAlloc(alloc, try self.store.resolveSystemCatalogIdentity(alloc, group, target), .{}),
+            .resolve_many => |request| blk: {
+                const result = try self.store.resolveSystemCatalogIdentitiesWithContext(alloc, group, request, context);
+                defer result.deinit(alloc);
+                break :blk std.json.Stringify.valueAlloc(alloc, result, .{});
+            },
+            .read => |request| self.store.systemCatalogRead(alloc, group, request),
+            .sql_type_bindings => |request| self.store.sqlTypeBindings(alloc, group, request, context),
+            else => error.UnexpectedOrdinaryCatalogCall,
+        };
+    }
+    fn server(self: *@This()) http.ApiHttpServer {
+        return http.ApiHttpServer.init(a, .{ .imported_runtime_io = .{ .api = std.testing.io } }, .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = call, .supports_query_definitions = true } }, null, null);
+    }
+    fn scope(self: *@This(), alloc: A, fence: L.scopes.CommandFence, nonce: u64, operation: @FieldType(L.Request, "operation")) !void {
+        const request: L.Request = .{ .admission = .{ .nonce = id(nonce), .head = (try self.store.systemCatalogMeta(alloc, group)).sequence_outcome_head orelse 0 }, .incarnation = fence.backend.incarnation, .standalone = false, .database = 1, .actor = .{ .session_user = .bootstrap, .credential = "" }, .backend = fence.backend, .operation = operation };
+        try self.apply(alloc, .{ .apply_sql_lock_scope = try std.json.Stringify.valueAlloc(alloc, request, .{}) });
+        _ = try (try std.json.parseFromSliceLeaky(?L.outcomes.Outcome, alloc, try self.store.sqlLockOutcome(alloc, group, request), .{})).?.result();
+    }
+    fn setup(self: *@This(), alloc: A) !L.scopes.CommandFence {
+        try self.store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = @splat('1') });
+        var coordinator: @import("../metadata/standalone_relation_reconciliation.zig").Coordinator = .{};
+        var ready = false;
+        for (0..200) |_| {
+            coordinator.next_round_at_ns = 0;
+            _ = try coordinator.step(self.store, alloc, group, @splat('1'), 9, @import("antfly_platform").time.monotonicNs());
+            const work = try self.store.relationReconciliationWork(group);
+            if (work.current) |state| if (state.phase == .ready and state.coverage == .constraint_names and work.root != null and work.root.?.eql(local.system_catalog_relation_reconciliation.Generation.of(&state))) {
+                ready = true;
+                break;
+            };
+        }
+        try std.testing.expect(ready);
+        const fence: L.scopes.CommandFence = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 }, .command = .{ .sequence = 1, .nonce = id(3), .executor = id(4) }, .database = 1, .principal = try L.principalDigest(alloc, .bootstrap), .standalone = false };
+        try self.scope(alloc, fence, 5, .{ .register = .{ .lease = .{ .backend = fence.backend, .database = 1, .node = 9, .principal = fence.principal, .expires_at_ms = 100000 }, .connection = @splat('a'), .nonce = id(6), .standalone = false } });
+        try self.scope(alloc, fence, 7, .{ .begin = fence.command });
+        return fence;
+    }
+};
+fn executeSql(server: *http.ApiHttpServer, alloc: A, context: Context, sql: []const u8) !catalog.DdlOutcome {
+    var compiled = try local.sql_compiler.compile(alloc, sql, .{});
+    defer compiled.deinit();
+    return @import("sql_catalog.zig").execute(server, null, context, "default", "public", alloc, .{ .catalog_ddl = compiled.statement.catalog_ddl });
+}
+
+test "SQL catalog ordinary scoped evolution observes lost replies without replaying mutations" {
+    for ([_]bool{ false, true }) |replicated| {
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try storage.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/evolution", .{tmp.sub_path}) });
+        defer store.deinit();
+        var source: Source = .{ .store = &store, .replicated = replicated };
+        const fence = try source.setup(alloc);
+        var server = source.server();
+        defer server.deinit();
+        for ([_][]const u8{ "CREATE DATABASE receipt_db", "COMMENT ON DATABASE receipt_db IS 'retained'", "ALTER DATABASE receipt_db RENAME TO renamed_db", "DROP DATABASE renamed_db", "CREATE SCHEMA receipt_ns", "COMMENT ON SCHEMA receipt_ns IS 'retained'", "ALTER SCHEMA receipt_ns RENAME TO renamed_ns", "DROP SCHEMA renamed_ns", "CREATE TABLESPACE receipt_space LOCATION '/tmp/antfly-receipt-space'", "ALTER TABLESPACE receipt_space RENAME TO renamed_space", "DROP TABLESPACE renamed_space" }, 0..) |sql, index| {
+            source.lose = .after;
+            const outcome = try executeSql(&server, alloc, .{ .sql_command_fence = &fence }, sql);
+            const receipt = outcome.catalog_receipt orelse return error.MissingOrdinaryReceipt;
+            try std.testing.expectEqual(.committed, receipt.state);
+            try std.testing.expectEqual(@as(usize, index + 1), source.attempts);
+            try std.testing.expectEqual(source.attempts, source.applied);
+            const before = try store.systemCatalogMeta(alloc, group);
+            const observed = try @import("sql_catalog_recovery.zig").recover(&server, null, .{}, alloc, receipt.recovery_token);
+            try std.testing.expectEqualDeep(receipt.catalog_revision, observed.catalog_revision);
+            try std.testing.expectEqual(.committed, observed.state);
+            try std.testing.expectEqualDeep(before, try store.systemCatalogMeta(alloc, group));
+            try std.testing.expectEqual(@as(usize, index + 1), source.attempts);
+        }
+    }
+}
+
+test "SQL catalog ordinary typed table unknown admission recovers after cold reopen and executor fencing" {
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/typed", .{tmp.sub_path});
+    var store = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+    var open = true;
+    defer if (open) store.deinit();
+    var source: Source = .{ .store = &store, .replicated = true };
+    const fence = try source.setup(alloc);
+    var server = source.server();
+    defer server.deinit();
+    source.lose = .after;
+    source.hide = true;
+    const input: catalog.Ddl = .{ .create_table = .{ .name = .{ .table = "typed_receipt" }, .schema_json = "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}", .if_not_exists = false } };
+    const outcome = try @import("sql_catalog.zig").execute(&server, null, .{ .sql_command_fence = &fence }, "default", "public", alloc, input);
+    const receipt = outcome.catalog_receipt orelse return error.MissingOrdinaryReceipt;
+    try std.testing.expectEqual(@as(?catalog.MutationOutcome, null), outcome.mutation_outcome);
+    try std.testing.expectEqual(.unknown, receipt.state);
+    try std.testing.expectEqual(@as(usize, 1), source.attempts);
+    store.deinit();
+    open = false;
+    store = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+    open = true;
+    source.hide = false;
+    try source.scope(alloc, fence, 5000, .{ .fence = .close });
+    const before = try store.systemCatalogMeta(alloc, group);
+    const observed = try @import("sql_catalog_recovery.zig").recover(&server, null, .{}, alloc, receipt.recovery_token);
+    try std.testing.expectEqual(.committed, observed.state);
+    const table = (try store.resolveSystemCatalogTable(alloc, group, .{ .table = "typed_receipt" })).?;
+    try std.testing.expectEqual(@as(?u64, table.table_id), observed.object_id);
+    try std.testing.expectEqualDeep(before, try store.systemCatalogMeta(alloc, group));
+    try std.testing.expectEqual(@as(usize, 1), source.attempts);
+}
+
+test "SQL catalog ordinary recovery rejects label substitution and current authorization revocation" {
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try storage.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/authorization", .{tmp.sub_path}) });
+    defer store.deinit();
+    var source: Source = .{ .store = &store };
+    const fence = try source.setup(alloc);
+    var server = source.server();
+    defer server.deinit();
+    const committed = (try executeSql(&server, alloc, .{ .sql_command_fence = &fence }, "CREATE DATABASE private_db")).catalog_receipt.?;
+    const size = try std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(committed.recovery_token);
+    const bytes = try alloc.alloc(u8, size);
+    try std.base64.url_safe_no_pad.Decoder.decode(bytes, committed.recovery_token);
+    const token = try std.json.parseFromSliceLeaky(ordinary.Token, alloc, bytes, .{});
+    var forged = token.request;
+    forged.target.kind = .namespace;
+    var permission = try @import("../usermgr/mod.zig").Permission.initOwned(a, .namespace, "default.private_db", .admin);
+    defer permission.deinit(a);
+    var permissions = [_]@import("../usermgr/mod.zig").Permission{permission};
+    const identity: http.AuthenticatedIdentity = .{ .username = @constCast("reader"), .permissions = &permissions };
+    const forged_receipt = try ordinary.newReceipt(alloc, alloc, forged);
+    const unknown = (try ordinary.recoverIfOrdinary(&server, identity, .{}, alloc, forged_receipt.recovery_token)).?;
+    try std.testing.expectEqual(.unknown, unknown.state);
+    try std.testing.expectEqual(@as(?u64, null), unknown.object_id);
+    const reads = source.observations;
+    try std.testing.expectError(error.Forbidden, ordinary.recoverIfOrdinary(&server, identity, .{}, alloc, committed.recovery_token));
+    try std.testing.expectEqual(reads, source.observations);
+    const users = @import("../usermgr/mod.zig");
+    var user_store = users.MemoryStore.init(a);
+    defer user_store.deinit();
+    var policy_store = @import("antfly_casbin").MemoryAdapter.init(a);
+    defer policy_store.deinit();
+    var manager = try users.UserManager.init(a, user_store.iface(), try users.initDefaultEnforcer(a, policy_store.iface()));
+    defer manager.deinit();
+    var user = try manager.createUser("reader", "test-password", &.{permission});
+    defer user.deinit(a);
+    var live = identity;
+    live.live_user_manager = &manager;
+    const permitted = (try ordinary.recoverIfOrdinary(&server, live, .{}, alloc, forged_receipt.recovery_token)).?;
+    try std.testing.expectEqual(.unknown, permitted.state);
+    try manager.removePermissionFromUser("reader", "default.private_db", .namespace);
+    const prior = source.observations;
+    try std.testing.expectError(error.Forbidden, ordinary.recoverIfOrdinary(&server, live, .{}, alloc, forged_receipt.recovery_token));
+    try std.testing.expectEqual(prior, source.observations);
+}
+
+test "SQL catalog ordinary constrained create preserves activation receipts without result allocation after admission" {
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try storage.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/activation", .{tmp.sub_path}) });
+    defer store.deinit();
+    var source: Source = .{ .store = &store };
+    const fence = try source.setup(alloc);
+    var server = source.server();
+    defer server.deinit();
+    const schema = "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}},\"checks\":[{\"name\":\"items_id_check\",\"expression\":{\"op\":\"literal\",\"type\":\"boolean\",\"value\":true}}]}";
+    for ([_]bool{ false, true }, 0..) |unknown, ordinal| {
+        var result_allocator = std.testing.FailingAllocator.init(alloc, .{});
+        source.fail_result_after_apply = &result_allocator;
+        defer source.fail_result_after_apply = null;
+        source.lose = if (unknown) .after else .none;
+        source.hide = unknown;
+        const outcome = try @import("sql_catalog.zig").executeWithAllocators(&server, null, .{ .sql_command_fence = &fence }, "default", "public", .{ .result = result_allocator.allocator(), .scratch = a }, .{ .create_table = .{ .name = .{ .table = if (unknown) "uncertain_checked_rows" else "checked_rows" }, .schema_json = schema, .if_not_exists = false } }, null);
+        try std.testing.expectEqual(@as(usize, ordinal + 1), source.applied);
+        try std.testing.expect(!result_allocator.has_induced_failure);
+        const table_receipt = outcome.receipt orelse return error.MissingActivationReceipt;
+        try std.testing.expect(!std.mem.eql(u8, table_receipt.table_id, "0"));
+        if (unknown) {
+            try std.testing.expectEqual(.admission_unknown, table_receipt.state);
+            try std.testing.expectEqual(.unknown, outcome.catalog_receipt.?.state);
+            try std.testing.expectEqual(@as(?catalog.MutationOutcome, null), outcome.mutation_outcome);
+        } else {
+            try std.testing.expectEqual(.pending, table_receipt.state);
+            try std.testing.expectEqual(.committed, outcome.catalog_receipt.?.state);
+            try std.testing.expectEqual(catalog.MutationOutcome.committed_pending, outcome.mutation_outcome.?);
+        }
+    }
+}
+
+test "SQL catalog ordinary uncertain nonsend becomes definite rejection only after native executor fencing" {
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try storage.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/nonsend", .{tmp.sub_path}) });
+    defer store.deinit();
+    var source: Source = .{ .store = &store };
+    const fence = try source.setup(alloc);
+    var server = source.server();
+    defer server.deinit();
+    source.lose = .before;
+    const receipt = (try executeSql(&server, alloc, .{ .sql_command_fence = &fence }, "CREATE SCHEMA never_admitted")).catalog_receipt.?;
+    try std.testing.expectEqual(.unknown, receipt.state);
+    const before_fence = try @import("sql_catalog_recovery.zig").recover(&server, null, .{}, alloc, receipt.recovery_token);
+    try std.testing.expectEqual(.unknown, before_fence.state);
+    try source.scope(alloc, fence, 5000, .{ .fence = .close });
+    const after_fence = try @import("sql_catalog_recovery.zig").recover(&server, null, .{}, alloc, receipt.recovery_token);
+    try std.testing.expectEqual(.rejected, after_fence.state);
+    try std.testing.expectEqual(@as(usize, 1), source.attempts);
+    try std.testing.expectEqual(@as(usize, 0), source.applied);
+}

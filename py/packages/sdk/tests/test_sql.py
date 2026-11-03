@@ -36,7 +36,36 @@ from antfly import (
     SQLRequest,
     SQLResponse,
 )
+from antfly.client_generated.models.sql_catalog_object_kind import SQLCatalogObjectKind
+from antfly.client_generated.models.sql_catalog_operation_state import SQLCatalogOperationState
 from antfly.client_generated.models.sql_numeric_modifier import SQLNumericModifier
+
+
+@pytest.mark.parametrize("kind", list(SQLCatalogObjectKind))
+@pytest.mark.parametrize("state", list(SQLCatalogOperationState))
+def test_catalog_recovery_supports_all_generated_kinds_and_states(kind, state):
+    calls = []
+    receipt = {
+        "kind": kind.value,
+        "state": state.value,
+        "operation": "create",
+        "database": "default",
+        "namespace": "public",
+        "name": "resource",
+        "recovery_token": "retained-operation",
+    }
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json=receipt)
+
+    client = AntflyClient(base_url="http://sql.test")
+    with httpx.Client(base_url=client.base_url, transport=httpx.MockTransport(respond)) as transport:
+        client._client.set_httpx_client(transport)
+        observed = client.get_sql_catalog_operation(receipt["recovery_token"])
+        assert observed.kind == kind
+        assert observed.state == state
+    assert len(calls) == 1
 
 
 def test_catalog_recovery_retains_unknown_receipt_without_replaying():

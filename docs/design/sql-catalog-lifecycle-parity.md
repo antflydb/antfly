@@ -18338,3 +18338,34 @@ three decoder contracts and the real standalone startup/preparation/cold-reopen
 case, without skips or leaks. Post-effect fault injection proves that even an
 error tag also used for admission rejection aborts the whole native transaction;
 only pre-effect admission failures can be ignored by receiving apply.
+
+
+### Public scoped ordinary DDL recovery
+
+Scoped database, namespace, tablespace, query-source and ordinary table commands
+now use that prepared native boundary through the public SQL dispatcher. Recovery
+binds the resource labels, expected revision and physical table identity into the
+native outcome digest. A recovery token carries identity, never authority:
+current resource administration permission is checked before observation,
+including grants revoked after request authentication. Unknown delivery only
+observes the original command; it never resubmits DDL. Executor fencing is
+required before an absent command can become a definite rejection.
+
+Both the catalog receipt and a constrained CREATE's activation receipt survive an
+uncertain admission. Their labels, token and physical table ID are allocated
+before submission. Completion does not allocate from the response allocator;
+fault campaigns arm that allocator immediately after native apply. Catalog
+commit and constraint readiness remain separate outcomes. Unconfirmed activation
+retains a pending receipt and does not claim background work has started.
+
+The SDK receipt contract includes all catalog object kinds and pending states.
+The TypeScript runtime enum lists are generated from OpenAPI rather than a
+sequence-only hand-maintained subset. Python and TypeScript qualification covers
+every generated kind/state pair. The SDK matrix passes 105 Python SQL tests and
+613 TypeScript tests (one existing intentional skip), and TypeScript typechecking
+passes. Generation and formatting have run for the public contract and clients.
+
+This is an integration checkpoint, not an original-case closure. The 87 original
+unresolved cases, including 64 DDL/catalog cases, remain unchanged. Automatic
+connection enrollment stays guarded until the remaining schema/view/FK and
+other mutation families share the command admission contract.

@@ -24,6 +24,32 @@ import type {
   SQLPreparedResponse,
 } from "../src/index.js";
 
+import {
+  sqlCatalogObjectKinds,
+  sqlCatalogOperationStates,
+} from "../src/sql-catalog-contract.generated.js";
+
+it.each(
+  sqlCatalogObjectKinds.flatMap((kind) =>
+    sqlCatalogOperationStates.map((state) => ({ kind, state }))
+  )
+)("observes generated $kind receipts in $state state with one request", async ({ kind, state }) => {
+  const receipt = {
+    kind,
+    state,
+    operation: "create",
+    database: "default",
+    namespace: "public",
+    name: "resource",
+    recovery_token: "retained-operation",
+  };
+  const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(receipt)));
+  vi.stubGlobal("fetch", fetch);
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  expect(await client.getSQLCatalogOperation(receipt.recovery_token)).toEqual(receipt);
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
 it("retains unknown catalog receipts and observes without replaying DDL", async () => {
   const token = "opaque-retained-operation";
   const receipt = {

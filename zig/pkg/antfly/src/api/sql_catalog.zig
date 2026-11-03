@@ -363,13 +363,13 @@ fn commentResource(server: *server_mod.ApiHttpServer, identity: ?server_mod.Auth
     if (identity) |authenticated| if (!server_mod.permissionsAllow(authenticated.permissions, permission_kind, resource, .admin)) return error.Forbidden;
     var private = context;
     private.setting_admin = true;
-    const response = server.source.systemCatalog(a, private, .{ .mutate = .{ .mutation = .{
+    var reply = @import("sql_ordinary_catalog.zig").submit(server, identity, private, allocators, .{ .mutation = .{
         .action = .comment,
         .kind = kind,
         .name = ddl.name.table,
         .database = database,
         .description = ddl.comment_value,
-    } } }) catch |err| {
+    } }) catch |err| {
         // PostgreSQL COMMENT ON DATABASE treats an absent database as a no-op.
         // Authorization still precedes lookup; no write was admitted here.
         if (kind == .database and err == error.DatabaseNotFound) return .{ .mutation_outcome = null };
@@ -377,12 +377,15 @@ fn commentResource(server: *server_mod.ApiHttpServer, identity: ?server_mod.Auth
         if (err == error.CatalogCommandTooLarge) return error.ProgramLimitExceeded;
         return err;
     };
-    defer a.free(response);
-    var result = std.json.parseFromSlice(domain.MutationResult, a, response, .{}) catch return error.SqlMutationOutcomeUnknown;
-    defer result.deinit();
-    const committed = result.value.resource orelse return error.SqlMutationOutcomeUnknown;
-    if (result.value.revision == 0 or committed.kind != kind or !std.mem.eql(u8, committed.name, ddl.name.table)) return error.SqlMutationOutcomeUnknown;
-    return .{ .mutation_outcome = .committed };
+    defer reply.deinit(allocators.result);
+    if (reply.unknown) return .{ .mutation_outcome = null, .catalog_receipt = reply.takeReceipt() };
+    if (reply.legacy) |response| {
+        var result = std.json.parseFromSlice(domain.MutationResult, a, response, .{}) catch return error.SqlMutationOutcomeUnknown;
+        defer result.deinit();
+        const committed = result.value.resource orelse return error.SqlMutationOutcomeUnknown;
+        if (result.value.revision == 0 or committed.kind != kind or !std.mem.eql(u8, committed.name, ddl.name.table)) return error.SqlMutationOutcomeUnknown;
+    }
+    return .{ .mutation_outcome = .committed, .catalog_receipt = reply.takeReceipt() };
 }
 
 fn commentTable(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, path: ?*const SearchPath) !catalog.DdlOutcome {
@@ -1267,7 +1270,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     };
     var mutation_context = context;
     if (request.mutation.sql_owner != null) mutation_context.setting_admin = true;
-    const response = server.source.systemCatalog(alloc, mutation_context, .{ .mutate = request }) catch |err| {
+    var reply = @import("sql_ordinary_catalog.zig").submit(server, identity, mutation_context, allocators, request) catch |err| {
         // Conditional DDL observes the authority's atomic outcome. Owner binding
         // never permits retrying an ambiguous durable submission.
         switch (input) {
@@ -1299,22 +1302,37 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         };
         return err;
     };
-    defer alloc.free(response);
+    defer reply.deinit(alloc);
+    if (reply.unknown) {
+        if (creation_receipt) |*receipt| {
+            const table_id = reply.takeTableId() orelse return error.SqlMutationOutcomeUnknown;
+            alloc.free(receipt.table_id);
+            receipt.table_id = table_id;
+            receipt.state = .admission_unknown;
+            receipt.diagnostic = "Table definition admission is unresolved. Observe the catalog receipt before checking constraint activation; do not replay CREATE.";
+            receipt_transferred = true;
+            return .{ .mutation_outcome = null, .catalog_receipt = reply.takeReceipt(), .receipt = receipt.* };
+        }
+        return .{ .mutation_outcome = null, .catalog_receipt = reply.takeReceipt() };
+    }
     if (creation_receipt) |*receipt| {
-        const result = std.json.parseFromSliceLeaky(domain.MutationResult, a, response, .{}) catch return error.SqlMutationOutcomeUnknown;
-        const resource_record = result.resource orelse return error.SqlMutationOutcomeUnknown;
-        const table_id = std.fmt.allocPrint(alloc, "{d}", .{resource_record.id}) catch return error.SqlMutationOutcomeUnknown;
+        const committed_id = if (reply.legacy) |response| blk: {
+            const result = std.json.parseFromSliceLeaky(domain.MutationResult, a, response, .{}) catch return error.SqlMutationOutcomeUnknown;
+            break :blk (result.resource orelse return error.SqlMutationOutcomeUnknown).id;
+        } else reply.table_id;
+        if (committed_id == 0) return error.SqlMutationOutcomeUnknown;
+        const table_id = reply.takeTableId() orelse (std.fmt.allocPrint(alloc, "{d}", .{committed_id}) catch return error.SqlMutationOutcomeUnknown);
         alloc.free(receipt.table_id);
         receipt.table_id = table_id;
         awaitActivation(server, context, alloc, request.physical_name.?, receipt, allocators.completion) catch |err| {
             std.log.warn("SQL table creation committed but activation observation failed table_id={s} err={s}", .{ receipt.table_id, @errorName(err) });
             receipt.state = .pending;
-            receipt.diagnostic = "Table creation committed; constraints are still being validated. Inspect table constraint status; do not replay the DDL.";
+            receipt.diagnostic = "Table creation committed; constraint activation is not yet confirmed. Inspect table constraint status; do not replay the DDL.";
         };
         receipt_transferred = true;
-        return .{ .mutation_outcome = if (receipt.state == .ready) .committed else if (receipt.state == .invalid) .committed_repair_required else .committed_pending, .receipt = receipt.* };
+        return .{ .mutation_outcome = if (receipt.state == .ready) .committed else if (receipt.state == .invalid) .committed_repair_required else .committed_pending, .receipt = receipt.*, .catalog_receipt = reply.takeReceipt() };
     }
-    return .{};
+    return .{ .catalog_receipt = reply.takeReceipt() };
 }
 
 /// Completion of a live nonunique generation requires every current owner.

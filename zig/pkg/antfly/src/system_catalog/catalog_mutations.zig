@@ -32,11 +32,40 @@ pub const Admission = struct {
         if (std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidCatalogMutation;
     }
 };
+/// Authorization labels are part of the retained native digest, not a token's
+/// unauthenticated description of some other resource's outcome.
+pub const Target = struct {
+    kind: @import("antfly_local_sources").system_catalog_domain.Kind,
+    action: @import("antfly_local_sources").system_catalog_domain.Action,
+    database: []const u8,
+    namespace: []const u8,
+    name: []const u8,
+    table_id: u64,
+    pub fn validateLabels(self: @This()) !void {
+        const domain = @import("antfly_local_sources").system_catalog_domain;
+        switch (self.kind) {
+            .table, .database, .namespace, .tablespace, .query_source => {},
+            else => return error.InvalidCatalogMutation,
+        }
+        try domain.validateResourceName(self.kind, self.name);
+        try domain.validateName(self.database);
+        try domain.validateName(self.namespace);
+    }
+    pub fn validate(self: @This()) !void {
+        try self.validateLabels();
+        if (self.kind != .table and self.table_id != 0) return error.InvalidCatalogMutation;
+        if (self.kind == .table and (self.action == .create or self.action == .drop) and self.table_id == 0) return error.InvalidCatalogMutation;
+    }
+};
 pub const Observation = struct {
     admission: Admission,
+    target: Target,
+    expected_revision: u64,
     digest: [32]u8,
     pub fn validate(self: @This()) !void {
         try self.admission.validate();
+        try self.target.validate();
+        if (self.expected_revision == std.math.maxInt(u64)) return error.InvalidCatalogMutation;
         if (std.mem.allEqual(u8, &self.digest, 0)) return error.InvalidCatalogMutation;
     }
 };
@@ -66,7 +95,15 @@ pub fn validate(command: Command) !void {
 }
 pub fn observation(a: A, command: Command) !Observation {
     try validate(command);
-    return .{ .admission = command.sql_catalog_admission.?, .digest = try hash(a, "antfly:sql-catalog-command:v1", command) };
+    const result: Observation = .{ .admission = command.sql_catalog_admission.?, .target = .{ .kind = command.mutation.kind, .action = command.mutation.action, .database = command.mutation.database, .namespace = command.mutation.namespace, .name = command.mutation.name, .table_id = if (command.mutation.kind == .table) command.mutation.table_id else 0 }, .expected_revision = command.expected_revision, .digest = try hash(a, "antfly:sql-catalog-command:v1", command) };
+    try result.validate();
+    return result;
+}
+pub fn matchesIntent(a: A, prepared: @import("antfly_local_sources").system_catalog_domain.Mutation, requested: @import("antfly_local_sources").system_catalog_domain.Mutation) !bool {
+    var logical = prepared;
+    logical.table_id = requested.table_id;
+    logical.storage_name = requested.storage_name;
+    return std.mem.eql(u8, &try hash(a, "antfly:sql-catalog-intent:v1", logical), &try hash(a, "antfly:sql-catalog-intent:v1", requested));
 }
 pub fn boundDigest(a: A, request: Observation) ![32]u8 {
     try request.validate();

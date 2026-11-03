@@ -20,6 +20,11 @@ import {
   type OrdinaryPaths,
 } from "./memory.js";
 import type { components, paths } from "./public-api.js";
+import {
+  sqlCatalogObjectKinds,
+  sqlCatalogOperationKinds,
+  sqlCatalogOperationStates,
+} from "./sql-catalog-contract.generated.js";
 import { parseSSEFrames } from "./sse.js";
 import type {
   AntflyAuth,
@@ -54,7 +59,6 @@ import type {
   IndexMaintenanceRequest,
   IndexMaintenanceResponse,
   IndexPublicationStatus,
-  SchemaValidationStatus,
   IndexStatus,
   LinearMergeRequest,
   LinearMergeResult,
@@ -92,6 +96,7 @@ import type {
   RetrievalAgentStreamCallbacks,
   RunResearchJobOptions,
   ScanKeysRequest,
+  SchemaValidationStatus,
   SQLCatalogOperationReceipt,
   SQLConnectionOpenRequest,
   SQLConnectionResponse,
@@ -119,9 +124,9 @@ function validSQLCatalogReceipt(value: unknown): value is SQLCatalogOperationRec
   if (typeof value !== "object" || value === null) return false;
   const receipt = value as SQLCatalogOperationReceipt;
   return (
-    receipt.kind === "sequence" &&
-    ["create", "alter", "rename", "drop"].includes(receipt.operation) &&
-    ["committed", "rejected", "unknown"].includes(receipt.state) &&
+    sqlCatalogObjectKinds.includes(receipt.kind) &&
+    sqlCatalogOperationKinds.includes(receipt.operation) &&
+    sqlCatalogOperationStates.includes(receipt.state) &&
     [receipt.database, receipt.namespace, receipt.name, receipt.recovery_token].every(
       (field) => typeof field === "string" && field.length > 0
     ) &&

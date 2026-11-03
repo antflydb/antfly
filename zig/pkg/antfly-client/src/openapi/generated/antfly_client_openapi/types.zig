@@ -52709,6 +52709,10 @@ pub const SQLCatalogObjectKind = enum {
     authorization,
     table,
     index,
+    database,
+    namespace,
+    tablespace,
+    query_source,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -52722,6 +52726,10 @@ pub const SQLCatalogObjectKind = enum {
             .authorization => "authorization",
             .table => "table",
             .index => "index",
+            .database => "database",
+            .namespace => "namespace",
+            .tablespace => "tablespace",
+            .query_source => "query_source",
         };
         try jw.write(s);
     }
@@ -52742,6 +52750,10 @@ pub const SQLCatalogObjectKind = enum {
             .{ "authorization", .authorization },
             .{ "table", .table },
             .{ "index", .index },
+            .{ "database", .database },
+            .{ "namespace", .namespace },
+            .{ "tablespace", .tablespace },
+            .{ "query_source", .query_source },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

@@ -735,6 +735,29 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-schema-validation-submission-test", "Verify audited binary schema submissions, exact durable acceptance and grant isolation")
         .dependOn(&schema_submission_run.step);
     system_catalog_api_step.dependOn(&schema_submission_run.step);
+    const ordinary_catalog_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{"SQL catalog ordinary"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const ordinary_catalog_run = addFilteredTestRunArtifact(b, ordinary_catalog_tests);
+    ordinary_catalog_run.addArg("--require-no-skips");
+    const ordinary_catalog_inventory = b.addRunArtifact(ordinary_catalog_tests);
+    ordinary_catalog_inventory.addArg("--list-tests");
+    const ordinary_catalog_audit = b.addSystemCommand(&.{"python3"});
+    ordinary_catalog_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for ([_][]const u8{
+        "SQL catalog ordinary scoped evolution observes lost replies without replaying mutations",
+        "SQL catalog ordinary typed table unknown admission recovers after cold reopen and executor fencing",
+        "SQL catalog ordinary recovery rejects label substitution and current authorization revocation",
+        "SQL catalog ordinary constrained create preserves activation receipts without result allocation after admission",
+        "SQL catalog ordinary uncertain nonsend becomes definite rejection only after native executor fencing",
+    }) |required| ordinary_catalog_audit.addArgs(&.{ "--filter", required });
+    ordinary_catalog_audit.addArg("--inventory");
+    ordinary_catalog_audit.addFileArg2(ordinary_catalog_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    ordinary_catalog_run.step.dependOn(&ordinary_catalog_audit.step);
+    const ordinary_catalog_step = b.step("antfly-sql-catalog-recovery-test", "Verify authorized scoped DDL, native lost-reply recovery and label-bound public receipts");
+    ordinary_catalog_step.dependOn(&ordinary_catalog_run.step);
     const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response" } });
     const sql_command_producer_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
@@ -5863,6 +5886,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_catalog_command_step = b.step("antfly-sql-catalog-command-test", "Qualify prepared ordinary catalog submission and exact standalone cold outcomes");
     sql_catalog_command_step.dependOn(&prepared_catalog_standalone_run.step);
     sql_catalog_command_step.dependOn(sql_command_fence_step);
+    ordinary_catalog_step.dependOn(sql_catalog_command_step);
     const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
     system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
     // Same physical source module and linked provider as the broad catalog

@@ -1918,7 +1918,7 @@ components:
           minimum: 0
     SQLCatalogObjectKind:
       type: string
-      enum: [sequence, function, procedure, operator, aggregate, cast, type, authorization, table, index]
+      enum: [sequence, function, procedure, operator, aggregate, cast, type, authorization, table, index, database, namespace, tablespace, query_source]
       description: Catalog object affected by an exact recoverable operation.
     SQLCatalogOperationKind:
       type: string
