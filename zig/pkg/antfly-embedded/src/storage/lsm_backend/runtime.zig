@@ -664,6 +664,12 @@ pub fn BoundStore(comptime BackendType: type) type {
         backend: *BackendType,
         namespace: backend_types.Namespace,
 
+        pub fn writeSerialization(self: *@This()) backend_erased.WriteSerialization {
+            if (comptime @hasField(BackendType, "serialized_write_mutex"))
+                return .{ .gate = &self.backend.serialized_write_mutex };
+            return .unsupported;
+        }
+
         pub fn capabilities(_: *@This()) backend_types.Capabilities {
             return .{
                 .ordered_ranges = true,
@@ -9219,6 +9225,12 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
         pub fn open(backend: *BackendType) !@This() {
             return try openWithOptions(backend, .{});
+        }
+
+        /// Logical bytes this transaction would present to commit admission
+        /// (the same measure `admitPreparedCommit` checks).
+        pub fn stagedLogicalBytes(self: *const @This()) u64 {
+            return self.mutable.estimatedLogicalBytes() +| self.bulk_appends.estimatedLogicalBytes();
         }
 
         pub fn openWithOptions(backend: *BackendType, options: backend_types.BatchOptions) !@This() {

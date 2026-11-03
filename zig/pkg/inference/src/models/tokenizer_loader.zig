@@ -902,7 +902,7 @@ pub fn loadSelected(allocator: std.mem.Allocator, model_dir: []const u8, manifes
                 // separate pathname check leaves a replacement window.
                 try man.verifyBoundarySidecar("tokenizer.json", bytes);
                 break :blk try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(allocator, bytes, .{ .strict_unigram_normalizer = true });
-            } else if (man.gliner_architecture == .span and man.gliner_span_declared) blk: {
+            } else if (man.gliner_architecture == .span and (man.gliner_span_declared or man.gliner_specialty_profile != null)) blk: {
                 const path = man.tokenizer_json_path orelse return error.NoTokenizerFound;
                 const bytes = try c_file.readFileMax(allocator, path, 32 * 1024 * 1024);
                 defer allocator.free(bytes);
@@ -911,7 +911,9 @@ pub fn loadSelected(allocator: std.mem.Allocator, model_dir: []const u8, manifes
                     if (digest.size_bytes != expected.size_bytes or !std.mem.eql(u8, &digest.sha256, &expected.sha256))
                         return error.GlinerDecisionArtifactMismatch;
                 } else return error.MissingGlinerDecisionIdentity;
-                const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, bytes);
+                const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(allocator, bytes, .{
+                    .strict_unigram_normalizer = man.gliner_specialty_profile != null,
+                });
                 result.decision_digest = digest;
                 break :blk tokenizer;
             } else try loadHuggingFaceTokenizerFromManifest(allocator, &man);

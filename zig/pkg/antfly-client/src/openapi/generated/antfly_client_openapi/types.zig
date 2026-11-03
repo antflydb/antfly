@@ -7575,8 +7575,14 @@ pub const CreateEmbeddingsIndexRequest = struct {
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
+    algorithm: ?DenseIndexAlgorithm = null,
+    /// LEANN tuning (dense only; requires algorithm=leann).
+    leann: ?LeannIndexConfig = null,
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
+    /// RaBitQ bits per dimension for dense indexes (dense only). Fixed when the index is created. HBC (default 1): larger values also store extended RaBitQ codes and use them to rescore candidates, which improves recall and reduces exact reranking at the cost of index size (about dims * bits / 8 extra bytes per vector). Values above 1 enable a random rotation of vectors. LEANN (default 4 with the rabitq quantizer; pq allows only 1): more bits tighten the error bounds, so fewer candidates get exact distances (about 15x fewer at 4 bits than 1 on NYTimes-256), and codes take bits / 8 bytes per dimension.
+    quantization_bits: ?i64 = null,
+    quantization_refine: ?QuantizationRefine = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
     embedder: ?IndexEmbedderConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
@@ -7607,7 +7613,11 @@ pub const CreateEmbeddingsIndexRequest = struct {
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "template", "template", true },
         .{ "distance_metric", "distance_metric", true },
+        .{ "algorithm", "algorithm", true },
+        .{ "leann", "leann", true },
         .{ "mem_only", "mem_only", true },
+        .{ "quantization_bits", "quantization_bits", true },
+        .{ "quantization_refine", "quantization_refine", true },
         .{ "embedder", "embedder", true },
         .{ "chunker", "chunker", true },
         .{ "top_k", "top_k", true },
@@ -7683,8 +7693,24 @@ pub const CreateEmbeddingsIndexRequest = struct {
             try jw.objectField("distance_metric");
             try jw.write(value);
         }
+        if (self.algorithm) |value| {
+            try jw.objectField("algorithm");
+            try jw.write(value);
+        }
+        if (self.leann) |value| {
+            try jw.objectField("leann");
+            try jw.write(value);
+        }
         if (self.mem_only) |value| {
             try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.quantization_bits) |value| {
+            try jw.objectField("quantization_bits");
+            try jw.write(value);
+        }
+        if (self.quantization_refine) |value| {
+            try jw.objectField("quantization_refine");
             try jw.write(value);
         }
         if (self.embedder) |value| {
@@ -8369,6 +8395,8 @@ pub const CreatedEmbeddingsIndex = struct {
     source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
+    algorithm: ?DenseIndexAlgorithm = null,
+    leann: ?LeannIndexConfig = null,
     mem_only: ?bool = null,
     embedder: ?CreatedProviderConfig = null,
     chunker: ?ChunkerConfig = null,
@@ -8395,6 +8423,8 @@ pub const CreatedEmbeddingsIndex = struct {
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "template", "template", true },
         .{ "distance_metric", "distance_metric", true },
+        .{ "algorithm", "algorithm", true },
+        .{ "leann", "leann", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
         .{ "chunker", "chunker", true },
@@ -8473,6 +8503,14 @@ pub const CreatedEmbeddingsIndex = struct {
             try jw.objectField("distance_metric");
             try jw.write(value);
         }
+        if (self.algorithm) |value| {
+            try jw.objectField("algorithm");
+            try jw.write(value);
+        }
+        if (self.leann) |value| {
+            try jw.objectField("leann");
+            try jw.write(value);
+        }
         if (self.mem_only) |value| {
             try jw.objectField("mem_only");
             try jw.write(value);
@@ -8523,6 +8561,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
+    algorithm: ?DenseIndexAlgorithm = null,
+    leann: ?LeannIndexConfig = null,
     mem_only: ?bool = null,
     embedder: ?CreatedProviderConfig = null,
     chunker: ?ChunkerConfig = null,
@@ -8544,6 +8584,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "template", "template", true },
         .{ "distance_metric", "distance_metric", true },
+        .{ "algorithm", "algorithm", true },
+        .{ "leann", "leann", true },
         .{ "mem_only", "mem_only", true },
         .{ "embedder", "embedder", true },
         .{ "chunker", "chunker", true },
@@ -8605,6 +8647,14 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         }
         if (self.distance_metric) |value| {
             try jw.objectField("distance_metric");
+            try jw.write(value);
+        }
+        if (self.algorithm) |value| {
+            try jw.objectField("algorithm");
+            try jw.write(value);
+        }
+        if (self.leann) |value| {
+            try jw.objectField("leann");
             try jw.write(value);
         }
         if (self.mem_only) |value| {
@@ -10847,6 +10897,32 @@ pub const DecisionUsage = struct {
     input_tokens: i64,
     /// Zero for classifiers, which generate no tokens.
     output_tokens: i64,
+};
+
+/// Dense vector index algorithm (dense only). "hbc" (default) keeps quantized codes plus full-precision rerank data. "leann" keeps only a pruned proximity graph and compact RaBitQ codes and recomputes exact distances for a few candidates per query, re-embedding them (see leann.vector_storage) or reading their stored embedding, trading query-time work for index size. LEANN indexes do not yet support shard splits or native index backups.
+pub const DenseIndexAlgorithm = enum {
+    hbc,
+    leann,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .hbc => "hbc",
+            .leann => "leann",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "hbc", .hbc },
+            .{ "leann", .leann },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Conservative distributed rollout phase for native WAL-backed dense-index storage. native_authoritative is reported only when every expected shard has supplied current authority evidence.
@@ -13753,7 +13829,7 @@ pub const EmbeddingSourceCoverageStatus = struct {
     }
 };
 
-/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense HBC vector index. For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
+/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index; `algorithm` selects HBC (default) or LEANN. For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
 pub const EmbeddingsIndexConfig = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
@@ -13775,8 +13851,14 @@ pub const EmbeddingsIndexConfig = struct {
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
+    algorithm: ?DenseIndexAlgorithm = null,
+    /// LEANN tuning (dense only; requires algorithm=leann).
+    leann: ?LeannIndexConfig = null,
     /// Whether to use in-memory only storage (dense only)
     mem_only: ?bool = null,
+    /// RaBitQ bits per dimension for dense indexes (dense only). Fixed when the index is created. HBC (default 1): larger values also store extended RaBitQ codes and use them to rescore candidates, which improves recall and reduces exact reranking at the cost of index size (about dims * bits / 8 extra bytes per vector). Values above 1 enable a random rotation of vectors. LEANN (default 4 with the rabitq quantizer; pq allows only 1): more bits tighten the error bounds, so fewer candidates get exact distances (about 15x fewer at 4 bits than 1 on NYTimes-256), and codes take bits / 8 bytes per dimension.
+    quantization_bits: ?i64 = null,
+    quantization_refine: ?QuantizationRefine = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
     embedder: ?IndexEmbedderConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
@@ -13803,7 +13885,11 @@ pub const EmbeddingsIndexConfig = struct {
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "template", "template", true },
         .{ "distance_metric", "distance_metric", true },
+        .{ "algorithm", "algorithm", true },
+        .{ "leann", "leann", true },
         .{ "mem_only", "mem_only", true },
+        .{ "quantization_bits", "quantization_bits", true },
+        .{ "quantization_refine", "quantization_refine", true },
         .{ "embedder", "embedder", true },
         .{ "chunker", "chunker", true },
         .{ "top_k", "top_k", true },
@@ -13866,8 +13952,24 @@ pub const EmbeddingsIndexConfig = struct {
             try jw.objectField("distance_metric");
             try jw.write(value);
         }
+        if (self.algorithm) |value| {
+            try jw.objectField("algorithm");
+            try jw.write(value);
+        }
+        if (self.leann) |value| {
+            try jw.objectField("leann");
+            try jw.write(value);
+        }
         if (self.mem_only) |value| {
             try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.quantization_bits) |value| {
+            try jw.objectField("quantization_bits");
+            try jw.write(value);
+        }
+        if (self.quantization_refine) |value| {
+            try jw.objectField("quantization_refine");
             try jw.write(value);
         }
         if (self.embedder) |value| {
@@ -20338,11 +20440,12 @@ pub const GeneratorConfig = struct {
     region: ?[]const u8 = null,
     /// Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID.
     workspace_id: ?[]const u8 = null,
+    /// Optional reasoning effort for Ollama's OpenAI-compatible endpoint. Use none to disable thinking on models that support it; supported values depend on the model.
+    reasoning_effort: ?OpenAIReasoningEffort = null,
     /// HTTP response timeout in seconds for Ollama API calls.
     timeout: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
-    reasoning_effort: ?OpenAIReasoningEffort = null,
     /// Opaque personal registration owned by the authenticated caller.
     connection_id: ?[]const u8 = null,
     /// OpenAI completion budget, including visible output and reasoning tokens. Use for reasoning models instead of max_tokens; the two are mutually exclusive.
@@ -20370,9 +20473,9 @@ pub const GeneratorConfig = struct {
         .{ "credentials_path", "credentials_path", true },
         .{ "region", "region", true },
         .{ "workspace_id", "workspace_id", true },
+        .{ "reasoning_effort", "reasoning_effort", true },
         .{ "timeout", "timeout", true },
         .{ "api_url", "api_url", true },
-        .{ "reasoning_effort", "reasoning_effort", true },
         .{ "connection_id", "connection_id", true },
         .{ "max_completion_tokens", "max_completion_tokens", true },
         .{ "max_image_input_tokens", "max_image_input_tokens", true },
@@ -20457,16 +20560,16 @@ pub const GeneratorConfig = struct {
             try jw.objectField("workspace_id");
             try jw.write(value);
         }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
         if (self.timeout) |value| {
             try jw.objectField("timeout");
             try jw.write(value);
         }
         if (self.api_url) |value| {
             try jw.objectField("api_url");
-            try jw.write(value);
-        }
-        if (self.reasoning_effort) |value| {
-            try jw.objectField("reasoning_effort");
             try jw.write(value);
         }
         if (self.connection_id) |value| {
@@ -26746,6 +26849,12 @@ pub const IndexConfig = struct {
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
+    algorithm: ?DenseIndexAlgorithm = null,
+    /// LEANN tuning (dense only; requires algorithm=leann).
+    leann: ?LeannIndexConfig = null,
+    /// RaBitQ bits per dimension for dense indexes (dense only). Fixed when the index is created. HBC (default 1): larger values also store extended RaBitQ codes and use them to rescore candidates, which improves recall and reduces exact reranking at the cost of index size (about dims * bits / 8 extra bytes per vector). Values above 1 enable a random rotation of vectors. LEANN (default 4 with the rabitq quantizer; pq allows only 1): more bits tighten the error bounds, so fewer candidates get exact distances (about 15x fewer at 4 bits than 1 on NYTimes-256), and codes take bits / 8 bytes per dimension.
+    quantization_bits: ?i64 = null,
+    quantization_refine: ?QuantizationRefine = null,
     /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
     embedder: ?IndexEmbedderConfig = null,
     /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before dense or sparse managed indexing.
@@ -26808,6 +26917,10 @@ pub const IndexConfig = struct {
         .{ "source_artifact_name", "source_artifact_name", true },
         .{ "template", "template", true },
         .{ "distance_metric", "distance_metric", true },
+        .{ "algorithm", "algorithm", true },
+        .{ "leann", "leann", true },
+        .{ "quantization_bits", "quantization_bits", true },
+        .{ "quantization_refine", "quantization_refine", true },
         .{ "embedder", "embedder", true },
         .{ "chunker", "chunker", true },
         .{ "top_k", "top_k", true },
@@ -26915,6 +27028,22 @@ pub const IndexConfig = struct {
         }
         if (self.distance_metric) |value| {
             try jw.objectField("distance_metric");
+            try jw.write(value);
+        }
+        if (self.algorithm) |value| {
+            try jw.objectField("algorithm");
+            try jw.write(value);
+        }
+        if (self.leann) |value| {
+            try jw.objectField("leann");
+            try jw.write(value);
+        }
+        if (self.quantization_bits) |value| {
+            try jw.objectField("quantization_bits");
+            try jw.write(value);
+        }
+        if (self.quantization_refine) |value| {
+            try jw.objectField("quantization_refine");
             try jw.write(value);
         }
         if (self.embedder) |value| {
@@ -34313,6 +34442,69 @@ pub const LakeCatalogResponse = struct {
     }
 };
 
+/// Tuning for algorithm=leann dense indexes. All fields are optional.
+pub const LeannIndexConfig = struct {
+    /// Graph degree cap M. Most nodes keep M/5 neighbors after pruning; hubs keep up to M.
+    max_degree: ?i64 = null,
+    /// Compact code used to steer the graph walk. "rabitq" (default) carries error bounds, so only candidates that can still reach the top k are recomputed. "pq" follows the LEANN paper's fixed rerank ratio; prefer it only for very low dimensions (below about 64).
+    quantizer: ?[]const u8 = null,
+    /// Whether document embeddings stay stored after the graph covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few candidates per query from the document's field or template through the index's embedder, so the index stores about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external vectors, chunked indexes, indexes fed by other enrichments, and the pq quantizer.
+    vector_storage: ?[]const u8 = null,
+    /// Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for pq).
+    search_ef: ?i64 = null,
+    /// Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates and loses fewer true neighbors.
+    bound_scale: ?f32 = null,
+    /// Candidates recomputed per batch. 0 uses k.
+    batch_size: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_degree", "max_degree", true },
+        .{ "quantizer", "quantizer", true },
+        .{ "vector_storage", "vector_storage", true },
+        .{ "search_ef", "search_ef", true },
+        .{ "bound_scale", "bound_scale", true },
+        .{ "batch_size", "batch_size", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_degree) |value| {
+            try jw.objectField("max_degree");
+            try jw.write(value);
+        }
+        if (self.quantizer) |value| {
+            try jw.objectField("quantizer");
+            try jw.write(value);
+        }
+        if (self.vector_storage) |value| {
+            try jw.objectField("vector_storage");
+            try jw.write(value);
+        }
+        if (self.search_ef) |value| {
+            try jw.objectField("search_ef");
+            try jw.write(value);
+        }
+        if (self.bound_scale) |value| {
+            try jw.objectField("bound_scale");
+            try jw.write(value);
+        }
+        if (self.batch_size) |value| {
+            try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Deprecated free-form graph filter accepted by the v0.2 compatibility contract.
 pub const LegacyGraphDocumentQuery = std.json.ArrayHashMap(std.json.Value);
 
@@ -41516,8 +41708,10 @@ pub const OllamaGeneratorConfig = struct {
     url: ?[]const u8 = null,
     /// Controls randomness in generation (0.0-2.0).
     temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
+    /// Maximum number of tokens to generate, including reasoning tokens for thinking models.
     max_tokens: ?i64 = null,
+    /// Optional reasoning effort for Ollama's OpenAI-compatible endpoint. Use none to disable thinking on models that support it; supported values depend on the model.
+    reasoning_effort: ?OpenAIReasoningEffort = null,
     /// Nucleus sampling parameter.
     top_p: ?f32 = null,
     /// Top-k sampling parameter.
@@ -41532,6 +41726,7 @@ pub const OllamaGeneratorConfig = struct {
         .{ "url", "url", true },
         .{ "temperature", "temperature", true },
         .{ "max_tokens", "max_tokens", true },
+        .{ "reasoning_effort", "reasoning_effort", true },
         .{ "top_p", "top_p", true },
         .{ "top_k", "top_k", true },
         .{ "timeout", "timeout", true },
@@ -41561,6 +41756,10 @@ pub const OllamaGeneratorConfig = struct {
         }
         if (self.max_tokens) |value| {
             try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
             try jw.write(value);
         }
         if (self.top_p) |value| {
@@ -43168,6 +43367,32 @@ pub const Pruner = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// How an HBC dense index with quantization_bits above 1 uses its extended codes (not allowed with algorithm=leann). near_cutoff scores with 1-bit codes and rescores only candidates that could still enter the result candidates; all rescores every scanned vector.
+pub const QuantizationRefine = enum {
+    near_cutoff,
+    all,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .near_cutoff => "near_cutoff",
+            .all => "all",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "near_cutoff", .near_cutoff },
+            .{ "all", .all },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 

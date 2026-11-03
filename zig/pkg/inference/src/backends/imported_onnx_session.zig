@@ -5051,7 +5051,7 @@ noinline fn validateFreshPreparedRouteFacts(target: *ImportedOnnxSession, routes
 fn importedTypedHostIngress(backend_type: BackendType) !void {
     const a = std.testing.allocator;
     if (backend_type == .cuda) {
-        var probe = @import("compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        var probe = @import("compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (@as(anyerror, err)) {
             error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
             else => return err,
         };

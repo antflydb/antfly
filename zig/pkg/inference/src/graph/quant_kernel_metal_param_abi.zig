@@ -319,7 +319,7 @@ const layouts = [_]Layout{
         .{ .uint32 = "batch seq_len hidden_size num_words" },
     } },
     .{ .name = "gliner_gru_combine_f32", .groups = &.{
-        .{ .uint32 = "rows dim reserved0 reserved1" },
+        .{ .uint32 = "rows dim add_residual reserved1" },
     } },
     .{ .name = "argmax_axis_f32", .groups = &.{
         .{ .uint32 = "outer axis_dim inner reserved" },

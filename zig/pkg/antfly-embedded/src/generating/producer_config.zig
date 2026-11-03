@@ -52,7 +52,7 @@ pub fn parse(alloc: Allocator, raw: []const u8) !Config {
 
     const schema = parsed.value.object.get("output_schema");
     if (schema) |value| {
-        if (value != .object or parsed.value.object.contains("tools") or parsed.value.object.contains("tool_choice") or parsed.value.object.contains("tool_output")) return error.InvalidConstrainedGenerationConfig;
+        if (value != .object or cfg.tools_json != null or parsed.value.object.contains("tool_choice") or parsed.value.object.contains("tool_output")) return error.InvalidConstrainedGenerationConfig;
         try constrained.validateSchema(value);
         if (cfg.provider != .antfly) try constrained.validateProviderSchema(cfg, try constrained.hostedCapabilities(cfg).select(.auto, null), value);
     }
@@ -67,7 +67,6 @@ pub fn parse(alloc: Allocator, raw: []const u8) !Config {
     const batch = if (parsed.value.object.get("batch")) |value| (try std.json.parseFromValue(constrained.Batch, parsed.arena.allocator(), value, .{})).value else constrained.Batch{};
     try batch.validate();
     if (schema == null and (output != .auto or parsed.value.object.contains("batch") or parsed.value.object.contains("instructions"))) return error.InvalidConstrainedGenerationConfig;
-    const tools = parsed.value.object.get("tools");
     const tool_choice = parsed.value.object.get("tool_choice");
     const tool_name = if (parsed.value.object.get("tool_name")) |value|
         if (value == .string) value.string else null
@@ -78,7 +77,7 @@ pub fn parse(alloc: Allocator, raw: []const u8) !Config {
         if (std.mem.eql(u8, value.string, "arguments")) break :blk ToolOutput.arguments;
         if (std.mem.eql(u8, value.string, "content")) break :blk ToolOutput.content;
         return error.InvalidGeneratorToolConfig;
-    } else if (tools != null) ToolOutput.arguments else ToolOutput.content;
+    } else if (cfg.tools_json != null) ToolOutput.arguments else ToolOutput.content;
 
     return .{
         .generator = cfg,
@@ -111,7 +110,9 @@ pub fn generatorConfigFromValue(alloc: Allocator, value: std.json.Value) !genera
     }
     var cfg = if (nested) |generator| try generating_runtime.parseConfigFromValue(alloc, generator) else try generating_runtime.parseConfigFromValue(alloc, .{ .object = object });
     errdefer cfg.deinit(alloc);
-    if (value.object.get("tools")) |tools| cfg.tools_json = try std.json.Stringify.valueAlloc(alloc, tools, .{});
+    if (try generating_runtime.chatToolsFromValue(value.object.get("tools"))) |_| {
+        cfg.tools_json = try std.json.Stringify.valueAlloc(alloc, value.object.get("tools").?, .{});
+    }
     if (value.object.get("tool_choice")) |choice| cfg.tool_choice_json = try std.json.Stringify.valueAlloc(alloc, choice, .{});
     return cfg;
 }
@@ -126,6 +127,28 @@ pub fn forcedToolName(tool_choice: ?std.json.Value) ?[]const u8 {
             return if (name == .string) name.string else null;
         },
         else => return null,
+    }
+}
+
+test "generating backend producer configuration normalizes null tools before selecting output mode" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "openai", "openrouter", "ollama" }) |provider| {
+        const raw = try std.fmt.allocPrint(a, "{{\"provider\":\"{s}\",\"model\":\"m\",\"tools\":null}}", .{provider});
+        defer a.free(raw);
+        var cfg = try parse(a, raw);
+        defer cfg.deinit(a);
+        try std.testing.expect(cfg.generator.tools_json == null);
+        try std.testing.expectEqual(ToolOutput.content, cfg.tool_output);
+    }
+    var constrained_cfg = try parse(a,
+        \\{"provider":"antfly","model":"m","tools":null,"output_schema":{"type":"string"}}
+    );
+    defer constrained_cfg.deinit(a);
+    try std.testing.expect(constrained_cfg.generator.tools_json == null);
+    for ([_][]const u8{ "{}", "false", "1", "\"tools\"", "[null]", "[42]" }) |invalid| {
+        const raw = try std.fmt.allocPrint(a, "{{\"provider\":\"ollama\",\"model\":\"m\",\"tools\":{s}}}", .{invalid});
+        defer a.free(raw);
+        try std.testing.expectError(error.InvalidGeneratorToolConfig, parse(a, raw));
     }
 }
 

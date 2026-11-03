@@ -587,7 +587,7 @@ test "actual CUDA pending scalar observation labels submission readback and canc
     const Empty = struct {
         fn populate(_: *@import("../ops/native_compute.zig").WeightStore) !void {}
     };
-    @import("../ops/media_residency_test.zig").onCuda(Empty.populate, checkCudaPendingObservation) catch |err| switch (err) {
+    @import("../ops/media_residency_test.zig").onCuda(Empty.populate, checkCudaPendingObservation) catch |err| switch (@as(anyerror, err)) {
         error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
         else => return err,
     };

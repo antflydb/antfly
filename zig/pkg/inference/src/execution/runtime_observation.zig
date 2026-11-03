@@ -163,7 +163,7 @@ pub const NativeBodies = struct {
     truncated: bool = false,
     unrecorded_calls: u64 = 0,
 };
-pub export fn antfly_runtime_observe_metal_dispatch(encoder: usize, pipeline: usize, kind: u32, gx: u64, gy: u64, gz: u64, tx: u64, ty: u64, tz: u64, overflow: bool) callconv(.c) void {
+pub fn antfly_runtime_observe_metal_dispatch(encoder: usize, pipeline: usize, kind: u32, gx: u64, gy: u64, gz: u64, tx: u64, ty: u64, tz: u64, overflow: bool) callconv(.c) void {
     var active = active_kernels;
     while (active) |scope| : (active = scope.previous) {
         const values = &scope.metal;
@@ -227,8 +227,12 @@ noinline fn nativeActivationBodyEnabled(activation: []const u8, vector_width: us
     }
 }
 
+const MetalDispatchSink = *const fn (usize, usize, u32, u64, u64, u64, u64, u64, u64, bool) callconv(.c) void;
+extern fn termite_metal_observation_exchange_dispatch_sink(sink: ?MetalDispatchSink) ?MetalDispatchSink;
+
 pub const KernelScope = struct {
     previous: ?*KernelScope = null,
+    previous_metal_sink: ?MetalDispatchSink = null,
     values: Kernels = .{},
     metal: MetalDispatches = .{},
     native_bodies: NativeBodies = .{},
@@ -237,9 +241,15 @@ pub const KernelScope = struct {
     pub fn begin(self: *KernelScope) void {
         self.* = .{ .previous = active_kernels, .attached = true };
         active_kernels = self;
+        // Referencing the callback here forces only observing link roots to
+        // emit it. C numerical entrypoints have no required Zig export.
+        if (comptime build_options.enable_metal)
+            self.previous_metal_sink = termite_metal_observation_exchange_dispatch_sink(antfly_runtime_observe_metal_dispatch);
     }
     pub fn finish(self: *KernelScope) Kernels {
         @import("std").debug.assert(self.attached and active_kernels == self);
+        if (comptime build_options.enable_metal)
+            _ = termite_metal_observation_exchange_dispatch_sink(self.previous_metal_sink);
         active_kernels = self.previous;
         self.attached = false;
         return self.values;
@@ -339,3 +349,42 @@ pub const Scope = struct {
         if (comptime build_options.enable_metal) termite_metal_observation_end();
     }
 };
+
+test "Metal dispatch bridge links without SDK work and restores nested and foreign callbacks" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const std = @import("std");
+    const Foreign = struct {
+        threadlocal var calls: usize = 0;
+        fn observe(_: usize, _: usize, _: u32, _: u64, _: u64, _: u64, _: u64, _: u64, _: u64, _: bool) callconv(.c) void {
+            calls += 1;
+        }
+    };
+    const original = termite_metal_observation_exchange_dispatch_sink(Foreign.observe);
+    defer _ = termite_metal_observation_exchange_dispatch_sink(original);
+    Foreign.calls = 0;
+    var parent = KernelScope{};
+    parent.begin();
+    var child = KernelScope{};
+    child.begin();
+    // Read the actual C TLS slot, then restore it before emitting evidence.
+    const nested_sink = termite_metal_observation_exchange_dispatch_sink(null);
+    _ = termite_metal_observation_exchange_dispatch_sink(nested_sink);
+    nested_sink.?(1, 2, 0, 32, 1, 1, 32, 1, 1, false);
+    _ = child.finish();
+    const parent_sink = termite_metal_observation_exchange_dispatch_sink(null);
+    _ = termite_metal_observation_exchange_dispatch_sink(parent_sink);
+    parent_sink.?(1, 2, 0, 64, 1, 1, 32, 1, 1, false);
+    _ = parent.finish();
+    const restored = termite_metal_observation_exchange_dispatch_sink(null);
+    try std.testing.expectEqual(@intFromPtr(&Foreign.observe), @intFromPtr(restored.?));
+    restored.?(1, 2, 0, 1, 1, 1, 1, 1, 1, false);
+    try std.testing.expectEqual(@as(usize, 1), Foreign.calls);
+    try std.testing.expectEqual(@as(u64, 1), child.metal.total_messages);
+    try std.testing.expectEqual(@as(u64, 2), parent.metal.total_messages);
+    try std.testing.expectEqual(@as(u64, 1), parent.metal.records[0].geometry_changes);
+    // The previously empty root remains empty after its owner retires.
+    var root = KernelScope{};
+    root.begin();
+    _ = root.finish();
+    try std.testing.expect(termite_metal_observation_exchange_dispatch_sink(null) == null);
+}

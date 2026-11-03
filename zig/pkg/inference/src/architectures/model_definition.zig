@@ -15,6 +15,7 @@
 
 //! Artifact semantics and typed weight sources, independent of backend preparation.
 const std = @import("std");
+const gliner_specialty = @import("../models/gliner_specialty_qualification.zig");
 const platform = @import("antfly_platform");
 const compat = @import("../io/compat.zig");
 const bert = @import("../models/bert.zig");
@@ -141,7 +142,7 @@ pub fn detectArchitectureWithGgufFile(
         if (try detectModelType(allocator, config_bytes)) |model_type| {
             defer allocator.free(model_type);
             if (std.mem.eql(u8, model_type, "extractor")) {
-                if (mf.gliner_architecture == .span and mf.gliner_span_declared)
+                if (mf.gliner_architecture == .span and (mf.gliner_span_declared or mf.gliner_specialty_profile != null))
                     try verifyGlinerDecisionSnapshot(config_bytes, mf.gliner_span_config_digest);
                 const wrapper = try parseLegacyGlinerWrapper(allocator, config_bytes);
                 if (mf.gliner_span_encoder_family == .modern_bert) {
@@ -426,6 +427,10 @@ fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8
         cfg.classification_token_id = mf.gliner_token_c;
     if (mf.gliner_token_e != 0) cfg.entity_token_id = mf.gliner_token_e;
     if (mf.gliner_token_r != 0) cfg.relation_token_id = mf.gliner_token_r;
+
+    // Authenticated specialty tokenizer markers cannot be replaced by an
+    // unpinned legacy added_tokens.json read after identity capture.
+    if (mf.gliner_specialty_profile != null) return;
 
     const at_path = try std.fmt.allocPrint(allocator, "{s}/added_tokens.json", .{model_path});
     defer allocator.free(at_path);
@@ -916,4 +921,20 @@ test "context generation keeps GGUF EOS defaults with a minimal model sidecar" {
     try std.testing.expect(explicit.isEosToken(23));
     try std.testing.expect(!explicit.isEosToken(1));
     try std.testing.expect(!explicit.isEosToken(106));
+}
+
+pub fn applyQualifiedGlinerSpecialtyExecutionPolicy(arch_config: *ArchConfig, profile: gliner_specialty.Profile) !void {
+    if (profile != .pii) return;
+    if (arch_config.* != .gliner) return error.UnsupportedGlinerSpecialtyArtifact;
+    arch_config.gliner.metal_require_f32_weight_mirrors = true;
+}
+
+test "qualified PII specialty requires DeBERTa F32 mirrors without changing GLiGuard" {
+    var pii = ArchConfig{ .gliner = .{} };
+    try applyQualifiedGlinerSpecialtyExecutionPolicy(&pii, .pii);
+    try std.testing.expect(pii.gliner.metal_require_f32_weight_mirrors);
+
+    var guard = ArchConfig{ .gliner = .{} };
+    try applyQualifiedGlinerSpecialtyExecutionPolicy(&guard, .gliguard);
+    try std.testing.expect(!guard.gliner.metal_require_f32_weight_mirrors);
 }

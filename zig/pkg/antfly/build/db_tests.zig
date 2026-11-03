@@ -165,7 +165,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
-    const db_enrichment_filters: []const []const u8 = &.{
+    const db_enrichment_filters: []const []const u8 = selectTestFilters(b, &.{
         "#1210",
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
         "db public extraction budget rejection publishes a failure manifest",
@@ -228,6 +228,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "request-owned retries do not inherit unrelated pipeline debt",
         "idle generated coverage gap becomes durable paged recovery debt",
         "durable enrichment retry progress preserves unrelated request debt across restart",
+        "OCR retryability counts failures beyond the diagnostic sample",
         "ordinary startup target preserves restored retry debt",
         "enrichment terminal failure envelope remains conservative across sparse durable debt",
         "enrichment terminal failure envelope uses exact durable lookup for sparse gaps",
@@ -496,6 +497,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "request-owned retries do not inherit unrelated pipeline debt",
         "idle generated coverage gap becomes durable paged recovery debt",
         "durable enrichment retry progress preserves unrelated request debt across restart",
+        "OCR retryability counts failures beyond the diagnostic sample",
         "ordinary startup target preserves restored retry debt",
         "enrichment terminal failure envelope remains conservative across sparse durable debt",
         "enrichment terminal failure envelope uses exact durable lookup for sparse gaps",
@@ -583,7 +585,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db dense index consuming a chunk-then-embed source via plural sources config converges its target counter",
         "runUntilIdle no-progress guard fails fast with a named stuck-index diagnostic",
         "target advance stuck tracking records first-seen time and clears on success",
-    };
+    });
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, db_enrichment_filters),

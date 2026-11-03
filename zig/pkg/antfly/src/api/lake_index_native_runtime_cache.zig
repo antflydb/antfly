@@ -183,7 +183,7 @@ pub const Entry = struct {
         self.store.implementation.cloud_io = context.io;
         try self.store.bindGenerationMap(cloud, if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none);
         if (self.store.cloud_binding) |*binding| binding.reader.cache_allocator = self.budget.allocator();
-        if (!std.mem.eql(u8, &self.store.identity, &scope)) return error.ExternalLakeIndexStoreChanged;
+        if (!std.mem.eql(u8, &self.store.cache_identity, &scope)) return error.ExternalLakeIndexStoreChanged;
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = scope, .context = context };
         const name = try a.dupe(u8, declaration.name);
         const path = try std.fmt.allocPrintSentinel(a, "/native-lake/{s}", .{declaration.artifact.artifact_id}, 0);

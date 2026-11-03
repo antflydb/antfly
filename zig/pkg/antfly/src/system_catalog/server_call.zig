@@ -75,6 +75,10 @@ pub const Call = union(enum) {
     policy_publication_mutate: @import("antfly_local_sources").system_catalog_policies.PublicationCommand,
     fk_generation_publication_begin: @import("../metadata/fk_generation_publication.zig").Plan,
     fk_generation_publication_mutate: @import("../metadata/fk_generation_publication.zig").Command,
+    sql_completion_ready: void,
+    sql_completion_reference: [16]u8,
+    sql_completion_reference_mutate: @import("../metadata/sql_completion_references.zig").Command,
+    fk_publication_completion: @import("../metadata/fk_generation_publication.zig").CompletionRequest,
     fk_generation_publication_status: u64,
     fk_generation_publication_work: u64,
     fk_generation_publication_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
@@ -117,7 +121,7 @@ pub const Call = union(enum) {
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
             .relation_replace, .relation_schema_mutate, .native_memory_create => true,
-            .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
+            .sql_completion_reference_mutate, .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
     }
@@ -134,6 +138,9 @@ pub const Call = union(enum) {
             .policy_snapshot,
             .policy_install_snapshot,
             .policy_publication_work,
+            .sql_completion_ready,
+            .sql_completion_reference,
+            .fk_publication_completion,
             .fk_generation_publication_status,
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
@@ -145,6 +152,14 @@ pub const Call = union(enum) {
             .fk_initial_create_work,
             .fk_initial_parent_decision,
             => true,
+            else => false,
+        };
+    }
+
+    /// Calls whose native owners report the first possible durable effect.
+    pub fn tracksSQLSubmission(self: @This()) bool {
+        return switch (self) {
+            .mutate, .relation_replace, .relation_schema_mutate, .fk_initial_create_begin, .fk_generation_publication_begin => true,
             else => false,
         };
     }
@@ -228,4 +243,14 @@ test "system catalog relation replacement wire retains exact owner and rejects i
     request.replacement = table;
     request.guard.incarnation = @splat(0);
     try std.testing.expectError(error.InvalidCatalogMutation, request.validate());
+}
+
+test "SQL pgwire native completion mutations require administrative grant and mutation forwarding" {
+    const write: Call = .{ .sql_completion_reference_mutate = undefined };
+    try std.testing.expect(write.requiresAdministrativeGrant());
+    try std.testing.expect(write.isMutation());
+    try std.testing.expect(!write.requiresSettingAuthorityReadGrant());
+    const read: Call = .{ .sql_completion_reference = @splat(1) };
+    try std.testing.expect(read.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!read.isMutation());
 }

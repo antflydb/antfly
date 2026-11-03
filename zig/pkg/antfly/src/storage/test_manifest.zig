@@ -238,6 +238,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_enrichment_document_checkpoints;
     _ = @import("antfly_local_sources").storage_db_enrichment_vector_label_cache;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_extraction;
+    _ = @import("antfly_local_sources").storage_db_enrichment_document_extraction_completion;
     _ = @import("antfly_local_sources").storage_db_enrichment_document_unit_fingerprint;
     _ = @import("antfly_local_sources").storage_db_enrichment_embedder;
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_runtime;
@@ -378,6 +379,9 @@ comptime {
     _ = @import("hot_standby/write_gate.zig");
     _ = @import("hot_standby/seed_materialization.zig");
     _ = @import("antfly_local_sources").storage_hbc_adapter;
+    _ = @import("antfly_local_sources").storage_leann_store;
+    _ = @import("antfly_local_sources").storage_leann_replica;
+    _ = @import("antfly_local_sources").storage_leann_replicated;
     _ = @import("antfly_local_sources").storage_hierarchy_navigation;
     _ = @import("antfly_local_sources").storage_internal_keys;
     _ = @import("kernel_owner_client.zig");

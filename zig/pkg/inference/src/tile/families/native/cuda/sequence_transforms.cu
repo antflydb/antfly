@@ -74,7 +74,8 @@ extern "C" __global__ void termite_gliner_gru_combine_f32(
     const float* gi,
     const float* gh,
     unsigned int rows,
-    unsigned int dim
+    unsigned int dim,
+    unsigned int add_residual
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int count = rows * dim;
@@ -87,7 +88,7 @@ extern "C" __global__ void termite_gliner_gru_combine_f32(
     float n = tanhf(gi[gate_base + dim * 2u] + r * gh[gate_base + dim * 2u]);
     float h0 = label_embeddings[idx];
     float h1 = (1.0f - z) * n + z * h0;
-    dst[idx] = h1 + h0;
+    dst[idx] = add_residual ? h1 + h0 : h1;
 }
 // native-program:entry termite_laya_action_features_f32
 extern "C" __global__ void termite_laya_action_features_f32(

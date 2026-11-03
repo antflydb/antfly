@@ -60,6 +60,9 @@ pub const speculative_activation = @import("speculative_activation.zig");
 test {
     _ = @import("../backends/compute_factory.zig");
     _ = @import("decoder_forward.zig");
+    _ = @import("executable.zig");
+    _ = @import("diagnostics.zig");
+    _ = @import("runtime_observation.zig");
     _ = @import("invocation_observation.zig");
     _ = @import("pending_observation.zig");
     _ = @import("shared_batch_observation.zig");

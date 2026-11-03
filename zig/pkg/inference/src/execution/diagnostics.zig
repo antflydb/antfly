@@ -361,6 +361,18 @@ test "diagnostic snapshots own published error text through copies scope retirem
     try std.testing.expectEqual(@as(u8, 128), copied.program_error.?.len);
     try std.testing.expectEqualStrings("ProgramError", copied.program_error.?.view()[0..12]);
     try std.testing.expectEqualStrings(copied.program_error.?.view(), captured.program_error.?.view());
+    const copied_report = copied.report.?;
+    const captured_report = captured.report.?;
+    try std.testing.expect(copied_report.program_failure.?.truncated);
+    try std.testing.expectEqual(@as(u8, 64), copied_report.program_failure.?.len);
+    try std.testing.expectEqualStrings("ProgramError", copied_report.program_failure.?.bytes[0..12]);
+    try std.testing.expectEqualDeep(copied_report.program_failure, captured_report.program_failure);
+    try std.testing.expectEqualStrings("success", copied_report.outcome);
+    try std.testing.expectEqual(@as(u8, 0), copied_report.failure.len);
+    owner.configure(true);
+    owner.publish(.{});
+    try std.testing.expect(owner.snapshot().?.report.?.program_failure == null);
+    try std.testing.expectEqualStrings("ProgramError", copied_report.program_failure.?.bytes[0..12]);
 }
 
 test "program callback capture preserves comptime arguments error unwinding and call-local cache metadata" {

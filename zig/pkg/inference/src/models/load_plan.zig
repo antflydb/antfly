@@ -20,6 +20,7 @@ const tokenizer_loader = @import("tokenizer_loader.zig");
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const manifest_mod = @import("manifest.zig");
+const gliner_specialty = @import("gliner_specialty_qualification.zig");
 const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
 const session_factory = @import("../architectures/session_factory.zig");
@@ -296,7 +297,11 @@ pub fn estimateModelLoadAdmission(
         session_factory.metalDebertaFastPathAdmissionAmounts(man)
     else
         runtime.tier.memory.AdmissionAmounts{};
-    return nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
+    var plan = try nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
+    if (backend_runtime.backend == .metal) {
+        try addMetalResidentHostSource(&plan, metalQualifiedSpecialtyF32HostSourceBytes(man, weights));
+    }
+    return plan;
 }
 
 pub fn a4bGpuModelLoadAdmission(
@@ -509,4 +514,42 @@ test "SentencePiece sidecar admission includes overlays when the base vocabulary
     const with = try tokenizerLoadAdmissionPlan(a, root, &man, .sentencepiece);
     try std.testing.expect(with.peak.host_weight_bytes >= without.peak.host_weight_bytes + overlay.len);
     try std.testing.expect(with.resident.host_weight_bytes >= without.resident.host_weight_bytes + overlay.len);
+}
+
+/// Exact F32 specialty mappings remain resident while Metal mirrors borrow them.
+/// Size is a prefilter; construction still authenticates the complete digest.
+pub fn metalQualifiedSpecialtyF32HostSourceBytes(
+    man: manifest_mod.ModelManifest,
+    artifact_bytes: usize,
+) usize {
+    const declared = man.gliner_specialty_profile orelse return 0;
+    const artifact_kind = man.nativeWeightArtifactKind() orelse return 0;
+    if (man.gliner_architecture != .span or
+        man.gliner_span_encoder_family != .deberta or
+        artifact_kind != .safetensors or
+        man.safetensors_index_path != null)
+    {
+        return 0;
+    }
+    const size_profile = gliner_specialty.profileForWeightSize(
+        std.math.cast(u64, artifact_bytes) orelse return 0,
+    ) orelse return 0;
+    return if (size_profile == declared) artifact_bytes else 0;
+}
+
+pub fn addMetalResidentHostSource(plan: *ModelLoadAdmissionPlan, bytes: usize) !void {
+    if (bytes == 0) return;
+    const resident_host = std.math.add(
+        usize,
+        plan.resident.host_weight_bytes,
+        bytes,
+    ) catch return error.ResourceLimitExceeded;
+    // Preserve the existing import staging above the newly resident source.
+    const peak_host = std.math.add(
+        usize,
+        plan.peak.host_weight_bytes,
+        bytes,
+    ) catch return error.ResourceLimitExceeded;
+    plan.resident.host_weight_bytes = resident_host;
+    plan.peak.host_weight_bytes = peak_host;
 }

@@ -35,6 +35,7 @@ const backends = @import("../backends/backends.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const model_compatibility = @import("../models/compatibility.zig");
 const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
+const gliner_specialty = @import("../models/gliner_specialty_qualification.zig");
 const managed_receipt = @import("../registry/managed_receipt.zig");
 
 const c_file = @import("../util/c_file.zig");
@@ -6315,6 +6316,8 @@ test "CUDA A4B operator cap remains authoritative over load-plan floor" {
 const onnxModelLoadAdmission = load_plan.onnxModelLoadAdmission;
 
 const nativeModelLoadAdmission = load_plan.nativeModelLoadAdmission;
+const metalQualifiedSpecialtyF32HostSourceBytes = load_plan.metalQualifiedSpecialtyF32HostSourceBytes;
+const addMetalResidentHostSource = load_plan.addMetalResidentHostSource;
 
 /// Serving services borrowed by the independent loader during construction.
 const SessionLoadHost = struct {
@@ -8557,6 +8560,106 @@ test "gpu model admission classifies weights and persistent scratch" {
     try std.testing.expectEqual(@as(usize, 0), metal.resident.host_weight_bytes);
     try std.testing.expectEqual(weights + extra_backend_resident.backend_weight_bytes, metal.resident.backend_weight_bytes);
     try std.testing.expectEqual(extra_backend_resident.backend_scratch_bytes, metal.resident.backend_scratch_bytes);
+}
+
+test "qualified F32 GLiNER specialty Metal admission retains host source without broadening generic models" {
+    const pii_bytes: usize = @intCast(gliner_specialty.pii_weight.size_bytes);
+    const guard_bytes: usize = @intCast(gliner_specialty.gliguard_weight.size_bytes);
+    const specialty = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .safetensors_path = "model.safetensors",
+        .gliner_architecture = .span,
+        .gliner_span_encoder_family = .deberta,
+        .gliner_specialty_profile = .pii,
+    };
+    try std.testing.expectEqual(pii_bytes, metalQualifiedSpecialtyF32HostSourceBytes(specialty, pii_bytes));
+    try std.testing.expectEqual(@as(usize, 0), metalQualifiedSpecialtyF32HostSourceBytes(specialty, guard_bytes));
+
+    var guard = specialty;
+    guard.gliner_specialty_profile = .gliguard;
+    try std.testing.expectEqual(guard_bytes, metalQualifiedSpecialtyF32HostSourceBytes(guard, guard_bytes));
+
+    var generic = specialty;
+    generic.gliner_specialty_profile = null;
+    try std.testing.expectEqual(@as(usize, 0), metalQualifiedSpecialtyF32HostSourceBytes(generic, pii_bytes));
+    var legacy_decide = specialty;
+    legacy_decide.gliner_specialty_profile = null;
+    legacy_decide.gliner_span_declared = true;
+    try std.testing.expectEqual(@as(usize, 0), metalQualifiedSpecialtyF32HostSourceBytes(legacy_decide, pii_bytes));
+    var reduced = specialty;
+    reduced.safetensors_path = null;
+    reduced.gguf_path = "model.gguf";
+    try std.testing.expectEqual(@as(usize, 0), metalQualifiedSpecialtyF32HostSourceBytes(reduced, pii_bytes));
+
+    var plan = try nativeModelLoadAdmission(1024, .metal, .{ .backend_scratch_bytes = 64 });
+    const old_peak_host = plan.peak.host_weight_bytes;
+    try addMetalResidentHostSource(&plan, pii_bytes);
+    try std.testing.expectEqual(pii_bytes, plan.resident.host_weight_bytes);
+    try std.testing.expectEqual(old_peak_host + pii_bytes, plan.peak.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 64), plan.resident.backend_scratch_bytes);
+
+    var overflow = ModelLoadAdmissionPlan{
+        .peak = .{ .host_weight_bytes = std.math.maxInt(usize) },
+        .resident = .{},
+    };
+    try std.testing.expectError(error.ResourceLimitExceeded, addMetalResidentHostSource(&overflow, 1));
+    try std.testing.expectEqual(@as(usize, 0), overflow.resident.host_weight_bytes);
+    try std.testing.expectEqual(std.math.maxInt(usize), overflow.peak.host_weight_bytes);
+}
+
+test "specialty Metal host baseline evicts prior model and avoids lazy cache double charge" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.initWithRuntimeEpoch(
+        allocator,
+        .{ .allocator = allocator, .preferred_backends = &.{.metal} },
+        0x51ec,
+    );
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+
+    // Build a lifecycle-complete idle model, then replace its fixture CPU
+    // lease with the GPU-host residency used by a Metal specialty source.
+    var pii_probe = TeardownTestProbe{};
+    const pii = try teardownTestModel(&manager, &pii_probe);
+    pii.resource_lease.?.release();
+    pii.resource_lease = try manager.acquireAmountsWithEviction(
+        .gpu,
+        .{ .host_limit_bytes = 64 },
+        .{ .host_weight_bytes = 64 },
+    );
+    pii.active_handles = 0;
+    pii.last_used_ns = 1;
+    try manager.loaded.put(allocator, try allocator.dupe(u8, "specialty-pii-metal"), pii);
+
+    // A second qualified model cannot share this deliberately tiny host
+    // domain. Acquiring its model-owned source reservation must evict PII
+    // before any request-time lazy tensor asks the tier cache for credit.
+    var guard_lease = try manager.acquireAmountsWithEviction(
+        .gpu,
+        .{ .host_limit_bytes = 64 },
+        .{ .host_weight_bytes = 64 },
+    );
+    defer guard_lease.release();
+    try std.testing.expect(pii_probe.closed);
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 64), manager.admissionController().snapshot().host_weight_bytes);
+
+    // The session tier cache receives the same resident amount as its baseline.
+    // Materializing the complete borrowed F32 source therefore owns no second
+    // aggregate credit and remains admissible after the eviction transition.
+    var cache = runtime.tier.cache.SharedCache.init(.{ .host_limit_bytes = 64 });
+    defer cache.deinitAdmission();
+    try cache.configureAdmission(
+        allocator,
+        manager.admissionController(),
+        .gpu,
+        .{ .host_limit_bytes = 64 },
+        .{ .host_limit_bytes = 64 },
+    );
+    try cache.reserve(.host, 64);
+    try std.testing.expectEqual(@as(usize, 64), manager.admissionController().snapshot().host_weight_bytes);
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, cache.admissionAmounts());
+    cache.noteRelease(.host, 64);
 }
 
 test "projector residency follows its request-scoped lifecycle" {

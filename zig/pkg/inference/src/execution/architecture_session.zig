@@ -67,6 +67,7 @@ const gliner_decision_head = @import("../architectures/gliner_decision_head.zig"
 const gliner_encoder = @import("../models/gliner_encoder.zig");
 const gliner_boundary_model = @import("../models/gliner_boundary.zig");
 const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
+const gliner_specialty = @import("../models/gliner_specialty_qualification.zig");
 const gliner_head_graph = @import("../architectures/gliner_head_graph.zig");
 const kernel_jit = @import("../graph/kernel_jit.zig");
 const graph_runtime = @import("../graph/runtime.zig");
@@ -213,6 +214,7 @@ pub fn metalDebertaFastPathAdmissionAmounts(mf: manifest_mod.ModelManifest) runt
         .vocab_size = mf.bert_vocab_size,
         .max_position_embeddings = mf.max_position_embeddings,
         .num_labels = mf.num_labels,
+        .metal_require_f32_weight_mirrors = mf.gliner_specialty_profile == .pii,
     }, gliner_deberta or mf.model_type == .reranker);
     return .{
         .backend_weight_bytes = reservation.persistent_bytes,
@@ -3512,6 +3514,23 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
         .cuda => self.backend_data.cuda.compute.snapshotStats(),
         else => null,
     };
+}
+
+pub const CudaAllocationStats = struct {
+    limit: usize,
+    live: usize,
+    peak: usize,
+};
+
+/// Context-owned physical buffers; caller holds the session execution lock.
+/// Driver/library-private allocations are outside this lifetime peak meter.
+pub fn getCudaAllocationStats(session: Session) ?CudaAllocationStats {
+    if (comptime !build_options.enable_cuda) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .cuda) return null;
+    const value = self.backend_data.cuda.compute.allocationStats();
+    return .{ .limit = value.limit, .live = value.live, .peak = value.peak };
 }
 
 /// Drain any buffered non-blocking CUDA op-profile events into the compute's
@@ -9452,4 +9471,66 @@ test "decoder owned current B retires real foreign Metal source before two provi
     try std.testing.expect(probe.original == null);
     try std.testing.expect(try expected.isSealed());
     if (probe.failure) |err| return err;
+}
+
+test "PII specialty Metal admission reserves required DeBERTa F32 mirrors" {
+    const mf = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .gliner_model_type = "gliner2",
+        .gliner_span_encoder_family = .deberta,
+        .gliner_specialty_profile = .pii,
+        .hidden_size = 768,
+        .num_hidden_layers = 12,
+        .num_attention_heads = 12,
+        .intermediate_size = 3072,
+        .bert_vocab_size = 250112,
+        .max_position_embeddings = 512,
+    };
+    const actual = metalDebertaFastPathAdmissionAmounts(mf);
+    const expected = deberta_arch.metalFastPathReservationBytes(.{
+        .hidden_size = mf.hidden_size,
+        .num_hidden_layers = mf.num_hidden_layers,
+        .num_attention_heads = mf.num_attention_heads,
+        .intermediate_size = mf.intermediate_size,
+        .vocab_size = mf.bert_vocab_size,
+        .max_position_embeddings = mf.max_position_embeddings,
+        .num_labels = mf.num_labels,
+        .metal_require_f32_weight_mirrors = true,
+    }, true);
+    try std.testing.expectEqual(expected.persistent_bytes, actual.backend_weight_bytes);
+    try std.testing.expectEqual(expected.scratch_bytes, actual.backend_scratch_bytes);
+}
+
+pub fn getGlinerSpecialtyIdentity(session: Session) !gliner_specialty.Identity {
+    const identity = try getGlinerDecisionIdentity(session);
+    const profile = try gliner_specialty.require(identity);
+    try gliner_specialty.requireBackend(profile, switch (session.backend()) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        else => .other,
+    });
+    return identity;
+}
+
+test "GLiNER specialty sealed identity accepts native Metal and CUDA sessions" {
+    inline for (.{ gliner_specialty.Profile.pii, gliner_specialty.Profile.gliguard }) |profile| {
+        var arch = ArchSession{
+            .allocator = std.testing.allocator,
+            .arch_config = .{ .deberta = .{} },
+            .task = .extractor,
+            .gliner_decision_identity = gliner_specialty.pinnedIdentity(profile),
+            .gliner_decision_identity_sealed = true,
+            .backend_type = .native,
+            // Identity queries inspect metadata only, without creating a device.
+            .backend_data = .{ .native = .{ .allocator = std.testing.allocator, .resident_weights = .empty, .lazy_weights = .empty } },
+        };
+        const session = Session{ .ptr = &arch, .vtable = &arch_vtable };
+        inline for (.{ BackendType.native, BackendType.metal, BackendType.cuda }) |backend| {
+            arch.backend_type = backend;
+            try std.testing.expectEqual(profile, try gliner_specialty.require(try getGlinerSpecialtyIdentity(session)));
+        }
+        arch.gliner_decision_identity_sealed = false;
+        try std.testing.expectError(error.MissingGlinerDecisionIdentity, getGlinerSpecialtyIdentity(session));
+    }
 }

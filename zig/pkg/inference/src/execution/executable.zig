@@ -348,7 +348,7 @@ fn testPhysicalFrameLifetime(comptime backend_kind: @import("../backends/backend
     const ml = @import("ml");
     const ResidentOutputs = @import("../backends/session.zig").ResidentOutputs;
     const a = std.testing.allocator;
-    var context = @import("../backends/compute_context.zig").BackendContext.init(a, backend_kind, null) catch |err| switch (err) {
+    var context = @import("../backends/compute_context.zig").BackendContext.init(a, backend_kind, null) catch |err| switch (@as(anyerror, err)) {
         error.CudaUnavailable, error.NoCudaDevices => if (backend_kind == .cuda) return error.SkipZigTest else return err,
         else => return err,
     };
@@ -1061,6 +1061,9 @@ test "prepared physical CUDA capture failure falls back before submission and re
     defer failed.deinit();
     var recovered = try prepare(a, &program, &original, .partitioned);
     defer recovered.deinit();
+    failed.configureExecutionDiagnostics(true);
+    recovered.configureExecutionDiagnostics(true);
+    var retained_failure: ?@import("invocation_report.zig").Report = null;
     for ([_]*Executable{ &failed, &recovered }, 0..) |executable, mode| for (0..3) |iteration| {
         const values: [8]f32 = @splat(@floatFromInt(iteration + 1));
         const input = try original.fromFloat32Shape(&values, &.{ 1, 8 });
@@ -1074,11 +1077,23 @@ test "prepared physical CUDA capture failure falls back before submission and re
         if (mode == 0 and iteration >= 1) {
             try std.testing.expectEqual(@import("stats.zig").PhysicalReplayDecision.capture_failed, result.stats.physical_replay);
             try std.testing.expectEqualStrings("OutOfMemory", result.stats.physical_replay_error.?);
+            const report = executable.diagnostics.snapshot().?.report.?;
+            try std.testing.expectEqualStrings("success", report.outcome);
+            try std.testing.expectEqual(@as(u8, 0), report.failure.len);
+            try std.testing.expectEqualStrings("capture_failed", report.program_route_decision.?);
+            const reason = report.program_failure.?;
+            try std.testing.expectEqualStrings("OutOfMemory", reason.bytes[0..reason.len]);
+            try std.testing.expect(!reason.truncated);
+            retained_failure = report;
             try std.testing.expectEqual(@as(u64, if (iteration == 1) 1 else 0), result.stats.physical_capture_failures);
             try std.testing.expectEqual(@as(u64, 0), result.stats.physical_graph_replays);
         }
+        if (mode == 1) try std.testing.expect(executable.diagnostics.snapshot().?.report.?.program_failure == null);
         if (mode == 1 and iteration == 2) try std.testing.expectEqual(@as(u64, 1), result.stats.physical_graph_replays);
     };
+    failed.configureExecutionDiagnostics(false);
+    const retained_reason = retained_failure.?.program_failure.?;
+    try std.testing.expectEqualStrings("OutOfMemory", retained_reason.bytes[0..retained_reason.len]);
 }
 
 test "assigned single-axis reductions use the Metal plan output and preserve held frames" {
@@ -1357,6 +1372,8 @@ fn qualifyCudaVendorReplay(with_bias: bool, evict_before_capture: bool) !void {
     var executable = try prepare(a, &program, &cb, .partitioned);
     var executable_owned = true;
     defer if (executable_owned) executable.deinit();
+    executable.configureExecutionDiagnostics(true);
+    var retained_failure: ?@import("invocation_report.zig").Report = null;
     const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
     try std.testing.expect(pool.replay_backend != null);
     var identity: [width * width]f32 = @splat(0);
@@ -1402,6 +1419,14 @@ fn qualifyCudaVendorReplay(with_bias: bool, evict_before_capture: bool) !void {
             if (evict_before_capture) {
                 try std.testing.expectEqual(@as(u64, 1), result.stats.physical_capture_failures);
                 try std.testing.expectEqualStrings("CublasLtUnsupported", result.stats.physical_replay_error.?);
+                const report = executable.diagnostics.snapshot().?.report.?;
+                try std.testing.expectEqualStrings("success", report.outcome);
+                try std.testing.expectEqual(@as(u8, 0), report.failure.len);
+                try std.testing.expectEqualStrings("capture_failed", report.program_route_decision.?);
+                const reason = report.program_failure.?;
+                try std.testing.expectEqualStrings("CublasLtUnsupported", reason.bytes[0..reason.len]);
+                try std.testing.expect(!reason.truncated);
+                retained_failure = report;
                 try std.testing.expectEqual(@as(u64, 0), result.stats.physical_graph_captures);
                 // Ordinary execution rebuilt the same strict-F32 vendor plan.
                 try std.testing.expect(blas.tensor_core_plans.count() > 0);
@@ -1421,6 +1446,10 @@ fn qualifyCudaVendorReplay(with_bias: bool, evict_before_capture: bool) !void {
     // Published values retain their storage after graph/plan retirement.
     executable.deinit();
     executable_owned = false;
+    if (evict_before_capture) {
+        const reason = retained_failure.?.program_failure.?;
+        try std.testing.expectEqualStrings("CublasLtUnsupported", reason.bytes[0..reason.len]);
+    }
     if (held) |*result| {
         const preserved = try cb.toFloat32(result.outputs[0], a);
         defer a.free(preserved);

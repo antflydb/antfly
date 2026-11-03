@@ -826,7 +826,7 @@ test "external lake global frontier coordinator rebuilds missing cloud map direc
     defer provider.deinit();
     var client = provider.client();
     try client.makeBucket("bucket");
-    var store: Store = .{ .opened = undefined, .implementation = try @import("../serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, client, "bucket", "native"), .identity = @splat(3), .locator = .{ .protocol = .s3, .connection = "test", .bucket = "bucket", .prefix = "native", .root = "test" } };
+    var store: Store = .{ .opened = undefined, .implementation = try @import("../serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, client, "bucket", "native"), .identity = @splat(3), .cache_identity = @splat(4), .locator = .{ .protocol = .s3, .connection = "test", .bucket = "bucket", .prefix = "native", .root = "test" } };
     defer store.implementation.deinit();
     const scope = try @import("../serverless/artifacts/store.zig").UploadScope.forPublication(@splat(4), 1, std.testing.io);
     var writer: maps.Writer = .{ .a = a, .io = std.testing.io, .scope = scope, .reader = .{ .client = client, .bucket = "bucket", .prefix = "native" }, .complete = true };

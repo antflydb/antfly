@@ -451,6 +451,8 @@ pub const OwnedBatchRequest = struct {
     artifact_catalog: ?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command) = null,
     artifact_publication: ?std.json.Parsed(@import("../storage/db/artifact_publication.zig").Command) = null,
     artifact_publication_transport: ?std.json.Parsed(@import("../storage/db/artifact_publication_transport.zig").Request) = null,
+    leann_record_index: ?[]u8 = null,
+    leann_record_bytes: ?[]u8 = null,
     merge_proof_adoption: ?std.json.Parsed(@import("../storage/db/merge_proof_adoption.zig").Command) = null,
     transaction_participants: [][]const u8 = &.{},
     split_checkpoint_range_start: ?[]u8 = null,
@@ -485,6 +487,8 @@ pub const OwnedBatchRequest = struct {
         if (self.artifact_catalog) |*control| control.deinit();
         if (self.artifact_publication) |*control| control.deinit();
         if (self.artifact_publication_transport) |*control| control.deinit();
+        if (self.leann_record_index) |name| alloc.free(name);
+        if (self.leann_record_bytes) |bytes| alloc.free(bytes);
         if (self.merge_proof_adoption) |*control| control.deinit();
         if (self.merge_page_effects) |*effects| {
             effects.deinit();
@@ -864,6 +868,28 @@ fn parseBatchRequestWithOptions(
         break :control @as(?std.json.Parsed(@import("../storage/db/artifact_publication_transport.zig").Request), transport_parsed);
     } else null;
     errdefer if (artifact_publication_transport) |*control| control.deinit();
+    var leann_record_index: ?[]u8 = null;
+    errdefer if (leann_record_index) |name| alloc.free(name);
+    var leann_record_bytes: ?[]u8 = null;
+    errdefer if (leann_record_bytes) |bytes| alloc.free(bytes);
+    if (root.get("_leann_record")) |value| {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "leann_record_v1")) return error.InvalidBatchRequest;
+        if (value != .object or value.object.count() != 2) return error.InvalidBatchRequest;
+        const name = value.object.get("index_name") orelse return error.InvalidBatchRequest;
+        const encoded = value.object.get("record_base64") orelse return error.InvalidBatchRequest;
+        if (name != .string or encoded != .string) return error.InvalidBatchRequest;
+        const decoder = std.base64.standard.Decoder;
+        const len = decoder.calcSizeForSlice(encoded.string) catch return error.InvalidBatchRequest;
+        if (len == 0 or len > db_mod.types.leann_record_max_bytes) return error.InvalidBatchRequest;
+        leann_record_index = try alloc.dupe(u8, name.string);
+        const bytes = try alloc.alloc(u8, len);
+        leann_record_bytes = bytes;
+        decoder.decode(bytes, encoded.string) catch return error.InvalidBatchRequest;
+    }
     var merge_proof_adoption = if (root.get("_merge_proof_adoption")) |value| control: {
         if (!allow_internal or root.count() != 5) return error.InvalidBatchRequest;
         const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
@@ -1513,6 +1539,8 @@ fn parseBatchRequestWithOptions(
         .artifact_catalog = artifact_catalog,
         .artifact_publication = artifact_publication,
         .artifact_publication_transport = artifact_publication_transport,
+        .leann_record_index = leann_record_index,
+        .leann_record_bytes = leann_record_bytes,
         .merge_proof_adoption = merge_proof_adoption,
         .transaction_participants = transaction_participants,
         .split_checkpoint_range_start = checkpoint_start,
@@ -1547,6 +1575,7 @@ fn parseBatchRequestWithOptions(
             .artifact_catalog = if (artifact_catalog) |control| control.value else null,
             .artifact_publication = if (artifact_publication) |control| control.value else null,
             .artifact_publication_transport = if (artifact_publication_transport) |control| control.value else null,
+            .leann_record = if (leann_record_index) |name| .{ .index_name = name, .record = leann_record_bytes.? } else null,
             .merge_proof_adoption = if (merge_proof_adoption) |control| control.value else null,
             .relational_schema_version = relational_schema_version,
             .schema_version = schema_version,
@@ -1649,6 +1678,7 @@ pub fn encodeOwnerBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.Batch
 
 fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest, local_owner: bool) ![]u8 {
     try @import("../storage/db/resolver_review.zig").validateRequest(req);
+    try db_mod.types.validateLeannRecordCommand(req);
     try @import("../storage/db/group_source_contract.zig").validateRequest(req);
     try @import("../storage/db/artifact_publication.zig").validateRequest(alloc, req);
     try @import("../storage/db/artifact_publication_transport.zig").validateBatchRequest(req);
@@ -1911,6 +1941,17 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
         defer alloc.free(encoded);
         try writer.writeAll(encoded);
+    }
+    if (req.leann_record) |command| {
+        try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"leann_record_v1\"},\"_leann_record\":{\"index_name\":");
+        try std.json.Stringify.value(command.index_name, .{}, writer);
+        try writer.writeAll(",\"record_base64\":\"");
+        const encoder = std.base64.standard.Encoder;
+        const encoded = try alloc.alloc(u8, encoder.calcSize(command.record.len));
+        defer alloc.free(encoded);
+        _ = encoder.encode(encoded, command.record);
+        try writer.writeAll(encoded);
+        try writer.writeAll("\"}");
     }
     if (req.merge_proof_adoption) |control| {
         try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"merge_proof_adoption_v1\"},\"_merge_proof_adoption\":");
@@ -3235,6 +3276,19 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "leann record survives the internal batch wire and is rejected publicly" {
+    const alloc = std.testing.allocator;
+    const record = [_]u8{ 0x4c, 0, 1, 2, 255, 254, 7 };
+    const encoded = try encodeBatchRequest(alloc, .{ .leann_record = .{ .index_name = "embed\"idx", .record = &record }, .sync_level = .write });
+    defer alloc.free(encoded);
+    var parsed = try parseInternalBatchRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualStrings("embed\"idx", parsed.req.leann_record.?.index_name);
+    try std.testing.expectEqualSlices(u8, &record, parsed.req.leann_record.?.record);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .leann_record = .{ .index_name = "idx", .record = &record }, .deletes = &.{"doc"} }));
 }
 
 test "internal batch graph endpoint cleanup command isolates planned effects" {

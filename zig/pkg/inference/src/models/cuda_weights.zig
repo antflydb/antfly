@@ -30,6 +30,7 @@ const runtime = @import("../runtime/root.zig");
 const qwen35_execution = @import("../architectures/qwen35_execution.zig");
 const boundary_bundle = @import("gliner_boundary_bundle.zig");
 const gliner_decide_qualification = @import("gliner_decide_qualification.zig");
+const gliner_specialty = @import("gliner_specialty_qualification.zig");
 const LoadedWeight = @import("weight_source.zig").LoadedWeight;
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const gpt_mod = @import("gpt.zig");
@@ -431,6 +432,8 @@ pub fn prepare(
     var manifest_owned = true;
     defer if (manifest_owned) model_manifest.deinit();
     try model_manifest.requireRecognizedGlinerArchitecture();
+    if (model_manifest.gliner_specialty_profile) |profile|
+        try gliner_specialty.requireBackend(profile, .cuda);
     if (model_manifest.embedding_style == .embedding_gemma2)
         try cuda_compute_mod.preflightProfileDevice(.embedding_gemma2);
     if (model_manifest.gliner_boundary_bundle) |receipt| {
@@ -550,7 +553,14 @@ pub fn prepare(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
-    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert;
+    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert or model_manifest.gliner_specialty_profile != null;
+    cuda_compute.qualified_span_fp32 = model_manifest.gliner_specialty_profile != null;
+    if (model_manifest.gliner_specialty_profile) |profile| {
+        // Model admission reserves this exact shared sequential GEMM bound.
+        // Install it as generic operator policy, without enlarging it from env.
+        cuda_compute.runtime_policy.workspace_bytes = gliner_specialty.cuda_matmul_workspace_bytes;
+        std.log.info("gliner_specialty_cuda_policy profile={s} weights=f32 attention=f32 diagnostic_overrides=ignored", .{@tagName(profile)});
+    }
     cuda_compute.gliner_encoder_attention = cuda_profile == .gliner25_modern_bert;
     cuda_compute.gliner_boundary_inference = cuda_profile == .gliner25_boundary;
     cuda_compute.gliner_mixed_attention = cuda_compute.gliner_encoder_attention and (gliner_precision == .fp16 or gliner_precision == .bf16);

@@ -144,3 +144,8 @@ pub const layaResidentStats = implementation.layaResidentStats;
 
 pub const NativeSessionOptions = implementation.NativeSessionOptions;
 pub const createNativeSessionWithOptions = implementation.createNativeSessionWithOptions;
+
+// Compatibility exports retain implementation ownership in execution.
+pub const CudaAllocationStats = implementation.CudaAllocationStats;
+pub const getCudaAllocationStats = implementation.getCudaAllocationStats;
+pub const getGlinerSpecialtyIdentity = implementation.getGlinerSpecialtyIdentity;

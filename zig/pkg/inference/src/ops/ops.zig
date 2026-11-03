@@ -715,6 +715,10 @@ pub const GlinerLabelGruCombinedRequest = struct {
     label_embeddings: CT,
     num_labels: usize,
     hidden_size: usize,
+    /// CountLSTMv2 consumes the GRU output with its label-state skip
+    /// connection. CountLSTMv1 consumes the raw GRU state before concatenating
+    /// the original label state into its projector.
+    add_residual: bool = true,
 };
 
 pub const GlinerGatherConcatReluRequest = struct {
@@ -1663,6 +1667,8 @@ pub const TrainingRuntimeStats = struct {
     download_last_bytes: u64 = 0,
     download_previous_bytes: u64 = 0,
     to_float32_calls: u64 = 0,
+    gliner_label_gru_calls: u64 = 0,
+    gliner_label_gru_no_residual_calls: u64 = 0,
     download_alloc_calls: u64 = 0,
     stream_synchronizations: u64 = 0,
     upload_synchronizations: u64 = 0,
@@ -3700,11 +3706,16 @@ pub const ComputeBackend = struct {
     }
 
     pub fn glinerLabelGruCombined(self: *const ComputeBackend, label_embeddings: CT, num_labels: usize, hidden_size: usize) !?CT {
+        return self.glinerLabelGru(label_embeddings, num_labels, hidden_size, true);
+    }
+
+    pub fn glinerLabelGru(self: *const ComputeBackend, label_embeddings: CT, num_labels: usize, hidden_size: usize, add_residual: bool) !?CT {
         if (self.vtable.regions.sequence_projection.gruSummary) |op| {
             return op(self.ptr, &.{
                 .label_embeddings = label_embeddings,
                 .num_labels = num_labels,
                 .hidden_size = hidden_size,
+                .add_residual = add_residual,
             });
         }
         return null;
@@ -6605,6 +6616,33 @@ fn fallbackLinearLoRA(
     _ = rank;
     _ = .{ self, input, base_weight, bias, lora_a, lora_b, alpha, rows, in_dim, out_dim };
     return error.LinearLoRANotImplemented;
+}
+
+test "GLiNER label GRU preserves residual mode through the backend API" {
+    const Probe = struct {
+        modes: [2]bool = undefined,
+        calls: usize = 0,
+        marker: u8 = 0,
+
+        fn run(raw: *anyopaque, request: *const GlinerLabelGruCombinedRequest) !?CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 3), request.num_labels);
+            try std.testing.expectEqual(@as(usize, 8), request.hidden_size);
+            self.modes[self.calls] = request.add_residual;
+            self.calls += 1;
+            return @ptrCast(&self.marker);
+        }
+    };
+    var probe = Probe{};
+    var vtable: ComputeBackend.VTable = undefined;
+    vtable.regions.sequence_projection.gruSummary = Probe.run;
+    const cb = ComputeBackend{ .ptr = &probe, .vtable = &vtable };
+    const label_embeddings: CT = @ptrCast(&probe.marker);
+
+    try std.testing.expect((try cb.glinerLabelGruCombined(label_embeddings, 3, 8)) != null);
+    try std.testing.expect((try cb.glinerLabelGru(label_embeddings, 3, 8, false)) != null);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, &probe.modes);
 }
 
 test "DeBERTa embeddings forward controls and release cancelled backend outputs" {

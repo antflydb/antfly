@@ -1463,6 +1463,7 @@ pub const Runtime = struct {
     }
 
     pub fn supportsClassification(self: *LoadedModel) bool {
+        if (self.manifest.gliner_specialty_profile) |profile| return profile == .gliguard;
         return model_caps.modelSupportsCapability(
             @tagName(self.manifest.model_type),
             self.manifest.gliner_model_type,
@@ -1472,6 +1473,7 @@ pub const Runtime = struct {
     }
 
     pub fn supportsExtraction(self: *LoadedModel) bool {
+        if (self.manifest.gliner_specialty_profile) |profile| return profile == .pii;
         return model_caps.modelSupportsCapability(
             @tagName(self.manifest.model_type),
             self.manifest.gliner_model_type,
@@ -1481,6 +1483,7 @@ pub const Runtime = struct {
     }
 
     pub fn supportsRelationExtraction(self: *LoadedModel) bool {
+        if (self.manifest.gliner_specialty_profile != null) return false;
         return model_caps.modelSupportsCapability(
             @tagName(self.manifest.model_type),
             self.manifest.gliner_model_type,

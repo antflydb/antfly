@@ -40,7 +40,11 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 24;
+pub const batch_protocol_version: u16 = 25;
+/// Version 25 carries leader-planned LEANN records (`_leann_record`), which
+/// replicas persist and apply verbatim in log order. Older peers cannot
+/// treat them as empty batches.
+pub const batch_leann_record_protocol_version: u16 = 25;
 /// Version 24 commits curator review CAS, overrides and replay atomically.
 pub const batch_resolver_review_protocol_version: u16 = 24;
 /// Version 23 applies grouped-source private state and unit sources atomically.

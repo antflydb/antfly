@@ -39,6 +39,17 @@ pub fn isCommit(input: []const u8) bool {
     return true;
 }
 
+pub fn isRollback(input: []const u8) bool {
+    var parser: Parser = .{ .alloc = undefined, .input = input };
+    const verb = parser.word() catch return false;
+    if (!std.ascii.eqlIgnoreCase(verb, "rollback") and !std.ascii.eqlIgnoreCase(verb, "abort")) return false;
+    const saved = parser.pos;
+    const modifier = parser.word() catch "";
+    if (!std.ascii.eqlIgnoreCase(modifier, "work") and !std.ascii.eqlIgnoreCase(modifier, "transaction")) parser.pos = saved;
+    parser.finish() catch return false;
+    return true;
+}
+
 test "pgwire held-cursor precommit recognition requires the complete command" {
     try std.testing.expect(isCommit("COMMIT;"));
     try std.testing.expect(isCommit("END TRANSACTION"));

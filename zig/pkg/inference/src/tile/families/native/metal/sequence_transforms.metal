@@ -47,7 +47,7 @@ kernel void termite_gliner_gru_combine_f32(device const float *label_embeddings 
     float r = 1.0f / (1.0f + exp(-(gi[gate_base] + gh[gate_base])));
     float z = 1.0f / (1.0f + exp(-(gi[gate_base + p.dim] + gh[gate_base + p.dim])));
     float n = tanh(gi[gate_base + p.dim * 2u] + r * gh[gate_base + p.dim * 2u]);
-    float h0 = label_embeddings[gid]; float h1 = (1.0f - z) * n + z * h0; output[gid] = h1 + h0;
+    float h0 = label_embeddings[gid]; float h1 = (1.0f - z) * n + z * h0; output[gid] = p.add_residual != 0u ? h1 + h0 : h1;
 }
 // native-program:entry termite_embed_absolute_position
 // native-program:indent 11

@@ -187,9 +187,17 @@ typedef struct { uintptr_t encoder, pipeline; } antfly_metal_observed_binding;
 static _Thread_local antfly_metal_observed_binding antfly_metal_bindings[16];
 static _Thread_local size_t antfly_metal_binding_count;
 static _Thread_local bool antfly_metal_binding_overflow;
-extern void antfly_runtime_observe_metal_dispatch(uintptr_t encoder, uintptr_t pipeline,
+// C owns the optional submitting-thread callback. Link roots that never open
+// resolved-dispatch observation do not require any Zig-exported symbol.
+typedef void (*antfly_metal_dispatch_sink)(uintptr_t encoder, uintptr_t pipeline,
     uint32_t kind, uint64_t gx, uint64_t gy, uint64_t gz,
     uint64_t tx, uint64_t ty, uint64_t tz, bool association_overflow);
+static _Thread_local antfly_metal_dispatch_sink antfly_metal_dispatch_callback;
+antfly_metal_dispatch_sink termite_metal_observation_exchange_dispatch_sink(antfly_metal_dispatch_sink sink) {
+    antfly_metal_dispatch_sink previous = antfly_metal_dispatch_callback;
+    antfly_metal_dispatch_callback = sink;
+    return previous;
+}
 static inline void antfly_metal_clear_bindings(void) {
     antfly_metal_binding_count = 0;
     antfly_metal_binding_overflow = false;
@@ -220,9 +228,11 @@ static __attribute__((always_inline)) inline void antfly_metal_set_compute_pipel
 static __attribute__((always_inline)) inline void antfly_metal_observe_dispatch(
     id<MTLComputeCommandEncoder> encoder, MTLSize grid, MTLSize threads, uint32_t kind) {
     if (__builtin_expect(antfly_metal_observation_depth == 0, 1)) return;
+    const antfly_metal_dispatch_sink sink = antfly_metal_dispatch_callback;
+    if (sink == NULL) return;
     const uintptr_t key = (uintptr_t)(__bridge void *)encoder;
     const uintptr_t pipeline = antfly_metal_bound_pipeline(key); // zero is explicitly unknown
-    antfly_runtime_observe_metal_dispatch(key, pipeline, kind, grid.width, grid.height, grid.depth,
+    sink(key, pipeline, kind, grid.width, grid.height, grid.depth,
         threads.width, threads.height, threads.depth, antfly_metal_binding_overflow);
 }
 
@@ -13764,7 +13774,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float r = 1.0f / (1.0f + exp(-(gi[gate_base] + gh[gate_base])));\n"
            "    float z = 1.0f / (1.0f + exp(-(gi[gate_base + p.dim] + gh[gate_base + p.dim])));\n"
            "    float n = tanh(gi[gate_base + p.dim * 2u] + r * gh[gate_base + p.dim * 2u]);\n"
-           "    float h0 = label_embeddings[gid]; float h1 = (1.0f - z) * n + z * h0; output[gid] = h1 + h0;\n"
+           "    float h0 = label_embeddings[gid]; float h1 = (1.0f - z) * n + z * h0; output[gid] = p.add_residual != 0u ? h1 + h0 : h1;\n"
            "}\n"
            // tile-codegen:end sequence.transforms.direct.3 family
            // tile-codegen:begin tensor.layout.direct.13 family (do not edit; run: zig build tile-kernel-codegen -- --write)
@@ -38531,6 +38541,15 @@ int termite_metal_decode_runtime_prepare_linear_generated_f32(
         NULL, bias, in_dim, out_dim, shared_if_unified != 0, NULL, 0, NULL, context, fill);
 }
 
+int termite_metal_decode_runtime_linear_slot_dtype(
+    termite_metal_decode_runtime *runtime,
+    size_t slot
+) {
+    if (runtime == NULL || slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY ||
+        runtime->linear_slot_prepared[slot] == 0) return -1;
+    return (int)runtime->linear_weight_dtypes[slot];
+}
+
 int termite_metal_decode_runtime_prefer_linear_mps(
     termite_metal_decode_runtime *runtime,
     size_t slot
@@ -51727,6 +51746,7 @@ int termite_metal_decode_runtime_gliner_gru_combine_f32_device(
     size_t gh_offset,
     size_t rows,
     size_t dim,
+    int add_residual,
     void *output_handle,
     size_t output_offset
 ) {
@@ -51749,7 +51769,7 @@ int termite_metal_decode_runtime_gliner_gru_combine_f32_device(
         termite_metal_gliner_gru_combine_f32_params params = {
             .rows = (uint32_t)rows,
             .dim = (uint32_t)dim,
-            .reserved0 = 0,
+            .add_residual = add_residual != 0,
             .reserved1 = 0,
         };
         bool frame_owned = true;
@@ -68172,6 +68192,10 @@ int termite_metal_decode_runtime_memory_snapshot(
         termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->q8_qkv_packed_weight_buffers[slot], &snapshot->quant_linear_bytes);
         termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->dense_pair_packed_weight_buffers[slot], &snapshot->dense_linear_bytes);
         if (runtime->dense_pair_packed_weight_buffers[slot] != nil) {
+            snapshot->dense_linear_buffer_count += 1;
+        }
+        termite_metal_decode_runtime_memory_add_buffer(snapshot, runtime->dense_pair_packed_bias_buffers[slot], &snapshot->dense_linear_bytes);
+        if (runtime->dense_pair_packed_bias_buffers[slot] != nil) {
             snapshot->dense_linear_buffer_count += 1;
         }
         id<MTLBuffer> quant_buffer = runtime->quant_linear_weight_buffers[slot];

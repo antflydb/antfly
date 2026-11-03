@@ -28,6 +28,7 @@ const deepseek_v4_arch = @import("../architectures/deepseek_v4.zig");
 const gliner_encoder = @import("gliner_encoder.zig");
 const gliner_boundary_model = @import("gliner_boundary.zig");
 const gliner_decide_qualification = @import("gliner_decide_qualification.zig");
+const gliner_specialty = @import("gliner_specialty_qualification.zig");
 const manifest_mod = @import("manifest.zig");
 const weight_source_mod = @import("weight_source.zig");
 const LoadedWeight = @import("weight_source.zig").LoadedWeight;
@@ -94,8 +95,33 @@ pub fn captureBoundaryIdentity(mf: *const manifest_mod.ModelManifest, store: ten
     return .{ .backbone = config.backbone, .precision = .fp32, .weight = boundary_bundle.Digest.ofMapped(reader.file_bytes), .sidecars = sidecars };
 }
 
+pub fn validateSpecialtyWeightConfig(mf: *const manifest_mod.ModelManifest, store: tensor_store_mod.TensorStore, identity: ?gliner_decide_qualification.Identity) !void {
+    if (mf.gliner_specialty_artifact_hint == null or mf.gliner_specialty_profile != null) return;
+    // Hash outside discovery/request listing and before any encoder/head runs.
+    // Reuse an already captured identity when a modern declaration supplied it.
+    const weight = if (identity) |captured| captured.weight else blk: {
+        const reader = store.singleSafetensorsReader() orelse return;
+        break :blk gliner_decide_qualification.Digest.ofMapped(reader.file_bytes);
+    };
+    try gliner_specialty.requireKnownWeightConfig(weight, mf.gliner_span_config_digest);
+}
+
+/// Known full-file weights require the profile derived from sealed sidecars.
+/// Size gates hashing; unrelated artifacts do not pay the full-file cost.
+pub fn requirePinnedSpecialtySidecars(mf: *const manifest_mod.ModelManifest, store: tensor_store_mod.TensorStore) !void {
+    // The ordinary qualified path below already authenticates known profiles;
+    // avoid hashing their multi-gigabyte weight twice.
+    if (mf.gliner_specialty_profile != null) return;
+    const reader = store.singleSafetensorsReader() orelse return;
+    if (gliner_specialty.profileForWeightSize(@intCast(reader.file_bytes.len)) == null) return;
+    try gliner_specialty.requirePinnedWeightProfile(
+        mf.gliner_specialty_profile,
+        gliner_specialty.Digest.ofMapped(reader.file_bytes),
+    );
+}
+
 pub fn captureGlinerDecisionIdentity(mf: *const manifest_mod.ModelManifest, store: tensor_store_mod.TensorStore) !?gliner_decide_qualification.Identity {
-    if (mf.gliner_architecture != .span or !mf.gliner_span_declared) return null;
+    if (mf.gliner_architecture != .span or (!mf.gliner_span_declared and mf.gliner_specialty_profile == null)) return null;
     const family: gliner_decide_qualification.EncoderFamily = switch (mf.gliner_span_encoder_family) {
         .deberta => .deberta,
         .modern_bert => .modern_bert,
@@ -1770,6 +1796,7 @@ pub fn prepare(allocator: std.mem.Allocator, model_path: []const u8, loaded_mode
     var store = loaded_model.takeWeights();
     var store_owned = true;
     errdefer if (store_owned) store.deinit();
+    try requirePinnedSpecialtySidecars(&mf, store);
     if (arch_config == .modern_bert) {
         if (arch_config.modern_bert.laya) |config| try @import("laya.zig").validateWeights(store, config, arch_config.modern_bert);
         if (requiresModernBertSpanClassifier(mf) and store.singleSafetensorsReader() != null) {
@@ -1797,6 +1824,13 @@ pub fn prepare(allocator: std.mem.Allocator, model_path: []const u8, loaded_mode
     }
     const boundary_identity = if (arch_config == .gliner_boundary) try captureBoundaryIdentity(&mf, store) else null;
     const gliner_decision_identity = try captureGlinerDecisionIdentity(&mf, store);
+    try validateSpecialtyWeightConfig(&mf, store, gliner_decision_identity);
+    if (mf.gliner_specialty_profile) |profile| {
+        const identity = gliner_decision_identity orelse return error.UnsupportedGlinerSpecialtyArtifact;
+        if (try gliner_specialty.require(identity) != profile) return error.UnsupportedGlinerSpecialtyArtifact;
+        try model_definition.applyQualifiedGlinerSpecialtyExecutionPolicy(&arch_config, profile);
+        direct_quant_enabled = false;
+    }
     const keep_gliner_q8 = preparation.intent == .device_upload and requiresModernBertSpanClassifier(mf) and ggufEncoderHasQuantizedTensors(store);
     if (keep_gliner_q8) {
         const identity = gliner_decision_identity orelse return error.UnsupportedGlinerDecisionArtifact;

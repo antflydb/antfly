@@ -37,6 +37,28 @@ pub fn replaceInline(root: std.json.ObjectMap, name: []const u8, replacement: st
     return count;
 }
 
+/// Delete every declaration of the table-level producer. Consumers remain in
+/// place so normal catalog validation can reject a dangling dependency.
+pub fn removeInline(root: std.json.ObjectMap, name: []const u8) usize {
+    var count: usize = 0;
+    var entries = root.iterator();
+    while (entries.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const definitions = entry.value_ptr.object.getPtr("enrichments") orelse continue;
+        if (definitions.* != .array) continue;
+        var index: usize = 0;
+        while (index < definitions.array.items.len) {
+            const definition = definitions.array.items[index];
+            const candidate = if (definition == .object) definition.object.get("name") else null;
+            if (candidate != null and candidate.? == .string and std.mem.eql(u8, candidate.?.string, name)) {
+                _ = definitions.array.orderedRemove(index);
+                count += 1;
+            } else index += 1;
+        }
+    }
+    return count;
+}
+
 test "replacement repairs every inline producer without touching index sources or other producers" {
     const alloc = std.testing.allocator;
     var catalog = try std.json.parseFromSlice(std.json.Value, alloc,
@@ -54,4 +76,10 @@ test "replacement repairs every inline producer without touching index sources o
     try std.testing.expect(std.mem.indexOf(u8, encoded, "keep") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"sources\":[{\"artifact\":\"units\"}]") != null);
     try std.testing.expectEqual(@as(usize, 0), replaceInline(catalog.value.object, "missing", replacement.value));
+    try std.testing.expectEqual(@as(usize, 2), removeInline(catalog.value.object, "units"));
+    try std.testing.expectEqual(@as(usize, 0), removeInline(catalog.value.object, "units"));
+    const remaining = catalog.value.object.get("first").?.object.get("enrichments").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    try std.testing.expectEqualStrings("other", remaining[0].object.get("name").?.string);
+    try std.testing.expectEqual(@as(usize, 0), catalog.value.object.get("second").?.object.get("enrichments").?.array.items.len);
 }

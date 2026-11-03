@@ -240,7 +240,7 @@
     F(u32, batch) F(u32, seq_len) F(u32, hidden_size) F(u32, num_words)
 
 #define TERMITE_METAL_ABI_FIELDS_gliner_gru_combine_f32(F) \
-    F(u32, rows) F(u32, dim) F(u32, reserved0) F(u32, reserved1)
+    F(u32, rows) F(u32, dim) F(u32, add_residual) F(u32, reserved1)
 
 #define TERMITE_METAL_ABI_FIELDS_argmax_axis_f32(F) \
     F(u32, outer) F(u32, axis_dim) F(u32, inner) F(u32, reserved)

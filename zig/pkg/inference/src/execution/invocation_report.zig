@@ -14,6 +14,9 @@ pub const Report = struct {
     backend_counter_scope: []const u8,
     outcome: []const u8,
     failure: @import("runtime_observation.zig").FailureText = .{},
+    /// Observed failure from the corresponding program; ordinary execution can
+    /// still succeed after capture fails. Inline text never borrows its owner.
+    program_failure: ?@import("runtime_observation.zig").FailureText = null,
     transfers: ?@import("transfer_audit.zig").Measurements = null,
     transfers_scope: enum { unavailable, invocation_submitting_thread, last_program_only } = .unavailable,
     implementation_entries: ?@import("runtime_observation.zig").Entries = null,
@@ -64,6 +67,11 @@ pub const Report = struct {
         report.terminal_native_bodies = value.runtime.terminal_native_bodies;
         if (value.pending_interval != null) report.synchronous_interval = .pending_phase_only;
         if (value.error_name) |failure| report.failure = @import("runtime_observation.zig").FailureText.init(failure.view());
+        if (value.program_error) |failure| {
+            var text = @import("runtime_observation.zig").FailureText.init(failure.view());
+            text.truncated = text.truncated or failure.truncated;
+            report.program_failure = text;
+        }
         if (value.runtime.transfers) |transfers| {
             report.transfers = transfers;
             report.transfers_scope = .invocation_submitting_thread;

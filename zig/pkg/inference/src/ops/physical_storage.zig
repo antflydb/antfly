@@ -770,7 +770,7 @@ test "physical immutable CUDA literals reject aliased writes without submission"
 }
 fn testImmutableLiteralWrites(comptime kind: @import("../backends/backends.zig").BackendType) !void {
     const a = std.testing.allocator;
-    var context = @import("../backends/compute_context.zig").BackendContext.init(a, kind, std.testing.io) catch |err| switch (err) {
+    var context = @import("../backends/compute_context.zig").BackendContext.init(a, kind, std.testing.io) catch |err| switch (@as(anyerror, err)) {
         error.CudaUnavailable => return error.SkipZigTest,
         else => return err,
     };

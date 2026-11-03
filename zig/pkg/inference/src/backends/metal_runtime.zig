@@ -976,6 +976,29 @@ pub const RawLinearSlotKind = enum(u8) {
     quantized,
 };
 
+pub const DenseLinearSlotDtype = enum(c_int) {
+    f32 = 0,
+    bf16 = 1,
+    f32_mps = 2,
+    f16 = 3,
+};
+
+fn preparedDenseLinearPrecisionMatches(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    prefer_bf16: bool,
+    prefer_f16_mps: bool,
+    prefer_f32_mps: bool,
+) bool {
+    if (!prefer_bf16 and !prefer_f16_mps and !prefer_f32_mps) return true;
+    const raw = termite_metal_decode_runtime_linear_slot_dtype(runtime, slot);
+    if (raw < 0) return false;
+    const dtype: DenseLinearSlotDtype = @fromBackingInt(@intCast(raw));
+    if (prefer_f32_mps) return dtype == .f32_mps;
+    if (prefer_f16_mps) return dtype == .f16;
+    return dtype == .bf16;
+}
+
 pub const CompressedKeyFormat = enum {
     polar4,
     turbo3,
@@ -7335,6 +7358,7 @@ pub fn decoderRuntimeGlinerGruCombineF32Device(
     gh: MetalTensor,
     rows: usize,
     dim: usize,
+    add_residual: bool,
     output_shape: []const i32,
 ) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
@@ -7356,6 +7380,7 @@ pub fn decoderRuntimeGlinerGruCombineF32Device(
         gh.deviceByteOffset(),
         rows,
         dim,
+        @intFromBool(add_residual),
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
@@ -11292,15 +11317,34 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         request.prefer_f32_mps_fallback
     else
         false;
-    if (rawLinearSlotPrepared(self, request.slot) and
+    const require_preferred_dense_precision = if (@hasField(@TypeOf(request), "require_preferred_dense_precision"))
+        request.require_preferred_dense_precision
+    else
+        false;
+    // Preserve the complete pre-policy reuse contract when precision is only
+    // preferred. In particular, the dense and quantized alternatives below
+    // intentionally retain their original, asymmetric preference checks.
+    const slot_prepared = rawLinearSlotPrepared(self, request.slot);
+    const legacy_prepared_reusable = slot_prepared and ((request.quantized_storage != null and
+        (self.raw_linear_slot_kinds[request.slot] == .dense or
+            (!prefer_bf16_fallback and !prefer_f16_mps_fallback and !prefer_f32_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized))) or
+        (request.quantized_storage == null and
+            (self.raw_linear_slot_kinds[request.slot] == .dense or
+                (retain_dense_fallback and !prefer_f32_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized))));
+    const required_precision_matches = !require_preferred_dense_precision or
+        (slot_prepared and self.raw_linear_slot_kinds[request.slot] == .dense and
+            preparedDenseLinearPrecisionMatches(
+                runtime,
+                request.slot,
+                prefer_bf16_fallback,
+                prefer_f16_mps_fallback,
+                prefer_f32_mps_fallback,
+            ));
+    if (slot_prepared and
         self.raw_linear_slot_in_dims[request.slot] == request.in_dim and
         self.raw_linear_slot_out_dims[request.slot] == request.out_dim and
-        ((request.quantized_storage != null and
-            (self.raw_linear_slot_kinds[request.slot] == .dense or
-                (!prefer_bf16_fallback and !prefer_f16_mps_fallback and !prefer_f32_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized))) or
-            (request.quantized_storage == null and
-                (self.raw_linear_slot_kinds[request.slot] == .dense or
-                    (retain_dense_fallback and !prefer_f32_mps_fallback and self.raw_linear_slot_kinds[request.slot] == .quantized)))))
+        legacy_prepared_reusable and
+        required_precision_matches)
     {
         return true;
     }
@@ -21107,6 +21151,10 @@ pub extern fn termite_metal_decode_runtime_linear_view_bytes(
     runtime: ?*RawMetalDecodeRuntime,
     count: usize,
 ) u64;
+pub extern fn termite_metal_decode_runtime_linear_slot_dtype(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_prefer_linear_mps(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -22626,6 +22674,7 @@ pub extern fn termite_metal_decode_runtime_gliner_gru_combine_f32_device(
     gh_offset: usize,
     rows: usize,
     dim: usize,
+    add_residual: c_int,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
@@ -50309,4 +50358,441 @@ fn rawLayerNormSlotPrepared(self: anytype, slot: usize) bool {
 }
 fn rawRmsNormSlotPrepared(self: anytype, slot: usize) bool {
     return slot < decoder_runtime_rms_norm_slot_capacity and self.raw_rms_norm_slots_prepared[slot] and !preparedBindingRetired(self, .rms_norm, slot);
+}
+
+test "metal native DeBERTa specialty required F32 replaces F16 while preferences preserve legacy reuse" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const dim: usize = 8;
+    var f32_weights: [dim * dim]f32 = undefined;
+    var f16_weights: [dim * dim]u16 = undefined;
+    var bias: [dim]f32 = undefined;
+    for (&f32_weights, &f16_weights, 0..) |*f32_value, *f16_value, i| {
+        const value = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) * 0.125;
+        f32_value.* = value;
+        f16_value.* = @bitCast(@as(f16, @floatCast(value)));
+    }
+    for (&bias, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i + 1)) * 0.01;
+    var weight = MetalTensor.borrowed(&f32_weights, f32_weights.len, &.{ dim, dim });
+    defer weight.deinit();
+    var bias_tensor = MetalTensor.borrowed(&bias, bias.len, &.{dim});
+    defer bias_tensor.deinit();
+    var stats: ops.NativeQuantTimingStats = .{};
+
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = weight,
+        .bias = bias_tensor,
+        .quantized_storage = null,
+        .dense_f16_bytes = @as(?[]const u8, std.mem.sliceAsBytes(&f16_weights)),
+        .in_dim = dim,
+        .out_dim = dim,
+        .retain_dense_fallback = true,
+        .prefer_f16_mps_fallback = true,
+    }, &stats));
+    const f16_snapshot = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 1), f16_snapshot.dense_linear_f16_slots);
+    try std.testing.expectEqual(@backingInt(DenseLinearSlotDtype.f16), termite_metal_decode_runtime_linear_slot_dtype(runtime, 0));
+
+    const prepares_before_generic = stats.decoder_runtime_prepare_linear_calls;
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = weight,
+        .bias = bias_tensor,
+        .quantized_storage = null,
+        .in_dim = dim,
+        .out_dim = dim,
+        .retain_dense_fallback = true,
+    }, &stats));
+    try std.testing.expectEqual(prepares_before_generic, stats.decoder_runtime_prepare_linear_calls);
+    try std.testing.expectEqual(@backingInt(DenseLinearSlotDtype.f16), termite_metal_decode_runtime_linear_slot_dtype(runtime, 0));
+
+    // The existing fallback flags remain preferences for every ordinary
+    // caller. A compatible dense slot is reused even when its dtype differs.
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = weight,
+        .bias = bias_tensor,
+        .quantized_storage = null,
+        .in_dim = dim,
+        .out_dim = dim,
+        .retain_dense_fallback = true,
+        .prefer_f32_mps_fallback = true,
+    }, &stats));
+    try std.testing.expectEqual(prepares_before_generic, stats.decoder_runtime_prepare_linear_calls);
+    try std.testing.expectEqual(@backingInt(DenseLinearSlotDtype.f16), termite_metal_decode_runtime_linear_slot_dtype(runtime, 0));
+
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = weight,
+        .bias = bias_tensor,
+        .quantized_storage = null,
+        .in_dim = dim,
+        .out_dim = dim,
+        .retain_dense_fallback = true,
+        .prefer_f32_mps_fallback = true,
+        .require_preferred_dense_precision = true,
+    }, &stats));
+    const f32_snapshot = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 1), f32_snapshot.dense_linear_f32_slots);
+    try std.testing.expectEqual(@as(u64, 0), f32_snapshot.dense_linear_f16_slots);
+    try std.testing.expectEqual(@as(u64, dim * dim * @sizeOf(f32)), f32_snapshot.dense_linear_f32_weight_bytes);
+    try std.testing.expectEqual(@backingInt(DenseLinearSlotDtype.f32_mps), termite_metal_decode_runtime_linear_slot_dtype(runtime, 0));
+
+    clearRawLinearSlot(&provider, 0);
+    const released = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 0), released.dense_linear_bytes);
+    try std.testing.expectEqual(@as(c_int, -1), termite_metal_decode_runtime_linear_slot_dtype(runtime, 0));
+}
+
+test "metal native DeBERTa specialty dense pair accounts packed bias and releases slots" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const hidden_size: usize = 4;
+    const out_dim: usize = 3;
+
+    const rms_weight_data = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
+    var rms_weight = try MetalTensor.ownedCloneFrom(&rms_weight_data, &[_]i32{@intCast(hidden_size)});
+    defer rms_weight.deinit();
+    try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{
+        .slot = 0,
+        .weight = rms_weight,
+        .hidden_size = hidden_size,
+    }));
+
+    const linear_weight_data = [_]f32{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.5, 0.5, 0.5, 0.5,
+    };
+    const linear_bias_data = [_]f32{ 0.0, 0.0, 0.0 };
+    var linear_weight = try MetalTensor.ownedCloneFrom(&linear_weight_data, &[_]i32{ @intCast(out_dim), @intCast(hidden_size) });
+    defer linear_weight.deinit();
+    var linear_bias = try MetalTensor.ownedCloneFrom(&linear_bias_data, &[_]i32{@intCast(out_dim)});
+    defer linear_bias.deinit();
+    var prep_stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = linear_weight,
+        .bias = linear_bias,
+        .quantized_storage = null,
+        .in_dim = hidden_size,
+        .out_dim = out_dim,
+        .retain_dense_fallback = true,
+    }, &prep_stats));
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 1,
+        .weight = linear_weight,
+        .bias = linear_bias,
+        .quantized_storage = null,
+        .in_dim = hidden_size,
+        .out_dim = out_dim,
+        .retain_dense_fallback = true,
+    }, &prep_stats));
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 2,
+        .weight = linear_weight,
+        .bias = linear_bias,
+        .quantized_storage = null,
+        .in_dim = hidden_size,
+        .out_dim = out_dim,
+        .retain_dense_fallback = true,
+    }, &prep_stats));
+
+    const input_data = [_]f32{ 1.0, -2.0, 0.5, 3.0 };
+    var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ 1, @intCast(hidden_size) });
+    defer input.deinit();
+
+    var linear_out = (try decoderRuntimeApplyLinear(&provider, .{
+        .slot = 0,
+        .input = input,
+        .in_dim = hidden_size,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    defer linear_out.deinit();
+    try std.testing.expect(linear_out.isDevice());
+
+    var rms_linear_out = (try decoderRuntimeApplyRmsNormLinear(&provider, .{
+        .norm_slot = 0,
+        .linear_slot = 0,
+        .input = input,
+        .hidden_size = hidden_size,
+        .eps = 1e-5,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    defer rms_linear_out.deinit();
+    try std.testing.expect(rms_linear_out.isDevice());
+
+    var activation_stats: ops.NativeQuantTimingStats = .{};
+    var activated = (try decoderRuntimeApplyActivation(&provider, .{
+        .kind = @as(ops.DecoderRuntimeActivationKind, .relu),
+        .input = rms_linear_out,
+        .dim = out_dim,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer activated.deinit();
+    try std.testing.expect(activated.isDevice());
+
+    var added = (try decoderRuntimeApplyAdd(&provider, .{
+        .lhs = rms_linear_out,
+        .rhs = linear_out,
+        .dim = out_dim,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer added.deinit();
+    try std.testing.expect(added.isDevice());
+
+    var rms_added = (try decoderRuntimeApplyRmsNormAdd(&provider, .{
+        .input = input,
+        .norm_slot = 0,
+        .residual = input,
+        .rows = 1,
+        .hidden_size = hidden_size,
+        .eps = 1e-5,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer rms_added.deinit();
+    try std.testing.expect(rms_added.isDevice());
+    var rms_added_host: [hidden_size]f32 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, rms_added.deviceHandle(), rms_added.deviceByteOffset(), @ptrCast(&rms_added_host), hidden_size * @sizeOf(f32)));
+    var sum_sq: f32 = 0.0;
+    for (input_data) |value| sum_sq += value * value;
+    const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(hidden_size)) + 1e-5);
+    for (input_data, rms_added_host) |value, actual| {
+        try std.testing.expectApproxEqAbs(value + value * inv_rms, actual, 1e-4);
+    }
+
+    var add_scaled = (try decoderRuntimeApplyAddScale(&provider, .{
+        .lhs = rms_linear_out,
+        .rhs = linear_out,
+        .dim = out_dim,
+        .scale = 0.25,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer add_scaled.deinit();
+    try std.testing.expect(add_scaled.isDevice());
+    var added_host: [out_dim]f32 = undefined;
+    var add_scaled_host: [out_dim]f32 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, added.deviceHandle(), added.deviceByteOffset(), @ptrCast(&added_host), out_dim * @sizeOf(f32)));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, add_scaled.deviceHandle(), add_scaled.deviceByteOffset(), @ptrCast(&add_scaled_host), out_dim * @sizeOf(f32)));
+    for (added_host, add_scaled_host) |base, scaled| {
+        try std.testing.expectApproxEqAbs(base * 0.25, scaled, 1e-4);
+    }
+
+    var scaled_add_scaled = (try decoderRuntimeApplyScaledAddScale(&provider, .{
+        .lhs = rms_linear_out,
+        .rhs = linear_out,
+        .dim = out_dim,
+        .lhs_scale = 0.5,
+        .output_scale = 0.25,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer scaled_add_scaled.deinit();
+    try std.testing.expect(scaled_add_scaled.isDevice());
+    var rms_host: [out_dim]f32 = undefined;
+    var linear_host: [out_dim]f32 = undefined;
+    var scaled_add_scaled_host: [out_dim]f32 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, rms_linear_out.deviceHandle(), rms_linear_out.deviceByteOffset(), @ptrCast(&rms_host), out_dim * @sizeOf(f32)));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, linear_out.deviceHandle(), linear_out.deviceByteOffset(), @ptrCast(&linear_host), out_dim * @sizeOf(f32)));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, scaled_add_scaled.deviceHandle(), scaled_add_scaled.deviceByteOffset(), @ptrCast(&scaled_add_scaled_host), out_dim * @sizeOf(f32)));
+    for (rms_host, linear_host, scaled_add_scaled_host) |lhs, rhs, scaled| {
+        try std.testing.expectApproxEqAbs((lhs * 0.5 + rhs) * 0.25, scaled, 1e-4);
+    }
+
+    var multiplied = (try decoderRuntimeApplyMultiply(&provider, activated, linear_out, out_dim)) orelse return error.UnexpectedNull;
+    defer multiplied.deinit();
+    try std.testing.expect(multiplied.isDevice());
+
+    var pair = (try tryApplyDenseRuntimeLinearPair(&provider, 0, 1, input, 1, hidden_size, out_dim)) orelse return error.UnexpectedNull;
+    defer pair.first.deinit();
+    defer pair.second.deinit();
+    try std.testing.expect(pair.first.isDevice());
+    try std.testing.expect(pair.second.isDevice());
+
+    const packed_pair_input_data = [_]f32{
+        1.0,  -2.0, 0.5, 3.0,
+        -0.5, 0.25, 2.0, 1.0,
+    };
+    var packed_pair_input = try testDeviceTensorFromSlice(runtime, &packed_pair_input_data, &.{ 2, @intCast(hidden_size) });
+    defer packed_pair_input.deinit();
+    const before_pair_memory = runtimeMemorySnapshot(runtime);
+    try beginFrame(runtime);
+    errdefer cancelFrame(runtime) catch {};
+    var packed_pair = (try tryApplyDenseRuntimeLinearPair(&provider, 0, 1, packed_pair_input, 2, hidden_size, out_dim)) orelse return error.UnexpectedNull;
+    defer packed_pair.first.deinit();
+    defer packed_pair.second.deinit();
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    const after_pair_memory = runtimeMemorySnapshot(runtime);
+    const packed_pair_weight_bytes = 2 * hidden_size * out_dim * @sizeOf(f32);
+    const packed_pair_bias_bytes = 2 * out_dim * @sizeOf(f32);
+    try std.testing.expectEqual(
+        before_pair_memory.dense_linear_bytes + packed_pair_weight_bytes + packed_pair_bias_bytes,
+        after_pair_memory.dense_linear_bytes,
+    );
+    try std.testing.expectEqual(before_pair_memory.dense_linear_buffer_count + 2, after_pair_memory.dense_linear_buffer_count);
+
+    var qkv = (try tryApplyDenseRuntimeLinearQkv(&provider, 0, 1, 2, input, 1, hidden_size, out_dim, out_dim)) orelse return error.UnexpectedNull;
+    defer qkv.first.deinit();
+    defer qkv.second.deinit();
+    defer qkv.third.deinit();
+    try std.testing.expect(qkv.first.isDevice());
+    try std.testing.expect(qkv.second.isDevice());
+    try std.testing.expect(qkv.third.isDevice());
+
+    const input_rows_data = [_]f32{
+        1.0,  -2.0, 0.5, 3.0,
+        -0.5, 0.25, 2.0, 1.0,
+    };
+    var input_rows = try testDeviceTensorFromSlice(runtime, &input_rows_data, &[_]i32{ 2, @intCast(hidden_size) });
+    defer input_rows.deinit();
+    var rms_added_rows = (try decoderRuntimeApplyRmsNormAdd(&provider, .{
+        .input = input_rows,
+        .norm_slot = 0,
+        .residual = input_rows,
+        .rows = 2,
+        .hidden_size = hidden_size,
+        .eps = 1e-5,
+    }, &activation_stats)) orelse return error.UnexpectedNull;
+    defer rms_added_rows.deinit();
+    try std.testing.expect(rms_added_rows.isDevice());
+    var rms_added_rows_mut = rms_added_rows;
+    const rms_added_rows_host = try tensorHostSlice(&rms_added_rows_mut);
+    try std.testing.expectEqual(input_rows_data.len, rms_added_rows_host.len);
+    for (0..2) |row| {
+        var row_sum_sq: f32 = 0.0;
+        for (0..hidden_size) |col| {
+            const value = input_rows_data[row * hidden_size + col];
+            row_sum_sq += value * value;
+        }
+        const row_inv_rms = 1.0 / @sqrt(row_sum_sq / @as(f32, @floatFromInt(hidden_size)) + 1e-5);
+        for (0..hidden_size) |col| {
+            const value = input_rows_data[row * hidden_size + col];
+            try std.testing.expectApproxEqAbs(value + value * row_inv_rms, rms_added_rows_host[row * hidden_size + col], 1e-4);
+        }
+    }
+    var qkv_rows = (try tryApplyDenseRuntimeLinearQkv(&provider, 0, 1, 2, input_rows, 2, hidden_size, out_dim, out_dim)) orelse return error.UnexpectedNull;
+    defer qkv_rows.first.deinit();
+    defer qkv_rows.second.deinit();
+    defer qkv_rows.third.deinit();
+    try std.testing.expect(qkv_rows.first.isDevice());
+    try std.testing.expect(qkv_rows.second.isDevice());
+    try std.testing.expect(qkv_rows.third.isDevice());
+
+    const reduce_hidden_size: usize = 128;
+    const reduce_out_dim: usize = 128;
+    const reduce_rows: usize = 2;
+    const reduce_weight_data = try std.testing.allocator.alloc(f32, reduce_hidden_size * reduce_out_dim);
+    defer std.testing.allocator.free(reduce_weight_data);
+    @memset(reduce_weight_data, 0);
+    for (0..reduce_out_dim) |idx| reduce_weight_data[idx * reduce_hidden_size + idx] = 1.0;
+    const reduce_bias_data = try std.testing.allocator.alloc(f32, reduce_out_dim);
+    defer std.testing.allocator.free(reduce_bias_data);
+    @memset(reduce_bias_data, 0);
+    var reduce_weight = try MetalTensor.ownedCloneFrom(reduce_weight_data, &[_]i32{ @intCast(reduce_out_dim), @intCast(reduce_hidden_size) });
+    defer reduce_weight.deinit();
+    var reduce_bias = try MetalTensor.ownedCloneFrom(reduce_bias_data, &[_]i32{@intCast(reduce_out_dim)});
+    defer reduce_bias.deinit();
+    for (3..6) |slot| {
+        try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+            .slot = slot,
+            .weight = reduce_weight,
+            .bias = reduce_bias,
+            .quantized_storage = null,
+            .in_dim = reduce_hidden_size,
+            .out_dim = reduce_out_dim,
+            .retain_dense_fallback = true,
+        }, &prep_stats));
+    }
+    const reduce_input_data = try std.testing.allocator.alloc(f32, reduce_rows * reduce_hidden_size);
+    defer std.testing.allocator.free(reduce_input_data);
+    for (reduce_input_data, 0..) |*value, idx| value.* = @floatFromInt(@as(i32, @intCast(idx % 17)) - 8);
+    var reduce_input = try testDeviceTensorFromSlice(runtime, reduce_input_data, &[_]i32{ @intCast(reduce_rows), @intCast(reduce_hidden_size) });
+    defer reduce_input.deinit();
+    if (try tryApplyDenseRuntimeLinearQkv(&provider, 3, 4, 5, reduce_input, reduce_rows, reduce_hidden_size, reduce_out_dim, reduce_out_dim)) |reduce_qkv| {
+        var reduce_qkv_mut = reduce_qkv;
+        defer reduce_qkv_mut.first.deinit();
+        defer reduce_qkv_mut.second.deinit();
+        defer reduce_qkv_mut.third.deinit();
+        try std.testing.expect(reduce_qkv_mut.first.isDevice());
+        try std.testing.expect(reduce_qkv_mut.second.isDevice());
+        try std.testing.expect(reduce_qkv_mut.third.isDevice());
+        var reduce_q_mut = reduce_qkv_mut.first;
+        const reduce_q_host = try tensorHostSlice(&reduce_q_mut);
+        try std.testing.expectEqual(reduce_input_data.len, reduce_q_host.len);
+        for (reduce_input_data, reduce_q_host) |expected, actual| {
+            try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+        }
+    }
+
+    try beginFrame(runtime);
+    try beginPlannedComputeScope(runtime, @backingInt(ComputeSource.dense_linear), .ffn);
+    var scoped_pair = (try tryApplyDenseRuntimeLinearPair(&provider, 0, 1, input, 1, hidden_size, out_dim)) orelse return error.UnexpectedNull;
+    defer scoped_pair.first.deinit();
+    defer scoped_pair.second.deinit();
+    var scoped_qkv = (try tryApplyDenseRuntimeLinearQkv(&provider, 0, 1, 2, input, 1, hidden_size, out_dim, out_dim)) orelse return error.UnexpectedNull;
+    defer scoped_qkv.first.deinit();
+    defer scoped_qkv.second.deinit();
+    defer scoped_qkv.third.deinit();
+    try plannedComputeBarrier(runtime);
+    var scoped_activation_stats: ops.NativeQuantTimingStats = .{};
+    var scoped_activated = (try decoderRuntimeApplyActivation(&provider, .{
+        .kind = @as(ops.DecoderRuntimeActivationKind, .relu),
+        .input = scoped_pair.first,
+        .dim = out_dim,
+    }, &scoped_activation_stats)) orelse return error.UnexpectedNull;
+    defer scoped_activated.deinit();
+    try plannedComputeBarrier(runtime);
+    var scoped_multiplied = (try decoderRuntimeApplyMultiply(&provider, scoped_activated, scoped_pair.second, out_dim)) orelse return error.UnexpectedNull;
+    defer scoped_multiplied.deinit();
+    try plannedComputeBarrier(runtime);
+    var scoped_added = (try decoderRuntimeApplyAdd(&provider, .{
+        .lhs = scoped_multiplied,
+        .rhs = scoped_qkv.first,
+        .dim = out_dim,
+    }, &scoped_activation_stats)) orelse return error.UnexpectedNull;
+    defer scoped_added.deinit();
+    try endPlannedComputeScope(runtime);
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    const planned_snapshot = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 1), planned_snapshot.last_frame_compute_encoder_count);
+    try std.testing.expectEqual(@as(u64, 1), planned_snapshot.last_frame_planned_compute_scope_count);
+    try std.testing.expectEqual(@as(u64, 1), planned_snapshot.last_frame_compute_dense_linear_count);
+    try std.testing.expectEqual(@as(u64, 1), planned_snapshot.last_frame_compute_region_ffn_count);
+
+    const linear_argmax = (try decoderRuntimeApplyLinearArgmax(&provider, .{
+        .slot = 0,
+        .input = input,
+        .in_dim = hidden_size,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    try std.testing.expect(linear_argmax < out_dim);
+
+    const logits_argmax = (try argmaxLogitsDevice(&provider, linear_out, out_dim)) orelse return error.UnexpectedNull;
+    try std.testing.expect(logits_argmax < out_dim);
+
+    const token_id = (try decoderRuntimeApplyRmsNormLinearArgmax(&provider, .{
+        .norm_slot = 0,
+        .linear_slot = 0,
+        .input = input,
+        .hidden_size = hidden_size,
+        .eps = 1e-5,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    try std.testing.expect(token_id < out_dim);
+
+    for (0..6) |slot| clearRawLinearSlot(&provider, slot);
+    clearRawRmsNormSlot(&provider, 0);
+    const released = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 0), released.dense_linear_bytes);
+    try std.testing.expectEqual(@as(u64, 0), released.dense_linear_buffer_count);
+    try std.testing.expectEqual(@as(u64, 0), released.norm_bytes);
 }

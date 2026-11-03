@@ -30,6 +30,7 @@ const boundary_bundle = @import("gliner_boundary_bundle.zig");
 const embedding_gemma2_arch = @import("../architectures/embedding_gemma2.zig");
 const deepseek_v4_arch = @import("../architectures/deepseek_v4.zig");
 const gliner_decide_qualification = @import("gliner_decide_qualification.zig");
+const gliner_specialty = @import("gliner_specialty_qualification.zig");
 const kernel_jit = @import("../graph/kernel_jit.zig");
 const manifest_mod = @import("manifest.zig");
 const weight_source_mod = @import("weight_source.zig");
@@ -692,6 +693,7 @@ pub fn sessionDirectQuantEnabled(
     manifest: manifest_mod.ModelManifest,
     arch_config: ArchConfig,
 ) bool {
+    if (manifest.gliner_specialty_profile != null) return false;
     if (arch_config == .gliner_boundary) {
         return if (manifest.gliner_boundary_bundle) |receipt| switch (receipt.value.precision) {
             .q8_0, .q4_0, .q4_k => true,
@@ -1148,6 +1150,7 @@ pub fn prepare(
 
     const resident_prefix: []const u8 = if (mf.safetensors_path != null or mf.safetensors_index_path != null or mf.gguf_path != null) blk: {
         tensor_store = loaded_model.takeWeights();
+        try host_weights.requirePinnedSpecialtySidecars(&mf, tensor_store.?);
         if (arch_config == .modern_bert) {
             if (arch_config.modern_bert.laya) |config| try @import("../models/laya.zig").validateWeights(tensor_store.?, config, arch_config.modern_bert);
         }
@@ -1157,6 +1160,17 @@ pub fn prepare(
         }
         if (arch_config == .embedding_gemma2) try embedding_gemma2_arch.validateWeights(allocator, tensor_store.?, arch_config.embedding_gemma2);
         gliner_decision_identity = try captureGlinerDecisionIdentity(&mf, tensor_store.?);
+        try host_weights.validateSpecialtyWeightConfig(&mf, tensor_store.?, gliner_decision_identity);
+        if (mf.gliner_specialty_profile) |profile| {
+            const identity = gliner_decision_identity orelse return error.UnsupportedGlinerSpecialtyArtifact;
+            if (try gliner_specialty.require(identity) != profile) return error.UnsupportedGlinerSpecialtyArtifact;
+            try gliner_specialty.requireBackend(profile, switch (backend_type) {
+                .metal => .metal,
+                .cuda => .cuda,
+                else => .other,
+            });
+            try model_definition.applyQualifiedGlinerSpecialtyExecutionPolicy(&arch_config, profile);
+        }
         const source = (try tensor_store.?.weightSource()) orelse return error.NoDenseWeightSource;
         const all_names = try source.listNames(allocator);
         defer allocator.free(all_names);
