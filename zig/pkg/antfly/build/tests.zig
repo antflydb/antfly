@@ -6036,6 +6036,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
     const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    const document_quality_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "db minimum chunk content", "enrichment chunker omits short text" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-document-quality-test", "Verify short text filtering and stale vector retirement in inline and background indexing")
+        .dependOn(&addFilteredTestRunArtifact(b, document_quality_tests).step);
     const graph_admission_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = selectTestFilters(b, &.{
