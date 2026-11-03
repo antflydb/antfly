@@ -3227,10 +3227,27 @@ pub const Connection = struct {
     test_admission_sleep: if (h.builtin.is_test) ?struct { ptr: *anyopaque, sleep: *const fn (*anyopaque, std.Io.Duration) std.Io.Cancelable!void } else void = if (h.builtin.is_test) null else {},
     test_path_lease_busy: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
 
+    fn traceAdmissionFailure(_: *Connection, phase: enum { local_gate, path_lease, runtime_refresh, proof_turn, allocator_proof, proof_tip_changed }, err: anyerror, started_ns: u64) void {
+        if ((err == error.FileBusy or err == error.WouldBlock) and Owner.qualificationMetricsEnabled())
+            std.log.info("antfly_bench_admission_refusal phase={s} error={s} elapsed_ns={d}", .{ @tagName(phase), @errorName(err), @import("antfly_platform").time.monotonicNs() -| started_ns });
+    }
+
+    fn refreshOwnerForAdmission(self: *Connection) !*h.Handle {
+        const started = @import("antfly_platform").time.monotonicNs();
+        return self.owner.refresh() catch |err| {
+            self.traceAdmissionFailure(.runtime_refresh, err, started);
+            return err;
+        };
+    }
+
     pub fn acquire(self: *Connection) !native.PathWriterLock {
         const io = h.handleLockIo();
+        const started = @import("antfly_platform").time.monotonicNs();
         if (self.admission_deadline_ns) |deadline|
-            try self.gate.mutex.lockUntil(io, deadline)
+            self.gate.mutex.lockUntil(io, deadline) catch |err| {
+                self.traceAdmissionFailure(.local_gate, err, started);
+                return err;
+            }
         else
             self.gate.mutex.lockUncancelable(io);
         errdefer self.gate.mutex.unlock(io);
@@ -3238,6 +3255,14 @@ pub const Connection = struct {
     }
 
     fn acquirePathLeaseAssumeLocked(self: *Connection) !native.PathWriterLock {
+        const started = @import("antfly_platform").time.monotonicNs();
+        return self.acquirePathLeaseWithinBudget() catch |err| {
+            self.traceAdmissionFailure(.path_lease, err, started);
+            return err;
+        };
+    }
+
+    fn acquirePathLeaseWithinBudget(self: *Connection) !native.PathWriterLock {
         const io = h.handleLockIo();
         const deadline = self.admission_deadline_ns orelse (std.Io.Clock.awake.now(io).nanoseconds + @as(i96, self.options.busy_timeout_ms) * std.time.ns_per_ms);
         var backoff: i96 = std.time.ns_per_ms;
@@ -3280,7 +3305,7 @@ pub const Connection = struct {
     /// owners still require capacity proof.
     /// No SQL request has started, so admission never replays partial work.
     pub fn refresh(self: *Connection, lease: *?native.PathWriterLock, intent: api.StorageIntent) !*h.Handle {
-        var root = try self.owner.refresh();
+        var root = try self.refreshOwnerForAdmission();
         if (self.options.profile == .native and self.options.open_mode == .writer and
             (usesCapacityAdmission(root) or (intent == .mutation and try self.needsReuseAdmission(root))))
         {
@@ -3302,21 +3327,31 @@ pub const Connection = struct {
             defer self.owner.allocator_proof_mutex.unlock(io);
             if (waited) {
                 lease.* = try self.acquirePathLeaseAssumeLocked();
-                root = try self.owner.refresh();
+                root = try self.refreshOwnerForAdmission();
             }
             if (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) {
                 // Keep foreign unverified opens from publishing index leases
                 // between the detached proof and reacquiring the writer lease.
-                if (!try self.owner.retainMaintenanceTurnAssumeLocked()) return error.FileBusy;
+                const proof_started = @import("antfly_platform").time.monotonicNs();
+                if (!try self.owner.retainMaintenanceTurnAssumeLocked()) {
+                    self.traceAdmissionFailure(.proof_turn, error.FileBusy, proof_started);
+                    return error.FileBusy;
+                }
                 defer self.owner.releaseMaintenanceTurnAssumeLocked();
-                try self.owner.verifyAllocatorAssumeLocked(lease, self);
+                self.owner.verifyAllocatorAssumeLocked(lease, self) catch |err| {
+                    self.traceAdmissionFailure(.allocator_proof, err, proof_started);
+                    return err;
+                };
                 if (lease.* == null) lease.* = try self.acquirePathLeaseAssumeLocked();
-                root = try self.owner.refresh();
+                root = try self.refreshOwnerForAdmission();
                 // Another process may move the tip during the detached walk.
                 // Do not repeat whole-file proofs while holding this
                 // connection's admission queue. No transaction has started:
                 // refuse safely and let a later request prove the new tip.
-                if (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) return error.FileBusy;
+                if (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) {
+                    self.traceAdmissionFailure(.proof_tip_changed, error.FileBusy, proof_started);
+                    return error.FileBusy;
+                }
             }
         }
         self.current = root;

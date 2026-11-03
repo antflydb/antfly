@@ -7267,6 +7267,55 @@
       "scope": "Single unchanged original importer, populated seed, Debug, concurrent compilation. Diagnostic attribution only, not release latency or throughput."
     },
     "additional_diagnostics": "Expose cumulative full-refresh elapsed time and existing publication timing counters; metrics-only refusal logs contain numeric byte/record footprints and the consumer flag, never paths or payloads.",
-    "remaining_causality": "This proves redundant allocator-wide work. Its fraction of the optimized end-to-end slowdown, the complete replay service bottleneck and the required scheduling change remain unproven."
+    "remaining_causality": "This proves redundant allocator-wide work. Its fraction of the optimized end-to-end slowdown, the complete replay service bottleneck and the required scheduling change remain unproven.",
+    "debug_library": {
+      "source_commit": "39406ce4e3c5fdf4e9062da653abad2686c78a08",
+      "library_sha256": "2bc5bfdab565393188cc0473f9459eb13905b16c96aa01796caa347f7e1233dd",
+      "whole_build_exit_code": 0,
+      "c_linkage": "passed",
+      "public_exports": 134
+    },
+    "populated_original_importer": {
+      "completed": true,
+      "succeeded": false,
+      "mode": "Debug",
+      "seconds": 266.7538852500729,
+      "public_error": "FileBusy",
+      "replay_backlog_bytes_after": 12104714,
+      "replay_backlog_limit_bytes": 16777216,
+      "replay_backpressure_waits": 0,
+      "peak_concurrent_native_builds": 8,
+      "path_hold_ns": 175606140289,
+      "path_hold_max_ns": 10413540959,
+      "path_admission_ns": 136417840,
+      "runtime_refresh_ns": 19118739000,
+      "replay_ns": 144151386000,
+      "replay_publication_overhead_ns": 100949601578,
+      "replay_index_admission_ns": 8994335000,
+      "replay_metadata_admission_ns": 24191759000,
+      "publication_hold_ns": 22464694207,
+      "qualification": false,
+      "interpretation": "Failure below the replay cap; substantial publication/admission overhead. Maximum lease hold exceeds the importer Busy budget. Busy admission stage still requires direct attribution; no cross-host or elapsed-time speed claim."
+    },
+    "near_limit_public_probe": {
+      "scope": "Separate short public batch on an immutable clone of the failed candidate state. Cold-open service diagnosis, not an exact replacement for the original importer workload.",
+      "seed_sha256": "73c3a942012cba7b9aeb6fa73966d2d4123f2e3c3780c81810913a0c4f82a4cf",
+      "insert_count": 1024,
+      "key_bytes": 256,
+      "succeeded": false,
+      "public_error": "LiteReplayBacklogExceeded",
+      "bytes_before": 16727202,
+      "bytes_after_attempt": 17526096,
+      "limit_bytes": 16777216,
+      "capacity_wait_seconds": 5,
+      "counterevidence": "No replay index groups were published during the observed capacity wait; startup namespace discovery differs from a warm importer owner. No timing comparison with historical references is valid."
+    }
+  },
+  "admission_causality_followup_20261103": {
+    "status": "instrumentation awaiting build and reproduction",
+    "purpose": "Distinguish local gate, path lease, runtime refresh, maintenance proof-turn, allocator proof and changed-proof-tip refusals. FileBusy alone cannot identify which of those stages timed out.",
+    "scope": "Numeric/enum metrics only; no admission deadline, retry policy, importer or SDK behavior changes.",
+    "reference_policy": "No baseline rebuilds or reruns. Existing completed observations and immutable artifacts are reused.",
+    "remaining": "Identify the rejecting stage and expensive lease-held work before selecting any wider storage/runtime ownership redesign. PR remains draft and issue1431 remains open."
   }
 }
