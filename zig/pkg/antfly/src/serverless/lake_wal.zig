@@ -202,16 +202,22 @@ pub const Store = struct {
         wal: ObjectWal,
         cursor: IndexedWal.CapturedReader,
         position: u64,
+        context: catalog.types.Context = .{},
 
         pub fn deinit(self: *Reader) void {
             self.cursor.deinit();
             self.wal.deinit();
         }
         pub fn next(self: *Reader, a: A) !?Record {
-            const row = (self.cursor.next(a) catch |err| switch (err) {
-                error.WalSnapshotExpired => return error.LakeOverlayCoverageUnavailable,
-                else => return err,
-            }) orelse return null;
+            return self.nextCaptured(a) catch |err| switch (err) {
+                error.WalSnapshotExpired => error.LakeOverlayCoverageUnavailable,
+                else => err,
+            };
+        }
+        /// Keep expiry distinct from missing coverage and caller cancellation.
+        /// A drain may yield already-owned rows, without renewing this root.
+        pub fn nextCaptured(self: *Reader, a: A) !?Record {
+            const row = (try self.cursor.next(a)) orelse return null;
             errdefer {
                 a.free(row.payload);
                 if (row.operation_id) |id| a.free(id);
@@ -231,7 +237,7 @@ pub const Store = struct {
         if (snapshot.latest_lsn < cut) return error.LakeWalCoverageGap;
         if (snapshot.latest_lsn - cut > max_pending) return error.LakeOverlayCoverageUnavailable;
         const cursor = try opened.indexed.?.capturedReader(a, namespace, captured, .{ .start_lsn = cut + 1, .end_lsn = snapshot.latest_lsn, .max_record_bytes = 32 * 1024 * 1024, .cancellation = catalog.types.contextCancellation(&self.context) });
-        return .{ .wal = opened, .cursor = cursor, .position = cut };
+        return .{ .wal = opened, .cursor = cursor, .position = cut, .context = self.context };
     }
     pub fn next(self: Store, a: A, cut: u64) !?Record {
         const head = try self.pin(a, cut) orelse return null;

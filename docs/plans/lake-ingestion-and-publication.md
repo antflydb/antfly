@@ -603,8 +603,12 @@ not enabled by this path.
 Each publication-worker pass group-commits the pending WAL suffix. Contiguous
 accepted transactions that share a source, epoch and key definition, and whose
 checkpoints chain exactly, fold into one Iceberg snapshot of at most 16,384
-changes and 8 MiB of payload. A forward reader shares one pinned WAL index
-traversal and hydrates only the group plus at most one lookahead transaction;
+changes and 8 MiB of payload. If the pinned WAL root expires after a valid prefix
+has been decoded, the worker commits that owned prefix and opens a fresh cut for
+the next pass. It never renews an expired lazy root or converts request deadlines,
+cancellation, integrity errors or an unreadable first record into success. A
+forward reader shares one pinned WAL index traversal and hydrates only the group
+plus at most one lookahead transaction;
 saved intents replay without rereading pending payloads. Groups stop before a
 checkpoint cycle would make the final checkpoint equal the initial predecessor.
 The snapshot's coverage is the group's last LSN

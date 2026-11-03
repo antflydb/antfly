@@ -203,9 +203,18 @@ fn readGroup(a: A, reader: *wal.Store.Reader, max_changes: usize, max_bytes: usi
     const first = (try reader.next(a)) orelse return null;
     var builder = try GroupBuilder.init(a, first);
     while (!builder.full(max_changes, max_bytes)) {
-        const record = (try reader.next(a)) orelse break;
+        const record = (reader.nextCaptured(a) catch |err| switch (err) {
+            // These rows are already owned and remain valid after the lazy WAL
+            // root expires. Commit their prefix instead of retrying it forever.
+            error.WalSnapshotExpired => {
+                try reader.context.ensureActive();
+                break;
+            },
+            else => return err,
+        }) orelse break;
         if (!try builder.add(a, record, max_changes, max_bytes)) break;
     }
+    try reader.context.ensureActive();
     return try builder.finish(a);
 }
 
@@ -656,4 +665,119 @@ test "external lake WAL group reader stops before hydrating a bounded pending su
     const one = (try readGroup(a, &byte_reader, max_group_changes, 1)).?;
     try std.testing.expectEqual(@as(usize, 1), one.records);
     try std.testing.expectEqual(@as(u64, 1), byte_reader.position);
+}
+
+test "external lake WAL group yields an owned prefix on root expiry without swallowing failures" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const objectstore = @import("objectstore");
+    const Indexed = @import("wal/indexed_object_store.zig").IndexedObjectStore;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var faults = objectstore.ScriptedFaultClient.init(alloc, client);
+    defer faults.deinit();
+    const Delay = struct {
+        now: u64 = std.time.ns_per_s,
+        step: u64 = 0,
+        faults: *objectstore.ScriptedFaultClient,
+        pages: usize = 0,
+        fail_after: ?usize = null,
+        fn reader(self: *@This(), reader_alloc: A, owner: *Indexed, start: u64, context: Context) !wal.Store.Reader {
+            return .{
+                .wal = .{ .alloc = reader_alloc, .client = self.faults.client(), .bucket = try reader_alloc.dupe(u8, "db"), .prefix = try reader_alloc.dupe(u8, "probe"), .owns_client = false },
+                .cursor = try owner.capturedReader(reader_alloc, "probe", try owner.captureRead("probe"), .{ .start_lsn = start, .end_lsn = 4, .max_record_bytes = 32 * 1024 * 1024 }),
+                .position = start - 1,
+                .context = context,
+            };
+        }
+        fn clock(raw: ?*const anyopaque) u64 {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return self.now;
+        }
+        fn page(_: *anyopaque, _: []const u8, key: []const u8) bool {
+            return std.mem.indexOf(u8, key, "/pages/") != null;
+        }
+        fn advance(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.now += self.step;
+            self.pages += 1;
+            if (self.fail_after) |maximum| if (self.pages == maximum) {
+                self.faults.get_filter = .{ .ptr = self, .matches = page };
+                self.faults.next_get = .{ .fail_before = error.ArtifactIntegrityMismatch };
+                return;
+            };
+            self.arm();
+        }
+        fn arm(self: *@This()) void {
+            self.faults.get_filter = .{ .ptr = self, .matches = page };
+            self.faults.next_get = .{ .complete_then_callback = .{ .ptr = self, .run = advance } };
+        }
+    };
+    var delay: Delay = .{ .faults = &faults };
+    var indexed = try Indexed.init(a, faults.client(), "db", "probe");
+    defer indexed.deinit();
+    indexed.managed_reads = true;
+    indexed.read_clock = .{ .ptr = &delay, .now_fn = Delay.clock };
+    const padding = try a.alloc(u8, 3 * 1024 * 1024);
+    @memset(padding, 'x');
+    for (1..5) |n| {
+        const payload = try std.json.Stringify.valueAlloc(a, .{ .batch_id = try std.fmt.allocPrint(a, "b{d}", .{n}), .source = "s", .epoch = "1", .checkpoint = try std.fmt.allocPrint(a, "{d}", .{n}), .expected_checkpoint = if (n == 1) null else try std.fmt.allocPrint(a, "{d}", .{n - 1}), .key_fields = .{"id"}, .changes = .{.{ .op = "upsert", .row = .{ .id = n, .body = padding } }} }, .{});
+        _ = try indexed.appendIdempotent("probe", 0, payload, try std.fmt.allocPrint(a, "op{d}", .{n}));
+    }
+    const cut = try indexed.captureRead("probe");
+    var measuring = try indexed.capturedReader(a, "probe", cut, .{ .start_lsn = 1, .end_lsn = 4, .max_record_bytes = 32 * 1024 * 1024 });
+    defer measuring.deinit();
+    const start_gets = faults.get_attempts;
+    _ = (try measuring.next(a)).?;
+    const reads = faults.get_attempts - start_gets;
+    try std.testing.expect(reads > 0);
+    delay.step = 14 * std.time.ns_per_s / reads;
+    delay.arm();
+    // A one-record drain works under this provider latency.
+    var single = try indexed.capturedReader(a, "probe", try indexed.captureRead("probe"), .{ .start_lsn = 1, .end_lsn = 4, .max_record_bytes = 32 * 1024 * 1024 });
+    defer single.deinit();
+    const single_start = delay.now;
+    _ = (try single.next(a)).?;
+    try std.testing.expect(delay.now - single_start < 30 * std.time.ns_per_s);
+    var covered: u64 = 0;
+    for (0..2) |_| {
+        var adapter = try delay.reader(a, &indexed, covered + 1, .{});
+        defer adapter.deinit();
+        const result = (try readGroup(a, &adapter, max_group_changes, max_group_payload_bytes)).?;
+        try std.testing.expectEqual(covered + 1, result.first_lsn);
+        try std.testing.expectEqual(@as(usize, 2), result.records);
+        covered = result.last_lsn;
+    }
+    try std.testing.expectEqual(@as(u64, 4), covered);
+    // Root expiry is a yield only after at least one record is fully owned.
+    delay.step = 40 * std.time.ns_per_s / reads;
+    var empty = try delay.reader(a, &indexed, 1, .{});
+    defer empty.deinit();
+    try std.testing.expectError(error.LakeOverlayCoverageUnavailable, readGroup(a, &empty, max_group_changes, max_group_payload_bytes));
+    // A caller deadline that coincides with root expiry must remain fatal.
+    delay.step = 14 * std.time.ns_per_s / reads;
+    const Deadline = struct {
+        delay: *Delay,
+        start: u64,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.delay.now - self.start >= 30 * std.time.ns_per_s) return error.DeadlineExceeded;
+        }
+    };
+    var deadline: Deadline = .{ .delay = &delay, .start = delay.now };
+    var canceled = try delay.reader(a, &indexed, 1, .{ .checkpoint = .{ .ptr = &deadline, .check = Deadline.check } });
+    defer canceled.deinit();
+    try std.testing.expectError(error.DeadlineExceeded, readGroup(a, &canceled, max_group_changes, max_group_payload_bytes));
+    // Integrity/transport failures are never converted into successful prefixes.
+    delay.step = 0;
+    delay.pages = 0;
+    delay.fail_after = reads;
+    delay.arm();
+    var corrupted = try delay.reader(a, &indexed, 1, .{});
+    defer corrupted.deinit();
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, readGroup(a, &corrupted, max_group_changes, max_group_payload_bytes));
 }
