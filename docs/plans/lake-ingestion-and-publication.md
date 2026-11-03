@@ -638,7 +638,9 @@ original snapshot and sequence numbers with EXISTING status. Manifests that
 carry partitions or column bounds are never merged. Without merging, each commit
 and each reader's planning step would grow with the total number of commits.
 Commits also trim `metadata-log` to the newest
-`write.metadata.previous-versions-max` entries (default 100); managed recovery
+`write.metadata.previous-versions-max` entries (default 100). As in Iceberg,
+zero and negative signed 32-bit values retain one previous file; larger positive
+values remain valid. Malformed values fail the commit. Managed recovery
 uses the immutable record chain, not that log. The writer
 supports flat primitive scalar schemas; unsupported nested and decimal schemas
 fail admission explicitly instead of dropping fields or encoding JSON as text.
@@ -755,8 +757,14 @@ must share the durable artifact/pin authority; moving it requires a coordinated
 reader drain and retention migration. Snapshot readers need write access to
 that shared pin lane even when source data credentials are read-only. Renewal
 failures or expired readers fail
-closed, including during cached reads. A full reader mark pass precedes any
-shared-file deletion. Native ownership markers bind URI, content digest and
+closed, including during cached reads. Before shared-file deletion, the managed
+catalog requires a complete reachability proof bound to the exact metadata
+document. It checkpoints bootstrap work, caches immutable manifest inventories,
+and shares that proof between vacuum selection and authoritative retirement.
+Retirement-only HEAD changes reuse the proof. Append-only root changes extend
+partially completed work; root removal or replacement rebuilds the exact set
+from cached inventories. Every retirement still uses the current HEAD CAS.
+Native ownership markers bind URI, content digest and
 ETag; deletes are conditional on that original ETag. Unmarked external files,
 legacy files, catalog history and orphan uploads outside retired snapshot graphs
 are retained. This is intentionally conservative migration behavior.
