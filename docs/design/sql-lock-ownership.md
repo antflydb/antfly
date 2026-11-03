@@ -385,3 +385,10 @@ No original SQL parity disposition is changed by these foundations.
 The preceding main merge preserves published LEANN data protocol 25 and assigns
 SQL index, schema, drop, and external-transaction controls distinct floors 26, 27,
 28, and 29. Earlier qualification entries record the pre-merge unpublished floors.
+
+The main integration through `3b712f2243` preserves all 80 published metadata
+transition tags, including completion references at tag 81 and completion
+capability floors 69, 71, and 78. The combined unpublished SQL profile now
+requires capability 154 for command fences (153 for native lock scopes); its
+private transition tags occupy 82–95. Earlier qualification entries retain
+the development capability numbers used when those checks ran.

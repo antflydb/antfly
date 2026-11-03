@@ -1421,6 +1421,10 @@ pub const MetadataHttpClient = struct {
     /// One raw binary command, one attempt. A successful HTTP response is not
     /// acceptance until its durable observation matches the retained command.
     pub fn submitSchemaValidationControlled(self: *MetadataHttpClient, base_uri: []const u8, command: []const u8, remaining_ms: u32, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
+        return self.submitSchemaValidationWithControl(base_uri, command, remaining_ms, setting_admin, .{ .cancellation = cancellation });
+    }
+    fn submitSchemaValidationWithControl(self: *MetadataHttpClient, base_uri: []const u8, command: []const u8, remaining_ms: u32, setting_admin: bool, control: CatalogControl) ![]u8 {
+        const cancellation = control.cancellation;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         if (remaining_ms == 0) return error.Timeout;
         const grant = try self.prepareSchemaValidationGrant(command, setting_admin);
@@ -1428,7 +1432,7 @@ pub const MetadataHttpClient = struct {
         var delivery: http_common.RequestDeliveryTracker = .{};
         // This call just minted the grant. Do not hash a potentially large
         // binary admission again merely to verify our own fresh signature.
-        return self.submitSchemaValidationGranted(base_uri, command, grant, remaining_ms, setting_admin, cancellation, &delivery, false);
+        return self.submitSchemaValidationGranted(base_uri, command, grant, remaining_ms, setting_admin, cancellation, &delivery, false, control.submitted);
     }
 
     /// Preparation has no external side effects. A durable producer must save
@@ -1447,10 +1451,10 @@ pub const MetadataHttpClient = struct {
     /// `delivery` records transport provenance, not metadata acceptance. Only
     /// an exact durable receipt proves acceptance; absence is still unknown.
     pub fn submitSchemaValidationWithGrantControlled(self: *MetadataHttpClient, base_uri: []const u8, command: []const u8, grant: []const u8, remaining_ms: u32, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation, delivery: *http_common.RequestDeliveryTracker) ![]u8 {
-        return self.submitSchemaValidationGranted(base_uri, command, grant, remaining_ms, setting_admin, cancellation, delivery, true);
+        return self.submitSchemaValidationGranted(base_uri, command, grant, remaining_ms, setting_admin, cancellation, delivery, true, null);
     }
 
-    fn submitSchemaValidationGranted(self: *MetadataHttpClient, base_uri: []const u8, command: []const u8, grant: []const u8, remaining_ms: u32, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation, delivery: *http_common.RequestDeliveryTracker, verify_grant: bool) ![]u8 {
+    fn submitSchemaValidationGranted(self: *MetadataHttpClient, base_uri: []const u8, command: []const u8, grant: []const u8, remaining_ms: u32, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation, delivery: *http_common.RequestDeliveryTracker, verify_grant: bool, submitted: ?*bool) ![]u8 {
         delivery.markNotSent();
         const ledger = @import("schema_validation_ledger.zig");
         const receipts = @import("schema_validation_receipt.zig");
@@ -1467,7 +1471,7 @@ pub const MetadataHttpClient = struct {
         var parsed = ledger.parseCommand(self.alloc, command) catch |err| return if (err == error.OutOfMemory) err else error.InvalidGenerationPublication;
         defer parsed.deinit();
         _ = try ledger.commandLookup(parsed.value);
-        const bytes = try self.executeLifecycleSubmission(base_uri, routes.Routes.internal_schema_validation, command, grant, remaining_ms, cancellation, delivery, 16 * 1024);
+        const bytes = try self.executeLifecycleSubmission(base_uri, routes.Routes.internal_schema_validation, command, grant, remaining_ms, cancellation, delivery, 16 * 1024, submitted);
         defer self.alloc.free(bytes);
         var observed = std.json.parseFromSlice(receipts.Observation, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
         defer observed.deinit();
@@ -1476,7 +1480,11 @@ pub const MetadataHttpClient = struct {
         return self.alloc.dupe(u8, bytes) catch return error.MetadataMutationOutcomeUnknown;
     }
 
-    fn executeLifecycleSubmission(self: *MetadataHttpClient, base_uri: []const u8, path: []const u8, command: []const u8, grant: []const u8, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation, delivery: *http_common.RequestDeliveryTracker, max_response_bytes: usize) ![]u8 {
+    fn executeLifecycleSubmission(self: *MetadataHttpClient, base_uri: []const u8, path: []const u8, command: []const u8, grant: []const u8, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation, delivery: *http_common.RequestDeliveryTracker, max_response_bytes: usize, submitted: ?*bool) ![]u8 {
+        var possible_submission = false;
+        defer if (possible_submission) if (submitted) |observed| {
+            observed.* = true;
+        };
         const authority = @import("../system_catalog/setting_authority.zig");
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
@@ -1487,6 +1495,7 @@ pub const MetadataHttpClient = struct {
             .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = "false" },
             .{ .name = authority.header_name, .value = grant },
         };
+        possible_submission = true;
         delivery.markUnknown();
         var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{
             .method = .POST,
@@ -1500,6 +1509,7 @@ pub const MetadataHttpClient = struct {
             .max_response_bytes = max_response_bytes,
         }, self.internal_service) catch |err| {
             if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) {
+                possible_submission = false;
                 delivery.markNotSent();
                 return error.RaftMutationRequestNotSent;
             }
@@ -1511,6 +1521,7 @@ pub const MetadataHttpClient = struct {
             return error.MetadataMutationOutcomeUnknown;
         };
         if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) {
+            possible_submission = false;
             if (@import("schema_validation_read.zig").ownerReadHttpFailure(response.status, response.body)) |err| return err;
             return error.MetadataMutationOutcomeUnknown;
         }
@@ -1522,6 +1533,10 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn submitTableRetirementControlled(self: *MetadataHttpClient, base_uri: []const u8, command: []const u8, remaining_ms: u32, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
+        return self.submitTableRetirementWithControl(base_uri, command, remaining_ms, setting_admin, .{ .cancellation = cancellation });
+    }
+    fn submitTableRetirementWithControl(self: *MetadataHttpClient, base_uri: []const u8, command: []const u8, remaining_ms: u32, setting_admin: bool, control: CatalogControl) ![]u8 {
+        const cancellation = control.cancellation;
         if (!setting_admin) return error.Forbidden;
         if (remaining_ms == 0) return error.Timeout;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
@@ -1532,7 +1547,7 @@ pub const MetadataHttpClient = struct {
         const grant = try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .admin, command, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
         defer self.alloc.free(grant);
         var delivery: http_common.RequestDeliveryTracker = .{};
-        const bytes = try self.executeLifecycleSubmission(base_uri, routes.Routes.internal_table_retirement, command, grant, remaining_ms, cancellation, &delivery, 32768);
+        const bytes = try self.executeLifecycleSubmission(base_uri, routes.Routes.internal_table_retirement, command, grant, remaining_ms, cancellation, &delivery, 32768, control.submitted);
         errdefer self.alloc.free(bytes);
         var observed = std.json.parseFromSlice(@import("table_retirement_receipt.zig").Observation, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
         defer observed.deinit();
@@ -1542,13 +1557,28 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
-        return self.forwardSystemCatalogControlled(base_uri, input, forwarding, setting_admin, null);
+        return self.forwardSystemCatalogWithControl(base_uri, input, forwarding, setting_admin, .{});
     }
+    pub const CatalogControl = struct {
+        cancellation: ?*const http_common.RequestCancellation = null,
+        submitted: ?*bool = null,
+    };
     pub fn forwardSystemCatalogControlled(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
-        if (input == .schema_validation_submit) return self.submitSchemaValidationControlled(base_uri, input.schema_validation_submit, forwarding.remaining_ms, setting_admin, cancellation);
-        if (input == .table_retirement_submit) return self.submitTableRetirementControlled(base_uri, input.table_retirement_submit, forwarding.remaining_ms, setting_admin, cancellation);
+        return self.forwardSystemCatalogWithControl(base_uri, input, forwarding, setting_admin, .{ .cancellation = cancellation });
+    }
+    pub fn forwardSystemCatalogObserved(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool, submitted: ?*bool) ![]u8 {
+        return self.forwardSystemCatalogWithControl(base_uri, input, forwarding, setting_admin, .{ .submitted = submitted });
+    }
+    pub fn forwardSystemCatalogWithControl(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool, control: CatalogControl) ![]u8 {
+        const cancellation = control.cancellation;
+        if (input == .schema_validation_submit) return self.submitSchemaValidationWithControl(base_uri, input.schema_validation_submit, forwarding.remaining_ms, setting_admin, control);
+        if (input == .table_retirement_submit) return self.submitTableRetirementWithControl(base_uri, input.table_retirement_submit, forwarding.remaining_ms, setting_admin, control);
         if (input.isSchemaValidationCall()) return (try self.readSystemCatalog(base_uri, input, forwarding.remaining_ms, cancellation)).body;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        var possible_submission = false;
+        defer if (possible_submission) if (control.submitted) |observed| {
+            observed.* = true;
+        };
         if (input.requiresAdministrativeGrant() != setting_admin) return error.Forbidden;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
@@ -1567,8 +1597,12 @@ pub const MetadataHttpClient = struct {
             .{ .name = authority.header_name, .value = grant orelse "" },
         };
         var delivery: http_common.RequestDeliveryTracker = .{};
+        possible_submission = true;
         var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery, .cancellation = cancellation, .max_response_bytes = catalogResponseLimit(input) }, self.internal_service) catch |err| {
-            if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) return error.RaftMutationRequestNotSent;
+            if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) {
+                possible_submission = false;
+                return error.RaftMutationRequestNotSent;
+            }
             return error.MetadataMutationOutcomeUnknown;
         };
         defer response.deinit(self.alloc);
@@ -1579,6 +1613,7 @@ pub const MetadataHttpClient = struct {
         if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_unknown)) return error.MetadataMutationOutcomeUnknown;
         if (response.status >= 200 and response.status < 300 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed)) return self.alloc.dupe(u8, response.body);
         if (!std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) return error.MetadataMutationOutcomeUnknown;
+        possible_submission = false; // Authenticated owner proved non-admission.
         if (input.isRelationalIndexOwnerCall()) if (@import("relational_index_publication.zig").ownerAckHttpFailure(response.status, response.body)) |err| return err;
         if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
         return switch (response.status) {
@@ -5970,4 +6005,43 @@ test "SQL command fence remains bound to the authenticated internal HTTP body" {
     defer a.free(response);
     try std.testing.expectEqualStrings("{}", response);
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}
+
+test "SQL pgwire native metadata RPC preserves explicit submission evidence" {
+    const a = std.testing.allocator;
+    const Executor = struct {
+        outcome: []const u8,
+        status: u16 = 503,
+        disconnected: bool = false,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const fixture: *@This() = @ptrCast(@alignCast(ptr));
+            if (fixture.disconnected) {
+                request.delivery_tracker.?.markNotSent();
+                return error.ConnectionRefused;
+            }
+            const headers = try alloc.alloc(http_common.Header, 1);
+            headers[0] = .{ .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header), .value = try alloc.dupe(u8, fixture.outcome) };
+            return .{ .status = fixture.status, .headers = headers, .body = try alloc.dupe(u8, "{}") };
+        }
+    };
+    var fixture: Executor = .{ .outcome = routes.Routes.raft_mutation_outcome_not_proposed };
+    var client = MetadataHttpClient.init(a, .{ .ptr = &fixture, .vtable = &.{ .execute = Executor.execute } });
+    const input: @import("../system_catalog/server_call.zig").Call = .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "evidence" } } };
+    const forwarding: raft_mutation_forwarding.Context = .{ .remaining_ms = 1000, .forwards_remaining = 0, .campaign_allowed = false };
+    var submitted = false;
+    try std.testing.expectError(error.NotLeader, client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted));
+    try std.testing.expect(!submitted);
+    fixture.outcome = routes.Routes.raft_mutation_outcome_unknown;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted));
+    try std.testing.expect(submitted);
+    submitted = false;
+    fixture.disconnected = true;
+    try std.testing.expectError(error.RaftMutationRequestNotSent, client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted));
+    try std.testing.expect(!submitted);
+    fixture.disconnected = false;
+    fixture.status = 200;
+    fixture.outcome = routes.Routes.raft_mutation_outcome_committed;
+    const response = try client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted);
+    defer a.free(response);
+    try std.testing.expect(submitted);
 }

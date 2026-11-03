@@ -28549,6 +28549,7 @@ const RemoteMetadataSource = struct {
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
+                .tracks_sql_submission = true,
                 .supports_query_definitions = true,
                 .supports_index_annotations = true,
                 .supports_sql_views = true,
@@ -30364,10 +30365,7 @@ const RemoteMetadataSource = struct {
                     bounded.remaining_ms = @intCast(@min(bounded.remaining_ms, @max(1, (deadline - now) / std.time.ns_per_ms)));
                 }
                 var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(ctx.request.cancellation);
-                const bytes = if (ctx.input == .schema_validation_submit)
-                    try client.forwardSystemCatalogControlled(base_uri, ctx.input, bounded, ctx.request.setting_admin, &cancellation)
-                else
-                    try client.forwardSystemCatalog(base_uri, ctx.input, bounded, ctx.request.setting_admin);
+                const bytes = try client.forwardSystemCatalogWithControl(base_uri, ctx.input, bounded, ctx.request.setting_admin, .{ .cancellation = &cancellation, .submitted = ctx.request.sql_completion_submission });
                 defer client.alloc.free(bytes);
                 if (@import("builtin").is_test) {
                     // Real HTTP, metadata preflight, proposal, committed apply

@@ -64,6 +64,7 @@ const gliner_decision_head = @import("gliner_decision_head.zig");
 const gliner_encoder = @import("../models/gliner_encoder.zig");
 const gliner_boundary_model = @import("../models/gliner_boundary.zig");
 const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
+const gliner_specialty = @import("../models/gliner_specialty_qualification.zig");
 const gliner_head_graph = @import("gliner_head_graph.zig");
 const kernel_jit = @import("../graph/kernel_jit.zig");
 const graph_runtime = @import("../graph/runtime.zig");
@@ -378,8 +379,19 @@ fn verifyGlinerDecisionSnapshot(bytes: []const u8, expected: ?gliner_decide_qual
         return error.GlinerDecisionArtifactMismatch;
 }
 
+fn validateSpecialtyWeightConfig(mf: *const manifest_mod.ModelManifest, store: tensor_store_mod.TensorStore, identity: ?gliner_decide_qualification.Identity) !void {
+    if (mf.gliner_specialty_artifact_hint == null or mf.gliner_specialty_profile != null) return;
+    // Hash outside discovery/request listing and before any encoder/head runs.
+    // Reuse an already captured identity when a modern declaration supplied it.
+    const weight = if (identity) |captured| captured.weight else blk: {
+        const reader = store.singleSafetensorsReader() orelse return;
+        break :blk gliner_decide_qualification.Digest.ofMapped(reader.file_bytes);
+    };
+    try gliner_specialty.requireKnownWeightConfig(weight, mf.gliner_span_config_digest);
+}
+
 fn captureGlinerDecisionIdentity(mf: *const manifest_mod.ModelManifest, store: tensor_store_mod.TensorStore) !?gliner_decide_qualification.Identity {
-    if (mf.gliner_architecture != .span or !mf.gliner_span_declared) return null;
+    if (mf.gliner_architecture != .span or (!mf.gliner_span_declared and mf.gliner_specialty_profile == null)) return null;
     const family: gliner_decide_qualification.EncoderFamily = switch (mf.gliner_span_encoder_family) {
         .deberta => .deberta,
         .modern_bert => .modern_bert,
@@ -440,6 +452,21 @@ fn captureGlinerDecisionIdentity(mf: *const manifest_mod.ModelManifest, store: t
             .special_tokens_map = mf.gliner_span_special_tokens_digest,
         },
     };
+}
+
+/// An exact reviewed specialty weight must retain the profile derived from all
+/// sealed sidecars. Size gates the complete-file digest so unrelated models
+/// pay no hashing cost; same-size nonmatching artifacts remain unqualified.
+fn requirePinnedSpecialtySidecars(mf: *const manifest_mod.ModelManifest, store: tensor_store_mod.TensorStore) !void {
+    // The ordinary qualified path below already authenticates known profiles;
+    // avoid hashing their multi-gigabyte weight twice.
+    if (mf.gliner_specialty_profile != null) return;
+    const reader = store.singleSafetensorsReader() orelse return;
+    if (gliner_specialty.profileForWeightSize(@intCast(reader.file_bytes.len)) == null) return;
+    try gliner_specialty.requirePinnedWeightProfile(
+        mf.gliner_specialty_profile,
+        gliner_specialty.Digest.ofMapped(reader.file_bytes),
+    );
 }
 
 fn shardedSafetensorsTotalBytes(allocator: std.mem.Allocator, index_path: []const u8) !u64 {
@@ -579,6 +606,22 @@ fn sessionPrefersImmutableGlinerF32Mps(
     return backend_type == .metal and arch_type == .gliner and task == .extractor;
 }
 
+fn applyQualifiedGlinerSpecialtyExecutionPolicy(arch_config: *ArchConfig, profile: gliner_specialty.Profile) !void {
+    if (profile != .pii) return;
+    if (arch_config.* != .gliner) return error.UnsupportedGlinerSpecialtyArtifact;
+    arch_config.gliner.metal_require_f32_weight_mirrors = true;
+}
+
+test "qualified PII specialty requires DeBERTa F32 mirrors without changing GLiGuard" {
+    var pii = ArchConfig{ .gliner = .{} };
+    try applyQualifiedGlinerSpecialtyExecutionPolicy(&pii, .pii);
+    try std.testing.expect(pii.gliner.metal_require_f32_weight_mirrors);
+
+    var guard = ArchConfig{ .gliner = .{} };
+    try applyQualifiedGlinerSpecialtyExecutionPolicy(&guard, .gliguard);
+    try std.testing.expect(!guard.gliner.metal_require_f32_weight_mirrors);
+}
+
 /// Metal mirror/cache and graph-plan scratch amounts that ModelManager must
 /// reserve for native DeBERTa and GLiNER sessions. An absent reranker
 /// architecture hint is treated conservatively because GGUF metadata can still
@@ -607,11 +650,40 @@ pub fn metalDebertaFastPathAdmissionAmounts(mf: manifest_mod.ModelManifest) runt
         .vocab_size = mf.bert_vocab_size,
         .max_position_embeddings = mf.max_position_embeddings,
         .num_labels = mf.num_labels,
+        .metal_require_f32_weight_mirrors = mf.gliner_specialty_profile == .pii,
     }, gliner_deberta or mf.model_type == .reranker);
     return .{
         .backend_weight_bytes = reservation.persistent_bytes,
         .backend_scratch_bytes = reservation.scratch_bytes,
     };
+}
+
+test "PII specialty Metal admission reserves required DeBERTa F32 mirrors" {
+    const mf = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .gliner_model_type = "gliner2",
+        .gliner_span_encoder_family = .deberta,
+        .gliner_specialty_profile = .pii,
+        .hidden_size = 768,
+        .num_hidden_layers = 12,
+        .num_attention_heads = 12,
+        .intermediate_size = 3072,
+        .bert_vocab_size = 250112,
+        .max_position_embeddings = 512,
+    };
+    const actual = metalDebertaFastPathAdmissionAmounts(mf);
+    const expected = deberta_arch.metalFastPathReservationBytes(.{
+        .hidden_size = mf.hidden_size,
+        .num_hidden_layers = mf.num_hidden_layers,
+        .num_attention_heads = mf.num_attention_heads,
+        .intermediate_size = mf.intermediate_size,
+        .vocab_size = mf.bert_vocab_size,
+        .max_position_embeddings = mf.max_position_embeddings,
+        .num_labels = mf.num_labels,
+        .metal_require_f32_weight_mirrors = true,
+    }, true);
+    try std.testing.expectEqual(expected.persistent_bytes, actual.backend_weight_bytes);
+    try std.testing.expectEqual(expected.scratch_bytes, actual.backend_scratch_bytes);
 }
 
 pub const GlinerBoundaryResidentLoadAmounts = struct {
@@ -891,6 +963,7 @@ fn createNativeSessionForCudaUpload(allocator: std.mem.Allocator, model_path: []
     var store = try tensor_store_mod.openFromManifest(allocator, mf);
     var store_owned = true;
     errdefer if (store_owned) store.deinit();
+    try requirePinnedSpecialtySidecars(&mf, store);
     if (arch_config == .modern_bert) {
         if (arch_config.modern_bert.laya) |config| try @import("../models/laya.zig").validateWeights(store, config, arch_config.modern_bert);
         if (requiresModernBertSpanClassifier(mf) and store.singleSafetensorsReader() != null) {
@@ -918,6 +991,15 @@ fn createNativeSessionForCudaUpload(allocator: std.mem.Allocator, model_path: []
     }
     const boundary_identity = if (arch_config == .gliner_boundary) try captureBoundaryIdentity(&mf, store) else null;
     const gliner_decision_identity = try captureGlinerDecisionIdentity(&mf, store);
+    try validateSpecialtyWeightConfig(&mf, store, gliner_decision_identity);
+    if (mf.gliner_specialty_profile) |profile| {
+        const identity = gliner_decision_identity orelse return error.UnsupportedGlinerSpecialtyArtifact;
+        if (try gliner_specialty.require(identity) != profile) return error.UnsupportedGlinerSpecialtyArtifact;
+        try applyQualifiedGlinerSpecialtyExecutionPolicy(&arch_config, profile);
+        // Original F32 specialty artifacts must not be silently staged into
+        // the generic native direct-quant representation.
+        direct_quant_enabled = false;
+    }
     const keep_gliner_q8 = retain_gliner_q8 and requiresModernBertSpanClassifier(mf) and ggufEncoderHasQuantizedTensors(store);
     if (keep_gliner_q8) {
         const identity = gliner_decision_identity orelse return error.UnsupportedGlinerDecisionArtifact;
@@ -1842,6 +1924,8 @@ fn createCudaSessionWithRequiredProfile(
     var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
     defer model_manifest.deinit();
     try model_manifest.requireRecognizedGlinerArchitecture();
+    if (model_manifest.gliner_specialty_profile) |profile|
+        try gliner_specialty.requireBackend(profile, .cuda);
     if (model_manifest.embedding_style == .embedding_gemma2)
         try cuda_compute_mod.preflightProfileDevice(.embedding_gemma2);
     if (model_manifest.gliner_boundary_bundle) |receipt| {
@@ -1959,7 +2043,11 @@ fn createCudaSessionWithRequiredProfile(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
-    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert;
+    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert or model_manifest.gliner_specialty_profile != null;
+    cuda_compute.qualified_span_fp32 = model_manifest.gliner_specialty_profile != null;
+    if (model_manifest.gliner_specialty_profile) |profile| {
+        std.log.info("gliner_specialty_cuda_policy profile={s} weights=f32 attention=f32 diagnostic_overrides=ignored", .{@tagName(profile)});
+    }
     cuda_compute.gliner_encoder_attention = cuda_profile == .gliner25_modern_bert;
     cuda_compute.gliner_boundary_inference = cuda_profile == .gliner25_boundary;
     cuda_compute.gliner_mixed_attention = cuda_compute.gliner_encoder_attention and (gliner_precision == .fp16 or gliner_precision == .bf16);
@@ -2603,6 +2691,7 @@ fn createGpuHostedSessionWithTaskOverride(
 
     const resident_prefix: []const u8 = if (mf.safetensors_path != null or mf.safetensors_index_path != null or mf.gguf_path != null) blk: {
         tensor_store = try tensor_store_mod.openFromManifest(allocator, mf);
+        try requirePinnedSpecialtySidecars(&mf, tensor_store.?);
         if (arch_config == .modern_bert) {
             if (arch_config.modern_bert.laya) |config| try @import("../models/laya.zig").validateWeights(tensor_store.?, config, arch_config.modern_bert);
         }
@@ -2612,6 +2701,17 @@ fn createGpuHostedSessionWithTaskOverride(
         }
         if (arch_config == .embedding_gemma2) try embedding_gemma2_arch.validateWeights(allocator, tensor_store.?, arch_config.embedding_gemma2);
         gliner_decision_identity = try captureGlinerDecisionIdentity(&mf, tensor_store.?);
+        try validateSpecialtyWeightConfig(&mf, tensor_store.?, gliner_decision_identity);
+        if (mf.gliner_specialty_profile) |profile| {
+            const identity = gliner_decision_identity orelse return error.UnsupportedGlinerSpecialtyArtifact;
+            if (try gliner_specialty.require(identity) != profile) return error.UnsupportedGlinerSpecialtyArtifact;
+            try gliner_specialty.requireBackend(profile, switch (backend_type) {
+                .metal => .metal,
+                .cuda => .cuda,
+                else => .other,
+            });
+            try applyQualifiedGlinerSpecialtyExecutionPolicy(&arch_config, profile);
+        }
         const source = (try tensor_store.?.weightSource()) orelse return error.NoDenseWeightSource;
         const all_names = try source.listNames(allocator);
         defer allocator.free(all_names);
@@ -2894,7 +2994,7 @@ fn detectArchitectureWithGgufFile(
         if (try detectModelType(allocator, config_bytes)) |model_type| {
             defer allocator.free(model_type);
             if (std.mem.eql(u8, model_type, "extractor")) {
-                if (mf.gliner_architecture == .span and mf.gliner_span_declared)
+                if (mf.gliner_architecture == .span and (mf.gliner_span_declared or mf.gliner_specialty_profile != null))
                     try verifyGlinerDecisionSnapshot(config_bytes, mf.gliner_span_config_digest);
                 const wrapper = try parseLegacyGlinerWrapper(allocator, config_bytes);
                 if (mf.gliner_span_encoder_family == .modern_bert) {
@@ -3181,6 +3281,10 @@ fn applyGlinerLabelTokenIds(allocator: std.mem.Allocator, model_path: []const u8
         cfg.classification_token_id = mf.gliner_token_c;
     if (mf.gliner_token_e != 0) cfg.entity_token_id = mf.gliner_token_e;
     if (mf.gliner_token_r != 0) cfg.relation_token_id = mf.gliner_token_r;
+
+    // Exact specialty markers come from the authenticated tokenizer snapshot.
+    // Do not reread an unpinned legacy override after capturing that identity.
+    if (mf.gliner_specialty_profile != null) return;
 
     const at_path = try std.fmt.allocPrint(allocator, "{s}/added_tokens.json", .{model_path});
     defer allocator.free(at_path);
@@ -5656,6 +5760,7 @@ fn sessionDirectQuantEnabled(
     manifest: manifest_mod.ModelManifest,
     arch_config: ArchConfig,
 ) bool {
+    if (manifest.gliner_specialty_profile != null) return false;
     if (arch_config == .gliner_boundary) {
         return if (manifest.gliner_boundary_bundle) |receipt| switch (receipt.value.precision) {
             .q8_0, .q4_0, .q4_k => true,
@@ -8455,6 +8560,24 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
     };
 }
 
+pub const CudaAllocationStats = struct {
+    limit: usize,
+    live: usize,
+    peak: usize,
+};
+
+/// Physical CUDA buffers owned by the session, including weights and cached
+/// temporaries. Peak spans the context lifetime; driver/library-private memory
+/// is outside this meter. Call while holding the session execution lock.
+pub fn getCudaAllocationStats(session: Session) ?CudaAllocationStats {
+    if (comptime !build_options.enable_cuda) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .cuda) return null;
+    const value = self.backend_data.cuda.compute.allocationStats();
+    return .{ .limit = value.limit, .live = value.live, .peak = value.peak };
+}
+
 /// Drain any buffered non-blocking CUDA op-profile events into the compute's
 /// stat counters. Call this after a request finishes (before reading stats) so
 /// the profiler's single host sync happens off the hot path. No-op when the
@@ -9488,6 +9611,42 @@ pub fn getGlinerDecisionIdentity(session: Session) !gliner_decide_qualification.
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     if (!self.gliner_decision_identity_sealed) return error.MissingGlinerDecisionIdentity;
     return self.gliner_decision_identity orelse error.MissingGlinerDecisionIdentity;
+}
+
+/// Specialty serving uses the same immutable snapshot and tokenizer seal as
+/// Decide, but has independent task and backend qualification.
+pub fn getGlinerSpecialtyIdentity(session: Session) !gliner_specialty.Identity {
+    const identity = try getGlinerDecisionIdentity(session);
+    const profile = try gliner_specialty.require(identity);
+    try gliner_specialty.requireBackend(profile, switch (session.backend()) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        else => .other,
+    });
+    return identity;
+}
+
+test "GLiNER specialty sealed identity accepts native Metal and CUDA sessions" {
+    inline for (.{ gliner_specialty.Profile.pii, gliner_specialty.Profile.gliguard }) |profile| {
+        var arch = ArchSession{
+            .allocator = std.testing.allocator,
+            .arch_config = .{ .deberta = .{} },
+            .task = .extractor,
+            .gliner_decision_identity = gliner_specialty.pinnedIdentity(profile),
+            .gliner_decision_identity_sealed = true,
+            .backend_type = .native,
+            // Identity queries inspect metadata only, without creating a device.
+            .backend_data = .{ .native = .{ .allocator = std.testing.allocator, .resident_weights = .empty, .lazy_weights = .empty } },
+        };
+        const session = Session{ .ptr = &arch, .vtable = &arch_vtable };
+        inline for (.{ BackendType.native, BackendType.metal, BackendType.cuda }) |backend| {
+            arch.backend_type = backend;
+            try std.testing.expectEqual(profile, try gliner_specialty.require(try getGlinerSpecialtyIdentity(session)));
+        }
+        arch.gliner_decision_identity_sealed = false;
+        try std.testing.expectError(error.MissingGlinerDecisionIdentity, getGlinerSpecialtyIdentity(session));
+    }
 }
 
 test "GLiNER decision identity seals only the exact tokenizer snapshot" {

@@ -588,14 +588,21 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     defer if (lake_commit) |*prepared| prepared.deinit(server);
     // Physical identity is immutable and never reused; native schema CAS also
     // fences concurrent schema changes. Never replay an uncertain submission.
-    const version = submitSchema(server, context, alloc, table.name, table.table_id, native.version, updated, retirement, validation, guard) catch |err| {
+    const completion_owner: operation.SQLCompletionOwner = .{ .id = table.table_id, .schema_version = if (validation) native.version else std.math.add(u32, native.version, 1) catch return error.SqlLimitExceeded };
+    try @import("sql_completion.zig").prepareMetadataWithContext(context, completion_owner);
+    var submitted = false;
+    var observed_context = context;
+    observed_context.sql_completion_submission = &submitted;
+    const version = submitSchema(server, observed_context, alloc, table.name, table.table_id, native.version, updated, retirement, validation, guard) catch |err| {
+        if (!submitted) try @import("sql_completion.zig").rejectMetadataBeforeSubmission(context, completion_owner);
+        try @import("sql_completion.zig").rejectMetadataWithContext(context, completion_owner, err);
         if (err == error.ForeignKeyReferenced) return error.SqlDependentConstraint;
-        if (ddl.concurrently and (err == error.MetadataMutationOutcomeUnknown or err == error.OutOfMemory)) {
+        if (ddl.concurrently and (err == error.MetadataMutationOutcomeUnknown or (err == error.OutOfMemory and submitted))) {
             receipt.?.state = .admission_unknown;
             receipt.?.diagnostic = "Index DDL admission is unresolved. Inspect this table ID and schema version through /indexes before retrying; do not replay the DDL.";
             return .{ .mutation_outcome = null, .receipt = receipt };
         }
-        if (err == error.MetadataMutationOutcomeUnknown or err == error.OutOfMemory) return error.SqlMutationOutcomeUnknown;
+        if (err == error.MetadataMutationOutcomeUnknown or (err == error.OutOfMemory and submitted)) return error.SqlMutationOutcomeUnknown;
         return err;
     };
     if (lake_commit) |*prepared| server.activateLakeCommit(prepared);
@@ -662,9 +669,25 @@ fn rewriteSchemaWithPolicies(server: *server_mod.ApiHttpServer, identity: ?serve
     receipt.restore_job_id = try std.fmt.allocPrint(alloc, "{d}", .{job_id});
     // Shared native restore machinery reserves the entire dependency cohort,
     // transforms into unpublished storage, validates, and publishes atomically.
-    var response = server.handleSchemaRewriteWithPolicies(table.*, schema, receipt.idempotency_key, identity, context, policies, guard) catch |err| return rewriteCallFailure(receipt, err);
+    const completion_owner: operation.SQLCompletionOwner = .{ .id = job_id, .schema_version = target_version, .kind = .restore };
+    try @import("sql_completion.zig").prepareMetadataWithContext(context, completion_owner);
+    var submitted = false;
+    var observed_context = context;
+    observed_context.sql_completion_submission = &submitted;
+    var response = server.handleSchemaRewriteWithPolicies(table.*, schema, receipt.idempotency_key, identity, observed_context, policies, guard) catch |err| {
+        if (!submitted) try @import("sql_completion.zig").rejectMetadataBeforeSubmission(context, completion_owner);
+        try @import("sql_completion.zig").rejectMetadataWithContext(context, completion_owner, err);
+        return rewriteCallFailure(receipt, err, submitted);
+    };
     defer response.deinit(server.alloc);
-    return rewriteResponse(alloc, response.status, response.body, receipt);
+    if (!submitted) {
+        try @import("sql_completion.zig").rejectMetadataBeforeSubmission(context, completion_owner);
+        if (response.status >= 500) return error.SqlWriteCapacityUnavailable;
+    }
+    return rewriteResponse(alloc, response.status, response.body, receipt) catch |err| {
+        try @import("sql_completion.zig").rejectMetadataWithContext(context, completion_owner, err);
+        return err;
+    };
 }
 
 fn rewriteResponse(alloc: std.mem.Allocator, status: u16, body_bytes: []const u8, input_receipt: catalog.DdlReceipt) !catalog.DdlOutcome {
@@ -704,8 +727,15 @@ fn unknownRewriteOutcome(input: catalog.DdlReceipt) catalog.DdlOutcome {
     return .{ .mutation_outcome = null, .receipt = receipt };
 }
 
-fn rewriteCallFailure(receipt: catalog.DdlReceipt, err: anyerror) anyerror!catalog.DdlOutcome {
+fn rewriteCallFailure(receipt: catalog.DdlReceipt, err: anyerror, submitted: bool) anyerror!catalog.DdlOutcome {
     std.log.warn("SQL schema rewrite failure err={s}", .{@errorName(err)});
+    // Before submission, even allocation/cancellation failures are definite.
+    // Preserve unknown outcomes only once persistence may have started.
+    if (!submitted) return switch (err) {
+        error.StoredDestinationAuthorizationRevoked => error.Forbidden,
+        error.GroupLeaderUnavailable => error.RestoreValidationPending,
+        else => err,
+    };
     // These errors are emitted before startRecoverable. Other errors may
     // occur after durable admission, including response-construction OOM.
     return switch (err) {
@@ -757,12 +787,14 @@ test "SQL rewrite response retains admitted and uncertain restore handles" {
     try std.testing.expectEqualStrings("41", unclassified.receipt.?.restore_job_id.?);
     try std.testing.expectEqual(.admission_unknown, (try rewriteResponse(alloc, 503, "{\"admission_outcome\":\"unknown\"}", receipt)).receipt.?.state);
     try std.testing.expectEqual(.admission_unknown, (try rewriteResponse(alloc, 503, "{malformed", receipt)).receipt.?.state);
-    try std.testing.expectError(error.RestoreValidationPending, rewriteCallFailure(receipt, error.RestoreValidationPending));
-    try std.testing.expectError(error.RestoreValidationPending, rewriteCallFailure(receipt, error.GroupLeaderUnavailable));
-    try std.testing.expectError(error.Forbidden, rewriteCallFailure(receipt, error.StoredDestinationAuthorizationRevoked));
-    try std.testing.expectError(error.UnsupportedSqlShape, rewriteCallFailure(receipt, error.RelationalRewriteTypeChange));
-    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, rewriteCallFailure(receipt, error.RelationalExpressionBudgetExceeded));
-    const response_oom = try rewriteCallFailure(receipt, error.OutOfMemory);
+    try std.testing.expectError(error.RestoreValidationPending, rewriteCallFailure(receipt, error.RestoreValidationPending, false));
+    try std.testing.expectError(error.RestoreValidationPending, rewriteCallFailure(receipt, error.GroupLeaderUnavailable, false));
+    try std.testing.expectError(error.Forbidden, rewriteCallFailure(receipt, error.StoredDestinationAuthorizationRevoked, false));
+    try std.testing.expectError(error.OutOfMemory, rewriteCallFailure(receipt, error.OutOfMemory, false));
+    try std.testing.expectError(error.DeadlineExceeded, rewriteCallFailure(receipt, error.DeadlineExceeded, false));
+    const response_oom = try rewriteCallFailure(receipt, error.OutOfMemory, true);
+    try std.testing.expectError(error.UnsupportedSqlShape, rewriteCallFailure(receipt, error.RelationalRewriteTypeChange, false));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, rewriteCallFailure(receipt, error.RelationalExpressionBudgetExceeded, false));
     try std.testing.expectEqual(.admission_unknown, response_oom.receipt.?.state);
     try std.testing.expectEqualStrings("41", response_oom.receipt.?.restore_job_id.?);
 }
@@ -815,6 +847,7 @@ fn retirementSnapshot(server: *server_mod.ApiHttpServer, context: operation.Requ
 }
 
 fn submitSchema(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, physical: []const u8, table_id: u64, expected_version: u32, body: []const u8, retirement: bool, validation: bool, guard: domain.RelationMutationGuard) !u32 {
+    try context.ensureActive();
     const next_version = if (validation) expected_version else std.math.add(u32, expected_version, 1) catch return error.SqlLimitExceeded;
     if (!retirement and !validation) {
         var private = context;
@@ -833,9 +866,11 @@ fn submitSchema(server: *server_mod.ApiHttpServer, context: operation.RequestCon
     const reader = server.table_reads orelse return error.UnsupportedSqlExecution;
     if (validation) {
         const writer = server.table_writes orelse return error.UnsupportedSqlExecution;
+        if (context.sql_completion_submission) |observed| observed.* = true;
         try @import("relational_constraint_recovery.zig").retry(alloc, reader, writer, snapshot.tables, snapshot.ranges, .{ .table_name = physical, .relational_schema_version = expected_version }, context);
         return expected_version;
     }
+    if (context.sql_completion_submission) |observed| observed.* = true;
     var replacement = try @import("relational_retirement_worker.zig").beginControlled(alloc, reader, snapshot.tables, snapshot.ranges, physical, body, false, context);
     defer replacement.deinit();
     try context.ensureActive();

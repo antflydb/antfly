@@ -410,7 +410,20 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     // Allocate every receipt field before durable admission. There must be no
     // fallible result construction after an accepted (or unknown) proposal.
     try context.ensureActive();
-    const accepted = try server.restore_job_store.startRecoverable(a, .{ .scope = .cluster, .source_kind = .empty_generation, .backup_id = &std.fmt.bytesToHex(digest, .lower), .location = try std.fmt.allocPrint(a, "metadata://empty-generation/{s}", .{std.fmt.bytesToHex(id, .lower)}), .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = idempotency_namespace, .idempotency_key = &key, .destination_authorization_principal = principal, .generation_plan_json = try std.json.Stringify.valueAlloc(a, plan, .{}) });
+    const location = try std.fmt.allocPrint(a, "metadata://empty-generation/{s}", .{std.fmt.bytesToHex(id, .lower)});
+    const generation_plan = try std.json.Stringify.valueAlloc(a, plan, .{});
+    const completion_owner: operation.SQLCompletionOwner = .{ .id = job_id, .schema_version = primary_schema.version, .kind = .restore };
+    try @import("sql_completion.zig").prepareMetadataWithContext(context, completion_owner);
+    context.ensureActive() catch |err| {
+        try @import("sql_completion.zig").rejectMetadataBeforeSubmission(context, completion_owner);
+        return err;
+    };
+    var submitted = false;
+    const accepted = server.restore_job_store.startRecoverableObserved(a, .{ .scope = .cluster, .source_kind = .empty_generation, .backup_id = &std.fmt.bytesToHex(digest, .lower), .location = location, .connection = "internal", .restore_mode = "overwrite", .table_names = names, .idempotency_namespace = idempotency_namespace, .idempotency_key = &key, .destination_authorization_principal = principal, .generation_plan_json = generation_plan }, true, &submitted) catch |err| {
+        if (!submitted) try @import("sql_completion.zig").rejectMetadataBeforeSubmission(context, completion_owner);
+        try @import("sql_completion.zig").rejectMetadataWithContext(context, completion_owner, err);
+        return err;
+    };
     server.schedulePendingRestoreJobs() catch {};
     var result = receipt;
     if (accepted == .unknown) {

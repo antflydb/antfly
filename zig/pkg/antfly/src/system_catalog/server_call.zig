@@ -113,6 +113,10 @@ pub const Call = union(enum) {
     table_retirement_owner_work: @import("../metadata/table_retirement_ledger.zig").Lookup,
     fk_generation_publication_begin: @import("../metadata/fk_generation_publication.zig").Plan,
     fk_generation_publication_mutate: @import("../metadata/fk_generation_publication.zig").Command,
+    sql_completion_ready: void,
+    sql_completion_reference: [16]u8,
+    sql_completion_reference_mutate: @import("../metadata/sql_completion_references.zig").Command,
+    fk_publication_completion: @import("../metadata/fk_generation_publication.zig").CompletionRequest,
     fk_generation_publication_status: u64,
     fk_generation_publication_work: u64,
     fk_generation_publication_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
@@ -232,8 +236,9 @@ pub const Call = union(enum) {
         var result = self;
         switch (result) {
             // These operations have their own independently joined native
-            // scope/decision identity. Membership activation is service work.
-            .sql_sequence_prepare, .sql_lock_read, .sql_lock_mutate, .sql_lock_outcome => return result,
+            // scope/decision identity. Membership activation and durable completion
+            // reference acknowledgements are service work, not new SQL effects.
+            .sql_sequence_prepare, .sql_completion_reference_mutate, .sql_lock_read, .sql_lock_mutate, .sql_lock_outcome => return result,
             .sql_sequence_counter_mutate, .sql_sequence_counter_outcome => |*request| {
                 if (request.request.command_fence) |old| {
                     if (!std.meta.eql(old, value)) return error.InvalidCatalogMutation;
@@ -267,7 +272,7 @@ pub const Call = union(enum) {
             .schema_validation_prepare, .schema_validation_status, .table_retirement_prepare, .table_retirement_submit, .table_retirement_receipt, .table_retirement_queue, .table_retirement_effects, .table_retirement_owner_work => true,
             .schema_validation_submit => |bytes| @import("../metadata/schema_validation_ledger.zig").requiresAdmissionAuthority(bytes),
             .sql_index_annotations, .sql_lock_read, .sql_lock_mutate, .sql_lock_outcome, .sql_prepared_read, .sql_prepared_mutate, .sql_prepared_outcome, .sql_authorization_read, .sql_authorization_mutate, .sql_authorization_outcome, .sql_type_snapshot, .sql_type_bindings, .sql_type_mutate, .sql_type_outcome, .sql_cast_snapshot, .sql_cast_mutate, .sql_cast_outcome, .sql_native_index_prepare, .sql_native_index_mutate, .sql_native_index_outcome, .sql_routine_snapshot, .sql_routine_mutate, .sql_routine_outcome, .sql_column_sequence_handoffs, .sql_sequence_prepare, .sql_sequence_counter_mutate, .sql_sequence_counter_outcome, .sql_view_mutate, .sql_sequence_snapshot, .sql_sequence_admission_head, .sql_sequence_mutate, .sql_sequence_outcome, .relation_replace, .relation_schema_mutate, .relation_description_mutate, .constraint_name_prepare, .constraint_name_check, .relational_index_status, .relational_index_prepare, .relational_index_begin, .native_memory_create => true,
-            .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
+            .sql_completion_reference_mutate, .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
     }
@@ -290,6 +295,9 @@ pub const Call = union(enum) {
             .table_retirement_queue,
             .table_retirement_effects,
             .table_retirement_owner_work,
+            .sql_completion_ready,
+            .sql_completion_reference,
+            .fk_publication_completion,
             .fk_generation_publication_status,
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
@@ -318,6 +326,14 @@ pub const Call = union(enum) {
             .fk_initial_create_work,
             .fk_initial_parent_decision,
             => true,
+            else => false,
+        };
+    }
+
+    /// Calls whose native owners report the first possible durable effect.
+    pub fn tracksSQLSubmission(self: @This()) bool {
+        return switch (self) {
+            .mutate, .relation_replace, .relation_schema_mutate, .fk_initial_create_begin, .fk_generation_publication_begin => true,
             else => false,
         };
     }
@@ -705,4 +721,14 @@ test "SQL command fence binds forwarded identities and rejects substitution and 
     const legacy = try std.json.Stringify.valueAlloc(a, .{ .nonce = old.nonce, .head = old.head }, .{});
     defer a.free(legacy);
     try std.testing.expectEqualStrings(legacy, encoded);
+}
+
+test "SQL pgwire native completion mutations require administrative grant and mutation forwarding" {
+    const write: Call = .{ .sql_completion_reference_mutate = undefined };
+    try std.testing.expect(write.requiresAdministrativeGrant());
+    try std.testing.expect(write.isMutation());
+    try std.testing.expect(!write.requiresSettingAuthorityReadGrant());
+    const read: Call = .{ .sql_completion_reference = @splat(1) };
+    try std.testing.expect(read.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!read.isMutation());
 }

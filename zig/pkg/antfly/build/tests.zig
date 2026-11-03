@@ -385,6 +385,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_command_fence_decoder_run.addArg("--require-no-skips");
     sql_command_fence_step.dependOn(&sql_command_fence_decoder_run.step);
 
+    const metadata_sql_sessions = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[4],
+        .filters = &.{ "metadata server can expose admin listener endpoints", "metadata SQL session routing" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-sql-sessions-test", "Verify persistent metadata API sessions and issuer routing")
+        .dependOn(&addFilteredTestRunArtifact(b, metadata_sql_sessions).step);
+    const metadata_sql_submission = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "SQL pgwire native metadata", "system catalog relation replacement preserves private grants", "table definition stamp distinguishes rejection", "metadata proposal receipt survives a post-acceptance dispatch failure" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-sql-submission-test", "Verify SQL metadata submission evidence and RPC outcomes")
+        .dependOn(&addFilteredTestRunArtifact(b, metadata_sql_submission).step);
     const media_status_owners = [_]*std.Build.Module{ metadata_unit_baseline_mods[8], metadata_unit_baseline_mods[2], api_http_runtime_test_mod };
     const media_status_filters = [_][]const []const u8{ &.{"runtime status"}, &.{"runtime status output counters"}, &.{ "runtime status media output counters", "index encoders expose local shard runtime status" } };
     for (media_status_owners, media_status_filters) |owner, filters| {
@@ -717,7 +731,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-schema-validation-submission-test", "Verify audited binary schema submissions, exact durable acceptance and grant isolation")
         .dependOn(&schema_submission_run.step);
     system_catalog_api_step.dependOn(&schema_submission_run.step);
-    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire" } });
+    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response" } });
     const sql_read_admission_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"SQL statement read admission"} });
     const sql_view_authority_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,

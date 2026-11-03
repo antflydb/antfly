@@ -164,103 +164,111 @@ const std = @import("std");
 /// dependent-column activation remains independently capability-gated.
 // CREATE copies native column annotations inside its guarded transaction.
 // Earlier creation-source readers must not silently discard these intents.
-pub const current_version: u16 = 138;
+// Main publishes completion capability floors 69, 71, and 78. The combined
+// unreleased SQL profile reserves floors above 78; historical notes above
+// describe its development sequence before this rebasing. Published transition
+// tag 81 remains SQL completion references; private SQL tags begin at 82.
+pub const current_version: u16 = 154;
 /// The unreleased combined catalog profile also decodes trigger-return contracts.
 /// Keep new declarations above the older scalar-only routine capability floor.
-pub const sql_trigger_function_version: u16 = 135;
+pub const sql_trigger_function_version: u16 = 151;
 /// SQL namespace ownership of native indexes and exact shared-journal outcomes.
-pub const sql_native_index_namespace_version: u16 = 135;
+pub const sql_native_index_namespace_version: u16 = 151;
 /// Private session decisions and standalone ownership share native recovery.
-pub const sql_connection_transactions_version: u16 = 136;
+pub const sql_connection_transactions_version: u16 = 152;
 /// Native lock scopes bind command authority and external-decision admission.
-pub const sql_lock_authority_version: u16 = 137;
+pub const sql_lock_authority_version: u16 = 153;
 /// Guarded catalog/counter identities retain outcomes before checking command liveness.
-pub const sql_command_fence_version: u16 = 138;
+pub const sql_command_fence_version: u16 = 154;
 /// Public catalog-operation recovery binds an immutable logical target label.
-pub const table_retirement_public_version: u16 = 135;
+pub const table_retirement_public_version: u16 = 151;
 /// Exact whole-table publication after physical barriers with no survivors.
-pub const table_retirement_direct_version: u16 = 134;
+pub const table_retirement_direct_version: u16 = 150;
 /// Root-bound all-survivor schema publication under the owning retirement.
-pub const table_retirement_survivors_version: u16 = 133;
+pub const table_retirement_survivors_version: u16 = 149;
 /// Root-bound source and parent plans with sparse, durable owner ACKs.
-pub const table_retirement_physical_version: u16 = 132;
+pub const table_retirement_physical_version: u16 = 148;
 /// Durable table-retirement reservations, dependency leases and recovery proof.
-pub const table_retirement_version: u16 = 131;
+pub const table_retirement_version: u16 = 147;
 /// Transactional incoming-FK indexing and bounded complete-coverage adoption.
-pub const foreign_key_directory_version: u16 = 130;
+pub const foreign_key_directory_version: u16 = 146;
 /// Hidden FK CREATE carries guarded LIKE inputs and immutable annotation effects.
-pub const initial_fk_creation_copy_version: u16 = 129;
+pub const initial_fk_creation_copy_version: u16 = 145;
 /// Hidden initial-FK plans reserve counter effects and publish them with the child.
-pub const initial_fk_column_sequences_version: u16 = 128;
-pub const sql_object_annotations_version: u16 = 127;
-pub const sql_attribute_handoffs_version: u16 = 126;
+pub const initial_fk_column_sequences_version: u16 = 144;
+pub const sql_object_annotations_version: u16 = 143;
+pub const sql_attribute_handoffs_version: u16 = 142;
 /// Column allocation attests the complete persisted default binding, including mode.
-pub const sql_column_default_proof_version: u16 = 122;
-pub const sql_creation_sources_version: u16 = 121;
-pub const sql_prepared_transactions_version: u16 = 119;
-pub const sql_domain_epoch_version: u16 = 118;
-pub const sql_domain_version: u16 = 117;
-pub const sql_type_retirement_version: u16 = 116;
-pub const sql_type_epoch_version: u16 = 115;
-pub const sql_type_comment_version: u16 = 114;
-pub const sql_authorization_version: u16 = 113;
-pub const sql_type_version: u16 = 111;
-pub const sql_cast_version: u16 = 110;
-pub const sql_routine_version: u16 = 110;
-pub const sql_materialized_refresh_version: u16 = 103;
-pub const sql_materialized_view_version: u16 = 102;
-pub const sql_population_version: u16 = 101;
-pub const job_state_version: u16 = 104;
-pub const sql_drop_generation_version: u16 = 99;
-pub const sql_view_domains_version: u16 = 98;
+pub const sql_column_default_proof_version: u16 = 138;
+pub const sql_creation_sources_version: u16 = 137;
+pub const sql_prepared_transactions_version: u16 = 135;
+pub const sql_domain_epoch_version: u16 = 134;
+pub const sql_domain_version: u16 = 133;
+pub const sql_type_retirement_version: u16 = 132;
+pub const sql_type_epoch_version: u16 = 131;
+pub const sql_type_comment_version: u16 = 130;
+pub const sql_authorization_version: u16 = 129;
+pub const sql_type_version: u16 = 127;
+pub const sql_cast_version: u16 = 126;
+pub const sql_routine_version: u16 = 126;
+pub const sql_materialized_refresh_version: u16 = 119;
+pub const sql_materialized_view_version: u16 = 118;
+pub const sql_population_version: u16 = 117;
+pub const job_state_version: u16 = 120;
+pub const sql_drop_generation_version: u16 = 115;
+pub const sql_view_domains_version: u16 = 114;
 // Owned defaults include the atomic attribute-reference directory.
-pub const sql_column_sequences_version: u16 = 125;
-pub const sql_sequence_retirement_version: u16 = 125;
-pub const native_service_tables_version: u16 = 96;
-pub const resolver_records_version: u16 = 104;
+pub const sql_column_sequences_version: u16 = 141;
+pub const sql_sequence_retirement_version: u16 = 141;
+pub const native_service_tables_version: u16 = 112;
+pub const resolver_records_version: u16 = 120;
 /// Stable database/namespace annotations, without physical schema publication.
-pub const sql_resource_comments_version: u16 = 95;
-pub const fk_historical_references_version: u16 = 93;
+pub const sql_resource_comments_version: u16 = 111;
+pub const fk_historical_references_version: u16 = 109;
 /// Version 65 retains presentation metadata on stable column identities.
-pub const sql_column_comments_version: u16 = 92;
+pub const sql_column_comments_version: u16 = 108;
 /// Role-default patches share this branch's qualified SQL reader cohort.
 /// Earlier main readers reject empty/global role scopes; never admit one
 /// using only the original v12 setting-catalog floor.
-pub const sql_role_defaults_version: u16 = 90;
+pub const sql_role_defaults_version: u16 = 106;
 /// Sequence records retain their original SQL reader cohort.
-pub const sql_sequence_catalog_version: u16 = 90;
+pub const sql_sequence_catalog_version: u16 = 106;
 /// Version 64 binds validation-only publication to signed physical owner cuts,
 /// durable all-owner installation/publication/release barriers and recovery.
-pub const schema_validation_publication_version: u16 = 91;
+pub const schema_validation_publication_version: u16 = 107;
 /// The same unreleased cohort decodes bounded native reporter retirement jobs.
-pub const native_reporter_restart_version: u16 = 91;
+pub const native_reporter_restart_version: u16 = 107;
 /// AFNOWN1 is also used by standalone schema validation and reporter recovery.
 /// Its format does not imply the stronger complete index-delivery workflow.
-pub const native_owner_binding_version: u16 = 91;
-pub const sql_column_transform_version: u16 = 89;
-pub const fk_generation_column_addition_version: u16 = 88;
-pub const sql_row_policy_intent_version: u16 = 87;
-pub const sql_deferred_check_validation_version: u16 = 86;
-pub const initial_fk_checks_catalog_version: u16 = 86;
-pub const sql_row_policy_mutation_version: u16 = 85;
-pub const sql_view_catalog_version: u16 = 84;
-pub const index_publication_release_version: u16 = 100;
+pub const native_owner_binding_version: u16 = 107;
+pub const sql_column_transform_version: u16 = 105;
+pub const fk_generation_column_addition_version: u16 = 104;
+pub const sql_row_policy_intent_version: u16 = 103;
+pub const sql_deferred_check_validation_version: u16 = 102;
+pub const initial_fk_checks_catalog_version: u16 = 102;
+pub const sql_row_policy_mutation_version: u16 = 101;
+pub const sql_view_catalog_version: u16 = 100;
+pub const index_publication_release_version: u16 = 116;
 // One coordinated floor for this unreleased protocol. A cohort capable only
 // of an earlier partial stage must not admit work that it cannot finish.
-pub const index_publication_installation_version: u16 = 100;
-pub const index_publication_decision_version: u16 = 100;
-pub const index_publication_head_version: u16 = 100;
-pub const index_delivery_version: u16 = 100;
+pub const index_publication_installation_version: u16 = 116;
+pub const index_publication_decision_version: u16 = 116;
+pub const index_publication_head_version: u16 = 116;
+pub const index_delivery_version: u16 = 116;
 /// Metadata replicas must validate ASCH/reader profile 34 before admitting it.
-pub const clock_defaults_reader_version: u16 = 94;
-pub const schema_reader_publication_version: u16 = 68;
-pub const schema_reader_floor_version: u16 = 67;
-pub const schema_reader_capability_version: u16 = 66;
-pub const index_publication_admission_version: u16 = 100;
-pub const checks_catalog_identity_version: u16 = 64;
+pub const clock_defaults_reader_version: u16 = 110;
+pub const schema_reader_publication_version: u16 = 84;
+pub const schema_reader_floor_version: u16 = 83;
+pub const schema_reader_capability_version: u16 = 82;
+pub const index_publication_admission_version: u16 = 116;
+pub const checks_catalog_identity_version: u16 = 80;
 /// Decoder floor for occupancy-capable reconciliation and name admission.
-pub const constraint_occupancy_version: u16 = 63;
-pub const resolver_namespaces_version: u16 = 112;
+pub const constraint_occupancy_version: u16 = 79;
+pub const resolver_namespaces_version: u16 = 128;
+/// Published SQL completion ownership from main; do not renumber these floors.
+pub const sql_completion_admission_version: u16 = 78;
+pub const sql_completion_owner_version: u16 = 71;
+pub const sql_completion_reference_version: u16 = 69;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {
