@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Not qualified: the unchanged original importer failed with LiteReplayBacklogExceeded after 751.557 seconds on the ownership-hardened Debug candidate, with zero native builds. Local diagnosis reproduced required tier merges blocking replay-credit return for over eight seconds. Final optimized qualification is held while separating merge preparation from replay service.",
+  "status": "Not qualified: the latest completed unchanged-importer Debug diagnostic failed with LiteReplayBacklogExceeded after 497.696 seconds, with zero native builds. Repeated all-deleted private merges were reproduced and fixed. Broad native and composed C API/SDK correctness gates pass; the unchanged importer is rerunning on that frozen fix. Final optimized issue #1431 qualification remains pending.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -952,7 +952,7 @@
     "Multi-GB retained-file warm batch/SQL cost comparisons",
     "Human-triggered repository aggregate CI",
     "Full factory session/housekeeping soak; fresh embedded Beads/Gas City component smoke now passes",
-    "Final-host ten-minute constant/changing-word active-write/storage soaks on frozen runtime 806695b4fb"
+    "Final-host ten-minute constant/changing-word active-write/storage soaks on the final frozen runtime"
   ],
   "final_host": {
     "environment": {
@@ -4888,7 +4888,7 @@
       "seconds": 36.04872883402277
     }
   },
-  "priority": "Candidate-only issue1431 gates failed. Investigate and fix the locally reproduced replay-byte-pressure admission problem before resuming final-host qualification or broad control comparisons.",
+  "priority": "Finish the isolated original-importer diagnostic after the all-deleted merge fix. Preserve the original caller and five-second wait; establish replay progress before final optimized full-corpus, contention and active-write qualification.",
   "issue1431_candidate_debug_first": {
     "source_commit": "e63c0a4ca8d077ec4c4e129b4c21791a1d290068",
     "runtime_source_commit": "3b417dd180adadd11619a8c275fb512f09cfe7f5",
@@ -6194,11 +6194,10 @@
       "scope": "Three C API lifecycle/conflict/FK/allocation regressions plus four fold/owned-overlay tests, before the final missing-key table-fence regression and counters."
     },
     "remaining": [
-      "Attribute interrupted maintenance by phase/error and distinguish source replay from stale artifact housekeeping.",
-      "Verify and measure fixed-slot page staging; profiles show retained-buffer copying inside publication.",
-      "Broad native/reader/persistent/C API and all SDK SQL/concurrency gates on final source.",
-      "Unchanged importer success before optimized wolfspider qualification; then matched frozen corpus, contention, active reuse, settling/accounting and ten-minute active-write gates.",
-      "Aggregate CI and Beads-owned factory."
+      "Unchanged original-importer completion, durable catch-up, logical and integrity checks.",
+      "Complete default consumer gate rerun after fixture corrections.",
+      "Matched optimized final-host corpus, original contention, active verified page reuse, accounting and ten-minute active-write gates.",
+      "Human-triggered aggregate CI and Beads-owned full factory."
     ],
     "sdk_change_required": false,
     "issue1431_resolved": false,
@@ -6476,12 +6475,250 @@
     }
   },
   "fixed_slot_page_staging": {
-    "status": "Implementation prepared; native correctness and comparative measurement pending.",
+    "status": "Implemented and correctness-tested. Public SQL scaling and stopped replay comparisons do not show a material end-to-end gain.",
     "reason": "The later v9 30-second sample attributed 282 inclusive samples directly below PageWriteBatch.flushCount to mem.copyForwards, compared with 31 beneath positional writes. This is a diagnostic hotspot, not a measured optimized-build regression or proof of the complete slowdown cause.",
     "design": "Keep payloads in fixed page slots and sort only descriptors. Ordered contiguous runs write directly; gather out-of-order contiguous runs once per flushed page. Retained payloads are never shifted. Preserve gap handling, late-page/duplicate replacement, no-heap operation, failure poisoning and cache admission after successful runs.",
     "memory": "64 KiB page slots plus bounded 64 KiB gather scratch; no per-page heap allocation.",
     "regressions": "Fragmented one-page drains, slot reuse, reversed contiguous runs, gaps and exact payloads at 4/8/16/32/64 KiB page sizes; existing failure and late-page tests retained.",
-    "validation": "pending",
-    "issue1431_resolved": false
+    "validation": {
+      "focused_native": {
+        "passed": 16,
+        "skipped": 0,
+        "failed": 0,
+        "leaked": 0
+      },
+      "abi_exports": 134,
+      "c_smoke_and_storage_linkage": "passed",
+      "log": ".tools/import-regression/root-cause/fixed-slot-page-v11-focused.log",
+      "matched_public_scaling": {
+        "runs": 6,
+        "all_passed": true,
+        "peak_native_builds": 0,
+        "checks": [
+          "generated keys and payloads",
+          "acknowledged rows",
+          "integrity",
+          "reopen"
+        ],
+        "summary": ".tools/import-regression/root-cause/sql-claim-scaling-v11/summary.json",
+        "interpretation": "Commit at 4096 staged rows remained approximately 3.7 seconds; no material gain established."
+      },
+      "matched_stopped_service": {
+        "seconds_per_run": 60,
+        "peak_native_builds": 0,
+        "initial_replay_bytes": 16566210,
+        "final_replay_bytes": 12563330,
+        "same_progress_in_both_runs": true,
+        "logs": [
+          ".tools/import-regression/root-cause/service-v9-page-baseline-r2.log",
+          ".tools/import-regression/root-cause/service-v11-page-slots.log"
+        ],
+        "scope": "Identical quiescent database clones with local background runtime enabled. This does not qualify sustained writes."
+      }
+    },
+    "issue1431_resolved": false,
+    "unchanged_importer_v11": {
+      "result": {
+        "input_index": 7,
+        "importer_exit_code": 1,
+        "censored": false,
+        "importer_succeeded": false,
+        "summary": [
+          0,
+          0,
+          1
+        ],
+        "seconds": 497.6959354589926,
+        "peak_native_builds": 0,
+        "metrics_enabled": true,
+        "library_sha256": "6a482d1b1a53a0d6b43859cd72e2700e1a3fd91a16155b6c4d4725dece6fcc97",
+        "public_errors": [
+          "LiteReplayBacklogExceeded"
+        ],
+        "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution."
+      },
+      "attribution": {
+        "batch_profiles": 101,
+        "maintenance_failure_events": {
+          "storage/EnrichmentWaitCanceled": 202,
+          "source/EnrichmentSourceChanged": 17,
+          "retirement/EnrichmentSourceChanged": 7,
+          "retirement/EnrichmentWaitCanceled": 1,
+          "capture/EmptySegment": 29,
+          "source/Canceled": 1
+        },
+        "owner_numeric": [
+          {
+            "source_turns": 307,
+            "capture_ns": 20818322000,
+            "replay_ns": 260930369000,
+            "artifacts_ns": 81764705000,
+            "storage_ns": 81685125000,
+            "runtime_refreshes": 760,
+            "maintenance_errors": 257,
+            "maintenance_timeouts": 0,
+            "merge_started": 55,
+            "merge_applied": 25,
+            "merge_discarded": 30,
+            "merge_prepare_ns": 33804905000,
+            "merge_staging_ns": 7704170000,
+            "merge_staged_bytes": 117453478,
+            "merge_publication_ns": 14396948000,
+            "sql_overlay_hits": 1045,
+            "sql_overlay_rebuilds": 349,
+            "sql_overlay_rebuild_entries": 45919,
+            "sql_overlay_evictions": 0,
+            "sql_staged_statements": 697,
+            "replay_waits": 17,
+            "replay_refused_prepare_ns": 8541994085
+          },
+          {
+            "capture": 29,
+            "source": 18,
+            "retirement": 8,
+            "artifacts": 0,
+            "storage": 202
+          }
+        ]
+      },
+      "integrity": {
+        "valid": true,
+        "errors": 0,
+        "tail_bytes": 0
+      },
+      "interpretation": "202 physical EnrichmentWaitCanceled events were expected contention/stale-tip yields; 29 capture/EmptySegment events repeatedly abandoned dead merges. Neither source-change counts nor idle shrink alone establish the end-to-end cause."
+    }
+  },
+  "empty_private_merge_replacement": {
+    "runtime_commit": "1c93647d32c4ab903f2e1c7d9688f4e61a165590",
+    "frozen_library": {
+      "head": "1c93647d32c4ab903f2e1c7d9688f4e61a165590",
+      "clean": true,
+      "optimize": "debug",
+      "build_exit_code": 0,
+      "library_sha256": "6d183b03868e0b104775d76fee7f4e8b160ad8a4c87fe1ef3a1a8bc770188da7",
+      "library": ".tools/import-regression/artifacts/empty-private-merge-v12-debug-library",
+      "build_log": ".tools/import-regression/root-cause/empty-private-merge-combined.log",
+      "focused_tests": {
+        "passed": 15,
+        "skipped": 0,
+        "failed": 0,
+        "leaked": 0
+      },
+      "abi_exports": 134,
+      "c_smoke_and_linkage": "passed",
+      "storage_owner_linkage": "passed",
+      "scope": "Frozen diagnostic artifact. Broad native gate has one obsolete mixed-group expectation failure; full correctness and end-to-end qualification incomplete.",
+      "files": {
+        "zig/LITE.md": "2db7b8e87508fe25be793a479a9893be72d9a8b1e4541f342e4b3077e8b78682",
+        "zig/bench/baselines/lite-sustained-write-qualification-20261102.json": "2ea08bee67301e220a79222734d0aad7d78d486493141c2ec9c88bea0b9e00c4",
+        "zig/build_support/embedded/embedded.zig": "60f2749945a3d687fa61dfadd2a941291a2e2f0100e153384bfaf0426805ef7e",
+        "zig/pkg/antfly-embedded/src/api/relational_integrity_commit.zig": "9e9b758ff34a311d7c4106539e3b1fd03a232c4db53e06760ef339a90c98d858",
+        "zig/pkg/antfly-embedded/src/api/relational_statement_overlay.zig": "883db16f48f761a26e52417f501b9f6a6a9ce270a054bea8be3ec7ebc45bf698",
+        "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "0de886a5fc7960495524253d1d50e4d92e5632d93f4a0c53eeeb15ba0e70e1cc",
+        "zig/pkg/antfly-embedded/src/capi/sql.zig": "db4856b59a7e5781b09de8d58a8abf8711250f41d0dcfb0b3638ed1da6d93520",
+        "zig/pkg/antfly-embedded/src/capi/sql_overlay.zig": "458066e02ce65c36a6474df458135ec11031e72fbb7f5491e230691fc476c62a",
+        "zig/pkg/antfly-embedded/src/capi/sql_session.zig": "12937581bbb73b70a1d9c65a69f4cbfc0629ddd3471b83e354b952da6f9d8ea0",
+        "zig/pkg/antfly-embedded/src/segment.zig": "41c2507a4bc9869c3a648feb3d851bbf4244d137accbd77fbb8b975f72d685d8",
+        "zig/pkg/antfly-embedded/src/sql/mutation_fold.zig": "61fd9731ad1c4b48b9c7bcdaf8fb430b5d19b38cf7aea9a934a36848a36b9d56",
+        "zig/pkg/antfly-embedded/src/storage/lite/native.zig": "3511e668ebdbec4837575074a4b77a6ca89006e826a57b19b0e5d3e32f49b478"
+      }
+    },
+    "cause": "finishOutput(0) escaped outside the encoder EmptySegment catch; fully deleted inputs were repeatedly abandoned rather than retired.",
+    "fix": [
+      "Validate deleted ordinals against each captured document count and checked-add live counts.",
+      "Retain immutable source uses, but return no output/source map before scratch creation when all captured documents are deleted.",
+      "Reuse the checked empty-publication path to remove only captured active IDs, preserving newer segments."
+    ],
+    "reproduction": {
+      "before": "The isolated all-deleted regression failed with EmptySegment at finishOutput.",
+      "after": "The pure regression passes without a scratch directory or output budget, including allocation faults, cancellation and invalid tombstones.",
+      "logs": [
+        ".tools/import-regression/root-cause/empty-private-merge-red.log",
+        ".tools/import-regression/root-cause/empty-private-merge-green.log"
+      ]
+    },
+    "focused": {
+      "passed": 15,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "coverage": [
+        "all-deleted private merge with exhaustive allocation faults",
+        "live private merge provenance",
+        "asynchronous capture/publication lifecycle including newer append preservation",
+        "SQL overlay invalidation and owned state",
+        "incremental mutation folding and point reads"
+      ],
+      "log": ".tools/import-regression/root-cause/empty-private-merge-combined.log"
+    },
+    "broad_correctness": {
+      "native": {
+        "passed": 737,
+        "skipped_benchmarks": 5,
+        "failed": 0,
+        "leaked": 0
+      },
+      "bounded_reader": {
+        "passed": 502,
+        "skipped_benchmarks": 2,
+        "failed": 0,
+        "leaked": 0
+      },
+      "persistent_selected": {
+        "passed": 8,
+        "failed": 0,
+        "leaked": 0
+      },
+      "strict_physical_capi": {
+        "passed": 273,
+        "skipped": 3,
+        "failed": 0,
+        "leaked": 0
+      },
+      "consumer_capi": {
+        "full_run_passed": 85,
+        "full_run_fixture_failures": 2,
+        "fixed_focused_passed": 2,
+        "fixed_focused_failed": 0,
+        "fixed_focused_leaked": 0,
+        "scope": "Composed coverage: the earlier full consumer command failed on two fixture expectations. Both corrected regressions passed in a separate command; the complete default consumer gate has not yet been repeated."
+      },
+      "sdk": {
+        "passed": 205,
+        "scope": "204 passed in the main run; the local HTTP embedder fixture was blocked by sandbox loopback policy, then passed alone with loopback enabled. Same frozen v12 production library."
+      },
+      "abi_exports": 134,
+      "c_smoke_and_storage_owner_linkage": "passed",
+      "logs": [
+        ".tools/import-regression/root-cause/empty-merge-final-debug-gates.log",
+        ".tools/import-regression/root-cause/empty-private-merge-broad-native.log",
+        ".tools/import-regression/root-cause/reclamation-ttl-consumer-focused-r2.log",
+        ".tools/import-regression/root-cause/empty-private-merge-sdk.log",
+        ".tools/import-regression/root-cause/empty-private-merge-sdk-loopback.log"
+      ],
+      "fixture_corrections": [
+        "Mixed authored/artifact-lease groups remain separate and preserve metadata identity.",
+        "Reclamation fixture drives the timed quiet retry, verifies clean admission and no repeated recovery while computation is parked.",
+        "Raw TTL maintenance fixture checks its namespace error, since only the outer worker owns the aggregate error counter."
+      ]
+    },
+    "unchanged_importer_v12": {
+      "status": "running",
+      "input_index": 7,
+      "timeout_seconds": 1800,
+      "original_busy_timeout_seconds": 5,
+      "metrics_enabled": true,
+      "library_sha256": "6d183b03868e0b104775d76fee7f4e8b160ad8a4c87fe1ef3a1a8bc770188da7",
+      "result_directory": ".tools/import-regression/root-cause/local-input7-empty-merge-v12-debug"
+    },
+    "sdk_changes_required_for_these_fixes": false,
+    "issue1431_resolved": false,
+    "remaining": [
+      "Unchanged original-importer completion, durable catch-up, logical and integrity checks.",
+      "Complete default consumer gate rerun after fixture corrections.",
+      "Matched optimized final-host corpus, original contention, active verified page reuse, accounting and ten-minute active-write gates.",
+      "Human-triggered aggregate CI and Beads-owned full factory."
+    ]
   }
 }

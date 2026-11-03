@@ -1560,6 +1560,13 @@ smaller-plan hints across runtime refresh; a successful merge restores normal
 planning. Automatic vacuum waits for construction, while in-place retirement and
 page reuse continue. An explicit peer replacement invalidates the construction.
 
+If every captured document is already deleted, construction returns an empty
+replacement without creating scratch output. It retains the input leases and
+validates deletion coverage just like a nonempty merge. Publication removes only
+the validated captured inputs; segments appended after capture remain active.
+An empty result is successful maintenance, so it cannot repeatedly select the
+same dead inputs through an `EmptySegment` retry.
+
 Background publication statistics separate merge preparation, native staging and
 final publication time, along with started/applied/discarded jobs and staged bytes.
 Preparation overlaps ordinary replay; its duration is not additive wall time.
