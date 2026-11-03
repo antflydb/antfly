@@ -773,6 +773,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL command producer native exact command heartbeat renews through cold lost replies and rejects replacement admissions",
         "SQL command producer native completion renews pending control without replaying SQL or dropping session grants",
         "SQL command producer native supervisor renews only live local owners and leaves expired sources fenced",
+        "SQL command producer native DISCARD atomically resets resources with resumable unlock intent across cold faults",
+        "SQL command producer native DISCARD settings adapter survives lost control replies and cancellation after reset",
         "durable SQL session rejects duplicate savepoint ids without double freeing overlays",
         "distributed txn session preserves numeric tokens across staging savepoints and durable recovery",
     }) |required| sql_command_producer_audit.addArgs(&.{ "--filter", required });

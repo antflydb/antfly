@@ -1280,17 +1280,17 @@ test "SQL command producer native transaction savepoint projection retains monot
     }
 }
 
-const OwnedSavepointPlan = struct {
+const OwnedControlPlan = struct {
     owned: std.json.Parsed(producer.Record),
-    value: producer.SavepointPlan,
+    value: producer.ControlPlan,
     fn deinit(self: *@This()) void {
         self.owned.deinit();
     }
 };
-fn savepointPlan(native: *Native, source: *transactions.DurableSessionStore, txn: [16]u8) !OwnedSavepointPlan {
+fn savepointPlan(native: *Native, source: *transactions.DurableSessionStore, txn: [16]u8) !OwnedControlPlan {
     var owned = (try producer.load(source, a, connection)).?;
     errdefer owned.deinit();
-    return .{ .value = try producer.observeSavepointPlan(a, owned.value, instance, txn, 2, native.nonce(), native.port()), .owned = owned };
+    return .{ .value = try producer.observeControlPlan(a, owned.value, instance, txn, 2, native.nonce(), native.port()), .owned = owned };
 }
 fn attachedTransaction(native: *Native, source: *transactions.DurableSessionStore, registry: *transactions.SessionRegistry, fence: authority.scopes.CommandFence) ![16]u8 {
     const node: u64 = if (native.standalone) 0 else 9;
@@ -1319,7 +1319,7 @@ fn savepointRows(registry: *transactions.SessionRegistry, txn: [16]u8) !usize {
 fn coldSavepointControl(metadata: *storage.RaftApplyStore, source: *transactions.DurableSessionStore, registry: *transactions.SessionRegistry, native: *Native, path: []const u8, finishing: bool) !void {
     for (0..128) |_| {
         var current = (try producer.load(source, a, connection)).?;
-        const done = current.value.savepoint_control == null and current.value.phase == (if (finishing) producer.Phase.idle else producer.Phase.executing);
+        const done = current.value.control_effect == null and current.value.phase == (if (finishing) producer.Phase.idle else producer.Phase.executing);
         current.deinit();
         if (done) return;
         native.step(source, instance, 2) catch |err| switch (err) {
@@ -1401,7 +1401,7 @@ test "SQL command producer native savepoint publication atomically rewinds SQL a
             try std.testing.expectEqual(@as(usize, 3), try savepointRows(&registry, txn));
             var unchanged = (try producer.load(&source, a, connection)).?;
             defer unchanged.deinit();
-            try std.testing.expect(unchanged.value.savepoint_control == null and unchanged.value.pending == null);
+            try std.testing.expect(unchanged.value.control_effect == null and unchanged.value.pending == null);
             try std.testing.expectError(error.SqlTransactionAborted, registry.nativeSqlCut(a, txn));
             // This is an ownership assertion on the live test facade, not a
             // request to execute a read on the intentionally failed session.
@@ -1965,5 +1965,200 @@ test "SQL command producer native supervisor renews only live local owners and l
             try std.testing.expectEqual(native.expiry_ms, observed.value.registration.lease.expires_at_ms);
             try std.testing.expectEqual(expired or mode == .fenced, observed.value.recovery);
         }
+    };
+}
+
+fn prepareDiscardResources(source: *transactions.DurableSessionStore, node: u64, now_ms: u64, expires_at_ms: u64, fence: *const authority.scopes.CommandFence) !u64 {
+    const prepared = @import("sql_prepared.zig");
+    const other: [32]u8 = @splat('c');
+    _ = try connections.mutate(source, .{ .create = .{ .id = other, .principal = "alice", .owner_node_id = node, .expires_at_ms = expires_at_ms, .database = "main", .namespace = "public" } }, "alice", node, now_ms);
+    _ = try connections.mutateWithCommand(source, .{ .overlay = .{ .id = connection, .expected_revision = 1, .entries = &.{.{ .identity = .{ .id = 44, .generation = 1 }, .value = .{ .string = "before" } }} } }, "alice", node, now_ms, fence);
+    const sequence: local.sql_sequence_session.Identity = .{ .incarnation = @splat(0x11), .id = 9 };
+    _ = try connections.mutateWithCommand(source, .{ .sequence_state = .{ .id = connection, .generation = 1, .sequence_epoch = 1, .active_txn = null, .value = .{ .values = &.{.{ .identity = sequence, .value = 42 }}, .last = sequence } } }, "alice", node, now_ms, fence);
+    var path: @import("../pgwire/search_path.zig").Path = .{};
+    try path.append(try @import("../pgwire/search_path.zig").Namespace.init("before"));
+    _ = try connections.mutateWithCommand(source, .{ .search_path = .{ .id = connection, .expected_revision = 3, .value = path } }, "alice", node, now_ms, fence);
+    for ([_][32]u8{ @splat('b'), @splat('d') }, [_][32]u8{ connection, other }) |resource_id, owner| {
+        var record = try connections.load(source, a, owner, "alice", node, now_ms);
+        defer record.deinit();
+        try prepared.create(source, .{ .id = resource_id, .principal = "alice", .owner_node_id = node, .expires_at_ms = expires_at_ms, .database = record.value.database, .namespace = "public", .statement = "SELECT 1", .connection_id = owner, .connection_generation = 1, .parameter_types = &.{}, .bindings = &.{} }, now_ms);
+    }
+    return 4;
+}
+
+fn requireDiscardState(source: *transactions.DurableSessionStore, node: u64, now_ms: u64, reset: bool) !void {
+    const prepared = @import("sql_prepared.zig");
+    var record = try connections.load(source, a, connection, "alice", node, now_ms);
+    defer record.deinit();
+    try std.testing.expectEqual(@as(u64, if (reset) 2 else 1), record.value.generation);
+    try std.testing.expectEqual(@as(u64, if (reset) 2 else 1), record.value.sequence_epoch);
+    try std.testing.expectEqual(@as(u64, if (reset) 5 else 4), record.value.revision);
+    try std.testing.expectEqual(@as(usize, if (reset) 0 else 1), record.value.overlay.len);
+    try std.testing.expectEqual(@as(usize, if (reset) 0 else 1), record.value.sequence_state.values.len);
+    try std.testing.expectEqual(reset, record.value.lookup_path == null);
+    const resource: [32]u8 = @splat('b');
+    if (reset) {
+        try std.testing.expectError(error.SqlPreparedNotFound, prepared.loadForConnection(source, a, &resource, "alice", node, now_ms, connection));
+    } else {
+        var own = try prepared.loadForConnection(source, a, &resource, "alice", node, now_ms, connection);
+        defer own.deinit();
+    }
+    const other: [32]u8 = @splat('d');
+    var retained = try prepared.loadForConnection(source, a, &other, "alice", node, now_ms, @splat('c'));
+    defer retained.deinit();
+}
+
+test "SQL command producer native DISCARD atomically resets resources with resumable unlock intent across cold faults" {
+    const advisory = @import("sql_advisory_execution.zig");
+    const Datum = local.sql_scalar.Datum;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |standalone| for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/discard-control-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated };
+        try setup(&metadata, &source, standalone, &native);
+        try native.until(&source, .idle, 2);
+        const ticket = try begin(&native, &source, 200);
+        const fence = try execute(&source, ticket);
+        const node: u64 = if (standalone) 0 else 9;
+        const revision = try prepareDiscardResources(&source, node, 2, 900, &fence);
+        for (0..3) |ordinal| {
+            var grant = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_lock, &.{Datum.json(.{ .integer = if (ordinal == 2) 43 else 42 })}, null, native.nonce());
+            _ = try finishMachine(&native, &grant);
+        }
+        for ([_]@FieldType(transactions.DurableSessionStore, "fail_connection_publication_for_test"){ .source, .resources, .connection }) |failure| {
+            var prior = (try producer.load(&source, a, connection)).?;
+            defer prior.deinit();
+            const plan = try producer.observeControlPlan(a, prior.value, instance, null, 2, native.nonce(), native.port());
+            source.fail_connection_publication_for_test = failure;
+            try std.testing.expectError(error.InjectedSessionStoreFailure, connections.mutateWithCommand(&source, .{ .discard_scoped = .{ .id = connection, .expected_revision = revision, .plan = plan } }, "alice", node, 2, &fence));
+            source.fail_connection_publication_for_test = null;
+            try requireDiscardState(&source, node, 2, false);
+            var unchanged = (try producer.load(&source, a, connection)).?;
+            defer unchanged.deinit();
+            try std.testing.expect(unchanged.value.control_effect == null and unchanged.value.pending == null);
+        }
+        {
+            var prior = (try producer.load(&source, a, connection)).?;
+            defer prior.deinit();
+            const stale = try producer.observeControlPlan(a, prior.value, instance, null, 2, native.nonce(), native.port());
+            try producer.renew(&source, "alice", prior.value, instance, 80000, try native.head(), native.nonce(), 2);
+            try std.testing.expectError(error.SqlConnectionChanged, connections.mutateWithCommand(&source, .{ .discard_scoped = .{ .id = connection, .expected_revision = revision, .plan = stale } }, "alice", node, 2, &fence));
+            try requireDiscardState(&source, node, 2, false);
+        }
+        for (0..8) |_| {
+            var current = (try producer.load(&source, a, connection)).?;
+            defer current.deinit();
+            if (current.value.pending == null) break;
+            try native.step(&source, instance, 2);
+        }
+        {
+            var prior = (try producer.load(&source, a, connection)).?;
+            defer prior.deinit();
+            const plan = try producer.observeControlPlan(a, prior.value, instance, null, 2, native.nonce(), native.port());
+            try std.testing.expectEqual(@as(usize, 1), try connections.mutateWithCommand(&source, .{ .discard_scoped = .{ .id = connection, .expected_revision = revision, .plan = plan } }, "alice", node, 2, &fence));
+        }
+        try requireDiscardState(&source, node, 2, true);
+        try std.testing.expectError(error.SqlConnectionBusy, connections.mutateWithCommand(&source, .{ .discard_sequences = connection }, "alice", node, 2, &fence));
+        {
+            var cut = try nativeCut(&native, fence.backend, null);
+            defer cut.deinit();
+            try std.testing.expectEqual(@as(u32, 2), cut.value.owner.?.resources);
+        }
+        try finishBody(&native, &source, ticket);
+        native.before = !replicated;
+        native.after = replicated;
+        for (0..64) |_| {
+            if (try phase(&source) == .idle) break;
+            native.step(&source, instance, 2) catch |err| switch (err) {
+                error.MetadataMutationOutcomeUnknown => {},
+                else => return err,
+            };
+            metadata.deinit();
+            metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+            source = transactions.DurableSessionStore.init(a, &metadata.store);
+        }
+        try std.testing.expectEqual(producer.Phase.idle, try phase(&source));
+        try requireDiscardState(&source, node, 2, true);
+        var cut = try nativeCut(&native, fence.backend, null);
+        defer cut.deinit();
+        try std.testing.expectEqual(@as(u32, 0), cut.value.owner.?.resources);
+        try std.testing.expectEqual(@as(@TypeOf(cut.value.scope.?.state), .active), cut.value.scope.?.state);
+        const next = try begin(&native, &source, 300);
+        const next_fence = try execute(&source, next);
+        try std.testing.expect(next_fence.backend.eql(fence.backend));
+        var reused = try advisory.Machine.init(advisoryFrame(&source, next_fence), .pg_advisory_lock, &.{Datum.json(.{ .integer = 42 })}, null, native.nonce());
+        _ = try finishMachine(&native, &reused);
+    };
+}
+
+test "SQL command producer native DISCARD settings adapter survives lost control replies and cancellation after reset" {
+    const advisory = @import("sql_advisory_execution.zig");
+    const http = @import("http_server.zig");
+    const Forward = struct {
+        native: *Native,
+        cancel: *std.atomic.Value(bool),
+        cancel_on_effect: bool,
+        fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedStatusRead;
+        }
+        fn catalog(raw: *anyopaque, alloc: A, context: local.api_operation.RequestContext, input: Call) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.ensureActive();
+            const stop = self.cancel_on_effect and input == .sql_lock_mutate and input.sql_lock_mutate.operation == .effect;
+            defer if (stop) {
+                self.cancel.store(true, .release);
+            };
+            return Native.call(self.native, alloc, input);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |replicated| for ([_]bool{ false, true }) |cancel| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/discard-settings-{any}-{any}", .{ tmp.sub_path, replicated, cancel });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        const now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated, .expiry_ms = now_ms + 60000, .database = "default" };
+        try setup(&metadata, &source, true, &native);
+        try native.until(&source, .idle, 2);
+        const ticket = try begin(&native, &source, 200);
+        const fence = try execute(&source, ticket);
+        const revision = try prepareDiscardResources(&source, 0, now_ms, now_ms + 30000, &fence);
+        var grant = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_lock, &.{local.sql_scalar.Datum.json(.{ .integer = 42 })}, null, native.nonce());
+        _ = try finishMachine(&native, &grant);
+        var runtime = try local.storage_db_selected_root.db.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+        defer runtime.deinit();
+        var cancelled: std.atomic.Value(bool) = .init(false);
+        var forward: Forward = .{ .native = &native, .cancel = &cancelled, .cancel_on_effect = cancel };
+        var server = http.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .session_store = &source, .session_maintenance_local_only = true, .deployment_mode = .standalone }, .{ .ptr = &forward, .vtable = &.{ .status = Forward.status, .system_catalog = Forward.catalog } }, null, null);
+        defer server.deinit();
+        server.sql_connection_admission.instance = instance;
+        var user: ?http.AuthenticatedIdentity = .{ .username = @constCast("alice") };
+        var adapter: @import("sql_execution.zig").Adapter = .{ .server = &server, .identity = &user, .database = "default", .namespace = "public", .connection_id = connection, .connection_revision = revision, .context = .{ .sql_command_fence = &fence, .cancellation = .fromAtomic(&cancelled) } };
+        native.after = true;
+        if (cancel) {
+            try std.testing.expectError(error.Canceled, @import("sql_http_settings.zig").execute(a, &adapter, .discard_all, &.{}));
+            try finishBody(&native, &source, ticket);
+            try native.until(&source, .idle, now_ms);
+        } else {
+            var result = try @import("sql_http_settings.zig").execute(a, &adapter, .discard_all, &.{});
+            defer result.deinit();
+            try std.testing.expectEqualStrings("DISCARD ALL", result.output.command_tag);
+            var current = (try producer.load(&source, a, connection)).?;
+            defer current.deinit();
+            try std.testing.expect(current.value.control_effect == null and !current.value.recovery);
+        }
+        try requireDiscardState(&source, 0, now_ms, true);
+        var cut = try nativeCut(&native, fence.backend, null);
+        defer cut.deinit();
+        try std.testing.expectEqual(@as(u32, 0), cut.value.owner.?.resources);
+        try std.testing.expectEqual(@as(@TypeOf(cut.value.scope.?.state), .active), cut.value.scope.?.state);
     };
 }

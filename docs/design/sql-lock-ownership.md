@@ -7,10 +7,11 @@ journal described here is not yet activation of the unresolved SQL cases.
 Current status (2026-11-03): the native ledger, durable command-source permits,
 shared prepared-decision integration and independent prepared lock home are
 implemented and qualified. The ordered scalar/type layer and native advisory
-execution owner are also implemented. SQL savepoint metadata and native advisory
-control now share an atomic source publication. Public HTTP/pgwire source
-activation and row/table participant enrollment remain open. The sections below retain earlier
-qualification records; the final sections describe the current implementation.
+execution owner are also implemented. SQL savepoints and connection DISCARD now
+publish their SQL metadata atomically with native advisory control. Public
+HTTP/pgwire source activation and row/table participant enrollment remain open.
+The sections below retain earlier qualification records; the final sections
+describe the current implementation.
 
 ## Native resource contract
 
@@ -961,3 +962,44 @@ pass. Main was fetched and merged again at `24486f5f30` (already contained). The
 original inventory remains **912 implemented, 138 rejected, 449 superseded and
 87 unresolved (64 DDL/catalog)**; public ingress and distributed activation are
 still required before crediting those originals.
+
+
+## Atomic connection reset and native unlock
+
+A scoped `DISCARD ALL` keeps the backend alive. Its accepting source transaction
+checks the exact command and observed connection revision, resets settings,
+search path and sequence state, increments resource generations, removes only
+that connection's prepared resources, and retains an immutable session-unlock
+intent. These changes commit together. It does not first unlock native grants
+or retire the backend. Other connections' prepared resources remain intact.
+
+Savepoints and DISCARD use the same `ControlPlan`, source CAS validation,
+`control_effect` outbox and bounded native cleanup loop. This is a general SQL
+metadata/control publication boundary, rather than a second reset coordinator.
+The SQL settings adapter allocates its empty result before publication and waits
+for the native completion proof before reporting success. A failed source CAS
+aborts the whole local transaction; only that proven pre-publication failure
+permits replanning. A changed logical connection revision is never overwritten.
+In-flight lease renewal is assisted as control before publication.
+
+After publication, cancellation and uncertain native replies leave the exact
+unlock intent durable. Command FINISH preserves it, and existing source recovery
+completes the indexed unlock job without executing SQL or incrementing reset
+generations again. Reentrant session references are all released. The same native
+backend can admit its next command and acquire those resources again.
+
+The native campaign injects failures after staging the source, prepared-resource
+removal and connection postimage; every aborted transaction preserves the old
+resources and metadata. It also covers a competing renewal CAS, cancellation
+after reset, lost effect replies, cold reopen between cleanup quanta, backend
+reuse and preservation of another connection's resources. Both catalog realms
+and local/Raft metadata apply are exercised. The shared settings adapter runs
+against the real native source/ledger path, including cancellation after reset.
+
+Debug qualification passes **83/83 build steps**, with **43 source/controller
+cases**, **42 native-result/API cases**, and the mounted transaction lifecycle
+and **18 transaction contract cases**. All report zero skips, failures and leaks.
+Formatting, license, Apache-boundary, control-catalog and inventory checks pass.
+This qualifies the scoped reset publication and recovery path; public ingress,
+pgwire connection ownership and distributed participant activation remain open.
+No original inventory disposition changes: **87 remain unresolved (64 DDL)**.

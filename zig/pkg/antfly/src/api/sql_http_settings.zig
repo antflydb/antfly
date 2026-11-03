@@ -128,8 +128,13 @@ fn executeConnection(alloc: std.mem.Allocator, adapter: *execution.Adapter, comm
         return runtime.Result.empty(alloc, "DISCARD SEQUENCES");
     }
     if (command == .discard_all) {
-        _ = try connections.mutateWithCommand(store, .{ .discard = id }, principal, owner_node_id, now_ms, adapter.context.sql_command_fence);
-        return runtime.Result.empty(alloc, "DISCARD ALL");
+        var result = try runtime.Result.empty(alloc, "DISCARD ALL");
+        errdefer result.deinit();
+        if (adapter.context.sql_command_fence != null) {
+            var coordinator: @import("sql_session.zig").Coordinator = .{ .server = adapter.server, .identity = adapter.identity, .context = adapter.context };
+            try coordinator.discard(id, expected_revision);
+        } else _ = try connections.mutateWithCommand(store, .{ .discard = id }, principal, owner_node_id, now_ms, null);
+        return result;
     }
     if (command == .reset_all) {
         _ = try connections.mutateWithCommand(store, .{ .overlay = .{ .id = id, .expected_revision = expected_revision, .entries = &.{}, .reset_search_path = true } }, principal, owner_node_id, now_ms, adapter.context.sql_command_fence);

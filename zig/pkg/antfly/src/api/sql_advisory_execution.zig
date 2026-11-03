@@ -41,7 +41,7 @@ pub const Frame = struct {
         var owned = (try producer.load(self.source, a, self.connection)) orelse return error.SqlConnectionNotFound;
         defer owned.deinit();
         const record = owned.value;
-        if (record.phase != .executing or record.recovery or record.savepoint_control != null or (record.pending != null and record.pending.?.operation != .renew) or record.ticket == null or
+        if (record.phase != .executing or record.recovery or record.control_effect != null or (record.pending != null and record.pending.?.operation != .renew) or record.ticket == null or
             record.registration.lease.expires_at_ms <= now_ms or !std.mem.eql(u8, record.principal, self.principal) or
             !std.mem.eql(u8, &record.instance, &self.instance)) return error.SqlConnectionBusy;
         const expected: authority.scopes.CommandFence = .{ .backend = record.registration.lease.backend, .command = record.ticket.?.command, .database = record.registration.lease.database, .principal = record.registration.lease.principal, .standalone = record.registration.standalone };

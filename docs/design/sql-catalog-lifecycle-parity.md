@@ -18232,3 +18232,24 @@ Apache-boundary, control-catalog and inventory audits pass. See
 for the precise remaining HTTP/pgwire, scheduling, disconnect and portal
 activation requirements. No original cases are credited from these component
 and source-worker campaigns: **87 remain unresolved (64 DDL/catalog)**.
+
+
+### Atomic scoped DISCARD and shared SQL control publication
+
+Scoped `DISCARD ALL` now resets connection settings, search path, sequence state
+and prepared resources in the same source transaction that retains native
+session-unlock intent. It preserves backend identity and other connections'
+resources. Savepoints and DISCARD share one control plan, source CAS and bounded
+cleanup loop. Only a proven aborted publication may be replanned; committed
+metadata is never executed again to recover a lost native reply.
+
+Fault tests cover every staged publication boundary, competing renewal,
+cancellation after reset and cold cleanup through standalone/clustered catalog
+realms and local/Raft apply. The shared settings adapter exercises the production
+native control path. The combined Debug gate passes 83 build steps, including
+43 source/controller cases, 42 native-result/API cases and the transaction
+lifecycle contracts, with no skips, failures or leaks. Formatting and source,
+license, control-catalog and inventory audits pass. Original counts remain
+912 implemented, 138 rejected, 449 superseded and 87 unresolved (64 DDL).
+[SQL lock ownership](sql-lock-ownership.md#atomic-connection-reset-and-native-unlock)
+records the still-open public ingress and participant activation requirements.

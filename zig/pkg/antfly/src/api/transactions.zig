@@ -1208,6 +1208,7 @@ pub const DurableSessionStore = struct {
     registration_locks: [64]std.atomic.Mutex = @splat(.unlocked),
     fail_writes_for_test: bool = false,
     fail_savepoint_publication_for_test: ?enum { session, source } = null,
+    fail_connection_publication_for_test: ?enum { source, resources, connection } = null,
     fail_lease_transition_after_session_write_for_test: bool = false,
 
     fn writeSerialization(self: *const DurableSessionStore) backend_erased.WriteSerialization {
@@ -1323,7 +1324,7 @@ pub const DurableSessionStore = struct {
         std.crypto.hash.Blake3.hash(bytes, &digest, .{});
         return .{ .value = try decodeSessionRecord(alloc, id, bytes), .digest = digest };
     }
-    fn saveSavepoint(self: *DurableSessionStore, session: Session, expected: ?[32]u8, plan: ?@import("sql_command_producer.zig").SavepointPlan, control: ?@import("antfly_local_sources").storage_pessimistic_lock_authority.ledger.Control, max_record_bytes: ?usize) !void {
+    fn saveSavepoint(self: *DurableSessionStore, session: Session, expected: ?[32]u8, plan: ?@import("sql_command_producer.zig").ControlPlan, control: ?@import("antfly_local_sources").storage_pessimistic_lock_authority.ledger.Control, max_record_bytes: ?usize) !void {
         const mutation = self.mutationMutex();
         platform_sync.lockYielding(mutation);
         defer mutation.unlock();
@@ -1348,7 +1349,7 @@ pub const DurableSessionStore = struct {
             },
         }
     }
-    fn saveSavepointTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, bytes: []const u8, session: Session, expected: ?[32]u8, plan: ?@import("sql_command_producer.zig").SavepointPlan, control: ?@import("antfly_local_sources").storage_pessimistic_lock_authority.ledger.Control) !void {
+    fn saveSavepointTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, bytes: []const u8, session: Session, expected: ?[32]u8, plan: ?@import("sql_command_producer.zig").ControlPlan, control: ?@import("antfly_local_sources").storage_pessimistic_lock_authority.ledger.Control) !void {
         if (expected) |want| {
             const previous = txn.get(key) catch |err| return if (err == error.NotFound) error.SqlTransactionNotActive else err;
             var actual: [32]u8 = undefined;
@@ -3903,7 +3904,7 @@ pub const SessionRegistry = struct {
     }
 
     pub const SqlSavepointAction = enum { create, rollback, release };
-    pub fn changeSqlSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: []const u8, action: SqlSavepointAction, plan: @import("sql_command_producer.zig").SavepointPlan) !?SavepointInfo {
+    pub fn changeSqlSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: []const u8, action: SqlSavepointAction, plan: @import("sql_command_producer.zig").ControlPlan) !?SavepointInfo {
         if (name.len == 0 or name.len > 63) return error.InvalidSavepointName;
         return switch (action) {
             .create => self.createSavepointNamed(alloc, txn_id, name, plan),
@@ -3911,7 +3912,7 @@ pub const SessionRegistry = struct {
             .release => self.changeSavepoint(alloc, txn_id, .{ .name = name }, true, plan),
         };
     }
-    fn refreshSavepointCandidate(self: *SessionRegistry, alloc: std.mem.Allocator, candidate: *Session, plan: ?@import("sql_command_producer.zig").SavepointPlan) !?[32]u8 {
+    fn refreshSavepointCandidate(self: *SessionRegistry, alloc: std.mem.Allocator, candidate: *Session, plan: ?@import("sql_command_producer.zig").ControlPlan) !?[32]u8 {
         if (plan == null) return null;
         const durable = self.durable orelse return error.SqlConnectionUnavailable;
         var latest = (try durable.savepointSnapshot(alloc, candidate.txn_id)) orelse return error.SqlTransactionNotActive;
@@ -3934,10 +3935,10 @@ pub const SessionRegistry = struct {
         candidate.* = latest.value;
         return latest.digest;
     }
-    fn persistSavepoint(self: *SessionRegistry, session: Session, expected: ?[32]u8, plan: ?@import("sql_command_producer.zig").SavepointPlan, control: ?@import("antfly_local_sources").storage_pessimistic_lock_authority.ledger.Control) !void {
+    fn persistSavepoint(self: *SessionRegistry, session: Session, expected: ?[32]u8, plan: ?@import("sql_command_producer.zig").ControlPlan, control: ?@import("antfly_local_sources").storage_pessimistic_lock_authority.ledger.Control) !void {
         if (self.durable) |durable| try durable.saveSavepoint(session, expected, plan, control, self.max_record_bytes) else if (plan != null) return error.SqlConnectionUnavailable;
     }
-    fn createSavepointNamed(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: ?[]const u8, plan: ?@import("sql_command_producer.zig").SavepointPlan) !?SavepointInfo {
+    fn createSavepointNamed(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, name: ?[]const u8, plan: ?@import("sql_command_producer.zig").ControlPlan) !?SavepointInfo {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
@@ -3997,7 +3998,7 @@ pub const SessionRegistry = struct {
         return self.changeSavepoint(alloc, txn_id, .{ .name = name }, true, null);
     }
 
-    fn changeSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, target: union(enum) { id: u64, name: []const u8 }, release: bool, plan: ?@import("sql_command_producer.zig").SavepointPlan) !?SavepointInfo {
+    fn changeSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, target: union(enum) { id: u64, name: []const u8 }, release: bool, plan: ?@import("sql_command_producer.zig").ControlPlan) !?SavepointInfo {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();

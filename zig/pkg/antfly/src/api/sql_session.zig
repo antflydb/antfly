@@ -61,30 +61,102 @@ pub const Coordinator = struct {
         const io = self.server.embedding_provider_runtime.io;
         const instance = try self.server.sql_connection_admission.executionInstance(io);
         const frame: @import("sql_advisory_execution.zig").Frame = .{ .source = store, .connection = connection, .principal = scope.principal, .instance = instance, .fence = fence.*, .actor = try @import("sql_authorization_recovery.zig").actor(self.server, self.identity.*) };
-        try frame.requireExecuting(self.server.alloc, platform_time.realtimeNs() / std.time.ns_per_ms);
-        var owned = (try producer.load(store, self.server.alloc, connection)) orelse return error.SqlConnectionNotFound;
-        defer owned.deinit();
         var native: producer.NativePort = .{ .server = self.server, .context = self.context };
-        var nonce: [16]u8 = undefined;
-        try io.randomSecure(&nonce);
-        var plan = try producer.observeSavepointPlan(self.server.alloc, owned.value, instance, id, platform_time.realtimeNs() / std.time.ns_per_ms, nonce, native.port());
+        for (0..8) |_| {
+            try frame.requireExecuting(self.server.alloc, platform_time.realtimeNs() / std.time.ns_per_ms);
+            var owned = (try producer.load(store, self.server.alloc, connection)) orelse return error.SqlConnectionNotFound;
+            defer owned.deinit();
+            var nonce: [16]u8 = undefined;
+            try io.randomSecure(&nonce);
+            if (owned.value.pending != null and owned.value.pending.?.operation == .renew) {
+                producer.advance(store, self.server.alloc, scope.principal, owned.value, instance, platform_time.realtimeNs() / std.time.ns_per_ms, nonce, native.port()) catch |err| switch (err) {
+                    error.MetadataMutationOutcomeUnknown, error.SqlConnectionChanged => {},
+                    else => return err,
+                };
+                continue;
+            }
+            var plan = try producer.observeControlPlan(self.server.alloc, owned.value, instance, id, platform_time.realtimeNs() / std.time.ns_per_ms, nonce, native.port());
+            try self.context.ensureActive();
+            plan.now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+            _ = (self.server.txn_sessions.changeSqlSavepoint(self.server.alloc, id, name, action, plan) catch |err| switch (err) {
+                // A failed source CAS aborts the whole SQL publication. Only
+                // that proven pre-publication failure permits replanning.
+                error.SqlConnectionChanged => continue,
+                else => return err,
+            }) orelse return error.SqlSavepointNotFound;
+            try self.drainControl(scope.principal, connection, instance, owned.value.ticket.?);
+            return;
+        }
+        return error.SqlConnectionBusy;
+    }
+
+    /// Metadata-first DISCARD: reset the logical connection and its resources
+    /// together with a durable unlock-all intent, then drain native control.
+    pub fn discard(self: *Coordinator, connection: [32]u8, expected_revision: u64) !void {
         try self.context.ensureActive();
-        plan.now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
-        _ = (try self.server.txn_sessions.changeSqlSavepoint(self.server.alloc, id, name, action, plan)) orelse return error.SqlSavepointNotFound;
+        const fence = self.context.sql_command_fence orelse return error.SqlConnectionBusy;
+        const store = self.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+        const producer = @import("sql_command_producer.zig");
+        const io = self.server.embedding_provider_runtime.io;
+        const principal = http.transactionPrincipal(self.identity.*) orelse "";
+        const instance = try self.server.sql_connection_admission.executionInstance(io);
+        const frame: @import("sql_advisory_execution.zig").Frame = .{ .source = store, .connection = connection, .principal = principal, .instance = instance, .fence = fence.*, .actor = try @import("sql_authorization_recovery.zig").actor(self.server, self.identity.*) };
+        var native: producer.NativePort = .{ .server = self.server, .context = self.context };
+        for (0..8) |_| {
+            try frame.requireExecuting(self.server.alloc, platform_time.realtimeNs() / std.time.ns_per_ms);
+            var owned = (try producer.load(store, self.server.alloc, connection)) orelse return error.SqlConnectionNotFound;
+            defer owned.deinit();
+            var nonce: [16]u8 = undefined;
+            try io.randomSecure(&nonce);
+            if (owned.value.pending != null and owned.value.pending.?.operation == .renew) {
+                producer.advance(store, self.server.alloc, principal, owned.value, instance, platform_time.realtimeNs() / std.time.ns_per_ms, nonce, native.port()) catch |err| switch (err) {
+                    error.MetadataMutationOutcomeUnknown, error.SqlConnectionChanged => {},
+                    else => return err,
+                };
+                continue;
+            }
+            var plan = try producer.observeControlPlan(self.server.alloc, owned.value, instance, null, platform_time.realtimeNs() / std.time.ns_per_ms, nonce, native.port());
+            try self.context.ensureActive();
+            plan.now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+            _ = connections.mutateWithCommand(store, .{ .discard_scoped = .{ .id = connection, .expected_revision = expected_revision, .plan = plan } }, principal, self.server.localSessionNodeId(), plan.now_ms, fence) catch |err| switch (err) {
+                error.SqlConnectionChanged => {
+                    // A different connection revision is not a heartbeat CAS
+                    // race. Never overwrite another logical metadata change.
+                    var logical = try connections.loadWithCommand(store, self.server.alloc, connection, principal, self.server.localSessionNodeId(), plan.now_ms, fence);
+                    defer logical.deinit();
+                    if (logical.value.revision != expected_revision) return err;
+                    continue;
+                },
+                else => return err,
+            };
+            try self.drainControl(principal, connection, instance, owned.value.ticket.?);
+            return;
+        }
+        return error.SqlConnectionBusy;
+    }
+
+    fn drainControl(self: *Coordinator, principal: []const u8, connection: [32]u8, instance: [16]u8, ticket: @import("sql_command_producer.zig").Ticket) !void {
+        const producer = @import("sql_command_producer.zig");
+        const store = self.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+        const io = self.server.embedding_provider_runtime.io;
+        var native: producer.NativePort = .{ .server = self.server, .context = self.context };
         var quanta: u8 = 0;
         while (true) {
             try self.context.ensureActive();
             var current = (try producer.load(store, self.server.alloc, connection)) orelse return error.SqlConnectionNotFound;
             defer current.deinit();
-            if (current.value.recovery or current.value.phase != .executing or !std.meta.eql(current.value.ticket, owned.value.ticket)) return error.SqlConnectionBusy;
-            if (current.value.savepoint_control == null) return;
+            if (current.value.recovery or current.value.phase != .executing or !std.meta.eql(current.value.ticket, @as(?producer.Ticket, ticket))) return error.SqlConnectionBusy;
+            if (current.value.control_effect == null) return;
+            var nonce: [16]u8 = undefined;
             try io.randomSecure(&nonce);
             const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
-            if (current.value.pending.?.operation != .renew and current.value.registration.lease.expires_at_ms > now_ms and current.value.registration.lease.expires_at_ms - now_ms <= producer.renew_before_ms) {
-                try producer.renew(store, scope.principal, current.value, instance, now_ms +| producer.execution_lease_ms, current.value.pending.?.admission.head, nonce, now_ms);
-            } else producer.advance(store, self.server.alloc, scope.principal, current.value, instance, now_ms, nonce, native.port()) catch |err| switch (err) {
-                // A concurrent worker may publish the next control quantum.
-                // Reload that exact intent; never re-run SQL publication.
+            const progress = if (current.value.pending.?.operation != .renew and current.value.registration.lease.expires_at_ms > now_ms and current.value.registration.lease.expires_at_ms - now_ms <= producer.renew_before_ms)
+                producer.renew(store, principal, current.value, instance, now_ms +| producer.execution_lease_ms, current.value.pending.?.admission.head, nonce, now_ms)
+            else
+                producer.advance(store, self.server.alloc, principal, current.value, instance, now_ms, nonce, native.port());
+            progress catch |err| switch (err) {
+                // Retry the already published control, including renewal CAS
+                // races. SQL metadata publication must never run a second time.
                 error.MetadataMutationOutcomeUnknown, error.SqlConnectionChanged => {},
                 else => return err,
             };

@@ -193,6 +193,7 @@ fn loadCommandTxn(txn: anytype, alloc: std.mem.Allocator, id: [32]u8, principal:
 pub const Action = union(enum) {
     create: record.Record,
     discard: [32]u8,
+    discard_scoped: struct { id: [32]u8, expected_revision: u64, plan: @import("sql_command_producer.zig").ControlPlan },
     close: [32]u8,
     begin: struct { id: [32]u8, expected_revision: u64, txn_id: [16]u8 },
     abort_begin: struct { id: [32]u8, txn_id: [16]u8 },
@@ -304,6 +305,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
     const id: [32]u8 = switch (action) {
         .create => unreachable,
         .discard, .close => |value| value,
+        .discard_scoped => |value| value.id,
         .begin => |value| value.id,
         .abort_begin => |value| value.id,
         .bind => |value| value.id,
@@ -339,11 +341,16 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             try record.putTxn(txn, alloc, next);
             break :blk 0;
         },
-        .discard, .close => blk: {
-            if (!try @import("sql_command_producer.zig").retirementReadyTxn(alloc, txn, id)) return error.SqlConnectionBusy;
+        .discard, .discard_scoped, .close => blk: {
+            if (action == .discard_scoped) {
+                if (fence == null or next.revision != action.discard_scoped.expected_revision) return error.SqlConnectionChanged;
+                try @import("sql_command_producer.zig").stageDiscardTxn(alloc, txn, action.discard_scoped.plan, id);
+                if (store.fail_connection_publication_for_test == .source) return error.InjectedSessionStoreFailure;
+            } else if (!try @import("sql_command_producer.zig").retirementReadyTxn(alloc, txn, id)) return error.SqlConnectionBusy;
             if (next.state != .idle) return error.SqlConnectionBusy;
             const removed = try prepared.discardConnectionTxn(txn, alloc, id);
-            if (action == .discard) {
+            if (action == .discard_scoped and store.fail_connection_publication_for_test == .resources) return error.InjectedSessionStoreFailure;
+            if (action != .close) {
                 if (next.generation == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
                 if (next.revision == std.math.maxInt(u64)) return error.SqlProgramLimitExceeded;
                 next.generation += 1;
@@ -354,6 +361,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
                 next.sequence_epoch += 1;
                 next.sequence_state = .{};
                 try record.putTxn(txn, alloc, next);
+                if (action == .discard_scoped and store.fail_connection_publication_for_test == .connection) return error.InjectedSessionStoreFailure;
             } else {
                 const connection_key = try record.key(&id);
                 try @import("sql_command_producer.zig").forgetRetiredTxn(alloc, txn, id);
