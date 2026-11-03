@@ -5653,7 +5653,6 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
             };
             defer connection.test_after_allocator_capture = null;
             var driver: MaintenancePhaseDriver(@TypeOf(connection)) = .{ .owner = connection, .started = &gate.started, .retry_idle = phase != .verification };
-            const before_capture = connection.current.?;
             const background = try std.Thread.spawn(.{}, @TypeOf(driver).run, .{&driver});
             var joined = false;
             defer if (!joined) {
@@ -5669,12 +5668,15 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
             const foreground_root = if (independent) blk: {
                 const guard = public.enterHandle(handle, .exclusive).?;
                 defer guard.leave();
-                if (guard.handle != before_capture) {
-                    try std.testing.expectEqual(@as(u64, 0), guard.handle.sql_commit_recovery_scans);
-                    try std.testing.expectEqual(@as(u64, 0), guard.handle.sql_ddl_recovery_scans);
-                }
+                // A physical-only maintenance snapshot deliberately carries
+                // no SQL recovery witness. Admission may recover its refreshed
+                // wrapper once before this parked computation is observed.
+                try std.testing.expect(!guard.handle.sql_commit_recovery_needed);
+                try std.testing.expect(!guard.handle.sql_ddl_recovery_needed);
                 break :blk guard.handle;
             } else connection.current.?;
+            const commit_scans = foreground_root.sql_commit_recovery_scans;
+            const ddl_scans = foreground_root.sql_ddl_recovery_scans;
             const Foreground = struct {
                 handle: ?*anyopaque,
                 done: std.Io.Event = .unset,
@@ -5689,7 +5691,11 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
             var foreground: Foreground = .{ .handle = handle };
             const writer = try std.Thread.spawn(.{}, Foreground.run, .{&foreground});
             const completed = if (foreground.done.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } })) |_| true else |_| false;
-            if (independent and completed) try std.testing.expectEqual(foreground_root, connection.current.?);
+            if (independent and completed) {
+                try std.testing.expectEqual(foreground_root, connection.current.?);
+                try std.testing.expectEqual(commit_scans, foreground_root.sql_commit_recovery_scans);
+                try std.testing.expectEqual(ddl_scans, foreground_root.sql_ddl_recovery_scans);
+            }
             gate.allowed.set(shared.handleLockIo());
             writer.join();
             background.join();
