@@ -64,8 +64,9 @@ use Debug to investigate and fix engine failures. OS caches are not flushed.
 Run regional qualification with the serving process in the bucket's region;
 label developer cross-region measurements separately.
 
-Local GCS runs acquire credentials with a minimum remaining lifetime before
-every child start. A single cached `gcloud auth print-access-token` result can
+Local GCS runs validate a conservative credential lifetime before every child
+start and refresh when insufficient. A still-valid in-memory token is retained
+across restarts even if another CLI user refreshes the shared gcloud cache. A single cached `gcloud auth print-access-token` result can
 expire partway through a long qualification, even when it was valid at startup.
 Externally supplied `--bearer-stdin` tokens retain their caller-owned lifetime;
 they cannot be refreshed by the harness. Cloud must use its managed refreshing

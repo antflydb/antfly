@@ -82,6 +82,9 @@ pub const ComposedProfile = struct {
     }
 };
 pub const Stats = struct {
+    // Snapshot at the API owner. Health exposition may run in a separately
+    // compiled runtime whose object-store module has independent atomics.
+    object_operations: @import("objectstore").operation_metrics.Snapshot = .{ .calls = @splat(0), .errors = @splat(0), .nanoseconds = @splat(0), .max_nanoseconds = @splat(0), .retries = 0 },
     navigation: Navigation = .{},
     best_first_calls: u64 = 0,
     best_first_segments: u64 = 0,
@@ -140,7 +143,7 @@ pub const Metrics = struct {
         if (self.slowest_lake == null or profile.duration(.total) > self.slowest_lake.?.duration(.total)) self.slowest_lake = profile;
     }
     pub fn snapshot(self: *Metrics) Stats {
-        var result: Stats = .{ .best_first_calls = self.best_first_calls.load(.monotonic), .best_first_segments = self.best_first_segments.load(.monotonic), .best_first_pruned_nodes = self.best_first_pruned_nodes.load(.monotonic) };
+        var result: Stats = .{ .object_operations = @import("objectstore").operation_metrics.runtime.snapshot(), .best_first_calls = self.best_first_calls.load(.monotonic), .best_first_segments = self.best_first_segments.load(.monotonic), .best_first_pruned_nodes = self.best_first_pruned_nodes.load(.monotonic) };
         inline for (@typeInfo(Navigation).@"struct".field_names, 0..) |field, index| @field(result.navigation, field) = self.navigation[index].load(.monotonic);
         for (0..count) |i| {
             result.calls[i] = self.calls[i].load(.monotonic);
@@ -158,7 +161,7 @@ pub const Metrics = struct {
 
 pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: anytype) !void {
     const operations = @import("objectstore").operation_metrics;
-    const object_stats = operations.runtime.snapshot();
+    const object_stats = query.object_operations;
     inline for (@typeInfo(operations.Operation).@"enum".field_names, 0..) |name, i| {
         try prom.appendPromMetric(writer, "antfly_objectstore_" ++ name ++ "_calls_total", "counter", "Linked API runtime logical client calls including local and nested fallback calls; excludes separately owned runtime counters", object_stats.calls[i]);
         try prom.appendPromMetric(writer, "antfly_objectstore_" ++ name ++ "_errors_total", "counter", "Logical client errors including absence and conditional conflicts", object_stats.errors[i]);
@@ -199,6 +202,22 @@ pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: any
         }
         try prom.appendPromMetric(writer, "antfly_lake_query_slowest_composed_composition_nanoseconds", "gauge", "Slowest composed request remainder after definition, leaves and cursor; native overlaps leaves", profile.composition());
     }
+}
+
+test "external lake single request owner operation snapshot survives transport and exposition" {
+    var snapshot: Stats = .{};
+    snapshot.object_operations.calls[@backingInt(@import("objectstore").operation_metrics.Operation.get)] = 12345;
+    snapshot.object_operations.retries = 17;
+    const a = std.testing.allocator;
+    const encoded = try std.json.Stringify.valueAlloc(a, snapshot, .{});
+    defer a.free(encoded);
+    var parsed = try std.json.parseFromSlice(Stats, a, encoded, .{});
+    defer parsed.deinit();
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    try append(&output.writer, local.serverless_query_lake_serving_cache.Cache.Stats{}, @as(?local.serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats, null), parsed.value);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "antfly_objectstore_get_calls_total 12345\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "antfly_objectstore_get_retries_total 17\n") != null);
 }
 
 test "external lake single request outlier profiles isolate interleaved phases and never wait" {

@@ -55,6 +55,14 @@ class RemotePerformanceTests(unittest.TestCase):
             cells = matrix.plan(args)
             self.assertEqual(len(cells), 16)
             self.assertEqual(len({cell["state"] for cell in cells}), 16)
+            self.assertEqual(
+                [cell["name"] for cell in cells[:2]],
+                ["before-local-stored-1-1", "after-local-stored-1-1"],
+            )
+            self.assertEqual(
+                [cell["name"] for cell in cells[8:10]],
+                ["after-local-stored-1-2", "before-local-stored-1-2"],
+            )
             for cell in cells:
                 self.assertIn(
                     "--store-source" if cell["store_source"] else "--no-store-source",

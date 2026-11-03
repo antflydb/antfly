@@ -194,6 +194,21 @@ def plan(args):
                     )
     if len({c["name"] for c in cells}) != len(cells):
         raise ValueError("Duplicate binary labels")
+    # Pair identical scenarios and alternate binary order on successive cycles.
+    # A resumed cell retains its exact recipe regardless of schedule position.
+    labels = [binding.partition("=")[0] for binding in args.binary]
+
+    def schedule(cell):
+        label, provider, _, stored, cycle = cell["name"].rsplit("-", 4)
+        ordinal = labels.index(label)
+        return (
+            int(cycle),
+            args.providers.index(provider),
+            -int(stored),
+            ordinal if int(cycle) % 2 else -ordinal,
+        )
+
+    cells.sort(key=schedule)
     return cells
 
 

@@ -580,6 +580,7 @@ def main():
         else ["hn_id", "created_at", "item_type", "author", "points"]
     )
     args.state.mkdir(parents=True, exist_ok=True)
+    token_valid_until = 0.0
     if args.filesystem_source:
         token = ""
     elif args.bearer_stdin:
@@ -590,7 +591,9 @@ def main():
         # Begin with nearly a full token lifetime. Besides bounding this run,
         # this permits matched measurements of older engines whose publication
         # signatures incorrectly depended on the literal bearer token.
+        acquired_started = time.monotonic()
         token = gcs_bearer(args.project, 3300)
+        token_valid_until = acquired_started + 3300
     local_source_root = (
         prepare_filesystem_source(args.filesystem_source, args.state)
         if args.filesystem_source
@@ -661,11 +664,15 @@ def main():
     startup_samples_ms = []
 
     def start():
-        nonlocal process, log, container, token
+        nonlocal process, log, container, token, token_valid_until
         if not args.filesystem_source and not args.bearer_stdin:
-            token = gcs_bearer(
-                args.project, min(3300, max(1800, args.build_timeout + 600))
-            )
+            minimum = min(3300, max(1800, args.build_timeout + 600))
+            if time.monotonic() + minimum >= token_valid_until:
+                acquired_started = time.monotonic()
+                token = gcs_bearer(args.project, 3300)
+                token_valid_until = acquired_started + 3300
+            # Keep our still-valid token if another gcloud user refreshes its
+            # shared CLI cache. Restart comparisons must not rotate by accident.
             env["HN_GCS_BEARER"] = token
         startup_started = time.monotonic()
         log = (args.state / "server.log").open("a")
