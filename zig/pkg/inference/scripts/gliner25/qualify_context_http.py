@@ -111,21 +111,37 @@ def main():
             if word_tokens <= 0 or not 0 <= overhead < 16384:
                 raise ValueError("invalid measured token geometry")
             words = (16384 - overhead) // word_tokens
-            if not 1 <= words <= 4095:
+            filler = "the "
+            filler_probe = execute(args.endpoint, filler, args.timeout)
+            probes.append(filler_probe)
+            filler_tokens = filler_probe["output"]["usage"]["prompt_tokens"] - overhead
+            if filler_tokens <= 0:
+                raise ValueError("invalid measured filler-token cost")
+            filler_words, remainder = divmod(
+                16384 - overhead - word_tokens * words, filler_tokens
+            )
+            if remainder != 0:
+                raise ValueError(
+                    "measured filler cannot reach the exact encoded-token boundary"
+                )
+            if not 1 <= words + filler_words <= 4095:
                 raise ValueError("encoded capacity cannot fit one body-word window")
             report.update(
                 word=word,
                 word_tokens=word_tokens,
                 overhead=overhead,
-                source_words=words,
+                dense_source_words=words,
+                source_words=words + filler_words,
+                filler=filler,
+                filler_tokens=filler_tokens,
+                filler_words=filler_words,
                 probes=probes,
             )
-            report["capacity"] = execute(args.endpoint, word * words, args.timeout)
+            report["capacity"] = execute(
+                args.endpoint, word * words + filler * filler_words, args.timeout
+            )
             actual = report["capacity"]["output"]["usage"]["prompt_tokens"]
-            if (
-                actual != overhead + word_tokens * words
-                or not 16384 - word_tokens < actual <= 16384
-            ):
+            if actual != 16384:
                 raise ValueError(
                     "full request did not reach the measured encoded-token boundary"
                 )

@@ -30,6 +30,47 @@ import qualify_context_http as capacity
 
 
 class ContractTests(unittest.TestCase):
+    def test_capacity_campaign_fills_exact_boundary_and_rejects_inexact_usage(self):
+        word = "configuration_visibility_maintenance_acknowledgement "
+        exact = word * 1819 + "the " * 3
+        counts = {word: 19, word * 2: 28, "the ": 11, exact: 16384}
+        with tempfile.TemporaryDirectory() as directory:
+            for fail in (False, True):
+                output = Path(directory) / f"{fail}.json"
+
+                def execute(_, text, __):
+                    return {
+                        "output": {
+                            "usage": {
+                                "prompt_tokens": counts[text]
+                                - (1 if fail and text == exact else 0)
+                            }
+                        }
+                    }
+
+                arguments = [
+                    "qualify_context_http",
+                    "--endpoint",
+                    "http://localhost/extract",
+                    "--output",
+                    str(output),
+                ]
+                with (
+                    patch.object(sys, "argv", arguments),
+                    patch.object(capacity, "execute", side_effect=execute),
+                ):
+                    if fail:
+                        with self.assertRaisesRegex(
+                            ValueError, "encoded-token boundary"
+                        ):
+                            capacity.main()
+                    else:
+                        capacity.main()
+                report = json.loads(output.read_text())
+                self.assertEqual(report["status"], "failed" if fail else "complete")
+                self.assertEqual(report["source_words"], 1822)
+                self.assertEqual(report["filler_words"], 3)
+
     def test_capacity_check_rejects_split_windows_and_invalid_source_spans(self):
         class Response(io.BytesIO):
             status = 200

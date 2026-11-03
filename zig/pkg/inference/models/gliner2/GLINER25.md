@@ -204,9 +204,8 @@ after its output projection, before the FFN. This removes overlapping phase
 lifetimes without increasing the request heap or the model/work limits. Device
 backends retain their command-frame lifetimes.
 
-With
-the pinned base model installed, select them separately from the more expensive
-encoded-token boundary:
+With the pinned base model installed, select the word/window checks separately
+from the more expensive encoded-token boundary:
 
 ```sh
 ANTFLY_GLINER25_BASE_MODEL_DIR=/path/to/gliner2.5-base-v1 \
@@ -218,8 +217,8 @@ ZIG_GLOBAL_CACHE_DIR="$PWD/../.zig-cache/global" zig build inference-test \
 ```
 
 The explicit `scripts/gliner25/qualify_context_http.py` command checks encoded
-capacity through an already-running loopback HTTP service. It measures repeated
-word token cost using two small requests, fills the 16384-token ceiling, and
+capacity through an already-running loopback HTTP service. It measures dense
+and filler word token costs using small requests, fills exactly 16384 tokens, and
 requires a single window, exact reported token usage and valid source spans.
 It does not measure long-context extraction accuracy:
 
