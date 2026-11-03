@@ -18122,3 +18122,27 @@ frame: query checks have a separate helper, reducing that frame from 5.9 MiB to
 write-source runtimes outlive error cleanup. Native Darwin Debug API compiler
 admission covers the measured 23,968,071,680-byte peak with a 28 GiB reservation;
 Linux, release and cross-host claims retain their existing profiles.
+
+
+### Journaled metadata command-fence boundary
+
+The next lock-activation prerequisite now binds immutable command authority into
+the existing bounded catalog admission and sequence-counter request identities.
+The receiving native transaction observes exact retained results before checking
+liveness, rejects late new work behind permanent fences, and preserves unknown
+outcomes after eviction. SQL producers bind before computing recovery digests;
+unbound or substituted scoped requests fail at dispatch. Four point reads suffice
+for the native guard, without a cursor, extra receipt journal, or extra proposal.
+Capability 138 protects the new payloads. Internal HTTP signatures cover the body,
+and scope observations use the normal stamped read contract.
+
+The native campaign covers both catalog realms, local/Raft apply, cold reopen,
+command rollover, queued waits, abort boundaries, eviction, identity substitution,
+and worst-case escaped owned notices. The focused Debug qualification plus
+sequence contracts passes 73 build steps; broader Debug qualification passes
+140 build steps and 354 tests. See
+[SQL lock ownership](sql-lock-ownership.md#native-command-fences-for-journaled-metadata-effects)
+for the receiving contract and the explicit remaining public-activation work.
+Legacy mutation paths without shared admission remain closed to scoped dispatch.
+This is architecture qualification, not a new original-fixture closure: the
+inventory remains 912 implemented, 138 rejected, 449 superseded, and 87 unresolved.

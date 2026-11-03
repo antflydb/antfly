@@ -366,7 +366,8 @@ test "system catalog canonical schema preserves columnless constant index predic
     var predicates = [_]wire.RelationalIndexPredicate{
         .{ .constant = true },
         .{ .constant = false },
-        .{ .column = "id", .op = .eq, .value = .{ .number_string = "9007199254740993" } },
+        .{ .column = "id", .op = .eq, .value = .{ .value = .{ .number_string = "9007199254740993" } } },
+        .{ .column = "id", .op = .eq, .value = .null_value },
     };
     var indexes = [_]wire.RelationalIndexDefinition{
         .{ .name = "id_idx", .keys = &.{.{ .column = "id" }}, .where = &predicates },
@@ -375,8 +376,9 @@ test "system catalog canonical schema preserves columnless constant index predic
     try canonicalizeOwnedSchema(std.testing.allocator, &schema);
     try std.testing.expectEqual(@as(?bool, true), predicates[0].constant);
     try std.testing.expectEqual(@as(?bool, false), predicates[1].constant);
-    try std.testing.expect(predicates[0].column == null and predicates[0].value == null);
-    try std.testing.expectEqualStrings("9007199254740993", predicates[2].value.?.number_string);
+    try std.testing.expect(predicates[0].column == null and predicates[0].value == .absent);
+    try std.testing.expectEqualStrings("9007199254740993", predicates[2].value.value.number_string);
+    try std.testing.expect(predicates[3].value == .null_value);
 }
 
 test "relational declarations public UUID defaults retain closed argument and shift shapes" {

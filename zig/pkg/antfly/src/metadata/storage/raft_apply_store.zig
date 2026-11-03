@@ -41444,7 +41444,7 @@ pub const RaftApplyStore = struct {
             const qualified_name = if (std.mem.eql(u8, parent.value.name, request.target.namespace)) dependent.name else try std.fmt.allocPrint(a, "{s}.{s}", .{ parent.value.name, dependent.name });
             break :single try std.fmt.allocPrint(a, "drop cascades to {s} {s}({s})", .{ if (record.kind == .operator) "operator" else "function", qualified_name, try record.definition.displaySignatureAlloc(a) });
         } else if (dependents.len > 1) try std.fmt.allocPrint(a, "drop cascades to {d} other objects", .{dependents.len}) else null;
-        const result: sql_routines.Result = .{ .revision = revision, .identity = if (next) |value| .{ .id = value.id, .generation = value.generation } else null, .removed = @intFromBool(next == null), .cascade_notice = cascade_notice };
+        const result: sql_routines.Result = .{ .revision = revision, .identity = if (next) |value| .{ .id = value.id, .generation = value.generation } else null, .removed = @intFromBool(next == null), .cascade_notice = if (cascade_notice) |text| try sql_routines.outcomes.Notice.init(text) else null };
         if (!apply) return result;
         var upserts: [1]system_catalog.Resource = undefined;
         if (next) |value| upserts[0] = .{ .kind = .routine, .id = value.id, .parent_id = namespace.id, .name = request.target.table, .signature = storage_signature, .source_json = try value.encode(a), .description = description };
@@ -41613,7 +41613,16 @@ pub const RaftApplyStore = struct {
             return .{ .rejected = rejected.rejected };
         };
         return switch (admission) {
-            .ready => if (binding.matches_name) .ready else .{ .rejected = .CatalogGenerationChanged },
+            .ready => blk: {
+                if (!binding.matches_name) break :blk .{ .rejected = .CatalogGenerationChanged };
+                if (request.request.command_fence) |fence| {
+                    @import("../../system_catalog/command_fence.zig").check(a, txn, group, request.incarnation, fence) catch |err| {
+                        const rejected = sql_sequences.CounterOutcome.fromError(err) orelse return err;
+                        break :blk .{ .rejected = rejected.rejected };
+                    };
+                }
+                break :blk .ready;
+            },
             .applied => |value| .{ .applied = value },
             .unknown => .unknown,
         };
@@ -64557,13 +64566,13 @@ test "SQL routine catalog aggregate dependency rebuild and retained retirement s
             retirement.admission = .{ .nonce = @splat(5), .head = (try T.cut(&store, a)).head };
             retirement.operation.drop.cascade = true;
             const removed = (try T.apply(&store, a, retirement)).success;
-            try std.testing.expectEqualStrings("drop cascades to function agg(text)", removed.cascade_notice.?);
+            try std.testing.expectEqualStrings("drop cascades to function agg(text)", removed.cascade_notice.?.slice());
             retired_revision = removed.revision;
         } else {
             try std.testing.expect((try T.cut(&store, a)).found == null);
             const replay = (try T.apply(&store, a, retirement)).success;
             try std.testing.expectEqual(retired_revision, replay.revision);
-            try std.testing.expectEqualStrings("drop cascades to function agg(text)", replay.cascade_notice.?);
+            try std.testing.expectEqualStrings("drop cascades to function agg(text)", replay.cascade_notice.?.slice());
             var txn = try store.store.beginReadTxn();
             defer txn.abort();
             try std.testing.expectEqual(@as(usize, 0), (try system_catalog_storage.functionDependents(a, &txn, group, transition.id, 1024)).len);
@@ -64648,7 +64657,7 @@ test "SQL routine catalog database casts retain typed dependencies and exact col
             retirement.operation.drop.cascade = true;
             const removed = (try T.routine(&store, a, retirement)).success;
             retired_revision = removed.revision;
-            try std.testing.expectEqualStrings("drop cascades to cast from jsonb to text", removed.cascade_notice.?);
+            try std.testing.expectEqualStrings("drop cascades to cast from jsonb to text", removed.cascade_notice.?.slice());
         } else {
             try std.testing.expectEqual(retired_revision, (try T.routine(&store, a, retirement)).success.revision);
             const before = try T.cut(&store, a);
@@ -67732,6 +67741,224 @@ test "SQL prepared transaction native lock scope atomically seals private admiss
                 defer read.abort();
                 try std.testing.expectEqual(@as(u64, 0), try P.activeCount(a, &read, T.group));
                 try std.testing.expectEqual(@as(?L.scopes.Work, null), try L.scopes.nextWork(a, &read, .{ .home = .metadata, .group = T.group, .incarnation = @splat(0x11) }, 10000, null));
+            }
+        }
+    }
+}
+
+test "SQL command fence guards native catalog and counter effects through cold replay and bounded eviction" {
+    const L = @import("../../system_catalog/lock_authority.zig");
+    const T = SessionCommitRegistryFixture;
+    const a_backing = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a_backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Helper = struct {
+        const Reader = struct {
+            txn: *docstore.DocStore.Txn,
+            reads: usize = 0,
+            pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+                self.reads += 1;
+                return self.txn.get(key);
+            }
+        };
+        const Fault = struct {
+            txn: *docstore.DocStore.Txn,
+            remaining: usize,
+            pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+                return self.txn.get(key);
+            }
+            pub fn put(self: *@This(), key: []const u8, value: []const u8) anyerror!void {
+                if (self.remaining == 0) return error.InjectedStorageFailure;
+                self.remaining -= 1;
+                try self.txn.put(key, value);
+            }
+            pub fn delete(self: *@This(), key: []const u8) anyerror!void {
+                try self.txn.delete(key);
+            }
+        };
+        fn scope(store: *RaftApplyStore, backing: std.mem.Allocator, backend: L.locks.Backend, standalone: bool, nonce: u8, op: @FieldType(L.Request, "operation")) !void {
+            const request: L.Request = .{ .admission = .{ .nonce = @splat(nonce), .head = try store.sqlSequenceAdmissionHead(T.group) }, .incarnation = @splat(0x11), .standalone = standalone, .database = 1, .actor = .{ .session_user = .bootstrap, .credential = "" }, .backend = backend, .operation = op };
+            try store.applyStandaloneCommand(T.group, .{ .apply_sql_lock_scope = try std.json.Stringify.valueAlloc(backing, request, .{}) });
+            const outcome = (try std.json.parseFromSliceLeaky(?L.outcomes.Outcome, backing, try store.sqlLockOutcome(backing, T.group, request), .{})).?;
+            _ = try outcome.result();
+        }
+        fn activation(store: *RaftApplyStore, backing: std.mem.Allocator, version: u16) !void {
+            try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(backing, topology_protocol.Activation{ .version = version, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+        }
+        fn apply(store: *RaftApplyStore, backing: std.mem.Allocator, command: TransitionCommand, index: u64, replicated: bool) !void {
+            if (!replicated) return store.applyStandaloneCommand(T.group, command);
+            const wire = try encodeTransitionCommand(backing, command);
+            const entries = try raft_state_machine.encodeCommittedEntries(backing, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = wire }});
+            try store.snapshotBuilder().applyBatch(.{ .group_id = T.group, .commit_index = index, .entries_bytes = entries });
+        }
+    };
+    for ([_]bool{ false, true }) |standalone| {
+        for ([_]bool{ false, true }) |replicated| {
+            const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/command-{any}-{any}", .{ tmp.sub_path, standalone, replicated });
+            const backend: L.locks.Backend = .{ .incarnation = @splat(0x11), .id = @splat(2), .fence = 1 };
+            const frame: L.scopes.Command = .{ .sequence = 1, .nonce = @splat(3), .executor = @splat(4) };
+            const fence: L.scopes.CommandFence = .{ .backend = backend, .command = frame, .database = 1, .principal = try L.principalDigest(a, .bootstrap), .standalone = standalone };
+            var create: sql_sequences.Mutation = undefined;
+            var first: sql_sequences.CounterRequest = undefined;
+            var accepted: sql_sequences.journal.Receipt = undefined;
+            var notice_admission: L.outcomes.Admission = undefined;
+            const notice: [1024]u8 = @splat(1);
+            for (0..2) |pass| {
+                var store = try RaftApplyStore.init(a_backing, .{ .root_dir = root });
+                defer store.deinit();
+                if (pass == 0) {
+                    try store.applyStandaloneCommand(T.group, .{ .initialize_metadata_incarnation = T.seed });
+                    if (standalone) try store.replaceStandaloneCatalog(T.group, try store.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
+                    try Helper.activation(&store, a, topology_protocol.sql_lock_authority_version);
+                    try store.applyStandaloneCommand(T.group, .{ .upsert_table = .{ .table_id = 17, .name = "owner_rows" } });
+                    try adoptRelationWriterForTest(&store, a, T.group);
+                    _ = try publishLiveRelationRootWithCoverageForTest(&store, a, T.group, .constraint_names);
+                    try Helper.scope(&store, a, backend, standalone, 40, .{ .register = .{ .lease = .{ .backend = backend, .database = 1, .node = if (standalone) 0 else 9, .principal = fence.principal, .expires_at_ms = 1000 }, .connection = @splat('2'), .nonce = @splat(5), .standalone = standalone } });
+                    try Helper.scope(&store, a, backend, standalone, 41, .{ .begin = frame });
+                    create = .{ .admission = .{ .nonce = @splat(50), .head = try store.sqlSequenceAdmissionHead(T.group), .command_fence = fence }, .target = .{ .table = "scoped_counter" }, .namespace_id = system_catalog.default_namespace_id, .incarnation = backend.incarnation, .operation = .{ .create = .{ .options = .{} } } };
+                    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.sqlSequencePreflight(a, T.group, create));
+                    try Helper.activation(&store, a, topology_protocol.sql_command_fence_version);
+                    {
+                        var txn = try store.store.beginReadTxn();
+                        defer txn.abort();
+                        var reader: Helper.Reader = .{ .txn = &txn };
+                        try @import("../../system_catalog/command_fence.zig").check(a, &reader, T.group, backend.incarnation, fence);
+                        // This adapter exposes neither cursors nor writes.
+                        // Guard cost is independent of catalog/table/lock size.
+                        try std.testing.expectEqual(@as(usize, 4), reader.reads);
+                    }
+                    const head = try store.sqlSequenceAdmissionHead(T.group);
+                    for (0..3) |substitution| {
+                        var foreign = create;
+                        switch (substitution) {
+                            0 => foreign.admission.command_fence.?.principal = @splat(99),
+                            1 => foreign.admission.command_fence.?.database = 99,
+                            2 => foreign.admission.command_fence.?.standalone = !standalone,
+                            else => unreachable,
+                        }
+                        try std.testing.expectEqual(.Forbidden, (try store.sqlSequencePreflight(a, T.group, foreign)).rejected);
+                    }
+                    try std.testing.expectEqual(head, try store.sqlSequenceAdmissionHead(T.group));
+                    const blocker: L.locks.Backend = .{ .incarnation = backend.incarnation, .id = @splat(9), .fence = 1 };
+                    const blocker_frame: L.scopes.Command = .{ .sequence = 1, .nonce = @splat(10), .executor = @splat(11) };
+                    try Helper.scope(&store, a, blocker, standalone, 60, .{ .register = .{ .lease = .{ .backend = blocker, .database = 1, .node = if (standalone) 0 else 9, .principal = fence.principal, .expires_at_ms = 1000 }, .connection = @splat('3'), .nonce = @splat(12), .standalone = standalone } });
+                    try Helper.scope(&store, a, blocker, standalone, 61, .{ .begin = blocker_frame });
+                    const acquire: L.scopes.ledger.Acquisition = .{ .resource = @splat(13), .mode = .{ .advisory = .exclusive }, .scope = .session };
+                    try Helper.scope(&store, a, blocker, standalone, 62, .{ .effect = .{ .command = blocker_frame, .effect = .{ .backend = blocker, .sequence = 1, .nonce = @splat(14), .action = .{ .acquire = acquire } } } });
+                    const waiting: L.EffectInput = .{ .command = frame, .effect = .{ .backend = backend, .sequence = 1, .nonce = @splat(15), .action = .{ .acquire = acquire } } };
+                    try Helper.scope(&store, a, backend, standalone, 63, .{ .effect = waiting });
+                    try std.testing.expectEqual(.CatalogPublicationProofPending, (try store.sqlSequencePreflight(a, T.group, create)).rejected);
+                    try Helper.scope(&store, a, backend, standalone, 64, .{ .cancel = waiting });
+                    try Helper.apply(&store, a, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(a, sql_sequences.command(create), .{}) }, 101, replicated);
+                    const identity = (try (try store.sqlSequenceOutcome(a, T.group, create)).result()).identity.?;
+                    first = .{ .target = create.target, .namespace_id = create.namespace_id, .sequence_id = identity.id, .incarnation = backend.incarnation, .request = .{ .expected = (try sql_sequences.sequence.Record.create(.{})).state, .request_id = @splat(51), .operation = .reserve, .command_fence = fence } };
+                    try std.testing.expectEqual(.ready, try store.sqlSequenceCounterPreflight(a, T.group, first));
+                    const binding = (try sql_sequences.sequence.Record.create(.{})).definition;
+                    for (0..2) |cut| {
+                        var txn = try store.store.beginWriteTxn();
+                        // Guard and effects borrow one accepting transaction;
+                        // neither a failed state write nor failed receipt can
+                        // escape its abort boundary into the WAL.
+                        try @import("../../system_catalog/command_fence.zig").check(a, &txn, T.group, first.incarnation, fence);
+                        var writer: Helper.Fault = .{ .txn = &txn, .remaining = cut };
+                        const counter: sql_sequences.journal.Store(Helper.Fault) = .{ .txn = &writer, .key = .{ .group = T.group, .sequence_id = identity.id } };
+                        const failed = counter.execute(a, binding, first.request);
+                        txn.abort();
+                        try std.testing.expectError(error.InjectedStorageFailure, failed);
+                        try std.testing.expectEqual(.ready, try store.sqlSequenceCounterPreflight(a, T.group, first));
+                    }
+                    try Helper.apply(&store, a, .{ .apply_sql_sequence_counter = try std.json.Stringify.valueAlloc(a, first, .{}) }, 102, replicated);
+                    accepted = try (try store.sqlSequenceCounterOutcome(a, T.group, first)).?.result();
+                    {
+                        // Codec witness: worst-case escaping plus a scoped
+                        // identity must remain readable within a fixed slot.
+                        var txn = try store.store.beginWriteTxn();
+                        errdefer txn.abort();
+                        const journal: L.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = T.group, .incarnation = backend.incarnation };
+                        notice_admission = .{ .nonce = @splat(56), .head = try journal.head(a), .command_fence = fence };
+                        const ordinal = (try journal.prepare(a, notice_admission, @splat(88))).append;
+                        try journal.append(a, ordinal, notice_admission, @splat(88), .{ .success = .{ .revision = (try system_catalog_storage.readMeta(a, &txn, T.group)).revision, .identity = null, .removed = 1, .cascade_notice = try L.outcomes.Notice.init(&notice) } });
+                        try txn.commit();
+                    }
+                    try Helper.scope(&store, a, backend, standalone, 65, .{ .finish = frame });
+                    const successor: L.scopes.Command = .{ .sequence = 2, .nonce = @splat(16), .executor = @splat(17) };
+                    try Helper.scope(&store, a, backend, standalone, 66, .{ .begin = successor });
+                    var next_create = create;
+                    next_create.target.table = "successor_counter";
+                    next_create.admission.nonce = @splat(54);
+                    next_create.admission.head = try store.sqlSequenceAdmissionHead(T.group);
+                    next_create.admission.command_fence.?.command = successor;
+                    try Helper.apply(&store, a, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(a, sql_sequences.command(next_create), .{}) }, 103, replicated);
+                    _ = try (try store.sqlSequenceOutcome(a, T.group, next_create)).result();
+                    var obsolete = first;
+                    obsolete.request.expected = accepted.state;
+                    obsolete.request.request_id = @splat(55);
+                    try std.testing.expectEqual(.CatalogGenerationChanged, (try store.sqlSequenceCounterPreflight(a, T.group, obsolete)).rejected);
+                    try Helper.scope(&store, a, backend, standalone, 42, .{ .fence = .close });
+                }
+                {
+                    var txn = try store.store.beginReadTxn();
+                    defer txn.abort();
+                    const journal: L.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = T.group, .incarnation = backend.incarnation };
+                    const historical = (try journal.lookup(a_backing, notice_admission, @splat(88))).?;
+                    // General-purpose allocation frees parser scratch before
+                    // returning. Reencoding must not borrow those freed bytes.
+                    const encoded = try std.json.Stringify.valueAlloc(a_backing, historical, .{});
+                    defer a_backing.free(encoded);
+                    var decoded = try std.json.parseFromSlice(L.outcomes.Outcome, a_backing, encoded, .{});
+                    defer decoded.deinit();
+                    try std.testing.expectEqualStrings(&notice, decoded.value.success.cascade_notice.?.slice());
+                }
+                // Exact success survives fencing and cold reopen. It does not
+                // invoke the current command guard or allocate another value.
+                _ = try (try store.sqlSequenceOutcome(a, T.group, create)).result();
+                try std.testing.expectEqualDeep(accepted, try (try store.sqlSequenceCounterOutcome(a, T.group, first)).?.result());
+                try Helper.apply(&store, a, .{ .apply_sql_sequence_counter = try std.json.Stringify.valueAlloc(a, first, .{}) }, 201 + pass * 10, replicated);
+                try std.testing.expectEqualDeep(accepted, try (try store.sqlSequenceCounterOutcome(a, T.group, first)).?.result());
+                var late = first;
+                late.request.expected = accepted.state;
+                late.request.request_id = @splat(52);
+                try std.testing.expectEqual(.CatalogGenerationChanged, (try store.sqlSequenceCounterPreflight(a, T.group, late)).rejected);
+                try Helper.apply(&store, a, .{ .apply_sql_sequence_counter = try std.json.Stringify.valueAlloc(a, late, .{}) }, 202 + pass * 10, replicated);
+                try std.testing.expectEqual(.CatalogGenerationChanged, (try store.sqlSequenceCounterOutcome(a, T.group, late)).?.rejected);
+                var late_create = create;
+                late_create.target.table = "never_created";
+                late_create.admission.nonce = @splat(53);
+                late_create.admission.head = try store.sqlSequenceAdmissionHead(T.group);
+                const before_head = late_create.admission.head;
+                try Helper.apply(&store, a, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(a, sql_sequences.command(late_create), .{}) }, 203 + pass * 10, replicated);
+                try std.testing.expectEqual(.CatalogGenerationChanged, (try store.sqlSequenceOutcome(a, T.group, late_create)).rejected);
+                try std.testing.expectEqual(before_head, try store.sqlSequenceAdmissionHead(T.group));
+                const snapshot = try std.json.parseFromSliceLeaky(sql_sequences.Snapshot, a, try store.sqlSequenceSnapshot(a, T.group, .{ .targets = &.{late_create.target} }, .{}), .{});
+                try std.testing.expectEqual(.absent, snapshot.entries[0].value);
+                if (pass == 1) {
+                    var administrative = first;
+                    administrative.request.command_fence = null;
+                    var last = accepted;
+                    for (0..sql_sequences.journal.retained_receipts + 1) |i| {
+                        administrative.request.expected = last.state;
+                        administrative.request.request_id = @splat(@as(u8, @intCast(100 + i)));
+                        try Helper.apply(&store, a, .{ .apply_sql_sequence_counter = try std.json.Stringify.valueAlloc(a, administrative, .{}) }, 300 + i, replicated);
+                        last = try (try store.sqlSequenceCounterOutcome(a, T.group, administrative)).?.result();
+                    }
+                    try std.testing.expectEqual(.unknown, try store.sqlSequenceCounterPreflight(a, T.group, first));
+                    try std.testing.expect((try store.sqlSequenceCounterOutcome(a, T.group, first)) == null);
+                    // Independent administrator traffic can evict old receipts.
+                    // Absence outside the admission window must remain unknown.
+                    for (0..L.outcomes.retained) |i| {
+                        var txn = try store.store.beginWriteTxn();
+                        errdefer txn.abort();
+                        const journal: L.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = T.group, .incarnation = backend.incarnation };
+                        const admission: L.outcomes.Admission = .{ .nonce = @splat(@as(u8, @intCast(100 + i))), .head = try journal.head(a) };
+                        const ordinal = (try journal.prepare(a, admission, @splat(77))).append;
+                        try journal.append(a, ordinal, admission, @splat(77), .{ .success = .{ .revision = (try system_catalog_storage.readMeta(a, &txn, T.group)).revision, .identity = null, .removed = 0 } });
+                        try txn.commit();
+                    }
+                    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, store.sqlSequenceOutcome(a, T.group, create));
+                }
             }
         }
     }

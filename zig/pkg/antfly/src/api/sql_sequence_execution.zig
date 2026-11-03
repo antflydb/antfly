@@ -272,7 +272,7 @@ pub const Owner = struct {
             try context.ensureActive();
             var nonce: [16]u8 = undefined;
             try io.randomSecure(&nonce);
-            const request: sequences.CounterRequest = .{ .target = live.reference.target, .namespace_id = live.reference.namespace_id, .sequence_id = live.reference.identity.id, .incarnation = live.reference.identity.incarnation, .request = .{ .expected = live.counter, .request_id = nonce, .operation = operation } };
+            const request: sequences.CounterRequest = .{ .target = live.reference.target, .namespace_id = live.reference.namespace_id, .sequence_id = live.reference.identity.id, .incarnation = live.reference.identity.incarnation, .request = .{ .expected = live.counter, .request_id = nonce, .operation = operation, .command_fence = if (context.sql_command_fence) |fence| fence.* else null } };
             const key: sequences.journal.Key = .{ .group = live.group, .sequence_id = live.reference.identity.id };
             _ = try sequences.journal.prepare(key, live.definition, live.counter, request.request, null);
             const bytes = self.root.server.source.systemCatalog(a, context, .{ .sql_sequence_counter_mutate = request }) catch null;
@@ -489,10 +489,11 @@ test "SQL sequence allocator observes the exact lost acknowledgement without rep
         fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
             return error.UnexpectedCall;
         }
-        fn call(raw: *anyopaque, a: A, _: local.api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        fn call(raw: *anyopaque, a: A, context: local.api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return switch (input) {
                 .sql_sequence_counter_mutate => |request| blk: {
+                    try std.testing.expectEqualDeep(if (context.sql_command_fence) |fence| @as(?local.storage_pessimistic_lock_authority.CommandFence, fence.*) else null, request.request.command_fence);
                     self.admissions += 1;
                     const decision = try sequences.journal.prepare(.{ .group = 7, .sequence_id = 9 }, self.definition, self.counter, request.request, null);
                     self.receipt = decision.apply;
@@ -500,6 +501,7 @@ test "SQL sequence allocator observes the exact lost acknowledgement without rep
                     break :blk error.InjectedLostAcknowledgement;
                 },
                 .sql_sequence_counter_outcome => |request| blk: {
+                    try std.testing.expectEqualDeep(if (context.sql_command_fence) |fence| @as(?local.storage_pessimistic_lock_authority.CommandFence, fence.*) else null, request.request.command_fence);
                     self.observations += 1;
                     try std.testing.expectEqualDeep(self.receipt.?, (try sequences.journal.prepare(.{ .group = 7, .sequence_id = 9 }, self.definition, self.counter, request.request, self.receipt)).replay);
                     var outcome: sequences.CounterAdmission = switch (self.mode) {
@@ -515,27 +517,30 @@ test "SQL sequence allocator observes the exact lost acknowledgement without rep
         }
     };
     const a = std.testing.allocator;
+    const fence: local.storage_pessimistic_lock_authority.CommandFence = .{ .backend = .{ .incarnation = @splat(1), .id = @splat(2), .fence = 1 }, .command = .{ .sequence = 1, .nonce = @splat(3), .executor = @splat(4) }, .principal = @splat(5), .database = 1, .standalone = false };
     inline for (.{ .applied, .ready, .unknown, .forged }) |mode| {
-        const definition = try sequences.sequence.Definition.prepare(null, .{ .cache = 4 });
-        var probe: Probe = .{ .mode = mode, .definition = definition, .counter = try sequences.sequence.State.init(definition) };
-        var api: http.ApiHttpServer = undefined;
-        api.alloc = a;
-        api.cfg = .{ .imported_runtime_io = .{ .api = std.testing.io } };
-        api.source = .{ .ptr = &probe, .vtable = &.{ .status = Probe.status, .system_catalog = Probe.call, .supports_sql_sequences = true } };
-        var identity: ?http.AuthenticatedIdentity = null;
-        var root: execution.Adapter = .{ .server = &api, .identity = &identity, .context = .{} };
-        var state: session.State = .{};
-        defer state.deinit(a);
-        var owner: Owner = .{ .root = &root, .arena = std.heap.ArenaAllocator.init(a), .state = &state, .state_allocator = a };
-        defer owner.arena.deinit();
-        var live: Live = .{ .reference = .{ .identity = .{ .incarnation = @splat(1), .id = 9 }, .namespace_id = 2, .target = .{ .table = "numbers" } }, .group = 7, .definition = definition, .counter = probe.counter };
-        if (mode == .applied) {
-            const receipt = try owner.allocate(&live, .reserve, null);
-            try std.testing.expectEqual(@as(i64, 1), try receipt.lease.?.value(0));
-        } else try std.testing.expectError(error.SqlSequenceOutcomeUnknown, owner.allocate(&live, .reserve, null));
-        try std.testing.expectEqual(@as(usize, 1), probe.admissions);
-        try std.testing.expectEqual(@as(usize, 1), probe.observations);
-        try std.testing.expectEqual(@as(i64, 4), probe.counter.last_value);
+        for ([_]bool{ false, true }) |scoped| {
+            const definition = try sequences.sequence.Definition.prepare(null, .{ .cache = 4 });
+            var probe: Probe = .{ .mode = mode, .definition = definition, .counter = try sequences.sequence.State.init(definition) };
+            var api: http.ApiHttpServer = undefined;
+            api.alloc = a;
+            api.cfg = .{ .imported_runtime_io = .{ .api = std.testing.io } };
+            api.source = .{ .ptr = &probe, .vtable = &.{ .status = Probe.status, .system_catalog = Probe.call, .supports_sql_sequences = true } };
+            var identity: ?http.AuthenticatedIdentity = null;
+            var root: execution.Adapter = .{ .server = &api, .identity = &identity, .context = .{ .sql_command_fence = if (scoped) &fence else null } };
+            var state: session.State = .{};
+            defer state.deinit(a);
+            var owner: Owner = .{ .root = &root, .arena = std.heap.ArenaAllocator.init(a), .state = &state, .state_allocator = a };
+            defer owner.arena.deinit();
+            var live: Live = .{ .reference = .{ .identity = .{ .incarnation = @splat(1), .id = 9 }, .namespace_id = 2, .target = .{ .table = "numbers" } }, .group = 7, .definition = definition, .counter = probe.counter };
+            if (mode == .applied) {
+                const receipt = try owner.allocate(&live, .reserve, null);
+                try std.testing.expectEqual(@as(i64, 1), try receipt.lease.?.value(0));
+            } else try std.testing.expectError(error.SqlSequenceOutcomeUnknown, owner.allocate(&live, .reserve, null));
+            try std.testing.expectEqual(@as(usize, 1), probe.admissions);
+            try std.testing.expectEqual(@as(usize, 1), probe.observations);
+            try std.testing.expectEqual(@as(i64, 4), probe.counter.last_value);
+        }
     }
 }
 

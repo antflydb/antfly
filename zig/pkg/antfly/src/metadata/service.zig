@@ -3728,6 +3728,11 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const command_fence = switch (command) {
+        .apply_system_catalog, .apply_sql_sequence_counter, .apply_sql_prepared_transaction, .apply_sql_lock_scope, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_schema_validation, .apply_table_retirement => |bytes| @import("schema_reader_wire.zig").requiresSqlCommandFence(bytes),
+        else => false,
+    };
+    if (command_fence) return metadata_topology_protocol.sql_command_fence_version;
     const native_index_names = switch (command) {
         .upsert_table => |table| table.sql_native_indexes_json.len != 0,
         .compare_and_replace_table => |value| value.expected.sql_native_indexes_json.len != 0 or value.replacement.sql_native_indexes_json.len != 0,
@@ -24392,4 +24397,15 @@ test "presentation malformed restore and catalog envelopes cannot reduce the cur
 test "SQL routine catalog trigger decoder admission precedes scalar and owner floors" {
     try std.testing.expectEqual(metadata_topology_protocol.sql_trigger_function_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"sql_owner\":{},\"sql_routine\":{\"operation\":{\"publish\":{\"definition\":{\"returns_trigger\":true}}}}}" }));
     try std.testing.expect(metadata_topology_protocol.sql_trigger_function_version > metadata_topology_protocol.sql_routine_version);
+}
+
+test "SQL command fence decoder admission dominates legacy catalog and counter floors" {
+    const guarded = "{\"admission\":{\"command_fence\":{}}}";
+    for ([_]metadata_storage.TransitionCommand{
+        .{ .apply_system_catalog = guarded },
+        .{ .apply_sql_sequence_counter = guarded },
+        .{ .apply_sql_prepared_transaction = guarded },
+        .{ .apply_sql_lock_scope = guarded },
+    }) |command| try std.testing.expectEqual(metadata_topology_protocol.sql_command_fence_version, baseRequiredCoordinatedDecoderVersion(command));
+    try std.testing.expectEqual(metadata_topology_protocol.sql_lock_authority_version, baseRequiredCoordinatedDecoderVersion(.{ .apply_sql_lock_scope = "{\"admission\":{\"command_fence\":null}}" }));
 }

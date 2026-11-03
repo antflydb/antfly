@@ -110,7 +110,7 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
     if (conditional_notice) |notice| if (root.notice_sink) |sink| if (sink.reserve) |reserve| try reserve(sink.ptr, 1, notice.message.len);
     var nonce: [16]u8 = undefined;
     try root.server.embedding_provider_runtime.io.randomSecure(&nonce);
-    const request: types.Mutation = .{ .admission = .{ .nonce = nonce, .head = cut.head }, .target = scope.target, .namespace_id = scope.namespace_id.?, .incarnation = cut.incarnation, .operation = operation };
+    const request: types.Mutation = .{ .admission = .{ .nonce = nonce, .head = cut.head, .command_fence = if (root.context.sql_command_fence) |fence| fence.* else null }, .target = scope.target, .namespace_id = scope.namespace_id.?, .incarnation = cut.incarnation, .operation = operation };
     try request.validate();
     if (operation == .drop and operation.drop.cascade and cut.has_dependents)
         return @import("sql_type_retirement.zig").execute(root, allocators, cut, request);

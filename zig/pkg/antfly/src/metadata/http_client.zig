@@ -5931,3 +5931,43 @@ test "table retirement manifest HTTP reads bind authority incarnation response l
     }
     try std.testing.expectEqual(@as(usize, 6), executor.calls);
 }
+
+test "SQL command fence remains bound to the authenticated internal HTTP body" {
+    const a = std.testing.allocator;
+    const calls = @import("../system_catalog/server_call.zig");
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const fence: @import("../system_catalog/command_fence.zig").Fence = .{ .backend = .{ .incarnation = @splat(1), .id = @splat(2), .fence = 1 }, .command = .{ .sequence = 1, .nonce = @splat(3), .executor = @splat(4) }, .principal = @splat(5), .database = 1, .standalone = false };
+    const Executor = struct {
+        expected: @TypeOf(fence),
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            const now = @as(i64, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            const grant = request.header(authority.header_name) orelse return error.TestUnexpectedResult;
+            try authority.verify("scope-test-secret", "scope-test", .admin, request.body, now, grant);
+            var parsed = try std.json.parseFromSlice(calls.Call, alloc, request.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualDeep(self.expected, parsed.value.sql_sequence_mutate.admission.command_fence.?);
+            parsed.value.sql_sequence_mutate.admission.command_fence.?.command.executor = @splat(9);
+            const substituted = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+            defer alloc.free(substituted);
+            try std.testing.expectError(error.Forbidden, authority.verify("scope-test-secret", "scope-test", .admin, substituted, now, grant));
+            const headers = try alloc.alloc(http_common.Header, 1);
+            errdefer alloc.free(headers);
+            const name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header);
+            errdefer alloc.free(name);
+            headers[0] = .{ .name = name, .value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_committed) };
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{}"), .headers = headers };
+        }
+    };
+    var executor: Executor = .{ .expected = fence };
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("scope-test-secret", "scope-test");
+    const call: calls.Call = .{ .sql_sequence_mutate = .{ .admission = .{ .nonce = @splat(6), .head = 0, .command_fence = fence }, .incarnation = @splat(1), .target = .{ .table = "s" }, .namespace_id = 2, .operation = .{ .create = .{ .options = .{} } } } };
+    const response = try client.forwardSystemCatalog("http://metadata.invalid", call, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, true);
+    defer a.free(response);
+    try std.testing.expectEqualStrings("{}", response);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}

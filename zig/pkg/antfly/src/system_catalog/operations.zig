@@ -451,7 +451,7 @@ pub fn mutateSqlSequenceCounter(svc: anytype, alloc: std.mem.Allocator, context:
     try context.ensureActive();
     try request.validate();
     try svc.ensureSqlSequenceDecoderReadyWithContext(context);
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_sequence_catalog_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (request.request.command_fence != null) protocol.sql_command_fence_version else protocol.sql_sequence_catalog_version);
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     switch (try store.sqlSequenceCounterPreflight(alloc, svc.metadata_group_id, request)) {
@@ -2395,7 +2395,8 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
     return result;
 }
 
-pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) anyerror![]u8 {
+pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, unbound: @import("server_call.zig").Call) anyerror![]u8 {
+    const input = try unbound.requireCommandFence(context.sql_command_fence);
     return switch (input) {
         .sql_snapshot_cohort => |request| blk: {
             try context.ensureActive();

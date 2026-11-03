@@ -49,10 +49,17 @@ pub const Request = struct {
     /// retried with a new revision/identity just because its reply was lost.
     request_id: [16]u8,
     operation: Operation,
+    command_fence: ?@import("../storage/pessimistic_lock_authority.zig").CommandFence = null,
 
     pub fn validate(self: Request) !void {
         if (self.expected.generation == 0 or self.expected.revision == 0 or
             std.mem.allEqual(u8, &self.request_id, 0)) return error.InvalidSequenceRequest;
+        if (self.command_fence) |fence| try fence.validate();
+    }
+
+    pub fn jsonStringify(self: Request, writer: anytype) !void {
+        if (self.command_fence) |fence| return writer.write(.{ .expected = self.expected, .request_id = self.request_id, .operation = self.operation, .command_fence = fence });
+        try writer.write(.{ .expected = self.expected, .request_id = self.request_id, .operation = self.operation });
     }
 
     fn digest(self: Request, key: Key) ![32]u8 {
@@ -77,6 +84,7 @@ pub const Request = struct {
                 h.update(&bytes);
             },
         }
+        if (self.command_fence) |fence| fence.hashInto(&h);
         return h.finalResult();
     }
 };
@@ -431,5 +439,37 @@ test "sequence catalog journal historical boundary leases cannot expand into ear
         // original preimage must reject values 3..8 from an earlier allocation.
         try t.expectError(error.InvalidSequenceReceipt, prepare(key, record.definition, third.state, second_request, damaged));
         try t.expectEqualDeep(second, (try prepare(key, record.definition, third.state, second_request, second)).replay);
+    }
+}
+
+test "SQL command fence counter receipts bind every execution identity and preserve ordinary wire bytes" {
+    const a = std.testing.allocator;
+    const key: Key = .{ .group = 1, .sequence_id = 3 };
+    var request: Request = .{ .expected = (try sequence.Record.create(.{})).state, .request_id = @splat(1), .operation = .reserve };
+    const legacy = try std.json.Stringify.valueAlloc(a, .{ .expected = request.expected, .request_id = request.request_id, .operation = request.operation }, .{});
+    defer a.free(legacy);
+    const encoded = try std.json.Stringify.valueAlloc(a, request, .{});
+    defer a.free(encoded);
+    try std.testing.expectEqualStrings(legacy, encoded);
+    const legacy_digest = try request.digest(key);
+    request.command_fence = .{ .backend = .{ .incarnation = @splat(1), .id = @splat(2), .fence = 1 }, .command = .{ .sequence = 1, .nonce = @splat(3), .executor = @splat(4) }, .principal = @splat(5), .database = 1, .standalone = false };
+    const digest = try request.digest(key);
+    try std.testing.expect(!std.mem.eql(u8, &legacy_digest, &digest));
+    for (0..9) |field| {
+        var changed = request;
+        switch (field) {
+            0 => changed.command_fence.?.backend.incarnation = @splat(9),
+            1 => changed.command_fence.?.backend.id = @splat(9),
+            2 => changed.command_fence.?.backend.fence += 1,
+            3 => changed.command_fence.?.command.sequence += 1,
+            4 => changed.command_fence.?.command.nonce = @splat(9),
+            5 => changed.command_fence.?.command.executor = @splat(9),
+            6 => changed.command_fence.?.database += 1,
+            7 => changed.command_fence.?.principal = @splat(9),
+            8 => changed.command_fence.?.standalone = true,
+            else => unreachable,
+        }
+        const other = try changed.digest(key);
+        try std.testing.expect(!std.mem.eql(u8, &digest, &other));
     }
 }

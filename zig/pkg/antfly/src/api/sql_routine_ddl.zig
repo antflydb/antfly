@@ -112,7 +112,7 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
     const io = root.server.embedding_provider_runtime.io;
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
-    const request: routines.Mutation = .{ .admission = .{ .nonce = nonce, .head = cut.head }, .target = target, .namespace_id = cut.scopes[index].namespace_id.?, .incarnation = cut.incarnation, .operation = if (declared) |definition| .{ .publish = .{ .kind = routine_kind, .definition = definition, .replace = if (ddl.routine) |intent| intent.replace else if (ddl.aggregate_definition) |intent| intent.replace else false, .expected = expected } } else if (ddl.action == .comment) .{ .comment = .{ .kind = routine_kind, .signature = signature orelse try prior.?.definition.signatureAlloc(a), .expected = expected.?, .description = ddl.comment_value } } else .{ .drop = .{ .kind = routine_kind, .signature = signature orelse try prior.?.definition.signatureAlloc(a), .expected = expected, .if_exists = ddl.conditional, .cascade = ddl.cascade } } };
+    const request: routines.Mutation = .{ .admission = .{ .nonce = nonce, .head = cut.head, .command_fence = if (root.context.sql_command_fence) |fence| fence.* else null }, .target = target, .namespace_id = cut.scopes[index].namespace_id.?, .incarnation = cut.incarnation, .operation = if (declared) |definition| .{ .publish = .{ .kind = routine_kind, .definition = definition, .replace = if (ddl.routine) |intent| intent.replace else if (ddl.aggregate_definition) |intent| intent.replace else false, .expected = expected } } else if (ddl.action == .comment) .{ .comment = .{ .kind = routine_kind, .signature = signature orelse try prior.?.definition.signatureAlloc(a), .expected = expected.?, .description = ddl.comment_value } } else .{ .drop = .{ .kind = routine_kind, .signature = signature orelse try prior.?.definition.signatureAlloc(a), .expected = expected, .if_exists = ddl.conditional, .cascade = ddl.cascade } } };
     try request.validate();
     const observation = try routines.observation(a, request);
     var receipt = try recovery.newReceipt(allocators.result, a, observation, cut.revision);
@@ -129,7 +129,7 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
         if (committed.cascade_notice) |notice| if (root.notice_sink) |sink| {
             // Durability remains visible even if an optional transport notice
             // cannot be delivered. Standard transports reserved before submit.
-            sink.emit(sink.ptr, .{ .message = notice }) catch return .{ .catalog_receipt = receipt };
+            sink.emit(sink.ptr, .{ .message = notice.slice() }) catch return .{ .catalog_receipt = receipt };
         };
         return .{ .catalog_receipt = receipt };
     }

@@ -20,6 +20,9 @@ const std = @import("std");
 const A = std.mem.Allocator;
 const Meta = @import("antfly_local_sources").system_catalog_domain.Meta;
 pub const retained: u64 = 64;
+// A valid 1024-byte notice may expand sixfold when JSON escapes controls.
+// Include fixed command-fence identities in the same bounded record budget.
+pub const max_record_bytes = 8192;
 
 pub const Identity = struct {
     id: u64,
@@ -28,11 +31,43 @@ pub const Identity = struct {
         if (self.id == 0 or self.generation == 0) return error.InvalidCatalogMutation;
     }
 };
+/// Owned bounded text: results outlive JSON parser arenas and native read
+/// scratch. JSON keeps the existing string/null representation.
+pub const Notice = struct {
+    bytes: [1024]u8 = @splat(0),
+    len: u16 = 0,
+    pub fn init(text: []const u8) !Notice {
+        if (text.len > 1024) return error.SqlProgramLimitExceeded;
+        if (text.len == 0 or !std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidSequenceOutcome;
+        var result: Notice = .{ .len = @intCast(text.len) };
+        @memcpy(result.bytes[0..text.len], text);
+        return result;
+    }
+    pub fn slice(self: *const Notice) []const u8 {
+        return self.bytes[0..self.len];
+    }
+    pub fn jsonParse(allocator: A, source: anytype, options: std.json.ParseOptions) !Notice {
+        return init(try std.json.innerParse([]const u8, allocator, source, options)) catch return error.UnexpectedToken;
+    }
+    pub fn jsonParseFromValue(_: A, source: std.json.Value, _: std.json.ParseOptions) !Notice {
+        if (source != .string) return error.UnexpectedToken;
+        return init(source.string) catch return error.UnexpectedToken;
+    }
+    pub fn jsonStringify(self: Notice, writer: anytype) !void {
+        try writer.write(self.slice());
+    }
+    fn validate(self: *const Notice) !void {
+        if (self.len == 0 or self.len > self.bytes.len or !std.mem.allEqual(u8, self.bytes[self.len..], 0)) return error.InvalidSequenceOutcome;
+        const text = self.slice();
+        if (!std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidSequenceOutcome;
+    }
+};
+
 pub const Result = struct {
     revision: u64,
     identity: ?Identity,
     removed: usize,
-    cascade_notice: ?[]const u8 = null,
+    cascade_notice: ?Notice = null,
     no_op: bool = false,
     pub fn jsonStringify(self: Result, writer: anytype) !void {
         if (self.no_op) return writer.write(.{ .revision = self.revision, .identity = self.identity, .removed = self.removed, .cascade_notice = self.cascade_notice, .no_op = true });
@@ -42,7 +77,10 @@ pub const Result = struct {
     }
     pub fn validate(self: Result) !void {
         if (self.no_op and (self.removed != 0 or self.cascade_notice != null)) return error.InvalidSequenceOutcome;
-        if (self.cascade_notice) |notice| if (notice.len == 0 or notice.len > 1024 or self.removed != 1 or !std.unicode.utf8ValidateSlice(notice) or std.mem.indexOfScalar(u8, notice, 0) != null) return error.InvalidSequenceOutcome;
+        if (self.cascade_notice) |notice| {
+            if (self.removed != 1) return error.InvalidSequenceOutcome;
+            try notice.validate();
+        }
         if (self.identity) |value| try value.validate();
         if (self.removed > 1 or (self.removed != 0 and self.identity != null) or
             (self.revision == 0 and (self.removed != 0 or self.identity != null))) return error.InvalidSequenceOutcome;
@@ -51,8 +89,14 @@ pub const Result = struct {
 pub const Admission = struct {
     nonce: [16]u8,
     head: u64,
+    command_fence: ?@import("command_fence.zig").Fence = null,
+    pub fn jsonStringify(self: Admission, writer: anytype) !void {
+        if (self.command_fence) |fence| return writer.write(.{ .nonce = self.nonce, .head = self.head, .command_fence = fence });
+        try writer.write(.{ .nonce = self.nonce, .head = self.head });
+    }
     pub fn validate(self: Admission) !void {
         if (std.mem.allEqual(u8, &self.nonce, 0)) return error.InvalidCatalogMutation;
+        if (self.command_fence) |fence| try fence.validate();
     }
 };
 pub const Rejection = enum {
@@ -216,6 +260,7 @@ const Record = struct {
     fn validate(self: Record, incarnation: [16]u8) !void {
         try self.admission.validate();
         try self.outcome.validate();
+        if (self.admission.command_fence) |fence| if (!std.mem.eql(u8, &fence.backend.incarnation, &incarnation)) return error.InvalidSequenceOutcome;
         if (self.format != 1 or !std.mem.eql(u8, &self.incarnation, &incarnation) or
             self.ordinal == 0 or self.admission.head >= self.ordinal or
             self.ordinal - self.admission.head > retained or std.mem.allEqual(u8, &self.digest, 0)) return error.InvalidSequenceOutcome;
@@ -282,7 +327,7 @@ pub fn Store(comptime Txn: type) type {
             if (ordinal == 0 or ordinal > latest or latest - ordinal >= retained) return error.InvalidSequenceOutcome;
             var buffer: [192]u8 = undefined;
             const bytes = (try self.optional(try self.slotKey(&buffer, ordinal))) orelse return error.InvalidSequenceOutcome;
-            if (bytes.len > 4096) return error.InvalidSequenceOutcome;
+            if (bytes.len > max_record_bytes) return error.InvalidSequenceOutcome;
             var parsed = std.json.parseFromSlice(Record, a, bytes, .{}) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidSequenceOutcome,
@@ -354,10 +399,27 @@ pub fn Store(comptime Txn: type) type {
         pub fn lookup(self: @This(), a: A, admission: Admission, digest: [32]u8) !?Outcome {
             try admission.validate();
             var buffer: [192]u8 = undefined;
-            const encoded = (try self.optional(try self.nonceKey(&buffer, admission.nonce))) orelse return null;
-            const value = try self.record(a, try number(encoded), try self.meta(a));
+            const encoded = (try self.optional(try self.nonceKey(&buffer, admission.nonce))) orelse {
+                if (admission.command_fence) |fence| {
+                    const latest = try self.head(a);
+                    // Outside the bounded admission window, absence cannot
+                    // prove non-execution: preserve the existing unknown result.
+                    if (admission.head > latest or latest - admission.head >= retained) return null;
+                    @import("command_fence.zig").check(a, self.txn, self.group, self.incarnation, fence) catch |err| return switch (err) {
+                        // These fences are irreversible. The nonce is absent in
+                        // the same native cut, so this proves definite nonexecution.
+                        error.CatalogGenerationChanged, error.Forbidden => Outcome.fromError(err),
+                        else => err,
+                    };
+                }
+                return null;
+            };
+            // Native read scratch may be reused by the next point lookup.
+            const ordinal = try number(encoded);
+            const catalog = try self.meta(a);
+            const value = try self.record(a, ordinal, catalog);
             if (!std.mem.eql(u8, &value.admission.nonce, &admission.nonce)) return error.InvalidSequenceOutcome;
-            if (value.admission.head != admission.head or !std.mem.eql(u8, &value.digest, &digest)) return error.SequenceAdmissionConflict;
+            if (!std.meta.eql(value.admission, admission) or !std.mem.eql(u8, &value.digest, &digest)) return error.SequenceAdmissionConflict;
             return value.outcome;
         }
         pub fn prepare(self: @This(), a: A, admission: Admission, digest: [32]u8) !Decision {
@@ -386,6 +448,7 @@ pub fn Store(comptime Txn: type) type {
             }
             const bytes = try std.json.Stringify.valueAlloc(a, next, .{});
             defer a.free(bytes);
+            if (bytes.len > max_record_bytes) return error.InvalidSequenceOutcome;
             catalog.sequence_outcome_head = ordinal;
             const catalog_bytes = try std.json.Stringify.valueAlloc(a, catalog, .{});
             defer a.free(catalog_bytes);

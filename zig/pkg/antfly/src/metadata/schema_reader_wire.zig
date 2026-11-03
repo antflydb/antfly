@@ -83,6 +83,10 @@ pub fn requiresSqlCast(bytes: []const u8) bool {
     return requiresMarker(bytes, "sql_cast");
 }
 
+pub fn requiresSqlCommandFence(bytes: []const u8) bool {
+    return requiresMarker(bytes, "command_fence");
+}
+
 pub fn requiresSqlNativeIndex(bytes: []const u8) bool {
     return requiresMarker(bytes, "sql_native_index") or requiresMarker(bytes, "sql_native_indexes_json");
 }
@@ -502,4 +506,11 @@ test "SQL routine catalog trigger decoder ignores source text and recognizes esc
 test "SQL native index capability markers cover mutation and retained table names" {
     for ([_][]const u8{ "{}", "{\"body\":\"sql_native_index\"}" }) |bytes| try std.testing.expect(!requiresSqlNativeIndex(bytes));
     for ([_][]const u8{ "{\"sql_native_index\":{}}", "{\"sql_native_indexes_json\":\"owned\"}", "{\"sql_native_ind\\u0065x\":{}}", "{" }) |bytes| try std.testing.expect(requiresSqlNativeIndex(bytes));
+}
+
+test "SQL command fence decoder projection finds escaped fields without parsing source text" {
+    for ([_][]const u8{ "{}", "{\"command_fence\":null}", "{\"source_json\":\"command_fence\"}" }) |bytes|
+        try std.testing.expect(!requiresSqlCommandFence(bytes));
+    for ([_][]const u8{ "{\"admission\":{\"command_fence\":{}}}", "{\"request\":{\"command_\\u0066ence\":{}}}", "{" }) |bytes|
+        try std.testing.expect(requiresSqlCommandFence(bytes));
 }

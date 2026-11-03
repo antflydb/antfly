@@ -182,7 +182,7 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
     const request: seq.Mutation = .{
-        .admission = .{ .nonce = nonce, .head = cut.head },
+        .admission = .{ .nonce = nonce, .head = cut.head, .command_fence = if (context.sql_command_fence) |fence| fence.* else null },
         .target = entry.target,
         .namespace_id = entry.namespace_id orelse return error.InvalidSqlBackendResponse,
         .incarnation = cut.incarnation,

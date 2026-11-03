@@ -211,6 +211,55 @@ pub const Call = union(enum) {
     /// Private binary transport only. The JSON catalog route rejects this tag.
     schema_validation_submit: []const u8,
 
+    /// Bind before serialization, so the existing service signature and exact
+    /// native request digest cover the command owner. Unjournaled mutations
+    /// remain closed to scoped execution until they provide the same contract.
+    pub fn withCommandFence(self: @This(), fence: ?*const @import("command_fence.zig").Fence) !@This() {
+        return self.commandFence(fence, true);
+    }
+    /// Producers must bind before computing compact recovery digests. Never
+    /// silently change an already prepared identity at the dispatch boundary.
+    pub fn requireCommandFence(self: @This(), fence: ?*const @import("command_fence.zig").Fence) !@This() {
+        return self.commandFence(fence, false);
+    }
+    fn commandFence(self: @This(), fence: ?*const @import("command_fence.zig").Fence, comptime bind: bool) !@This() {
+        // Observations retain the original statement identity. A later SQL
+        // command may observe an earlier result; rebinding would corrupt its
+        // digest or incorrectly require the earlier executor to remain alive.
+        if (!self.isMutation()) return self;
+        const value = (fence orelse return self).*;
+        try value.validate();
+        var result = self;
+        switch (result) {
+            // These operations have their own independently joined native
+            // scope/decision identity. Membership activation is service work.
+            .sql_sequence_prepare, .sql_lock_read, .sql_lock_mutate, .sql_lock_outcome => return result,
+            .sql_sequence_counter_mutate, .sql_sequence_counter_outcome => |*request| {
+                if (request.request.command_fence) |old| {
+                    if (!std.meta.eql(old, value)) return error.InvalidCatalogMutation;
+                } else if (!bind) return error.InvalidCatalogMutation;
+                request.request.command_fence = value;
+                return result;
+            },
+            inline else => |*request| {
+                const T = @TypeOf(request.*);
+                if (comptime @typeInfo(T) == .@"struct") {
+                    if (comptime @hasField(T, "admission")) {
+                        if (comptime @TypeOf(request.admission) == @import("sequence_outcomes.zig").Admission) {
+                            if (request.admission.command_fence) |old| {
+                                if (!std.meta.eql(old, value)) return error.InvalidCatalogMutation;
+                            } else if (!bind) return error.InvalidCatalogMutation;
+                            request.admission.command_fence = value;
+                            return result;
+                        }
+                    }
+                }
+            },
+        }
+        if (self.isMutation()) return error.TableTopologyProtocolUpgradeRequired;
+        return result;
+    }
+
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
             .resolve_many => |request| request.sql_principal != null,
@@ -275,7 +324,7 @@ pub const Call = union(enum) {
 
     pub fn isMutation(self: @This()) bool {
         return self == .schema_validation_submit or self == .mutate or self == .fk_initial_retirement_ack or self == .relational_index_owner_ack or self == .relational_index_publish_decide or self == .relational_index_cancel or self == .relational_index_source_accept or self == .relational_index_source_complete or
-            (self != .sql_native_index_prepare and self != .sql_native_index_outcome and self != .resolve_many and self != .sql_index_annotations and self != .sql_prepared_read and self != .sql_prepared_outcome and self != .sql_authorization_read and self != .sql_authorization_outcome and self != .sql_type_snapshot and self != .sql_type_bindings and self != .sql_type_outcome and self != .sql_cast_snapshot and self != .sql_cast_outcome and self != .sql_routine_snapshot and self != .sql_routine_outcome and self != .sql_column_sequence_handoffs and self != .schema_validation_prepare and self != .table_retirement_prepare and self != .table_retirement_receipt and self != .table_retirement_queue and self != .table_retirement_effects and self != .table_retirement_owner_work and self != .schema_validation_status and self != .sql_sequence_counter_outcome and self != .sql_sequence_snapshot and self != .sql_sequence_admission_head and self != .sql_sequence_outcome and self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self != .relational_index_status and self != .relational_index_prepare and self.requiresAdministrativeGrant());
+            (self != .sql_native_index_prepare and self != .sql_native_index_outcome and self != .resolve_many and self != .sql_index_annotations and self != .sql_lock_read and self != .sql_lock_outcome and self != .sql_prepared_read and self != .sql_prepared_outcome and self != .sql_authorization_read and self != .sql_authorization_outcome and self != .sql_type_snapshot and self != .sql_type_bindings and self != .sql_type_outcome and self != .sql_cast_snapshot and self != .sql_cast_outcome and self != .sql_routine_snapshot and self != .sql_routine_outcome and self != .sql_column_sequence_handoffs and self != .schema_validation_prepare and self != .table_retirement_prepare and self != .table_retirement_receipt and self != .table_retirement_queue and self != .table_retirement_effects and self != .table_retirement_owner_work and self != .schema_validation_status and self != .sql_sequence_counter_outcome and self != .sql_sequence_snapshot and self != .sql_sequence_admission_head and self != .sql_sequence_outcome and self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self != .relational_index_status and self != .relational_index_prepare and self.requiresAdministrativeGrant());
     }
 
     pub fn isRelationalIndexOwnerCall(self: @This()) bool {
@@ -624,4 +673,36 @@ test "table retirement manifest preparation is a body-bound administrative read 
     try std.testing.expect(call.requiresSettingAuthorityReadGrant());
     try std.testing.expect(!call.isMutation());
     try std.testing.expect(!call.isRelationalIndexOwnerCall());
+}
+
+test "SQL command fence binds forwarded identities and rejects substitution and unjournaled mutations" {
+    const a = std.testing.allocator;
+    try std.testing.expect(!(Call{ .sql_lock_read = undefined }).isMutation());
+    try std.testing.expect(!(Call{ .sql_lock_outcome = undefined }).isMutation());
+    try std.testing.expect((Call{ .sql_lock_mutate = undefined }).isMutation());
+    const fence: @import("command_fence.zig").Fence = .{ .backend = .{ .incarnation = @splat(1), .id = @splat(2), .fence = 1 }, .command = .{ .sequence = 1, .nonce = @splat(3), .executor = @splat(4) }, .principal = @splat(5), .database = 1, .standalone = false };
+    const call: Call = .{ .sql_sequence_mutate = .{ .admission = .{ .nonce = @splat(6), .head = 0 }, .incarnation = @splat(1), .target = .{ .table = "s" }, .namespace_id = 2, .operation = .{ .create = .{ .options = .{} } } } };
+    try std.testing.expectError(error.InvalidCatalogMutation, call.requireCommandFence(&fence));
+    const bound = try call.withCommandFence(&fence);
+    try std.testing.expectEqualDeep(bound, try bound.requireCommandFence(&fence));
+    const bytes = try std.json.Stringify.valueAlloc(a, bound, .{});
+    defer a.free(bytes);
+    var decoded = try std.json.parseFromSlice(Call, a, bytes, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(fence, decoded.value.sql_sequence_mutate.admission.command_fence.?);
+    try std.testing.expectEqualDeep(bound, try decoded.value.withCommandFence(&fence));
+    var foreign = fence;
+    foreign.command.executor = @splat(9);
+    const observation: Call = .{ .sql_sequence_outcome = bound.sql_sequence_mutate };
+    try std.testing.expectEqualDeep(observation, try observation.requireCommandFence(&foreign));
+    try std.testing.expectEqualDeep(observation, try observation.withCommandFence(&foreign));
+    try std.testing.expectError(error.InvalidCatalogMutation, bound.withCommandFence(&foreign));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, (Call{ .relation_schema_mutate = .{ .guard = undefined, .schema_json = "{}" } }).withCommandFence(&fence));
+    try std.testing.expectEqualDeep(call, try call.withCommandFence(null));
+    const old = call.sql_sequence_mutate.admission;
+    const encoded = try std.json.Stringify.valueAlloc(a, old, .{});
+    defer a.free(encoded);
+    const legacy = try std.json.Stringify.valueAlloc(a, .{ .nonce = old.nonce, .head = old.head }, .{});
+    defer a.free(legacy);
+    try std.testing.expectEqualStrings(legacy, encoded);
 }

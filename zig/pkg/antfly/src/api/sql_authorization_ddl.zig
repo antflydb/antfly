@@ -133,7 +133,7 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
         @memcpy(roles[position..end], part.roles);
         position = end;
     }
-    var request: auth.Mutation = .{ .admission = .{ .nonce = undefined, .head = first.head }, .incarnation = first.incarnation, .actor = actor, .label = switch (intent.operation) {
+    var request: auth.Mutation = .{ .admission = .{ .nonce = undefined, .head = first.head, .command_fence = if (root.context.sql_command_fence) |fence| fence.* else null }, .incarnation = first.incarnation, .actor = actor, .label = switch (intent.operation) {
         .create_role, .drop_role => ddl.name.table,
         .grant => "grant",
         .revoke => "revoke",

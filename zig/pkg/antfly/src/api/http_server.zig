@@ -2117,7 +2117,8 @@ pub const StatusSource = struct {
 
     /// The shared public data-admission boundary. Ownership is captured with
     /// catalog identity, so every HTTP/MCP/SQL resolver gets the same decision.
-    pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+    pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, unbound: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        const input = try unbound.requireCommandFence(context.sql_command_fence);
         if (input.isSchemaValidationCall() and !context.schema_validation_authority) return error.Forbidden;
         if (input == .mutate and input.mutate.mutation.action == .comment and !context.setting_admin) return error.Forbidden;
         switch (input) {

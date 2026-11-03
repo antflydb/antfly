@@ -321,3 +321,67 @@ command execution. The existing 22 contract/journal tests also pass. Independent
 PostgreSQL 18 oracles pass 130 conflict/lifetime and 31 wait/cancellation checks.
 These results qualify the backend and recovery boundary. Inventory remains 912
 implemented, 138 rejected, 449 superseded and 87 unresolved originals.
+
+
+## Native command fences for journaled metadata effects
+
+The shared bounded catalog admission now carries an optional immutable command
+fence. SQL producers bind it before calculating compact observation/recovery
+hashes; the dispatch boundary verifies that binding rather than silently changing
+a prepared identity. The existing body-bound internal service grant covers the
+serialized fence. It grants no catalog, table, or role privileges.
+
+The receiving journal first checks its exact retained nonce/digest. A known
+result is returned even after its command has completed, been fenced, or survived
+a cold reopen. For an absent request still inside the 64-slot admission window,
+the same accepting transaction checks catalog incarnation, activated decoder 138,
+standalone/cluster realm, backend fence, base principal, database, command sequence,
+nonce, executor, and the absence of a queued lock wait or control job. A permanent
+fence proves nonexecution only while absence remains authoritative. Outside that
+window the result stays unknown. No additional journal, receipt, or coordinator
+was introduced.
+
+Sequence counter requests bind the same fixed-width identity into their existing
+semantic request digest. Existing successful reservations are observed before
+liveness checks, so closing a command cannot allocate a second value or disguise
+an evicted reservation as a definite rejection. `nextval`, `setval`, and implicit
+column allocation retain the guarded request through lost-ACK recovery. Ordinary
+requests retain their prior wire shape and perform no additional scope reads or
+scope writes.
+
+The guard uses at most four native point reads. Its qualification adapter exposes
+neither a cursor nor a writer. SQL connection context borrows the immutable fence
+through one pointer; forwarding copies the identity into the already-owned
+mutation. Scope observations and outcome observations are classified as reads,
+retain administrative authorization, and receive metadata identity stamps.
+
+Catalog success notices now own a bounded 1024-byte value rather than borrowing
+JSON parser or native read scratch. Their wire form remains a string or null.
+The shared reader/writer record bound is 8 KiB, allowing worst-case JSON escaping
+plus the fixed fence identity. Notice limits are checked while preparing the
+catalog result, before applying the logical change.
+
+The audited native campaign covers standalone and cluster realms, local and Raft
+apply, queued-wait cancellation, command rollover, stale executors, counter-write
+abort boundaries, exact cold replay, bounded journal eviction, substituted
+principals/databases/realms, escaped capability markers, body-signature tampering,
+and general-allocator decoding/reencoding of maximally escaped notices. The
+focused Debug gate and sequence contracts pass all 73 build steps. Broader Debug
+qualification passes 140 build steps and 354 tests, including mounted native
+sequence/session effects, public SQL/pgwire, standalone recovery, and catalog
+regressions. The final observation-identity review gate passes all 70 steps.
+
+This completes the receiving boundary for mutations already using the common
+admission journal and for sequence counters. It does not activate public advisory
+SQL functions. Legacy catalog/view/table/settings mutation paths without that
+journal reject scoped dispatch until they are integrated. Durable local connection
+registration/adoption and command production, universal scoped private commits,
+HTTP/pgwire lifecycle integration, ordered scalar effects, prepared-owner handoff,
+row/table participant enrollment, and retirement-floor GC remain required. An
+already admitted asynchronous catalog job must retain its independent durable
+publication authority; it must not depend on a finished statement remaining live.
+No original SQL parity disposition is changed by these foundations.
+
+The preceding main merge preserves published LEANN data protocol 25 and assigns
+SQL index, schema, drop, and external-transaction controls distinct floors 26, 27,
+28, and 29. Earlier qualification entries record the pre-merge unpublished floors.

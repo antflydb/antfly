@@ -354,6 +354,37 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-native-reporter-recovery-test", "Verify bounded native startup retirement, signed profiles, snapshots and cold recovery")
         .dependOn(&native_reporter_recovery_run.step);
     const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
+    const sql_command_fence_native_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "SQL command fence", "sequence catalog allocator commands" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_command_fence_decoder_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"SQL command fence decoder"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_command_fence_step = b.step("antfly-sql-command-fence-test", "Verify fenced metadata effects, native cold replay, bounded eviction and transport identity binding");
+    const sql_command_fence_native_run = addFilteredTestRunArtifact(b, sql_command_fence_native_tests);
+    sql_command_fence_native_run.addArg("--require-no-skips");
+    const sql_command_fence_inventory = b.addRunArtifact(sql_command_fence_native_tests);
+    sql_command_fence_inventory.addArg("--list-tests");
+    const sql_command_fence_audit = b.addSystemCommand(&.{"python3"});
+    sql_command_fence_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for ([_][]const u8{
+        "SQL command fence guards native catalog and counter effects through cold replay and bounded eviction",
+        "SQL command fence remains bound to the authenticated internal HTTP body",
+        "SQL command fence binds forwarded identities and rejects substitution and unjournaled mutations",
+        "sequence catalog allocator commands preserve catalog epochs and exact bounded cold outcomes",
+    }) |required| sql_command_fence_audit.addArgs(&.{ "--filter", required });
+    sql_command_fence_audit.addArg("--inventory");
+    sql_command_fence_audit.addFileArg2(sql_command_fence_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    sql_command_fence_native_run.step.dependOn(&sql_command_fence_audit.step);
+    sql_command_fence_step.dependOn(&sql_command_fence_native_run.step);
+    const sql_command_fence_decoder_run = addFilteredTestRunArtifact(b, sql_command_fence_decoder_tests);
+    sql_command_fence_decoder_run.addArg("--require-no-skips");
+    sql_command_fence_step.dependOn(&sql_command_fence_decoder_run.step);
+
     const media_status_owners = [_]*std.Build.Module{ metadata_unit_baseline_mods[8], metadata_unit_baseline_mods[2], api_http_runtime_test_mod };
     const media_status_filters = [_][]const []const u8{ &.{"runtime status"}, &.{"runtime status output counters"}, &.{ "runtime status media output counters", "index encoders expose local shard runtime status" } };
     for (media_status_owners, media_status_filters) |owner, filters| {

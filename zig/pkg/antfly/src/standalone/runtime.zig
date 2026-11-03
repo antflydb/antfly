@@ -2953,7 +2953,8 @@ const LocalStandaloneMetadata = struct {
         return observed;
     }
 
-    fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
+    fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, unbound: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
+        const call = try unbound.requireCommandFence(context.sql_command_fence);
         if (call == .native_memory_create) {
             if (!context.setting_admin or context.native_service != .memory) return error.Forbidden;
             var request = call.native_memory_create;

@@ -899,7 +899,7 @@ fn executeNativeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.A
     }
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
-    const request: indexes.Mutation = .{ .admission = .{ .nonce = nonce, .head = prepared.head }, .guard = guard, .name = ddl.name.table, .config_json = config_json };
+    const request: indexes.Mutation = .{ .admission = .{ .nonce = nonce, .head = prepared.head, .command_fence = if (context.sql_command_fence) |fence| fence.* else null }, .guard = guard, .name = ddl.name.table, .config_json = config_json };
     const observation = try indexes.observation(a, request);
     var receipt = try recovery.newReceipt(allocators.result, a, observation, prepared.revision);
     errdefer receipt.deinit(allocators.result);

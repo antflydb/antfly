@@ -76,7 +76,7 @@ pub fn execute(root: *execution.Adapter, allocators: catalog.DdlAllocators, ddl:
     }
     var nonce: [16]u8 = undefined;
     try root.server.embedding_provider_runtime.io.randomSecure(&nonce);
-    const request: casts.Mutation = .{ .admission = .{ .nonce = nonce, .head = cut.head }, .database = root.database, .database_id = database_id, .incarnation = cut.incarnation, .operation = if (definition) |value| .{ .create = value } else .{ .drop = .{ .pair = pair, .expected = if (cut.record) |old| .{ .id = old.id, .generation = old.generation } else null, .if_exists = ddl.conditional } } };
+    const request: casts.Mutation = .{ .admission = .{ .nonce = nonce, .head = cut.head, .command_fence = if (root.context.sql_command_fence) |fence| fence.* else null }, .database = root.database, .database_id = database_id, .incarnation = cut.incarnation, .operation = if (definition) |value| .{ .create = value } else .{ .drop = .{ .pair = pair, .expected = if (cut.record) |old| .{ .id = old.id, .generation = old.generation } else null, .if_exists = ddl.conditional } } };
     try request.validate();
     const observation = try casts.observation(a, request);
     var receipt = try recovery.newReceipt(allocators.result, a, observation, cut.revision);

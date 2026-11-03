@@ -119,6 +119,9 @@ pub const RowPolicyIntegrityRead = struct {
 };
 
 pub const RequestContext = struct {
+    /// Captured by the durable SQL command owner. Catalog adapters bind this
+    /// into their existing mutation identities before any forwarding.
+    sql_command_fence: ?*const @import("../storage/pessimistic_lock_authority.zig").CommandFence = null,
     /// Borrowed preparation broker; never serialized or invoked by Raft apply.
     column_sequences: ?@import("../system_catalog/column_sequences.zig").Provider = null,
     /// Captured by the authenticated SQL transaction owner, never decoded

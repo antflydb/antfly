@@ -44,6 +44,42 @@ pub const Command = struct {
         if (self.sequence == 0 or self.sequence == std.math.maxInt(u64) or std.mem.allEqual(u8, &self.nonce, 0) or std.mem.allEqual(u8, &self.executor, 0)) return error.InvalidLockEffect;
     }
 };
+/// Restrictive metadata-effect fence. This grants no SQL/catalog privileges;
+/// the accepting writer independently joins it to the live command scope.
+pub const CommandFence = struct {
+    backend: locks.Backend,
+    command: Command,
+    database: u64,
+    principal: [32]u8,
+    standalone: bool,
+
+    pub fn validate(self: CommandFence) !void {
+        try self.backend.validate();
+        try self.command.validate();
+        if (self.database == 0 or std.mem.allEqual(u8, &self.principal, 0)) return error.InvalidLockScope;
+    }
+    pub fn requireCommand(self: CommandFence, _: anytype, _: ledger.Namespace, value: Record, command: Command) !void {
+        if (!self.backend.eql(value.registration.lease.backend) or !std.meta.eql(self.command, command) or
+            self.database != value.registration.lease.database or self.standalone != value.registration.standalone or
+            !std.mem.eql(u8, &self.principal, &value.registration.lease.principal)) return error.Forbidden;
+    }
+    /// Extend existing fixed-width request hashes without changing legacy
+    /// requests. Never hash struct padding or native-endian integer bytes.
+    pub fn hashInto(self: CommandFence, hash: anytype) void {
+        hash.update("antfly/sql-command-fence/v1");
+        hash.update(&self.backend.incarnation);
+        hash.update(&self.backend.id);
+        inline for (.{ self.backend.fence, self.command.sequence, self.database }) |number| {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, number, .little);
+            hash.update(&bytes);
+        }
+        hash.update(&self.command.nonce);
+        hash.update(&self.command.executor);
+        hash.update(&self.principal);
+        hash.update(&.{@intFromBool(self.standalone)});
+    }
+};
 /// This is a reference to the existing external decision owner, not a second
 /// decision. The receiver must join it to its native registry in requireSeal
 /// and requireResolution, including the complete immutable participant cohort.
