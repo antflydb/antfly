@@ -157,10 +157,18 @@ engine over the same Iceberg tables. This is the documented boundary in
 - **Results.** Small results stream through the coordinator. Large results are
   written as result pages to object storage and exposed through the existing
   cursor and continuation contracts.
-- **Consistency.** Every task reads the pinned snapshot. Snapshot pins keep
-  vacuum from collecting its files. Accepted-visibility reads add the same
-  bounded WAL overlay to the probe side only. The overlay is small by
-  construction, at most 64 pending records.
+- **Consistency.** The coordinator captures a pinned base snapshot and an
+  accepted WAL cut for each input, and retains both for the entire query.
+  Snapshot pins keep vacuum from collecting base files; WAL retention protects
+  each overlay until all tasks finish. Apply accepted inserts, replacements and
+  deletes on every input before that input's predicates and limits. In
+  particular, overlay the build input before broadcasting it or constructing
+  dynamic filters; overlay the probe input before applying those filters.
+  Bucket and shuffle tasks route mutations with their input's partitioning and
+  suppress replaced base rows before exchange. Retries use the same snapshot
+  and WAL cut. Admission accounts for overlay bytes and requests across all
+  inputs: the existing 64 pending-record bound is per input, not a query-wide
+  byte or request bound.
 - **Cleanup.** Exchange objects carry an expiry and are reclaimed by the
   expiring-objects collector, even when a coordinator crashes.
 
