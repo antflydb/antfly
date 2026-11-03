@@ -245,12 +245,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     test_imports.configure(b, admission_api_root, true, true);
+    admission_api_root.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const admission_api_tests = b.addTest(.{
         .root_module = admission_api_root,
         .filters = &.{
             "public table create index preserves permanent inference budget",
             "public artifact enrichment preserves permanent inference budget",
             "public table query returns hierarchy validation pointers",
+            "embedding validation failures share",
+            "hierarchy validation body survives",
+            "serverless create index normalization resolves and persists",
         },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -1992,6 +1996,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "admission routing",
         "native memory",
         "httpx internal control routes call typed operations directly",
         "caller cancellation does not interrupt protected child work",
@@ -2196,6 +2201,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-enrichment-shorthand-test", "Validate enrichment shorthand expansion into producer configs")
         .dependOn(&addFilteredTestRunArtifact(b, enrichment_shorthand_api_tests).step);
+
+    const admission_routing_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{"admission routing"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("admission-routing-test", "Verify admission and validation identities through the production HTTP router")
+        .dependOn(&addFilteredTestRunArtifact(b, admission_routing_tests).step);
 
     const memory_api_check = b.addTest(.{ .name = "memory-api-check", .root_module = api_http_runtime_test_mod, .filters = &.{"native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("memory-api-check", "Compile native memory HTTP and MCP tests").dependOn(&memory_api_check.step);

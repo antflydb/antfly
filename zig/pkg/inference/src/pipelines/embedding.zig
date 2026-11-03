@@ -445,18 +445,26 @@ pub const EmbeddingPipeline = struct {
             // Request arenas retain logical frees. Encoder temporaries need a
             // reclaiming owner with an admitted physical allocation ceiling.
             const limit = 512 * 1024 * 1024;
-            var permit = try self.session.admit(.{ .batch = 1, .sequence = 1, .host_preprocess_bytes = limit, .output_bytes = texts.len * 768 * @sizeOf(f32) * 2 });
-            defer permit.deinit();
-            var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = std.heap.smp_allocator, .limit = limit };
+            // The ceiling is a guard, not live residency. Charging all 512 MiB
+            // rejects even one short CPU row under the default scratch budget.
+            // Admit physical allocations in chunks before touching backing RAM.
+            var admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator{
+                .backing = @import("embedding_gemma2.zig").workspaceBackingAllocator(self.session.backend()),
+                .session = self.session,
+            };
+            defer admitted.deinit();
+            var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = admitted.allocator(), .limit = limit };
             defer std.debug.assert(bounded.live == 0);
             var scoped = self.*;
             scoped.allocator = bounded.allocator();
             // Length buckets retain the admitted physical allocation ceiling.
-            const temporary = (if (self.config.resident_text_encoder and self.config.normalize and self.config.pooling == .mean and self.text_projection == null and (self.session.backend() == .native or self.session.backend() == .metal)) scoped.embedGemma2Texts(texts) else scoped.embedWithBatchPlan(texts, .{ .batch_size = 1, .pad_final_batch = false })) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else err;
+            const temporary = (if (self.config.resident_text_encoder and self.config.normalize and self.config.pooling == .mean and self.text_projection == null and (self.session.backend() == .native or self.session.backend() == .metal)) scoped.embedGemma2Texts(texts) else scoped.embedWithBatchPlan(texts, .{ .batch_size = 1, .pad_final_batch = false })) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.MemoryBudgetExceeded else if (err == error.OutOfMemory) admitted.admission_error orelse err else err;
             defer {
                 for (temporary) |vector| scoped.allocator.free(vector);
                 scoped.allocator.free(temporary);
             }
+            var output_permit = try self.session.admitHostPreprocess(try std.math.mul(usize, temporary.len, 768 * @sizeOf(f32) * 2 + @sizeOf([]f32)));
+            defer output_permit.deinit();
             const output = try self.allocator.alloc([]f32, temporary.len);
             var count: usize = 0;
             errdefer {
@@ -515,7 +523,7 @@ pub const EmbeddingPipeline = struct {
                 const seq = lengths[order[cursor + count - 1]];
                 var cohort_rows: usize = 0;
                 for (sorted_lengths[0..count]) |length| cohort_rows += length;
-                const request = session_mod.RunRequest{ .batch = if (compact_policy) 1 else count, .sequence = if (compact_policy) cohort_rows else seq, .input_bytes = count * seq * 24, .host_preprocess_bytes = count * seq * 32, .workspace_bytes = 256 * 1024 * 1024 + (if (compact_policy) cohort_rows else count * seq) * 192 * 1024, .output_bytes = count * self.config.embedding_gemma2_dimensions * @sizeOf(f32) };
+                const request = session_mod.RunRequest{ .batch = if (compact_policy) 1 else count, .sequence = if (compact_policy) cohort_rows else seq, .input_bytes = count * seq * 24, .host_preprocess_bytes = count * seq * 32, .workspace_bytes = try @import("embedding_gemma2.zig").textEncoderWorkspace(if (compact_policy) cohort_rows else count * seq), .output_bytes = count * self.config.embedding_gemma2_dimensions * @sizeOf(f32) };
                 if (count > 1 and !try self.session.fitsRun(request)) {
                     count -= 1;
                     continue;
@@ -1162,7 +1170,7 @@ pub const EmbeddingPipeline = struct {
             .host_preprocess_bytes = std.math.mul(usize, total, 32) catch
                 return error.ResourceLimitExceeded,
             .workspace_bytes = if (session_factory.getEmbeddingGemma2Config(self.session) != null)
-                try std.math.add(usize, 256 * 1024 * 1024, try std.math.mul(usize, if (compact_policy) active_rows else total, 192 * 1024))
+                try @import("embedding_gemma2.zig").textEncoderWorkspace(if (compact_policy) active_rows else total)
             else
                 0,
         });

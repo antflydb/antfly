@@ -55,6 +55,46 @@ pub fn reset() void {
     reranking.resetCandidateLimitDiagnostic();
 }
 
+/// A single response body for standalone, multi-query and serverless routes.
+/// Only literal field paths and messages leave request-owned storage.
+pub fn takeValidationErrorBody(alloc: std.mem.Allocator) !?[]u8 {
+    const diagnostic = query_contract.takeValidationDiagnostic() orelse return null;
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .@"error" = "invalid_query_request",
+        .message = diagnostic.message,
+        .pointer = diagnostic.pointer,
+        .retryable = false,
+    }, .{});
+}
+
+/// Catalog binding and generated envelopes can reject a query before canonical
+/// parsing runs. Recover its canonical field diagnostic only on that error path;
+/// successful queries incur no extra parse or allocation.
+pub fn validationErrorBodyForRequest(alloc: std.mem.Allocator, table_name: []const u8, body: []const u8) !?[]u8 {
+    if (try takeValidationErrorBody(alloc)) |error_body| return error_body;
+    var context: Context = .{};
+    const scope = Scope.init(&context);
+    defer scope.deinit();
+    var parsed = query_contract.parseQueryRequest(alloc, null, table_name, body) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return takeValidationErrorBody(alloc);
+    };
+    defer parsed.deinit(alloc);
+    return null;
+}
+
+test "hierarchy validation body survives rejection before canonical dispatch" {
+    const alloc = std.testing.allocator;
+    const body = (try validationErrorBodyForRequest(alloc, "docs",
+        \\{"fields":[],"hierarchy":{"group_by":{"level":"source","matches":{}}}}
+    )).?;
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("/hierarchy/group_by/matches/fields", parsed.value.object.get("pointer").?.string);
+    try std.testing.expect((try validationErrorBodyForRequest(alloc, "docs", "{\"bad\":true}")) == null);
+}
+
 test "nested query scopes restore their caller reranker diagnostic" {
     var outer: Context = .{};
     const outer_scope = Scope.init(&outer);

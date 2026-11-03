@@ -17,4 +17,7 @@
 pub const memory = @import("runtime/tier/memory.zig");
 test {
     _ = memory;
+    _ = @import("server/admission_diagnostics.zig");
+    _ = @import("backends/admitted_allocator.zig");
+    _ = @import("pipelines/embedding_gemma2_admission.zig");
 }

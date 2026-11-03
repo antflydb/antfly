@@ -19,6 +19,7 @@
 // and backend session, and returns a pipeline ready for inference.
 
 const std = @import("std");
+const admission_diagnostics = @import("admission_diagnostics.zig");
 const lightonocr3_reader = @import("../readers/lightonocr3.zig");
 const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
@@ -4160,6 +4161,7 @@ fn attachSessionRunAdmission(
     limits: runtime.tier.memory.Limits,
     resident: runtime.tier.memory.AdmissionAmounts,
     man: ?*const manifest_mod.ModelManifest,
+    manager: *ModelManager,
 ) !void {
     const backend_class = admissionBackendClassForRuntime(backend_runtime);
     try session_factory.configureSharedCacheAdmissionForSession(
@@ -4182,6 +4184,7 @@ fn attachSessionRunAdmission(
         null;
     session.run_admission = .{
         .controller = controller,
+        .denial_observer = .{ .context = manager, .record = ModelManager.observeSessionAdmissionDenied },
         .backend_class = backend_class,
         .limits = limits,
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
@@ -4584,60 +4587,13 @@ const TeardownTicket = struct {
         domain.release();
     }
 };
-/// Emit the first denial and at most one diagnostic batch per second thereafter.
-/// The manager updates its diagnostic counters on every attempt, including
-/// suppressed retries. Access is serialized by admission_diagnostic_mutex.
-const AdmissionDenialLogGate = struct {
-    last_logged_ns: ?u64 = null,
-
-    fn shouldLog(self: *@This(), now_ns: u64) bool {
-        if (self.last_logged_ns) |last| {
-            if (now_ns -| last < std.time.ns_per_s) return false;
-        }
-        self.last_logged_ns = now_ns;
-        return true;
-    }
-};
-
-test "memory admission denial logging bounds a retry flood and resumes after the interval" {
-    var gate = AdmissionDenialLogGate{};
-    try std.testing.expect(gate.shouldLog(0));
-    for (1..271_168) |attempt|
-        try std.testing.expect(!gate.shouldLog(@intCast(attempt)));
-    try std.testing.expect(gate.shouldLog(std.time.ns_per_s));
-    try std.testing.expect(!gate.shouldLog(std.time.ns_per_s));
-    try std.testing.expect(!gate.shouldLog(0));
-    try std.testing.expect(gate.shouldLog(2 * std.time.ns_per_s));
-}
-
 pub const ModelManager = struct {
     pub const HostCacheReclaimer = struct {
         context: *anyopaque,
         reclaim: *const fn (*anyopaque, usize) usize,
     };
 
-    pub const MemoryAdmissionDiagnostic = struct {
-        pressure: []const u8 = "none",
-        error_code: []const u8 = "",
-        retryable: bool = false,
-        denied_count: u64 = 0,
-        last_denied_ns: u64 = 0,
-        request_count: u64 = 0,
-        requested_host_bytes: u64 = 0,
-        requested_backend_bytes: u64 = 0,
-        requested_kv_bytes: u64 = 0,
-        requested_scratch_bytes: u64 = 0,
-        admitted_host_bytes: u64 = 0,
-        admitted_backend_bytes: u64 = 0,
-        host_limit_bytes: u64 = 0,
-        backend_limit_bytes: u64 = 0,
-        combined_limit_bytes: u64 = 0,
-        kv_limit_bytes: u64 = 0,
-        scratch_limit_bytes: u64 = 0,
-        available_memory_bytes: u64 = 0,
-        shared_host_limit_bytes: u64 = 0,
-        shared_unified_limit_bytes: u64 = 0,
-    };
+    pub const MemoryAdmissionDiagnostic = admission_diagnostics.Diagnostic;
 
     const LoadedModelMap = std.StringHashMapUnmanaged(*LoadedModel);
     const tokenizer_cache_budget_shard_count = 16;
@@ -4846,9 +4802,7 @@ pub const ModelManager = struct {
     session_manager: backends.SessionManager,
     /// Null for diagnostic/offline CLIs. Serving Nodes set this before any model load.
     serving_policy: ?model_compatibility.Policy = null,
-    admission_diagnostic_mutex: std.atomic.Mutex = .unlocked,
-    admission_diagnostic: MemoryAdmissionDiagnostic = .{},
-    admission_denial_log_gate: AdmissionDenialLogGate = .{},
+    admission_diagnostics: admission_diagnostics.Recorder = .{},
     admission_enabled: bool = false,
     admission_limit_overrides: runtime.tier.memory.Limits = .{},
     process_memory_limit_bytes: usize = 0,
@@ -6056,6 +6010,12 @@ pub const ModelManager = struct {
     /// Keep client responses deliberately generic while leaving enough
     /// operator evidence to distinguish stable-policy saturation from current
     /// live-memory pressure. Artifact paths and request contents are excluded.
+    fn observeSessionAdmissionDenied(raw: *anyopaque, err: anyerror, pressure: ?runtime.tier.memory.AdmissionPressure, request: runtime.tier.memory.AdmissionRequest) void {
+        const self: *ModelManager = @ptrCast(@alignCast(raw));
+        self.logRunAdmissionDenied(err, pressure, &.{request});
+    }
+
+    /// Count every denial; sample memory and emit at most one batch per second.
     fn logRunAdmissionDenied(
         self: *ModelManager,
         err: anyerror,
@@ -6089,15 +6049,8 @@ pub const ModelManager = struct {
             diagnostic.kv_limit_bytes = requests[0].limits.kv_limit_bytes;
             diagnostic.scratch_limit_bytes = requests[0].limits.scratch_limit_bytes;
         }
-        if (!builtin.is_test) if (runtime.tier.memory.currentSystemMemoryInfoForLimit(self.process_memory_limit_bytes, self.process_memory_limit_provenance)) |info| {
-            diagnostic.available_memory_bytes = info.available_bytes orelse 0;
-        };
-        spinLock(&self.admission_diagnostic_mutex);
-        diagnostic.denied_count = self.admission_diagnostic.denied_count +| 1;
-        self.admission_diagnostic = diagnostic;
-        const should_log = self.admission_denial_log_gate.shouldLog(diagnostic.last_denied_ns);
-        self.admission_diagnostic_mutex.unlock();
-        if (!should_log or builtin.is_test) return;
+        diagnostic = self.admission_diagnostics.record(diagnostic, self, sampleAdmissionAvailableMemory) orelse return;
+        if (builtin.is_test) return;
         std.log.warn(
             "inference run admission denied error={s} retryable={} pressure={s} denied_count={d} request_count={d} admitted_host_bytes={d} admitted_backend_bytes={d} admitted_kv_bytes={d} admitted_scratch_bytes={d} shared_host_limit_bytes={d} shared_unified_limit_bytes={d}",
             .{
@@ -6134,10 +6087,15 @@ pub const ModelManager = struct {
         }
     }
 
+    fn sampleAdmissionAvailableMemory(self: *ModelManager) ?u64 {
+        if (builtin.is_test) return null;
+        const info = runtime.tier.memory.currentSystemMemoryInfoForLimit(self.process_memory_limit_bytes, self.process_memory_limit_provenance) orelse return null;
+        const available = info.available_bytes orelse return null;
+        return @intCast(available);
+    }
+
     pub fn memoryAdmissionDiagnostic(self: *ModelManager) MemoryAdmissionDiagnostic {
-        spinLock(&self.admission_diagnostic_mutex);
-        defer self.admission_diagnostic_mutex.unlock();
-        return self.admission_diagnostic;
+        return self.admission_diagnostics.snapshot();
     }
 
     fn evictExpired(self: *ModelManager) void {
@@ -6737,6 +6695,7 @@ pub const ModelManager = struct {
                         session_admission_limits,
                         resident_amounts,
                         null,
+                        self,
                     );
                 }
                 return loaded.take();
@@ -11044,6 +11003,7 @@ fn loadSessionForPreferredBackends(
                     session_admission_limits,
                     resident_amounts,
                     &man,
+                    manager,
                 );
             }
             // Resident preparation can populate the shared weight cache.

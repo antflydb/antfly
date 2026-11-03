@@ -125,7 +125,10 @@ pub fn validateManagedEmbeddingRuntimeConfigJsonWithOptions(
     ) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.ModelNotFound => return err,
-        error.EmbeddingProbeUnavailable => return err,
+        error.EmbeddingProbeUnavailable,
+        error.ResourceLimitExceeded,
+        error.MemoryBudgetExceeded,
+        => return err,
         error.MissingEmbeddingArtifactEnrichment,
         error.MissingEmbeddingArtifactProducer,
         error.InvalidEmbeddingArtifactProducer,

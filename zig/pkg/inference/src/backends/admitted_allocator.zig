@@ -212,3 +212,37 @@ test "model aware media adaptive admission shares capacity grows and releases id
     second.deinit();
     try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().host_scratch_bytes);
 }
+
+test "admission Gemma temporary ceiling does not reserve unused half gigabyte" {
+    const MiB = 1024 * 1024;
+    const limits = memory.Limits{ .host_limit_bytes = 2 * 1024 * MiB, .scratch_limit_bytes = 341 * MiB };
+    var controller: memory.AdmissionController = .{};
+    const session = sessions.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = limits,
+        .static_workspace_bytes = 0,
+        .check_live_memory = false,
+    } };
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitHostPreprocess(512 * MiB));
+    var admitted = AdmittedAllocator{ .backing = std.testing.allocator, .session = session };
+    defer admitted.deinit();
+    var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = admitted.allocator(), .limit = 512 * MiB };
+    const bytes = try bounded.allocator().alloc(u8, MiB);
+    try std.testing.expect(controller.snapshot().host_scratch_bytes < 2 * MiB);
+    var execution = try session.admitHostPreprocess(256 * MiB);
+    execution.deinit();
+    bounded.allocator().free(bytes);
+    try admitted.trim();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    try std.testing.expectError(error.OutOfMemory, bounded.allocator().alloc(u8, 400 * MiB));
+    try std.testing.expectEqual(@as(?anyerror, error.ResourceLimitExceeded), admitted.admission_error);
+    var held = try session.admitHostPreprocess(320 * MiB);
+    try std.testing.expectError(error.OutOfMemory, bounded.allocator().alloc(u8, 32 * MiB));
+    try std.testing.expectEqual(@as(?anyerror, error.ResourceTemporarilyUnavailable), admitted.admission_error);
+    held.deinit();
+    const recovered = try bounded.allocator().alloc(u8, MiB);
+    bounded.allocator().free(recovered);
+    try admitted.trim();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}

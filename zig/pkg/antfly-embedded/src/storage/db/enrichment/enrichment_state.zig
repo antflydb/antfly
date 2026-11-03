@@ -408,10 +408,18 @@ fn encodeRuntimeAuxSidecar(runtime_status: []const u8, status: RuntimeStatus) [r
 }
 
 pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatus) !void {
-    const key = try runtimeStatusKey(std.heap.page_allocator, scope);
-    defer std.heap.page_allocator.free(key);
-    const retry_count_key = try runtimeRetryCountKey(std.heap.page_allocator, scope);
-    defer std.heap.page_allocator.free(retry_count_key);
+    // Status is saved on the indexing hot path. Keep the four ordinary keys
+    // on the stack; unusually long scopes share a single arena lifetime.
+    var key_buffer: [1024]u8 = undefined;
+    var fixed_keys = std.heap.FixedBufferAllocator.init(&key_buffer);
+    var heap_keys = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer heap_keys.deinit();
+    const key_overhead = 3 * runtime_status_prefix.len + runtime_retry_count_prefix.len + ":admission".len + ":error".len;
+    const key_alloc = if (scope.len <= (key_buffer.len - key_overhead) / 4) fixed_keys.allocator() else heap_keys.allocator();
+    const key = try runtimeStatusKey(key_alloc, scope);
+    defer key_alloc.free(key);
+    const retry_count_key = try runtimeRetryCountKey(key_alloc, scope);
+    defer key_alloc.free(retry_count_key);
     var buf = encodeRuntimeStatus(status);
     var retry_count_buf = encodeRuntimeAuxSidecar(&buf, status);
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
@@ -420,14 +428,14 @@ pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatu
     errdefer txn.abort();
     try txn.put(key, &buf);
     try txn.put(retry_count_key, &retry_count_buf);
-    const admission_key = try std.mem.concat(std.heap.page_allocator, u8, &.{ runtime_status_prefix, scope, ":admission" });
-    defer std.heap.page_allocator.free(admission_key);
+    const admission_key = try std.mem.concat(key_alloc, u8, &.{ runtime_status_prefix, scope, ":admission" });
+    defer key_alloc.free(admission_key);
     var admission: [12]u8 = undefined;
     std.mem.writeInt(u64, admission[0..8], std.hash.Wyhash.hash(0x454e525354415455, &buf), .little);
     std.mem.writeInt(u32, admission[8..12], status.admission_wait_count, .little);
     try txn.put(admission_key, &admission);
-    const detail_key = try std.mem.concat(std.heap.page_allocator, u8, &.{ runtime_status_prefix, scope, ":error" });
-    defer std.heap.page_allocator.free(detail_key);
+    const detail_key = try std.mem.concat(key_alloc, u8, &.{ runtime_status_prefix, scope, ":error" });
+    defer key_alloc.free(detail_key);
     var detail: [264]u8 = undefined;
     std.mem.writeInt(u64, detail[0..8], std.hash.Wyhash.hash(0x454e525354415455, &buf), .little);
     const code = status.last_error_code.slice();
@@ -740,4 +748,33 @@ test "admission wait budget survives reopen and ignores stale rollback sidecars"
     try txn.commit();
     const rolled_back = try loadRuntimeStatus(std.testing.allocator, store, "admission-test");
     try std.testing.expectEqual(@as(u32, 0), rolled_back.admission_wait_count);
+    // Long scopes use the heap fallback without truncating any sidecar key.
+    const long_scope = @as([1024]u8, @splat('x'));
+    try saveRuntimeStatus(store, &long_scope, status);
+    const long_loaded = try loadRuntimeStatus(std.testing.allocator, store, &long_scope);
+    try std.testing.expectEqual(@as(u32, 15), long_loaded.admission_wait_count);
+}
+
+test "admission wait budget survives disk close and WAL replay" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    // Reconstruct both backend and runtime store between every attempt. This
+    // exercises durable sidecars rather than reopening an in-memory view.
+    for (0..17) |attempt| {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer store.deinit();
+        var status = try loadRuntimeStatus(alloc, store, "admission-test");
+        try std.testing.expectEqual(@as(u32, @intCast(attempt)), status.admission_wait_count);
+        try std.testing.expectEqual(@as(u32, 0), status.retry_failure_count);
+        status.target_sequence = 10;
+        status.retry_failure_fingerprint = 42;
+        status.admission_wait_count += 1;
+        status.retrying = true;
+        try saveRuntimeStatus(store, "admission-test", status);
+    }
 }

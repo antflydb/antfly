@@ -26,6 +26,7 @@ const graph_distinct_budget_diagnostic = @import("antfly_local_sources").graph_d
 const graph_work_budget_diagnostic = @import("antfly_local_sources").graph_work_budget_diagnostic;
 const graph_path_weight_diagnostic = @import("antfly_local_sources").graph_path_weight_diagnostic;
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
+const inference_validation_errors = @import("inference_validation_errors.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
 const common_secrets = @import("antfly_local_sources").common_secrets;
 const common_config = @import("antfly_local_sources").common_config;
@@ -1919,14 +1920,9 @@ pub fn handleTableQueryRequest(
                     return .{ .status = 422, .body = try unsupportedExactSortBody(alloc), .json = true };
                 }
                 std.log.err("public table query invalid table={s} err={}", .{ table_name, err });
-                if (query_contract.takeValidationDiagnostic()) |diagnostic| return .{
+                if (try query_request_diagnostics.validationErrorBodyForRequest(alloc, table_name, body)) |error_body| return .{
                     .status = 400,
-                    .body = try std.json.Stringify.valueAlloc(alloc, .{
-                        .@"error" = "invalid_query_request",
-                        .message = diagnostic.message,
-                        .pointer = diagnostic.pointer,
-                        .retryable = false,
-                    }, .{}),
+                    .body = error_body,
                     .json = true,
                 };
                 return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
@@ -2484,11 +2480,13 @@ pub fn handleTableGetIndex(
 
 pub const inference_endpoint_access_denied_message = "embedder.api_url denied inference access; check endpoint credentials and permissions. For local Antfly inference omit embedder.api_url. An HTTP /ai/v1 endpoint requires public_inference.enabled and inference permissions.";
 
-fn embeddingValidationResourceLimitResponse(alloc: std.mem.Allocator) !OwnedResponse {
+pub fn embeddingValidationFailureResponse(alloc: std.mem.Allocator, err: anyerror) !OwnedResponse {
+    const failure = inference_validation_errors.classify(err) orelse return error.InvalidArgument;
     return .{
-        .status = 400,
-        .body = try alloc.dupe(u8, "{\"error\":\"MODEL_RESOURCE_LIMIT\",\"message\":\"embedding validation exceeds the configured inference memory budget; inspect admission logs for requested bytes and host, backend, combined, KV and scratch limits\",\"retryable\":false}"),
+        .status = failure.status,
+        .body = try failure.bodyAlloc(alloc),
         .json = true,
+        .retry_after_seconds = failure.retry_after_seconds,
     };
 }
 
@@ -2521,13 +2519,8 @@ pub fn handleTableCreateIndex(
             .json = true,
             .retry_after_seconds = 1,
         },
-        error.ResourceLimitExceeded, error.MemoryBudgetExceeded => return embeddingValidationResourceLimitResponse(alloc),
-        error.ProbeUnavailable => return .{
-            .status = 503,
-            .body = try alloc.dupe(u8, "{\"error\":\"index_probe_unavailable\",\"message\":\"index validation probe unavailable\",\"retryable\":true}"),
-            .json = true,
-            .retry_after_seconds = 1,
-        },
+        error.ResourceLimitExceeded, error.MemoryBudgetExceeded => return embeddingValidationFailureResponse(alloc, err),
+        error.ProbeUnavailable => return embeddingValidationFailureResponse(alloc, err),
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"model_not_found\",\"message\":\"model not found\",\"retryable\":false}"), .json = true },
         error.Backpressured => return .{
             .status = 429,
@@ -2614,13 +2607,8 @@ pub fn handlePutArtifactEnrichment(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "table mutation conflict; retry request") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
-        error.ResourceLimitExceeded, error.MemoryBudgetExceeded => return embeddingValidationResourceLimitResponse(alloc),
-        error.ProbeUnavailable => return .{
-            .status = 503,
-            .body = try alloc.dupe(u8, "{\"error\":\"index_probe_unavailable\",\"message\":\"embedding validation probe unavailable\",\"retryable\":true}"),
-            .json = true,
-            .retry_after_seconds = 1,
-        },
+        error.ResourceLimitExceeded, error.MemoryBudgetExceeded => return embeddingValidationFailureResponse(alloc, err),
+        error.ProbeUnavailable => return embeddingValidationFailureResponse(alloc, err),
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "model not found") },
         error.InferenceEndpointAccessDenied => return .{ .status = 400, .body = try alloc.dupe(u8, inference_endpoint_access_denied_message) },
         error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
