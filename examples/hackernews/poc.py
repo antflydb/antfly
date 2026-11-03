@@ -139,6 +139,24 @@ def gcs_bearer(project, minimum_seconds=1800):
         ) from None
 
 
+def wait_for_server(
+    read_ready, deadline, before_poll, *, now=time.monotonic, sleep=time.sleep
+):
+    """Retry startup probes only; measured queries never use this loop."""
+    while now() < deadline:
+        before_poll()
+        try:
+            read_ready(min(2, max(0.001, deadline - now())))
+            return
+        except RequestFailure as failure:
+            if failure.record["code"] != "transport_error" and failure.record.get(
+                "http_status"
+            ) not in (502, 503, 504):
+                raise
+        sleep(min(0.5, max(0, deadline - now())))
+    raise RuntimeError("Antfly startup timed out")
+
+
 def parse_lake_metrics(text):
     """Retain aggregate query phases without arbitrary metric label values."""
     phases = {"total", "publication", "search", "hydration", "delivery"}
@@ -816,21 +834,19 @@ def main():
             stdout=log,
             stderr=subprocess.STDOUT,
         )
-        deadline = time.monotonic() + 90
-        while time.monotonic() < deadline:
+
+        def check_process():
             if process.poll() is not None:
                 raise RuntimeError(
                     f"Antfly exited with {process.returncode}; see {args.state / 'server.log'}"
                 )
-            try:
-                call("GET", "/tables")
-                startup_samples_ms.append(
-                    round((time.monotonic() - startup_started) * 1000, 2)
-                )
-                return
-            except (urllib.error.URLError, TimeoutError, ConnectionError):
-                time.sleep(0.5)
-        raise RuntimeError("Antfly startup timed out")
+
+        wait_for_server(
+            lambda timeout: call("GET", "/tables", timeout=timeout),
+            time.monotonic() + 90,
+            check_process,
+        )
+        startup_samples_ms.append(round((time.monotonic() - startup_started) * 1000, 2))
 
     def stop():
         nonlocal container

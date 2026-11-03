@@ -31,6 +31,53 @@ spec.loader.exec_module(poc)
 
 
 class ConstructionRecoveryTests(unittest.TestCase):
+    def test_startup_transports_retry_but_terminal_http_and_deadline_do_not(self):
+        clock = [0.0]
+        calls = []
+        failures = [
+            poc.RequestFailure.transport(
+                "GET", "/tables", ConnectionRefusedError(61, "startup"), 1
+            ),
+            poc.RequestFailure.http("GET", "/tables", 503, b"{}", 1),
+            None,
+        ]
+
+        def ready(timeout):
+            calls.append(timeout)
+            failure = failures.pop(0)
+            if failure:
+                raise failure
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        poc.wait_for_server(ready, 3, lambda: None, now=lambda: clock[0], sleep=sleep)
+        self.assertEqual(clock[0], 1)
+        self.assertEqual(calls, [2, 2, 2])
+        denied = poc.RequestFailure.http("GET", "/tables", 403, b"{}", 1)
+        with self.assertRaises(poc.RequestFailure) as error:
+            poc.wait_for_server(
+                lambda _: (_ for _ in ()).throw(denied),
+                3,
+                lambda: None,
+                now=lambda: clock[0],
+                sleep=sleep,
+            )
+        self.assertIs(error.exception, denied)
+        self.assertEqual(clock[0], 1)
+        unavailable = poc.RequestFailure.transport(
+            "GET", "/tables", ConnectionRefusedError(), 1
+        )
+        with self.assertRaisesRegex(RuntimeError, "startup timed out"):
+            poc.wait_for_server(
+                lambda _: (_ for _ in ()).throw(unavailable),
+                2,
+                lambda: None,
+                now=lambda: clock[0],
+                sleep=sleep,
+            )
+        self.assertEqual(clock[0], 2)
+
     def test_timeout_evidence_keeps_duration_and_code_without_provider_body(self):
         failure = poc.RequestFailure.http(
             "POST",
