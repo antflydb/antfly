@@ -40698,7 +40698,15 @@ pub const RaftApplyStore = struct {
                     if (!ref.backend.eql(scope.registration.lease.backend)) return error.CatalogGenerationChanged;
                     const context: SqlLocks.Context = .{ .a = a, .actor = request.actor, .database = request.database_id, .standalone = request.standalone };
                     const current = SqlLocks.scopes.guard(a, txn, ns, ref.backend, ref.command, context) catch |err| return SqlLocks.semanticError(err);
-                    if (current.transaction == null or !std.mem.eql(u8, &current.transaction.?.id, &identity.txn_id)) return error.CatalogGenerationChanged;
+                    if (current.transaction) |transaction| {
+                        if (!std.mem.eql(u8, &transaction.id, &identity.txn_id)) return error.CatalogGenerationChanged;
+                    } else {
+                        // A private commit may bind its first transaction in
+                        // this same native admission. No earlier RPC can leave
+                        // an orphan binding if the decision admission fails.
+                        if (identity.kind != .session_commit) return error.CatalogGenerationChanged;
+                        if (current.released_transaction) |released| if (std.mem.eql(u8, &released.id, &identity.txn_id)) return error.CatalogGenerationChanged;
+                    }
                     const lock_owner = try SqlLocks.scopes.ledger.readOwner(a, txn, ns, ref.backend) orelse return error.InvalidCatalogRecord;
                     if (lock_owner.waiting != null or lock_owner.job != null) return error.CatalogPublicationProofPending;
                 } else if (identity.lock_scope != null) return error.CatalogGenerationChanged;
@@ -40798,7 +40806,9 @@ pub const RaftApplyStore = struct {
                     const identity = request.operation.admit.identity;
                     const owner = try identity.owner(a);
                     const context: SqlLocks.Context = .{ .a = a, .actor = request.actor, .database = request.database_id, .standalone = request.standalone };
-                    try SqlLocks.scopes.seal(a, txn, .{ .home = .metadata, .group = group, .incarnation = request.incarnation }, ref.backend, ref.command, .{ .operation = owner.operation_id, .admission = owner.admission_digest }, context);
+                    const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
+                    try SqlLocks.scopes.bindTransaction(a, txn, ns, ref.backend, ref.command, identity.txn_id, context);
+                    try SqlLocks.scopes.seal(a, txn, ns, ref.backend, ref.command, .{ .operation = owner.operation_id, .admission = owner.admission_digest }, context);
                 };
                 try journal.append(a, ordinal, request.admission, hash, .{ .success = planned.result });
             },

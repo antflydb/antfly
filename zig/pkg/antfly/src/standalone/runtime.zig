@@ -18894,6 +18894,39 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
             try scopeMutate(a, api, backend, 83, .{ .effect = .{ .command = scope_frame, .effect = .{ .backend = backend, .sequence = 1, .nonce = @splat(25), .action = .{ .try_acquire = .{ .resource = @splat(26), .mode = .{ .advisory = .exclusive }, .scope = .session } } } } });
             try scopeMutate(a, api, backend, 84, .{ .fence = .close });
         }
+        fn scopedWrite(backing: std.mem.Allocator, api: *antfly.public_api.ApiHttpServer) !void {
+            var arena = std.heap.ArenaAllocator.init(backing);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const cut = try scopeRead(a, api, null);
+            const backend: scope_types.locks.Backend = .{ .incarnation = cut.incarnation, .id = @splat(0xed), .fence = 1 };
+            const connection_id: [32]u8 = @splat('f');
+            const command_frame: scope_types.scopes.Command = .{ .sequence = 1, .nonce = @splat(31), .executor = @splat(32) };
+            const registration: scope_types.scopes.Registration = .{ .lease = .{ .backend = backend, .database = 1, .node = 0, .principal = try scope_types.principalDigest(a, .bootstrap), .expires_at_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60000 }, .connection = connection_id, .nonce = @splat(33), .standalone = true };
+            try scopeMutate(a, api, backend, 91, .{ .register = registration });
+            try scopeMutate(a, api, backend, 92, .{ .begin = command_frame });
+            const frame: @import("../system_catalog/command_fence.zig").Fence = .{ .backend = backend, .command = command_frame, .database = 1, .principal = registration.lease.principal, .standalone = true };
+            const session = try api.txn_sessions.beginForPrincipalWithSettings(backing, .{ .sync_level = .write, .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 0, null, &.{}, connection_id);
+            var identity: ?antfly.public_api.http_server.AuthenticatedIdentity = null;
+            const encoded_session = std.fmt.bytesToHex(session.txn_id, .lower);
+            var adapter: @import("../api/sql_execution.zig").Adapter = .{ .server = api, .identity = &identity, .context = .{ .sql_command_fence = &frame }, .session_id = &encoded_session, .connection_id = connection_id };
+            defer adapter.releaseExecutionOwners();
+            var compiled = try @import("antfly_local_sources").sql_compiler.compile(backing, "INSERT INTO lock_probe(id,v) VALUES ('scoped',2)", .{});
+            defer compiled.deinit();
+            var result = try adapter.execute(backing, &compiled, &.{}, .{}, null);
+            defer result.deinit();
+            var coordinator: @import("../api/sql_session.zig").Coordinator = .{ .server = api, .identity = &identity, .context = .{ .sql_command_fence = &frame } };
+            const decision = try @import("../api/sql_session.zig").Coordinator.commit(&coordinator, .{ .principal = "", .database = "default", .namespace = "public" }, session.txn_id);
+            try std.testing.expectEqual(.committed, decision.outcome);
+            var sql_state = (try api.txn_sessions.getSqlState(backing, session.txn_id)).?;
+            defer sql_state.deinit(backing);
+            try std.testing.expectEqual(.committed, sql_state.terminal.?);
+            const completed = try scopeRead(a, api, backend);
+            try std.testing.expect(completed.scope.?.transaction == null);
+            try std.testing.expectEqualDeep(command_frame, completed.scope.?.completed.?);
+            // The private decision used real table participants and remains
+            // separate from the named prepared cohort exercised below.
+        }
         fn finishScope(backing: std.mem.Allocator, api: *antfly.public_api.ApiHttpServer) !void {
             var arena = std.heap.ArenaAllocator.init(backing);
             defer arena.deinit();
@@ -18967,6 +19000,7 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
         try std.testing.expectEqual(@as(u64, 0), api.localSessionNodeId());
         if (phase == 0) {
             try Helper.command(alloc, api, null, "CREATE TABLE lock_probe(id TEXT PRIMARY KEY, v INTEGER)", "CREATE TABLE");
+            try Helper.scopedWrite(alloc, api);
             for ([_][]const u8{ "commit", "abort" }) |kind| {
                 var begun = try Helper.sql(alloc, api, null, "BEGIN");
                 defer begun.deinit();
@@ -18980,20 +19014,20 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
             }
             // Physical participants retain private rows; ordinary MVCC readers
             // see the preceding committed image throughout the prepared interval.
-            try Helper.rows(alloc, api, &.{});
+            try Helper.rows(alloc, api, &.{"scoped"});
             const reloads = metadata.lifecycle_projection_reloads;
             try Helper.setupScope(alloc, api);
             try std.testing.expectEqual(reloads, metadata.lifecycle_projection_reloads);
         } else if (phase == 1) {
-            try Helper.rows(alloc, api, &.{});
+            try Helper.rows(alloc, api, &.{"scoped"});
             try Helper.command(alloc, api, null, "COMMIT PREPARED 'local_commit'", "COMMIT PREPARED");
             try Helper.command(alloc, api, null, "ROLLBACK PREPARED 'local_abort'", "ROLLBACK PREPARED");
-            try Helper.rows(alloc, api, &.{"commit"});
+            try Helper.rows(alloc, api, &.{ "commit", "scoped" });
             const reloads = metadata.lifecycle_projection_reloads;
             try Helper.finishScope(alloc, api);
             try std.testing.expectEqual(reloads, metadata.lifecycle_projection_reloads);
         } else {
-            try Helper.rows(alloc, api, &.{"commit"});
+            try Helper.rows(alloc, api, &.{ "commit", "scoped" });
             // A retired GID can be reused without adopting the old admission.
             var begun = try Helper.sql(alloc, api, null, "BEGIN");
             defer begun.deinit();

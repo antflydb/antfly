@@ -41,6 +41,13 @@ pub const Registry = struct {
     pub fn snapshot(self: *@This(), a: A, lookup: registry.Read) !registry.Snapshot {
         var private = self.context;
         private.setting_admin = true;
+        // The identity embeds the command scope. Independent decision delivery
+        // must keep the sealed admission hash unchanged across client death.
+        if (private.sql_command_fence != null) {
+            private.sql_completion = null;
+            private.sql_completion_submission = null;
+            private.sql_command_fence = null;
+        }
         try private.ensureActive();
         const bytes = try self.server.source.systemCatalog(a, private, .{ .sql_prepared_read = lookup });
         defer a.free(bytes);
@@ -68,6 +75,13 @@ pub const Registry = struct {
     fn mutate(self: *@This(), a: A, request: registry.Mutation) !void {
         var private = self.context;
         private.setting_admin = true;
+        // The identity embeds the command scope. Independent decision delivery
+        // must keep the sealed admission hash unchanged across client death.
+        if (private.sql_command_fence != null) {
+            private.sql_completion = null;
+            private.sql_completion_submission = null;
+            private.sql_command_fence = null;
+        }
         try private.ensureActive();
         const bytes = try self.server.source.systemCatalog(a, private, .{ .sql_prepared_mutate = request });
         defer a.free(bytes);
@@ -149,21 +163,55 @@ pub const Registry = struct {
         cancel.operation = .{ .cancel_admission = .{ .original_actor = original.actor, .original = original.operation.admit } };
         var private = self.context;
         private.setting_admin = true;
+        if (private.sql_command_fence != null) {
+            private.sql_completion = null;
+            private.sql_completion_submission = null;
+            private.sql_command_fence = null;
+        }
         const response = self.server.source.systemCatalog(a, private, .{ .sql_prepared_mutate = cancel });
         var fenced = false;
-        var expired = false;
         if (response) |bytes| {
             defer a.free(bytes);
-            const outcome = (try std.json.parseFromSliceLeaky(?registry.outcomes.Outcome, a, bytes, .{})) orelse return error.MetadataMutationOutcomeUnknown;
-            fenced = outcome == .rejected;
+            if (try std.json.parseFromSliceLeaky(?registry.outcomes.Outcome, a, bytes, .{})) |outcome| fenced = outcome == .rejected;
         } else |err| switch (err) {
-            error.SequenceAdmissionExpired => expired = true,
+            error.SequenceAdmissionExpired, error.MetadataMutationOutcomeUnknown => {},
             else => return err,
         }
         const cut = try self.snapshot(a, .{ .operation = seal.identity.operation_id });
         try checkRealm(cut, seal.identity);
-        const head_fence = expired and cut.head >= original.admission.head and cut.head - original.admission.head >= registry.outcomes.retained;
+        // The authoritative window/absence cut remains a proof even when the
+        // cancellation response itself was lost or its old receipt was evicted.
+        const head_fence = cut.head >= original.admission.head and cut.head - original.admission.head >= registry.outcomes.retained;
         return (fenced or head_fence) and cut.records.len == 0 and cut.receipts.len == 0;
+    }
+
+    /// Unadmitted SQL may already hold transaction locks. Native cleanup must
+    /// prove the original purpose was rejected or permanently fenced, in the
+    /// same writer transaction that releases a quantum of those locks.
+    fn releaseUnadmittedScope(self: *@This(), a: A, seal: transactions.ExternalPreparationSeal) !bool {
+        const ref = seal.identity.lock_scope orelse return true;
+        const types = @import("../system_catalog/lock_authority.zig");
+        const anchor = try self.snapshot(a, .{ .operation = seal.identity.operation_id });
+        var context = self.context;
+        context.setting_admin = true;
+        context.sql_command_fence = null;
+        context.sql_completion = null;
+        context.sql_completion_submission = null;
+        const query: types.Query = .{ .incarnation = anchor.incarnation, .standalone = anchor.standalone, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database = seal.identity.database_id, .backend = ref.backend };
+        const before = try std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }), .{});
+        const scope = before.scope orelse return error.InvalidSqlBackendResponse;
+        if (scope.next_command > ref.command.sequence or scope.transaction == null) return true;
+        if (!std.meta.eql(scope.transaction, @as(?types.scopes.Transaction, .{ .id = seal.identity.txn_id }))) return error.ExternalTransactionDecisionChanged;
+        var nonce: [16]u8 = undefined;
+        try self.server.embedding_provider_runtime.io.randomSecure(&nonce);
+        const request: types.Request = .{ .admission = .{ .head = before.head, .nonce = nonce }, .incarnation = before.incarnation, .standalone = before.standalone, .actor = query.actor, .database = query.database, .backend = ref.backend, .operation = .{ .release_unadmitted = try seal.admissionRequest() } };
+        const bytes = try self.server.source.systemCatalog(a, context, .{ .sql_lock_mutate = request });
+        const result = (try std.json.parseFromSliceLeaky(?types.outcomes.Outcome, a, bytes, .{})) orelse return error.MetadataMutationOutcomeUnknown;
+        _ = try result.result();
+        self.anchor = null;
+        // One bounded cleanup quantum, then yield to the existing supervisor.
+        const after = try std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }), .{});
+        return after.scope != null and after.scope.?.transaction == null;
     }
 
     /// One journal quantum per recovery pass. Scope cleanup shares the same
@@ -226,6 +274,7 @@ fn recoverSessionWithContext(server: *http.ApiHttpServer, txn_id: [16]u8, bytes:
     if (cut.receipts.len == 0) {
         if (!prepared and !aborted and !committed) {
             if (try source.cancelUnadmitted(a, seal)) {
+                if (!try source.releaseUnadmittedScope(a, seal)) return error.MetadataMutationOutcomeUnknown;
                 _ = (try server.txn_sessions.recordExternalAdmissionRejection(server.alloc, txn_id, try seal.identity.owner(a))) orelse return error.SqlTransactionNotActive;
                 return;
             }
@@ -303,7 +352,6 @@ pub fn advanceWork(server: *http.ApiHttpServer, after: *?[16]u8) !void {
     if (server.cfg.prepared_transaction_leadership) |leadership| {
         if (!leadership.isLocalLeader(group)) return;
     } else if (server.cfg.deployment_mode != .standalone) return;
-    const writes = server.table_writes orelse return;
     var region = std.heap.ArenaAllocator.init(server.alloc);
     defer region.deinit();
     const a = region.allocator();
@@ -318,6 +366,11 @@ pub fn advanceWork(server: *http.ApiHttpServer, after: *?[16]u8) !void {
     after.* = record.identity.operation_id;
     source.database_id = record.identity.database_id;
     if ((record.phase == .preparing or record.phase == .prepared) and registry.recoveryDecision(record, time.realtimeNs()) == null) return;
+    if (record.participants.len == 0) {
+        _ = try recoverEmptyCohort(&source, a, record, time.realtimeNs());
+        return;
+    }
+    const writes = server.table_writes orelse return;
     const deadline = time.monotonicNs() +| distributed.external_recovery_pass_timeout_ns;
     var local_worker = distributed.LocalTableWriteParticipantWorker.init(writes);
     local_worker.recovery_deadline_ns = deadline;
@@ -363,6 +416,104 @@ const ParticipantTransport = struct {
         return if (self.hosted) self.hosted_worker.worker() else self.local_worker.worker();
     }
 };
+
+/// Empty cohorts still have a durable decision and scope-release barrier.
+/// They require no storage transport and must remain recoverable on nodes
+/// without a local table writer. At most one decision and one handoff per pass.
+fn recoverEmptyCohort(source: *Registry, a: A, before: registry.Record, now_ns: u64) !registry.Record {
+    if (before.participants.len != 0) return error.InvalidTxnRequest;
+    var record = before;
+    if (registry.recoveryDecision(record, now_ns)) |decision| {
+        const version = try distributed.commitVersion(record.identity.begin_timestamp);
+        record = try Registry.advance(source, a, record, switch (decision) {
+            .abort => .{ .abort = version },
+            .commit => .{ .commit = .{ .version = version, .sync_level = record.identity.commit_sync_level } },
+        });
+    }
+    if (record.phase == .resolved) record = try Registry.advance(source, a, record, .handoff);
+    return record;
+}
+
+/// Scoped COMMIT uses the existing external decision graph. The local seal is
+/// durable before native admission; every later error is reconciliation debt,
+/// never permission to run the ordinary commit coordinator under the same ID.
+pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdentity, context: local.api_operation.RequestContext, id: sql_session.Id, tables: []const distributed.TableCommitRequest, abort: bool) !sql_session.CommitResult {
+    const frame = context.sql_command_fence orelse return error.InvalidLockScope;
+    if (abort and tables.len != 0) return error.InvalidTxnRequest;
+    if (server.txn_sessions.durable == null) return error.SqlPreparedDurabilityUnavailable;
+    const info = server.txn_sessions.getInfo(id) orelse return error.SqlTransactionNotActive;
+    var state = (try server.txn_sessions.getSqlState(server.alloc, id)) orelse return error.SqlTransactionNotActive;
+    defer state.deinit(server.alloc);
+    const connection_id = state.connection_id orelse return error.SqlConnectionNotFound;
+    if (state.owner_node_id != server.localSessionNodeId() or (state.metadata.accepted_lake_reads and tables.len != 0)) return error.UnsupportedSqlExecution;
+    var region = std.heap.ArenaAllocator.init(server.alloc);
+    defer region.deinit();
+    const a = region.allocator();
+    var current_user = user;
+    var root: execution.Adapter = .{ .server = server, .identity = &current_user, .context = context, .database = state.metadata.database };
+    var source: Registry = .{ .server = server, .context = context, .database_id = try databaseIdentity(&root, a) };
+    if (source.database_id != frame.database) return error.InvalidLockScope;
+    var cohort = try distributed.ExternalPreparation.init(a, server.catalogSource(), tables);
+    defer cohort.deinit(a);
+    var transport: ParticipantTransport = undefined;
+    if (cohort.manifest.len != 0) try transport.init(server);
+    const encoded = try transactions.encodeExecutionPlan(a, tables);
+    const actor = try @import("sql_authorization_recovery.zig").actor(server, user);
+    source.actor = actor;
+    var operation_id: [16]u8 = undefined;
+    try server.embedding_provider_runtime.io.randomSecure(&operation_id);
+    const cut = try source.snapshot(a, .{ .operation = operation_id });
+    if (cut.standalone != frame.standalone or !std.mem.eql(u8, &cut.incarnation, &frame.backend.incarnation)) return error.CatalogGenerationChanged;
+    const now = @import("antfly_platform").time.realtimeNs();
+    const identity: registry.Identity = .{
+        .kind = .session_commit,
+        .lock_scope = .{ .backend = frame.backend, .command = frame.command },
+        .commit_sync_level = if (info.sync_level == .propose) .write else info.sync_level,
+        .session = .{ .owner_node_id = state.owner_node_id, .connection_id = connection_id, .standalone = cut.standalone },
+        .gid = "",
+        .database_id = source.database_id,
+        .native_service = context.native_service,
+        .principal = actor.principal(),
+        .txn_id = id,
+        .operation_id = operation_id,
+        .metadata_incarnation = std.fmt.bytesToHex(cut.incarnation, .lower),
+        .begin_timestamp = info.begin_timestamp,
+        .expires_at_unix_ns = try std.math.add(u64, now, 5 * std.time.ns_per_min),
+        .plan_digest = try registry.planDigest(encoded),
+        .manifest_digest = try registry.manifestDigest(a, cohort.manifest, std.fmt.bytesToHex(cut.incarnation, .lower)),
+    };
+    const seal: transactions.ExternalPreparationSeal = .{ .admission_head = cut.head, .admitted_at_ns = now, .standalone = cut.standalone, .identity = identity, .actor = actor, .participants = cohort.manifest };
+    if (context.sql_completion) |completion| try completion.prepare_transaction(completion.ptr, id);
+    var plan = (try server.txn_sessions.sealExternalEncodedExecutionPlan(server.alloc, id, seal, encoded)) orelse return error.SqlTransactionNotActive;
+    defer plan.deinit();
+    // A zero-row transaction can still own transaction locks. It traverses the
+    // same durable decision and release barriers, without requiring a fictitious
+    // table participant or constructing a transport that will never be called.
+    deliver: {
+        var record = if (cohort.manifest.len == 0)
+            Registry.admit(&source, a, identity, cohort.manifest) catch break :deliver
+        else
+            cohort.prepare(a, transport.worker(), source.authority(), identity, .{ .fanout_io = server.sharedApiIo(), .external_deadline_ns = context.deadline_ns }) catch break :deliver;
+        if (cohort.manifest.len == 0) {
+            if (abort) {
+                record = Registry.advance(&source, a, record, .{ .abort = distributed.commitVersion(info.begin_timestamp) catch break :deliver }) catch break :deliver;
+            } else {
+                record = Registry.advance(&source, a, record, .prepare) catch break :deliver;
+            }
+            _ = recoverEmptyCohort(&source, a, record, now) catch break :deliver;
+        } else {
+            _ = distributed.recoverExternalTransaction(a, transport.worker(), source.authority(), operation_id, now, .{ .fanout_io = server.sharedApiIo(), .external_deadline_ns = context.deadline_ns }) catch break :deliver;
+        }
+    }
+    const bytes = (server.txn_sessions.externalPreparationSeal(server.alloc, id) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
+    defer server.alloc.free(bytes);
+    // Exact native receipt adoption persists the terminal result before ACK.
+    // Lost admission/reply and incomplete lock cleanup are owned by maintenance.
+    recoverSessionWithContext(server, id, bytes, false, false, false, context) catch {};
+    var observed = (server.txn_sessions.getSqlState(server.alloc, id) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
+    defer observed.deinit(server.alloc);
+    return .{ .outcome = if (observed.terminal_abort) .aborted else if (observed.terminal != null) .committed else .unknown, .reconciliation_id = id };
+}
 
 /// Session ownership, current schema/RLS, predicates and FK/UNIQUE preparation
 /// use the ordinary transaction pipeline. Only the durable decision authority

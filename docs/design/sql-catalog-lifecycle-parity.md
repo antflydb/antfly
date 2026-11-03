@@ -18172,3 +18172,30 @@ The final source-lifetime gate additionally passes all 126 Debug build steps:
 sequence/session tests, five metadata-submission tests, and standalone cold
 prepared recovery. It covers publication across an idle TTL using only a live
 source fence, and independent connection reconciliation after source retirement.
+
+
+### Scoped SQL commit and abort coordination
+
+Connection-scoped transaction completion now uses the existing private
+metadata-authoritative decision graph instead of the legacy commit coordinator.
+This includes guarded implicit DML, explicit/empty COMMIT, validation aborts and
+ROLLBACK. First binding and native decision admission are atomic. Empty cohorts
+recover without a table writer; real row cohorts retain the same signed RLS,
+integrity preparation and participant routes as ordinary SQL writes.
+
+Unadmitted abort cleanup requires native proof of the exact original rejection
+or a permanently closed admission window, plus decision/receipt absence in the
+accepting writer. It preserves session locks and yields between bounded cleanup
+quanta. Source FINISH and independently proved connection reconciliation wait for
+that barrier without replaying SQL. See [SQL lock ownership](sql-lock-ownership.md#scoped-transaction-decisions)
+for the authority and remaining public activation requirements. This architectural
+qualification alone credits no additional original SQL cases: 87 remain unresolved.
+
+Qualification: all 147 Debug build steps and 84 selected tests pass, including
+real standalone row participants, 24 metadata-delivery/cold-reopen scenarios,
+rejected-admission cleanup after journal eviction, failed-transaction rollback,
+retained session grants, public SQL/pgwire, sequence/session and submission gates.
+Generation, formatting, source-boundary, license and inventory checks pass.
+Private full-index visibility/repair delivery and database-retirement scope
+barriers still require public activation qualification; no original disposition
+is changed by this coordinator cohort.

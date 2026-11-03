@@ -126,10 +126,12 @@ pub fn retirementReadyTxn(a: A, txn: anytype, id: [32]u8) !bool {
     return found.value.phase == .retired;
 }
 /// Connection reconciliation has independent begin/terminal proof. It may
-/// publish only while this source has no executing or pending SQL command.
+/// publish only while this source has no executing SQL body. Finishing owns
+/// control delivery only and cannot mint another body execution permit.
 pub fn reconciliationReadyTxn(a: A, txn: anytype, id: [32]u8) !bool {
     var found = (try readTxn(a, txn, id)) orelse return true;
     defer found.deinit();
+    if (found.value.phase == .finishing) return true;
     return (found.value.phase == .idle or found.value.phase == .retired) and found.value.pending == null and found.value.ticket == null;
 }
 pub fn requireUnusedTxn(a: A, txn: anytype, id: [32]u8) !void {
@@ -195,6 +197,28 @@ fn readIndexedTxn(a: A, txn: anytype, id: [32]u8) !?std.json.Parsed(Record) {
     };
     if (indexed != (found != null and found.?.value.phase != .retired)) return error.InvalidSqlConnection;
     return found;
+}
+fn uncertainConnection(store: *transactions.DurableSessionStore, a: A, id: [32]u8) !bool {
+    var found = switch (store.backend) {
+        .docstore => |backend| blk: {
+            var txn = try backend.beginReadTxn();
+            defer txn.abort();
+            break :blk connections.loadTxn(&txn, a, &id) catch |err| switch (err) {
+                error.SqlConnectionNotFound => return false,
+                else => return err,
+            };
+        },
+        .runtime => |backend| blk: {
+            var txn = try backend.beginRead();
+            defer txn.abort();
+            break :blk connections.loadTxn(&txn, a, &id) catch |err| switch (err) {
+                error.SqlConnectionNotFound => return false,
+                else => return err,
+            };
+        },
+    };
+    defer found.deinit();
+    return found.value.state == .uncertain;
 }
 fn loadMode(store: *transactions.DurableSessionStore, a: A, id: [32]u8, comptime indexed: bool) !?std.json.Parsed(Record) {
     return switch (store.backend) {
@@ -513,11 +537,28 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
                 next.pending = null;
             },
             .finishing => {
+                // A returned SQL body may still await an independent durable
+                // decision. Do not complete its command and admit a new body
+                // merely because no native decision has been installed yet.
+                if (try uncertainConnection(store, a, prior.registration.connection)) return;
                 if (!std.meta.eql(scope.completed, @as(?authority.scopes.Command, prior.ticket.?.command))) {
+                    // A terminal SQL receipt can precede bounded transaction
+                    // lock cleanup. Wait for the existing decision controller;
+                    // finishing may not fence the backend's session grants.
+                    if (scope.releasing or (scope.transaction != null and scope.transaction.?.decision != null) or
+                        (cut.owner != null and (cut.owner.?.job != null or cut.owner.?.waiting != null))) return;
                     if (expired(prior.pending.?, cut.head)) {
                         next.pending = next.controlRequest(cut.head, nonce, prior.pending.?.operation);
                         try replace(store, principal, prior, next);
                     } else if (try port.deliver(a, prior.pending.?)) |failure| {
+                        if (failure == .CatalogPublicationProofPending) {
+                            // A busy result is retained under its original
+                            // nonce. Retry only this idempotent control with a
+                            // fresh admission after the next native observation.
+                            next.pending = next.controlRequest(cut.head, nonce, prior.pending.?.operation);
+                            try replace(store, principal, prior, next);
+                            return;
+                        }
                         next.failure = failure;
                         next.recovery = true;
                         try replace(store, principal, prior, next);
@@ -621,11 +662,15 @@ pub fn advanceWork(server: *@import("http_server.zig").ApiHttpServer, after: *?[
     // A shared physical session store does not confer another issuer's source
     // ownership. A different facade also isn't evidence of process death.
     if (prior.registration.lease.node != server.localSessionNodeId()) return true;
+    const time = @import("antfly_platform").time;
+    if (prior.phase == .finishing and try uncertainConnection(store, a, prior.registration.connection)) {
+        var reconciled = try @import("sql_connections.zig").loadReconciled(store, &server.txn_sessions, a, prior.registration.connection, prior.principal, prior.registration.lease.node, time.realtimeNs() / std.time.ns_per_ms);
+        reconciled.deinit();
+    }
     const io = server.embedding_provider_runtime.io;
     const instance = try server.sql_connection_admission.executionInstance(io);
     var nonce: Id = undefined;
     try io.randomSecure(&nonce);
-    const time = @import("antfly_platform").time;
     var native: NativePort = .{ .server = server, .context = .{ .deadline_ns = time.monotonicNs() +| std.time.ns_per_s } };
     try advance(store, a, prior.principal, prior, instance, time.realtimeNs() / std.time.ns_per_ms, nonce, native.port());
     return true;

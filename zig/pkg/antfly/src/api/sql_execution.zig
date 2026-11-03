@@ -494,7 +494,7 @@ pub const Adapter = struct {
             });
         }
         var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context, .sync_level = if (self.setting_overlay_source == .connection) try setting_catalog.mutationSyncLevel(self.setting_overlay) else null };
-        var owner = session_api.Adapter{ .command_fence = self.context.sql_command_fence, .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = if (self.setting_overlay_source == .durable_session) self.setting_overlay else &.{}, .connection_search_path = if (self.connection_id != null and self.ddl_search_path != null) self.ddl_search_path.?.* else null };
+        var owner = session_api.Adapter{ .command_fence = self.context.sql_command_fence, .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .rollback_fn = session_api.Coordinator.rollback, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = if (self.setting_overlay_source == .durable_session) self.setting_overlay else &.{}, .connection_search_path = if (self.connection_id != null and self.ddl_search_path != null) self.ddl_search_path.?.* else null };
         var session = sessions.Session{ .owner = owner.owner(), .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .namespace = self.session_namespace orelse self.namespace } };
         if (self.session_id) |encoded| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return zig017_failure: {
@@ -628,7 +628,11 @@ pub const Adapter = struct {
         const captured_conflict = compiled.statement == .insert and compiled.statement.insert.conflict != null and compiled.statement.insert.conflict.?.capture_count != 0;
         const deferred_conflict = compiled.statement == .insert and compiled.statement.insert.conflict != null and compiled.statement.insert.conflict.?.deferred_count != 0;
         const versioned_returning = ast.returningWriteVersion(compiled.statement);
-        const implicit_guarded = (compiled.statement == .effect_block or compiled.statement == .merge or captured_conflict or deferred_conflict or versioned_returning) and session.transaction_id == null;
+        const scoped_mutation = self.context.sql_command_fence != null and switch (compiled.statement) {
+            .insert, .update, .delete, .merge, .effect_block => true,
+            else => false,
+        };
+        const implicit_guarded = (scoped_mutation or compiled.statement == .effect_block or compiled.statement == .merge or captured_conflict or deferred_conflict or versioned_returning) and session.transaction_id == null;
         if (implicit_guarded) {
             if (!supportsRangeGuards(self.server)) return zig017_failure: {
                 zig017_return_error = error.SqlRangeTrackingRequired;

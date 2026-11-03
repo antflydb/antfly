@@ -454,8 +454,8 @@ execution, retirement and reclamation.
 
 This is the source control boundary, not activation of public advisory
 functions. Public HTTP/pgwire entry points still need to create/pin these owners
-around SQL; all scoped writes must select the existing private decision path,
-ordered advisory scalars need their PostgreSQL NULL/void contracts, and legacy
+around SQL. Scoped DML and transaction completion now select the existing
+private decision path described below. Ordered advisory scalars still need their PostgreSQL NULL/void contracts, and legacy
 metadata effects, prepared-owner handoff, participant enrollment and retirement-
 floor GC remain. No original fixture is reclassified from this qualification
 alone.
@@ -478,3 +478,72 @@ standalone cold prepared recovery test. Active command publication may cross the
 parent's idle TTL only with its exact unexpired source fence; ordinary expired
 connection access stays rejected. Independently proved BEGIN/terminal repairs
 remain possible after source retirement, preventing cleanup from being stranded.
+
+
+### Scoped transaction decisions
+
+The SQL session coordinator selects the existing metadata-authoritative private
+`session_commit` purpose whenever the request owns a command fence. Explicit
+COMMIT, guarded implicit DML, zero-row commits, validation aborts and ROLLBACK
+share that authority. SQL authorization, RLS participant signing, FK/UNIQUE
+preparation, immutable route manifests and durability settings still use the
+ordinary transaction pipeline. A scoped request never falls back to the legacy
+commit coordinator after an external purpose is sealed.
+
+The session persists its exact signed plan, connection, scope, command and
+participant digest before metadata admission. A first private admission binds
+and seals the transaction in the same native writer, eliminating a separate
+binding RPC and its orphan-binding crash window. An existing different binding,
+the retained released transaction ID, an obsolete command or an unscoped admission on a
+bound connection is rejected. Metadata control deliveries retain the original
+admission digest after the client command dies.
+
+Zero-participant transactions still cross the native decision and release
+barriers; they do not invent a table participant or require a storage writer.
+The same indexed supervisor advances their commit/abort and handoff. Once the
+plan is sealed, interrupted delivery is reconciliation debt under that purpose,
+not permission to replay SQL. Terminal native receipts are adopted locally
+before their delivery ACK can be reclaimed.
+
+An unadmitted purpose can nevertheless own transaction locks acquired earlier.
+Its cleanup supplies the original sealed admission to the native lock writer.
+That writer independently joins the incarnation, connection, principal, command,
+transaction and exact admission journal, verifies both decision record and
+receipt absence, and requires a retained rejection or a permanently expired
+admission window. Absence inside a live window never permits release. Each
+cleanup quantum retains session grants and checks the same proof; a local SQL
+abort is published only after the native unsealed binding has been released.
+No second decision registry or additional permanent tombstone family is added.
+
+Command completion waits for uncertain connection decisions and bounded native
+transaction-lock cleanup. Independent terminal reconciliation may publish while
+a source is finishing, because that phase cannot issue another SQL execution
+permit. A busy FINISH control cannot fence the backend and discard its session
+locks. The existing supervisor performs the terminal reconciliation before
+advancing the source again. Normal completion adds only a bounded local
+connection-record lookup, not a scan or a copy of the staged row plan.
+
+This integration does not activate public advisory functions. HTTP/pgwire source
+pinning, ordered scalar effects with PostgreSQL NULL/void contracts, prepared
+owner handoff, row/table participant enrollment and authoritative retirement-floor
+GC remain separate requirements. Original parity dispositions are unchanged.
+
+
+The final qualification passes all **147 Debug build steps** and 84 selected
+tests with no skips, failures or leaks. It includes 24 before/after-delivery
+scenarios over three native-store lifetimes for admission, prepare, decision,
+handoff and ACK; healthy/failed rollback with admitted and rejected purposes;
+refusal of release while admission remains possible; cleanup after the original
+journal window is evicted; and preservation of session grants and usable idle
+connections. The standalone integration commits a scoped row through real native
+table participants beside named prepared transactions and verifies both across
+cold reopen. Existing sequence/session, public SQL/pgwire, metadata-submission
+and command-fence gates also pass. `make generate`, `make fmt`, source-boundary,
+license and original-inventory checks pass.
+
+Before public scoped-write activation, also qualify full-index visibility and
+repair-status delivery: private SQL currently waits for the final external
+receipt, retaining unresolved work rather than claiming visibility after an
+incomplete native resolution. Database retirement must account for active scope
+bindings before removing the catalog object needed by cleanup. These remain
+activation requirements, not additional original-case credits.

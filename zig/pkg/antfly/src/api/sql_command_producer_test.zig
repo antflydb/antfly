@@ -39,9 +39,14 @@ const Native = struct {
     standalone: bool = false,
     index: u64 = 100,
     serial: u64 = 1000,
+    expiry_ms: u64 = 1000,
+    database: []const u8 = "main",
     before: bool = false,
     after: bool = false,
     calls: usize = 0,
+    failure: ?enum { admit, prepare, commit, handoff, ack } = null,
+    fail_before: bool = false,
+    block_cancel: bool = false,
     previous: ?[32]u8 = null,
     last: ?[32]u8 = null,
     fn nonce(self: *@This()) [16]u8 {
@@ -54,6 +59,39 @@ const Native = struct {
     fn call(raw: *anyopaque, alloc: A, input: Call) anyerror![]u8 {
         const self: *@This() = @ptrCast(@alignCast(raw));
         return switch (input) {
+            .read => |request| self.metadata.systemCatalogRead(alloc, group, request),
+            .sql_prepared_read => |request| self.metadata.sqlPreparedRead(alloc, group, request, .{ .setting_admin = true }),
+            .sql_prepared_outcome => |request| self.metadata.sqlPreparedOutcome(alloc, group, request),
+            .sql_prepared_mutate => |request| blk: {
+                if (request.operation == .cancel_admission and self.block_cancel) return error.MetadataMutationOutcomeUnknown;
+                const point: @TypeOf(self.failure) = switch (request.operation) {
+                    .admit => .admit,
+                    .acknowledge_receipt => .ack,
+                    .advance => |change| switch (change.action) {
+                        .prepare => .prepare,
+                        .commit => .commit,
+                        .handoff => .handoff,
+                        else => null,
+                    },
+                    else => null,
+                };
+                const lose = point != null and point == self.failure;
+                if (lose) self.failure = null;
+                if (lose and self.fail_before) return error.MetadataMutationOutcomeUnknown;
+                const body = try std.json.Stringify.valueAlloc(alloc, request, .{});
+                defer alloc.free(body);
+                const command: storage.TransitionCommand = .{ .apply_sql_prepared_transaction = body };
+                if (self.replicated) {
+                    const wire = try storage.encodeTransitionCommand(alloc, command);
+                    defer alloc.free(wire);
+                    self.index += 1;
+                    const entries = try @import("../raft/state_machine/mod.zig").encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = self.index, .entry_type = .normal, .data = wire }});
+                    defer alloc.free(entries);
+                    try self.metadata.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = self.index, .entries_bytes = entries });
+                } else try self.metadata.applyStandaloneCommand(group, command);
+                if (lose) return error.MetadataMutationOutcomeUnknown;
+                break :blk try self.metadata.sqlPreparedOutcome(alloc, group, request);
+            },
             .sql_lock_read => |query| self.metadata.sqlLockRead(alloc, group, query, .{ .setting_admin = true }),
             .sql_lock_outcome => |request| self.metadata.sqlLockOutcome(alloc, group, request),
             .sql_lock_mutate => |request| blk: {
@@ -124,9 +162,10 @@ fn setup(metadata: *storage.RaftApplyStore, source: *transactions.DurableSession
     defer a.free(activation);
     try metadata.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
     const node: u64 = if (standalone) 0 else 9;
-    _ = try connections.mutate(source, .{ .create = .{ .id = connection, .principal = "alice", .owner_node_id = node, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", node, 1);
-    const registration: authority.scopes.Registration = .{ .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 }, .database = 1, .node = node, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = 1000 }, .connection = connection, .nonce = id(3), .standalone = standalone };
-    try producer.create(source, "alice", registration, actor, instance, try native.head(), native.nonce(), 1);
+    const created_at_ms = if (native.expiry_ms == 1000) 1 else native.expiry_ms - 60000;
+    _ = try connections.mutate(source, .{ .create = .{ .id = connection, .principal = "alice", .owner_node_id = node, .expires_at_ms = native.expiry_ms, .database = native.database, .namespace = "public" } }, "alice", node, created_at_ms);
+    const registration: authority.scopes.Registration = .{ .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 }, .database = 1, .node = node, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = native.expiry_ms }, .connection = connection, .nonce = id(3), .standalone = standalone };
+    try producer.create(source, "alice", registration, actor, instance, try native.head(), native.nonce(), created_at_ms);
 }
 fn begin(native: *Native, source: *transactions.DurableSessionStore, serial: u64) !producer.Ticket {
     var owned = (try producer.load(source, a, connection)).?;
@@ -556,5 +595,208 @@ test "SQL command producer native retired sources preserve independent connectio
         try std.testing.expect(restored.value.active_txn == null);
         _ = try connections.mutate(&source, .{ .close = connection }, "alice", 0, 2);
         try std.testing.expect((try producer.load(&source, a, connection)) == null);
+    }
+}
+
+// Drive the production SQL coordinator and its exact local seal through the
+// actual metadata receiver. No table transport exists: even an empty COMMIT
+// must decide and release its scope, and cold maintenance must finish it.
+test "SQL command producer native scoped COMMIT survives every metadata delivery boundary and cold adoption" {
+    const coordinator = @import("sql_prepared_coordinator.zig");
+    const Forward = struct {
+        fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedStatusRead;
+        }
+        fn catalog(raw: *anyopaque, alloc: A, _: local.api_operation.RequestContext, input: Call) anyerror![]u8 {
+            return Native.call(raw, alloc, input);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |replicated| for ([_]bool{ false, true }) |before| {
+        for ([_]@TypeOf(@as(Native, undefined).failure){ null, .admit, .prepare, .commit, .handoff, .ack }, 0..) |fault, number| {
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/scoped-commit-{any}-{any}-{d}", .{ tmp.sub_path, replicated, before, number });
+            defer a.free(path);
+            var txn_id: [16]u8 = undefined;
+            var operation_id: ?[16]u8 = null;
+            for (0..3) |phase_index| {
+                var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+                defer metadata.deinit();
+                var durable = transactions.DurableSessionStore.init(a, &metadata.store);
+                var native: Native = .{ .metadata = &metadata, .replicated = replicated, .standalone = true, .index = 100 + phase_index * 1000 };
+                var runtime = try local.storage_db_selected_root.db.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+                defer runtime.deinit();
+                var server = @import("http_server.zig").ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .session_store = &durable, .session_maintenance_local_only = true, .deployment_mode = .standalone }, .{ .ptr = &native, .vtable = &.{ .status = Forward.status, .system_catalog = Forward.catalog } }, null, null);
+                defer server.deinit();
+                if (phase_index == 0) {
+                    try setup(&metadata, &durable, true, &native);
+                    try native.until(&durable, .idle, 2);
+                    const ticket = try begin(&native, &durable, 60);
+                    const fence = try execute(&durable, ticket);
+                    const session = try server.txn_sessions.beginForPrincipalWithSettings(a, .{ .sync_level = .propose, .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 0, "alice", &.{}, connection);
+                    txn_id = session.txn_id;
+                    native.failure = fault;
+                    native.fail_before = before;
+                    var user: ?@import("http_server.zig").AuthenticatedIdentity = null;
+                    var owner: @import("sql_session.zig").Coordinator = .{ .server = &server, .identity = &user, .context = .{ .sql_command_fence = &fence } };
+                    const result = try @import("sql_session.zig").Coordinator.commit(&owner, .{ .principal = "alice", .database = "default", .namespace = "public" }, txn_id);
+                    try std.testing.expectEqualDeep(txn_id, result.reconciliation_id);
+                    try std.testing.expect(result.outcome == .committed or result.outcome == .aborted or result.outcome == .unknown);
+                    if (fault == null) try std.testing.expectEqual(.committed, result.outcome);
+                    var durable_result = (try durable.load(txn_id)).?;
+                    defer durable_result.deinit(a);
+                    var seal = try std.json.parseFromSlice(transactions.ExternalPreparationSeal, a, durable_result.external_preparation.?, .{});
+                    defer seal.deinit();
+                    operation_id = seal.value.identity.operation_id;
+                    try std.testing.expectEqual(.session_commit, seal.value.identity.kind);
+                    try std.testing.expectEqual(.write, seal.value.identity.commit_sync_level);
+                    try std.testing.expectEqualDeep(fence.command, seal.value.identity.lock_scope.?.command);
+                    try std.testing.expectEqual(@as(usize, 0), seal.value.participants.len);
+                } else {
+                    var bytes = (try durable.load(txn_id)).?;
+                    defer bytes.deinit(a);
+                    try std.testing.expect(bytes.external_preparation != null);
+                    var region = std.heap.ArenaAllocator.init(a);
+                    defer region.deinit();
+                    var owner: coordinator.Registry = .{ .server = &server, .context = .{}, .database_id = 1 };
+                    var cut = try owner.snapshot(region.allocator(), .{ .operation = operation_id.? });
+                    if (cut.records.len == 1 and cut.records[0].phase == .preparing) {
+                        // Interrupted preparation may abort, but can never be
+                        // promoted to a commit without its durable prepare cut.
+                        const record = cut.records[0];
+                        _ = try owner.authority().advance(&owner, region.allocator(), record, .{ .abort = try @import("distributed_txn.zig").commitVersion(record.identity.begin_timestamp) });
+                    }
+                    for (0..8) |_| {
+                        var cursor: ?[16]u8 = null;
+                        coordinator.advanceWork(&server, &cursor) catch |err| switch (err) {
+                            error.MetadataMutationOutcomeUnknown => {},
+                            else => return err,
+                        };
+                        coordinator.recoverSession(&server, txn_id, bytes.external_preparation.?, bytes.external_preparation_prepared, bytes.terminal_abort, bytes.terminal_commit != null) catch |err| switch (err) {
+                            error.MetadataMutationOutcomeUnknown => {},
+                            else => return err,
+                        };
+                    }
+                    var terminal = (try durable.load(txn_id)).?;
+                    defer terminal.deinit(a);
+                    try std.testing.expect(terminal.terminal_abort or terminal.terminal_commit != null);
+                    try std.testing.expect(terminal.external_receipt_acknowledged);
+                    try std.testing.expect(terminal.execution_plan == null);
+                    cut = try owner.snapshot(region.allocator(), .{ .operation = operation_id.? });
+                    try std.testing.expectEqual(@as(usize, 0), cut.records.len);
+                    try std.testing.expectEqual(@as(usize, 0), cut.receipts.len);
+                }
+            }
+        }
+    };
+}
+
+test "SQL command producer native scoped rollback retains its durable abort and releases only transaction locks" {
+    const Coordinator = @import("sql_session.zig").Coordinator;
+    const Adapter = @import("sql_session.zig").Adapter;
+    const prepared = @import("sql_prepared_coordinator.zig");
+    const Forward = struct {
+        fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedStatusRead;
+        }
+        fn catalog(raw: *anyopaque, alloc: A, _: local.api_operation.RequestContext, input: Call) anyerror![]u8 {
+            return Native.call(raw, alloc, input);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (0..4) |mode| {
+        const failed = mode & 1 != 0;
+        const rejected = mode & 2 != 0;
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/scoped-rollback-{d}", .{ tmp.sub_path, mode });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var durable = transactions.DurableSessionStore.init(a, &metadata.store);
+        var native: Native = .{ .metadata = &metadata, .standalone = true, .expiry_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60000, .database = "default" };
+        try setup(&metadata, &durable, true, &native);
+        try native.until(&durable, .idle, 2);
+        const ticket = try begin(&native, &durable, 60);
+        const fence = try execute(&durable, ticket);
+        var runtime = try local.storage_db_selected_root.db.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+        defer runtime.deinit();
+        var server = @import("http_server.zig").ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .session_store = &durable, .session_maintenance_local_only = true, .deployment_mode = .standalone }, .{ .ptr = &native, .vtable = &.{ .status = Forward.status, .system_catalog = Forward.catalog } }, null, null);
+        defer server.deinit();
+        var user: ?@import("http_server.zig").AuthenticatedIdentity = null;
+        var coordinator: Coordinator = .{ .server = &server, .identity = &user, .context = .{ .sql_command_fence = &fence } };
+        var adapter: Adapter = .{ .alloc = a, .registry = &server.txn_sessions, .node_id = 0, .commit_context = &coordinator, .commit_fn = Coordinator.commit, .rollback_fn = Coordinator.rollback, .connection_id = connection, .connection_revision = 1, .command_fence = &fence };
+        const scope: local.sql_session.Scope = .{ .principal = "alice", .database = "default", .namespace = "public" };
+        const transaction = try adapter.owner().vtable.begin(&adapter, scope, .{ .isolation = .read_committed });
+        var source = (try producer.load(&durable, a, connection)).?;
+        defer source.deinit();
+        try native.submit(source.value, .{ .bind = .{ .command = ticket.command, .transaction = transaction.id } });
+        try native.submit(source.value, .{ .effect = .{ .command = ticket.command, .effect = .{ .backend = fence.backend, .sequence = 1, .nonce = id(71), .action = .{ .try_acquire = .{ .resource = @splat(7), .mode = .{ .advisory = .exclusive }, .scope = .session } } } } });
+        try native.submit(source.value, .{ .effect = .{ .command = ticket.command, .effect = .{ .backend = fence.backend, .sequence = 2, .nonce = id(72), .action = .{ .try_acquire = .{ .resource = @splat(8), .mode = .{ .advisory = .exclusive }, .scope = .{ .transaction = .{ .id = transaction.id, .subtransaction = 0 } } } } } } });
+        if (failed) try server.txn_sessions.setSqlFailed(a, transaction.id, true);
+        if (rejected) {
+            native.failure = .admit;
+            native.fail_before = true;
+            native.block_cancel = true;
+            try std.testing.expectError(error.SqlTransactionOutcomeUnknown, adapter.owner().vtable.rollback(&adapter, scope, transaction.id));
+            var pending = (try durable.load(transaction.id)).?;
+            defer pending.deinit(a);
+            var seal = try std.json.parseFromSlice(transactions.ExternalPreparationSeal, a, pending.external_preparation.?, .{});
+            defer seal.deinit();
+            // Absence while this purpose can still arrive is NOT an abort
+            // proof. The real native receiver must reject early lock release.
+            try std.testing.expectError(error.CatalogPublicationProofPending, native.submit(source.value, .{ .release_unadmitted = try seal.value.admissionRequest() }));
+            if (failed) {
+                // Evict the admission window using definite rejected controls.
+                // A lost cancellation ACK cannot strand cleanup after churn.
+                for (0..authority.outcomes.retained + 1) |_| try std.testing.expectError(error.CatalogGenerationChanged, native.submit(source.value, .{ .bind = .{ .command = ticket.command, .transaction = id(999) } }));
+            }
+            native.block_cancel = false;
+        } else try adapter.owner().vtable.rollback(&adapter, scope, transaction.id);
+        var finishing = (try producer.load(&durable, a, connection)).?;
+        defer finishing.deinit();
+        try producer.finish(&durable, "alice", finishing.value, instance, ticket, try native.head(), native.nonce());
+        try native.step(&durable, instance, 3);
+        var waiting = (try producer.load(&durable, a, connection)).?;
+        defer waiting.deinit();
+        try std.testing.expectEqual(.finishing, waiting.value.phase);
+        try std.testing.expect(!waiting.value.recovery);
+        // The SQL outcome is terminal before ACK/reclamation; bounded native
+        // cleanup can continue independently and must preserve session grants.
+        for (0..8) |_| {
+            var current = (try durable.load(transaction.id)).?;
+            defer current.deinit(a);
+            prepared.recoverSession(&server, transaction.id, current.external_preparation.?, current.external_preparation_prepared, current.terminal_abort, current.terminal_commit != null) catch |err| switch (err) {
+                error.MetadataMutationOutcomeUnknown => {},
+                else => return err,
+            };
+            var reconciled = try connections.loadReconciled(&durable, &server.txn_sessions, a, connection, "alice", 0, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+            reconciled.deinit();
+            var cursor: ?[16]u8 = null;
+            prepared.advanceWork(&server, &cursor) catch |err| switch (err) {
+                error.MetadataMutationOutcomeUnknown => {},
+                else => return err,
+            };
+        }
+        var terminal = (try durable.load(transaction.id)).?;
+        defer terminal.deinit(a);
+        try std.testing.expect(terminal.terminal_abort);
+        try std.testing.expect(terminal.external_preparation != null);
+        try std.testing.expect(terminal.execution_plan == null);
+        var read = try metadata.store.beginReadTxn();
+        defer read.abort();
+        const ns: authority.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = fence.backend.incarnation };
+        const lock_owner = (try authority.scopes.ledger.readOwner(a, &read, ns, fence.backend)).?;
+        try std.testing.expectEqual(@as(u32, 1), lock_owner.resources);
+        try std.testing.expectEqual(@as(u32, 0), lock_owner.transaction_resources);
+        try std.testing.expect(lock_owner.transaction == null);
+        const native_scope = (try authority.scopes.read(a, &read, ns, fence.backend)).?;
+        try std.testing.expect(native_scope.transaction == null);
+        try std.testing.expectEqual(.active, native_scope.state);
+        var reusable = try connections.load(&durable, a, connection, "alice", 0, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+        defer reusable.deinit();
+        try std.testing.expectEqual(.idle, reusable.value.state);
+        // Source admission advances only after the native decision released
+        // the command. It must preserve the backend and its session grants.
+        try native.until(&durable, .idle, 3);
     }
 }

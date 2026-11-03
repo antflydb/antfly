@@ -755,6 +755,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL command producer native orphaned connections retire through native fences without evaluating SQL",
         "SQL command producer native closure survives a delayed renewal after its outbox was superseded",
         "SQL command producer native retired sources preserve independent connection begin and terminal reconciliation",
+        "SQL command producer native scoped COMMIT survives every metadata delivery boundary and cold adoption",
+        "SQL command producer native scoped rollback retains its durable abort and releases only transaction locks",
     }) |required| sql_command_producer_audit.addArgs(&.{ "--filter", required });
     sql_command_producer_audit.addArg("--inventory");
     sql_command_producer_audit.addFileArg2(sql_command_producer_inventory.captureStdErr(.{}), .{ .make_absolute = true });

@@ -32,6 +32,21 @@ pub const Coordinator = struct {
     /// session's current value inside the commit body's atomic publication.
     sync_level: ?@import("antfly_local_sources").storage_db_types.SyncLevel = null,
 
+    /// Rollback must cross the same durable scope/decision barrier as commit.
+    /// An existing sealed decision cannot be replaced by a local abort.
+    pub fn rollback(ptr: *anyopaque, _: sql.Scope, id: sql.Id) !void {
+        const self: *Coordinator = @ptrCast(@alignCast(ptr));
+        try self.context.ensureActive();
+        const lease = self.server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
+        defer lease.release();
+        var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
+        defer state.deinit(self.server.alloc);
+        if (state.terminal_abort) return;
+        if (state.execution_started or state.terminal != null or state.terminal_prepare) return error.SqlTransactionOutcomeUnknown;
+        const result = try @import("sql_prepared_coordinator.zig").commitScoped(self.server, self.identity.*, self.context, id, &.{}, true);
+        if (result.outcome != .aborted) return error.SqlTransactionOutcomeUnknown;
+    }
+
     pub fn commit(ptr: *anyopaque, _: sql.Scope, id: sql.Id) !sql.CommitResult {
         const self: *Coordinator = @ptrCast(@alignCast(ptr));
         const server = self.server;
@@ -43,10 +58,12 @@ pub const Coordinator = struct {
         var lake_validation: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = self.identity, .context = self.context };
         lake_validation.validateAcceptedSerializable(alloc, id) catch |err| {
             if (err != error.SqlWriteConflict) return err;
+            if (self.context.sql_command_fence != null) return @import("sql_prepared_coordinator.zig").commitScoped(server, self.identity.*, self.context, id, &.{}, true);
             if (!server.txn_sessions.removeBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .aborted, .reconciliation_id = id };
         };
         var request = (try server.txn_sessions.cloneCommitRequestWithSqlSyncLevel(alloc, id, null, self.sync_level)) orelse {
+            if (self.context.sql_command_fence != null) return @import("sql_prepared_coordinator.zig").commitScoped(server, self.identity.*, self.context, id, &.{}, false);
             if (!server.txn_sessions.commitBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .committed, .reconciliation_id = id };
         };
@@ -63,10 +80,16 @@ pub const Coordinator = struct {
         const tables = tables_view.tables;
         try server.validateCommitTablesAgainstSchema(self.context, tables);
         if (try server.validateCommitReadSet(request)) |conflict| {
+            if (self.context.sql_command_fence != null) {
+                var outcome = try @import("sql_prepared_coordinator.zig").commitScoped(server, self.identity.*, commit_context, id, &.{}, true);
+                if (outcome.outcome == .aborted and conflict.reason == .unique_constraint_violation) outcome.constraint_failure = .unique_constraint_violation;
+                return outcome;
+            }
             if (!server.txn_sessions.removeBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .aborted, .reconciliation_id = id, .constraint_failure = if (conflict.reason == .unique_constraint_violation) .unique_constraint_violation else null };
         }
         if (tables.len == 0) {
+            if (self.context.sql_command_fence != null) return @import("sql_prepared_coordinator.zig").commitScoped(server, self.identity.*, commit_context, id, &.{}, false);
             if (!server.txn_sessions.commitBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .committed, .reconciliation_id = id };
         }
@@ -76,6 +99,7 @@ pub const Coordinator = struct {
         var proof_arena = std.heap.ArenaAllocator.init(alloc);
         defer proof_arena.deinit();
         const signed = try server.signCurrentRowPolicyMutationParticipants(proof_arena.allocator(), prepared.tables, commit_context);
+        if (self.context.sql_command_fence != null) return @import("sql_prepared_coordinator.zig").commitScoped(server, self.identity.*, commit_context, id, signed, false);
         if (self.context.sql_completion) |completion| try completion.prepare_transaction(completion.ptr, id);
         var plan = (try server.txn_sessions.sealExecutionPlan(alloc, id, signed)) orelse return error.SqlTransactionNotActive;
         defer plan.deinit();
@@ -136,6 +160,7 @@ pub const Adapter = struct {
     node_id: u64,
     commit_context: *anyopaque,
     commit_fn: *const fn (*anyopaque, sql.Scope, sql.Id) anyerror!sql.CommitResult,
+    rollback_fn: ?*const fn (*anyopaque, sql.Scope, sql.Id) anyerror!void = null,
     supports_range_guards: bool = false,
     connection_id: ?[32]u8 = null,
     connection_revision: ?u64 = null,
@@ -249,6 +274,16 @@ pub const Adapter = struct {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
+        if (self.command_fence != null) {
+            const callback = self.rollback_fn orelse return error.SqlTransactionOutcomeUnknown;
+            callback(self.commit_context, scope, id) catch |err| {
+                if (err == error.SqlTransactionOutcomeUnknown) if (self.connection_id) |connection|
+                    self.connectionMutation(scope, .{ .uncertain = .{ .id = connection, .txn_id = id } }) catch {};
+                return err;
+            };
+            if (self.connection_id) |connection| self.connectionMutation(scope, .{ .terminal = .{ .id = connection, .txn_id = id } }) catch {};
+            return;
+        }
         if (self.connection_id) |connection|
             try self.registry.rollbackConnectionBeforeExecution(self.alloc, id, connection)
         else if (!self.registry.removeBeforeExecution(self.alloc, id))

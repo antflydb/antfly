@@ -41,6 +41,9 @@ pub const Request = struct {
         fence: scopes.Fence,
         bind: struct { command: scopes.Command, transaction: [16]u8 },
         release: scopes.Transaction,
+        /// Exact unadmitted private purpose, retained locally before dispatch.
+        /// Native journal absence/rejection, not that local claim, authorizes cleanup.
+        release_unadmitted: prepared.Mutation,
         effect: EffectInput,
         cancel: EffectInput,
         step: EffectInput,
@@ -66,6 +69,13 @@ pub const Request = struct {
             },
             .begin, .finish => |command| try command.validate(),
             .bind => |value| try value.command.validate(),
+            .release_unadmitted => |original| {
+                try original.validate();
+                if (original.operation != .admit or original.operation.admit.identity.kind != .session_commit or
+                    !std.mem.eql(u8, &original.incarnation, &self.incarnation) or original.standalone != self.standalone or original.database_id != self.database) return error.InvalidCatalogMutation;
+                const ref = original.operation.admit.identity.lock_scope orelse return error.InvalidCatalogMutation;
+                if (!ref.backend.eql(self.backend)) return error.InvalidCatalogMutation;
+            },
             .renew => |value| if (value.observed_at_ms >= value.expected_expiry) return error.CatalogGenerationChanged,
             .fence => |reason| if (reason == .expired and self.actor.session_user.kind != .bootstrap) return error.Forbidden,
             else => {},
@@ -107,6 +117,7 @@ pub const Context = struct {
     database: u64,
     standalone: bool,
     maintenance: bool = false,
+    unadmitted: ?prepared.Mutation = null,
     fn requireOwner(self: Context, value: scopes.Record) !void {
         if (value.registration.standalone != self.standalone or value.registration.lease.database != self.database) return error.Forbidden;
         if (self.maintenance and self.actor.session_user.kind == .bootstrap and self.actor.current_role == null) return;
@@ -149,15 +160,41 @@ pub const Context = struct {
         const found = try self.record(txn, ns, value, decision);
         if (value.command == null or !std.meta.eql(found.identity.lock_scope.?.command, value.command.?)) return error.InvalidLockScope;
     }
+    fn requireUnadmitted(self: Context, txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Record, expected: scopes.Transaction, original: prepared.Mutation) !void {
+        const identity = original.operation.admit.identity;
+        const session = identity.session orelse return error.InvalidLockScope;
+        const ref = identity.lock_scope orelse return error.InvalidLockScope;
+        if (expected.decision != null or !std.mem.eql(u8, &expected.id, &identity.txn_id) or
+            !ref.backend.eql(value.registration.lease.backend) or session.connection_id == null or
+            !std.mem.eql(u8, &session.connection_id.?, &value.registration.connection) or session.owner_node_id != value.registration.lease.node or
+            session.standalone != value.registration.standalone or identity.database_id != value.registration.lease.database or
+            !std.mem.eql(u8, &try principalDigest(self.a, original.actor.session_user), &value.registration.lease.principal)) return error.InvalidLockScope;
+        if (value.state == .active and !std.meta.eql(value.command, @as(?scopes.Command, ref.command))) return error.LockOwnerChanged;
+        // These point reads and the release share the accepting native writer.
+        // An admitted or delivered purpose can only use its real decision.
+        if (try prepared.readOperation(self.a, txn, ns.group, identity.operation_id) != null or
+            try prepared.readReceipt(self.a, txn, ns.group, identity.operation_id) != null) return error.LockOwnerBusy;
+        const journal: prepared.outcomes.Store(@TypeOf(txn.*)) = .{ .txn = txn, .group = ns.group, .incarnation = ns.incarnation };
+        const outcome = try journal.lookup(self.a, original.admission, try prepared.commandDigest(self.a, original));
+        if (outcome) |known| {
+            if (known != .rejected) return error.LockOwnerBusy;
+        } else {
+            // Eviction alone is not a proof. The immutable old admission head
+            // must permanently prevent a delayed admission of this same body.
+            const head = try journal.head(self.a);
+            if (head < original.admission.head or head - original.admission.head < prepared.outcomes.retained) return error.LockOwnerBusy;
+        }
+    }
     pub fn requireResolution(self: Context, txn: anytype, ns: scopes.ledger.Namespace, value: scopes.Record, expected: scopes.Transaction) !void {
         try self.requireOwner(value);
+        if (self.unadmitted) |original| try self.requireUnadmitted(txn, ns, value, expected, original);
         if (value.transaction == null and std.meta.eql(value.released_transaction, @as(?scopes.Transaction, expected))) return;
         if (!std.meta.eql(value.transaction, @as(?scopes.Transaction, expected))) return error.LockOwnerChanged;
         const decision = expected.decision orelse {
-            // Active source rollback needs a command-bound local abort proof.
+            // Active rollback needs an independently checked rejected admission.
             // Expiry cleanup may retire an unsealed transaction only AFTER its
             // command was fenced, so no future native admission can install.
-            if (value.state == .active) return error.LockOwnerBusy;
+            if (value.state == .active and self.unadmitted == null) return error.LockOwnerBusy;
             return;
         };
         if (try prepared.readOperation(self.a, txn, ns.group, decision.operation)) |_| {
@@ -180,13 +217,14 @@ pub const Context = struct {
 pub fn apply(a: A, txn: anytype, group: u64, request: Request) !void {
     try request.validate();
     const ns: scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
-    const context: Context = .{ .a = a, .actor = request.actor, .database = request.database, .standalone = request.standalone, .maintenance = request.operation == .close_step or request.operation == .release or request.operation == .fence };
+    const context: Context = .{ .a = a, .actor = request.actor, .database = request.database, .standalone = request.standalone, .maintenance = request.operation == .close_step or request.operation == .release or request.operation == .release_unadmitted or request.operation == .fence, .unadmitted = if (request.operation == .release_unadmitted) request.operation.release_unadmitted else null };
     switch (request.operation) {
         .register => |value| try scopes.register(a, txn, ns, value, context),
         .begin => |command| _ = try scopes.begin(a, txn, ns, request.backend, command, context),
         .finish => |command| try scopes.finish(a, txn, ns, request.backend, command, context),
         .bind => |value| try scopes.bindTransaction(a, txn, ns, request.backend, value.command, value.transaction, context),
         .release => |value| _ = try scopes.releaseTransaction(a, txn, ns, request.backend, value, context),
+        .release_unadmitted => |original| _ = try scopes.releaseTransaction(a, txn, ns, request.backend, .{ .id = original.operation.admit.identity.txn_id }, context),
         .renew => |value| try scopes.renew(a, txn, ns, request.backend, value.expected_expiry, value.expires_at_ms, context),
         .fence => |reason| try scopes.fence(a, txn, ns, request.backend, reason, context),
         .effect => |value| _ = try scopes.applyEffect(a, txn, ns, request.backend, value.command, value.effect, context),
