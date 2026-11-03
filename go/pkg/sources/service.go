@@ -205,10 +205,10 @@ func (s *Service) Close() error {
 	}
 	done := s.done
 	s.mu.Unlock()
+	s.stop()
 	if done != nil {
 		<-done
 	}
-	s.stop()
 	s.closeClients()
 	return s.lock.Unlock()
 }

@@ -170,6 +170,22 @@ func (s *Service) serveMediaStream(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	stopServiceCancel := context.AfterFunc(s.ctx, cancel)
 	defer stopServiceCancel()
+	// Context cancellation alone cannot interrupt a blocked socket write.
+	controller := http.NewResponseController(w)
+	deadline, _ := ctx.Deadline()
+	_ = controller.SetWriteDeadline(deadline)
+	writeStopped := make(chan struct{})
+	stopWrite := context.AfterFunc(ctx, func() {
+		_ = controller.SetWriteDeadline(time.Now())
+		close(writeStopped)
+	})
+	defer func() {
+		if !stopWrite() {
+			<-writeStopped
+		}
+		_ = controller.SetWriteDeadline(time.Time{})
+	}()
+
 	pin, err := s.readMediaPin(id)
 	if err != nil {
 		serviceError(w, 410, "media_revoked")

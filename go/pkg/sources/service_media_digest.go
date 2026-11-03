@@ -190,6 +190,10 @@ func (s *Service) pruneMediaDigests(keep map[string]bool) error {
 		}
 		digests[pin.ContentIdentity+".json"] = true
 	}
+	return s.pruneUnreferencedMediaDigests(digests)
+}
+
+func (s *Service) pruneUnreferencedMediaDigests(digests map[string]bool) error {
 	directory := filepath.Join(s.directory, "media-digests")
 	dir, err := os.Open(directory)
 	if errors.Is(err, os.ErrNotExist) {
@@ -214,7 +218,7 @@ func (s *Service) pruneMediaDigests(keep map[string]bool) error {
 			}
 		}
 		if err == io.EOF {
-			return nil
+			return dir.Sync()
 		}
 	}
 }

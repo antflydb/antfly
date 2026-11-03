@@ -457,6 +457,13 @@ func (c *GoogleConnector) ValidateCachedSnapshot(ctx context.Context, r Request,
 	return c.get(ctx, pinned, "/files/"+url.PathEscape(config.FolderID)+"?fields=id&supportsAllDrives=true", &response)
 }
 func (c *GoogleConnector) OpenSource(ctx context.Context, r Request, o Item) (io.ReadCloser, error) {
+	// Originals have exact lengths and can stream directly into a caller's
+	// durable staging store. Native Workspace exports retain the bounded reader
+	// because their enumerated size is only an upper bound.
+	upper, _ := o.Metadata["size_is_upper_bound"].(bool)
+	if o.Size > 0 && !upper && configString(o.Metadata, "export_mime_type") == "" {
+		return c.OpenMedia(ctx, r, o, MediaRange{Length: o.Size})
+	}
 	client, err := c.client(ctx, r)
 	if err != nil {
 		return nil, err

@@ -19,8 +19,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // A purge intent is written before removing the profile entry. Replaying it is
@@ -102,18 +104,28 @@ func (s *Service) purgeSourcesLocked(ctx context.Context, profile Profile) error
 		}
 	}
 	publisher := &Publisher{Endpoint: profile.Endpoint, Token: token}
-	for len(queue.Sources) > 0 {
-		source := queue.Sources[0]
-		err := s.purgeSource(ctx, publisher, profile, source)
-		if err != nil {
-			return &sourceSyncError{sourceID: source.ID, phase: "purge", cause: err}
+	completed := 0
+	removed := map[string]bool{}
+	var purgeErr error
+	for _, source := range queue.Sources {
+		if err := s.purgeSource(ctx, publisher, profile, source); err != nil {
+			purgeErr = &sourceSyncError{sourceID: source.ID, phase: "purge", cause: err}
+			break
 		}
-		queue.Sources = queue.Sources[1:]
+		removed[source.ID] = true
+		completed++
+	}
+	if completed != 0 {
+		// One bounded directory walk for the entire batch, even for large queues.
+		if err := s.purgeMediaFiles(ctx, removed); err != nil {
+			return err
+		}
+		queue.Sources = queue.Sources[completed:]
 		if err := writeJSON(s.purgePath(), queue, 1<<20); err != nil {
 			return err
 		}
 	}
-	return nil
+	return purgeErr
 }
 
 // Validate durable identity before issuing any destructive database operation.
@@ -194,4 +206,53 @@ func purgeTableExists(ctx context.Context, publisher *Publisher, table string) (
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// Retain all other sources' published and pending descriptors. Digest receipts
+// are shared across sources and may only be retired after the last pin is gone.
+// The durable purge intent remains until both directories have been synced.
+func (s *Service) purgeMediaFiles(ctx context.Context, sourceIDs map[string]bool) error {
+	directory := filepath.Join(s.directory, "media")
+	dir, err := os.Open(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return s.pruneUnreferencedMediaDigests(nil)
+	}
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	digests := map[string]bool{}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		entries, readErr := dir.ReadDir(128)
+		if readErr != nil && readErr != io.EOF {
+			return readErr
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasSuffix(name, ".json") || !validContentSHA(strings.TrimSuffix(name, ".json")) {
+				continue
+			}
+			pin, err := s.readMediaPin(strings.TrimSuffix(name, ".json"))
+			if err != nil {
+				return err
+			}
+			if sourceIDs[pin.SourceID] {
+				if err := os.Remove(filepath.Join(directory, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+			} else {
+				digests[pin.ContentIdentity+".json"] = true
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+	}
+	if err := dir.Sync(); err != nil {
+		return err
+	}
+	return s.pruneUnreferencedMediaDigests(digests)
 }

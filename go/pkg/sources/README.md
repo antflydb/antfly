@@ -535,20 +535,32 @@ the object (S3 uses a one-byte authorization probe). S3 and GCS keep one provide
 response open per contiguous requested range while buffering at most 1 MiB.
 Drive fetches bounded windows and passes before/after revision checks before
 releasing bytes. There are four active requests and a two-minute request deadline.
+Socket write deadlines also release slots when clients stop reading. When embedding
+the handler, response-writer middleware must expose `Unwrap() http.ResponseWriter`
+for `http.ResponseController` to reach the server connection.
 Google streaming responses use this operation deadline rather than the metadata
 client's 60-second timeout; initial hash verification allows 30 minutes.
+The reusable Google `OpenSource` reader also streams original files directly into
+application-owned staging. Callers must check both copy and close errors before
+accepting staged bytes; native Workspace exports retain bounded acquisition.
 A later provider failure truncates an already started response; clients must
 require the advertised complete length. Saturation returns `503` and
 `Retry-After`.
 
 Provider clients and refreshed token sources are pooled per credential generation
-with a 64-entry bound; rotation/revocation retires idle transports. Generations
+with a 64-entry bound and at most 64 concurrent constructions; rotation/revocation
+retires idle transports. Each caller can cancel its wait without cancelling a
+shared token source. Shutdown cancels construction before joining workers. Custom
+`http.DefaultTransport` wrappers are supported. Generations
 track only the secrets referenced by a connection, so unrelated source,
 connection, or secret changes do not revoke valid in-flight reads. Membership
 checks use signed sorted compact inventories and a bounded 32 MiB LRU, without
 reading acquisition journals on each request. Pending inventories are reconciled
 once after restart. Signed descriptors survive restart and are pruned after
-successful full syncs. Failed runs keep pending/published generations for recovery.
+successful full syncs. Explicit purges remove descriptors and unreferenced digest
+receipts before committing deletion completion, including purge-only jobs. Receipts
+shared with other sources survive. Failed runs keep pending/published generations
+for recovery.
 
 Media publication computes `metadata.sha256` from verified original bytes.
 Signed receipts bind that digest to provider URI, version, endpoint and exact

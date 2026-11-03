@@ -42,6 +42,7 @@ type providerClientBuild struct {
 }
 type providerClients struct {
 	mu       sync.Mutex
+	builders sync.WaitGroup
 	epoch    atomic.Uint64
 	tick     uint64
 	entries  map[string]providerClientEntry
@@ -95,50 +96,71 @@ func (s *Service) providerConnector(ctx context.Context, connection Connection) 
 	if pool.building == nil {
 		pool.building = map[string]*providerClientBuild{}
 	}
+	if len(pool.building) >= 64 {
+		pool.mu.Unlock()
+		return nil, fmt.Errorf("provider client construction capacity exceeded")
+	}
+	pool.builders.Add(1)
 	build := &providerClientBuild{done: make(chan struct{})}
 	pool.building[key] = build
 	pool.mu.Unlock()
-	// Token sources retain a service-lifetime context, not the context of the first
-	// request. Refresh itself has a bounded HTTP client; data operations use their
-	// own cancellable deadline. In particular, cancelling one request cannot poison
-	// every later request using the same refreshed Google credential.
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DisableCompression = true
-	credentialContext := context.WithValue(s.ctx, oauth2.HTTPClient, &http.Client{Transport: transport, Timeout: 30 * time.Second})
-	connector, err := s.factory(credentialContext, connection)
-	pool.mu.Lock()
-	delete(pool.building, key)
-	if err == nil && (pool.closed || generation != s.clientGenerationLocked(connection)) {
-		err = fmt.Errorf("%w: connection generation changed", ErrInvalidInput)
-	}
-	var retired Connector
-	if err == nil {
-		if pool.entries == nil {
-			pool.entries = map[string]providerClientEntry{}
+	// Construction is shared, but each caller can stop waiting independently.
+	// OAuth refresh retains the service context rather than a request context.
+	transport := http.DefaultTransport
+	factory := s.factory
+	go func() {
+		defer pool.builders.Done()
+		// Token sources retain a service-lifetime context, not the context of the first
+		// request. Refresh itself has a bounded HTTP client; data operations use their
+		// own cancellable deadline. In particular, cancelling one request cannot poison
+		// every later request using the same refreshed Google credential.
+		if base, ok := transport.(*http.Transport); ok {
+			clone := base.Clone()
+			clone.DisableCompression = true
+			transport = clone
 		}
-		if len(pool.entries) >= 64 {
-			var oldest string
-			var age uint64 = ^uint64(0)
-			for id, entry := range pool.entries {
-				if entry.used < age {
-					oldest, age = id, entry.used
-				}
+		credentialContext := context.WithValue(s.ctx, oauth2.HTTPClient, &http.Client{Transport: transport, Timeout: 30 * time.Second})
+		connector, err := factory(credentialContext, connection)
+		pool.mu.Lock()
+		delete(pool.building, key)
+		if err == nil && (pool.closed || generation != s.clientGenerationLocked(connection)) {
+			err = fmt.Errorf("%w: connection generation changed", ErrInvalidInput)
+		}
+		var retired Connector
+		if err == nil {
+			if pool.entries == nil {
+				pool.entries = map[string]providerClientEntry{}
 			}
-			retired = pool.entries[oldest].connector
-			delete(pool.entries, oldest)
+			if len(pool.entries) >= 64 {
+				var oldest string
+				var age uint64 = ^uint64(0)
+				for id, entry := range pool.entries {
+					if entry.used < age {
+						oldest, age = id, entry.used
+					}
+				}
+				retired = pool.entries[oldest].connector
+				delete(pool.entries, oldest)
+			}
+			pool.tick++
+			pool.entries[key] = providerClientEntry{connector: connector, connection: connection, used: pool.tick}
+			build.connector = connector
+		} else if connector != nil {
+			retired = connector
 		}
-		pool.tick++
-		pool.entries[key] = providerClientEntry{connector: connector, connection: connection, used: pool.tick}
-		build.connector = connector
-	} else if connector != nil {
-		retired = connector
+		build.err = err
+		close(build.done)
+		pool.mu.Unlock()
+		closeProviderClient(retired)
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-build.done:
+		return build.connector, build.err
 	}
-	build.err = err
-	close(build.done)
-	pool.mu.Unlock()
-	closeProviderClient(retired)
-	return build.connector, build.err
 }
+
 func (s *Service) invalidateClients() {
 	pool := &s.clients
 	pool.mu.Lock()
@@ -155,6 +177,7 @@ func (s *Service) closeClients() {
 	s.clients.closed = true
 	s.clients.mu.Unlock()
 	s.invalidateClients()
+	s.clients.builders.Wait()
 }
 
 func closeGoogleTransport(client *http.Client) {
