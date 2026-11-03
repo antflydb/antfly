@@ -18534,7 +18534,8 @@ churn. The physical adapter's certifier asserts no preparation-owned leases are
 live at the wait boundary. The broad mounted schema campaign now follows the
 exact validation token through all ready/installed/released barriers and uses
 the status's final active version, rather than treating a pending receipt's
-target version as publication completion. Final qualification is pending.
+target version as publication completion. The native owner and mounted schema
+campaigns below qualify this boundary.
 
 Schema-validation and retirement submissions report first possible effects at
 the existing native observed-proposal boundary. Metadata HTTP no longer marks
@@ -18545,3 +18546,26 @@ is replayed. Service tests check the witness before preflight and after proposal
 the authenticated binary endpoint checks both response headers. This also
 allows the existing public test client to wait for catalog readiness using its
 strict no-receipt, definite-nonadmission predicate.
+
+
+Catalog-only owner reconfiguration closes new admission and drains existing
+leases before retiring the runtime. It does not revoke the physical root while
+admitted readers still need to attest their immutable cut. Generation, namespace,
+restore/bootstrap binding changes and explicit physical retirement retain
+immediate revocation. Ordinary release and deferred Raft apply release both
+finish the catalog drain; periodic inspection does not initiate one.
+
+Durable-only reads omit prospective schema and first-open range hints. They
+borrow a configured owner without a reopen. Physical schema installation still
+requires a replay owner with deferred public serving. Session upgrades drain
+their read lease and recheck the same generation and physical root before
+preparing the installation. Read observations and progress-only controls avoid
+that reopen while preserving the install/publication fence.
+
+Debug qualification passes the descriptor-drain and strict-bootstrap contracts,
+native current/replay reuse and install-serving fence, physical-root replacement,
+all six schema ACK crash/restart campaigns, and the broad schema lifecycle
+campaign's 23 scenarios. The native reuse contract checks that read-only control
+adds no database open and installation takes one guarded reopen. All selected
+gates report zero skipped tests and zero leaks. Generation and formatting pass.
+These checks strengthen existing case evidence; no inventory dispositions change.

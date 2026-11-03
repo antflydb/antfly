@@ -547,6 +547,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         /// must stop entering so the existing leases can drain.
         exclusive_pending: bool = false,
         exclusive_active: bool = false,
+        /// A catalog-only reopen closes new admission while admitted readers
+        /// finish on the still-current physical root. Physical retirement must
+        /// not invalidate their observations before this drain completes.
+        catalog_drain_pending: bool = false,
         retired: bool = false,
         closing: bool = false,
         bulk_ingest_active: std.atomic.Value(bool) = .init(false),
@@ -2764,7 +2768,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             entry.exclusive_active = false;
         }
         entry.active_users -= 1;
-        if (entry.active_users == 0 and entry.transient_retirement_pending and !entry.resident)
+        if (entry.active_users == 0 and (entry.catalog_drain_pending or
+            (entry.transient_retirement_pending and !entry.resident)))
             entry.retired = true;
         if (!entry.retired or entry.active_users != 0) return;
         for (self.entries.items, 0..) |candidate, index| {
@@ -2780,7 +2785,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             const released = entry.pending_apply_releases.swap(0, .acq_rel);
             std.debug.assert(released <= entry.active_users);
             entry.active_users -= released;
-            if (entry.active_users == 0 and entry.transient_retirement_pending and !entry.resident)
+            if (entry.active_users == 0 and (entry.catalog_drain_pending or
+                (entry.transient_retirement_pending and !entry.resident)))
                 entry.retired = true;
         }
     }
@@ -2799,13 +2805,13 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         var count: usize = 0;
         for (self.entries.items) |entry| {
-            if (entry.retired or entry.transient_retirement_pending or entry.exclusive_pending or entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
+            if (entry.retired or entry.catalog_drain_pending or entry.transient_retirement_pending or entry.exclusive_pending or entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
             count += 1;
         }
         const leases = try self.alloc.alloc(Lease, count);
         var initialized: usize = 0;
         for (self.entries.items) |entry| {
-            if (entry.retired or entry.transient_retirement_pending or entry.exclusive_pending or entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
+            if (entry.retired or entry.catalog_drain_pending or entry.transient_retirement_pending or entry.exclusive_pending or entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
             entry.active_users += 1;
             leases[initialized] = .{ .source = self, .entry = entry };
             initialized += 1;
@@ -2848,7 +2854,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         while (cursor.* < limit and cursor.* < self.entries.items.len) {
             const entry = self.entries.items[cursor.*];
             cursor.* += 1;
-            if (entry.retired or entry.transient_retirement_pending or entry.exclusive_pending or
+            if (entry.retired or entry.catalog_drain_pending or entry.transient_retirement_pending or entry.exclusive_pending or
                 entry.exclusive_active or (skip_bulk_ingest and entry.bulk_ingest_active.load(.acquire))) continue;
             entry.active_users += 1;
             return .{ .source = self, .entry = entry };
@@ -2872,7 +2878,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or entry.generation != generation or
                 !std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.retired or entry.transient_retirement_pending or entry.exclusive_pending or
+            if (entry.retired or entry.catalog_drain_pending or entry.transient_retirement_pending or entry.exclusive_pending or
                 entry.exclusive_active or entry.bulk_ingest_active.load(.acquire)) return null;
             entry.active_users += 1;
             return .{ .source = self, .entry = entry };
@@ -3182,6 +3188,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         cancellation: ?db_types.CancellationToken = null,
         historical_raft_apply: bool = false,
         durable_catalog: bool = false,
+        /// Schema installation retains its deferred serving fence. Reads and
+        /// progress-only controls may borrow a configured current owner.
+        require_historical_owner: bool = false,
         allow_deferred_catalog: bool = false,
 
         fn from(req: anytype) ReadControls {
@@ -3826,6 +3835,17 @@ pub const ProvisionedKernelOwnerSource = struct {
         namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace,
         context: request_operation.RequestContext,
     ) !Lease {
+        return self.acquireSchemaBoundOwnerMode(group_id, table_name, namespace, false, context);
+    }
+
+    fn acquireSchemaBoundOwnerMode(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace,
+        require_historical_owner: bool,
+        context: request_operation.RequestContext,
+    ) !Lease {
         if (self.online_source_authority != .raft) return self.acquireBoundOwner(group_id, table_name, namespace, context);
         try context.ensureActive();
         const normalized = try platformDeadlineContext(context);
@@ -3833,6 +3853,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .allow_deferred_catalog = true,
             .historical_raft_apply = true,
             .durable_catalog = true,
+            .require_historical_owner = require_historical_owner,
             .execution_deadline_ns = normalized.deadline_ns,
             .cancellation = normalized.cancellation,
         }) catch |err| switch (err) {
@@ -4206,13 +4227,17 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
 
         pub fn reacquireAfterApply(self: *@This()) !void {
+            return self.reacquireOwner(false);
+        }
+
+        fn reacquireOwner(self: *@This(), require_historical_owner: bool) !void {
             std.debug.assert(!self.lease.active);
             // Admission/cancellation may still bound the owner open. Once a
             // committed effect is found, recoverCommitted reads it independently
             // of the initiating request's cancellation, on this exact lease.
             const source = self.lease.source;
             try self.context.ensureActive();
-            var next = try source.acquireSchemaBoundOwner(self.binding.fence.owner_group_id, self.table_name, self.binding.fence.namespace, self.context);
+            var next = try source.acquireSchemaBoundOwnerMode(self.binding.fence.owner_group_id, self.table_name, self.binding.fence.namespace, require_historical_owner, self.context);
             errdefer next.deinit();
             // Qualify physical identity BEFORE interpreting its domain/job.
             // A replacement may not yet carry this job or source authority;
@@ -4265,6 +4290,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             try self.context.ensureActive();
             const command = try @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Command.decodeRaft(bytes);
             if (!std.meta.eql(command.binding, self.binding)) return error.SchemaValidationJobChanged;
+            if (command.action == .install) try self.requireSchemaInstallOwner();
             const normalized = try platformDeadlineContext(self.context);
             var cancellation = normalized.cancellation;
             var lease = self.lease.cloneRead();
@@ -4279,6 +4305,16 @@ pub const ProvisionedKernelOwnerSource = struct {
                 try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(prepared.root_generation) != self.initial.root_generation)
                 return error.SchemaValidationRuntimeRecoveryRequired;
             return .{ .lease = lease, .prepared = prepared, .table_name = lease.entry.table_name, .binding = self.binding, .root_generation = self.initial.root_generation, .physical_root_incarnation = self.initial.observation.physical_root_incarnation };
+        }
+
+        /// Reads and progress-only controls may share a configured owner.
+        /// Installing a new physical schema requires the replay owner whose
+        /// public catalog stays deferred until post-publication reconciliation.
+        fn requireSchemaInstallOwner(self: *@This()) !void {
+            if (!self.lease.active) return error.SchemaValidationRuntimeRecoveryRequired;
+            if (self.lease.entry.opened_for_historical_apply) return;
+            self.lease.deinit();
+            try self.reacquireOwner(true);
         }
 
         fn observeWithContext(self: *@This(), context: request_operation.RequestContext) !SchemaAttestation.RootedRaftObservation {
@@ -4557,6 +4593,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var lease = try self.acquireDescriptorOnce(key.group, decoded.table(), path, descriptor, .shared, .resident, .{
             .historical_raft_apply = true,
             .durable_catalog = true,
+            .require_historical_owner = decoded.command.action == .install,
             .cancellation = context.cancellation,
         });
         errdefer lease.deinit();
@@ -5690,7 +5727,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn tryReserveEntryLeaseLocked(entry: *Entry, admission: LeaseAdmission) bool {
         const exclusive = admission != .shared;
-        if (entry.exclusive_active or (admission != .exclusive and entry.exclusive_pending)) return false;
+        if (entry.catalog_drain_pending or entry.exclusive_active or (admission != .exclusive and entry.exclusive_pending)) return false;
         if (exclusive and entry.active_users != 0) {
             if (admission == .exclusive) entry.exclusive_pending = true;
             return false;
@@ -5847,15 +5884,16 @@ pub const ProvisionedKernelOwnerSource = struct {
             }
             if (entry.catalog_deferred and !entry.opened_for_historical_apply and !controls.allow_deferred_catalog and !controls.historical_raft_apply)
                 return error.StorageReadTemporarilyUnavailable;
+            const control_binding_changed = !std.mem.eql(u8, entry.restore_bootstrap_json, descriptor.restore_bootstrap_json) or
+                !std.mem.eql(u8, entry.initial_child_bootstrap_json, descriptor.initial_child_bootstrap_json) or
+                entry.restore_cancel_recovery != descriptor.restore_cancel_recovery or
+                entry.restore_ha_replay != descriptor.restore_ha_replay;
             if ((!controls.historical_raft_apply and entry.opened_for_historical_apply) or
+                (controls.require_historical_owner and !entry.opened_for_historical_apply) or
                 (!controls.durable_catalog and (!std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
                     !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
-                    !std.meta.eql(entry.table_storage, descriptor.table_storage))) or
-                !std.mem.eql(u8, entry.restore_bootstrap_json, descriptor.restore_bootstrap_json) or
-                !std.mem.eql(u8, entry.initial_child_bootstrap_json, descriptor.initial_child_bootstrap_json) or
-                !descriptor_contract.initialRangesEqual(entry.initial_range, descriptor.initial_range) or
-                entry.restore_cancel_recovery != descriptor.restore_cancel_recovery or
-                entry.restore_ha_replay != descriptor.restore_ha_replay)
+                    !std.meta.eql(entry.table_storage, descriptor.table_storage) or
+                    !descriptor_contract.initialRangesEqual(entry.initial_range, descriptor.initial_range))) or control_binding_changed)
             {
                 // Catalog definition changes do not necessarily publish a new
                 // physical root generation. An API lease is not the only DB
@@ -5865,13 +5903,15 @@ pub const ProvisionedKernelOwnerSource = struct {
                 // reopen with the new exact descriptor. Live configure here
                 // would race the old descriptor's DB-owned maintenance.
                 if (entry.active_users != 0) {
-                    // An admitted descriptor change must close admission before
-                    // waiting, or overlapping readers can starve its drain.
-                    // Periodic inspection yields without retiring readers.
-                    // Historical Raft apply may need the old schema after the
-                    // current owner's leases drain.
+                    // Close admission without revoking the current physical
+                    // root: admitted readers may still need to sign their cut.
+                    // Retire at the last release, then reopen from a fresh
+                    // descriptor. Periodic inspection never starts this drain.
                     if (admission != .exclusive_if_idle and
-                        (controls.historical_raft_apply or !schemaVersionRegresses(entry.schema_json, descriptor.schema_json))) entry.retired = true;
+                        (controls.historical_raft_apply or !schemaVersionRegresses(entry.schema_json, descriptor.schema_json)))
+                    {
+                        if (control_binding_changed) entry.retired = true else entry.catalog_drain_pending = true;
+                    }
                     return error.StorageKernelOwnerTransitionRequired;
                 }
                 entry.retired = true;
@@ -8879,6 +8919,7 @@ test "current catalog acquisition replaces a replay-only owner with the same des
     const descriptor: descriptor_contract.Descriptor = .{
         .lsm_root_generation = table_reads.backend_current_root_generation,
         .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .initial_range = .{ .start = "", .end = "" },
         .schema_json = "{\"version\":0}",
         .indexes_json =
         \\{"search":{"type":"full_text","artifact_name":"chunks","enrichments":[{"name":"assets","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},{"name":"chunks","kind":"chunk","source_artifact_name":"assets","field":"text","chunk_size":128}]}}
@@ -8918,13 +8959,50 @@ test "current catalog acquisition replaces a replay-only owner with the same des
             if (platform_time.monotonicNs() >= deadline) return error.TestEnrichmentRuntimeNotStarted;
             try std.testing.io.sleep(.fromMilliseconds(1), .awake);
         }
+        // The current catalog requests a reopen while a real replay reader
+        // is pinned. Close new admission without revoking its physical cut.
+        try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", path, descriptor, .shared, .resident, .{}));
+        try std.testing.expect(replay.entry.catalog_drain_pending and !replay.entry.retired);
+        var admitted = try replay.owner().lookupJson("docs", "{\"key\":\"doc:second\"}");
+        defer admitted.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, admitted.bytes(), "second") != null);
     }
+    // The ordinary last-reader release drains and closes the replay runtime.
     var current = try source.acquireDescriptor(1, "docs", path, descriptor);
     defer current.deinit();
     try std.testing.expectEqual(@as(u64, 2), source.cacheStats().miss_count);
     var second = try current.owner().lookupJson("docs", "{\"key\":\"doc:second\"}");
     defer second.deinit();
     try std.testing.expect(std.mem.indexOf(u8, second.bytes(), "second") != null);
+    // Durable control reads omit prospective schema/range hints. Borrow the
+    // configured physical owner instead of revoking it or reopening its DB.
+    var durable_descriptor = descriptor;
+    durable_descriptor.schema_json = "";
+    durable_descriptor.indexes_json = "";
+    durable_descriptor.initial_range = null;
+    var durable = try source.acquireDescriptorOnce(1, "docs", path, durable_descriptor, .shared, .resident, .{
+        .historical_raft_apply = true,
+        .durable_catalog = true,
+        .allow_deferred_catalog = true,
+    });
+    defer durable.deinit();
+    try std.testing.expect(durable.entry == current.entry);
+    try std.testing.expect(!current.entry.retired and !current.entry.catalog_drain_pending);
+    try std.testing.expectEqual(@as(u64, 2), source.cacheStats().miss_count);
+    const apply_controls: ProvisionedKernelOwnerSource.ReadControls = .{
+        .historical_raft_apply = true,
+        .durable_catalog = true,
+        .require_historical_owner = true,
+        .allow_deferred_catalog = true,
+    };
+    try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", path, durable_descriptor, .shared, .resident, apply_controls));
+    try std.testing.expect(current.entry.catalog_drain_pending and !current.entry.retired);
+    durable.deinit();
+    current.deinit();
+    var applying = try source.acquireDescriptorWithMode(1, "docs", path, durable_descriptor, false, .resident, apply_controls);
+    defer applying.deinit();
+    try std.testing.expect(applying.entry.opened_for_historical_apply and applying.entry.catalog_deferred);
+    try std.testing.expectEqual(@as(u64, 3), source.cacheStats().miss_count);
 }
 
 test "pending exclusive storage owner lease blocks new readers until drain" {
@@ -9095,7 +9173,10 @@ test "owner descriptor changes close admission before draining existing readers"
         try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, .{}));
         // Scheduled inspection yields without interrupting foreground work.
         // An admitted change must prevent observers from extending the drain.
-        try std.testing.expectEqual(admission != .exclusive_if_idle, entry.retired);
+        try std.testing.expectEqual(admission != .exclusive_if_idle, entry.catalog_drain_pending);
+        // An admitted reader's physical-root observation remains truthful
+        // until its lease ends; descriptor drain is not root revocation.
+        try std.testing.expect(!entry.retired and !entry.closing);
         if (admission != .exclusive_if_idle) {
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowEntryLocked(&entry));
             var old_descriptor = descriptor;
@@ -9103,6 +9184,21 @@ test "owner descriptor changes close admission before draining existing readers"
             try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", old_descriptor, .shared, .resident, .{}));
         }
         try std.testing.expectEqual(@as(usize, 1), entry.active_users);
+        entry.pending_apply_releases.store(1, .release);
+        source.reconcileApplyReleasesLocked();
+        try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+        try std.testing.expectEqual(admission != .exclusive_if_idle, entry.retired);
+        // Private bootstrap authority changes still revoke immediately. This
+        // is distinct from a catalog-only reopen on the same physical root.
+        entry.active_users = 1;
+        entry.retired = false;
+        entry.catalog_drain_pending = false;
+        var bootstrap_descriptor = descriptor;
+        bootstrap_descriptor.schema_json = entry.schema_json;
+        bootstrap_descriptor.restore_bootstrap_json = "changed private bootstrap";
+        try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", bootstrap_descriptor, admission, .resident, .{}));
+        try std.testing.expectEqual(admission != .exclusive_if_idle, entry.retired);
+        try std.testing.expect(!entry.catalog_drain_pending);
     }
 }
 
@@ -9252,7 +9348,7 @@ test "owner descriptor changes do not retire a live owner for an older schema ve
         // A newer schema still closes admission so the drain can complete.
         descriptor.schema_json = "{\"version\":8,\"default_type\":\"_default\"}";
         try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, .{}));
-        try std.testing.expect(entry.retired);
+        try std.testing.expect(entry.catalog_drain_pending and !entry.retired);
         try std.testing.expectEqual(@as(usize, 1), entry.active_users);
     }
 
