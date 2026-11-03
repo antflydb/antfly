@@ -1075,6 +1075,15 @@ pub fn build(b: *std.Build) void {
     embeddinggemma2_bench.root_module.link_libc = true;
     const install_embeddinggemma2_bench = b.addInstallArtifact(embeddinggemma2_bench, .{});
     b.step("build-embeddinggemma2-bench", "Build the prepared-text encoder benchmark without running it").dependOn(&install_embeddinggemma2_bench.step);
+    const query_bench = b.addExecutable(.{
+        .name = "antfly-embeddinggemma2-query-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/embeddinggemma2_query.zig"), .target = target, .optimize = optimize }),
+    });
+    query_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    query_bench.root_module.addImport("build_options", build_options_mod);
+    runtime_graph.identities.addImports(query_bench.root_module);
+    query_bench.root_module.link_libc = true;
+    b.step("build-embeddinggemma2-query-bench", "Build the managed CPU/CUDA text query benchmark").dependOn(&b.addInstallArtifact(query_bench, .{}).step);
     const live_bench = b.addExecutable(.{ .name = "antfly-embeddinggemma2-live", .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/embeddinggemma2_live.zig"), .target = target, .optimize = optimize }) });
     live_bench.root_module.addImport("build_options", build_options_mod);
     live_bench.root_module.addImport("inference_internal", inference_internal_mod);

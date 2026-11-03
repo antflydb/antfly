@@ -22,7 +22,7 @@ const pipeline = internal.pipelines.embedding_gemma2;
 const Bounded = internal.runtime.bounded_allocator.BoundedAllocator;
 const Memory = if (@import("build_options").enable_metal) internal.metal_runtime.RawRuntimeMemoryStats else struct {};
 const Sample = struct { seconds: f64, host_peak_bytes: usize, device_peak_bytes: u64, download_bytes: u64, device_readbacks: u64, gpu_frame_ns: u128, frame_submits: u64, frame_wait_ns: u128, media: pipeline.MediaTimings, memory: Memory };
-const Report = struct { max_projector_batch: ?usize, image: []const u8, batch: usize, scope: []const u8, projected_tokens: usize, samples: []Sample, p50_seconds: f64, p95_seconds: f64, images_per_second: f64, output: []f32 };
+const Report = struct { max_projector_batch: ?usize, image: []const u8, batch: usize, scope: []const u8, encoded_bytes: usize, sha256: []const u8, projected_tokens: usize, warmup_samples: []Sample, samples: []Sample, p50_seconds: f64, p95_seconds: f64, images_per_second: f64, output: []f32 };
 fn now() !u64 {
     var ts: std.posix.timespec = undefined;
     if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return error.ClockFailed;
@@ -64,25 +64,31 @@ pub fn main(init: std.process.Init) !void {
     if (!std.mem.eql(u8, scope, "projector") and !std.mem.eql(u8, scope, "image") and !std.mem.eql(u8, scope, "embedding") and !std.mem.eql(u8, scope, "encoded-embedding")) return error.InvalidScope;
     const embedding_scope = std.mem.eql(u8, scope, "embedding") or std.mem.eql(u8, scope, "encoded-embedding");
     const metal = std.mem.eql(u8, backend, "metal");
-    if (!metal and !std.mem.eql(u8, backend, "native")) return error.InvalidBackend;
+    const cuda = std.mem.eql(u8, backend, "cuda");
+    if (!metal and !cuda and !std.mem.eql(u8, backend, "native")) return error.InvalidBackend;
     const load_started = try now();
-    const session = if (metal) try factory.createMetalSession(a, model orelse return error.MissingModel) else try factory.createNativeSession(a, model orelse return error.MissingModel);
+    const session = if (metal) try factory.createMetalSession(a, model orelse return error.MissingModel) else if (cuda) try factory.createCudaSession(a, model orelse return error.MissingModel) else try factory.createNativeSession(a, model orelse return error.MissingModel);
     defer session.close();
-    if (!metal) factory.attachIo(session, init.io);
+    factory.attachIo(session, init.io);
     const load_seconds = @as(f64, @floatFromInt(try now() - load_started)) / std.time.ns_per_s;
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.WrongArchitecture;
     if (!cfg.vision) return error.NoVisionSession;
+    const tokenizer_started = try now();
     const tokenizer_path = try std.fs.path.join(out, &.{ model.?, "tokenizer.json" });
     const tokenizer_bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, tokenizer_path, out, .limited(64 * 1024 * 1024));
     const tokenizer_impl = try internal.hf_tokenizer.HfTokenizer.loadFromBytes(a, tokenizer_bytes);
     const tokenizer = tokenizer_impl.tokenizer();
     defer tokenizer.deinitTokenizer();
+    const tokenizer_load_seconds = @as(f64, @floatFromInt(try now() - tokenizer_started)) / std.time.ns_per_s;
     var reports = std.ArrayList(Report).empty;
     for (paths.items) |path| {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, out, .limited(64 * 1024 * 1024));
         const prepared = try projector.prepareEmbeddingGemma2Image(a, bytes);
         defer prepared.deinit();
-        const samples = try out.alloc(Sample, iterations);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        const all_samples = try out.alloc(Sample, warmups + iterations);
+        const samples = all_samples[warmups..];
         var saved: []f32 = &.{};
         var executed_batch: usize = 1;
         for (0..warmups + iterations) |iteration| {
@@ -126,7 +132,7 @@ pub fn main(init: std.process.Init) !void {
                         defer for (result.vectors) |vector| workspace.free(vector);
                         for (result.vectors) |vector| try values.appendSlice(workspace, vector);
                     } else for (images[0..batch]) |encoded| {
-                        const result = try pipeline.embed(workspace, session, tokenizer, .{ .content = &.{.{ .image = encoded }} }, .{}, null, .{ .native_call_policy = .in_process });
+                        const result = try pipeline.embed(workspace, session, tokenizer, .{ .content = &.{.{ .image = encoded }} }, .{ .prepare_ahead = prepare_ahead, .timings = &media }, null, .{ .io = init.io, .native_call_policy = .in_process });
                         defer workspace.free(result.vector);
                         try values.appendSlice(workspace, result.vector);
                     }
@@ -151,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
                         defer for (result.vectors) |vector| workspace.free(vector);
                         for (result.vectors) |vector| try values.appendSlice(workspace, vector);
                     } else for (rasters[0..batch]) |raster| {
-                        const result = try pipeline.embed(workspace, session, tokenizer, .{ .content = &.{.{ .raster = raster }} }, .{}, null, .{ .native_call_policy = .in_process });
+                        const result = try pipeline.embed(workspace, session, tokenizer, .{ .content = &.{.{ .raster = raster }} }, .{ .prepare_ahead = prepare_ahead, .timings = &media }, null, .{ .io = init.io, .native_call_policy = .in_process });
                         defer workspace.free(result.vector);
                         try values.appendSlice(workspace, result.vector);
                     }
@@ -171,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
                         memory = internal.metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime);
                     }
                 }
-                if (iteration >= warmups) samples[iteration - warmups] = .{ .seconds = @as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s, .host_peak_bytes = bounded.peak, .device_peak_bytes = after.metal_tensor_device_owned_peak_live_bytes, .download_bytes = after.metal_tensor_host_mirror_download_bytes - before.metal_tensor_host_mirror_download_bytes, .device_readbacks = after.metal_tensor_to_host_device_calls - before.metal_tensor_to_host_device_calls, .gpu_frame_ns = if (cb == null) media.gpu_frame_ns else after.decoder_runtime_frame_gpu_nanos -| before.decoder_runtime_frame_gpu_nanos, .frame_submits = if (cb == null) media.frame_submits else after.decoder_runtime_frame_submits -| before.decoder_runtime_frame_submits, .frame_wait_ns = if (cb == null) media.frame_wait_ns else after.decoder_runtime_frame_wait_nanos -| before.decoder_runtime_frame_wait_nanos, .media = media, .memory = memory };
+                all_samples[iteration] = .{ .seconds = @as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s, .host_peak_bytes = bounded.peak, .device_peak_bytes = after.metal_tensor_device_owned_peak_live_bytes, .download_bytes = after.metal_tensor_host_mirror_download_bytes - before.metal_tensor_host_mirror_download_bytes, .device_readbacks = after.metal_tensor_to_host_device_calls - before.metal_tensor_to_host_device_calls, .gpu_frame_ns = if (cb == null) media.gpu_frame_ns else after.decoder_runtime_frame_gpu_nanos -| before.decoder_runtime_frame_gpu_nanos, .frame_submits = if (cb == null) media.frame_submits else after.decoder_runtime_frame_submits -| before.decoder_runtime_frame_submits, .frame_wait_ns = if (cb == null) media.frame_wait_ns else after.decoder_runtime_frame_wait_nanos -| before.decoder_runtime_frame_wait_nanos, .media = media, .memory = memory };
                 if (iteration + 1 == warmups + iterations) saved = try out.dupe(f32, values.items);
             }
             if (bounded.live != 0) return error.WorkspaceLeak;
@@ -184,8 +190,8 @@ pub fn main(init: std.process.Init) !void {
             sum += sample.seconds;
         }
         std.mem.sort(f64, sorted, {}, std.sort.asc(f64));
-        try reports.append(out, .{ .max_projector_batch = if (embedding_scope) null else executed_batch, .image = path, .batch = batch, .scope = scope, .projected_tokens = prepared.geometry.tokenCount(), .samples = samples, .p50_seconds = sorted[(iterations - 1) / 2], .p95_seconds = sorted[(iterations * 95 + 99) / 100 - 1], .images_per_second = @as(f64, @floatFromInt(batch * iterations)) / sum, .output = saved });
+        try reports.append(out, .{ .max_projector_batch = if (embedding_scope) null else executed_batch, .image = path, .batch = batch, .scope = scope, .encoded_bytes = bytes.len, .sha256 = try out.dupe(u8, &std.fmt.bytesToHex(digest, .lower)), .warmup_samples = all_samples[0..warmups], .projected_tokens = prepared.geometry.tokenCount(), .samples = samples, .p50_seconds = sorted[(iterations - 1) / 2], .p95_seconds = sorted[(iterations * 95 + 99) / 100 - 1], .images_per_second = @as(f64, @floatFromInt(batch * iterations)) / sum, .output = saved });
     }
-    const json = try std.json.Stringify.valueAlloc(out, .{ .version = 1, .model = model.?, .backend = backend, .load_seconds = load_seconds, .warmups = warmups, .execution = if (batching) "bounded same-shape batches" else "sequential", .transfer_and_workspace_counters_available = !embedding_scope, .synchronized_readback = true, .prepare_ahead = prepare_ahead, .cases = reports.items }, .{ .whitespace = .indent_2 });
+    const json = try std.json.Stringify.valueAlloc(out, .{ .version = 1, .model = model.?, .backend = backend, .load_seconds = load_seconds, .tokenizer_load_seconds = tokenizer_load_seconds, .warmups = warmups, .execution = if (batching) "bounded same-shape batches" else "sequential", .transfer_and_workspace_counters_available = !embedding_scope, .synchronized_readback = true, .stage_timing_scope = "host elapsed; GPU stages enqueue asynchronously and final readback waits for completion", .prepare_ahead = prepare_ahead, .cases = reports.items }, .{ .whitespace = .indent_2 });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output orelse return error.MissingOutput, .data = json });
 }

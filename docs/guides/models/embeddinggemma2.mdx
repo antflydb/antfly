@@ -62,6 +62,14 @@ antfly inference embed "$MODEL_DIR" --group \
   --text 'Reset a forgotten password.' --image reset.png
 ```
 
+## CPU query services
+
+Native F32 text-query serving is [qualified on the ARM GB10 reference host](../../design/inference/history/embeddinggemma2/2026-11-03-cpu-production-qualification.md).
+The report records concurrency, latency, memory and resource limits; use those
+measurements when sizing a separate CPU service. Select the `native` backend
+for CPU preloads and pin the CPU service's returned identity. The CPU and CUDA
+recipes have different identities, so a CUDA identity pin rejects CPU results.
+
 ## Pin the model in an index
 
 Each response includes a `model_identity` hash for the exact weights, processor,
