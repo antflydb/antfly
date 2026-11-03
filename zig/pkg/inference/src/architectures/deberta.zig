@@ -725,6 +725,7 @@ pub fn forwardFromHiddenRange(
 
     const shape = [_]i32{ @intCast(total), @intCast(H) };
     var hidden = try cb.fromFloat32Shape(hidden_in, &shape);
+    errdefer cb.free(hidden);
     const rel_emb = try buildRelativePositionEmbInfo(cb, allocator, config, seq_len);
     defer cb.free(rel_emb.embeddings);
     defer if (rel_emb.full_to_unique) |ids| allocator.free(ids);
@@ -893,9 +894,11 @@ fn buildRelativePositionEmbInfoWithLayout(
     }
 
     if (unique_count == num_rel) {
+        const gathered = try normalizedRelativeEmbeddingLookup(cb, allocator, rel_weight, ln_w, ln_b, bucket_ids, H, config.layer_norm_eps);
+        // Keep the error cleanup's ownership until the last fallible operation.
         allocator.free(full_to_unique);
         return .{
-            .embeddings = try normalizedRelativeEmbeddingLookup(cb, allocator, rel_weight, ln_w, ln_b, bucket_ids, H, config.layer_norm_eps),
+            .embeddings = gathered,
             .full_to_unique = null,
             .unique_count = num_rel,
             .full_count = num_rel,
@@ -1457,6 +1460,32 @@ test "DeBERTa native bucketed relative projections preserve values and clean up 
         }
     };
     try platform.allocator.checkAllAllocationFailures(a, Check.run, .{ &store, config });
+    const UniqueCheck = struct {
+        fn run(allocator: std.mem.Allocator, weights: *native.WeightStore, cfg: Config) !void {
+            var backend = native.NativeCompute.init(allocator, weights, null);
+            defer backend.deinit();
+            const cb = backend.computeBackend();
+            // Metal selects compact layout for short inputs too. Exercise its
+            // all-unique host cleanup using the native backend's fallible ops.
+            const relative = try buildRelativePositionEmbInfoWithLayout(&cb, allocator, cfg, 7, true);
+            defer cb.free(relative.embeddings);
+            try std.testing.expect(relative.full_to_unique == null);
+        }
+    };
+    try platform.allocator.checkAllAllocationFailures(a, UniqueCheck.run, .{ &store, config });
+    const HiddenRangeCheck = struct {
+        fn run(allocator: std.mem.Allocator, weights: *native.WeightStore, cfg: Config) !void {
+            var backend = native.NativeCompute.init(allocator, weights, null);
+            defer backend.deinit();
+            const cb = backend.computeBackend();
+            const hidden: [1200]f32 = @splat(0.5);
+            const mask: [300]i64 = @splat(1);
+            const states = try forwardFromHiddenRange(&cb, allocator, cfg, &hidden, &mask, 1, 300, 0, 1);
+            defer allocator.free(states);
+            for (states) |value| try std.testing.expect(std.math.isFinite(value));
+        }
+    };
+    try platform.allocator.checkAllAllocationFailures(a, HiddenRangeCheck.run, .{ &store, config });
     const EncoderCheck = struct {
         fn run(allocator: std.mem.Allocator, weights: *native.WeightStore, cfg: Config) !void {
             var backend = native.NativeCompute.init(allocator, weights, null);

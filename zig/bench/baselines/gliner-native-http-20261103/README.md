@@ -27,6 +27,16 @@ No overall throughput, tail-latency or four-client full-word pass is claimed.
 The original single-client short-request slowdown and single-client full-word
 confidence interval remain unresolved. CI also requires maintainer approval.
 
+## Allocation cleanup follow-up
+
+Fresh review of `58853ade60` reproduced two pre-existing cleanup defects in the
+shared DeBERTa code: a double free in the all-unique compact relative layout,
+and a hidden-tensor leak when partial encoder replay fails. The before logs and
+`cleanup-review.json` preserve the reproducers' outcomes and source digest.
+Allocation-failure regression coverage now includes both paths. The recorded
+optimized HTTP measurements describe their pinned revisions; they do not
+qualify subsequent cleanup changes or close the remaining performance gaps.
+
 ## Evidence format and superseded runs
 
 The `http-fixed-*.json` reports precede the timing isolation fix. Retain their

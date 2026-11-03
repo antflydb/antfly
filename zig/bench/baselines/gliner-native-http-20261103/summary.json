@@ -676,5 +676,13 @@
       "Retain bounded HTTP failure details and endpoint in failed benchmark reports."
     ],
     "implementation_commit": "29570dcf9924bce387c3d824af955f9f47956144"
+  },
+  "subsequent_cleanup_validation": {
+    "receipt": "cleanup-review.json",
+    "debug_selected": 2,
+    "debug_passed": 2,
+    "debug_skipped": 0,
+    "attribution": "Pre-existing all-unique compact-layout double free and partial-encoder error-path leak.",
+    "optimized_http_requalified": false
   }
 }
