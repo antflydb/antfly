@@ -71,7 +71,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
     var artifacts = store.artifactStore();
     artifacts.allocator = a;
     const normalized: @import("antfly_cancellation").CancellationToken = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none;
-    const cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead = if (cache) |shared| .{ .cache = shared, .scope = store.identity, .context = context } else null;
+    const cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead = if (cache) |shared| .{ .cache = shared, .scope = store.cache_identity, .context = context } else null;
     var inventory_lease: ?@import("lake_index_decoded_metadata.zig").Owned(InventoryMetadata) = null;
     errdefer if (inventory_lease) |owned| owned.release();
     var owned_inventory: ?InventoryMetadata = null;
@@ -122,6 +122,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
             hash.update(&published.signature.source);
             hash.update(&published.signature.credentials);
             hash.update(&published.signature.store);
+            hash.update(&store.cache_identity);
             hash.update(published.inventory.artifact_id);
             hash.update(published.inventory.checksum);
             var result: [32]u8 = undefined;
