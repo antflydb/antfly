@@ -2122,7 +2122,9 @@ pub const Owner = struct {
         self.publication_stats.allocator_proof_max_ns = @max(self.publication_stats.allocator_proof_max_ns, proof_ns);
         // The proof is this call's own work, not waiting: it does not use up
         // the busy budget carried to later re-entries of the same call.
-        if (connection) |caller| caller.admission_active_ns +|= proof_ns;
+        if (connection) |caller| if (caller.admission_active_sink) |sink| {
+            sink.* +|= proof_ns;
+        };
         if (verified) |_| {} else |_| {
             self.publication_stats.allocator_proof_failures +|= 1;
         }
@@ -2268,9 +2270,11 @@ pub const Connection = struct {
     // Scoped to C API admission while mutex is held. Reacquisition after a
     // detached allocator proof consumes the same request budget.
     admission_deadline_ns: ?i96 = null,
-    /// Active work (this call's own allocator proof) during admissions,
-    /// excluded from the waiting budget carried to re-entries.
-    admission_active_ns: u64 = 0,
+    /// Where the admitting call accumulates its own active work (allocator
+    /// proof), excluded from the waiting budget carried to re-entries. Set
+    /// only while that call holds `mutex`, like `admission_deadline_ns`, so
+    /// one call's work is never credited to another.
+    admission_active_sink: ?*u64 = null,
     current: ?*h.Handle = null,
     attached: bool = false,
     sql_sessions: @FieldType(h.Handle, "sql_sessions") = .empty,

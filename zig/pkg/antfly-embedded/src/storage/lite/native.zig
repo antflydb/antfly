@@ -12140,8 +12140,9 @@ pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, p
     defer allocator.free(lock_path);
     var queue = writer_queue.Queue.open(allocator, io, lock_path) catch |err| switch (err) {
         // Without a writable queue directory there is nobody to be fair to;
-        // keep the plain kernel wait.
-        error.AccessDenied, error.ReadOnlyFileSystem, error.PermissionDenied => return plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns),
+        // keep the plain kernel wait. The queue name always fits when the
+        // sidecar's does; a full path at the platform limit still falls back.
+        error.AccessDenied, error.ReadOnlyFileSystem, error.PermissionDenied, error.NameTooLong => return plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns),
         else => return err,
     };
     var queue_owned = true;
@@ -12187,7 +12188,7 @@ pub fn tryFairWriterLockWithIo(allocator: Allocator, io: std.Io, path: []const u
     const lock_path = try writerLockPathAlloc(allocator, io, path);
     defer allocator.free(lock_path);
     var queue = writer_queue.Queue.open(allocator, io, lock_path) catch |err| switch (err) {
-        error.AccessDenied, error.ReadOnlyFileSystem, error.PermissionDenied => return lockWriterPathWithIo(allocator, io, path),
+        error.AccessDenied, error.ReadOnlyFileSystem, error.PermissionDenied, error.NameTooLong => return lockWriterPathWithIo(allocator, io, path),
         else => return err,
     };
     defer queue.close(io);
@@ -13820,6 +13821,35 @@ test "lite fair writer lock grants contended writers in arrival order" {
     for (threads) |t| t.join();
     try std.testing.expectEqual(@as(usize, 0), probe.failures);
     try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2 }, probe.order[0..probe.len]);
+}
+
+test "lite fair writer lock queues writers of a database with a 250-byte file name" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(16) });
+    defer threaded.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The sidecar `<name>.lock` is exactly 255 bytes, the platform limit.
+    var name_buf: [250]u8 = @splat('n');
+    @memcpy(name_buf[name_buf.len - ".aflite".len ..], ".aflite");
+    const name: []const u8 = &name_buf;
+    const path = try testPath(std.testing.allocator, tmp, name);
+    defer std.testing.allocator.free(path);
+    const io = std.testing.io;
+    var probe: FairLockProbe = .{ .path = path, .wait_io = threaded.io() };
+
+    var holder = try fairWriterLockWithIo(std.testing.allocator, io, threaded.io(), path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+    var threads: [2]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, FairLockProbe.takeOnce, .{ &probe, @as(u8, @intCast(i)) });
+        try io.sleep(.fromMilliseconds(30), .awake);
+    }
+    // The queue is in use (not the plain fallback) and sees both waiters.
+    try std.testing.expect(holder.queue_watch != null);
+    try std.testing.expect(holder.queue_watch.?.hasArrivals(io));
+    holder.close();
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(usize, 0), probe.failures);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, probe.order[0..probe.len]);
 }
 
 test "lite fair writer lock rule 9: a direct flock holder delays the queue without reordering it" {

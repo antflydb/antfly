@@ -265,7 +265,7 @@ pub fn scavengePortableRestoreGenerations(
         lease_open = false;
         try deleteFileIfExists(io, lease_path);
         // The writer FIFO directory next to the sidecar, if one was made.
-        const queue_path = try std.fmt.allocPrint(allocator, "{s}.q", .{lease_path});
+        const queue_path = try @import("writer_queue.zig").queuePathAlloc(allocator, lease_path);
         defer allocator.free(queue_path);
         std.Io.Dir.cwd().deleteTree(io, queue_path) catch {};
         std.log.info("removed abandoned Lite portable generation path={s}", .{candidate});

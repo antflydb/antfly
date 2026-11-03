@@ -954,22 +954,21 @@ fn enterWithAdmissionBudget(initial: HandleEntry, ptr: ?*anyopaque, access: Hand
     if (timeout_ms == 0) return enterCapturedHandle(initial, access, intent, false);
     const io = handleLockIo();
     const deadline = std.Io.Clock.awake.now(io).nanoseconds + @max(0, budget_ns orelse @as(i96, timeout_ms) * std.time.ns_per_ms);
-    // Calls on one connection serialize on its mutex, so the delta is this
-    // call's proof work unless another thread races this unlocked read, in
-    // which case the carried budget is merely a little more generous.
-    const active_before = connection.admission_active_ns;
-    var guard = enterBeforeDeadline(initial, ptr, access, intent, retain_entry, connection, deadline) orelse return null;
+    // This call's own proof work, credited only through its own admission
+    // scope, so work by other calls on the connection is never counted.
+    var active_ns: u64 = 0;
+    var guard = enterBeforeDeadline(initial, ptr, access, intent, retain_entry, connection, deadline, &active_ns) orelse return null;
     // Only waiting consumes the budget: add back this call's own proof work.
-    const active: i96 = @intCast(connection.admission_active_ns -% active_before);
+    const active: i96 = @intCast(active_ns);
     guard.admission_budget_ns = @max(0, deadline - std.Io.Clock.awake.now(io).nanoseconds + active);
     return guard;
 }
 
-fn enterBeforeDeadline(initial: HandleEntry, ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent, comptime retain_entry: bool, connection: *@import("lite_connection.zig").Connection, deadline: i96) ?HandleGuard {
+fn enterBeforeDeadline(initial: HandleEntry, ptr: ?*anyopaque, access: HandleAccess, intent: StorageIntent, comptime retain_entry: bool, connection: *@import("lite_connection.zig").Connection, deadline: i96, active_ns: *u64) ?HandleGuard {
     const io = handleLockIo();
     const started = std.Io.Clock.awake.now(io).nanoseconds;
     var entry = initial;
-    var guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline);
+    var guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline, active_ns);
     defer if (intent == .mutation and guard.entry_error == null) {
         // Successful admission still owns the path gate. Count this admission,
         // including retries and proof work. Resuming a suspended operation is
@@ -1002,7 +1001,7 @@ fn enterBeforeDeadline(initial: HandleEntry, ptr: ?*anyopaque, access: HandleAcc
             return entry.failedGuard(access, capi.mapError(error.FileBusy));
         // An expired backoff cannot start a new admission attempt. A proof
         // already in progress may still finish and take an uncontended lease.
-        guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline);
+        guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline, active_ns);
         if (guard.entry_error == null) capi.clearLastError();
         backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
     }
@@ -1055,10 +1054,10 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, intent: StorageIn
 }
 
 fn enterCapturedHandle(entry: HandleEntry, access: HandleAccess, intent: StorageIntent, pinned: bool) HandleGuard {
-    return enterCapturedHandleWithDeadline(entry, access, intent, pinned, null);
+    return enterCapturedHandleWithDeadline(entry, access, intent, pinned, null, null);
 }
 
-fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, intent: StorageIntent, pinned: bool, deadline: ?i96) HandleGuard {
+fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, intent: StorageIntent, pinned: bool, deadline: ?i96, active_ns: ?*u64) HandleGuard {
     const handle = entry.handle;
     const slot = entry.slot;
     const lock_handle = entry.lock_handle;
@@ -1068,6 +1067,8 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
         var guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = access, .connection = connection };
         connection.admission_deadline_ns = deadline;
         defer connection.admission_deadline_ns = null;
+        connection.admission_active_sink = active_ns;
+        defer connection.admission_active_sink = null;
         // An attempt already in progress may spend time queued locally or
         // proving the allocator. Its first lease try must still be allowed;
         // only contention waits consult the deadline. The retry loop checks

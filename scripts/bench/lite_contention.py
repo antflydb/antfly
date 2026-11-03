@@ -423,9 +423,13 @@ def native_worker(config, index, ready, start, results, finish=None):
 
 def status_reader(config, stop, results):
     """The #1431 shape: an independent status-only reader once per interval."""
-    reads, errors, latencies = 0, [], []
+    reads, errors, latencies, startup_error = 0, [], [], None
     try:
-        af = sdk(config["library"])
+        try:
+            af = sdk(config["library"])
+        except Exception as error:  # noqa: BLE001 - reported, and fails the run
+            startup_error = f"{type(error).__name__}: {error}"[:300]
+            raise
         while not stop.wait(config["status_interval"]):
             began = time.perf_counter_ns()
             try:
@@ -445,11 +449,29 @@ def status_reader(config, stop, results):
             {
                 "reads": reads,
                 "errors": len(errors),
+                "startup_error": startup_error,
                 "first_errors": errors[:5],
                 "p50_ns": percentile(latencies, 50),
                 "max_ns": max(latencies, default=None),
             }
         )
+
+
+def status_reader_problem(result: dict | None, exitcode: int | None) -> str | None:
+    """Why the status reader cannot vouch for this run, or None.
+
+    A reader that never started, crashed, or completed no read reports nothing
+    about reader latency, so it must fail the run rather than read as clean.
+    """
+    if result is None:
+        return "status_reader_failed"
+    if result.get("startup_error") or exitcode not in (0, None):
+        return "status_reader_failed"
+    if result.get("reads", 0) == 0:
+        return "status_reader_failed"
+    if result.get("errors"):
+        return "status_reader_errors"
+    return None
 
 
 def acknowledged_writes(workers: list[dict]) -> list[dict]:
@@ -798,8 +820,12 @@ def native_cases(args):
                     raise TimeoutError("worker close exceeded watchdog")
                 if reader is not None:
                     reader_stop.set()
-                    row["status_reader"] = reader_results.get(timeout=args.watchdog)
+                    try:
+                        row["status_reader"] = reader_results.get(timeout=args.watchdog)
+                    except queue.Empty:
+                        row["status_reader"] = None
                     reader.join(timeout=args.watchdog)
+                    row["status_reader_exitcode"] = reader.exitcode
                 if any(worker["status"] != "ok" for worker in workers):
                     row.update(status="error", workers=workers)
                 elif any(process.exitcode != 0 for process in processes):
@@ -809,8 +835,12 @@ def native_cases(args):
                     )
                 else:
                     row.update(aggregate(workers))
-                    if row.get("status_reader", {}).get("errors"):
-                        row.update(status="status_reader_errors")
+                    if reader is not None:
+                        problem = status_reader_problem(
+                            row["status_reader"], row["status_reader_exitcode"]
+                        )
+                        if problem:
+                            row.update(status=problem)
             except RuntimeError as error:
                 row.update(status="error", diagnostic=str(error))
             except (queue.Empty, TimeoutError):

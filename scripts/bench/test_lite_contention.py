@@ -341,6 +341,35 @@ class ContentionReportTests(unittest.TestCase):
         self.assertIn("missing library", notice["diagnostic"])
         self.assertEqual(results.get_nowait(), notice)
 
+    def test_status_reader_startup_failure_is_reported_not_silent(self):
+        results = queue.Queue()
+        stop = SimpleNamespace(wait=lambda _interval: True)
+        with patch.object(bench, "sdk", side_effect=OSError("library missing")):
+            with self.assertRaises(OSError):
+                bench.status_reader(
+                    {"library": "x", "status_interval": 1, "database": "d", "timeout_ms": 5000},
+                    stop,
+                    results,
+                )
+        result = results.get_nowait()
+        self.assertEqual(result["reads"], 0)
+        self.assertIn("library missing", result["startup_error"])
+        self.assertEqual(
+            bench.status_reader_problem(result, 1), "status_reader_failed"
+        )
+
+    def test_status_reader_problem_requires_successful_reads_and_clean_exit(self):
+        clean = {"reads": 3, "errors": 0, "startup_error": None}
+        self.assertIsNone(bench.status_reader_problem(clean, 0))
+        self.assertEqual(bench.status_reader_problem(None, 0), "status_reader_failed")
+        self.assertEqual(bench.status_reader_problem(clean, -9), "status_reader_failed")
+        self.assertEqual(
+            bench.status_reader_problem({**clean, "reads": 0}, 0), "status_reader_failed"
+        )
+        self.assertEqual(
+            bench.status_reader_problem({**clean, "errors": 2}, 0), "status_reader_errors"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

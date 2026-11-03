@@ -720,7 +720,11 @@ storage state rather than from an error's name:
   53100, and any other cause 58000 ("not applied; safe to retry"). None
   carries a transaction receipt.
 - **Unknown.** The checkpoint publication that would make the decision durable
-  failed or was cancelled part-way (40003, `ANTFLY_OUTCOME_UNKNOWN`). COMMIT and
+  failed or was cancelled part-way (40003, `ANTFLY_OUTCOME_UNKNOWN`). On
+  directory (LSM) handles, any failure after the WAL append was attempted or
+  the memtable was published is also unknown: the record may be durable, and a
+  later flush, rotation or manifest step can fail after the write is visible.
+  COMMIT and
   coordinated autocommit include the `transaction_id` receipt; reconcile it and
   do not replay. Plain autocommit and batch calls have no receipt; after
   reconciliation, read back the affected keys.

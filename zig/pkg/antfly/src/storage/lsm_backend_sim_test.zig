@@ -695,7 +695,8 @@ test "lsm failed bulk SST publication preserves WAL credit and requires replay b
         var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
         defer txn.abort();
         try txn.appendPut(.{}, "replay-me", "durable-wal");
-        try std.testing.expectError(error.InjectedWriteFault, txn.commit());
+        // The WAL record is durable before the run write fails.
+        try std.testing.expectError(error.OutcomeUnknown, txn.commit());
     }
     try std.testing.expect(backend.manifest_recovery_required);
     try std.testing.expect(backend.manifest_unpublished_wire_bytes != 0);
@@ -830,7 +831,8 @@ test "lsm backend simulation hard wal admission fault rejects before append" {
             .defer_commit_flush = true,
         });
         try txn.put(.{ .name = "docs" }, "doc:a", &value_b);
-        try std.testing.expectError(error.InjectedSyncFault, txn.commit());
+        // Fails after the write may have applied.
+        try std.testing.expectError(error.OutcomeUnknown, txn.commit());
     }
 
     const writes = lsm_backend.snapshotWriteStats();

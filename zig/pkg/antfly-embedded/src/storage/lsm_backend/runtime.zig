@@ -454,6 +454,11 @@ pub fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
 
+/// WAL appends and direct ingests a backend has started; see `commit`.
+fn writePublicationAttempts(backend: anytype) u64 {
+    return if (@hasField(@TypeOf(backend.*), "write_publication_attempts")) backend.write_publication_attempts else 0;
+}
+
 fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable) !void {
     if (incoming.entryCount() == 0) return;
     if (comptime @TypeOf(backend.mutable) == ActiveMemTable) {
@@ -4768,7 +4773,22 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             self.* = undefined;
         }
 
+        /// After the write may have been applied (a WAL append or direct
+        /// ingest was attempted, or the memtable was published), every
+        /// failure is `error.OutcomeUnknown`. Later steps (flush, rotation,
+        /// manifest persist) can fail with ordinary errors while the write is
+        /// already durable or visible, and callers treat ordinary errors as
+        /// "not applied, safe to retry".
         pub fn commit(self: *@This()) !void {
+            var maybe_applied = false;
+            self.commitTracked(&maybe_applied) catch |err| {
+                if (!maybe_applied) return err;
+                if (err != error.OutcomeUnknown) std.log.warn("lsm commit failed after the write may have applied: {s}", .{@errorName(err)});
+                return error.OutcomeUnknown;
+            };
+        }
+
+        fn commitTracked(self: *@This(), maybe_applied: *bool) !void {
             if (self.closed) return error.TransactionClosed;
             defer if (self.closed) {
                 self.bulk_index.deinit(self.allocator);
@@ -4777,6 +4797,13 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
+            // Pressure relief inside the append can unlock the backend, so a
+            // concurrent commit may also move this counter. That only makes
+            // an early failure read as unknown, never the reverse.
+            const publication_attempts_before = writePublicationAttempts(self.backend);
+            errdefer if (writePublicationAttempts(self.backend) != publication_attempts_before) {
+                maybe_applied.* = true;
+            };
             var release_on_error = true;
             errdefer if (release_on_error) {
                 self.mutable.deinit(self.allocator);
@@ -4820,6 +4847,8 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
                     try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
                 }
+                // Published to the memtable: visible, and durable when WAL is on.
+                if (mutated) maybe_applied.* = true;
                 if (mutated or direct_ingested_bulk_appends) notePotentialMaintenanceDebtLocked(self.backend);
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
                 if (!self.batch_options.defer_commit_flush) {
@@ -9269,7 +9298,22 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             self.* = undefined;
         }
 
+        /// After the write may have been applied (a WAL append or direct
+        /// ingest was attempted, or the memtable was published), every
+        /// failure is `error.OutcomeUnknown`. Later steps (flush, rotation,
+        /// manifest persist) can fail with ordinary errors while the write is
+        /// already durable or visible, and callers treat ordinary errors as
+        /// "not applied, safe to retry".
         pub fn commit(self: *@This()) !void {
+            var maybe_applied = false;
+            self.commitTracked(&maybe_applied) catch |err| {
+                if (!maybe_applied) return err;
+                if (err != error.OutcomeUnknown) std.log.warn("lsm commit failed after the write may have applied: {s}", .{@errorName(err)});
+                return error.OutcomeUnknown;
+            };
+        }
+
+        fn commitTracked(self: *@This(), maybe_applied: *bool) !void {
             if (self.closed) return error.TransactionClosed;
             defer if (self.closed) {
                 self.bulk_index.deinit(self.allocator);
@@ -9280,6 +9324,13 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
+            // Pressure relief inside the append can unlock the backend, so a
+            // concurrent commit may also move this counter. That only makes
+            // an early failure read as unknown, never the reverse.
+            const publication_attempts_before = writePublicationAttempts(self.backend);
+            errdefer if (writePublicationAttempts(self.backend) != publication_attempts_before) {
+                maybe_applied.* = true;
+            };
             var release_on_error = true;
             errdefer if (release_on_error) {
                 self.mutable.deinit(self.allocator);
@@ -9324,6 +9375,8 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     if (@hasDecl(BackendType, "invalidateMutableReadSnapshot")) self.backend.invalidateMutableReadSnapshot();
                     try state_mod.applyMutableMoveToMutable(&self.backend.mutable, self.allocator, &self.mutable);
                 }
+                // Published to the memtable: visible, and durable when WAL is on.
+                if (mutated) maybe_applied.* = true;
                 if (mutated or direct_ingested_bulk_appends) notePotentialMaintenanceDebtLocked(self.backend);
                 if (@hasDecl(BackendType, "syncTrackedInMemoryStateUsageCurrentLocked")) self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
                 if (!self.batch_options.defer_commit_flush) {
@@ -9801,7 +9854,9 @@ test "lsm namespace write txn keeps merged mutable state when flush fails after 
     var txn = try NamespaceWriteTxn(TestBackend).open(&backend);
     errdefer txn.abort();
     try txn.put(.{ .name = "docs" }, "doc:a", "A");
-    try std.testing.expectError(error.InjectedFlushFailure, txn.commit());
+    // The write is merged and visible before the flush fails, so the
+    // outcome cannot be reported as not applied.
+    try std.testing.expectError(error.OutcomeUnknown, txn.commit());
 
     try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     try std.testing.expectEqualStrings("docs", backend.mutable.entryAt(0).namespace_name.?);

@@ -18,9 +18,12 @@
 //! waiter races, and the process that just released usually wins again. This
 //! module orders writers with a CLH-style queue of ticket files.
 //!
-//! Layout, in `<sidecar>.q/`:
-//! - `tail`: an 8-byte little-endian next-ticket counter. Its own `flock` is
-//!   held only for the few syscalls that issue a ticket.
+//! Layout, in `<sidecar>.q/` (see `queuePathAlloc` for names too long for
+//! that suffix):
+//! - `tail`: the next-ticket counter, 8 little-endian bytes followed by their
+//!   complement, so a torn or partial write is detected instead of read as a
+//!   smaller number. Its own `flock` is held only for the few syscalls that
+//!   issue a ticket.
 //! - `t-<ticket>`: one file per waiter. The waiter holds an exclusive `flock`
 //!   on it from enqueue until it finishes, and keeps its state in byte 0.
 //!
@@ -45,12 +48,15 @@
 //! 1. Issue. A ticket is created and locked, and its `W` state written,
 //!    before the counter advances, all under the tail lock. A walker can
 //!    therefore never see a live ticket unlocked or without a state.
-//! 2. Monotonic numbers. The counter is written whole under the tail lock and
-//!    never decreases. Enqueue also takes the maximum with one more than the
-//!    highest ticket file, so a missing, short or damaged counter can never
-//!    number a ticket below a live one. A crash between creating a ticket and
-//!    advancing the counter leaves an unlocked `W` file that no walker has
-//!    seen; the next ticket is numbered above it and skips it as dead.
+//! 2. Monotonic numbers. The counter is written under the tail lock and never
+//!    decreases. A counter that fails its check (missing, short, torn by a
+//!    failed or partial write) is replaced by one more than the highest ticket
+//!    file, so it can never number a ticket below a live one. A torn write
+//!    that happens to pass the check can only read as the previous value,
+//!    which is still at or above every ticket a walker can see. Tickets are
+//!    created exclusively: an existing file at the next number (a crash
+//!    between creating a ticket and advancing the counter) is never reused;
+//!    the number is skipped, and the file is later skipped as dead.
 //! 3. No bypass. A walker skips a predecessor only after holding that
 //!    predecessor's lock and reading `W` or `A`, which proves its owner has
 //!    abandoned or died; it then continues to the next lower ticket, so it
@@ -59,7 +65,11 @@
 //! 4. Grant. A walker is granted on reaching a `D` or `G` ticket (finished,
 //!    or holder died), or a missing file. Files are deleted only by a granted
 //!    ticket, and only below itself, so a missing file means a later grant
-//!    already proved everything below it finished.
+//!    already proved everything below it finished. A granted ticket deletes
+//!    everything below it in ascending order, including leftovers of an
+//!    earlier grant that died mid-cleanup. Interrupted cleanup therefore
+//!    leaves one contiguous run ending at the dead grant's own file, and the
+//!    next grant removes it, so ticket history stays bounded.
 //! 5. Death. Process death releases all of its ticket and tail locks: a dead
 //!    waiter reads as `W` (skipped), a dead holder as `G` (finished). Death
 //!    while holding the tail lock leaves at most rule 2's unadvanced file.
@@ -91,6 +101,24 @@ const State = enum(u8) {
 
 const tail_name = "tail";
 const ticket_name_len = "t-".len + 16;
+const counter_len = 16;
+const counter_check: u64 = 0xA5A5_5A5A_C3C3_3C3C;
+/// Longest single path component on the platforms Lite supports.
+const max_name_len = 255;
+/// Bound on retries of a spurious `FileNotFound` when several processes
+/// create the same file in a just-created directory (observed on APFS).
+const create_retries = 8;
+
+/// The queue directory for a sidecar: `<sidecar>.q`, or, when that name would
+/// exceed the platform name limit, a shortened `<prefix>-<hash>.q` in the same
+/// directory. Every process derives the same name from the same sidecar path.
+pub fn queuePathAlloc(allocator: std.mem.Allocator, sidecar_path: []const u8) ![]u8 {
+    const base = std.fs.path.basename(sidecar_path);
+    if (base.len + ".q".len <= max_name_len) return std.fmt.allocPrint(allocator, "{s}.q", .{sidecar_path});
+    const dir_len = sidecar_path.len - base.len;
+    const keep = max_name_len - "-".len - 16 - ".q".len;
+    return std.fmt.allocPrint(allocator, "{s}{s}-{x:0>16}.q", .{ sidecar_path[0..dir_len], base[0..keep], std.hash.Wyhash.hash(0, base) });
+}
 
 fn ticketName(buf: *[ticket_name_len]u8, index: u64) []const u8 {
     return std.fmt.bufPrint(buf, "t-{x:0>16}", .{index}) catch unreachable;
@@ -101,7 +129,7 @@ pub const Queue = struct {
 
     /// Opens (creating if needed) the queue directory next to the sidecar.
     pub fn open(allocator: std.mem.Allocator, io: std.Io, sidecar_path: []const u8) !Queue {
-        const queue_path = try std.fmt.allocPrint(allocator, "{s}.q", .{sidecar_path});
+        const queue_path = try queuePathAlloc(allocator, sidecar_path);
         defer allocator.free(queue_path);
         const cwd = std.Io.Dir.cwd();
         return .{ .dir = cwd.openDir(io, queue_path, .{}) catch |err| switch (err) {
@@ -135,7 +163,7 @@ pub const Queue = struct {
     /// The tail critical section is a few syscalls, so a short kernel wait is
     /// fine here. The deadline still bounds it against a stopped process.
     pub fn lockTail(self: *Queue, io: std.Io, deadline_ns: i96) !TailGuard {
-        const file = try self.dir.createFile(io, tail_name, .{ .read = true, .truncate = false });
+        const file = try self.openTail(io);
         const held = blk: {
             if (file.tryLock(io, .exclusive) catch |err| {
                 file.close(io);
@@ -151,12 +179,19 @@ pub const Queue = struct {
         return .{ .file = held, .next = try self.readOrRecoverCounter(held, io) };
     }
 
+    fn openTail(self: *Queue, io: std.Io) !std.Io.File {
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            return self.dir.createFile(io, tail_name, .{ .read = true, .truncate = false }) catch |err| switch (err) {
+                error.FileNotFound => if (tries < create_retries) continue else err,
+                else => err,
+            };
+        }
+    }
+
     /// Rule 2. Only called with the tail lock held.
     fn readOrRecoverCounter(self: *Queue, file: std.Io.File, io: std.Io) !u64 {
-        var raw: [8]u8 = @splat(0);
-        const n = try file.readPositionalAll(io, &raw, 0);
-        if (n == raw.len) return std.mem.readInt(u64, &raw, .little);
-        return self.recoverCounter(io);
+        return try readCounter(file, io) orelse self.recoverCounter(io);
     }
 
     /// One more than the highest ticket file, or 0 with no tickets.
@@ -174,19 +209,20 @@ pub const Queue = struct {
     }
 
     /// Whether any ticket numbered `mark` or above has been issued. One open
-    /// and an 8-byte read, without the tail lock: the counter only grows and
-    /// is written in one 8-byte write, and a stale read only delays noticing.
-    /// Errors answer "yes" so callers fall back to releasing.
+    /// and a 16-byte read, without the tail lock: the counter only grows, and
+    /// a stale read only delays noticing. A read that fails its check (torn
+    /// by a concurrent write) or any error answers "yes", so callers fall
+    /// back to releasing.
     pub fn ticketsIssuedSince(self: *const Queue, io: std.Io, mark: u64) bool {
         const tail = self.dir.openFile(io, tail_name, .{}) catch return true;
         defer tail.close(io);
-        const next = readCounter(tail, io) catch return true;
+        const next = (readCounter(tail, io) catch return true) orelse return true;
         return next > mark;
     }
 
     /// Like `lockTail` but returns `error.WouldBlock` instead of waiting.
     pub fn tryLockTail(self: *Queue, io: std.Io) !TailGuard {
-        const file = try self.dir.createFile(io, tail_name, .{ .read = true, .truncate = false });
+        const file = try self.openTail(io);
         errdefer file.close(io);
         if (!try file.tryLock(io, .exclusive)) return error.WouldBlock;
         return .{ .file = file, .next = try self.readOrRecoverCounter(file, io) };
@@ -219,26 +255,32 @@ pub const Queue = struct {
     /// observe it unlocked while its owner is alive.
     pub fn enqueue(self: *Queue, io: std.Io, tail: *TailGuard) !Ticket {
         var name_buf: [ticket_name_len]u8 = undefined;
-        // Rule 2: never number a ticket below an existing one, even if the
-        // counter was damaged. Only contended admissions enqueue, and the
-        // directory holds just live and recently finished tickets.
-        tail.next = @max(tail.next, try self.recoverCounter(io));
-        var recovered = false;
+        var skipped: usize = 0;
+        var not_found: usize = 0;
         const index, const name, const file = while (true) {
             const index = tail.next;
             const name = ticketName(&name_buf, index);
-            // An unlocked leftover here is rule 2's unadvanced file: reuse it.
+            // Rule 2: exclusive create, so a ticket number is never reused.
+            // Nobody else can open this name yet: walkers only open numbers
+            // below the counter, and we hold the tail.
             const file = self.dir.createFile(io, name, .{
                 .read = true,
-                .truncate = true,
+                .exclusive = true,
                 .lock = .exclusive,
                 .lock_nonblocking = true,
             }) catch |err| switch (err) {
-                // A live ticket at the next number: the counter is behind.
-                error.WouldBlock => {
-                    if (recovered) return error.FileBusy;
-                    recovered = true;
-                    tail.next = @max(tail.next + 1, try self.recoverCounter(io));
+                // A leftover from an issuer that died before advancing the
+                // counter. Skip the number; walkers skip the file as dead.
+                // Many in a row means the counter is far behind: rescan.
+                error.PathAlreadyExists, error.WouldBlock => {
+                    skipped += 1;
+                    tail.next = if (skipped < 4) index + 1 else @max(index + 1, try self.recoverCounter(io));
+                    if (skipped > 8) return error.FileBusy;
+                    continue;
+                },
+                error.FileNotFound => {
+                    not_found += 1;
+                    if (not_found > create_retries) return err;
                     continue;
                 },
                 else => return err,
@@ -250,9 +292,7 @@ pub const Queue = struct {
             self.dir.deleteFile(io, name) catch {};
         }
         try writeState(file, io, .waiting);
-        var raw: [8]u8 = undefined;
-        std.mem.writeInt(u64, &raw, index + 1, .little);
-        try tail.file.writePositionalAll(io, &raw, 0);
+        try writeCounter(tail.file, io, index + 1);
         tail.next = index + 1;
         return .{ .index = index, .file = file };
     }
@@ -296,9 +336,21 @@ pub const Queue = struct {
             }
         }
         try writeState(ticket.file, io, .granted);
-        // FIFO guarantees every ticket below ours has finished.
-        var i = lowest_visited;
-        while (i < ticket.index) : (i += 1) self.dir.deleteFile(io, ticketName(&name_buf, i)) catch {};
+        self.removeFinished(io, lowest_visited, ticket.index);
+    }
+
+    /// Rule 4. FIFO guarantees every ticket below a granted one has finished.
+    /// Extends `low` down over any contiguous leftovers (from a grant that
+    /// died before or during its own cleanup), then deletes ascending, so an
+    /// interruption here again leaves one contiguous run below a granted file.
+    fn removeFinished(self: *Queue, io: std.Io, low: u64, granted: u64) void {
+        var name_buf: [ticket_name_len]u8 = undefined;
+        var floor = low;
+        while (floor > 0) : (floor -= 1) {
+            self.dir.access(io, ticketName(&name_buf, floor - 1), .{}) catch break;
+        }
+        var i = floor;
+        while (i < granted) : (i += 1) self.dir.deleteFile(io, ticketName(&name_buf, i)) catch {};
     }
 
     /// Passes the turn to the next ticket.
@@ -359,10 +411,25 @@ pub const Watch = struct {
     }
 };
 
-fn readCounter(file: std.Io.File, io: std.Io) !u64 {
-    var raw: [8]u8 = @splat(0);
+/// Null when the counter is missing, short, or fails its check.
+fn readCounter(file: std.Io.File, io: std.Io) !?u64 {
+    var raw: [counter_len]u8 = @splat(0);
     const n = try file.readPositionalAll(io, &raw, 0);
-    return if (n == raw.len) std.mem.readInt(u64, &raw, .little) else 0;
+    if (n != raw.len) return null;
+    const value = std.mem.readInt(u64, raw[0..8], .little);
+    const check = std.mem.readInt(u64, raw[8..16], .little);
+    return if (check == value ^ counter_check) value else null;
+}
+
+fn writeCounter(file: std.Io.File, io: std.Io, value: u64) !void {
+    var raw: [counter_len]u8 = undefined;
+    encodeCounter(&raw, value);
+    try file.writePositionalAll(io, &raw, 0);
+}
+
+fn encodeCounter(raw: *[counter_len]u8, value: u64) void {
+    std.mem.writeInt(u64, raw[0..8], value, .little);
+    std.mem.writeInt(u64, raw[8..16], value ^ counter_check, .little);
 }
 
 fn readState(file: std.Io.File, io: std.Io) !State {
@@ -576,7 +643,8 @@ test "writer queue rule 2: a damaged counter never numbers a ticket below a live
     try q.awaitTurn(io, &head, farDeadline(io));
     var live = try enqueueOne(&q, io);
     defer q.abandon(io, &live);
-    for ([_][]const u8{ &.{ 0, 0, 0, 0, 0, 0, 0, 0 }, &.{ 1, 2, 3 }, "" }) |damage| {
+    const zeros: [counter_len]u8 = @splat(0);
+    for ([_][]const u8{ &zeros, zeros[0..8], &.{ 1, 2, 3 }, "" }) |damage| {
         try writeCounterRaw(&q, io, damage);
         var next = try enqueueOne(&q, io);
         try testing.expect(next.index > live.index);
@@ -607,6 +675,143 @@ test "writer queue rule 2: an unadvanced leftover ticket is skipped as dead" {
     // Granted at once: the leftover reads as a dead waiter.
     try q.awaitTurn(io, &t, std.Io.Clock.awake.now(io).nanoseconds + 50 * std.time.ns_per_ms);
     q.finish(io, &t);
+}
+
+test "writer queue rule 2: a torn counter write cannot hide a live waiter" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .limited(8) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sidecar = try testSidecar(&tmp, io, &path_buf);
+    var q = try Queue.open(testing.allocator, io, sidecar);
+    defer q.close(io);
+
+    // A live waiter at 255, so the counter holds 256.
+    var start: [counter_len]u8 = undefined;
+    encodeCounter(&start, 255);
+    try writeCounterRaw(&q, io, &start);
+    var live = try enqueueOne(&q, io);
+    try testing.expectEqual(@as(u64, 255), live.index);
+    defer q.abandon(io, &live);
+
+    // The next advance (256 -> 257) is torn after each prefix length. Byte 0
+    // alone turns the value into 0 under the old check; no prefix may read
+    // as an idle queue or number a ticket at or below the live one.
+    var old: [counter_len]u8 = undefined;
+    var new: [counter_len]u8 = undefined;
+    encodeCounter(&old, 256);
+    encodeCounter(&new, 257);
+    for (1..counter_len) |prefix| {
+        var torn = old;
+        @memcpy(torn[0..prefix], new[0..prefix]);
+        try writeCounterRaw(&q, io, &torn);
+        {
+            var tail = try q.lockTail(io, farDeadline(io));
+            defer tail.release(io);
+            try testing.expect(tail.next >= 256);
+            try testing.expect(!try q.isIdle(io, &tail));
+        }
+        var next = try enqueueOne(&q, io);
+        try testing.expect(next.index > live.index);
+        q.abandon(io, &next);
+        try writeCounterRaw(&q, io, &old);
+    }
+}
+
+test "writer queue rule 4: leftovers of interrupted grants are removed by the next grant" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .limited(8) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sidecar = try testSidecar(&tmp, io, &path_buf);
+    var q = try Queue.open(testing.allocator, io, sidecar);
+    defer q.close(io);
+
+    // Three grants that each died after writing `G` but before deleting
+    // anything: t-0..t-98 are finished leftovers, each crash adding 33.
+    var name_buf: [ticket_name_len]u8 = undefined;
+    for (0..99) |i| {
+        const f = try q.dir.createFile(io, ticketName(&name_buf, i), .{});
+        defer f.close(io);
+        try writeState(f, io, if (i % 33 == 32) .granted else .done);
+    }
+    var raw: [counter_len]u8 = undefined;
+    encodeCounter(&raw, 99);
+    try writeCounterRaw(&q, io, &raw);
+
+    var t = try enqueueOne(&q, io);
+    try testing.expectEqual(@as(u64, 99), t.index);
+    try q.awaitTurn(io, &t, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+    q.finish(io, &t);
+    try testing.expectEqual(@as(usize, 1), try countTickets(&q, io));
+
+    // A grant interrupted halfway through its ascending cleanup leaves a run
+    // ending at its own file; the next grant clears it too.
+    for (100..120) |i| {
+        const f = try q.dir.createFile(io, ticketName(&name_buf, i), .{});
+        defer f.close(io);
+        try writeState(f, io, if (i == 119) .granted else .done);
+    }
+    encodeCounter(&raw, 120);
+    try writeCounterRaw(&q, io, &raw);
+    var u = try enqueueOne(&q, io);
+    try q.awaitTurn(io, &u, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+    q.finish(io, &u);
+    try testing.expectEqual(@as(usize, 1), try countTickets(&q, io));
+}
+
+fn countTickets(q: *Queue, io: std.Io) !usize {
+    var dir = try q.dir.openDir(io, ".", .{ .iterate = true });
+    defer dir.close(io);
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "t-")) n += 1;
+    }
+    return n;
+}
+
+test "writer queue directory name fits the platform limit for long database names" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .limited(8) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(dir_path);
+
+    // A 250-byte database name: its sidecar `<db>.lock` is 255 bytes.
+    const db_name: [250]u8 = @splat('d');
+    const sidecar = try std.fmt.allocPrint(testing.allocator, "{s}/{s}.lock", .{ dir_path, &db_name });
+    defer testing.allocator.free(sidecar);
+    const queue_path = try queuePathAlloc(testing.allocator, sidecar);
+    defer testing.allocator.free(queue_path);
+    try testing.expect(std.fs.path.basename(queue_path).len <= max_name_len);
+    try testing.expectEqualStrings(dir_path, std.fs.path.dirname(queue_path).?);
+    // Same name every time, distinct from a sibling sharing the prefix.
+    const again = try queuePathAlloc(testing.allocator, sidecar);
+    defer testing.allocator.free(again);
+    try testing.expectEqualStrings(queue_path, again);
+    const sibling = try std.fmt.allocPrint(testing.allocator, "{s}/{s}.lock2", .{ dir_path, db_name[0..249] });
+    defer testing.allocator.free(sibling);
+    const sibling_queue = try queuePathAlloc(testing.allocator, sibling);
+    defer testing.allocator.free(sibling_queue);
+    try testing.expect(!std.mem.eql(u8, queue_path, sibling_queue));
+
+    var q = try Queue.open(testing.allocator, io, sidecar);
+    defer q.close(io);
+    var t = try enqueueOne(&q, io);
+    try q.awaitTurn(io, &t, farDeadline(io));
+    q.finish(io, &t);
+
+    // Short names keep the readable suffix.
+    const short = try queuePathAlloc(testing.allocator, "/x/db.aflite.lock");
+    defer testing.allocator.free(short);
+    try testing.expectEqualStrings("/x/db.aflite.lock.q", short);
 }
 
 test "writer queue rule 6: cancelling a queued waiter does not let a later one pass an earlier live one" {
@@ -662,9 +867,9 @@ fn childStep(mode: ChildMode, tail_path: [*:0]const u8, ticket_path: [*:0]const 
     if (c.flock(t, c.LOCK.EX) != 0) c._exit(13);
     if (c.pwrite(t, "W", 1, 0) != 1) c._exit(14);
     if (mode == .die_before_advance) c._exit(0);
-    var raw: [8]u8 = undefined;
-    std.mem.writeInt(u64, &raw, index + 1, .little);
-    if (c.pwrite(tail, &raw, 8, 0) != 8) c._exit(15);
+    var raw: [counter_len]u8 = undefined;
+    encodeCounter(&raw, index + 1);
+    if (c.pwrite(tail, &raw, raw.len, 0) != raw.len) c._exit(15);
     _ = c.close(tail);
     if (mode == .die_granted) {
         if (c.pwrite(t, "G", 1, 0) != 1) c._exit(16);

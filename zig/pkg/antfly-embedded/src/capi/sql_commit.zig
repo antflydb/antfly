@@ -612,6 +612,41 @@ test "capi SQL outcome batch export classifies each boundary" {
     }
 }
 
+test "capi SQL outcome batch on a directory handle is unknown once the LSM write may have applied" {
+    const api = @import("db.zig");
+    const Backend = @import("../storage/lsm_backend.zig").Backend;
+    for ([_]struct { at: @FieldType(Backend.TestCommitFault, "at"), code: h.capi.ErrorCode, applied: bool }{
+        // Nothing written yet: an ordinary, retryable failure.
+        .{ .at = .before_wal_append, .code = .internal, .applied = false },
+        // The WAL record may be durable: never "not applied".
+        .{ .at = .after_wal_append, .code = .outcome_unknown, .applied = false },
+        // Visible and durable, then a flush step failed.
+        .{ .at = .after_publish, .code = .outcome_unknown, .applied = true },
+    }) |case| {
+        var directory = try api.TestDirectory.init("outcome-lsm-batch");
+        defer directory.cleanup();
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+        const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}", .{directory.path()}, 0);
+        defer std.testing.allocator.free(path);
+        var id: ?*anyopaque = null;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open(path, &id));
+        defer api.antfly_db_close(id);
+
+        Backend.test_commit_fault = .{ .at = case.at, .err = error.InputOutput };
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free(&out);
+        const code = api.antfly_db_batch_json(id, .fromSlice("{\"inserts\":{\"batch-key\":{\"v\":1}}}"), &out);
+        const fired = Backend.test_commit_fault == null;
+        Backend.test_commit_fault = null;
+        try std.testing.expect(fired);
+        try std.testing.expectEqual(case.code, code);
+        var lookup: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free(&lookup);
+        const found = api.antfly_db_lookup_json(id, .fromSlice("batch-key"), &lookup);
+        try std.testing.expectEqual(case.applied, found == .ok);
+    }
+}
+
 test "capi SQL outcome refusals after an unresolved decision are not unknown" {
     const errors = dependencies.sql_errors;
     for ([_]anyerror{ error.SqlReconciliationRequired, error.OutcomeReconciliationRequired }) |err| {

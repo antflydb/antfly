@@ -2599,7 +2599,8 @@ test "wal lsm sync boundary failures recover a valid acknowledged prefix" {
         var crashed_wal = try WAL.open(path, opts);
         try std.testing.expectEqual(@as(u64, 1), try crashed_wal.append("committed"));
         try device_model.injectSyncFailureForPathContains(needle);
-        try std.testing.expectError(error.InjectedSyncFault, crashed_wal.append("uncertain"));
+        // The record may have reached the segment before its sync failed.
+        try std.testing.expectError(error.OutcomeUnknown, crashed_wal.append("uncertain"));
         try device_model.device().crash();
         crashed_wal.abandonAfterCrash();
 

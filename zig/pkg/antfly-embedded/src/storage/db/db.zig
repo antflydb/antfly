@@ -8661,20 +8661,10 @@ pub const DB = struct {
                 error.EnrichmentWaitTimeout,
                 error.EnrichmentRetryInProgress,
                 => return error.CommitVisibilityNotSatisfied,
-                // Already-uncertain outcomes keep their identity, and a
-                // committed write whose enrichment failed still needs repair.
-                error.EnrichmentWorkerFailed,
-                error.OutcomeUnknown,
-                error.WriteOutcomeUnknown,
-                error.DurabilityOutcomeUnknown,
-                error.CommitDecisionUnknown,
-                error.CommitVisibilityNotSatisfied,
-                => {},
-                // The primary write is durable. Any later failure (replication
-                // append, observers, sync-level waits, memory) must not reach
-                // a caller as a plain error it could retry, re-applying a
-                // committed write. Report committed-but-not-yet-visible.
-                else => return error.CommitVisibilityNotSatisfied,
+                // Other errors keep their identity for internal callers that
+                // act on them. Exported calls classify a failure after the
+                // primary write from `batchTracked`'s flag, not from its name.
+                else => {},
             };
             return err;
         };

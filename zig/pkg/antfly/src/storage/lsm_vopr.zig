@@ -396,7 +396,9 @@ fn consumeWriteFault(state: anytype) !bool {
     var txn = try state.lsm.beginWrite();
     defer txn.abort();
     try txn.put(.{}, "fault:write", "must-not-commit");
-    txn.commit() catch |err| return err == error.InjectedWriteFault;
+    // A WAL write fault follows the append attempt, so the commit reports an
+    // unknown outcome rather than a plain, retryable failure.
+    txn.commit() catch |err| return err == error.InjectedWriteFault or err == error.OutcomeUnknown;
     return false;
 }
 

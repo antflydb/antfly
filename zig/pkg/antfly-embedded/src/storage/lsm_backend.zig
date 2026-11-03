@@ -679,6 +679,20 @@ pub const Backend = struct {
         versions: ?*runtime_mod.ReadVersion = null,
     };
     pub var test_deep_mutable_snapshots: bool = false;
+    /// One-shot commit fault for outcome-classification tests.
+    pub const TestCommitFault = struct {
+        at: enum { before_wal_append, after_wal_append, after_publish },
+        err: anyerror,
+    };
+    pub var test_commit_fault: if (builtin.is_test) ?TestCommitFault else void = if (builtin.is_test) null else {};
+
+    fn takeTestCommitFault(comptime at: @FieldType(TestCommitFault, "at")) !void {
+        if (comptime !builtin.is_test) return;
+        const fault = test_commit_fault orelse return;
+        if (fault.at != at) return;
+        test_commit_fault = null;
+        return fault.err;
+    }
     pub const OpenPhase = enum {
         idle,
         initializing_storage,
@@ -1745,6 +1759,9 @@ pub const Backend = struct {
     unpublished_wal_logical_bytes: u64 = 0,
     unpublished_wal_max_batch_logical_bytes: u64 = 0,
     wal_retention: WalRetentionState = .{},
+    /// WAL appends and direct ingests started, counted before any write so a
+    /// commit can tell whether a failure may follow a durable or visible one.
+    write_publication_attempts: u64 = 0,
     remembered_compaction: ?compaction_mod.RememberedCompaction = null,
     open_stats: OpenStats = .{},
     write_stats: WriteStats = .{},
@@ -4385,6 +4402,7 @@ pub const Backend = struct {
     }
 
     pub fn maybeFlushMutable(self: *Backend) !void {
+        try takeTestCommitFault(.after_publish);
         if (self.shouldFlushMutable()) {
             if (self.shouldDeferCommitFlush()) {
                 try self.rotateMutableToImmutable();
@@ -4900,6 +4918,7 @@ pub const Backend = struct {
     /// mutable state followed immediately by another run for the new batch.
     pub fn directIngestCombinedMutable(self: *Backend, incoming: *ActiveMemTable) !bool {
         if (!self.options.direct_bulk_ingest) return false;
+        self.write_publication_attempts +%= 1;
 
         if (self.canQueueDirectBulkStateWithPendingImmutable()) {
             // Commit serialization orders the old mutable entries before the
@@ -5403,6 +5422,7 @@ pub const Backend = struct {
     pub fn ingestSortedState(self: *Backend, state: *const State) !void {
         if (self.options.backend.read_only) return error.ReadOnly;
         if (state.entryCount() == 0) return;
+        self.write_publication_attempts +%= 1;
 
         if (self.mutable.entryCount() > 0) {
             try self.flushMutable();
@@ -5444,6 +5464,7 @@ pub const Backend = struct {
     pub fn ingestOwnedSortedState(self: *Backend, state: *State) !void {
         if (self.options.backend.read_only) return error.ReadOnly;
         if (state.entryCount() == 0) return;
+        self.write_publication_attempts +%= 1;
         if (self.root_dir != null) {
             try self.ingestSortedState(state);
             return;
@@ -5926,6 +5947,8 @@ pub const Backend = struct {
         };
         var wal_lock = try self.acquireWalOperationLock(.exclusive);
         defer wal_lock.release();
+        try takeTestCommitFault(.before_wal_append);
+        self.write_publication_attempts +%= 1;
         const append_result = try self.wal_retention.append(
             self.storage.?,
             self.allocator,
@@ -5937,6 +5960,8 @@ pub const Backend = struct {
         );
         self.noteMutableWalSegment(append_result.segment);
         self.syncTrackedWalRetentionUsageCurrentLocked();
+        // Stands in for a sync failure after the record reached the segment.
+        try takeTestCommitFault(.after_wal_append);
         self.write_stats.wal_append_records += 1;
         self.write_stats.wal_append_entries += @intCast(state.entryCount());
         self.write_stats.wal_append_bytes += append_result.bytes;
@@ -11325,6 +11350,53 @@ fn implementationTests() type {
             defer read.abort();
             try std.testing.expectEqualStrings("alpha", try read.get(.{ .name = "docs" }, "doc:a"));
             try std.testing.expect(backend.write_stats.wal_replay_records > 0);
+        }
+
+        test "issue1431 lsm commit failure after the write may have applied is outcome unknown" {
+            const Case = struct { at: @FieldType(Backend.TestCommitFault, "at"), expect: anyerror, visible: bool, replayed: bool };
+            const cases = [_]Case{
+                // Before the WAL append nothing was written: an ordinary error.
+                .{ .at = .before_wal_append, .expect = error.InputOutput, .visible = false, .replayed = false },
+                // The record is in the segment but was not published here.
+                .{ .at = .after_wal_append, .expect = error.OutcomeUnknown, .visible = false, .replayed = true },
+                // Published and durable; a later flush step failed.
+                .{ .at = .after_publish, .expect = error.OutcomeUnknown, .visible = true, .replayed = true },
+            };
+            for (cases) |case| {
+                var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+                defer storage.deinit();
+                const root_dir = "/lsm-commit-outcome";
+                const options = Options{ .flush_threshold = 1 << 20, .storage = storage.storage() };
+                var backend = try Backend.open(std.testing.allocator, root_dir, options);
+                {
+                    var txn = try backend.beginWrite();
+                    defer txn.abort();
+                    try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+                    Backend.test_commit_fault = .{ .at = case.at, .err = error.InputOutput };
+                    defer Backend.test_commit_fault = null;
+                    try std.testing.expectError(case.expect, txn.commit());
+                }
+                {
+                    var read = try backend.beginRead();
+                    defer read.abort();
+                    const got = read.get(.{ .name = "docs" }, "doc:a") catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    try std.testing.expectEqual(case.visible, got != null);
+                }
+                backend.options.backend.read_only = true;
+                backend.close();
+                backend = try Backend.open(std.testing.allocator, root_dir, options);
+                defer backend.close();
+                var read = try backend.beginRead();
+                defer read.abort();
+                const got = read.get(.{ .name = "docs" }, "doc:a") catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                try std.testing.expectEqual(case.replayed, got != null);
+            }
         }
 
         test "lsm backend maintenance stats report retained wal debt across reopen and reset" {

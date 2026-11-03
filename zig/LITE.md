@@ -1249,8 +1249,14 @@ A kernel `flock` queue has no ordering, so a writer that releases and retries at
 once tends to win again and can starve the others. A `<sidecar>.q/` directory
 holds a CLH-style queue: each waiter holds an exclusive `flock` on its own
 `t-<ticket>` file and blocks only on the ticket directly ahead of it, so each
-release wakes one process. A crashed waiter or holder drops its ticket lock and
+release wakes one process. When `<sidecar>.q` would exceed the 255-byte name
+limit, the directory is named from a prefix of the sidecar name plus a hash.
+A crashed waiter or holder drops its ticket lock and
 the next ticket proceeds. Abandoned tickets (busy timeout expired) are skipped.
+The ticket counter carries a check value, so a torn write is detected and the
+counter rebuilt from the ticket files rather than read as a smaller number.
+Each grant deletes finished tickets below it, including those left by a holder
+that crashed mid-cleanup, so the directory holds only recent tickets.
 When nothing is queued, a writer takes the sidecar without a ticket. The sidecar
 `flock` remains the safety authority. Code or binaries that bypass the queue can
 delay a queued writer but cannot break exclusion. Background maintenance waits in

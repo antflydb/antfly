@@ -390,7 +390,9 @@ fn appendOne(state: anytype, events: *vopr.event.Sink, allocator: Allocator, slo
     errdefer state.allocator.free(payload);
     const lsn = state.wal.append(payload) catch |err| {
         const pending = state.pending_io_fault orelse return err;
-        const expected = switch (pending) {
+        // LSM-backed appends fail after the append attempt, so they report an
+        // unknown outcome instead of the raw device fault.
+        const expected = err == error.OutcomeUnknown or switch (pending) {
             .write => err == error.InjectedWriteFault,
             .sync => err == error.InjectedSyncFault,
             .partial_write => err == error.InjectedPartialWriteFault,
