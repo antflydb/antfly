@@ -35,8 +35,12 @@ not a guarantee that every schema/shape fits every device budget.
 For windows using the full word limit, set `long_document.window_words` to `4096`; the default
 remains `1024` for throughput. Windows include schema cost in exact tokenization
 and shrink only when the real encoded prompt capacity requires it. Fitting uses
-a bounded search for a uniform word budget, preserves overlap/global offsets,
-and never silently truncates input. Physical window groups shrink independently
+exact per-word token costs and prefix sums to select the largest fitting uniform
+word budget. Changing width moves window boundaries, so fitting checks candidates
+without assuming token counts are monotonic. The requested ceiling is prepared
+once when it fits; otherwise at most 4,096 candidate widths use indexed source
+geometry, without retokenizing the document for each candidate. Fitting preserves
+overlap/global offsets and never silently truncates input. Physical window groups shrink independently
 when aggregate batch work or memory limits require it. Workspace planning and
 execution use the same preparation and group admission paths.
 
@@ -91,7 +95,7 @@ Backing-OOM retries count against both budgets, and subdivisions stay within the
 original admitted group boundaries. Declared evidence-budget exhaustion reports
 its memory-limit error without speculative smaller-group retries.
 
-Final Debug validation passed **71 tests locally (4 skips)** and **65 CUDA tests
+At `2dc7086a03`, Debug validation passed **71 tests locally (4 skips)** and **65 CUDA tests
 on glowworm's NVIDIA GB10 (no skips)**. Both Metal and CUDA completed the full
 4096-body-word boundary and a 16381/16384-token prompt under the default work
 budget. Pinned CUDA parity covered window groups of 1/2/4 and an injected backing
@@ -120,6 +124,38 @@ To reproduce, extend the preceding focused command with
 `GLiNER bounded window composition pinned CUDA` for the learned checks. The
 receipt lists the exact scope and skip reasons; aggregate repository CI remains
 separate.
+
+### Exact fitting and complete-request diagnostic (2026-11-03)
+
+Window fitting now selects the largest valid uniform width using exact word-cost
+prefix sums and indexed terminal geometry. The former binary search could reject
+valid requests because changing width moves the partition boundaries. Regressions
+cover the reproduced width-12/width-10 case, exhaustive tokenized partitions,
+Unicode and both splitters, bounded tokenizer calls at a 4096-word ceiling, and
+all fitting allocation failures. The native OOM retry test now injects failure
+inside the learned encoder instead of relying on a platform-dependent whole-request
+6 MiB cap; retry completion passes on macOS and Linux.
+
+Fresh checks passed native/Metal/CUDA window parity and the 4096-body-word and
+16381/16384-token learned boundaries. The extracting suite passed all 37 tests.
+The [source-pinned receipt](../../../../bench/baselines/gliner-token-fitting-20261103.json)
+records the main suites, environment failures and successful reruns separately.
+
+A supplemental warm **in-process CUDA** comparison used the same Debug/reference
+implementation with preparation reuse disabled/enabled. After warming both modes,
+eight ABBA rounds measured 16 requests per mode and produced identical responses.
+Median latency fell from **146.6 to 104.7 ms**, and nearest-rank p95 from
+**147.6 to 105.4 ms** (about **1.40x** requests per unit time). Timing includes
+workspace/qualification planning, inference, global decoding, serialization and
+preparation-store teardown. Model/tokenizer loading, input JSON/schema parsing,
+HTTP transport/server queues and returned-response disposal are excluded. This
+is a shared-host diagnostic, not optimized HTTP-service throughput or an
+old-commit comparison.
+
+To reproduce on CUDA, set `ANTFLY_GLINER25_BASE_MODEL_DIR` to the pinned base
+artifact and `ANTFLY_GLINER_E2E_BENCH=1`, then run `inference-test -Dcuda=true
+-Doptimize=debug` with `'-Dtest-filter=boundary end-to-end CUDA benchmark'`.
+The benchmark is opt-in; its ordinary test run skips it.
 
 ## Current status
 

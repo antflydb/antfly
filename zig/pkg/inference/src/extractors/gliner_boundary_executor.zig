@@ -1639,3 +1639,171 @@ test "CUDA boundary managed Multi-Decide batches windows and recovers after canc
         std.debug.print("family_cuda_windows: windows={d} batched_serial_equal=true cancellation_recovered=true\n", .{window_count});
     }
 }
+
+fn exerciseNonmonotonicFitting(a: Allocator) !void {
+    const weights = [_]usize{ 1, 1, 1, 15, 30, 15, 1, 15, 15, 1, 30, 1, 30, 15, 1, 15, 1, 1, 1, 30, 15, 1, 1, 15 };
+    var text = std.ArrayListUnmanaged(u8).empty;
+    defer text.deinit(a);
+    for (weights) |weight| {
+        for (0..weight) |_| try text.append(a, 'a');
+        try text.append(a, ' ');
+    }
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "probe", .schema = .{ .entities = .{"x"} }, .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 12), .overlap_words = @as(usize, 0), .max_windows = @as(usize, 3) } }, .inputs = .{.{ .content = text.items }} }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+    var empty = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = "", .schema = &request.items[0].compiled }}, .{});
+    const prefix_and_terminal = empty.sequence_length;
+    empty.deinit();
+    var config = QualificationGeometryTest.config();
+    var identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+    identity.backbone = config.backbone;
+    const options = long_executor.Options{ .identity = identity, .processor = .{ .max_sequence_tokens = prefix_and_terminal + 103 }, .limits = .{ .window_batch_size = 1 } };
+    var receiver = PreparationReuseTest.Receiver{};
+    const fitted = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+    request.items[0].options.long_document.window_words = 10;
+    const valid = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(@as(usize, 3), fitted.window_count);
+    try std.testing.expectEqual(valid.prompt_tokens, fitted.prompt_tokens);
+    // Checking thousands of candidate widths must not multiply tokenizer work.
+    config.max_len = 4096;
+    request.items[0].options.long_document.window_words = 4096;
+    const before = tokenizer.calls;
+    const wide = try long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), &request.items[0], options, &receiver);
+    try std.testing.expectEqual(valid.prompt_tokens, wide.prompt_tokens);
+    try std.testing.expect(tokenizer.calls - before < 256);
+}
+
+test "boundary qualification fitting preserves valid nonmonotonic partitions" {
+    try exerciseNonmonotonicFitting(std.testing.allocator);
+}
+
+test "boundary qualification token fitting releases every failed allocation" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseNonmonotonicFitting, .{});
+}
+
+test "boundary qualification indexed fitting matches exhaustive tokenized partitions" {
+    const a = std.testing.allocator;
+    const documents = @import("../pipelines/gliner_boundary_long_document.zig");
+    const texts = [_][]const u8{ "İΣ a bc def 😀 https://x.test @owner a@b.test a bb ccc dddd ", "a bb ccc dddd eeeee ffffff ggggggg h i j k l!", "https://x.test a b c d e f https://y.test" };
+    for (texts) |text| for ([_]processor.WordSplitter{ .whitespace, .char }) |splitter| {
+        const raw = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "probe", .schema = .{ .entities = .{"x"} }, .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 12), .overlap_words = @as(usize, 1) } }, .inputs = .{.{ .content = text }} }, .{});
+        defer a.free(raw);
+        var request = try wire.parseJson(a, raw, .{});
+        defer request.deinit();
+        const item = &request.items[0];
+        item.options.word_splitter = splitter;
+        var tokenizer = QualificationGeometryTest.TokenizerProbe{};
+        var empty = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = "", .schema = &item.compiled }}, .{ .word_splitter = splitter });
+        const overhead = empty.sequence_length;
+        empty.deinit();
+        const config = QualificationGeometryTest.config();
+        var identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+        identity.backbone = config.backbone;
+        for ([_]usize{ 4, 8, 16, 24 }) |body_budget| {
+            const cap = overhead + body_budget;
+            var expected: ?struct { tokens: usize, windows: usize } = null;
+            var width: usize = 12;
+            while (width >= 2) : (width -= 1) {
+                var document = documents.plan(a, text, item.compiled.fingerprint, .{ .mode = .windowed, .word_splitter = splitter, .max_window_body_words = width, .overlap_words = 1 }) catch |err| switch (err) {
+                    error.InvalidLongDocumentLimits => continue,
+                    else => return err,
+                };
+                defer document.deinit();
+                var total: usize = 0;
+                var fits = true;
+                for (document.windows) |window| {
+                    var batch = processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = try document.windowText(window.index), .schema = &item.compiled }}, .{ .word_splitter = splitter, .max_text_words = width, .max_sequence_tokens = cap }) catch |err| switch (err) {
+                        error.BoundarySequenceLimitExceeded => {
+                            fits = false;
+                            break;
+                        },
+                        else => return err,
+                    };
+                    total += batch.sequence_length;
+                    batch.deinit();
+                }
+                if (fits) {
+                    expected = .{ .tokens = total, .windows = document.windows.len };
+                    break;
+                }
+            }
+            var receiver = PreparationReuseTest.Receiver{};
+            const result = long_executor.planGeometry(.native, a, &config, tokenizer.tokenizer(), item, .{ .identity = identity, .processor = .{ .max_sequence_tokens = cap }, .limits = .{ .window_batch_size = 1 } }, &receiver);
+            if (expected) |value| {
+                const actual = try result;
+                try std.testing.expectEqual(value.tokens, actual.prompt_tokens);
+                try std.testing.expectEqual(value.windows, actual.window_count);
+            } else if (result) |_| return error.TestUnexpectedResult else |err| {
+                if (err == error.OutOfMemory) return err;
+            }
+        }
+    };
+}
+
+test "boundary end-to-end CUDA benchmark measures complete warm requests" {
+    if (!@import("build_options").enable_cuda) return error.SkipZigTest;
+    const env = @import("antfly_platform").env;
+    if (!env.getenvBool("ANTFLY_GLINER_E2E_BENCH")) return error.SkipZigTest;
+    const directory = env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const factory = @import("../architectures/session_factory.zig");
+    const session = try factory.createCudaSession(a, directory);
+    defer session.close();
+    const config = try factory.getGlinerBoundaryConfig(session);
+    const identity = try factory.getGlinerBoundaryIdentity(session);
+    const path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(path);
+    const bytes = try @import("../util/c_file.zig").readFile(a, path);
+    defer a.free(bytes);
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, bytes);
+    defer tokenizer.tokenizer().deinitTokenizer();
+    const sentence = "The library indexes records and answers search queries. ";
+    const text = try a.alloc(u8, sentence.len * 64);
+    defer a.free(text);
+    for (0..64) |i| @memcpy(text[i * sentence.len ..][0..sentence.len], sentence);
+    const raw = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = "base",
+        .schema = .{ .entities = .{"concept"} },
+        .options = .{ .long_document = .{ .mode = "window", .window_words = @as(usize, 128), .overlap_words = @as(usize, 16) } },
+        .inputs = .{.{ .content = text }},
+    }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    const watchdog = try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a);
+    defer watchdog.destroy();
+    try watchdog.start(std.testing.io);
+    const control = Control{ .hard_cancellation = watchdog.boundary(), .deadline_ns = @import("antfly_platform").time.monotonicNs() + 600 * std.time.ns_per_s };
+    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    defer managed.deinit();
+    var expected: ?[]u8 = null;
+    defer if (expected) |response| a.free(response);
+    var totals = [_]u64{ 0, 0 };
+    // Warm both modes, then collect eight ABBA rounds (16 requests per mode). Identical learned dispatch policy and
+    // grouping isolate preparation reuse. Include final preparation-store free;
+    // exclude model/tokenizer loading, JSON parsing, transport and response free.
+    for (0..34) |sample| {
+        const reuse = if (sample < 2) sample == 1 else ((sample - 2) % 4 == 1 or (sample - 2) % 4 == 2);
+        var store = PreparationStore.init(a);
+        const options = Options{ .identity = identity, .control = control, .preparations = if (reuse) &store else null };
+        const start = @import("antfly_platform").time.monotonicNs();
+        const response = response: {
+            errdefer store.deinit();
+            _ = try workspaceGeometryFor(.cuda, a, &config, tokenizer.tokenizer(), &request, options);
+            var gate = try qualification.Admission.initResolved(identity, .cuda, &request, options.pipeline, control);
+            try qualifyRequestGeometry(&managed.backend, a, &config, tokenizer.tokenizer(), &request, options, &gate);
+            break :response try executeChecked(&managed.backend, a, &config, tokenizer.tokenizer(), &request, options, &gate);
+        };
+        defer a.free(response);
+        store.deinit();
+        const elapsed = @import("antfly_platform").time.monotonicNs() - start;
+        if (expected) |reference| try std.testing.expectEqualStrings(reference, response) else expected = try a.dupe(u8, response);
+        if (sample < 2) continue;
+        totals[@intFromBool(reuse)] += elapsed;
+        std.debug.print("e2e_bench backend=cuda policy=reference_v1 reuse={} ns={} response_bytes={}\n", .{ reuse, elapsed, response.len });
+    }
+    std.debug.print("e2e_bench total_without_ns={} total_with_ns={} equal_responses=true\n", .{ totals[0], totals[1] });
+}

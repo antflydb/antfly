@@ -596,9 +596,9 @@ fn prepareDocument(backend: compute.BackendKind, allocator: Allocator, config: *
 }
 
 // Fit complete prompts to actual processor/model capacity, independently of
-// measured qualification shapes. Search for a uniform word budget that fits
-// every exact tokenized window without imposing a measured context cap. This takes at most log2(word limit)
-// replans; no model executes during fitting and no document text is truncated.
+// measured qualification shapes. Exact per-word costs select a uniform width
+// without repeated document tokenization or a monotonic partition assumption.
+// No model executes during fitting and no document text is truncated.
 /// Serial, request-local store. The request, tokenizer and configuration must
 /// remain immutable and outlive this store; it is never shared across requests.
 /// All retained plans and token samples, including fitting trials, are bounded.
@@ -667,48 +667,116 @@ fn prepareTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, 
     return retained;
 }
 
+fn fittingCheckpoint(raw: *const anyopaque) !void {
+    const control: *const Control = @ptrCast(@alignCast(raw));
+    try control.check();
+}
+
+fn fittingWordCost(allocator: Allocator, tokenizer: Tokenizer, word: []const u8, options: processor.Options) !usize {
+    return processor.bodyWordTokenCost(allocator, tokenizer, word, options) catch |err| switch (err) {
+        // An unusable endpoint must not reject partitions that never use it.
+        error.BoundaryFragmentLimitExceeded, error.UnencodableBoundaryFragment, error.InvalidGlinerBoundaryTokenizer => options.max_sequence_tokens + 1,
+        else => return err,
+    };
+}
+
 fn fitTokenizedDocument(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options) !PreparedDocument {
-    var options = supplied;
+    var options = try resolveOptions(config, item, supplied);
     options.limits.plan.max_window_body_words = @min(options.limits.plan.max_window_body_words, options.processor.max_text_words);
     const planning = try qualification.longPlanning(config, item, options.limits.plan, options.control);
-    var upper = planning.max_window_body_words;
-    // A separate synthetic terminal word may need a slot in addition to one
-    // owned source word and overlap. Preserve explicitly smaller valid plans.
-    var lower = @min(upper, planning.overlap_words + 2);
-    var width = upper;
-    var best: ?PreparedDocument = null;
-    var refusal: anyerror = error.BoundarySequenceLimitExceeded;
-    errdefer if (best) |*value| value.deinit();
-    while (true) {
+    // Preserve the common path: a fitting ceiling is prepared exactly once.
+    var initial = try prepareDocument(backend, allocator, config, item, options);
+    var initial_live = true;
+    defer if (initial_live) initial.deinit();
+    if (try tokenizedDocumentFits(allocator, tokenizer, item, &initial)) {
+        initial_live = false;
+        return initial;
+    }
+    // Width changes repartition the document: fitting is NOT monotonic. Index
+    // exact independent word costs once, then inspect every candidate width
+    // using prefix sums and the same source geometry used by final execution.
+    const windows = @import("antfly_extracting").text_processing.windows;
+    var geometry = try windows.GeometryIndex.init(allocator, item.text, initial.document.words, planning.word_splitter, if (options.control) |*control| .{ .ptr = control, .check_fn = fittingCheckpoint } else null);
+    defer geometry.deinit();
+    const process = initial.process_options;
+    var prefix_options = process;
+    prefix_options.max_sequence_tokens = std.math.maxInt(i32);
+    prefix_options.max_batch_tokens = std.math.maxInt(i32);
+    var empty = try processor.prepare(allocator, tokenizer, &.{.{ .text = "", .schema = &item.compiled }}, prefix_options);
+    defer empty.deinit();
+    const empty_sample = empty.samples[0];
+    const period_word = empty_sample.words[empty_sample.words.len - 1];
+    const period_cost = period_word.input_end - period_word.input_start;
+    const prompt_cost = empty_sample.input_ids.len - period_cost;
+    const ranges = initial.document.words;
+    const sums = try allocator.alloc(usize, ranges.len + 1);
+    defer allocator.free(sums);
+    const endings = try allocator.alloc(usize, ranges.len);
+    defer allocator.free(endings);
+    sums[0] = 0;
+    for (ranges, 0..) |range, i| {
         try check(options);
-        options.limits.plan.max_window_body_words = width;
-        var planned = prepareDocument(backend, allocator, config, item, options) catch |err| {
-            // Too many windows means this trial width is too small, not that
-            // no admissible width exists. Search upward within the token cap.
-            if (err != error.LongDocumentWindowLimitExceeded) return err;
-            refusal = err;
-            lower = width + 1;
-            if (lower > upper) return best orelse refusal;
-            width = lower + (upper - lower) / 2;
-            continue;
-        };
-        const fits = tokenizedDocumentFits(allocator, tokenizer, item, &planned) catch |err| {
-            planned.deinit();
+        const word = item.text[range.start..range.end];
+        const cost = try fittingWordCost(allocator, tokenizer, word, process);
+        sums[i + 1] = try std.math.add(usize, sums[i], cost);
+        if (std.mem.indexOfScalar(u8, ".!?", word[word.len - 1]) != null) {
+            endings[i] = cost;
+        } else if (geometry.terminal_after_word[i]) {
+            endings[i] = try std.math.add(usize, cost, period_cost);
+        } else {
+            const suffixed = try std.mem.concat(allocator, u8, &.{ word, "." });
+            defer allocator.free(suffixed);
+            endings[i] = try fittingWordCost(allocator, tokenizer, suffixed, process);
+        }
+    }
+    if (ranges.len != 0 and ranges[ranges.len - 1].end < item.text.len)
+        endings[ranges.len - 1] = try std.math.add(usize, sums[ranges.len] - sums[ranges.len - 1], period_cost);
+    const scratch = try allocator.alloc(windows.Window, planning.max_windows);
+    defer allocator.free(scratch);
+    const minimum = planning.overlap_words + 1;
+    // Wider one-window plans have the same rejected prompt as the ceiling.
+    var width = @min(planning.max_window_body_words, ranges.len + @intFromBool(geometry.full_terminal));
+    var refusal: anyerror = error.BoundarySequenceLimitExceeded;
+    while (width > minimum) {
+        width -= 1;
+        try check(options);
+        var trial = planning;
+        trial.max_window_body_words = width;
+        const parts = geometry.planWindows(scratch, .{
+            .mode = trial.mode,
+            .word_splitter = trial.word_splitter,
+            .max_window_body_words = width,
+            .overlap_words = trial.overlap_words,
+            .max_windows = trial.max_windows,
+            .max_window_scan_bytes = trial.max_window_scan_bytes,
+        }) catch |err| {
+            if (err == error.LongDocumentWindowLimitExceeded or err == error.InvalidLongDocumentLimits or err == error.LongDocumentWorkLimitExceeded) {
+                refusal = err;
+                continue;
+            }
             return err;
         };
-        if (fits) {
-            if (best) |*value| value.deinit();
-            best = planned;
-            if (width == upper) return best.?;
-            lower = width + 1;
-        } else {
-            planned.deinit();
-            refusal = error.BoundarySequenceLimitExceeded;
-            upper = width - 1;
+        var fits = true;
+        for (parts) |part| {
+            const begin = part.words.start;
+            const end = part.words.end;
+            const body_cost = if (begin == end) period_cost else sums[end - 1] - sums[begin] + endings[end - 1];
+            if (prompt_cost + body_cost > process.max_sequence_tokens) {
+                fits = false;
+                break;
+            }
         }
-        if (lower > upper) return best orelse refusal;
-        width = lower + (upper - lower) / 2;
+        if (!fits) continue;
+        options.limits.plan.max_window_body_words = width;
+        // Release the failed ceiling before retaining the final token batches.
+        initial.deinit();
+        initial_live = false;
+        var result = try prepareDocument(backend, allocator, config, item, options);
+        errdefer result.deinit();
+        if (!try tokenizedDocumentFits(allocator, tokenizer, item, &result)) return error.BoundarySequenceLimitExceeded;
+        return result;
     }
+    return refusal;
 }
 
 fn tokenizedDocumentFits(allocator: Allocator, tokenizer: Tokenizer, item: *const wire.Item, planned: *PreparedDocument) !bool {
@@ -1344,18 +1412,10 @@ test "gliner boundary long executor evidence terminal allocation preserves backi
     try std.testing.expectEqual(error.Cancelled, evidenceAllocationError(terminal, error.Cancelled));
 }
 
-// Real memory pressure -- not a fake/synthetic backend -- against the pinned
-// base checkpoint: a bounded host allocator sized so the configured
-// window_batch_size=4 group's encode/head/score forward pass genuinely
-// cannot allocate, but a smaller group (down to one window) can. Calibrated
-// empirically (see this task's report) against this exact document/schema:
-// 6 MiB reliably forces at least one 4->2 shrink (and some positions shrink
-// further to 1) while still completing the whole document; 8 MiB and above
-// never needs to shrink at all. Picked comfortably inside that window so the
-// test exercises the retry path deterministically without being so tight it
-// fails even at group size 1 (which would make this a resource-exhaustion
-// test instead of a recovery test).
-test "gliner boundary long executor adaptive group shrink recovers from real encode-phase OutOfMemory pressure" {
+// Inject one real backing-allocation failure inside the learned native encoder.
+// A fixed whole-request byte ceiling also constrains retained decoder evidence
+// and is sensitive to platform allocation layout; it cannot isolate this retry.
+test "gliner boundary long executor adaptive group shrink recovers from injected encode-phase OutOfMemory" {
     const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const factory = @import("../architectures/session_factory.zig");
@@ -1397,9 +1457,33 @@ test "gliner boundary long executor adaptive group shrink recovers from real enc
     defer unbounded.deinit();
     try std.testing.expectEqual(@as(usize, 10), unbounded.window_count);
 
-    var pressure = BoundedAllocator{ .backing = a, .limit = 6 * 1024 * 1024 };
-    var result = try execute(&managed.backend, pressure.allocator(), &config, tokenizer.tokenizer(), item, options);
+    const Failure = struct {
+        allocator: std.testing.FailingAllocator,
+        armed: bool = false,
+        attempts: usize = 0,
+        fn observe(context: ?*anyopaque, event: observation.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (event != .phase) return;
+            if (event.phase == .tokenizing and self.allocator.has_induced_failure)
+                self.allocator.fail_index = std.math.maxInt(usize);
+            if (event.phase == .execution) {
+                self.attempts += 1;
+                if (!self.armed) {
+                    // Let the schema-pointer array allocate, then fail the
+                    // encoder's first allocation. Preparation already finished.
+                    self.allocator.fail_index = self.allocator.alloc_index + 1;
+                    self.armed = true;
+                }
+            }
+        }
+    };
+    var failure = Failure{ .allocator = std.testing.FailingAllocator.init(a, .{}) };
+    var retry_options = options;
+    retry_options.observer = .{ .context = &failure, .emit_fn = Failure.observe };
+    var result = try execute(&managed.backend, failure.allocator.allocator(), &config, tokenizer.tokenizer(), item, retry_options);
     defer result.deinit();
+    try std.testing.expect(failure.allocator.has_induced_failure);
+    try std.testing.expect(failure.attempts > (unbounded.window_count + options.limits.window_batch_size - 1) / options.limits.window_batch_size);
     try std.testing.expectEqual(@as(usize, 10), result.window_count);
     try std.testing.expect(result.sample.entities.len > 0);
     var mentions: usize = 0;

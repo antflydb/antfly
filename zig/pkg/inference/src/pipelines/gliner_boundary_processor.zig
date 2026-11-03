@@ -56,6 +56,21 @@ pub fn sourceWordRanges(a: Allocator, text: []const u8, options: WordRangeOption
     return shared_text.sourceWordRanges(a, text, .{ .word_splitter = options.word_splitter, .max_text_bytes = options.max_text_bytes, .max_words = options.max_words, .control = if (options.control) |*control| .{ .ptr = control, .check_fn = textCheckpoint } else null });
 }
 pub const terminalWordAdded = shared_text.terminalWordAdded;
+/// Exact independently encoded body-word cost, using the same Unicode
+/// lowering and fragment validation as normal preparation. No wrapper tokens.
+pub fn bodyWordTokenCost(a: Allocator, tokenizer: Tokenizer, word: []const u8, options: Options) !usize {
+    try options.check();
+    const lowered = try lowerTextWord(a, word);
+    defer a.free(lowered);
+    if (lowered.len > options.max_fragment_bytes) return error.BoundaryFragmentLimitExceeded;
+    const ids = try tokenizer.encode(a, lowered);
+    defer a.free(ids);
+    try options.check();
+    if (ids.len == 0) return error.UnencodableBoundaryFragment;
+    for (ids) |id| if (id < 0 or @as(usize, @intCast(id)) >= tokenizer.vocabSize()) return error.InvalidGlinerBoundaryTokenizer;
+    return ids.len;
+}
+
 pub const Word = struct {
     /// Lowercased body token, or verbatim synthetic enum-prefix fragment.
     text: []const u8,
