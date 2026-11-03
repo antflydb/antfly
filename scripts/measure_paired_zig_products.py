@@ -343,8 +343,20 @@ def main():
         parser.error(f"use a fresh report name: {logs}")
     logs.mkdir()
     shutil.copy2(__file__, logs / "measurement-tool.py")
+    # Use identical, retained sampling and attribution code for both revisions,
+    # including baselines predating the current collector protocol.
+    collector_root = logs / "collector"
+    collector_scripts = collector_root / "scripts"
+    collector_scripts.mkdir(parents=True)
+    collector_files = {}
+    for name in ("diagnose-zig-build-memory.sh", "summarize_zig_compile_memory.py"):
+        destination = collector_scripts / name
+        shutil.copy2(ROOT / "scripts" / name, destination)
+        collector_files[name] = sha(destination)
+    collector = collector_scripts / "diagnose-zig-build-memory.sh"
     report = {
         "tool_sha256": sha(Path(__file__)),
+        "collector_files_sha256": collector_files,
         "format_version": 1,
         "scope": args.scope,
         "qualification": False,
@@ -448,7 +460,7 @@ def main():
                 if args.jobs:
                     build.append(f"-j{args.jobs}")
                 command = [
-                    str(tree / "scripts/diagnose-zig-build-memory.sh"),
+                    str(collector),
                     "--zig-dir",
                     str(tree / "zig"),
                     "--out-dir",
@@ -535,9 +547,9 @@ def main():
                     row["capture_valid"] = code == 0 and valid_memory_capture(
                         memory, phase
                     )
-                row["collector_sha256"] = sha(
-                    tree / "scripts/diagnose-zig-build-memory.sh"
-                )
+                row["collector_sha256"] = collector_files[
+                    "diagnose-zig-build-memory.sh"
+                ]
                 report["runs"].append(row)
                 if not row["tracked_source_clean"]:
                     raise RuntimeError(
