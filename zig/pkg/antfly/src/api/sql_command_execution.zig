@@ -217,6 +217,29 @@ pub const Loan = struct {
     }
     /// Publication is local and does not inspect a cancelled request context.
     /// Independent maintenance subsequently owns all remaining control work.
+    /// Retire this exact owner after failed cleanup. An old copied loan can
+    /// never retire a newer command or a replacement backend.
+    fn retire(self: *Loan, a: A) !bool {
+        for (0..8) |_| {
+            var owned = try self.controller.load(a);
+            defer owned.deinit();
+            const prior = owned.value;
+            if (!prior.registration.lease.backend.eql(self.fence.backend)) return error.SqlConnectionChanged;
+            if (prior.recovery) {
+                self.finished.store(true, .release);
+                return true;
+            }
+            if (self.finished.load(.acquire) or prior.next_command > self.ticket.command.sequence) return false;
+            if (!std.meta.eql(prior.ticket, @as(?source.Ticket, self.ticket))) return error.SqlConnectionChanged;
+            source.requestRecovery(self.controller.store, self.controller.principal, prior) catch |err| switch (err) {
+                error.SqlConnectionChanged => continue,
+                else => return err,
+            };
+            self.finished.store(true, .release);
+            return true;
+        }
+        return error.SqlConnectionBusy;
+    }
     pub fn finish(self: *Loan, a: A) !void {
         if (self.finished.load(.acquire)) return;
         for (0..8) |_| {
@@ -334,6 +357,21 @@ pub const Request = struct {
             @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms >= self.signal.expires_at_ms.load(.acquire);
     }
     pub fn finish(self: *Request) !void {
-        if (self.loan) |*loan| try loan.finish(self.native.server.alloc);
+        if (self.loan) |*loan| {
+            const server = self.native.server;
+            if (self.signal.retire_required.load(.acquire)) {
+                if (try loan.retire(server.alloc)) {
+                    // Retirement is now durable. Only an unsealed session can
+                    // be detached; decided work stays in its recovery graph.
+                    if (@import("sql_connections.zig").load(loan.controller.store, server.alloc, loan.controller.connection, loan.controller.principal, loan.controller.node, 0)) |value| {
+                        var connection = value;
+                        defer connection.deinit();
+                        if (connection.value.active_txn) |id| _ = server.txn_sessions.removeBeforeExecution(server.alloc, id);
+                    } else |_| {}
+                }
+                return error.SqlMutationOutcomeUnknown;
+            }
+            try loan.finish(server.alloc);
+        }
     }
 };

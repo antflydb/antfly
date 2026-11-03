@@ -120,9 +120,9 @@ pub fn prepare(a: A, record: records.Record, resolver: ?@import("routine_binding
     const cast: ast.Scalar = .{ .cast = .{ .operand = expression, .type = result.kind.?, .element_type = result.element_type, .temporal_kind = result.temporal_kind, .coercion = .function, .context = .assignment } };
     const program = try a.create(scalar.Program);
     program.* = try scalar.bindTypedExpectedWithSettings(a, &cast, columns, descriptors, result, .{ .routines = resolver }, settings);
-    // Suspending external effects need their own retained invocation directory;
-    // do not let child ordinals alias the caller's sequence/decision receipts.
-    if (@import("decision_eval.zig").hasExternal(program)) return error.UnsupportedSqlShape;
+    // Scalar call frames retain each nested invocation's own suspended-effect
+    // slots. Binding must preserve the program's transitive effect shape so
+    // runtime ordering and transaction admission include catalog routines too.
     const resolved = try a.create(@import("routine_bindings.zig").Resolved);
     resolved.* = .{ .id = record.id, .generation = record.generation, .arguments = descriptors, .output = result, .program = program, .strict = record.definition.strict, .volatility = std.meta.stringToEnum(scalar.Volatility, @tagName(record.definition.volatility)).? };
     return resolved;

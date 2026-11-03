@@ -1208,6 +1208,7 @@ pub const DurableSessionStore = struct {
     registration_locks: [64]std.atomic.Mutex = @splat(.unlocked),
     fail_writes_for_test: bool = false,
     fail_command_finish_for_test: std.atomic.Value(bool) = .init(false),
+    fail_command_recovery_once_for_test: std.atomic.Value(bool) = .init(false),
     fail_savepoint_publication_for_test: ?enum { session, source } = null,
     fail_connection_publication_for_test: ?enum { source, resources, connection } = null,
     fail_lease_transition_after_session_write_for_test: bool = false,
@@ -1474,6 +1475,7 @@ pub const DurableSessionStore = struct {
         defer self.alloc.free(expiry_key);
         try self.rejectReferencedResurrection(txn, session);
         try self.preserveCompletionTxn(txn, session, false);
+        try self.putConnectionExecutionTxn(txn, session);
         try txn.put(session_key, session_value);
         try txn.put(expiry_key, &.{});
         if (sessionNeedsRecovery(session)) {
@@ -1940,6 +1942,39 @@ pub const DurableSessionStore = struct {
         try self.deleteSessionAndExpiryTxn(txn, key, txn_id);
     }
 
+    /// Compact execution admission, published with every connection-owned SQL
+    /// session write. Source completion must not decode staged rows or plans.
+    pub fn connectionExecutionPendingTxn(_: *DurableSessionStore, txn: anytype, txn_id: db_mod.types.TxnId, connection: [32]u8, principal: []const u8, node: u64) !bool {
+        var key: [96]u8 = undefined;
+        const raw = txn.get(try connectionExecutionKey(&key, txn_id)) catch |err| return if (err == error.NotFound) error.InvalidTransactionSessionRecord else err;
+        if (raw.len != 74 or raw[0] != 1 or raw[1] > 2 or !std.mem.eql(u8, raw[2..34], &connection) or std.mem.readInt(u64, raw[34..42], .big) != node) return error.InvalidTransactionSessionRecord;
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(principal, &hash, .{});
+        if (!std.mem.eql(u8, raw[42..74], &hash)) return error.InvalidTransactionSessionRecord;
+        return raw[1] == 1;
+    }
+
+    fn connectionExecutionKey(buffer: []u8, txn_id: db_mod.types.TxnId) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "\x00\x00__api_sql_execution__:{s}", .{&std.fmt.bytesToHex(txn_id, .lower)});
+    }
+
+    fn putConnectionExecutionTxn(_: *DurableSessionStore, txn: anytype, session: Session) !void {
+        const connection = session.connection_id orelse return;
+        var key: [96]u8 = undefined;
+        const name = try connectionExecutionKey(&key, session.txn_id);
+        var encoded: [74]u8 = undefined;
+        encoded[0] = 1;
+        encoded[1] = if (session.terminal_commit != null or session.terminal_abort or session.external_preparation_prepared) 2 else if (session.commit_execution_started) 1 else 0;
+        @memcpy(encoded[2..34], &connection);
+        std.mem.writeInt(u64, encoded[34..42], session.owner_node_id, .big);
+        std.crypto.hash.Blake3.hash(session.principal orelse "", encoded[42..74], .{});
+        if (txn.get(name) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        }) |previous| if (std.mem.eql(u8, previous, &encoded)) return;
+        try txn.put(name, &encoded);
+    }
+
     /// Reads the transaction under an existing connection write transaction,
     /// so terminal proof and committed setting values share its detach cut.
     pub fn loadSessionTxn(self: *DurableSessionStore, txn: anytype, txn_id: db_mod.types.TxnId) !?Session {
@@ -1972,6 +2007,7 @@ pub const DurableSessionStore = struct {
         defer self.alloc.free(expiry_key);
         try self.rejectReferencedResurrection(txn, session);
         try self.preserveCompletionTxn(txn, session, false);
+        try self.putConnectionExecutionTxn(txn, session);
         try txn.put(key, value);
         try txn.put(expiry_key, &.{});
         if (sessionNeedsRecovery(session)) {
@@ -1982,18 +2018,27 @@ pub const DurableSessionStore = struct {
     }
 
     fn deleteSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, txn_id: db_mod.types.TxnId) !void {
+        var connection_owned = false;
         if (txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         }) |raw| {
             var previous = try decodeSessionRecord(self.alloc, txn_id, raw);
             defer previous.deinit(self.alloc);
+            connection_owned = previous.connection_id != null;
             // Deletion and its terminal witness share one storage commit.
             if (previous.commit_execution_started and !sessionCompletionSettled(previous)) return error.SqlTransactionOutcomeUnknown;
             try self.preserveCompletionTxn(txn, previous, true);
             const expiry_key = try makeSessionExpiryKey(self.alloc, previous.last_touched_timestamp, txn_id);
             defer self.alloc.free(expiry_key);
             txn.delete(expiry_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+        if (connection_owned) {
+            var execution_key: [96]u8 = undefined;
+            txn.delete(try connectionExecutionKey(&execution_key, txn_id)) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
             };
@@ -10008,4 +10053,63 @@ test "distributed txn private COMMIT visibility adoption is monotone across cold
             }
         }
     }
+}
+
+test "durable SQL connection execution projection bounds reads and avoids unchanged writes" {
+    const Probe = struct {
+        bytes: [74]u8 = undefined,
+        present: bool = false,
+        reads: usize = 0,
+        writes: usize = 0,
+        fn get(self: *@This(), key: []const u8) ![]const u8 {
+            try std.testing.expect(std.mem.startsWith(u8, key, "\x00\x00__api_sql_execution__:"));
+            self.reads += 1;
+            if (!self.present) return error.NotFound;
+            return &self.bytes;
+        }
+        fn put(self: *@This(), _: []const u8, bytes: []const u8) !void {
+            try std.testing.expectEqual(self.bytes.len, bytes.len);
+            @memcpy(&self.bytes, bytes);
+            self.present = true;
+            self.writes += 1;
+        }
+    };
+    // The unopened backend cannot supply a session payload. All work must use
+    // the explicit transaction probe, bounded stack scratch and no allocator.
+    var backend: docstore_mod.DocStore = undefined;
+    var store = DurableSessionStore.init(std.testing.allocator, &backend);
+    var probe: Probe = .{};
+    const connection: [32]u8 = @splat('a');
+    var session: Session = .{ .txn_id = @splat(3), .owner_node_id = 7, .principal = @constCast("alice"), .connection_id = connection, .begin_timestamp = 1, .last_touched_timestamp = 1, .sync_level = .write };
+    try store.putConnectionExecutionTxn(&probe, session);
+    try std.testing.expectEqual(@as(usize, 1), probe.writes);
+    probe.reads = 0;
+    try std.testing.expect(!try store.connectionExecutionPendingTxn(&probe, session.txn_id, connection, "alice", 7));
+    try std.testing.expectEqual(@as(usize, 1), probe.reads);
+    for (0..100) |_| {
+        session.last_touched_timestamp += 1;
+        session.sequence_epoch += 1;
+        try store.putConnectionExecutionTxn(&probe, session);
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.writes);
+    session.commit_execution_started = true;
+    try store.putConnectionExecutionTxn(&probe, session);
+    try std.testing.expect(try store.connectionExecutionPendingTxn(&probe, session.txn_id, connection, "alice", 7));
+    try std.testing.expectEqual(@as(usize, 2), probe.writes);
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, store.connectionExecutionPendingTxn(&probe, session.txn_id, @splat('b'), "alice", 7));
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, store.connectionExecutionPendingTxn(&probe, session.txn_id, connection, "bob", 7));
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, store.connectionExecutionPendingTxn(&probe, session.txn_id, connection, "alice", 8));
+    session.terminal_abort = true;
+    try store.putConnectionExecutionTxn(&probe, session);
+    try std.testing.expect(!try store.connectionExecutionPendingTxn(&probe, session.txn_id, connection, "alice", 7));
+    try std.testing.expectEqual(@as(usize, 3), probe.writes);
+    probe.bytes[1] = 3;
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, store.connectionExecutionPendingTxn(&probe, session.txn_id, connection, "alice", 7));
+    probe.present = false;
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, store.connectionExecutionPendingTxn(&probe, session.txn_id, connection, "alice", 7));
+    probe = .{};
+    session.connection_id = null;
+    try store.putConnectionExecutionTxn(&probe, session);
+    try std.testing.expectEqual(@as(usize, 0), probe.reads);
+    try std.testing.expectEqual(@as(usize, 0), probe.writes);
 }

@@ -295,6 +295,17 @@ pub fn invoke(raw: *anyopaque, a: A, function: effects.Function, args: []const s
             try active(ptr);
         }
     };
+    // Decide from the invoked effect, after scalar STRICT/CASE/filter handling.
+    // This also covers effects hidden in SQL routines, operators and casts.
+    const transaction: ?Transaction = if (root.active_transaction) |id|
+        .{ .id = id, .subtransaction = root.active_subtransaction }
+    else if (root.implicit_advisory) |scope|
+        if (function.transactional() or scope.session.transaction_id != null)
+            .{ .id = try scope.transaction(), .subtransaction = 0 }
+        else
+            null
+    else
+        null;
     var port: producer.NativePort = .{ .server = root.server, .context = root.context };
     var owner: Owner = .{
         .frame = .{
@@ -307,7 +318,7 @@ pub fn invoke(raw: *anyopaque, a: A, function: effects.Function, args: []const s
         },
         .port = port.port(),
         .runtime = .{ .ptr = root, .now_ms = Hooks.now, .nonce = Hooks.nonce, .active = Hooks.active, .pause = Hooks.pause },
-        .transaction = if (root.active_transaction) |id| .{ .id = id, .subtransaction = root.active_subtransaction } else null,
+        .transaction = transaction,
     };
     return Owner.invoke(&owner, a, function, args);
 }

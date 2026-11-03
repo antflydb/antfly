@@ -769,6 +769,21 @@ test "SQL command producer native scoped rollback retains its durable abort and 
         defer waiting.deinit();
         try std.testing.expectEqual(.finishing, waiting.value.phase);
         try std.testing.expect(!waiting.value.recovery);
+        if (!rejected) {
+            // Do not run prepared-job maintenance. The source's own decision-
+            // gated outbox must release this transaction and admit the next
+            // command, including a lost release request/reply.
+            native.before = failed;
+            native.after = !failed;
+            for (0..64) |_| {
+                if (try phase(&durable) == .idle) break;
+                native.step(&durable, instance, 3) catch |err| switch (err) {
+                    error.MetadataMutationOutcomeUnknown => {},
+                    else => return err,
+                };
+            }
+            try std.testing.expectEqual(producer.Phase.idle, try phase(&durable));
+        }
         // The SQL outcome is terminal before ACK/reclamation; bounded native
         // cleanup can continue independently and must preserve session grants.
         for (0..8) |_| {
@@ -2393,5 +2408,333 @@ test "SQL command producer native enrolled HTTP requests own authority through c
         defer cut.deinit();
         try std.testing.expectEqual(@as(@TypeOf(cut.value.scope.?.state), .retired), cut.value.scope.?.state);
         try std.testing.expectEqual(@as(u32, 0), cut.value.owner.?.resources);
+    }
+}
+
+test "SQL command producer native autocommit advisory reads lazily decide and release transaction grants" {
+    const http = @import("http_server.zig");
+    const httpx = @import("httpx");
+    const Forward = struct {
+        native: *Native,
+        store: *transactions.DurableSessionStore,
+        io: std.Io = undefined,
+        mutex: std.Io.Mutex = .init,
+        effects: usize = 0,
+        cancel: *std.atomic.Value(bool),
+        cancel_effect: std.atomic.Value(bool) = .init(false),
+        fail_abort: std.atomic.Value(bool) = .init(false),
+        fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedStatusRead;
+        }
+        fn catalog(raw: *anyopaque, alloc: A, context: local.api_operation.RequestContext, input: Call) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.ensureActive();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (input == .sql_lock_mutate and input.sql_lock_mutate.operation == .effect) self.effects += 1;
+            if (input == .sql_prepared_read and input.sql_prepared_read == .operation and self.cancel.load(.acquire) and self.fail_abort.swap(false, .acq_rel)) {
+                self.store.fail_command_recovery_once_for_test.store(true, .release);
+                return error.GroupLeaderUnavailable;
+            }
+            if (input == .sql_routine_snapshot) return self.native.metadata.sqlRoutineSnapshot(alloc, group, input.sql_routine_snapshot, .{ .setting_admin = true });
+            switch (input) {
+                .sql_sequence_prepare => return alloc.dupe(u8, "{}"),
+                .sql_sequence_snapshot => |request| return self.native.metadata.sqlSequenceSnapshot(alloc, group, request, .{ .setting_admin = true }),
+                .sql_sequence_counter_mutate => |request| {
+                    const body = try std.json.Stringify.valueAlloc(alloc, request, .{});
+                    defer alloc.free(body);
+                    const command: storage.TransitionCommand = .{ .apply_sql_sequence_counter = body };
+                    if (self.native.replicated) {
+                        const encoded = try storage.encodeTransitionCommand(alloc, command);
+                        defer alloc.free(encoded);
+                        self.native.index += 1;
+                        const entries = try @import("../raft/state_machine/mod.zig").encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = self.native.index, .entry_type = .normal, .data = encoded }});
+                        defer alloc.free(entries);
+                        try self.native.metadata.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = self.native.index, .entries_bytes = entries });
+                    } else try self.native.metadata.applyStandaloneCommand(group, command);
+                    return std.json.Stringify.valueAlloc(alloc, try self.native.metadata.sqlSequenceCounterOutcome(alloc, group, request), .{});
+                },
+                .sql_sequence_counter_outcome => |request| return std.json.Stringify.valueAlloc(alloc, try self.native.metadata.sqlSequenceCounterOutcome(alloc, group, request), .{}),
+                else => {},
+            }
+            const bytes = try Native.call(self.native, alloc, input);
+            if (input == .sql_lock_mutate and input.sql_lock_mutate.operation == .effect and self.cancel_effect.load(.acquire)) {
+                self.cancel.store(true, .release);
+                alloc.free(bytes);
+                return error.Canceled;
+            }
+            return bytes;
+        }
+    };
+    const Case = struct { sql: []const u8, success: bool = true, resources: u32 = 0, cancel: bool = false, fail_abort: bool = false, effects: usize = 1, first: ?i64 = null, parameters: []const std.json.Value = &.{} };
+    const cases = [_]Case{
+        .{ .sql = "SELECT 1", .effects = 0 },
+        .{ .sql = "SELECT CASE WHEN false THEN pg_try_advisory_xact_lock(42) ELSE false END", .effects = 0 },
+        .{ .sql = "SELECT pg_try_advisory_xact_lock(NULL::bigint)", .effects = 0 },
+        .{ .sql = "SELECT pg_advisory_xact_lock(42)" },
+        .{ .sql = "SELECT pg_try_advisory_xact_lock(42), pg_try_advisory_xact_lock(42)", .effects = 2 },
+        .{ .sql = "SELECT pg_advisory_xact_lock_shared(-42,7), pg_try_advisory_xact_lock_shared(-42,7)", .effects = 2 },
+        .{ .sql = "SELECT pg_advisory_lock(42)", .resources = 1 },
+        .{ .sql = "SELECT pg_advisory_xact_lock(42), pg_advisory_unlock(42)", .effects = 2 },
+        .{ .sql = "SELECT pg_advisory_xact_lock(42), pg_advisory_lock(42)", .resources = 1, .effects = 2 },
+        .{ .sql = "SELECT pg_advisory_unlock(42)" },
+        .{ .sql = "SELECT 1 / CASE WHEN pg_try_advisory_xact_lock(42) THEN $1 ELSE 1 END", .parameters = &.{.{ .integer = 0 }}, .success = false },
+        .{ .sql = "SELECT pg_advisory_xact_lock(42)" },
+        .{ .sql = "SELECT hidden_lock(42::bigint)" },
+        .{ .sql = "SELECT hidden_lock(42::bigint), hidden_lock(43::bigint)", .effects = 2 },
+        .{ .sql = "SELECT CASE WHEN false THEN hidden_lock(42::bigint) ELSE false END", .effects = 0 },
+        .{ .sql = "WITH r AS MATERIALIZED (SELECT hidden_lock(42::bigint) AS x) SELECT x FROM r" },
+        .{ .sql = "SELECT pg_advisory_xact_lock(42)", .success = false, .cancel = true },
+        .{ .sql = "SELECT hidden_lock(42::bigint)", .success = false, .cancel = true },
+        .{ .sql = "SELECT hidden_lock(42::bigint)" },
+        .{ .sql = "EXPLAIN SELECT hidden_lock(42::bigint)", .effects = 0 },
+        .{ .sql = "SELECT hidden_lock(42::bigint) LIMIT 0", .effects = 0 },
+        .{ .sql = "SELECT hidden_lock(42::bigint) WHERE false", .effects = 0 },
+        .{ .sql = "SELECT hidden_lock(NULL::bigint)", .effects = 0 },
+        .{ .sql = "SELECT hidden_lock(42::bigint), hidden_lock(42::bigint)", .effects = 2 },
+        .{ .sql = "SELECT hidden_lock(42::bigint) UNION ALL SELECT hidden_lock(43::bigint)", .effects = 2 },
+        .{ .sql = "SELECT CASE WHEN hidden_lock(42::bigint) THEN hidden_lock(43::bigint) ELSE false END", .effects = 2 },
+        .{ .sql = "WITH r AS MATERIALIZED (SELECT hidden_lock(42::bigint) AS x) SELECT x,x FROM r" },
+        .{ .sql = "SELECT nextval('counter'), pg_advisory_xact_lock(42)", .first = 1 },
+        .{ .sql = "SELECT pg_advisory_xact_lock(42), nextval('counter')" },
+        .{ .sql = "SELECT hidden_counter('counter'), hidden_lock(42::bigint)", .first = 3 },
+        .{ .sql = "SELECT hidden_lock(42::bigint), hidden_counter('counter')" },
+        .{ .sql = "SELECT pg_advisory_xact_lock(42), hidden_counter('counter') / (hidden_counter('counter') - currval('counter'))", .success = false },
+        .{ .sql = "SELECT lastval()", .first = 6, .effects = 0 },
+        .{ .sql = "SELECT hidden_counter('counter'), pg_advisory_xact_lock(42), 1 / (hidden_counter('counter') - currval('counter'))", .success = false },
+        .{ .sql = "SELECT lastval()", .first = 8, .effects = 0 },
+        .{ .sql = "SELECT hidden_lock(42::bigint), hidden_counter('counter') / (hidden_counter('counter') - currval('counter'))", .success = false },
+        .{ .sql = "SELECT lastval()", .first = 10, .effects = 0 },
+        .{ .sql = "SELECT pg_advisory_xact_lock(42)", .success = false, .cancel = true, .fail_abort = true },
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/implicit-advisory-{any}", .{ tmp.sub_path, replicated });
+        defer a.free(path);
+        var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer metadata.deinit();
+        var source = transactions.DurableSessionStore.init(a, &metadata.store);
+        const now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+        var native: Native = .{ .metadata = &metadata, .replicated = replicated, .expiry_ms = now_ms + 60000, .database = "default", .principal = "" };
+        try setup(&metadata, &source, true, &native);
+        try native.until(&source, .idle, 2);
+        // Sequence admission needs the same constraint-name root as production
+        // startup. Drive the real bounded coordinator; no fabricated root or
+        // private registry keys stand in for its adoption/publication proofs.
+        var catalog_bootstrap: @import("../metadata/standalone_relation_reconciliation.zig").Coordinator = .{};
+        const bootstrap_deadline = @import("antfly_platform").time.monotonicNs() + 10 * std.time.ns_per_s;
+        var catalog_ready = false;
+        while (@import("antfly_platform").time.monotonicNs() < bootstrap_deadline) {
+            catalog_bootstrap.next_round_at_ns = 0;
+            _ = try catalog_bootstrap.step(&metadata, a, group, @splat('1'), 0, @import("antfly_platform").time.monotonicNs());
+            const work = try metadata.relationReconciliationWork(group);
+            if (work.current) |state| if (state.phase == .ready and state.coverage == .constraint_names and work.root != null and work.root.?.eql(local.system_catalog_relation_reconciliation.Generation.of(&state))) {
+                catalog_ready = true;
+                break;
+            };
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(catalog_ready);
+        const routines = @import("../system_catalog/routines.zig");
+        const definition: routines.Mutation = .{ .admission = .{ .nonce = id(999), .head = (try metadata.systemCatalogMeta(a, group)).sequence_outcome_head orelse 0 }, .target = .{ .table = "hidden_lock" }, .namespace_id = 2, .incarnation = @splat(0x11), .operation = .{ .publish = .{ .definition = .{ .arguments = &.{.{ .type = .{ .scalar = .int64 } }}, .result = .{ .scalar = .boolean }, .body = "SELECT pg_try_advisory_xact_lock($1)", .owner = .auth_disabled } } } };
+        const definition_bytes = try std.json.Stringify.valueAlloc(a, routines.command(definition), .{});
+        defer a.free(definition_bytes);
+        try metadata.applyStandaloneCommand(group, .{ .apply_system_catalog = definition_bytes });
+        const sequences = @import("../system_catalog/sequence_catalog.zig");
+        const counter: sequences.Mutation = .{ .admission = .{ .nonce = id(998), .head = try metadata.sqlSequenceAdmissionHead(group) }, .target = .{ .table = "counter" }, .namespace_id = 2, .incarnation = @splat(0x11), .operation = .{ .create = .{ .options = .{} } } };
+        const counter_bytes = try std.json.Stringify.valueAlloc(a, sequences.command(counter), .{});
+        defer a.free(counter_bytes);
+        try metadata.applyStandaloneCommand(group, .{ .apply_system_catalog = counter_bytes });
+        const counter_function: routines.Mutation = .{ .admission = .{ .nonce = id(997), .head = try metadata.sqlSequenceAdmissionHead(group) }, .target = .{ .table = "hidden_counter" }, .namespace_id = 2, .incarnation = @splat(0x11), .operation = .{ .publish = .{ .definition = .{ .arguments = &.{.{ .type = .{ .scalar = .text } }}, .result = .{ .scalar = .int64 }, .body = "SELECT nextval($1)", .owner = .auth_disabled } } } };
+        const function_bytes = try std.json.Stringify.valueAlloc(a, routines.command(counter_function), .{});
+        defer a.free(function_bytes);
+        try metadata.applyStandaloneCommand(group, .{ .apply_system_catalog = function_bytes });
+        var runtime = try local.storage_db_selected_root.db.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+        defer runtime.deinit();
+        var cancelled: std.atomic.Value(bool) = .init(false);
+        var forward: Forward = .{ .native = &native, .store = &source, .cancel = &cancelled };
+        var server = http.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .session_store = &source, .session_maintenance_local_only = true, .deployment_mode = .standalone }, .{ .ptr = &forward, .vtable = &.{ .status = Forward.status, .system_catalog = Forward.catalog, .supports_sql_routines = true, .supports_sql_sequences = true } }, null, null);
+        defer server.deinit();
+        forward.io = server.embedding_provider_runtime.io;
+        server.sql_connection_admission.instance = instance;
+        var handler: @import("httpx_handler.zig").AntflyApiHandler = .{ .api_server = &server };
+        for (cases, 0..) |case, ordinal| {
+            cancelled.store(false, .release);
+            forward.cancel_effect.store(case.cancel, .release);
+            forward.fail_abort.store(case.fail_abort, .release);
+            forward.mutex.lockUncancelable(forward.io);
+            const effects_before = forward.effects;
+            forward.mutex.unlock(forward.io);
+            var before = try connections.load(&source, a, connection, "", 0, now_ms);
+            defer before.deinit();
+            var request = try httpx.Request.init(a, .POST, "http://127.0.0.1/db/v1/sql");
+            defer request.deinit();
+            const body = try std.json.Stringify.valueAlloc(a, .{ .statement = case.sql, .connection_id = &connection, .parameters = case.parameters }, .{});
+            defer a.free(body);
+            request.body = body;
+            var context = httpx.Context.init(a, std.testing.io, &request);
+            defer context.deinit();
+            context.cancellation = &cancelled;
+            var response = try handler.executeSQL(&context);
+            defer response.deinit();
+            if ((response.status.code == 200) != case.success) std.debug.print("implicit advisory {d}: {s}: {s}\n", .{ ordinal, case.sql, response.body orelse "" });
+            try std.testing.expectEqual(case.success, response.status.code == 200);
+            if (case.first) |expected| {
+                var output = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+                defer output.deinit();
+                const value = output.value.object.get("rows").?.array.items[0].array.items[0];
+                const actual = switch (value) {
+                    .string => |text| try std.fmt.parseInt(i64, text, 10),
+                    .integer => |integer| integer,
+                    else => return error.TestExpectedInteger,
+                };
+                try std.testing.expectEqual(expected, actual);
+            }
+            var after = try connections.load(&source, a, connection, "", 0, now_ms);
+            defer after.deinit();
+            try std.testing.expectEqual(@import("sql_connection_record.zig").State.idle, after.value.state);
+            try std.testing.expect(after.value.active_txn == null);
+            // No SQL transaction is created for plain, untaken or STRICT-null
+            // effects. Native command permits alone do not revise a connection.
+            if (case.effects == 0) try std.testing.expectEqual(before.value.revision, after.value.revision);
+            if (case.fail_abort) {
+                var closing = (try producer.load(&source, a, connection)).?;
+                defer closing.deinit();
+                try std.testing.expect(closing.value.recovery);
+                try std.testing.expect(!source.fail_command_recovery_once_for_test.load(.acquire));
+                // Exercise the production source controller directly; this
+                // requires no prepared-work scanner or original SQL replay.
+                for (0..64) |_| {
+                    if (try phase(&source) == .retired) break;
+                    producer.advanceConnection(&server, a, connection, .none) catch |err| switch (err) {
+                        error.SqlConnectionChanged, error.MetadataMutationOutcomeUnknown => {},
+                        else => return err,
+                    };
+                }
+                try std.testing.expectEqual(producer.Phase.retired, try phase(&source));
+            }
+            // Observe under the same forwarding mutex as independent upkeep.
+            forward.mutex.lockUncancelable(forward.io);
+            const bytes = metadata.sqlLockRead(a, group, .{ .incarnation = @splat(0x11), .standalone = true, .actor = actor, .database = 1, .backend = .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 } }, .{ .setting_admin = true }) catch |err| {
+                forward.mutex.unlock(forward.io);
+                return err;
+            };
+            const effects_count = forward.effects;
+            forward.mutex.unlock(forward.io);
+            defer a.free(bytes);
+            var cut = try std.json.parseFromSlice(authority.Snapshot, a, bytes, .{});
+            defer cut.deinit();
+            if (cut.value.scope.?.transaction != null) std.debug.print("implicit advisory retained transaction at {d}: {s}\n", .{ ordinal, case.sql });
+            try std.testing.expect(cut.value.scope.?.transaction == null);
+            try std.testing.expectEqual(case.resources, cut.value.owner.?.resources);
+            if (case.effects != effects_count - effects_before) std.debug.print("implicit advisory effect count at {d}: {s}\n", .{ ordinal, case.sql });
+            try std.testing.expectEqual(case.effects, effects_count - effects_before);
+        }
+    }
+}
+
+test "SQL command producer native sealed execution fences completion before the connection marker across restart" {
+    const session_api = @import("sql_session.zig");
+    const prepared = @import("sql_prepared_coordinator.zig");
+    const Forward = struct {
+        fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedStatusRead;
+        }
+        fn catalog(raw: *anyopaque, alloc: A, _: local.api_operation.RequestContext, input: Call) anyerror![]u8 {
+            return Native.call(raw, alloc, input);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |replicated| {
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/sealed-before-marker-{any}", .{ tmp.sub_path, replicated });
+        defer a.free(path);
+        var txn_id: [16]u8 = undefined;
+        var ticket: producer.Ticket = undefined;
+        var fence: authority.scopes.CommandFence = undefined;
+        for (0..2) |pass| {
+            var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+            defer metadata.deinit();
+            var durable = transactions.DurableSessionStore.init(a, &metadata.store);
+            var native: Native = .{ .metadata = &metadata, .standalone = true, .replicated = replicated, .index = 100 + pass * 1000, .serial = 10000 * (pass + 1), .expiry_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + 60000, .database = "default", .block_cancel = true };
+            var runtime = try local.storage_db_selected_root.db.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+            defer runtime.deinit();
+            var server = @import("http_server.zig").ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .session_store = &durable, .session_maintenance_local_only = true, .deployment_mode = .standalone }, .{ .ptr = &native, .vtable = &.{ .status = Forward.status, .system_catalog = Forward.catalog } }, null, null);
+            defer server.deinit();
+            if (pass == 0) {
+                try setup(&metadata, &durable, true, &native);
+                try native.until(&durable, .idle, 2);
+                ticket = try begin(&native, &durable, 60);
+                fence = try execute(&durable, ticket);
+                var user: ?@import("http_server.zig").AuthenticatedIdentity = null;
+                var coordinator: session_api.Coordinator = .{ .server = &server, .identity = &user, .context = .{ .sql_command_fence = &fence } };
+                var adapter: session_api.Adapter = .{ .alloc = a, .registry = &server.txn_sessions, .node_id = 0, .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .rollback_fn = session_api.Coordinator.rollback, .connection_id = connection, .connection_revision = 1, .command_fence = &fence };
+                const scope: local.sql_session.Scope = .{ .principal = "alice" };
+                txn_id = (try adapter.owner().vtable.begin(&adapter, scope, .{ .isolation = .read_committed })).id;
+                var source = (try producer.load(&durable, a, connection)).?;
+                defer source.deinit();
+                try native.submit(source.value, .{ .bind = .{ .command = ticket.command, .transaction = txn_id } });
+                try native.submit(source.value, .{ .effect = .{ .command = ticket.command, .effect = .{ .backend = fence.backend, .sequence = 1, .nonce = id(71), .action = .{ .try_acquire = .{ .resource = @splat(7), .mode = .{ .advisory = .exclusive }, .scope = .session } } } } });
+                native.failure = .admit;
+                native.fail_before = true;
+                // Stop after the durable seal and unknown native admission,
+                // before Adapter.commit can write the logical uncertain marker.
+                const outcome = try session_api.Coordinator.commit(&coordinator, scope, txn_id);
+                try std.testing.expectEqual(local.sql_session.CommitOutcome.unknown, outcome.outcome);
+                try producer.finish(&durable, "alice", source.value, instance, ticket, try native.head(), native.nonce());
+            }
+            var connection_state = try connections.load(&durable, a, connection, "alice", 0, 2);
+            defer connection_state.deinit();
+            try std.testing.expectEqual(@import("sql_connection_record.zig").State.active, connection_state.value.state);
+            try native.step(&durable, instance, 3);
+            try std.testing.expectEqual(producer.Phase.finishing, try phase(&durable));
+            var cut = try nativeCut(&native, fence.backend, null);
+            defer cut.deinit();
+            try std.testing.expectEqualDeep(@as(?authority.scopes.Command, ticket.command), cut.value.scope.?.command);
+            if (pass == 0) continue;
+            // Cold recovery cancels only the exact absent admission, proves
+            // abort, releases its scope, and preserves the session grant.
+            native.block_cancel = false;
+            for (0..16) |_| {
+                var state = (try durable.load(txn_id)).?;
+                defer state.deinit(a);
+                if (state.external_receipt_acknowledged) break;
+                prepared.recoverSession(&server, txn_id, state.external_preparation.?, state.external_preparation_prepared, state.terminal_abort, state.terminal_commit != null) catch |err| switch (err) {
+                    error.MetadataMutationOutcomeUnknown => {},
+                    else => return err,
+                };
+            }
+            var terminal = (try durable.load(txn_id)).?;
+            defer terminal.deinit(a);
+            try std.testing.expect(terminal.terminal_abort and terminal.external_receipt_acknowledged);
+            var detached = try connections.loadReconciled(&durable, &server.txn_sessions, a, connection, "alice", 0, 3);
+            detached.deinit();
+            try native.until(&durable, .idle, 3);
+            var final = try nativeCut(&native, fence.backend, null);
+            defer final.deinit();
+            try std.testing.expect(final.value.scope.?.transaction == null);
+            try std.testing.expectEqual(@as(u32, 1), final.value.owner.?.resources);
+            // A subsequent BEGIN interrupted before session publication has no
+            // execution projection. Reconcile the beginning attachment rather
+            // than treating its missing session as an uncertain admission.
+            const next_ticket = try begin(&native, &durable, 71);
+            const next_fence = try execute(&durable, next_ticket);
+            var idle = try connections.load(&durable, a, connection, "alice", 0, 3);
+            defer idle.deinit();
+            _ = try connections.mutateWithCommand(&durable, .{ .begin = .{ .id = connection, .expected_revision = idle.value.revision, .txn_id = id(301) } }, "alice", 0, 3, &next_fence);
+            var next_source = (try producer.load(&durable, a, connection)).?;
+            defer next_source.deinit();
+            try producer.finish(&durable, "alice", next_source.value, instance, next_ticket, try native.head(), native.nonce());
+            for (0..8) |_| {
+                if (try phase(&durable) == .idle) break;
+                try producer.advanceConnection(&server, a, connection, .none);
+            }
+            try std.testing.expectEqual(producer.Phase.idle, try phase(&durable));
+            var reusable = try connections.load(&durable, a, connection, "alice", 0, 3);
+            defer reusable.deinit();
+            try std.testing.expectEqual(@import("sql_connection_record.zig").State.idle, reusable.value.state);
+            try std.testing.expect(reusable.value.active_txn == null);
+        }
     }
 }

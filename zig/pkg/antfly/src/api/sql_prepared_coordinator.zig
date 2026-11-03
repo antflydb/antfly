@@ -273,6 +273,30 @@ pub fn recoverSession(server: *http.ApiHttpServer, txn_id: [16]u8, bytes: []cons
     return recoverSessionWithContext(server, txn_id, bytes, prepared, aborted, committed, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s });
 }
 
+/// Drain only an already terminal local transaction's exact completion. This
+/// never admits a SQL body, scans the work queue, or changes its decision. An
+/// autocommit caller keeps its command loan until native scope release and ACK.
+pub fn drainSessionCompletion(server: *http.ApiHttpServer, txn_id: [16]u8, context: local.api_operation.RequestContext) !void {
+    const store = server.txn_sessions.durable orelse return error.SqlPreparedDurabilityUnavailable;
+    var quanta: u8 = 0;
+    while (true) {
+        try context.ensureActive();
+        var state = (try store.load(txn_id)) orelse return error.SqlTransactionNotActive;
+        defer state.deinit(server.alloc);
+        if (!state.terminal_abort and state.terminal_commit == null) return error.SqlTransactionOutcomeUnknown;
+        if (state.external_receipt_acknowledged) return;
+        recoverSessionWithContext(server, txn_id, state.external_preparation orelse return error.InvalidTransactionSessionRecord, state.external_preparation_prepared, state.terminal_abort, state.terminal_commit != null, context) catch |err| switch (err) {
+            error.MetadataMutationOutcomeUnknown => {},
+            else => return err,
+        };
+        quanta += 1;
+        if (quanta == 8) {
+            try server.embedding_provider_runtime.io.sleep(.fromMilliseconds(1), .awake);
+            quanta = 0;
+        }
+    }
+}
+
 fn recoverSessionWithContext(server: *http.ApiHttpServer, txn_id: [16]u8, bytes: []const u8, prepared: bool, aborted: bool, committed: bool, context: local.api_operation.RequestContext) !void {
     var region = std.heap.ArenaAllocator.init(server.alloc);
     defer region.deinit();

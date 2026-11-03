@@ -211,6 +211,118 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
 
 const ReceiptWaitBudget = @import("antfly_local_sources").sql_read_requirements.WaitBudget;
 
+/// A read already owns its statement snapshot and clock. Only its native
+/// advisory transaction lifetime is lazy: changing active_transaction halfway
+/// through evaluation would incorrectly change snapshot/staging semantics.
+const ImplicitAdvisory = struct {
+    root: *Adapter,
+    session: *@import("antfly_local_sources").sql_session.Session,
+    coordinator: *@import("sql_session.zig").Coordinator,
+    phase: enum { dormant, active, deciding, done } = .dormant,
+
+    pub fn transaction(self: *ImplicitAdvisory) ![16]u8 {
+        try self.root.context.ensureActive();
+        if (self.phase == .dormant) {
+            if (self.root.sequence_owner != null) {
+                // nextval may precede this first advisory effect. Publish its
+                // nontransactional postimage before BEGIN changes attachment.
+                try @import("sql_sequence_execution.zig").flush(self.root);
+                const store = self.root.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
+                var connection = try @import("sql_connections.zig").loadWithCommand(store, self.root.server.alloc, self.root.connection_id orelse return error.SqlConnectionNotFound, self.session.scope.principal, self.root.server.localSessionNodeId(), @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, self.root.context.sql_command_fence);
+                defer connection.deinit();
+                const owner: *@import("sql_session.zig").Adapter = @ptrCast(@alignCast(self.session.owner.ptr));
+                owner.connection_revision = connection.value.revision;
+            }
+            _ = try self.session.execute(.{ .begin = .{ .isolation = .read_committed } });
+            self.phase = .active;
+            if (self.root.sequence_owner) |owner| {
+                owner.transaction = self.session.transaction_id;
+                owner.flushed = false;
+            }
+        }
+        if (self.phase != .active) return error.SqlTransactionNotActive;
+        return self.session.transaction_id orelse error.SqlTransactionNotActive;
+    }
+
+    fn finish(self: *ImplicitAdvisory) !void {
+        if (self.phase == .dormant) return;
+        std.debug.assert(self.phase == .active);
+        try @import("sql_sequence_execution.zig").flush(self.root);
+        // Once decision admission starts, errors retain its reconciliation ID.
+        // Never turn a lost COMMIT reply into a second, contradictory ROLLBACK.
+        self.root.outcome_transaction_id = std.fmt.bytesToHex(self.session.transaction_id.?, .lower);
+        self.phase = .deciding;
+        const result = self.session.execute(.commit) catch |err| {
+            // A definite pre-seal error may still use bounded rollback. Once
+            // sealed, the source and decision journal own recovery instead.
+            var state = self.root.server.txn_sessions.getSqlState(self.root.server.alloc, self.session.transaction_id.?) catch return error.SqlTransactionOutcomeUnknown;
+            defer if (state) |*value| value.deinit(self.root.server.alloc);
+            if (state) |value| {
+                if (!value.execution_started and value.terminal == null and !value.terminal_prepare and !value.terminal_abort) self.phase = .active;
+            }
+            return err;
+        };
+        const commit = result.commit orelse return error.InvalidSqlBackendResponse;
+        switch (commit.outcome) {
+            .committed, .committed_pending, .committed_repair_required => {
+                try @import("sql_prepared_coordinator.zig").drainSessionCompletion(self.root.server, commit.reconciliation_id, self.coordinator.context);
+                self.phase = .done;
+            },
+            .aborted => return @import("antfly_local_sources").sql_session.abortError(commit),
+            .unknown => return error.SqlTransactionOutcomeUnknown,
+        }
+    }
+
+    fn abort(self: *ImplicitAdvisory) !void {
+        if (self.phase != .active) return;
+        errdefer self.retireFailedOwner();
+        // Request cancellation must not orphan an implicit transaction's
+        // grants. This is bounded control work using the original command
+        // fence; the accepting writer still rejects lost/expired authority.
+        const previous = self.coordinator.context;
+        defer self.coordinator.context = previous;
+        self.coordinator.context.cancellation = .none;
+        self.coordinator.context.deadline_io = null;
+        self.coordinator.context.deadline_ns = @import("antfly_platform").time.monotonicNs() +| std.time.ns_per_s;
+        self.root.outcome_transaction_id = std.fmt.bytesToHex(self.session.transaction_id.?, .lower);
+        const id = self.session.transaction_id.?;
+        // PostgreSQL sequence session state survives statement rollback. Flush
+        // it while its exact connection attachment is still present.
+        try @import("sql_sequence_execution.zig").flush(self.root);
+        _ = try self.session.execute(.rollback);
+        try @import("sql_prepared_coordinator.zig").drainSessionCompletion(self.root.server, id, self.coordinator.context);
+        self.phase = .done;
+    }
+    fn retireFailedOwner(self: *ImplicitAdvisory) void {
+        // An implicit transaction must not become a client-owned explicit
+        // transaction after cleanup fails. Close through the existing durable
+        // source outbox; native decision barriers still precede lock release.
+        const store = self.root.server.txn_sessions.durable orelse return;
+        const connection = self.root.connection_id orelse return;
+        const fence = self.root.context.sql_command_fence orelse return;
+        self.root.server.sql_connection_admission.requireRetirement(self.root.server.embedding_provider_runtime.io, .init(connection, self.session.scope.principal), fence.command);
+        for (0..8) |_| {
+            var current = (producer.load(store, self.root.server.alloc, connection) catch return) orelse return;
+            defer current.deinit();
+            if (current.value.ticket == null or !std.meta.eql(current.value.ticket.?.command, fence.command) or
+                !current.value.registration.lease.backend.eql(fence.backend)) return;
+            if (!current.value.recovery) producer.requestRecovery(store, current.value.principal, current.value) catch |err| switch (err) {
+                error.SqlConnectionChanged => continue,
+                else => return,
+            };
+            // The durable closure intent now prevents another body from taking
+            // this owner. An unsealed implicit transaction can be detached;
+            // a sealed decision remains in the existing recovery graph.
+            if (self.session.transaction_id) |id| if (self.root.server.txn_sessions.removeBeforeExecution(self.root.server.alloc, id)) {
+                self.session.transaction_id = null;
+                self.root.outcome_transaction_id = null;
+            };
+            return;
+        }
+    }
+    const producer = @import("sql_command_producer.zig");
+};
+
 pub const Adapter = struct {
     const StatementCommand = struct {
         adapter: *Adapter,
@@ -337,6 +449,9 @@ pub const Adapter = struct {
     result_session_id: ?[32]u8 = null,
     transaction_status: @import("antfly_local_sources").sql_session.Status = .idle,
     active_transaction: ?[16]u8 = null,
+    /// Borrowed only while an autocommit read is executing. Bound routines,
+    /// operators and casts reach the same provider as direct SQL calls.
+    implicit_advisory: ?*ImplicitAdvisory = null,
     active_subtransaction: u64 = 0,
     active_write_version: ?u64 = null,
     accepted_lake_repeatable: bool = false,
@@ -854,6 +969,14 @@ pub const Adapter = struct {
             }
             return result;
         }
+        // Allocate no transaction until a transaction-scoped effect actually
+        // executes. Parser flags cannot see effects hidden inside bound routines
+        // and would start unnecessary transactions for untaken CASE branches.
+        var advisory_scope: ImplicitAdvisory = .{ .root = self, .session = &session, .coordinator = &coordinator };
+        std.debug.assert(self.implicit_advisory == null);
+        self.implicit_advisory = &advisory_scope;
+        defer self.implicit_advisory = null;
+        errdefer advisory_scope.abort() catch {};
         var statement_backend = guarded_backend orelse self.backend();
         statement_backend.statement_clock = .{ .source = statement_source, .statement = statement_instant, .transaction = statement_instant };
         statement_backend.transaction_start = statement_instant;
@@ -862,13 +985,22 @@ pub const Adapter = struct {
         if (self.read_delivery) |delivery| if (self.session_id == null and compiled.statement == .select) {
             if (try @import("antfly_local_sources").sql_read_stream.Stream.openOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), statement_backend, compiled, parameters, limits)) |stream| {
                 defer stream.close();
-                return delivery.deliver(delivery.ptr, alloc, stream);
+                var result = delivery.deliver(delivery.ptr, alloc, stream) catch |err| {
+                    zig017_return_error = err;
+                    return err;
+                };
+                errdefer result.deinit();
+                try advisory_scope.finish();
+                return result;
             }
         };
-        return @import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), statement_backend, compiled, parameters, limits) catch |zig017_err| {
-            zig017_return_error = zig017_err;
-            return zig017_err;
+        var result = @import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), statement_backend, compiled, parameters, limits) catch |err| {
+            zig017_return_error = err;
+            return err;
         };
+        errdefer result.deinit();
+        try advisory_scope.finish();
+        return result;
     }
 
     // Both tables have static storage. Runtime fields inside an address-of
@@ -918,6 +1050,14 @@ pub const Adapter = struct {
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
         return .{ .prepare_definition_copy = .{ .ptr = self, .prepare = @import("sql_definition_copy.zig").prepare }, .named_type_resolver = if (self.server.source.vtable.supports_sql_types) .{ .ptr = self, .resolve = @import("sql_type_schema.zig").bindCast } else null, .resolve_declared_types = if (self.server.source.vtable.supports_sql_types) .{ .ptr = self, .resolve = @import("sql_type_schema.zig").bindDeclaredColumns } else null, .validate_persisted_expressions = .{ .ptr = self, .validate = @import("sql_persisted_expressions.zig").validate }, .copy_filter = self.copy_filter, .notice_sink = self.notice_sink, .procedure_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bindProcedure } else null, .routine_resolver = if (self.server.source.vtable.supports_sql_routines) .{ .ptr = self, .resolve = @import("sql_routine_execution.zig").bind, .resolve_operator = @import("sql_routine_execution.zig").bindOperator, .resolve_aggregate = @import("sql_routine_execution.zig").bindAggregate, .resolve_cast = @import("sql_routine_execution.zig").bindCast } else null, .sequence_resolver = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .resolve = @import("sql_sequence_execution.zig").bind } else null, .advisory_provider = if (self.context.sql_command_fence != null) .{ .ptr = self, .invoke = @import("sql_advisory_execution.zig").invoke } else null, .sequence_provider = if (self.server.source.vtable.supports_sql_sequences) .{ .ptr = self, .invoke = @import("sql_sequence_execution.zig").invoke, .flush = @import("sql_sequence_execution.zig").flush } else null, .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null or self.pending_transaction_cut != null) .{ .ptr = self, .validate = validatePreparedExecution } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_text_predicates = true, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .statement_mutations = if (self.active_transaction != null and self.range_reads != null) .{ .ptr = self, .begin = beginCommand } else null, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.dynamic_snapshot == null and self.pending_transaction_cut == null and self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null or self.pending_transaction_cut != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
+    }
+
+    /// Effect providers follow lazy advisory attachment without changing the
+    /// row-read/staging path midway through the statement.
+    pub fn effectTransaction(self: *const Adapter) ?[16]u8 {
+        if (self.active_transaction) |id| return id;
+        if (self.implicit_advisory) |scope| return scope.session.transaction_id;
+        return null;
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {

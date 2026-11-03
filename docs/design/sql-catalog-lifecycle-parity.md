@@ -18279,3 +18279,38 @@ records the remaining automatic enrollment, metadata guards, pgwire/portal,
 implicit advisory transaction and participant activation requirements. Original
 counts remain 912 implemented, 138 rejected, 449 superseded and 87 unresolved
 (64 DDL/catalog). No unsupported original is reclassified by this cohort.
+
+### Implicit advisory lifetimes, sequence state and native completion
+
+The shared adapter now starts one SQL transaction at the first executed
+transaction-scoped advisory effect, including catalog routine calls, without
+changing the statement's row snapshot or adding transaction work to plain reads
+and untaken branches. Invocation-owned frames retain nested effects. Sequence
+owners follow either ordering of sequence and advisory effects; nontransactional
+`currval`/`lastval` state survives statement rollback.
+
+Implicit completion drains its exact native release and receipt ACK. Source
+completion can independently deliver decision-gated release quanta. A failed
+abort and a failed first retirement write cannot become an ordinary FINISH:
+command-specific admission intent makes finalization retry retirement, while
+closing maintenance preserves sealed decisions and removes unsealed staging.
+
+A fixed 74-byte execution projection shares session/lease publication and
+retirement transactions. It prevents completion from invalidating a sealed
+admission whose best-effort connection marker was not written, with one bounded
+read and no unchanged-projection writes. Cold campaigns also cover interrupted
+BEGIN before session publication. The source gate passes 49 cases, and the
+PostgreSQL 18 scalar/lifetime oracle passes 221 assertions.
+
+The original inventory remains 912 implemented, 138 rejected, 449 superseded and
+87 unresolved (64 DDL/catalog). Automatic connection enrollment still requires
+metadata mutation guards; pgwire ownership and distributed row/table enrollment
+remain open. [SQL lock ownership](sql-lock-ownership.md#lazy-implicit-advisory-transactions-and-independent-completion)
+records these boundaries and the separate stored-body constant-reference
+admission requirement. No original case is credited from component qualification.
+
+The final formatted combined Debug qualification passes 118/118 build steps,
+including 49 source/controller, 42 native-result, two mounted routine/prepared,
+and the mounted transaction lifecycle plus 18 lifecycle contract cases. There
+are no skips, failures or leaks; formatting and the source/control, license,
+Apache-boundary and inventory audits pass.

@@ -1058,7 +1058,85 @@ Apache-boundary, control-catalog and original-inventory checks pass.
 
 This wires enrolled connections; automatic enrollment of newly opened public
 connections still needs the remaining metadata publication guards. Pgwire
-connection/portal ownership, implicit advisory transaction scopes and row/table
-participant enrollment also remain open. The original inventory is unchanged:
+connection/portal ownership and row/table participant enrollment also remain open.
+Implicit advisory lifetimes are addressed by the following section. The original inventory is unchanged:
 **87 unresolved, including 64 DDL/catalog cases**. These remaining activation
 requirements are not claimed by the enrolled-connection fixtures.
+
+## Lazy implicit advisory transactions and independent completion
+
+Autocommit evaluation pins a lazy advisory transaction owner on the shared SQL
+adapter. The first executed transaction-scoped advisory effect begins one durable
+SQL transaction. Later effects, including session effects in the same statement,
+share its binding. Plain reads, untaken branches, STRICT null calls and
+preparation do not create a SQL transaction. Invocation-time admission includes
+catalog-bound routines, operators and casts without guessing their effect shape
+from the outer SQL text. The read keeps its original statement snapshot and
+clock; starting its advisory scope does not switch its row-read or staging path.
+Catalog scalar routine binding now preserves transitive external-effect metadata
+and uses the evaluator's existing invocation-owned suspension frames.
+
+Successful implicit completion adopts the durable decision and drains the exact
+session's native release/receipt ACK before exposing the result. Error cleanup
+uses bounded control with the original accepting-writer fence independently of
+request cancellation. Failure of that cleanup retires the connection through the
+durable source outbox, rather than exposing an implicit transaction as a new
+explicit client transaction. A sealed or unknown decision is never replaced by
+another SQL execution or a contradictory rollback.
+
+Command-source completion also delivers decision-gated transaction release
+through its own outbox. Each observation stages or delivers one exact quantum;
+lost requests/replies resume that admission. This allows the independent source
+lane to free a decided connection without the prepared-work scanner. Session
+grants survive ordinary transaction release. Native decision validation remains
+a prerequisite, and an uncertain admission still blocks command completion.
+
+Sealed execution and a connection's best-effort uncertain marker can become
+visible in separate local commits. A fixed 74-byte projection of session owner,
+principal and execution state now accompanies every connection-owned session
+publication, including lease transfers. Source completion reads that fact and the
+connection in one native cut, so a missing uncertain marker cannot invalidate a
+still-arriving admission. This does not load staged rows or execution plans.
+Unchanged facts do not produce additional LSM writes; connectionless sessions do
+not allocate this projection. Session retirement removes it atomically.
+
+Automatic public connection enrollment still requires the remaining metadata
+publication guards. Pgwire connection/portal ownership and distributed row/table
+participant enrollment remain separate activation requirements. No original case
+is reclassified by this component and enrolled-ingress work.
+
+Sequence effects use the current effect attachment independently of row staging.
+When `nextval` precedes the first advisory transaction effect, its nontransactional
+session postimage is flushed before BEGIN, and the existing sequence owner then
+follows the new attachment. When it follows that effect, its owner binds directly
+to the lazy transaction. Rollback flushes sequence session state before detaching,
+preserving PostgreSQL `currval`/`lastval` behavior after expression errors. Native
+fixtures drive the real catalog adoption/publication coordinator before creating
+sequences. An interrupted BEGIN without a session projection instead uses the
+existing exact connection reconciliation; it cannot be mistaken for a sealed
+admission or leave the source blocked on a missing record.
+
+A separate definition-admission gap remains for constant sequence names inside
+stored SQL bodies: native body validation needs the caller's authenticated
+namespace resolution and exact sequence identity proofs, checked again by the
+receiving writer. Dynamic sequence arguments use the existing invocation lookup.
+Do not suppress native reference validation to enable constants. String-body
+validation proofs must also remain distinct from stored dependency edges, so
+DROP/recreate and execution-time lookup retain PostgreSQL's semantics.
+
+Failed cleanup also marks a command-specific retirement requirement on its live
+admission signal before attempting local publication. The request finalizer
+therefore publishes retirement instead of ordinary FINISH if the first retirement
+write fails and storage recovers before finalization. If that retry also fails,
+the source remains executing and cannot be adopted by another request. Closing
+source maintenance retries removal of unsealed local staging; sealed decisions
+remain intact. The fault campaign fails both decision lookup and the first
+retirement write, then verifies retirement, detached local state and native cleanup.
+
+Final qualification passes **118/118 Debug build steps**: **49 source/controller
+cases**, **42 native-result cases**, **two mounted routine/prepared cases**, the
+mounted transaction lifecycle case and **18 transaction lifecycle contracts**,
+without skips, failures or leaks. The PostgreSQL 18 oracle passes **221
+assertions**, including mixed sequence/advisory ordering and error postimages.
+Formatting, license, Apache-boundary, control-catalog and inventory audits pass.
+The original inventory remains unchanged at **87 unresolved (64 DDL/catalog)**.

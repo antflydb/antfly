@@ -104,7 +104,12 @@ pub const Record = struct {
                 },
                 .fence => if (self.phase != .fencing) return error.InvalidSqlConnection,
                 .renew => |renewal| if ((self.phase != .idle and self.phase != .ready and self.phase != .executing and self.phase != .finishing) or renewal.expected_expiry != self.registration.lease.expires_at_ms or renewal.expires_at_ms <= renewal.expected_expiry) return error.InvalidSqlConnection,
-                .release => if (self.phase != .closing) return error.InvalidSqlConnection,
+                .release => |transaction| {
+                    if (self.phase != .closing and self.phase != .finishing) return error.InvalidSqlConnection;
+                    // A normal completion can only deliver an independently
+                    // sealed decision, never abandon a live transaction.
+                    if (self.phase == .finishing and transaction.decision == null) return error.InvalidSqlConnection;
+                },
                 .close_step => if (self.phase != .closing) return error.InvalidSqlConnection,
                 else => return error.InvalidSqlConnection,
             }
@@ -295,27 +300,35 @@ fn readIndexedTxn(a: A, txn: anytype, id: [32]u8) !?std.json.Parsed(Record) {
     if (indexed != (found != null and found.?.value.phase != .retired)) return error.InvalidSqlConnection;
     return found;
 }
+fn uncertainConnectionTxn(store: *transactions.DurableSessionStore, a: A, txn: anytype, id: [32]u8) !bool {
+    var found = connections.loadTxn(txn, a, &id) catch |err| switch (err) {
+        error.SqlConnectionNotFound => return false,
+        else => return err,
+    };
+    defer found.deinit();
+    // An interrupted BEGIN can precede session/header publication. Finishing
+    // has no live body, so its normal connection reconciliation owns aborting
+    // that exact beginning attachment before admission can proceed.
+    if (found.value.state == .uncertain or found.value.state == .beginning) return true;
+    const transaction = found.value.active_txn orelse return false;
+    // Sealing and native delivery precede the best-effort connection marker.
+    // A failed marker write cannot let FINISH invalidate a still-arriving
+    // admission. The compact fact and connection share this native read cut.
+    return store.connectionExecutionPendingTxn(txn, transaction, id, found.value.principal, found.value.owner_node_id);
+}
 fn uncertainConnection(store: *transactions.DurableSessionStore, a: A, id: [32]u8) !bool {
-    var found = switch (store.backend) {
+    return switch (store.backend) {
         .docstore => |backend| blk: {
             var txn = try backend.beginReadTxn();
             defer txn.abort();
-            break :blk connections.loadTxn(&txn, a, &id) catch |err| switch (err) {
-                error.SqlConnectionNotFound => return false,
-                else => return err,
-            };
+            break :blk try uncertainConnectionTxn(store, a, &txn, id);
         },
         .runtime => |backend| blk: {
             var txn = try backend.beginRead();
             defer txn.abort();
-            break :blk connections.loadTxn(&txn, a, &id) catch |err| switch (err) {
-                error.SqlConnectionNotFound => return false,
-                else => return err,
-            };
+            break :blk try uncertainConnectionTxn(store, a, &txn, id);
         },
     };
-    defer found.deinit();
-    return found.value.state == .uncertain;
 }
 fn loadMode(store: *transactions.DurableSessionStore, a: A, id: [32]u8, comptime indexed: bool) !?std.json.Parsed(Record) {
     return switch (store.backend) {
@@ -593,6 +606,7 @@ fn sameRegistration(left: authority.scopes.Registration, right: authority.scopes
 }
 
 pub fn requestRecovery(store: *transactions.DurableSessionStore, principal: []const u8, prior: Record) !void {
+    if (store.fail_command_recovery_once_for_test.swap(false, .acq_rel)) return error.InjectedSessionStoreFailure;
     try prior.validate(store.alloc);
     if (prior.recovery or prior.phase == .retired) return;
     var next = prior;
@@ -773,10 +787,27 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
                 // merely because no native decision has been installed yet.
                 if (try uncertainConnection(store, a, prior.registration.connection)) return;
                 if (!std.meta.eql(scope.completed, @as(?authority.scopes.Command, prior.ticket.?.command))) {
-                    // A terminal SQL receipt can precede bounded transaction
-                    // lock cleanup. Wait for the existing decision controller;
-                    // finishing may not fence the backend's session grants.
-                    if (scope.releasing or (scope.transaction != null and scope.transaction.?.decision != null)) return;
+                    // A terminal SQL receipt can precede native lock cleanup.
+                    // Deliver one decision-gated release quantum through this
+                    // source's exact outbox, independently of the work scanner.
+                    // The accepting writer validates the sealed decision; a
+                    // finishing command must never fence away session grants.
+                    if (scope.transaction) |transaction| if (transaction.decision != null) {
+                        if (!std.meta.eql(scope.command, @as(?authority.scopes.Command, prior.ticket.?.command))) return error.InvalidSqlBackendResponse;
+                        const operation: @FieldType(authority.Request, "operation") = .{ .release = transaction };
+                        if (std.meta.eql(prior.pending.?.operation, operation) and !expired(prior.pending.?, cut.head)) {
+                            if (try port.deliver(a, prior.pending.?)) |failure| {
+                                if (failure != .CatalogPublicationProofPending) {
+                                    next.failure = failure;
+                                    next.recovery = true;
+                                }
+                            }
+                        }
+                        next.pending = next.controlRequest(cut.head, nonce, operation);
+                        try replace(store, principal, prior, next);
+                        return;
+                    };
+                    if (scope.releasing) return error.InvalidSqlBackendResponse;
                     if (!std.meta.eql(scope.command, @as(?authority.scopes.Command, prior.ticket.?.command))) return error.InvalidSqlBackendResponse;
                     // Completion owns abandoned effect cleanup, not SQL replay.
                     // Each observation stages/delivers at most one exact native
@@ -945,6 +976,19 @@ pub fn advanceConnection(server: *@import("http_server.zig").ApiHttpServer, a: A
     // A shared physical session store does not confer another issuer's source
     // ownership. A different facade also isn't evidence of process death.
     if (prior.registration.lease.node != server.localSessionNodeId()) return;
+    if (prior.recovery) {
+        // This durable owner cannot admit another body. Discard unsealed local
+        // staging independently of the request; sealed decisions remain owned
+        // by the existing coordinator. Failed I/O retries on a later quantum.
+        var connection = @import("sql_connections.zig").load(store, a, connection_id, prior.principal, prior.registration.lease.node, 0) catch |err| switch (err) {
+            error.SqlConnectionNotFound => null,
+            else => return err,
+        };
+        defer if (connection) |*value| value.deinit();
+        if (connection) |value| {
+            if (value.value.active_txn) |id| _ = server.txn_sessions.removeBeforeExecution(server.alloc, id);
+        }
+    }
     const time = @import("antfly_platform").time;
     if (prior.phase == .finishing and try uncertainConnection(store, a, prior.registration.connection)) {
         var reconciled = try @import("sql_connections.zig").loadReconciled(store, &server.txn_sessions, a, prior.registration.connection, prior.principal, prior.registration.lease.node, time.realtimeNs() / std.time.ns_per_ms);

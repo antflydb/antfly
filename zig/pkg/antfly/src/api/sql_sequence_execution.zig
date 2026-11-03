@@ -170,14 +170,15 @@ pub const Owner = struct {
         }
         const principal = http.transactionPrincipal(root.identity.*);
         const node = root.server.localSessionNodeId();
+        const effect_transaction = root.effectTransaction();
         var state: ?@import("transactions.zig").SessionRegistry.SqlState = null;
         defer if (state) |*value| value.deinit(a);
         if (root.session_id) |encoded| {
             const id = try @import("distributed_txn.zig").parseTxnIdHex(encoded);
-            if (root.active_transaction == null or !std.meta.eql(root.active_transaction.?, id)) return error.SqlTransactionNotActive;
+            if (effect_transaction == null or !std.meta.eql(effect_transaction.?, id)) return error.SqlTransactionNotActive;
             self.transaction = id;
         }
-        if (root.active_transaction) |id| {
+        if (effect_transaction) |id| {
             state = (try root.server.txn_sessions.getSqlState(a, id)) orelse return error.SqlTransactionNotActive;
             if (state.?.owner_node_id != node) return error.SessionLeaseLost;
             if (!std.meta.eql(state.?.connection_id, root.connection_id)) return error.SqlConnectionNotFound;
@@ -190,7 +191,7 @@ pub const Owner = struct {
             const store = root.server.txn_sessions.durable orelse return error.SequenceProviderUnavailable;
             var connection = try @import("sql_connections.zig").loadWithCommand(store, a, id, principal orelse "", node, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, root.context.sql_command_fence);
             defer connection.deinit();
-            if (!std.meta.eql(connection.value.active_txn, root.active_transaction)) return error.SqlConnectionBusy;
+            if (!std.meta.eql(connection.value.active_txn, effect_transaction)) return error.SqlConnectionBusy;
             self.transaction = connection.value.active_txn;
             self.connection_generation = connection.value.generation;
             self.connection_sequence_epoch = connection.value.sequence_epoch;

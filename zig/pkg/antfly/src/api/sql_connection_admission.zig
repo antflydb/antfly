@@ -23,6 +23,7 @@ const Command = @import("antfly_local_sources").storage_pessimistic_lock_authori
 pub const Signal = struct {
     expires_at_ms: std.atomic.Value(u64) = .init(0),
     lost: std.atomic.Value(bool) = .init(false),
+    retire_required: std.atomic.Value(bool) = .init(false),
 };
 const Entry = struct { ticket: u64, command: ?Command = null, signal: ?*Signal = null };
 pub const capacity = 128;
@@ -106,6 +107,17 @@ pub const Pool = struct {
         if (!std.meta.eql(entry.command, @as(?Command, command))) return;
         const signal = entry.signal orelse return;
         if (expiry) |value| signal.expires_at_ms.store(value, .release) else signal.lost.store(true, .release);
+    }
+    /// A failed implicit cleanup cannot later publish ordinary FINISH, even
+    /// if its first attempt to persist the retirement intent also fails.
+    pub fn requireRetirement(self: *Pool, io: std.Io, key: Key, command: Command) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const entry = self.active.get(key) orelse return;
+        if (!std.meta.eql(entry.command, @as(?Command, command))) return;
+        const signal = entry.signal orelse return;
+        signal.retire_required.store(true, .release);
+        signal.lost.store(true, .release);
     }
     pub fn acquire(self: *Pool, a: A, io: std.Io, key: Key) !Lease {
         try self.mutex.lock(io);
@@ -221,8 +233,15 @@ test "SQL connection admission publishes lease signals only to the exact live co
     try lease.bindCommand(io, next);
     try lease.bindSignal(io, next, &signal);
     pool.publish(io, key, old, null);
+    pool.requireRetirement(io, key, old);
+    try std.testing.expect(!signal.retire_required.load(.acquire));
     try std.testing.expect(!signal.lost.load(.acquire));
     try std.testing.expectEqual(@as(u64, 300), signal.expires_at_ms.load(.acquire));
     pool.publish(io, key, next, null);
+    try std.testing.expect(signal.lost.load(.acquire));
+    try std.testing.expect(!signal.retire_required.load(.acquire));
+    pool.requireRetirement(io, key, next);
+    pool.publish(io, key, next, 400);
+    try std.testing.expect(signal.retire_required.load(.acquire));
     try std.testing.expect(signal.lost.load(.acquire));
 }

@@ -159,6 +159,108 @@ def check():
             0,
             20,
         )
+        # Autocommit locks live through the entire expression, including
+        # catalog-bound SQL routines. Only session references survive its end.
+        connection.execute(
+            "CREATE FUNCTION hidden_lock(bigint) RETURNS boolean "
+            "LANGUAGE sql VOLATILE AS 'SELECT pg_try_advisory_xact_lock($1)'"
+        )
+        for sql, count in (
+            ("SELECT pg_advisory_xact_lock(42)", 0),
+            ("SELECT pg_try_advisory_xact_lock(42), pg_try_advisory_xact_lock(42)", 0),
+            (
+                (
+                    "SELECT pg_advisory_xact_lock_shared(-42,7), "
+                    "pg_try_advisory_xact_lock_shared(-42,7)"
+                ),
+                0,
+            ),
+            ("SELECT pg_advisory_lock(42)", 1),
+            ("SELECT pg_advisory_xact_lock(42), pg_advisory_unlock(42)", 0),
+            ("SELECT pg_advisory_xact_lock(42), pg_advisory_lock(42)", 1),
+            ("SELECT pg_advisory_unlock(42)", 0),
+            ("SELECT hidden_lock(42)", 0),
+            ("SELECT hidden_lock(42), hidden_lock(43)", 0),
+            (
+                "WITH r AS MATERIALIZED (SELECT hidden_lock(42) AS x) SELECT x FROM r",
+                0,
+            ),
+        ):
+            connection.execute(sql).fetchall()
+            value(
+                connection,
+                "SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+                "AND pid=pg_backend_pid()",
+                count,
+                20,
+            )
+        rejects(connection, "SELECT pg_advisory_xact_lock(42), 1 / 0", "22012")
+        value(
+            connection,
+            "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid()",
+            0,
+            20,
+        )
+        for sql in (
+            "SELECT pg_advisory_xact_lock(42), pg_sleep(10)",
+            "SELECT hidden_lock(42), pg_sleep(10)",
+        ):
+            connection.execute("SELECT pg_advisory_lock(43)")
+            connection.execute("SET statement_timeout = '100ms'")
+            rejects(connection, sql, "57014")
+            connection.execute("SET statement_timeout = '2s'")
+            value(
+                connection,
+                "SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+                "AND pid=pg_backend_pid()",
+                1,
+                20,
+            )
+            connection.execute("SELECT pg_advisory_unlock_all()")
+        connection.execute("CREATE SEQUENCE counter")
+        connection.execute(
+            "CREATE FUNCTION hidden_counter(text) RETURNS bigint LANGUAGE sql "
+            "VOLATILE AS $$SELECT nextval($1)$$"
+        )
+        for sql in (
+            "SELECT nextval('counter'), pg_advisory_xact_lock(42)",
+            "SELECT pg_advisory_xact_lock(42), nextval('counter')",
+            "SELECT hidden_counter('counter'), hidden_lock(42)",
+            "SELECT hidden_lock(42), hidden_counter('counter')",
+        ):
+            connection.execute(sql).fetchall()
+        for sql, expected in (
+            (
+                (
+                    "SELECT pg_advisory_xact_lock(42), "
+                    "hidden_counter('counter') / (hidden_counter('counter') - currval('counter'))"
+                ),
+                6,
+            ),
+            (
+                (
+                    "SELECT hidden_counter('counter'), pg_advisory_xact_lock(42), "
+                    "1 / (hidden_counter('counter') - currval('counter'))"
+                ),
+                8,
+            ),
+            (
+                (
+                    "SELECT hidden_lock(42), "
+                    "hidden_counter('counter') / (hidden_counter('counter') - currval('counter'))"
+                ),
+                10,
+            ),
+        ):
+            rejects(connection, sql, "22012")
+            value(connection, "SELECT lastval()", expected, 20)
+            value(
+                connection,
+                "SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+                "AND pid=pg_backend_pid()",
+                0,
+                20,
+            )
         for format_, raw, expected in (
             (0, b"ignored", b""),
             (0, b"", b""),
