@@ -7476,12 +7476,19 @@ pub const DB = struct {
     }
 
     /// Like `batch`, also reporting whether the primary write became durable.
-    /// After it has, every error is a committed-pending or unknown outcome;
-    /// before it, the batch was not applied unless the error is an unknown
-    /// outcome (checkpoint publication failed mid-way).
+    /// Callers classify a failure from the flag: after the primary write it
+    /// is committed (pending or needing repair); before it, the batch was not
+    /// applied unless the error is an unknown outcome. Keeps `batch`'s
+    /// ANTFLY_BENCH_METRICS phase profile.
     pub fn batchTracked(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
         primary_committed.* = false;
-        return self.batchInternal(req, null, .{ .primary_committed = primary_committed });
+        if (benchMetricsEnabled()) {
+            var profile = BatchProfile{};
+            try self.batchInternal(req, &profile, .{ .primary_committed = primary_committed });
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, .{ .primary_committed = primary_committed });
+        }
     }
 
     pub fn batchWithVisibilityCancellation(self: *DB, req: types.BatchRequest, cancellation: types.CancellationToken) anyerror!void {

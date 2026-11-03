@@ -74,7 +74,10 @@
 //!    waiter reads as `W` (skipped), a dead holder as `G` (finished). Death
 //!    while holding the tail lock leaves at most rule 2's unadvanced file.
 //! 6. Cancellation. Any error or cancellation before the grant abandons the
-//!    ticket (`A`, then unlock). After the grant the caller must `finish`
+//!    ticket (`A`, then unlock). That includes a failed enqueue: its file is
+//!    kept as an abandoned ticket rather than deleted, because a partial
+//!    counter write can leave a valid, advanced counter, and a missing file
+//!    there would read as a finished predecessor. After the grant the caller must `finish`
 //!    (`D`, then unlock); errors after the grant release through `Turn`.
 //! 7. One ticket per process per path. Callers hold the in-process path gate
 //!    while queued, so a process never waits on its own ticket. This also
@@ -257,7 +260,7 @@ pub const Queue = struct {
         var name_buf: [ticket_name_len]u8 = undefined;
         var skipped: usize = 0;
         var not_found: usize = 0;
-        const index, const name, const file = while (true) {
+        const index, const file = while (true) {
             const index = tail.next;
             const name = ticketName(&name_buf, index);
             // Rule 2: exclusive create, so a ticket number is never reused.
@@ -285,14 +288,19 @@ pub const Queue = struct {
                 },
                 else => return err,
             };
-            break .{ index, name, file };
+            break .{ index, file };
         };
+        // A failed counter write may still have left a valid, advanced
+        // counter (a partial write that covered the changed bytes). Keep the
+        // file as an abandoned ticket so walkers and `isIdle` see a skipped
+        // predecessor, never a gap that reads as "everyone below finished".
+        // The number is then consumed whether or not the counter advanced.
         errdefer {
+            writeState(file, io, .abandoned) catch {};
             file.close(io);
-            self.dir.deleteFile(io, name) catch {};
         }
         try writeState(file, io, .waiting);
-        try writeCounter(tail.file, io, index + 1);
+        try writeEnqueueCounter(tail.file, io, index + 1);
         tail.next = index + 1;
         return .{ .index = index, .file = file };
     }
@@ -419,6 +427,20 @@ fn readCounter(file: std.Io.File, io: std.Io) !?u64 {
     const value = std.mem.readInt(u64, raw[0..8], .little);
     const check = std.mem.readInt(u64, raw[8..16], .little);
     return if (check == value ^ counter_check) value else null;
+}
+
+/// Test hook: write only this many counter bytes, then fail.
+var test_partial_counter_write: if (@import("builtin").is_test) ?usize else void = if (@import("builtin").is_test) null else {};
+
+fn writeEnqueueCounter(file: std.Io.File, io: std.Io, value: u64) !void {
+    if (comptime @import("builtin").is_test) if (test_partial_counter_write) |len| {
+        test_partial_counter_write = null;
+        var raw: [counter_len]u8 = undefined;
+        encodeCounter(&raw, value);
+        try file.writePositionalAll(io, raw[0..len], 0);
+        return error.InputOutput;
+    };
+    try writeCounter(file, io, value);
 }
 
 fn writeCounter(file: std.Io.File, io: std.Io, value: u64) !void {
@@ -717,6 +739,45 @@ test "writer queue rule 2: a torn counter write cannot hide a live waiter" {
         try testing.expect(next.index > live.index);
         q.abandon(io, &next);
         try writeCounterRaw(&q, io, &old);
+    }
+}
+
+test "writer queue rule 1: a failed counter write cannot let a later ticket pass a live waiter" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .limited(8) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    // Every partial length: 9 bytes leaves the new value with a valid check
+    // (only the first check byte differs between consecutive values).
+    for (0..counter_len) |written| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const sidecar = try testSidecar(&tmp, io, &path_buf);
+        var q = try Queue.open(testing.allocator, io, sidecar);
+        defer q.close(io);
+
+        var head = try enqueueOne(&q, io);
+        try q.awaitTurn(io, &head, farDeadline(io));
+        var live = try enqueueOne(&q, io);
+        {
+            var tail = try q.lockTail(io, farDeadline(io));
+            defer tail.release(io);
+            test_partial_counter_write = written;
+            defer test_partial_counter_write = null;
+            try testing.expectError(error.InputOutput, q.enqueue(io, &tail));
+        }
+        {
+            var tail = try q.lockTail(io, farDeadline(io));
+            defer tail.release(io);
+            try testing.expect(!try q.isIdle(io, &tail));
+        }
+        // A later ticket still waits behind the live one.
+        var later = try enqueueOne(&q, io);
+        try testing.expect(later.index > live.index);
+        q.finish(io, &head);
+        try q.awaitTurn(io, &live, farDeadline(io));
+        try testing.expectError(error.FileBusy, q.awaitTurn(io, &later, std.Io.Clock.awake.now(io).nanoseconds + 30 * std.time.ns_per_ms));
+        q.finish(io, &live);
     }
 }
 

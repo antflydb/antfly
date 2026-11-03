@@ -849,6 +849,9 @@ pub const Owner = struct {
     // One graph walk per owner. Admission waits without the foreground gate;
     // the worker only try-locks under that gate and yields to an active proof.
     allocator_proof_mutex: std.Io.Mutex = .init,
+    /// A proof that completed but could not be transferred because the
+    /// writer lease was busy. Guarded by the proof mutex.
+    allocator_proof_receipt: ?native.NativeFile.AllocatorProofReceipt = null,
     verification_cancel: @FieldType(NativeStore, "maintenance_cancel") = .{},
     allocator_certificate_pending: bool = false,
     // Historical attempts suppress close-time retries; only active work is
@@ -904,6 +907,9 @@ pub const Owner = struct {
         // Detached graph-walk totals, including foreground and maintenance.
         // These survive runtime refresh and exclude lease/queue wait time.
         allocator_proof_walks: u64 = 0,
+        /// Proofs completed on an earlier attempt that yielded busy, reused
+        /// without repeating the walk.
+        allocator_proof_receipt_reuses: u64 = 0,
         allocator_proof_failures: u64 = 0,
         allocator_proof_ns: u64 = 0,
         allocator_proof_max_ns: u64 = 0,
@@ -2086,6 +2092,22 @@ pub const Owner = struct {
         if (needsOutcomeReconciliation(foreground)) return error.OutcomeReconciliationRequired;
         if (file.transaction_header != null or file.durable_header != null) return error.FileBusy;
         if (file.free_pages_verified) return;
+        if (self.allocator_proof_receipt) |receipt| {
+            self.allocator_proof_receipt = null;
+            // The same fence as the transfer below: under the writer lease,
+            // the on-disk header and inode must still be the live ones.
+            var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
+            defer probe.close();
+            if (std.meta.eql(file.header, probe.header) and
+                (try file.file.stat(file.runtime())).inode == (try probe.file.stat(probe.runtime())).inode)
+            {
+                try file.inheritAllocatorProofReceipt(receipt);
+                if (file.free_pages_verified) {
+                    self.publication_stats.allocator_proof_receipt_reuses +|= 1;
+                    return;
+                }
+            }
+        }
         foreground.allocator_verification_references += 1;
         defer {
             foreground.allocator_verification_references -= 1;
@@ -2122,13 +2144,19 @@ pub const Owner = struct {
         self.publication_stats.allocator_proof_max_ns = @max(self.publication_stats.allocator_proof_max_ns, proof_ns);
         // The proof is this call's own work, not waiting: it does not use up
         // the busy budget carried to later re-entries of the same call.
-        if (connection) |caller| if (caller.admission_active_sink) |sink| {
-            sink.* +|= proof_ns;
-        };
+        if (connection) |caller| {
+            if (caller.admission_active_sink) |sink| sink.* +|= proof_ns;
+            // Credit it now, before reacquiring the lease below, so the walk
+            // does not shorten this attempt's own wait either.
+            if (caller.admission_deadline_ns) |*deadline| deadline.* +|= proof_ns;
+        }
         if (verified) |_| {} else |_| {
             self.publication_stats.allocator_proof_failures +|= 1;
         }
         try verified;
+        // If reacquiring the lease below yields busy, the next attempt reuses
+        // this proof instead of repeating the walk.
+        self.allocator_proof_receipt = try reader.allocatorProofReceipt();
         // A foreground operation has not started its mutation yet. Preserve
         // its connection-local busy policy when another process wins the
         // writer lease during the detached proof. Background turns stay
@@ -2146,6 +2174,7 @@ pub const Owner = struct {
                 (try live.file.stat(live.runtime())).inode == (try probe.file.stat(probe.runtime())).inode)
                 try live.inheritAllocatorVerification(reader);
         }
+        self.allocator_proof_receipt = null;
     }
 
     fn deinitMaintenanceSchedules(self: *Owner) void {
@@ -3162,6 +3191,18 @@ test "capi native allocator proof reacquisition honors per-connection busy admis
                 try std.testing.expectError(error.WouldBlock, result);
                 try std.testing.expectEqual(@as(usize, 0), probe.retries);
             },
+        }
+        if (scenario != .foreground) {
+            // The proof completed before the busy yield. The next attempt
+            // transfers it under the lease instead of walking again.
+            probe.release();
+            owner.test_after_allocator_capture = null;
+            if (lease == null) lease = try owner.tryWriterLeaseAssumeLocked();
+            const walks = owner.publication_stats.allocator_proof_walks;
+            try owner.verifyAllocatorAssumeLocked(&lease, if (scenario == .background) null else connection);
+            try std.testing.expectEqual(walks, owner.publication_stats.allocator_proof_walks);
+            try std.testing.expectEqual(@as(u64, 1), owner.publication_stats.allocator_proof_receipt_reuses);
+            try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
         }
     }
 }

@@ -985,8 +985,14 @@ fn enterBeforeDeadline(initial: HandleEntry, ptr: ?*anyopaque, access: HandleAcc
     const test_sleep = if (builtin.is_test) connection.test_admission_sleep else {};
     // Capacity-limited reads can also need a proof. Only admission is retried:
     // the exported operation has not executed yet.
+    // The call's own proof work extends its deadline; only waiting counts.
+    const Effective = struct {
+        fn at(base: i96, active: *const u64) i96 {
+            return base + @as(i96, @intCast(active.*));
+        }
+    };
     while (guard.entry_error == .busy) {
-        const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+        const remaining = Effective.at(deadline, active_ns) - std.Io.Clock.awake.now(io).nanoseconds;
         if (remaining <= 0) return guard;
         guard.leaveWithRegistry(!retain_entry);
         const delay = std.Io.Duration.fromNanoseconds(@min(backoff, remaining));
@@ -997,11 +1003,11 @@ fn enterBeforeDeadline(initial: HandleEntry, ptr: ?*anyopaque, access: HandleAcc
         if (!retain_entry) entry = HandleEntry.capture(ptr) orelse return null;
         // Cancellation must not reacquire a path lease or begin another proof.
         slept catch |err| return entry.failedGuard(access, capi.mapErrorContext(err, @src().fn_name));
-        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline)
+        if (std.Io.Clock.awake.now(io).nanoseconds >= Effective.at(deadline, active_ns))
             return entry.failedGuard(access, capi.mapError(error.FileBusy));
         // An expired backoff cannot start a new admission attempt. A proof
         // already in progress may still finish and take an uncontended lease.
-        guard = enterCapturedHandleWithDeadline(entry, access, intent, false, deadline, active_ns);
+        guard = enterCapturedHandleWithDeadline(entry, access, intent, false, Effective.at(deadline, active_ns), active_ns);
         if (guard.entry_error == null) capi.clearLastError();
         backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
     }

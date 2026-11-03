@@ -3696,10 +3696,12 @@ pub const PathWriterLock = struct {
     }
 
     pub fn close(self: *PathWriterLock) void {
-        self.endHold();
         if (self.reader_registration_batch) |batch| batch.end();
         const io = self.borrowed_io orelse self.io_impl.io();
         self.file.close(io);
+        // The hold ends when the descriptor (and its flock) is released, so
+        // it covers reader-marker cleanup done under the lock, as handoffs do.
+        self.endHold();
         if (self.queue_turn) |*turn| turn.release(io);
         if (self.queue_watch) |*watch| watch.release(io);
         if (self.borrowed_io == null) self.io_impl.deinit();
@@ -5034,6 +5036,33 @@ pub const NativeFile = struct {
     /// a completed proof for append-only descendants of its captured base.
     /// The caller serializes publications; foreign headers, inode changes
     /// and uncertainty reject inheritance.
+    /// A completed allocator proof of `header` on the file with `inode`,
+    /// kept after its reader is gone (for example across a busy yield that
+    /// happened before the proof could be transferred).
+    pub const AllocatorProofReceipt = struct {
+        header: Header,
+        inode: @FieldType(std.Io.File.Stat, "inode"),
+    };
+
+    pub fn allocatorProofReceipt(self: *NativeFile) !?AllocatorProofReceipt {
+        if (!self.free_pages_verified) return null;
+        return .{ .header = self.header, .inode = (try self.file.stat(self.runtime())).inode };
+    }
+
+    /// Same acceptance as `inheritAllocatorVerification` from a verified
+    /// owner: the identical generation, or a descendant of the proof's base.
+    /// Callers fence it the same way, under the writer lease.
+    pub fn inheritAllocatorProofReceipt(self: *NativeFile, receipt: AllocatorProofReceipt) !void {
+        if (self.free_pages_verified or self.transaction_header != null or self.durable_header != null or
+            self.checkpoint_publication_uncertain) return;
+        const identical = std.meta.eql(self.header, receipt.header);
+        const descendant = if (self.allocator_verification_base) |base| std.meta.eql(base, receipt.header) else false;
+        if (!identical and !descendant) return;
+        if ((try self.file.stat(self.runtime())).inode != receipt.inode) return;
+        self.free_pages_verified = true;
+        self.allocator_verification_base = null;
+    }
+
     pub fn inheritAllocatorVerification(self: *NativeFile, owner: *NativeFile) !void {
         if (!owner.free_pages_verified and (self.free_pages_verified or owner.allocator_verification_base == null)) return;
         if (!std.mem.eql(u8, self.path, owner.path) or owner.transaction_header != null or owner.durable_header != null or

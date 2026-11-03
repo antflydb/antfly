@@ -292,33 +292,67 @@ def native_worker(config, index, ready, start, results, finish=None):
             success, busy = [], []
             window_seconds = config.get("progress_window_seconds", 60)
             success_windows = [0] * max(1, math.ceil(config["seconds"] / window_seconds))
-            # Longest interval without an acknowledged write: the direct
-            # measure of starvation, independent of total throughput.
-            last_progress = 0.0
-            max_progress_gap = 0.0
-            sequence = 0
+            threads = max(1, config.get("threads_per_worker", 1))
+            lock = threading.Lock()
             last_write = None
             latest_churn_writes = {}
-            while time.monotonic() < deadline:
-                key = f"worker-{index}-{sequence if config['workload'] == 'append' else sequence % 128}"
-                payload = {"inserts": {key: {"text": "v" * 1024, "sequence": sequence}}}
-                began_call = time.perf_counter_ns()
+            # Longest interval without an acknowledged write, per thread: the
+            # direct measure of starvation, independent of total throughput.
+            thread_gaps = [0.0] * threads
+            thread_last_progress = [0.0] * threads
+            thread_errors = []
+
+            def write_loop(thread_index):
+                nonlocal last_write
+                last_progress = 0.0
+                max_gap = 0.0
+                sequence = 0
+                prefix = f"worker-{index}" if threads == 1 else f"worker-{index}-t{thread_index}"
                 try:
-                    db.batch_json(payload)
-                    success.append(time.perf_counter_ns() - began_call)
-                    elapsed = time.monotonic() - began
-                    window = min(len(success_windows) - 1, int(elapsed / window_seconds))
-                    success_windows[window] += 1
-                    max_progress_gap = max(max_progress_gap, elapsed - last_progress)
-                    last_progress = elapsed
-                    last_write = {"key": key, "sequence": sequence}
-                    if config["workload"] == "churn":
-                        latest_churn_writes[key] = last_write
-                except af.BusyError:
-                    busy.append(time.perf_counter_ns() - began_call)
-                sequence += 1
+                    while time.monotonic() < deadline:
+                        key = f"{prefix}-{sequence if config['workload'] == 'append' else sequence % 128}"
+                        payload = {"inserts": {key: {"text": "v" * 1024, "sequence": sequence}}}
+                        began_call = time.perf_counter_ns()
+                        try:
+                            db.batch_json(payload)
+                            latency = time.perf_counter_ns() - began_call
+                            elapsed = time.monotonic() - began
+                            write = {"key": key, "sequence": sequence}
+                            with lock:
+                                success.append(latency)
+                                window = min(len(success_windows) - 1, int(elapsed / window_seconds))
+                                success_windows[window] += 1
+                                last_write = write
+                                if config["workload"] == "churn":
+                                    latest_churn_writes[key] = write
+                            max_gap = max(max_gap, elapsed - last_progress)
+                            last_progress = elapsed
+                        except af.BusyError:
+                            with lock:
+                                busy.append(time.perf_counter_ns() - began_call)
+                        sequence += 1
+                except BaseException:  # noqa: BLE001 - surfaced as a worker failure below
+                    thread_errors.append(traceback.format_exc())
+                thread_gaps[thread_index] = max_gap
+                thread_last_progress[thread_index] = last_progress
+
+            if threads == 1:
+                write_loop(0)
+            else:
+                pool = [threading.Thread(target=write_loop, args=(t,)) for t in range(threads)]
+                for thread in pool:
+                    thread.start()
+                for thread in pool:
+                    thread.join()
+            if thread_errors:
+                raise RuntimeError(thread_errors[0])
             ended = time.monotonic()
-            max_progress_gap = max(max_progress_gap, (ended - began) - last_progress)
+            # The trailing interval after each thread's last acknowledged write.
+            thread_gaps = [
+                max(gap, (ended - began) - last)
+                for gap, last in zip(thread_gaps, thread_last_progress, strict=True)
+            ]
+            max_progress_gap = max(thread_gaps)
             # Preserve measured progress if a later diagnostic or close fails.
             # The terminal result remains an error and cannot pass qualification.
             completed_workload = {
@@ -370,6 +404,7 @@ def native_worker(config, index, ready, start, results, finish=None):
                 "success_latency_ns": success,
                 "success_windows": success_windows,
                 "max_progress_gap_seconds": max_progress_gap,
+                "thread_max_progress_gap_seconds": thread_gaps,
                 "progress_window_seconds": window_seconds,
                 "lease": lease_delta(initial_stats, final_stats),
                 "busy_latency_ns": busy,
@@ -738,6 +773,7 @@ def native_cases(args):
                 "allocator_diagnostics": args.allocator_diagnostics,
                 "progress_window_seconds": args.progress_window,
                 "status_interval": args.status_interval,
+                "threads_per_worker": args.threads_per_worker,
             }
             reader_stop, reader_results = context.Event(), context.Queue()
             reader = (
@@ -968,6 +1004,12 @@ def main():
         help="native: seconds per per-worker progress window (a zero window marks a stall)",
     )
     parser.add_argument(
+        "--threads-per-worker",
+        type=int,
+        default=1,
+        help="native: writer threads per process sharing one handle (exercises in-process lease handoff)",
+    )
+    parser.add_argument(
         "--status-interval",
         type=float,
         default=0,
@@ -985,6 +1027,7 @@ def main():
         or args.seed_records < 1
         or args.progress_window <= 0
         or args.status_interval < 0
+        or not 1 <= args.threads_per_worker <= 64
     ):
         parser.error(
             "counts/durations must be positive; concurrency <= 128; timeout >= 0"

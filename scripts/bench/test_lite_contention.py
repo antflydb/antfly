@@ -17,6 +17,7 @@ import queue
 from contextlib import nullcontext
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -176,6 +177,56 @@ class ContentionReportTests(unittest.TestCase):
         self.assertEqual(result["last_write"], {"key": "worker-4-0", "sequence": 0})
         self.assertEqual(result["proofs"]["allocator_proof_ns"], 500)
         self.assertIn("worker-4-0", database.payload["inserts"])
+
+    def test_threaded_worker_writes_distinct_keys_and_reports_each_thread(self):
+        class Database:
+            def __init__(self):
+                self.keys = set()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def batch_json(self, payload):
+                self.keys.update(payload["inserts"])
+                time.sleep(0.001)
+
+        database = Database()
+        api = SimpleNamespace(open=lambda *a, **k: database, BusyError=RuntimeError)
+        zero = dict.fromkeys(bench.PROOF_FIELDS, 0)
+        zero.update(
+            mutation_admission_count=0,
+            mutation_admission_ns=0,
+            mutation_admission_max_ns=0,
+            mutation_admission_log2_ns=[0] * 64,
+        )
+        ready, results = queue.Queue(), queue.Queue()
+        config = {
+            "library": "fake",
+            "database": "fresh",
+            "no_sync": True,
+            "timeout_ms": 5,
+            "watchdog": 1,
+            "seconds": 0.05,
+            "workload": "churn",
+            "threads_per_worker": 3,
+        }
+        with (
+            patch.object(bench, "sdk", return_value=api),
+            patch.object(bench, "measurement_stats", return_value=zero),
+        ):
+            bench.native_worker(
+                config, 2, ready, SimpleNamespace(wait=lambda _: True), results
+            )
+        result = results.get_nowait()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(result["thread_max_progress_gap_seconds"]), 3)
+        prefixes = {key.rsplit("-", 1)[0] for key in database.keys}
+        self.assertEqual(prefixes, {"worker-2-t0", "worker-2-t1", "worker-2-t2"})
+        written = {write["key"] for write in result["latest_churn_writes"]}
+        self.assertEqual(written, database.keys)
 
     def test_worker_close_failure_emits_one_error_and_no_success(self):
         class Database:

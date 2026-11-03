@@ -412,7 +412,8 @@ fn consumeDeviceFullFault(state: anytype) !bool {
     var txn = try state.lsm.beginWrite();
     defer txn.abort();
     try txn.put(.{}, "fault:full", "must-not-commit");
-    txn.commit() catch |err| return err == error.InjectedDeviceFull;
+    // Device-full during the WAL append also follows the append attempt.
+    txn.commit() catch |err| return err == error.InjectedDeviceFull or err == error.OutcomeUnknown;
     return false;
 }
 
