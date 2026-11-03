@@ -7317,5 +7317,94 @@
     "scope": "Numeric/enum metrics only; no admission deadline, retry policy, importer or SDK behavior changes.",
     "reference_policy": "No baseline rebuilds or reruns. Existing completed observations and immutable artifacts are reused.",
     "remaining": "Identify the rejecting stage and expensive lease-held work before selecting any wider storage/runtime ownership redesign. PR remains draft and issue1431 remains open."
+  },
+  "e2e_causal_investigation_20261103": {
+    "report": "lite-e2e-causal-investigation-20261103.json",
+    "qualification": "not qualified",
+    "scope": "Local candidate-only causal investigation; wolfspider untouched and historical observations reused.",
+    "fixture_correction": "Raw cp clones preserve an old path-bound reader namespace and disable reuse. Earlier cde20/394 populated-prefix imports, near-capacity public batches and the new quiet-service fixture used raw copies; their path evidence must not be used for ordinary-workload performance/retention attribution. The earlier fresh-database optimized full-import failure remains valid. Corrected local helper uses native copy_stable_snapshot.",
+    "current_debug_validation": {
+      "source": "bc6f685247705e5c6c51bba3219c503f6408c531",
+      "whole_build_exit_code": 0,
+      "contracts_passed": 26,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "exports": 134,
+      "linkage": "passed",
+      "library_sha256": "a44cc07f9c2f3a66ed6dcf76918b3839af5afae1406ec6ade981162a4c96fa9b"
+    },
+    "confirmed_new_path": "Whole-file primary witnesses invalidate SQL constraint overlays on unrelated writes: 16 staged statements revisit 120 earlier entries, versus zero prior entries rebuilt in the quiet CLI probe. Rows and integrity pass.",
+    "pending": "Architectural fixes and regression validation; candidate-only final optimized qualification. The failed corrected local snapshot passed integrity but still has index debt.",
+    "corrected_original_importer": {
+      "head": "bc6f685247705e5c6c51bba3219c503f6408c531",
+      "mode": "Debug",
+      "qualification": false,
+      "result": {
+        "input_index": 7,
+        "importer_exit_code": 1,
+        "censored": false,
+        "importer_succeeded": false,
+        "summary": [
+          0,
+          0,
+          1
+        ],
+        "seconds": 337.48673891602084,
+        "peak_native_builds": 18,
+        "metrics_enabled": true,
+        "library_sha256": "a44cc07f9c2f3a66ed6dcf76918b3839af5afae1406ec6ade981162a4c96fa9b",
+        "public_errors": [
+          "LiteReplayBacklogExceeded"
+        ],
+        "seed_sha256": "2002c183a24efebf17a7bc1d1a0e90658d5b7c9270857b874a7b0528e43fc8d1",
+        "seed_copy_method": "native_stable_snapshot",
+        "scope": "Local diagnosis only. Metrics and any overlapping compilation prevent clean performance attribution."
+      },
+      "completed_primary_batch_profiles": 32,
+      "completed_primary_documents": 32768,
+      "completed_primary_profile_seconds": 48.294,
+      "completed_primary_store_seconds": 34.241,
+      "identity_metadata_write_operations": 163968,
+      "store_write_operations": 269184,
+      "completed_text_worker_profiles": 55,
+      "completed_text_worker_documents": 15228,
+      "completed_text_worker_seconds": 82.257,
+      "completed_text_prepare_seconds": 35.086,
+      "longest_completed_text_worker_seconds": 10.49,
+      "admission_stage_refusals": {},
+      "physical_replay_quota_refusals": 3,
+      "maintenance_failure_enums": {
+        "storage/EnrichmentWaitCanceled": 42
+      },
+      "limits": [
+        "Corrected native snapshot publication preserves the source hash and safely binds destination reader coordination.",
+        "No completed owner-close summary was emitted in this run, so owner/path totals and SQL overlay totals are unavailable; unknown is not zero.",
+        "Successful-operation profiles omit failed operations and do not cover all SQL work. Nested and parallel times are not additive elapsed time.",
+        "Eighteen native builds overlap; no timing comparison or optimized performance conclusion.",
+        "This still reproduces quota refusal after correcting the raw-copy artifact."
+      ],
+      "private_receipts": [
+        "root-cause/local-populated-input7-bc6-native-copy/result.json",
+        "root-cause/local-populated-input7-bc6-native-copy/seed-copy.json",
+        "root-cause/local-populated-input7-bc6-native-copy/numeric-stage-evidence.json",
+        "root-cause/local-populated-input7-bc6-native-copy/debt-after-failure.json"
+      ],
+      "read_only_inspection": {
+        "integrity_valid": true,
+        "file_bytes": 1480339456,
+        "backlog": {
+          "bytes": 16760435,
+          "records": 359,
+          "limits": {
+            "bytes": 16777216,
+            "records": 4096
+          }
+        },
+        "namespaces": 45,
+        "namespaces_with_index_debt": 2,
+        "qualification": false
+      }
+    }
   }
 }

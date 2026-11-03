@@ -27,7 +27,10 @@ seed for both libraries. For example:
 For replay, create a separate seed with --pending-batches 8, then select replay
 with the same rows/fields/pending-batches arguments. Timed service precedes an
 explicit drain and acknowledgment/search/integrity/reopen checks. Use a parent
-process watchdog for potentially blocked native calls. This synthetic diagnostic
+process watchdog for potentially blocked native calls. Source fixtures are
+published through the native snapshot API: copying only the file preserves its
+old reader-namespace binding and conservatively disables reuse at the new path.
+This synthetic diagnostic
 is not unchanged-importer or sustained-write qualification.
 """
 
@@ -215,15 +218,21 @@ def main():
                 raise RuntimeError(
                     "source fixture parameters or immutable identity mismatch"
                 )
-            if sys.platform == "darwin":
-                subprocess.run(["cp", "-c", str(a.source), str(database)], check=True)
-            else:
-                shutil.copyfile(a.source, database)
-            if (
-                digest(database) != report["source_sha256"]
-                or digest(a.source) != report["source_sha256"]
-            ):
-                raise RuntimeError("source changed while cloning")
+            with af.open_with_options(
+                a.source,
+                af.OpenOptions(
+                    profile=af.Profile.HOSTED,
+                    mode=af.OpenMode.READONLY,
+                    busy_timeout=5,
+                ),
+            ) as source:
+                report["source_copy"] = source.copy_stable_snapshot(
+                    str(database.resolve())
+                )
+            report["source_copy_method"] = "native_stable_snapshot"
+            report["initial_database_sha256"] = digest(database)
+            if digest(a.source) != report["source_sha256"]:
+                raise RuntimeError("source changed while publishing snapshot")
             if a.mode == "open":
                 assert a.pending_batches == 0
                 report["samples"] = []
