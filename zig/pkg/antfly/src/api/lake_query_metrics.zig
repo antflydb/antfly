@@ -82,6 +82,9 @@ pub const ComposedProfile = struct {
     }
 };
 pub const Stats = struct {
+    // Snapshot at the API owner. Health exposition may run in a separately
+    // compiled runtime whose object-store module has independent atomics.
+    object_operations: @import("objectstore").operation_metrics.Snapshot = .{ .calls = @splat(0), .errors = @splat(0), .nanoseconds = @splat(0), .max_nanoseconds = @splat(0), .retries = 0 },
     navigation: Navigation = .{},
     best_first_calls: u64 = 0,
     best_first_segments: u64 = 0,
@@ -89,6 +92,7 @@ pub const Stats = struct {
     calls: [count]u64 = @splat(0),
     nanoseconds: [count]u64 = @splat(0),
     slowest_composed: ?ComposedProfile = null,
+    slowest_lake: ?ComposedProfile = null,
     slow_profile_drops: u64 = 0,
 };
 pub const Metrics = struct {
@@ -100,6 +104,7 @@ pub const Metrics = struct {
     nanoseconds: [count]std.atomic.Value(u64) = @splat(.init(0)),
     slow_mutex: std.atomic.Mutex = .unlocked,
     slowest_composed: ?ComposedProfile = null,
+    slowest_lake: ?ComposedProfile = null,
     slow_profile_drops: std.atomic.Value(u64) = .init(0),
     pub fn recordBestFirst(self: *Metrics, segments: u64, pruned: u64) void {
         _ = self.best_first_calls.fetchAdd(1, .monotonic);
@@ -128,8 +133,17 @@ pub const Metrics = struct {
         defer self.slow_mutex.unlock();
         if (self.slowest_composed == null or profile.duration(.composed_total) > self.slowest_composed.?.duration(.composed_total)) self.slowest_composed = profile;
     }
+    pub fn retainSlowLake(self: *Metrics, profile: ComposedProfile) void {
+        if (profile.duration(.total) < 750 * std.time.ns_per_ms) return;
+        if (!self.slow_mutex.tryLock()) {
+            _ = self.slow_profile_drops.fetchAdd(1, .monotonic);
+            return;
+        }
+        defer self.slow_mutex.unlock();
+        if (self.slowest_lake == null or profile.duration(.total) > self.slowest_lake.?.duration(.total)) self.slowest_lake = profile;
+    }
     pub fn snapshot(self: *Metrics) Stats {
-        var result: Stats = .{ .best_first_calls = self.best_first_calls.load(.monotonic), .best_first_segments = self.best_first_segments.load(.monotonic), .best_first_pruned_nodes = self.best_first_pruned_nodes.load(.monotonic) };
+        var result: Stats = .{ .object_operations = @import("objectstore").operation_metrics.runtime.snapshot(), .best_first_calls = self.best_first_calls.load(.monotonic), .best_first_segments = self.best_first_segments.load(.monotonic), .best_first_pruned_nodes = self.best_first_pruned_nodes.load(.monotonic) };
         inline for (@typeInfo(Navigation).@"struct".field_names, 0..) |field, index| @field(result.navigation, field) = self.navigation[index].load(.monotonic);
         for (0..count) |i| {
             result.calls[i] = self.calls[i].load(.monotonic);
@@ -139,12 +153,22 @@ pub const Metrics = struct {
         if (self.slow_mutex.tryLock()) {
             defer self.slow_mutex.unlock();
             result.slowest_composed = self.slowest_composed;
+            result.slowest_lake = self.slowest_lake;
         }
         return result;
     }
 };
 
 pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: anytype) !void {
+    const operations = @import("objectstore").operation_metrics;
+    const object_stats = query.object_operations;
+    inline for (@typeInfo(operations.Operation).@"enum".field_names, 0..) |name, i| {
+        try prom.appendPromMetric(writer, "antfly_objectstore_" ++ name ++ "_calls_total", "counter", "Linked API runtime logical client calls including local and nested fallback calls; excludes separately owned runtime counters", object_stats.calls[i]);
+        try prom.appendPromMetric(writer, "antfly_objectstore_" ++ name ++ "_errors_total", "counter", "Logical client errors including absence and conditional conflicts", object_stats.errors[i]);
+        try prom.appendPromMetric(writer, "antfly_objectstore_" ++ name ++ "_nanoseconds_total", "counter", "Logical client elapsed time; nested and concurrent calls overlap", object_stats.nanoseconds[i]);
+        try prom.appendPromMetric(writer, "antfly_objectstore_" ++ name ++ "_max_nanoseconds", "gauge", "Maximum logical client elapsed time since process start", object_stats.max_nanoseconds[i]);
+    }
+    try prom.appendPromMetric(writer, "antfly_objectstore_get_retries_total", "counter", "Client retries after mutable metadata precondition races", object_stats.retries);
     try prom.appendPromMetric(writer, "antfly_lake_cache_disk_ready", "gauge", "Whether persistent lake cache initialization succeeded", @intFromBool(disk != null));
     if (memory.disk_unavailable) |reason| try prom.appendPromMetricLabeled(writer, "antfly_lake_cache_disk_unavailable", "gauge", "Persistent cache initialization failure; reads continue through RAM and source", &.{.{ .name = "reason", .value = reason }}, 1);
     inline for (.{ "hits", "misses", "disk_hits", "mapping_hits", "disk_bytes", "provider_reads", "provider_bytes", "disk_init_attempts", "disk_init_failures" }) |field| {
@@ -167,12 +191,53 @@ pub fn append(writer: *std.Io.Writer, memory: anytype, disk: anytype, query: any
         try prom.appendPromMetric(writer, "antfly_lake_query_" ++ phase ++ "_nanoseconds_total", "counter", "Lake query phase elapsed nanoseconds including failed work", query.nanoseconds[i]);
     }
     try prom.appendPromMetric(writer, "antfly_lake_query_slow_profile_drops_total", "counter", "Slow composed profiles skipped due to diagnostic contention", query.slow_profile_drops);
+    if (query.slowest_lake) |profile| {
+        inline for (.{ "total", "source", "publication", "ranking", "cursor_retention", "result_delivery" }) |phase| {
+            try prom.appendPromMetric(writer, "antfly_lake_query_slowest_lake_" ++ phase ++ "_nanoseconds", "gauge", "Request-local phase of slowest lake request above 750 ms since startup; unlisted setup is part of total", profile.duration(@field(Phase, phase)));
+        }
+    }
     if (query.slowest_composed) |profile| {
         inline for (.{ "total", "definition", "leaf", "native_leaf", "cursor" }) |phase| {
             try prom.appendPromMetric(writer, "antfly_lake_query_slowest_composed_" ++ phase ++ "_nanoseconds", "gauge", "Request-local phase of the slowest composed request above 750 ms since startup; nested phases overlap", profile.duration(@field(Phase, "composed_" ++ phase)));
         }
         try prom.appendPromMetric(writer, "antfly_lake_query_slowest_composed_composition_nanoseconds", "gauge", "Slowest composed request remainder after definition, leaves and cursor; native overlaps leaves", profile.composition());
     }
+}
+
+test "external lake single request owner operation snapshot survives transport and exposition" {
+    var snapshot: Stats = .{};
+    snapshot.object_operations.calls[@backingInt(@import("objectstore").operation_metrics.Operation.get)] = 12345;
+    snapshot.object_operations.retries = 17;
+    const a = std.testing.allocator;
+    const encoded = try std.json.Stringify.valueAlloc(a, snapshot, .{});
+    defer a.free(encoded);
+    var parsed = try std.json.parseFromSlice(Stats, a, encoded, .{});
+    defer parsed.deinit();
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    try append(&output.writer, local.serverless_query_lake_serving_cache.Cache.Stats{}, @as(?local.serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats, null), parsed.value);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "antfly_objectstore_get_calls_total 12345\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "antfly_objectstore_get_retries_total 17\n") != null);
+}
+
+test "external lake single request outlier profiles isolate interleaved phases and never wait" {
+    var metrics: Metrics = .{};
+    var fast: ComposedProfile = .{};
+    var slow: ComposedProfile = .{};
+    fast.add(&metrics, .ranking, 100 * std.time.ns_per_ms);
+    slow.add(&metrics, .publication, 3000 * std.time.ns_per_ms);
+    fast.add(&metrics, .total, 150 * std.time.ns_per_ms);
+    slow.add(&metrics, .total, 4000 * std.time.ns_per_ms);
+    metrics.retainSlowLake(fast);
+    try std.testing.expect(metrics.snapshot().slowest_lake == null);
+    metrics.retainSlowLake(slow);
+    const profile = metrics.snapshot().slowest_lake.?;
+    try std.testing.expectEqual(@as(u64, 3000 * std.time.ns_per_ms), profile.duration(.publication));
+    try std.testing.expectEqual(@as(u64, 0), profile.duration(.ranking));
+    try std.testing.expect(metrics.slow_mutex.tryLock());
+    metrics.retainSlowLake(slow);
+    metrics.slow_mutex.unlock();
+    try std.testing.expectEqual(@as(u64, 1), metrics.snapshot().slow_profile_drops);
 }
 
 test "external lake slow composed profiles isolate interleaved requests and never wait" {
