@@ -512,6 +512,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, introducer_test_mod, true, true);
 
+    const replay_executor_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/replay_executor_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, replay_executor_test_mod, true, true);
+    const replay_executor_tests = b.addTest(.{
+        .root_module = replay_executor_test_mod,
+        .filters = selectTestFilters(b, &.{ "manual replay", "replay budget" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const replay_executor_test_step = b.step("replay-executor-test", "Verify bounded manual replay and adaptive budgets");
+    replay_executor_test_step.dependOn(&addFilteredTestRunArtifact(b, replay_executor_tests).step);
+
     const data_consumer_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/data_runtime_test_root.zig"),
         .target = target,
@@ -2917,6 +2931,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, VOPR, integration, chaos, and recall checks");
 
     const unit_test_step = b.step("antfly-unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
+    unit_test_step.dependOn(replay_executor_test_step);
     unit_test_step.dependOn(&b.top_level_steps.get("aws-credentials-test").?.step);
     unit_test_step.dependOn(&b.top_level_steps.get("antfly-google-embedding-catalog-test").?.step);
     unit_test_step.dependOn(&b.top_level_steps.get("embedded-package-test").?.step);

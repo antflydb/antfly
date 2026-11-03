@@ -1414,13 +1414,14 @@ const asyncIndexProfileEnabled = local_mutation.asyncIndexProfileEnabled;
 
 const nsToMs = local_mutation.nsToMs;
 
-fn logOpenProfile(path: []const u8, open_mode: OpenOptions.OpenMode, start_index_workers: bool, profile: OpenProfile) void {
+fn logOpenProfile(path: []const u8, open_mode: OpenOptions.OpenMode, start_index_workers: bool, table_id: u64, profile: OpenProfile) void {
     std.log.info(
-        "db_open_profile path={s} mode={s} start_index_workers={} primary_store_ns={} core_resources_ns={} init_async_infrastructure_ns={} table_storage_ns={} init_optional_runtimes_ns={} load_indexes_ns={} replay_pending_derived_ns={} start_index_workers_ns={} start_optional_runtimes_ns={} total_ns={}",
+        "db_open_profile path={s} mode={s} start_index_workers={} table_id={} primary_store_ns={} core_resources_ns={} init_async_infrastructure_ns={} table_storage_ns={} init_optional_runtimes_ns={} load_indexes_ns={} replay_pending_derived_ns={} start_index_workers_ns={} start_optional_runtimes_ns={} total_ns={}",
         .{
             path,
             @tagName(open_mode),
             start_index_workers,
+            table_id,
             profile.primary_store_ns,
             profile.core_resources_ns,
             profile.init_async_infrastructure_ns,
@@ -4461,7 +4462,7 @@ pub const DB = struct {
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) _ = try db.drainStandaloneGraphEndpointCleanup();
             profile.total_ns = monotonicTimeNs() - open_started_ns;
             if (openProfileEnabled()) {
-                logOpenProfile(path, opts.open_mode, db.start_index_workers, profile);
+                logOpenProfile(path, opts.open_mode, db.start_index_workers, db.core.identity_namespace.table_id, profile);
             }
             break :blk db;
         };

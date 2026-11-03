@@ -1418,6 +1418,13 @@ and starve consumers. Partial applied watermarks are persisted before yielding; 
 full visibility target. Explicit foreground visibility waits still complete their
 requested target. An individual indivisible record can exceed the quantum.
 
+Storage-only background turns authenticate the current inode and checkpoint
+without refreshing the serving DB. They transfer the detached allocator cache
+and digest after certificate validation, then perform physical maintenance
+without opening query indexes or providers. A peer's logical publication stays
+unadopted by the serving wrapper until ordinary logical admission refreshes it;
+physical service cannot grant a clean schema or recovery witness.
+
 Replay-journal retirement records its requested watermark during source work,
 then runs after releasing the primary snapshot. Short owner/path admission
 revalidates the catalog and clamps deletion against current enrichment,
@@ -1642,6 +1649,31 @@ document, index and control bytes after equivalent settling and compaction;
 physical file size alone cannot explain a live-payload regression. Verify reuse
 of available capacity during active writes to cover the related #1362 append
 behavior. Preserve failed controls and incomplete qualification explicitly.
+
+For a shorter local replay-pressure diagnostic, run:
+
+```sh
+python3 scripts/bench/lite_sql_replay_pressure.py \
+  --library zig/zig-out/lib/libantfly.dylib \
+  --directory .tools/replay-pressure-candidate --require-no-busy
+```
+
+Use the same prebuilt optimization mode and workload arguments for both
+libraries, with no concurrent compilation. This public synthetic workload
+commits SQL transactions across two indexed tables, immediately probes batch
+admission at a five-second Busy timeout, then checks every acknowledged row,
+index catch-up, physical integrity and reopening. It never retries an ambiguous
+COMMIT. The default 512-byte keys deliberately amplify replay pressure; record
+key width, text size and transaction size with results. The diagnostic is useful
+for iteration, but does not replace the original importer or sustained active
+write qualification. Compare replay wall time with
+`background_publications.replay_publication_overhead_ns` (admission, validation
+and storage-publication hold) before attributing elapsed time to analysis CPU.
+`maintenance_publication_overhead_ns` also includes subsequent retirement and
+artifact work; keep its larger scope separate from replay time.
+Successful index and watermark admission waits are also reported separately as
+`replay_index_admission_ns` and `replay_metadata_admission_ns`; compare their
+respective group counts before changing publication grouping.
 
 Sustained-write qualification must measure progress and storage while writers
 remain active. `scripts/bench/lite_contention.py native --require-sustained`

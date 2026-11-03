@@ -345,6 +345,7 @@ pub const storage_db_derived_apply_state = @import("storage/db/derived/apply_sta
 pub const storage_db_derived_backlog_tracker = @import("storage/db/derived/backlog_tracker.zig");
 pub const storage_db_derived_catch_up_policy = @import("storage/db/derived/catch_up_policy.zig");
 pub const storage_db_derived_change_journal = @import("storage/db/derived/change_journal.zig");
+pub const storage_db_derived_derived_executor = @import("storage/db/derived/derived_executor.zig");
 pub const storage_db_derived_derived_log = @import("storage/db/derived/derived_log.zig");
 pub const storage_db_derived_derived_types = @import("storage/db/derived/derived_types.zig");
 pub const storage_db_derived_derived_worker = @import("storage/db/derived/derived_worker.zig");

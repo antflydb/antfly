@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "Not qualified: corrected model-backed final control imports and primary checks passed, but index settling reproduced GlinerBoundaryPaddedSequenceLimitExceeded. Final runs stopped. A locally reproduced profile-planning fix is in Debug validation; candidate full imports, contention, soaks, Beads-owned factory and aggregate CI remain.",
+  "status": "Not qualified: public model preflight passes, but the unchanged original importer reproduced LiteReplayBacklogExceeded in the exact three-writer Debug topology and on full-corpus input 7. Local replay service and publication work is under validation. Matched optimized importer runs, index catch-up, sustained-write soaks, Beads-owned factory and aggregate CI remain.",
   "base_commit": "70fb539fee7c11f4f98d312ae76cb5192a294667",
   "runtime_commit": "8ec7f1eaa918e86cfc5df6e83803dc6bc5f450b9",
   "importer_sha256": "c365c77558e1c66c1d9c15f8f5478a09b333ee336ada15c3cd064f784a13b21c",
@@ -5093,5 +5093,189 @@
       "next_step": "Minimize the local replay-byte-pressure reproducer and measure consumer progress/credit retirement across a large SQL commit. Preserve the precommit versus committed outcome distinction and bounded growth. Do not merely increase limits or claim the same optimized outcome without testing."
     },
     "decision": "Issue1431 is not qualified as fixed. Both candidate-only Debug original-topology contention and full15 gate failed replay-capacity admission; both stopped databases passed physical integrity. Expanded controls, optimized comparisons and long soaks remain deferred."
+  },
+  "local_replay_service_followup": {
+    "status": "Physical-capture fix passes targeted correctness; end-to-end and optimized qualification pending.",
+    "scope": "Local Debug diagnostics; original importer, Busy timeout and file-wide replay limits unchanged. No final-host debugging.",
+    "baseline_library_sha256": "e5217fe92cf80c6ce6598cec2a4a46280ae5b5d7a8d195ce1740b0adb30349de",
+    "stemming_only_library_sha256": "9b67a74550c510811dd00880c1f42e984ff4ebe31a2e83caaff4f3f12190742d",
+    "synthetic_fixture": "scripts/bench/lite_sql_replay_pressure.py",
+    "stemming_only_comparison": {
+      "transactions": 8,
+      "rows_per_table_per_transaction": 1024,
+      "tables": 2,
+      "key_bytes": 512,
+      "text_bytes": 4096,
+      "unique_row_source_bytes": true,
+      "sync_writes": true,
+      "busy_timeout_seconds": 5,
+      "baseline_sql_commit_seconds": 21.296997836092487,
+      "stemming_only_sql_commit_seconds": 21.139508707798086,
+      "baseline_drain_seconds": 2.954516415949911,
+      "stemming_only_drain_seconds": 3.6322914159391075,
+      "both_checks": "admission, all 16512 acknowledged rows, index catch-up, integrity and reopen passed",
+      "interpretation": "No demonstrated end-to-end improvement from stemming reuse alone; one paired local diagnostic, not a production timing claim."
+    },
+    "background_service_observation": {
+      "start_debt_bytes": 16624856,
+      "end_debt_bytes": 15624136,
+      "seconds": 19.77771141694393,
+      "start_records": 344,
+      "end_records": 328,
+      "first_credit_return_seconds": 6.882721250061877,
+      "interpretation": "Service makes progress after writers stop. This does not prove sufficient service during active SQL commits."
+    },
+    "publication_followup": "Instrumentation only: replay-only and replay-plus-retirement/artifact publication overhead have distinct scopes. Successful index and metadata admission durations are separate. No new replay-completion callbacks or retained-lease protocol remain.",
+    "tests": {
+      "manual_executor_and_budget": {
+        "passed": 6,
+        "skipped": 0,
+        "failed": 0,
+        "leaks": 0,
+        "scope": "Historical prototype had 6 tests; focused final target has 5 existing manual replay/adaptive-budget tests after removing the completion experiment."
+      },
+      "analysis": {
+        "passed": 47,
+        "opt_in_benchmark_skips": 1,
+        "failed": 0,
+        "leaks": 0,
+        "scope": "Historical discarded stemming-cache prototype only; no new stemming cache remains in the source."
+      },
+      "native_completion_lifecycle": {
+        "passed": 1,
+        "variants": [
+          "normal watermark publication",
+          "cancellation after prepared text publication; later drain"
+        ],
+        "skipped": 0,
+        "failed": 0,
+        "leaks": 0,
+        "scope": "Historical discarded joined-lease prototype only."
+      },
+      "source_catalog_tools": {
+        "tests": 32,
+        "failures": 3,
+        "attribution": "The identical three LiteralSourceOwnership physical-import assertions fail on untouched integrated-main control 010ac1f3b2; source catalog generation/currentness checks pass. Not introduced by the executor export."
+      },
+      "debug_capi_abi": {
+        "public_exports": 134,
+        "internal_exports": 0,
+        "C_executable_linkage": "passed",
+        "C_shared_library_linkage": "passed",
+        "smoke": "passed"
+      },
+      "final_source_native_owner": {
+        "passed": 21,
+        "skipped": 0,
+        "failed": 0,
+        "leaks": 0,
+        "scope": "Final physical-only source: foreign-tip storage capture, ledger/cache transfer, conservative SQL-recovery flags, and existing admission/proof/committed-transform regressions."
+      },
+      "final_source_manual_executor_and_budget": {
+        "passed": 5,
+        "skipped": 0,
+        "failed": 0,
+        "leaks": 0
+      }
+    },
+    "remaining": "Build and hash the final physical-only library, compare matched local replay pressure and namespace workloads, then qualify unchanged-importer corpus/topology, accounting/reuse and sustained soaks with optimized artifacts on wolfspider. Beads owns factory; aggregate CI remains pending.",
+    "original_input7_stage_diagnostics": {
+      "scope": "Sums of completed instrumented events on the failed e521 local Debug run; nested/overlapping timings, not an exhaustive wall-time partition. Metrics enabled; not a clean performance qualification.",
+      "full_text_events": 157,
+      "full_text_apply_seconds": 131.149,
+      "full_text_prepare_seconds": 72.233,
+      "full_text_apply_guard_seconds": 10.709,
+      "full_text_max_prepare_seconds": 4.586,
+      "foreground_batch_events": 91,
+      "foreground_batch_total_seconds": 88.52,
+      "foreground_store_seconds": 60.643,
+      "db_open_events": 2281,
+      "db_open_seconds": 87.122,
+      "index_open_seconds": 76.72,
+      "interpretation": "Preparation and repeated runtime/index opening are both material. A sampled English stemmer stack alone does not identify the entire end-to-end cause."
+    },
+    "joined_debug_library_sha256": "54de9013e69c5912d5fc9170eab5ec21bbe96ce2f19b1d8d144cb29461b6cd78",
+    "joined_local_synthetic_result": {
+      "benchmark_sha256": "9ae0f0902dbfd04e11f5a08bb0abd39eefff6e19f3e1a64170050dbb68306889",
+      "arguments": {
+        "library": ".tools/import-regression/artifacts/replay-completion-debug-library",
+        "directory": ".tools/import-regression/root-cause/sql-pressure-completion-unique-v1",
+        "rows": 1024,
+        "transactions": 8,
+        "block_rows": 128,
+        "key_bytes": 512,
+        "text_bytes": 4096,
+        "followup_rows": 128,
+        "busy_timeout": 5,
+        "no_sync": false,
+        "require_no_busy": true
+      },
+      "status": "passed",
+      "sql_prepare_seconds": 6.33059391588904,
+      "sql_commit_seconds": 20.417181750875898,
+      "followup_seconds": 0.6342324169818312,
+      "measured_cpu": {
+        "cpu_seconds": 35.123656,
+        "voluntary_context_switches": 8739,
+        "involuntary_context_switches": 18488
+      },
+      "explicit_drain_seconds": 2.6859812919283286,
+      "acknowledged_rows": 16512,
+      "reopen": true,
+      "interpretation": "All 16512 acknowledged rows, index catch-up, integrity and reopening passed with zero Busy. A single 20.42s versus 21.30s local Debug commit-time comparison is modest; it does not establish a fix for issue 1431.",
+      "counter_scope": "In the 54de Debug artifact, replay_publication_overhead_ns included the entire detached maintenance turn. The source now captures replay-only overhead before retirement/artifacts and exposes maintenance_publication_overhead_ns separately; do not subtract the old aggregate from replay wall time."
+    },
+    "storage_capture_followup": {
+      "status": "Final physical-only source: 21 native owner tests and 5 replay/budget tests passed; no stemming cache or retained-publication protocol.",
+      "evidence": "The 54de local original-importer early stack contains storageMaintenanceTurn -> Owner.refresh -> openLiteHandleAllocWithSharedInference -> DB.open under the capture gate. Physical service unnecessarily constructs a serving runtime before capturing its already separate native store.",
+      "design": "Capture and authenticate the physical file tip directly under path admission, transfer the verified detached allocator cache/digest, and preserve the serving logical wrapper until ordinary logical admission refreshes it. Do not inherit stale schemas, index runtime state or recovery witnesses. Retain the serving wrapper across detached physical work to prevent retirement during adoption.",
+      "regression": "Foreign metadata publication followed by physical maintenance must create no serving or detached DB runtime, leave the logical wrapper/header unchanged, then allow a normal fresh lookup and integrity check.",
+      "recovery_witness": "A physical tip never inherits clean SQL commit or DDL recovery flags from the previous logical wrapper. Mark recovery needed even when allocator authentication succeeded; Owner.refresh can use a physical cache as a proof donor, not as a logical clean witness."
+    },
+    "joined_original_input7_debug": {
+      "result": {
+        "input_index": 7,
+        "exit_code": 1,
+        "seconds": 537.771109375055,
+        "timed_out": false,
+        "summary": [
+          "0",
+          "0",
+          "1"
+        ],
+        "public_errors": [
+          "LiteReplayBacklogExceeded"
+        ],
+        "scope": "local diagnosis with metrics enabled; fresh database and only original input 7; not a full-corpus or throughput qualification"
+      },
+      "antfly_bench_derived_worker": {
+        "events": 171,
+        "documents": 51726.0,
+        "total_ms": 133995.0,
+        "full_text_prepare_ms": 67137.0,
+        "full_text_apply_lock_held_ms": 11993.0
+      },
+      "antfly_bench_batch": {
+        "events": 93,
+        "writes": 95232.0,
+        "total_ms": 89348.0,
+        "store_ms": 61053.0
+      },
+      "runtime_open": {
+        "events": 2363,
+        "total_seconds": 86.558805,
+        "index_open_seconds": 76.078245
+      },
+      "library_sha256": "54de9013e69c5912d5fc9170eab5ec21bbe96ce2f19b1d8d144cb29461b6cd78",
+      "interpretation": "Still fails with the same replay backlog error, 537.77s versus baseline 540.59s. Do not claim issue 1431 fixed, and do not infer optimized-build performance from these Debug diagnostics."
+    },
+    "stemming_reuse_decision": "Excluded from the follow-up source. Microbenchmark-only improvement and no demonstrated end-to-end importer gain do not justify adding another per-stream cache. The 9b67 and 54de artifacts remain historical diagnostic prototypes; the next candidate retains the existing HEAD analysis implementation.",
+    "sdk_compatibility": "No SDK changes: Rust uses serde_json::Value, Go json.RawMessage, TypeScript unknown, and Python decoded JSON for background_publications. Public C ABI and requests unchanged.",
+    "publication_completion_decision": "Excluded from the follow-up source. The joined-lease prototype did not resolve the original importer failure, and retaining admission changes when fixed publication overhead is recorded for adaptive sizing. Keep original lease lifetimes; measure successful index and metadata admission separately before changing grouping.",
+    "source_files_sha256": {
+      "zig/pkg/antfly-embedded/src/capi/lite_connection.zig": "b95c36079861a1bda42215d25ddab1c94794fea61929f2aadc306346fa29fb91",
+      "zig/pkg/antfly-embedded/src/storage/db/db.zig": "c54934c512b400d9d9f403d572cf691eb670e8fc1ba89ec50efeffaefb26f91b",
+      "scripts/bench/lite_sql_replay_pressure.py": "9ae0f0902dbfd04e11f5a08bb0abd39eefff6e19f3e1a64170050dbb68306889"
+    }
   }
 }

@@ -933,6 +933,10 @@ pub const Owner = struct {
         replay_backpressure_waits: u64 = 0,
         replay_refused_preparation_ns: u64 = 0,
         replay_index_groups: u64 = 0,
+        replay_publication_overhead_ns: u64 = 0,
+        replay_index_admission_ns: u64 = 0,
+        replay_metadata_admission_ns: u64 = 0,
+        maintenance_publication_overhead_ns: u64 = 0,
         publication_hold_ns: u64 = 0,
         replay_metadata_groups: u64 = 0,
         replay_attempts: u64 = 0,
@@ -1491,13 +1495,17 @@ pub const Owner = struct {
     fn enterReplayIndexPublication(ptr: *anyopaque) !void {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         if (comptime h.builtin.is_test) if (root.maintenance_owner.?.test_before_replay_index_publication) |hook| hook.notify(hook.ptr, root);
+        const started = @import("antfly_platform").time.monotonicNs();
         try enterMaintenanceWriter(root, .index);
+        root.maintenance_owner.?.publication_stats.replay_index_admission_ns +|= @import("antfly_platform").time.monotonicNs() -| started;
         root.maintenance_owner.?.publication_stats.replay_index_groups +|= 1;
     }
 
     fn enterReplayMetadataPublication(ptr: *anyopaque) !void {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
+        const started = @import("antfly_platform").time.monotonicNs();
         try enterMaintenanceWriter(root, .primary);
+        root.maintenance_owner.?.publication_stats.replay_metadata_admission_ns +|= @import("antfly_platform").time.monotonicNs() -| started;
         root.maintenance_owner.?.publication_stats.replay_metadata_groups +|= 1;
     }
 
@@ -1669,8 +1677,16 @@ pub const Owner = struct {
     const MaintenanceCapture = enum { storage, artifacts, source };
 
     fn refreshMaintenanceSnapshot(self: *Owner, foreground: *h.Handle, capture: MaintenanceCapture) !*h.Handle {
+        return self.refreshMaintenanceSnapshotAt(foreground, capture, null);
+    }
+
+    /// Physical service can capture a newer file tip without opening a serving
+    /// DB. The optional authority is borrowed under path admission and may
+    /// donate only its exact verified allocator cache, never logical runtimes.
+    fn refreshMaintenanceSnapshotAt(self: *Owner, foreground: *h.Handle, capture: MaintenanceCapture, physical_tip: ?*native.NativeFile) !*h.Handle {
         const need_database = capture != .storage;
-        const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
+        std.debug.assert(physical_tip == null or !need_database);
+        const file = physical_tip orelse &foreground.owned_lite_backend.?.native_docstore.?.file;
         if (self.maintenance_snapshot) |snapshot| {
             const cached_store = snapshot.owned_lite_backend.?.native_docstore.?;
             const captured = &cached_store.file;
@@ -1693,8 +1709,11 @@ pub const Owner = struct {
                 // changed catalog/index identity or inode always opens anew.
                 if (!std.meta.eql(file.header, captured.header)) try cached_store.refreshIndexPublicationCheckpoint(file.header);
                 try captured.inheritAllocatorVerification(file);
-                snapshot.sql_commit_recovery_needed = foreground.sql_commit_recovery_needed;
-                snapshot.sql_ddl_recovery_needed = foreground.sql_ddl_recovery_needed;
+                if (physical_tip != null) _ = try captured.takeVerifiedAllocator(file);
+                // A physical tip authenticates allocator state, never the
+                // previous logical wrapper's SQL recovery observations.
+                snapshot.sql_commit_recovery_needed = physical_tip != null or foreground.sql_commit_recovery_needed;
+                snapshot.sql_ddl_recovery_needed = physical_tip != null or foreground.sql_ddl_recovery_needed;
                 snapshot.sql_ddl_recovery_generation = foreground.sql_ddl_recovery_generation;
                 self.configureRetirementBudget(cached_store);
                 return snapshot;
@@ -1708,6 +1727,7 @@ pub const Owner = struct {
         // detached computation, even when it touches unrelated pages.
         options.artifact_reader_fence = false;
         options.allocator_verification_owner = file;
+        if (physical_tip != null) options.allocator_state_donor = file;
         // This owner gate and background-turn lease make the previous detached
         // cache quiescent. Authenticate its rebase before opening indexes can
         // publish leases; mutable allocator state is moved, never shared.
@@ -1715,7 +1735,7 @@ pub const Owner = struct {
         defer if (certified) |*cache| cache.close();
         if (self.maintenance_snapshot) |old| {
             const previous = &old.owned_lite_backend.?.native_docstore.?.file;
-            if (old.maintenance_references == 0 and previous.ledger != null) {
+            if (options.allocator_state_donor == null and old.maintenance_references == 0 and previous.ledger != null) {
                 certified = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
                 certified.?.allocator_cancel_token = &self.verification_cancel;
                 if (try certified.?.takeAllocatorRebaseBase(previous)) {
@@ -1747,8 +1767,8 @@ pub const Owner = struct {
             break :blk opened;
         };
         snapshot.lease_snapshot = true;
-        snapshot.sql_commit_recovery_needed = foreground.sql_commit_recovery_needed;
-        snapshot.sql_ddl_recovery_needed = foreground.sql_ddl_recovery_needed;
+        snapshot.sql_commit_recovery_needed = physical_tip != null or foreground.sql_commit_recovery_needed;
+        snapshot.sql_ddl_recovery_needed = physical_tip != null or foreground.sql_ddl_recovery_needed;
         snapshot.sql_ddl_recovery_generation = foreground.sql_ddl_recovery_generation;
         const store = snapshot.owned_lite_backend.?.native_docstore.?;
         store.file.reader_coordinator = self.reader_coordinator;
@@ -2204,6 +2224,7 @@ pub const Owner = struct {
         if (run_source) database.async_context.replay_metadata_publication = .{ .ptr = root, .enter = enterReplayMetadataPublication, .leave = leaveMaintenanceWriter };
         if (run_source) database.async_context.replay_publication = .{ .ptr = &publication, .publish = PreparedPublication.publishReplay };
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
+        const publication_overhead_before = group_state.publication_overhead_ns.load(.monotonic);
         lease.close();
         lease_held = false;
         self.gate.mutex.unlock(io);
@@ -2232,6 +2253,7 @@ pub const Owner = struct {
             break :blk true;
         } else projected;
         const replay_finished = @import("antfly_platform").time.monotonicNs();
+        const replay_publication_overhead = group_state.publication_overhead_ns.load(.monotonic) -| publication_overhead_before;
         // Capture source eligibility before retirement/LSM housekeeping adds
         // its own continuation. An artifact-only turn must never re-run source
         // providers, replay, relational sweeps or status snapshot publication.
@@ -2330,6 +2352,8 @@ pub const Owner = struct {
         self.publication_stats.maintenance_capture_ns +|= detached_started -| turn_started;
         self.publication_stats.maintenance_proof_ns +|= proof_finished -| detached_started;
         self.publication_stats.maintenance_replay_ns +|= replay_finished -| proof_finished;
+        self.publication_stats.replay_publication_overhead_ns +|= replay_publication_overhead;
+        self.publication_stats.maintenance_publication_overhead_ns +|= group_state.publication_overhead_ns.load(.monotonic) -| publication_overhead_before;
         self.publication_stats.producer_replay_budget = group_state.producer_replay_budget.producerSnapshot();
         self.publication_stats.maintenance_artifacts_ns +|= artifacts_finished -| replay_finished;
         self.publication_stats.maintenance_storage_ns +|= @import("antfly_platform").time.monotonicNs() -| artifacts_finished;
@@ -2416,17 +2440,42 @@ pub const Owner = struct {
         var lease = try self.acquireMaintenancePathLeaseAssumeLocked();
         var lease_held = true;
         defer if (lease_held) lease.close();
-        const foreground = try self.refresh();
-        if (needsOutcomeReconciliation(foreground)) return true;
-        // A changed tip can invalidate a previously scheduled storage turn.
-        // Yield it to the shared proof lane before bounded reclamation can
-        // require reuse, rather than proving a second pool under its gate.
-        if (!foreground.owned_lite_backend.?.native_docstore.?.file.free_pages_verified) return true;
+        const foreground = self.current orelse return true;
+        if (needsOutcomeReconciliation(foreground)) return error.OutcomeUnknown;
+        if (self.maintenance_snapshot) |snapshot| if (needsOutcomeReconciliation(snapshot)) return error.OutcomeUnknown;
         const entry_header = foreground.owned_lite_backend.?.native_docstore.?.file.header;
-        const root = try self.refreshMaintenanceSnapshot(foreground, .storage);
+        var tip = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
+        var tip_open = true;
+        defer if (tip_open) tip.close();
+        tip.allocator_cancel_token = &self.verification_cancel;
+        self.reader_coordinator.observeCurrent((try tip.file.stat(tip.runtime())).inode, tip.headerFingerprint());
+        try tip.inheritAllocatorVerification(&foreground.owned_lite_backend.?.native_docstore.?.file);
+        if (self.maintenance_snapshot) |snapshot| {
+            const previous = &snapshot.owned_lite_backend.?.native_docstore.?.file;
+            try tip.inheritAllocatorVerification(previous);
+            if (snapshot.maintenance_references == 0) {
+                if (!try tip.takeVerifiedAllocator(previous)) _ = try tip.takeAllocatorRebaseBase(previous);
+            }
+        }
+        // Certificate validation reuses the detached ledger/digest. It does not
+        // construct DBs, open index leases, or run source/provider maintenance.
+        // A genuinely unchecked tip still yields to the ordinary proof lane.
+        if (!tip.free_pages_verified) _ = try tip.inheritAllocatorCertificate();
+        if (!tip.free_pages_verified) return true;
+        const root = try self.refreshMaintenanceSnapshotAt(foreground, .storage, &tip);
+        tip.close();
+        tip_open = false;
         const store = root.owned_lite_backend.?.native_docstore.?;
         const maintenance_entry_header = store.file.header;
         root.maintenance_references += 1;
+        // Foreground refresh may retire its logical wrapper while physical
+        // service is detached. Retain it until adoption has checked identity.
+        foreground.query_borrows += 1;
+        defer {
+            std.debug.assert(gate_locked);
+            foreground.query_borrows -= 1;
+            self.collectRetired();
+        }
         root.maintenance_owner = self;
         root.maintenance_publication = null;
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
@@ -6626,4 +6675,52 @@ test "capi native replay publication retains primary epoch after preparing text 
     }
     try std.testing.expect(probe.publications != 0);
     try std.testing.expect(!probe.missing_epoch);
+}
+
+test "capi native allocator proof storage-only foreign tip avoids runtime refresh" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("physical-tip-without-runtime", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    const foreground = owner.current.?;
+    const entry_header = foreground.owned_lite_backend.?.native_docstore.?.file.header;
+    foreground.sql_commit_recovery_needed = false;
+    foreground.sql_ddl_recovery_needed = false;
+    {
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        var peer = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), fixture.path, .{ .externally_locked = true, .no_sync = true });
+        defer peer.close();
+        try peer.inheritAllocatorVerification(&foreground.owned_lite_backend.?.native_docstore.?.file);
+        try peer.putCatalogRecord("runtime-affecting-metadata", "peer publication");
+        try std.testing.expect(try peer.certifyAllocator());
+    }
+    const refreshes = owner.publication_stats.serving_runtime_refreshes;
+    const runtime_opens = owner.test_runtime_snapshot_opens;
+    const cache_transfers_before = foreground.owned_lite_backend.?.native_docstore.?.file.allocator_work.cache_transfers;
+    try std.testing.expect(try owner.storageMaintenanceTurn());
+    try std.testing.expectEqual(foreground, owner.current.?);
+    try std.testing.expectEqualDeep(entry_header, foreground.owned_lite_backend.?.native_docstore.?.file.header);
+    try std.testing.expectEqual(refreshes, owner.publication_stats.serving_runtime_refreshes);
+    try std.testing.expectEqual(runtime_opens, owner.test_runtime_snapshot_opens);
+    try std.testing.expect(owner.maintenance_snapshot != null);
+    try std.testing.expect(!owner.maintenance_snapshot.?.db_live);
+    try std.testing.expect(owner.maintenance_snapshot.?.sql_commit_recovery_needed);
+    try std.testing.expect(owner.maintenance_snapshot.?.sql_ddl_recovery_needed);
+    const physical_file = &owner.maintenance_snapshot.?.owned_lite_backend.?.native_docstore.?.file;
+    try std.testing.expect(physical_file.free_pages_verified);
+    try std.testing.expect(physical_file.ledger != null);
+    // Physical telemetry is absorbed into the serving owner after service.
+    try std.testing.expect(foreground.owned_lite_backend.?.native_docstore.?.file.allocator_work.cache_transfers > cache_transfers_before);
+    try std.testing.expectEqual(@as(usize, 0), foreground.query_borrows);
+    // Logical admission must still refresh and expose the real data; physical
+    // housekeeping never certifies an obsolete schema/index runtime as current.
+    try fixture.expectWritten(.batch, true);
+    var lease = try fixture.connection.acquire();
+    defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    defer lease.close();
+    const current = try owner.refresh();
+    try std.testing.expect((try current.owned_lite_backend.?.native_docstore.?.file.check()).valid);
 }
