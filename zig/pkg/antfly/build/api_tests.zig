@@ -971,6 +971,29 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     fk_validation_run.addArg("--require-no-skips");
     b.step("antfly-fk-validation-transactions-test", "Verify selected FK validation uses guarded ordinary attachments and durable native transactions")
         .dependOn(&fk_validation_run.step);
+    const sql_transaction_lifecycle_tests = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{ "SQL prepared transaction", "SQL command scope database", "distributed txn private COMMIT", "distributed txn external coordinator" },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 28 else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_transaction_lifecycle_run = addFilteredTestRunArtifact(b, sql_transaction_lifecycle_tests);
+    sql_transaction_lifecycle_run.addArg("--require-no-skips");
+    const sql_transaction_lifecycle_inventory = b.addRunArtifact(sql_transaction_lifecycle_tests);
+    sql_transaction_lifecycle_inventory.addArg("--list-tests");
+    const sql_transaction_lifecycle_audit = b.addSystemCommand(&.{"python3"});
+    sql_transaction_lifecycle_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for ([_][]const u8{
+        "SQL prepared transaction native visibility receipts retain cold partial progress and terminal repair",
+        "SQL command scope database holds survive cold snapshots and block rename and drop until retirement",
+        "distributed txn private COMMIT visibility adoption is monotone across cold reopen and retains repair proof",
+        "distributed txn external coordinator freezes authority and resumes every lost phase reply",
+    }) |required| sql_transaction_lifecycle_audit.addArgs(&.{ "--filter", required });
+    sql_transaction_lifecycle_audit.addArg("--inventory");
+    sql_transaction_lifecycle_audit.addFileArg2(sql_transaction_lifecycle_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    sql_transaction_lifecycle_run.step.dependOn(&sql_transaction_lifecycle_audit.step);
+    b.step("antfly-sql-transaction-lifecycle-test", "Qualify durable SQL commit progress, index repair delivery and database scope retirement")
+        .dependOn(&sql_transaction_lifecycle_run.step);
     const api_table_writes_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_writes_test_root.zig"),
         .target = target,
@@ -1053,6 +1076,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed txn coordinator groups by range and commits all participants",
             "distributed txn external recovery pass retains a sendable hosted budget",
             "distributed txn external coordinator freezes authority and resumes every lost phase reply",
+            "distributed txn private COMMIT visibility adoption is monotone across cold reopen and retains repair proof",
+            "SQL prepared transaction native visibility receipts retain cold partial progress and terminal repair",
+            "SQL command scope database holds survive cold snapshots and block rename and drop until retirement",
             "stable distributed transaction retry resumes a durable commit decision",
             "distributed txn retries an ambiguous coordinator decision under the same id",
             "distributed txn bounds unresolved coordinator decision retries",

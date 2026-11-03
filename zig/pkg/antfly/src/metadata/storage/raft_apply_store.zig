@@ -26213,6 +26213,15 @@ pub const RaftApplyStore = struct {
         };
         if (mutation.kind == .database and mutation.action == .drop and
             try PreparedTransactions.databaseCount(reader.view.alloc, reader.view.txn, reader.view.group_id, target.id) != 0) return error.TableTransitionActive;
+        if (mutation.kind == .database) {
+            // No scope can precede metadata identity initialization. Preserve
+            // ordinary database DDL on a store which has never admitted one.
+            var identity_buffer: [160]u8 = undefined;
+            if (try stagingGet(reader.view.txn, try metadataIncarnationKeyForGroup(&identity_buffer, reader.view.group_id)) != null) {
+                const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = reader.view.group_id, .incarnation = try catalogIncarnationTxn(reader.view.txn, reader.view.group_id) };
+                if (try SqlLocks.scopes.databaseCount(reader.view.txn, ns, target.id) != 0) return error.SqlDatabaseInUse;
+            }
+        }
         const lifecycle = @import("../table_lifecycle_lock.zig");
         var prefix_buffer: [160]u8 = undefined;
         const prefix = try lifecycle.prefix(&prefix_buffer, reader.view.group_id);
@@ -26732,6 +26741,7 @@ pub const RaftApplyStore = struct {
         try self.validateGeneratedConstraintNamesTxn(a, &txn, group_id, command, meta);
         const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = &txn, .group_id = group_id, .meta = meta } };
         try validateCatalogTopology(command);
+        try validateSqlDropNameMutation(reader, command);
         if (command.topology) |topology| switch (topology) {
             .create => |create| {
                 const guards = try sql_type_layouts.guardsForDefinitionsAlloc(a, create.table.schema_json, create.table.read_schema_json);
@@ -27326,7 +27336,7 @@ pub const RaftApplyStore = struct {
         const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = txn, .group_id = group_id, .meta = meta } };
         validateCatalogTopology(command) catch return;
         validateSqlDropNameMutation(reader, command) catch |err| switch (err) {
-            error.TableTransitionActive => return,
+            error.TableTransitionActive, error.SqlDatabaseInUse => return,
             else => return err,
         };
         var delta = system_catalog.planWithTopology(a, reader, meta.next_id, command.mutation, command.mutation.kind == .table and command.mutation.action == .drop) catch |err| switch (err) {
@@ -68586,5 +68596,199 @@ test "system catalog relation namespace transaction prepared table and FK consum
         var complete = try std.json.parseFromSlice(refs.Status, a, after, .{});
         defer complete.deinit();
         try std.testing.expect(complete.value.record.?.complete);
+    }
+}
+
+test "SQL prepared transaction native visibility receipts retain cold partial progress and terminal repair" {
+    const P = @import("../../system_catalog/prepared_transactions.zig");
+    const T = SessionCommitRegistryFixture;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Helper = struct {
+        fn cut(store: *RaftApplyStore, a: std.mem.Allocator, id: [16]u8) !P.Snapshot {
+            return std.json.parseFromSliceLeaky(P.Snapshot, a, try store.sqlPreparedRead(a, T.group, .{ .operation = id }, .{}), .{});
+        }
+        fn send(store: *RaftApplyStore, a: std.mem.Allocator, request: P.Mutation) !void {
+            try store.applyStandaloneCommand(T.group, .{ .apply_sql_prepared_transaction = try std.json.Stringify.valueAlloc(a, request, .{}) });
+            const outcome = (try std.json.parseFromSliceLeaky(?P.outcomes.Outcome, a, try store.sqlPreparedOutcome(a, T.group, request), .{})).?;
+            _ = try outcome.result();
+        }
+        fn change(store: *RaftApplyStore, a: std.mem.Allocator, identity: P.Identity, nonce: u8, action: P.Action) !void {
+            const before = try cut(store, a, identity.operation_id);
+            try send(store, a, .{ .admission = .{ .nonce = @splat(nonce), .head = before.head }, .incarnation = before.incarnation, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database_id = 1, .operation = .{ .advance = .{ .owner = try identity.owner(a), .expected_revision = before.records[0].revision, .action = action } } });
+        }
+        fn ack(store: *RaftApplyStore, a: std.mem.Allocator, identity: P.Identity, nonce: u8) !void {
+            const before = try cut(store, a, identity.operation_id);
+            try send(store, a, .{ .admission = .{ .nonce = @splat(nonce), .head = before.head }, .incarnation = before.incarnation, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database_id = 1, .operation = .{ .acknowledge_receipt = .{ .owner = try identity.owner(a), .txn_id = identity.txn_id } } });
+        }
+    };
+    for ([_]bool{ false, true }) |repair| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/visibility-{any}", .{ tmp.sub_path, repair });
+        var identity = try T.identity(a, .session_commit, 91, "");
+        for (0..6) |phase| {
+            var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+            defer store.deinit();
+            if (phase == 0) {
+                try store.applyStandaloneCommand(T.group, .{ .initialize_metadata_incarnation = T.seed });
+                try store.applyStandaloneCommand(T.group, .{ .upsert_table = .{ .table_id = 901, .name = "visibility_rows", .schema_json = "{\"version\":1}" } });
+                const ranges = [_]metadata.RangeRecord{
+                    .{ .table_id = 901, .group_id = 902, .start_key = "", .end_key = "doc:m" },
+                    .{ .table_id = 901, .group_id = 903, .start_key = "doc:m", .end_key = null },
+                };
+                for (ranges) |range| try store.applyStandaloneCommand(T.group, .{ .upsert_range = range });
+                {
+                    var write = try store.store.beginWriteTxn();
+                    errdefer write.abort();
+                    const meta = try system_catalog_storage.readMeta(a, &write, T.group);
+                    var resources = [_]system_catalog.Resource{.{ .kind = .table, .id = 901, .parent_id = 2, .name = "visibility_rows", .storage_name = "visibility_rows" }};
+                    try system_catalog_storage.applyDelta(a, &write, T.group, .{ .upserts = &resources, .removes = &.{}, .next_id = @max(meta.next_id, 904) }, meta, @splat(1));
+                    try write.commit();
+                }
+                const manifest = try a.alloc(P.Participant, 2);
+                for (ranges, manifest) |range, *part| part.* = .{ .table_name = "visibility_rows", .schema_version = 1, .route = .{
+                    .metadata_group_id = T.group,
+                    .metadata_incarnation = T.seed,
+                    .catalog_revision = try store.writeValidationRevision(T.group),
+                    .table_id = 901,
+                    .topology_epoch = 1,
+                    .route = .{ .group_id = range.group_id, .range_id = metadata_table_manager.rangeDocIdentityRangeId(range), .identity_namespace = .{ .table_id = 901, .shard_id = metadata_table_manager.rangeDocIdentityShardId(range), .range_id = metadata_table_manager.rangeDocIdentityRangeId(range) } },
+                } };
+                identity.manifest_digest = try P.manifestDigest(a, manifest, T.seed);
+                try store.applyStandaloneCommand(T.group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = T.seed, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+                const before = try Helper.cut(&store, a, identity.operation_id);
+                var request = T.admission(identity);
+                request.admission.head = before.head;
+                request.operation.admit.participants = manifest;
+                try Helper.send(&store, a, request);
+                try Helper.change(&store, a, identity, 21, .prepare);
+                try Helper.change(&store, a, identity, 22, .{ .commit = .{ .version = 30, .sync_level = .full_index } });
+                const committed = try Helper.cut(&store, a, identity.operation_id);
+                try std.testing.expectEqual(.committed, committed.receipts[0].status);
+                try std.testing.expectEqual(.resolving, committed.receipts[0].progress);
+                try std.testing.expectError(error.InvalidPreparedTransactionPhase, Helper.ack(&store, a, identity, 23));
+            } else if (phase == 1) {
+                try Helper.change(&store, a, identity, 24, .{ .activate = 3 });
+                try Helper.change(&store, a, identity, 25, .{ .resolve = 1 });
+                try std.testing.expectError(error.InvalidPreparedTransactionPhase, Helper.change(&store, a, identity, 26, .{ .visibility = .{ .complete = 1 } }));
+                try std.testing.expectEqual(.resolving, (try Helper.cut(&store, a, identity.operation_id)).receipts[0].progress);
+            } else if (phase == 2) {
+                try Helper.change(&store, a, identity, 27, .{ .resolve = 2 });
+                try std.testing.expectEqual(.indexing, (try Helper.cut(&store, a, identity.operation_id)).receipts[0].progress);
+                try std.testing.expectError(error.InvalidPreparedTransactionPhase, Helper.ack(&store, a, identity, 28));
+                try std.testing.expectError(error.InvalidPreparedTransactionPhase, Helper.change(&store, a, identity, 29, .handoff));
+                try Helper.change(&store, a, identity, 30, .{ .visibility = .{ .complete = 1, .repair = if (repair) 1 else 0 } });
+            } else if (phase == 3) {
+                const before = try Helper.cut(&store, a, identity.operation_id);
+                try std.testing.expectEqual(@as(u64, 1), before.records[0].visibility);
+                if (!repair) try std.testing.expectError(error.ExternalTransactionDecisionChanged, Helper.change(&store, a, identity, 31, .{ .visibility = .{ .complete = 1, .repair = 1 } }));
+                try Helper.change(&store, a, identity, 32, .{ .visibility = .{ .complete = 2 } });
+                const ready = try Helper.cut(&store, a, identity.operation_id);
+                try std.testing.expectEqual(if (repair) P.CommitProgress.repair_required else .ready, ready.receipts[0].progress);
+                try Helper.change(&store, a, identity, 33, .handoff);
+            } else if (phase == 4) {
+                const delivered = try Helper.cut(&store, a, identity.operation_id);
+                try std.testing.expectEqual(@as(usize, 0), delivered.records.len);
+                try std.testing.expectEqual(if (repair) P.CommitProgress.repair_required else .ready, delivered.receipts[0].progress);
+                try Helper.ack(&store, a, identity, 34);
+            } else {
+                const retired = try Helper.cut(&store, a, identity.operation_id);
+                try std.testing.expectEqual(@as(usize, 0), retired.records.len);
+                try std.testing.expectEqual(@as(usize, 0), retired.receipts.len);
+            }
+        }
+    }
+}
+
+test "SQL command scope database holds survive cold snapshots and block rename and drop until retirement" {
+    const L = @import("../../system_catalog/lock_authority.zig");
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const group = 21;
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/scope-database", .{tmp.sub_path});
+    const backend: L.locks.Backend = .{ .incarnation = @splat(0x11), .id = @splat(2), .fence = 1 };
+    var database: u64 = 0;
+    const Helper = struct {
+        fn snapshot(store: *RaftApplyStore, backing: std.mem.Allocator, id: u64, owner: L.locks.Backend) !L.Snapshot {
+            return std.json.parseFromSliceLeaky(L.Snapshot, backing, try store.sqlLockRead(backing, group, .{ .incarnation = owner.incarnation, .standalone = false, .database = id, .actor = .{ .session_user = .bootstrap, .credential = "" }, .backend = owner }, .{ .setting_admin = true }), .{});
+        }
+        fn submit(store: *RaftApplyStore, backing: std.mem.Allocator, id: u64, owner: L.locks.Backend, nonce: u8, op: @FieldType(L.Request, "operation")) !void {
+            const before = try snapshot(store, backing, id, owner);
+            const request: L.Request = .{ .admission = .{ .head = before.head, .nonce = @splat(nonce) }, .incarnation = owner.incarnation, .standalone = false, .database = id, .actor = .{ .session_user = .bootstrap, .credential = "" }, .backend = owner, .operation = op };
+            try store.applyStandaloneCommand(group, .{ .apply_sql_lock_scope = try std.json.Stringify.valueAlloc(backing, request, .{}) });
+            const result = (try std.json.parseFromSliceLeaky(?L.outcomes.Outcome, backing, try store.sqlLockOutcome(backing, group, request), .{})).?;
+            _ = try result.result();
+        }
+        fn count(store: *RaftApplyStore, id: u64) !u32 {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            return L.scopes.databaseCount(&read, .{ .home = .metadata, .group = group, .incarnation = @splat(0x11) }, id);
+        }
+        fn blocked(store: *RaftApplyStore, backing: std.mem.Allocator) !void {
+            try std.testing.expectError(error.SqlDatabaseInUse, store.validateSystemCatalog(group, .{ .expected_revision = (try store.systemCatalogMeta(backing, group)).revision, .mutation = .{ .action = .rename, .kind = .database, .name = "leased_db", .new_name = "retired_db" } }));
+            try std.testing.expectError(error.SqlDatabaseInUse, store.validateSystemCatalog(group, .{ .expected_revision = (try store.systemCatalogMeta(backing, group)).revision, .mutation = .{ .action = .drop, .kind = .database, .name = "leased_db" } }));
+        }
+    };
+    for (0..3) |phase| {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        if (phase == 0) {
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = @splat('1') });
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+            try applySystemCatalogTestCommand(&store, 1, .{ .expected_revision = (try store.systemCatalogMeta(a, group)).revision, .mutation = .{ .action = .create, .kind = .database, .name = "leased_db" } });
+            const state = try std.json.parseFromSliceLeaky(system_catalog.State, a, try store.systemCatalogRead(a, group, .{ .kind = .database, .name = "leased_db" }), .{});
+            for (state.resources) |resource| if (resource.kind == .database and std.mem.eql(u8, resource.name, "leased_db")) {
+                database = resource.id;
+            };
+            try std.testing.expect(database != 0);
+            const registration: L.scopes.Registration = .{ .lease = .{ .backend = backend, .database = database, .node = 7, .principal = try L.principalDigest(a, .bootstrap), .expires_at_ms = 1000 }, .connection = @splat('a'), .nonce = @splat(3), .standalone = false };
+            try Helper.submit(&store, a, database, backend, 11, .{ .register = registration });
+            try Helper.submit(&store, a, database, backend, 13, .{ .register = registration });
+            try std.testing.expectEqual(@as(u32, 1), try Helper.count(&store, database));
+            try Helper.blocked(&store, a);
+            // The proposal could have passed preflight before registration.
+            // Both late committed proposals must lose without partial writes.
+            const revision = (try store.systemCatalogMeta(a, group)).revision;
+            try applySystemCatalogTestCommand(&store, 2, .{ .expected_revision = revision, .mutation = .{ .action = .rename, .kind = .database, .name = "leased_db", .new_name = "retired_db" } });
+            try applySystemCatalogTestCommand(&store, 3, .{ .expected_revision = revision, .mutation = .{ .action = .drop, .kind = .database, .name = "leased_db" } });
+            try std.testing.expectEqual(revision, (try store.systemCatalogMeta(a, group)).revision);
+            try Helper.submit(&store, a, database, backend, 12, .{ .fence = .close });
+            try Helper.blocked(&store, a);
+        } else if (phase == 1) {
+            try std.testing.expectEqual(@as(u32, 1), try Helper.count(&store, database));
+            const bytes = try store.snapshotBuilder().buildSnapshot(a, group);
+            const clone_root = try std.fmt.allocPrint(a, "{s}-clone", .{root});
+            var clone = try RaftApplyStore.init(alloc, .{ .root_dir = clone_root });
+            defer clone.deinit();
+            try RaftApplyStore.installSnapshotFromRaft(&clone, a, group, 10, bytes);
+            try std.testing.expectEqual(@as(u32, 1), try Helper.count(&clone, database));
+            try Helper.blocked(&clone, a);
+            for (0..8) |step| {
+                if ((try Helper.snapshot(&store, a, database, backend)).scope.?.state == .retired) break;
+                try Helper.blocked(&store, a);
+                try Helper.submit(&store, a, database, backend, @intCast(20 + step), .close_step);
+            }
+            try std.testing.expectEqual(@as(u32, 0), try Helper.count(&store, database));
+            try applySystemCatalogTestCommand(&store, 4, .{ .expected_revision = (try store.systemCatalogMeta(a, group)).revision, .mutation = .{ .action = .rename, .kind = .database, .name = "leased_db", .new_name = "retired_db" } });
+            const state = try std.json.parseFromSliceLeaky(system_catalog.State, a, try store.systemCatalogRead(a, group, .{ .kind = .namespace, .database = "retired_db" }), .{});
+            var index: u64 = 5;
+            for (state.resources) |resource| if (resource.kind == .namespace and resource.parent_id == database) {
+                try applySystemCatalogTestCommand(&store, index, .{ .expected_revision = (try store.systemCatalogMeta(a, group)).revision, .mutation = .{ .action = .drop, .kind = .namespace, .database = "retired_db", .name = resource.name } });
+                index += 1;
+            };
+            try applySystemCatalogTestCommand(&store, index, .{ .expected_revision = (try store.systemCatalogMeta(a, group)).revision, .mutation = .{ .action = .drop, .kind = .database, .name = "retired_db" } });
+        } else {
+            try std.testing.expectEqual(@as(u32, 0), try Helper.count(&store, database));
+            // A source can still adopt its terminal native fence after the
+            // database name has gone; cleanup never resurrects the database.
+            try std.testing.expectEqual(.retired, (try Helper.snapshot(&store, a, database, backend)).scope.?.state);
+        }
     }
 }

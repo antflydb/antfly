@@ -234,6 +234,29 @@ fn writeCount(txn: anytype, ns: ledger.Namespace, value: u32) !void {
     std.mem.writeInt(u32, &raw, value, .little);
     try txn.put(try key(&buffer, ns, null), &raw);
 }
+fn databaseCountKey(buffer: []u8, ns: ledger.Namespace, database: u64) ![]const u8 {
+    try ns.validate();
+    if (database == 0) return error.InvalidLockScope;
+    // Keep the counter in the existing scope snapshot projection. It counts
+    // unreclaimed owners, including fenced owners whose cleanup is unfinished.
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:sql_lock_scope:{x:0>16}:{s}:database:{x:0>16}", .{ ns.group, std.fmt.bytesToHex(ns.incarnation, .lower), database });
+}
+pub fn databaseCount(txn: anytype, ns: ledger.Namespace, database: u64) !u32 {
+    var buffer: [192]u8 = undefined;
+    const raw = (try optional(txn, try databaseCountKey(&buffer, ns, database))) orelse return 0;
+    if (raw.len != 4) return error.InvalidLockRecord;
+    const value = std.mem.readInt(u32, raw[0..4], .little);
+    if (value == 0 or value > max_active) return error.InvalidLockRecord;
+    return value;
+}
+fn writeDatabaseCount(txn: anytype, ns: ledger.Namespace, database: u64, value: u32) !void {
+    var buffer: [192]u8 = undefined;
+    const address = try databaseCountKey(&buffer, ns, database);
+    if (value == 0) return txn.delete(address);
+    var raw: [4]u8 = undefined;
+    std.mem.writeInt(u32, &raw, value, .little);
+    try txn.put(address, &raw);
+}
 fn connectionKey(buffer: []u8, ns: ledger.Namespace, node: u64, connection_id: [32]u8) ![]const u8 {
     try ns.validate();
     if (ns.home != .metadata) return error.InvalidLockScope;
@@ -264,11 +287,14 @@ pub fn register(backing: A, txn: anytype, ns: ledger.Namespace, registration: Re
     if (try connection(a, txn, ns, registration.lease.node, registration.connection) != null) return error.LockOwnerChanged;
     const active = try count(txn, ns);
     if (active == max_active) return error.LockLimitExceeded;
+    const database_active = try databaseCount(txn, ns, registration.lease.database);
+    if (database_active >= max_active) return error.InvalidLockRecord;
     const value: Record = .{ .registration = registration };
     try ledger.register(a, txn, ns, registration.lease, RegistrationContext{});
     try write(a, txn, ns, value);
     try writeWork(txn, ns, value);
     try writeCount(txn, ns, active + 1);
+    try writeDatabaseCount(txn, ns, registration.lease.database, database_active + 1);
     var buffer: [192]u8 = undefined;
     var binding: [24]u8 = undefined;
     @memcpy(binding[0..16], &registration.lease.backend.id);
@@ -584,11 +610,13 @@ pub fn closeStep(backing: A, txn: anytype, ns: ledger.Namespace, backend: locks.
         return false;
     }
     const active = try count(txn, ns);
-    if (active == 0) return error.InvalidLockRecord;
+    const database_active = try databaseCount(txn, ns, value.registration.lease.database);
+    if (active == 0 or database_active == 0) return error.InvalidLockRecord;
     try eraseWork(txn, ns, value);
     value.state = .retired;
     try write(a, txn, ns, value);
     try writeCount(txn, ns, active - 1);
+    try writeDatabaseCount(txn, ns, value.registration.lease.database, database_active - 1);
     return true;
 }
 fn CloseContext(comptime Authority: type) type {

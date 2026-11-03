@@ -480,7 +480,7 @@ test "pessimistic locks native LSM scope renewal and registration abort every pa
     var store = try DocStore.open(a, path, .{});
     defer store.close();
     // Ledger owner, scope and capacity counter share one accepting transaction.
-    for (0..5) |fail_after| {
+    for (0..6) |fail_after| {
         var txn = try store.beginWriteTxn();
         var fault: FaultTxn = .{ .txn = &txn, .remaining = fail_after };
         try std.testing.expectError(error.InjectedLockWriteFailure, scopes.register(a, &fault, ns, scope_registration, scope_authority));
@@ -488,6 +488,7 @@ test "pessimistic locks native LSM scope renewal and registration abort every pa
         var read = try store.beginReadTxn();
         defer read.abort();
         try std.testing.expectEqual(@as(?scopes.Record, null), try scopes.read(a, &read, ns, source.backend));
+        try std.testing.expectEqual(@as(u32, 0), try scopes.databaseCount(&read, ns, source.database));
         try std.testing.expectEqual(@as(?ledger.Owner, null), try ledger.readOwner(a, &read, ns, source.backend));
     }
     try registerScope(&store);

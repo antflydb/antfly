@@ -178,6 +178,8 @@ pub fn manifestDigest(a: A, manifest: []const Participant, incarnation: [32]u8) 
     return digest(a, "antfly:sql-prepared-participants:v1\x00", manifest);
 }
 
+pub const CommitProgress = enum { resolving, indexing, ready, repair_required };
+
 pub const Phase = enum { preparing, prepared, decided, active, resolved, retired };
 pub const DecisionInput = struct { version: u64, sync_level: local.storage_db_types.SyncLevel = .write };
 pub const Decision = struct { status: enum { committed, aborted }, version: u64, sync_level: local.storage_db_types.SyncLevel = .write };
@@ -190,17 +192,30 @@ pub const Record = struct {
     votes: u64 = 0,
     activations: u64 = 0,
     resolutions: u64 = 0,
+    visibility: u64 = 0,
+    visibility_repairs: u64 = 0,
     decision: ?Decision = null,
 
     pub fn mask(self: Record) u64 {
         return if (self.participants.len == 64) std.math.maxInt(u64) else (@as(u64, 1) << @as(u6, @intCast(self.participants.len))) - 1;
     }
 
+    pub fn visibilityMask(self: Record) u64 {
+        return if (self.identity.kind == .session_commit and self.decision != null and self.decision.?.status == .committed and self.decision.?.sync_level != .write) self.mask() else 0;
+    }
+    pub fn commitProgress(self: Record) CommitProgress {
+        if (self.phase == .decided or self.phase == .active) return .resolving;
+        if (self.visibility != self.visibilityMask()) return .indexing;
+        return if (self.visibility_repairs != 0) .repair_required else .ready;
+    }
     pub fn validate(self: Record, a: A) !void {
         try self.identity.validate();
         if (self.revision == 0 or !std.mem.eql(u8, &try manifestDigest(a, self.participants, self.identity.metadata_incarnation), &self.identity.manifest_digest)) return error.InvalidCatalogRecord;
         const all = self.mask();
         if ((self.votes | self.activations | self.resolutions) & ~all != 0) return error.InvalidCatalogRecord;
+        if ((self.visibility | self.visibility_repairs) & ~self.visibilityMask() != 0 or self.visibility_repairs & ~self.visibility != 0) return error.InvalidCatalogRecord;
+        if (self.phase != .resolved and self.phase != .retired and self.visibility != 0) return error.InvalidCatalogRecord;
+        if (self.phase == .retired and self.visibility != self.visibilityMask()) return error.InvalidCatalogRecord;
         switch (self.phase) {
             .preparing, .prepared => {
                 if (self.decision != null or self.activations != 0 or self.resolutions != 0) return error.InvalidCatalogRecord;
@@ -231,6 +246,7 @@ pub const Action = union(enum) {
     abort: u64,
     activate: u64,
     resolve: u64,
+    visibility: struct { complete: u64, repair: u64 = 0 },
     handoff,
 };
 
@@ -275,8 +291,17 @@ pub fn advance(a: A, record: Record, expected_revision: u64, owner: Owner, actio
             next.resolutions |= members;
             if (next.resolutions == all) next.phase = .resolved;
         },
+        .visibility => |progress| {
+            if (record.phase != .resolved or record.identity.kind != .session_commit or progress.complete == 0 or
+                progress.complete & ~record.visibilityMask() != 0 or progress.repair & ~progress.complete != 0) return error.InvalidPreparedTransactionPhase;
+            // An already attested successful barrier cannot become an index
+            // failure belonging to some later mutation of the same table.
+            if (progress.repair & record.visibility & ~record.visibility_repairs != 0) return error.ExternalTransactionDecisionChanged;
+            next.visibility |= progress.complete;
+            next.visibility_repairs |= progress.repair;
+        },
         .handoff => {
-            if (record.phase != .resolved) return error.InvalidPreparedTransactionPhase;
+            if (record.phase != .resolved or record.visibility != record.visibilityMask()) return error.InvalidPreparedTransactionPhase;
             next.phase = .retired;
         },
     }
@@ -550,7 +575,7 @@ pub fn plan(a: A, txn: anytype, group: u64, catalog_revision: u64, request: Muta
         .acknowledge_receipt => |ack| {
             const receipt = (try readReceipt(a, txn, group, ack.owner.operation_id)) orelse return .{ .writes = &.{}, .deletes = &.{}, .result = .{ .revision = catalog_revision, .identity = null, .removed = 0, .no_op = true } };
             if (!receipt.owner.eql(ack.owner) or !std.mem.eql(u8, &receipt.txn_id, &ack.txn_id)) return error.ExternalTransactionDecisionChanged;
-            if (receipt.status == .pending) return error.InvalidPreparedTransactionPhase;
+            if (receipt.status == .pending or receipt.progress == .resolving or receipt.progress == .indexing) return error.InvalidPreparedTransactionPhase;
             try changeReceiptCount(a, txn, group, false, &writes, &deletes);
             try deletes.append(a, try receiptKey(a, group, ack.owner.operation_id));
             try deletes.append(a, try receiptNodeKey(a, group, receipt.session.owner_node_id, ack.owner.operation_id));
@@ -590,13 +615,19 @@ pub fn plan(a: A, txn: anytype, group: u64, catalog_revision: u64, request: Muta
             // Publication of PREPARED and its API handoff proof are one commit.
             // A later GID resolution cannot erase the original session result.
             const named_handoff = next.identity.kind == .named and ((!previous.was_prepared and next.was_prepared) or (!next.was_prepared and previous.phase != .resolved and next.phase == .resolved));
-            const session_handoff = next.identity.kind == .session_commit and previous.phase != .resolved and next.phase == .resolved;
+            const session_handoff = next.identity.kind == .session_commit and
+                ((next.decision != null and next.decision.?.status == .committed and
+                    (previous.decision == null or previous.commitProgress() != next.commitProgress())) or
+                    (previous.phase != .resolved and next.phase == .resolved));
             if (next.identity.session != null and (named_handoff or session_handoff)) {
                 var receipt = (try readReceipt(a, txn, group, next.identity.operation_id)) orelse return error.InvalidCatalogRecord;
-                if (receipt.status != .pending or !receipt.owner.eql(change.owner) or !std.mem.eql(u8, &receipt.txn_id, &next.identity.txn_id)) return error.InvalidCatalogRecord;
+                if ((receipt.status != .pending and !(receipt.kind == .session_commit and receipt.status == .committed)) or !receipt.owner.eql(change.owner) or !std.mem.eql(u8, &receipt.txn_id, &next.identity.txn_id)) return error.InvalidCatalogRecord;
                 if (receipt.kind != next.identity.kind) return error.InvalidCatalogRecord;
                 receipt.status = if (next.identity.kind == .session_commit) (if (next.decision.?.status == .committed) .committed else .aborted) else if (next.was_prepared) .prepared else .aborted;
-                if (next.identity.kind == .session_commit) receipt.decision = next.decision;
+                if (next.identity.kind == .session_commit) {
+                    receipt.decision = next.decision;
+                    receipt.progress = if (next.decision.?.status == .committed) next.commitProgress() else .ready;
+                }
                 try writeReceipt(a, group, receipt, false, &writes);
             }
             if (next.phase == .retired) {
@@ -658,6 +689,7 @@ pub const Receipt = struct {
     /// Private COMMIT recovery must retain its exact version and visibility
     /// contract after the metadata job and native coordinator are retired.
     decision: ?Decision = null,
+    progress: CommitProgress = .ready,
     pub fn jsonStringify(self: Receipt, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Receipt).@"struct".field_names) |field| {
@@ -666,7 +698,7 @@ pub const Receipt = struct {
                     try writer.objectField(field);
                     try writer.write(self.lock_scope);
                 }
-            } else if (!(comptime std.mem.eql(u8, field, "kind") or std.mem.eql(u8, field, "decision")) or self.kind == .session_commit) {
+            } else if (!(comptime std.mem.eql(u8, field, "kind") or std.mem.eql(u8, field, "decision") or std.mem.eql(u8, field, "progress")) or self.kind == .session_commit) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
             }
@@ -683,10 +715,12 @@ pub const Receipt = struct {
         try self.session.validate();
         try validateGid(self.gid);
         if ((self.kind == .named and self.status == .committed) or (self.kind == .session_commit and (self.status == .prepared or self.gid.len != 0 or self.session.connection_id == null))) return error.InvalidCatalogRecord;
+        if (self.status != .committed and self.progress != .ready) return error.InvalidCatalogRecord;
         if (self.kind == .named and self.decision != null) return error.InvalidCatalogRecord;
         if (self.kind == .session_commit) {
             if ((self.status == .pending) != (self.decision == null)) return error.InvalidCatalogRecord;
             if (self.decision) |decision| {
+                if (decision.sync_level == .write and (self.progress == .indexing or self.progress == .repair_required)) return error.InvalidCatalogRecord;
                 if (decision.version == 0 or (self.status == .committed) != (decision.status == .committed) or (decision.status == .committed and decision.sync_level == .propose)) return error.InvalidCatalogRecord;
             }
         }

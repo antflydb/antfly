@@ -735,8 +735,9 @@ pub const ExternalPreparationSeal = struct {
                 if (decision.version <= self.identity.begin_timestamp) return error.InvalidTransactionSessionRecord;
                 if (decision.status == .committed) {
                     const terminal = session.terminal_commit orelse return error.InvalidTransactionSessionRecord;
-                    if (session.terminal_abort or decision.sync_level != self.identity.commit_sync_level or terminal.status != .committed or terminal.commit_version != decision.version or
-                        terminal.coordinator_group_id != null or terminal.coordinator_table_name != null or !terminal.coordinator_acknowledged or terminal.repair_required) return error.InvalidTransactionSessionRecord;
+                    if (session.terminal_abort or decision.sync_level != self.identity.commit_sync_level or terminal.commit_version != decision.version or
+                        terminal.coordinator_group_id != null or terminal.coordinator_table_name != null or !terminal.coordinator_acknowledged or
+                        (terminal.repair_required and terminal.status != .committed) or (session.external_receipt_acknowledged and terminal.status != .committed)) return error.InvalidTransactionSessionRecord;
                 } else if (!session.terminal_abort or session.terminal_commit != null) return error.InvalidTransactionSessionRecord;
             } else if (session.terminal_commit != null or (session.terminal_abort and !session.external_receipt_acknowledged)) return error.InvalidTransactionSessionRecord;
             if ((session.terminal_commit != null or session.terminal_abort) and (session.execution_plan != null or session.staged != null or session.native_sql_cut != null or session.savepoints.count() != 0 or session.read_snapshots.count() != 0 or session.lake_cuts.count() != 0)) return error.InvalidTransactionSessionRecord;
@@ -2564,6 +2565,7 @@ pub const SessionRegistry = struct {
         owner_node_id: u64,
         execution_started: bool,
         terminal: ?TerminalCommitStatus,
+        terminal_repair_required: bool = false,
         terminal_prepare: bool = false,
         terminal_abort: bool = false,
         terminal_abort_reason: ?CommitConflictReason = null,
@@ -2584,7 +2586,7 @@ pub const SessionRegistry = struct {
         if (self.sessions.getPtr(txn_id)) |existing| {
             defer self.mutex.unlock();
             const metadata = existing.sql orelse return null;
-            var result: SqlState = .{ .metadata = try metadata.clone(alloc), .begin_timestamp = existing.begin_timestamp, .connection_id = existing.connection_id, .owner_node_id = existing.owner_node_id, .execution_started = existing.commit_execution_started, .terminal = if (existing.terminal_commit) |terminal| terminal.status else null, .terminal_prepare = existing.external_preparation_prepared, .terminal_abort = existing.terminal_abort, .terminal_abort_reason = existing.terminal_abort_reason, .savepoints = existing.savepoints.count() };
+            var result: SqlState = .{ .metadata = try metadata.clone(alloc), .begin_timestamp = existing.begin_timestamp, .connection_id = existing.connection_id, .owner_node_id = existing.owner_node_id, .execution_started = existing.commit_execution_started, .terminal = if (existing.terminal_commit) |terminal| terminal.status else null, .terminal_repair_required = if (existing.terminal_commit) |terminal| terminal.repair_required else false, .terminal_prepare = existing.external_preparation_prepared, .terminal_abort = existing.terminal_abort, .terminal_abort_reason = existing.terminal_abort_reason, .savepoints = existing.savepoints.count() };
             errdefer result.deinit(alloc);
             result.sequence_epoch = existing.sequence_epoch;
             result.sequence_state = try existing.sequence_state.clone(alloc);
@@ -2596,7 +2598,7 @@ pub const SessionRegistry = struct {
         var loaded = (try durable.load(txn_id)) orelse return null;
         defer loaded.deinit(durable.alloc);
         const metadata = loaded.sql orelse return null;
-        var result: SqlState = .{ .metadata = try metadata.clone(alloc), .begin_timestamp = loaded.begin_timestamp, .connection_id = loaded.connection_id, .owner_node_id = loaded.owner_node_id, .execution_started = loaded.commit_execution_started, .terminal = if (loaded.terminal_commit) |terminal| terminal.status else null, .terminal_prepare = loaded.external_preparation_prepared, .terminal_abort = loaded.terminal_abort, .terminal_abort_reason = loaded.terminal_abort_reason, .savepoints = loaded.savepoints.count() };
+        var result: SqlState = .{ .metadata = try metadata.clone(alloc), .begin_timestamp = loaded.begin_timestamp, .connection_id = loaded.connection_id, .owner_node_id = loaded.owner_node_id, .execution_started = loaded.commit_execution_started, .terminal = if (loaded.terminal_commit) |terminal| terminal.status else null, .terminal_repair_required = if (loaded.terminal_commit) |terminal| terminal.repair_required else false, .terminal_prepare = loaded.external_preparation_prepared, .terminal_abort = loaded.terminal_abort, .terminal_abort_reason = loaded.terminal_abort_reason, .savepoints = loaded.savepoints.count() };
         errdefer result.deinit(alloc);
         result.sequence_epoch = loaded.sequence_epoch;
         result.sequence_state = try loaded.sequence_state.clone(alloc);
@@ -3449,15 +3451,42 @@ pub const SessionRegistry = struct {
             !std.meta.eql(receipt.session, seal.identity.session.?) or !std.meta.eql(receipt.lock_scope, seal.identity.lock_scope) or !std.mem.eql(u8, receipt.gid, seal.identity.gid)) return error.ExternalTransactionDecisionChanged;
         const decision = receipt.decision orelse return error.ExternalTransactionDecisionChanged;
         if (decision.version <= seal.identity.begin_timestamp or (decision.status == .committed and decision.sync_level != seal.identity.commit_sync_level)) return error.ExternalTransactionDecisionChanged;
+        const status: TerminalCommitStatus = switch (receipt.progress) {
+            .resolving => .committed_recovery_pending,
+            .indexing => .committed_visibility_pending,
+            .ready, .repair_required => .committed,
+        };
+        const repair = receipt.progress == .repair_required;
         if (candidate.external_decision) |prior| {
             if (!std.meta.eql(prior, decision)) return error.ExternalTransactionDecisionChanged;
-            candidate.deinit(alloc);
-            return {};
-        }
-        if (candidate.terminal_abort or candidate.terminal_commit != null) return error.ExternalTransactionDecisionChanged;
+            if (candidate.terminal_commit) |terminal| {
+                const rank = struct {
+                    fn of(value: TerminalCommitStatus) u8 {
+                        return switch (value) {
+                            .committed_recovery_pending => 0,
+                            .committed_visibility_pending => 1,
+                            .committed => 2,
+                        };
+                    }
+                }.of;
+                // Delayed earlier snapshots cannot downgrade a later proof.
+                if (rank(status) < rank(terminal.status)) {
+                    candidate.deinit(alloc);
+                    return {};
+                }
+                if (rank(status) == rank(terminal.status)) {
+                    if (terminal.repair_required != repair) return error.ExternalTransactionDecisionChanged;
+                    candidate.deinit(alloc);
+                    return {};
+                }
+            } else {
+                candidate.deinit(alloc);
+                return {};
+            }
+        } else if (candidate.terminal_abort or candidate.terminal_commit != null) return error.ExternalTransactionDecisionChanged;
         candidate.external_decision = decision;
         if (receipt.status == .committed) {
-            candidate.terminal_commit = .{ .status = .committed, .coordinator_acknowledged = true, .commit_version = decision.version };
+            candidate.terminal_commit = .{ .status = status, .repair_required = repair, .coordinator_acknowledged = true, .commit_version = decision.version };
         } else candidate.terminal_abort = true;
         releaseExternalExecutionInputs(&candidate, alloc);
         try seal.validate(a, candidate, null);
@@ -3493,6 +3522,7 @@ pub const SessionRegistry = struct {
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
         if (candidate.external_preparation == null or (!candidate.external_preparation_prepared and !candidate.terminal_abort and candidate.terminal_commit == null)) return error.InvalidTransactionSessionRecord;
+        if (candidate.terminal_commit) |terminal| if (terminal.status != .committed) return error.InvalidTransactionSessionRecord;
         if (candidate.external_receipt_acknowledged) {
             candidate.deinit(alloc);
             return {};
@@ -9767,4 +9797,74 @@ test "durable session mutations publish only after persistence succeeds: shared 
     // contract, and callers can supply Store.write_gate for other providers.
     runtime.write_serialization = .intrinsic;
     try durable.bindRegistrationIssuer(1);
+}
+
+test "distributed txn private COMMIT visibility adoption is monotone across cold reopen and retains repair proof" {
+    const a = std.testing.allocator;
+    const P = @import("../system_catalog/prepared_transactions.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "key", .value = "{}" }} }};
+    const encoded = try encodeExecutionPlan(a, &tables);
+    defer a.free(encoded);
+    const manifest = [_]P.Participant{.{ .table_name = "docs", .route = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 7, .topology_epoch = 3, .route = .{ .group_id = 9, .range_id = 9, .identity_namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 9 } } } }};
+    for ([_]bool{ false, true }) |repair| {
+        const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/private-visibility-{any}", .{ tmp.sub_path, repair }, 0);
+        defer a.free(path);
+        var txn_id: [16]u8 = undefined;
+        var receipt: P.Receipt = undefined;
+        for (0..5) |phase| {
+            var store = try docstore_mod.DocStore.open(a, path, .{});
+            defer store.close();
+            var durable = DurableSessionStore.init(a, &store);
+            var sessions = SessionRegistry.init(&durable);
+            defer sessions.deinit(a);
+            if (phase == 0) {
+                const session = try sessions.beginForPrincipalWithSettings(a, .{ .sync_level = .full_index, .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, null, &.{}, @splat('a'));
+                txn_id = session.txn_id;
+                const identity: P.Identity = .{ .kind = .session_commit, .commit_sync_level = .full_index, .session = .{ .owner_node_id = 7, .connection_id = @splat('a') }, .gid = "", .database_id = 1, .principal = .bootstrap, .txn_id = txn_id, .operation_id = @splat(3), .metadata_incarnation = @splat('1'), .begin_timestamp = session.begin_timestamp, .expires_at_unix_ns = session.begin_timestamp + 60 * std.time.ns_per_s, .plan_digest = try P.planDigest(encoded), .manifest_digest = try P.manifestDigest(a, &manifest, @splat('1')) };
+                const seal: ExternalPreparationSeal = .{ .admission_head = 0, .admitted_at_ns = session.begin_timestamp, .standalone = false, .identity = identity, .actor = .{ .session_user = .bootstrap, .credential = "" }, .participants = &manifest };
+                var plan = (try sessions.sealExternalExecutionPlan(a, txn_id, seal, &tables)).?;
+                defer plan.deinit();
+                receipt = .{ .kind = .session_commit, .owner = try identity.owner(a), .txn_id = txn_id, .gid = "", .session = identity.session.?, .status = .committed, .progress = .resolving, .decision = .{ .status = .committed, .version = std.math.maxInt(u64), .sync_level = .full_index } };
+                _ = (try sessions.recordExternalCommitReceipt(a, txn_id, receipt)).?;
+                var state = (try sessions.getSqlState(a, txn_id)).?;
+                defer state.deinit(a);
+                try std.testing.expectEqual(.committed_recovery_pending, state.terminal.?);
+                try std.testing.expectError(error.InvalidTransactionSessionRecord, sessions.markExternalPreparationReceiptAcknowledged(a, txn_id));
+            } else if (phase == 1) {
+                receipt.progress = .indexing;
+                _ = (try sessions.recordExternalCommitReceipt(a, txn_id, receipt)).?;
+                var stale = receipt;
+                stale.progress = .resolving;
+                _ = (try sessions.recordExternalCommitReceipt(a, txn_id, stale)).?;
+                var state = (try sessions.getSqlState(a, txn_id)).?;
+                defer state.deinit(a);
+                try std.testing.expectEqual(.committed_visibility_pending, state.terminal.?);
+                try std.testing.expect(!state.terminal_repair_required);
+                try std.testing.expectError(error.InvalidTransactionSessionRecord, sessions.markExternalPreparationReceiptAcknowledged(a, txn_id));
+            } else if (phase == 2) {
+                receipt.progress = if (repair) .repair_required else .ready;
+                _ = (try sessions.recordExternalCommitReceipt(a, txn_id, receipt)).?;
+                var stale = receipt;
+                stale.progress = .indexing;
+                _ = (try sessions.recordExternalCommitReceipt(a, txn_id, stale)).?;
+                var changed = receipt;
+                changed.progress = if (repair) .ready else .repair_required;
+                try std.testing.expectError(error.ExternalTransactionDecisionChanged, sessions.recordExternalCommitReceipt(a, txn_id, changed));
+                _ = (try sessions.markExternalPreparationReceiptAcknowledged(a, txn_id)).?;
+            } else {
+                var state = (try sessions.getSqlState(a, txn_id)).?;
+                defer state.deinit(a);
+                try std.testing.expectEqual(.committed, state.terminal.?);
+                try std.testing.expectEqual(repair, state.terminal_repair_required);
+                var terminal = (try durable.load(txn_id)).?;
+                defer terminal.deinit(a);
+                try std.testing.expect(terminal.external_receipt_acknowledged);
+                try std.testing.expect(terminal.execution_plan == null);
+                try std.testing.expectEqual(receipt.decision.?.version, terminal.terminal_commit.?.commit_version.?);
+                _ = (try sessions.recordExternalCommitReceipt(a, txn_id, receipt)).?;
+            }
+        }
+    }
 }

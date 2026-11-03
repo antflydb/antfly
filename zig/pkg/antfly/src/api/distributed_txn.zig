@@ -1294,14 +1294,17 @@ pub const ExternalPreparation = struct {
 };
 
 const ExternalFanoutTask = struct {
-    const Operation = enum { begin, vote, activate, resolve };
-    const Slot = struct { err: ?anyerror = null, completed: bool = false };
+    const Operation = enum { begin, vote, activate, resolve, visibility };
+    const Slot = struct { err: ?anyerror = null, completed: bool = false, repair: bool = false };
 
     fn run(worker: ParticipantWorker, record: ExternalRecord, preparation: ?*const ExternalPreparation, operation: Operation, index: usize, owner: transactions_mod.ExternalDecisionOwner, deadline: ?u64, slot: *Slot) void {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         execute(arena.allocator(), worker, record, preparation, operation, index, owner, deadline) catch |err| {
-            slot.err = err;
+            if (operation == .visibility and isTerminalVisibilityRepair(err)) {
+                slot.repair = true;
+                slot.completed = true;
+            } else slot.err = err;
             return;
         };
         slot.completed = true;
@@ -1331,12 +1334,15 @@ const ExternalFanoutTask = struct {
                 .route_fence = p.route,
                 .req = .{ .external_decision_owner = owner, .external_activation = true },
             }),
-            .resolve => {
+            .resolve, .visibility => {
                 const request: TxnResolveRequest = .{
                     .txn_id = record.identity.txn_id,
                     .status = if (record.decision.?.status == .committed) .committed else .aborted,
                     .commit_version = record.decision.?.version,
-                    .sync_level = record.decision.?.sync_level,
+                    // Private commits separate durable row resolution from
+                    // asynchronous index visibility. Only the second barrier
+                    // can classify an index failure as terminal repair debt.
+                    .sync_level = if (operation == .resolve and record.identity.kind == .session_commit) .write else record.decision.?.sync_level,
                     // Native enlistment and the exact immutable decision owner
                     // authorize phase two. Never replan a durable decision or
                     // wait on a mutable full-catalog projection to deliver it.
@@ -1355,6 +1361,7 @@ fn runExternalFanout(a: std.mem.Allocator, worker: ParticipantWorker, record: Ex
     const skip = switch (operation) {
         .activate => record.activations,
         .resolve => record.resolutions,
+        .visibility => record.visibility,
         else => 0,
     };
     const width = fanoutWidth(options, record.participants.len);
@@ -1410,6 +1417,22 @@ pub fn recoverExternalTransaction(a: std.mem.Allocator, worker: ParticipantWorke
                 if (failure) |err| return err;
             },
             .resolved => {
+                if (record.visibility != record.visibilityMask()) {
+                    const failure: ?anyerror = failure: {
+                        runExternalFanout(a, worker, record, null, .visibility, &slots, options) catch |err| break :failure err;
+                        break :failure null;
+                    };
+                    var complete: u64 = 0;
+                    var repair: u64 = 0;
+                    for (slots[0..record.participants.len], 0..) |slot, i| if (slot.completed) {
+                        const bit = @as(u64, 1) << @intCast(i);
+                        complete |= bit;
+                        if (slot.repair) repair |= bit;
+                    };
+                    if (complete != 0) record = try authority.advance(authority.ptr, a, record, .{ .visibility = .{ .complete = complete, .repair = repair } });
+                    if (failure) |err| return err;
+                    continue;
+                }
                 if (options.external_deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
                 if (record.participants.len != 0) {
                     // A missing ACK capability is recovery debt, never proof
@@ -1443,6 +1466,7 @@ pub fn recoverExternalTransaction(a: std.mem.Allocator, worker: ParticipantWorke
                     }
                 }
                 record = try authority.advance(authority.ptr, a, record, .handoff);
+                return record;
             },
         }
     }
@@ -7682,6 +7706,9 @@ test "distributed txn external coordinator freezes authority and resumes every l
         acknowledgements: usize = 0,
         begins: usize = 0,
         votes: usize = 0,
+        visibility_calls: usize = 0,
+        visibility_retry: u64 = 0,
+        visibility_repair: u64 = 0,
 
         fn authority(self: *@This()) ExternalAuthority {
             return .{ .ptr = self, .read = read, .admit = admit, .advance = advance, .next_version = nextVersion };
@@ -7745,7 +7772,14 @@ test "distributed txn external coordinator freezes authority and resumes every l
             } else try std.testing.expect(self.record.decision.?.status == .aborted);
             try std.testing.expect((try self.record.identity.owner(a)).eql(request.external_decision_owner.?));
             try std.testing.expectEqual(self.record.decision.?.version, request.commit_version);
-            try std.testing.expectEqual(self.record.decision.?.sync_level, request.sync_level);
+            const index_barrier = self.record.identity.kind == .session_commit and self.record.phase == .resolved;
+            try std.testing.expectEqual(if (self.record.identity.kind == .session_commit and !index_barrier) db_mod.types.SyncLevel.write else self.record.decision.?.sync_level, request.sync_level);
+            if (index_barrier) {
+                self.visibility_calls += 1;
+                const bit = @as(u64, 1) << @intCast(group - 1);
+                if (self.visibility_retry & bit != 0) return error.EnrichmentWaitTimeout;
+                if (self.visibility_repair & bit != 0) return error.EnrichmentWorkerFailed;
+            }
             try std.testing.expectEqual(@as(u64, 0), request.topology_epoch);
             self.resolved |= @as(u64, 1) << @intCast(group - 1);
         }
@@ -7809,7 +7843,7 @@ test "distributed txn external coordinator freezes authority and resumes every l
     session_identity.commit_sync_level = .full_index;
     session_identity.gid = "";
     session_identity.session = .{ .owner_node_id = 9, .connection_id = @splat('2') };
-    const commit_losses = [_]?ExternalAction{ null, .prepare, .{ .commit = .{ .version = 20 } }, .{ .activate = 3 }, .{ .resolve = 3 }, .handoff };
+    const commit_losses = [_]?ExternalAction{ null, .prepare, .{ .commit = .{ .version = 20 } }, .{ .activate = 3 }, .{ .resolve = 3 }, .{ .visibility = .{ .complete = 3 } }, .handoff };
     for (commit_losses) |loss| {
         var harness: Harness = .{ .record = .{ .identity = session_identity, .participants = &manifest }, .fail_advance = loss };
         const prepared = preparation.prepare(a, harness.worker(), harness.authority(), session_identity, .{});
@@ -7825,6 +7859,26 @@ test "distributed txn external coordinator freezes authority and resumes every l
         try std.testing.expectEqual(@as(u64, 3), harness.activated);
         try std.testing.expectEqual(@as(u64, 3), harness.resolved);
         try std.testing.expect(harness.acknowledgements != 0);
+    }
+    // Real row resolution must complete at write durability before any index
+    // wait. Persist partial index progress, skip successful owners on retry and
+    // retain permanent failures as repair debt without replaying row writes.
+    for ([_]bool{ false, true }) |repair| {
+        var visibility: Harness = .{ .record = .{ .identity = session_identity, .participants = &manifest }, .visibility_retry = 2, .visibility_repair = if (repair) 1 else 0 };
+        _ = try preparation.prepare(a, visibility.worker(), visibility.authority(), session_identity, .{});
+        try std.testing.expectError(error.EnrichmentWaitTimeout, recoverExternalTransaction(a, visibility.worker(), visibility.authority(), session_identity.operation_id, 1000, .{}));
+        try std.testing.expectEqual(.resolved, visibility.record.phase);
+        try std.testing.expectEqual(@as(u64, 3), visibility.record.resolutions);
+        try std.testing.expectEqual(@as(u64, 1), visibility.record.visibility);
+        try std.testing.expectEqual(@as(u64, if (repair) 1 else 0), visibility.record.visibility_repairs);
+        try std.testing.expectEqual(.indexing, visibility.record.commitProgress());
+        try std.testing.expectEqual(@as(usize, 0), visibility.acknowledgements);
+        const calls = visibility.visibility_calls;
+        visibility.visibility_retry = 0;
+        _ = try recoverExternalTransaction(a, visibility.worker(), visibility.authority(), session_identity.operation_id, 1000, .{});
+        try std.testing.expectEqual(.retired, visibility.record.phase);
+        try std.testing.expectEqual(@as(usize, 1), visibility.visibility_calls - calls);
+        try std.testing.expectEqual(if (repair) external_registry.CommitProgress.repair_required else .ready, visibility.record.commitProgress());
     }
     var unvoted: Harness = .{ .record = .{ .identity = session_identity, .participants = &manifest } };
     _ = try recoverExternalTransaction(a, unvoted.worker(), unvoted.authority(), session_identity.operation_id, 1000, .{});

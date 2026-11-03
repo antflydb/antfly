@@ -295,6 +295,13 @@ fn recoverSessionWithContext(server: *http.ApiHttpServer, txn_id: [16]u8, bytes:
         }
         if (seal.identity.kind == .session_commit) {
             _ = (try server.txn_sessions.recordExternalCommitReceipt(server.alloc, txn_id, cut.receipts[0])) orelse return error.SqlTransactionNotActive;
+            if (cut.receipts[0].progress == .resolving) return error.MetadataMutationOutcomeUnknown;
+            if (cut.receipts[0].progress == .indexing) {
+                // Row intents have resolved: release transactional locks while
+                // the independent index barrier remains durable recovery debt.
+                _ = try source.releaseScopeQuantum(a, seal.identity);
+                return error.MetadataMutationOutcomeUnknown;
+            }
         } else {
             _ = (try server.txn_sessions.recordExternalPreparationReceipt(server.alloc, txn_id, cut.receipts[0])) orelse return error.SqlTransactionNotActive;
         }
@@ -512,7 +519,10 @@ pub fn commitScoped(server: *http.ApiHttpServer, user: ?http.AuthenticatedIdenti
     recoverSessionWithContext(server, id, bytes, false, false, false, context) catch {};
     var observed = (server.txn_sessions.getSqlState(server.alloc, id) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
     defer observed.deinit(server.alloc);
-    return .{ .outcome = if (observed.terminal_abort) .aborted else if (observed.terminal != null) .committed else .unknown, .reconciliation_id = id };
+    return .{ .outcome = if (observed.terminal_abort) .aborted else if (observed.terminal) |terminal| switch (terminal) {
+        .committed => if (observed.terminal_repair_required) .committed_repair_required else .committed,
+        .committed_recovery_pending, .committed_visibility_pending => .committed_pending,
+    } else .unknown, .reconciliation_id = id };
 }
 
 /// Session ownership, current schema/RLS, predicates and FK/UNIQUE preparation

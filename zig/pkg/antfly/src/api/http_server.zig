@@ -5619,7 +5619,7 @@ pub const ApiHttpServer = struct {
             if (now >= self.sql_prepared_work_due_ns) {
                 self.sql_prepared_work_due_ns = now +| std.time.ns_per_s;
                 @import("sql_prepared_coordinator.zig").advanceWork(self, &self.sql_prepared_work_cursor) catch |err| switch (err) {
-                    error.UnsupportedSqlExecution, error.TableTopologyProtocolUpgradeRequired, error.CatalogGenerationChanged, error.MetadataMutationOutcomeUnknown, error.CommitDecisionUnknown, error.Timeout, error.Canceled, error.DeadlineExceeded => {},
+                    error.UnsupportedSqlExecution, error.TableTopologyProtocolUpgradeRequired, error.CatalogGenerationChanged, error.MetadataMutationOutcomeUnknown, error.CommitDecisionUnknown, error.CommitVisibilityNotSatisfied, error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress, error.CommitPropagationIncomplete, error.Timeout, error.Canceled, error.DeadlineExceeded => {},
                     else => std.log.warn("prepared transaction participant recovery deferred err={s}", .{@errorName(err)}),
                 };
             }

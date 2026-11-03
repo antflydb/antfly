@@ -203,7 +203,7 @@ pub const Context = struct {
             return;
         }
         const receipt = try prepared.readReceipt(self.a, txn, ns.group, decision.operation) orelse return error.LockOwnerBusy;
-        if ((receipt.status != .committed and receipt.status != .aborted) or !std.mem.eql(u8, &receipt.owner.admission_digest, &decision.admission) or !std.mem.eql(u8, &receipt.txn_id, &expected.id)) return error.LockOwnerBusy;
+        if (receipt.progress == .resolving or (receipt.status != .committed and receipt.status != .aborted) or !std.mem.eql(u8, &receipt.owner.admission_digest, &decision.admission) or !std.mem.eql(u8, &receipt.txn_id, &expected.id)) return error.LockOwnerBusy;
     }
     pub fn requireRetirement(self: Context, _: anytype, _: scopes.ledger.Namespace, value: scopes.Record) !void {
         try self.requireOwner(value);

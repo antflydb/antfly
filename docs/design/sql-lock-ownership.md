@@ -541,12 +541,27 @@ cold reopen. Existing sequence/session, public SQL/pgwire, metadata-submission
 and command-fence gates also pass. `make generate`, `make fmt`, source-boundary,
 license and original-inventory checks pass.
 
-Before public scoped-write activation, also qualify full-index visibility and
-repair-status delivery: private SQL currently waits for the final external
-receipt, retaining unresolved work rather than claiming visibility after an
-incomplete native resolution. Database retirement must account for active scope
-bindings before removing the catalog object needed by cleanup. These remain
-activation requirements, not additional original-case credits.
+Private commit recovery now separates durable row resolution from the requested
+index visibility barrier. The metadata receipt records a known committed decision
+while row propagation is pending, then records index visibility progress. Native
+participant bitmaps retain successful visibility barriers across retries;
+permanent enrichment failures become terminal repair debt. The source adopts
+these receipts monotonically and persists the exact terminal version and repair
+status before acknowledging the receipt. Transactional locks can be released
+after row resolution while asynchronous indexing remains pending; an early
+committed receipt alone cannot authorize their release.
+
+Live command scopes hold a durable per-database reference in the same native
+transaction as registration. Fencing keeps that reference until bounded cleanup
+has retired the scope. Database rename/drop checks the counter in preflight and
+again during Raft apply, so a late proposal cannot remove the catalog identity
+needed by cleanup. The counter shares the existing scope snapshot projection;
+rename/drop performs a point read rather than scanning connection owners.
+
+These are shared activation prerequisites, not additional original-case credits.
+Public scoped ownership still requires named prepared-transaction handoff and
+consistent HTTP/pgwire command lifetime integration before advisory/table-lock
+cases can be credited.
 
 
 After merging `origin/main` at `24486f5f30`, regeneration resolves the generated
@@ -555,3 +570,16 @@ package compiles. The merged qualification passes all **156 Debug build steps**
 and **87 selected tests**, with no skips, failures or leaks, including main's
 three agent-generation regressions. The source-boundary and original-inventory
 checks also pass on the merged tree; 87 original cases remain unresolved.
+
+
+The private commit visibility and database-retirement cohort passes **170/170
+Debug build steps** and **110 selected tests**, with no skips, failures or leaks.
+The audited `antfly-sql-transaction-lifecycle-test` selects all required native
+receipt, cold adoption, partial visibility, repair and database-retirement tests
+through the transaction discovery root. The normal transaction suite also owns
+the new cases. The standalone test requests `full_index` through real native
+participants. Source-producer, public SQL/pgwire, sequence/session,
+metadata-submission, native lock fault and command-fence gates pass together.
+`make generate`, `make fmt`, license, source-boundary and original-inventory
+checks pass. The original inventory remains **87 unresolved cases**; these
+recovery prerequisites do not independently close a public locking case.

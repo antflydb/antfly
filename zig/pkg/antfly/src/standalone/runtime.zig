@@ -18906,7 +18906,7 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
             try scopeMutate(a, api, backend, 91, .{ .register = registration });
             try scopeMutate(a, api, backend, 92, .{ .begin = command_frame });
             const frame: @import("../system_catalog/command_fence.zig").Fence = .{ .backend = backend, .command = command_frame, .database = 1, .principal = registration.lease.principal, .standalone = true };
-            const session = try api.txn_sessions.beginForPrincipalWithSettings(backing, .{ .sync_level = .write, .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 0, null, &.{}, connection_id);
+            const session = try api.txn_sessions.beginForPrincipalWithSettings(backing, .{ .sync_level = .full_index, .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 0, null, &.{}, connection_id);
             var identity: ?antfly.public_api.http_server.AuthenticatedIdentity = null;
             const encoded_session = std.fmt.bytesToHex(session.txn_id, .lower);
             var adapter: @import("../api/sql_execution.zig").Adapter = .{ .server = api, .identity = &identity, .context = .{ .sql_command_fence = &frame }, .session_id = &encoded_session, .connection_id = connection_id };
@@ -18915,7 +18915,7 @@ test "standalone SQL prepared transactions preserve node-zero ownership and row 
             defer compiled.deinit();
             var result = try adapter.execute(backing, &compiled, &.{}, .{}, null);
             defer result.deinit();
-            var coordinator: @import("../api/sql_session.zig").Coordinator = .{ .server = api, .identity = &identity, .context = .{ .sql_command_fence = &frame } };
+            var coordinator: @import("../api/sql_session.zig").Coordinator = .{ .server = api, .identity = &identity, .context = .{ .sql_command_fence = &frame }, .sync_level = .full_index };
             const decision = try @import("../api/sql_session.zig").Coordinator.commit(&coordinator, .{ .principal = "", .database = "default", .namespace = "public" }, session.txn_id);
             try std.testing.expectEqual(.committed, decision.outcome);
             var sql_state = (try api.txn_sessions.getSqlState(backing, session.txn_id)).?;
