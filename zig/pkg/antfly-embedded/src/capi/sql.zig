@@ -490,13 +490,14 @@ pub fn Adapter(comptime native: type) type {
                     return output;
                 }
             }
-            const previous = if (self.transaction) |session| if (session.active) try session.commitRequests(alloc) else &.{} else &.{};
+            const session = if (self.transaction) |value| if (value.active) value else null else null;
+            const has_previous = if (session) |value| value.entries.items.len != 0 else false;
             // Arbiters and their coverage belong to the selected table. Only
             // staged transaction writes need the dependency catalog to replay
             // earlier FK/unique effects. Do not open unrelated namespaces for
             // every standalone ON CONFLICT probe; commit preparation still
             // obtains the complete catalog for inbound/outbound constraints.
-            const metadata = if (previous.len != 0)
+            const metadata = if (has_previous)
                 try self.localCatalog(alloc, table.schema_version)
             else metadata: {
                 const tables = try alloc.alloc(topology.TableRecord, 1);
@@ -508,7 +509,9 @@ pub fn Adapter(comptime native: type) type {
             const writes = try dependencies.sql_mutation_images.writes(types.BatchWrite, alloc, mutations);
             const target_predicates = try dependencies.sql_conflict_predicate.toNative(alloc, target.conditions);
             const keys = try dependencies.sql_conflict_predicate.expressionsToNative(alloc, target.expressions);
-            const owners = try integrity.resolveConflictTargetOwnersWithScratch(alloc, scratch_alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, previous, .{});
+            const overlay = if (session) |value| try value.preparedConstraintOverlay(self.localSource(), metadata, self.repairAdmission(), value.entries.items.len) else null;
+            const previous = if (overlay == null) (if (session) |value| try value.commitRequests(alloc) else &.{}) else &.{};
+            const owners = try integrity.resolveConflictTargetOwnersWithOverlay(alloc, scratch_alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, previous, overlay, .{});
             const output = try alloc.alloc(catalog.ConflictOwner, owners.len);
             for (owners, output) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .identities = owner.identities, .guard = owner };
             return output;

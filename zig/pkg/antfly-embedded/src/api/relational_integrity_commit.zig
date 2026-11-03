@@ -32,6 +32,7 @@ const TableRecord = @import("../common/topology_records.zig").TableRecord;
 const RangeRecord = @import("../common/topology_records.zig").RangeRecord;
 const Allocator = std.mem.Allocator;
 const RequestContext = @import("operation.zig").RequestContext;
+pub const StatementOverlay = @import("relational_statement_overlay.zig").Overlay;
 /// Select repair planning as the mutation closure grows. Native preparation
 /// still validates and locks each participant's exact failed checkpoint.
 pub const RepairAdmission = struct {
@@ -260,8 +261,14 @@ const Builder = struct {
     statement: bool = false,
     constraint_timing: []const native.ConstraintTiming = &.{},
     previous: []const contract.TableCommitRequest = &.{},
+    previous_overlay: ?*const StatementOverlay = null,
 
     fn previousRow(self: *Builder, table: []const u8, key: []const u8) ?struct { value: ?[]const u8 } {
+        if (self.previous_overlay) |overlay| {
+            const rows = overlay.rows(table) orelse return null;
+            const value = rows.get(key) orelse return null;
+            return .{ .value = value };
+        }
         for (self.previous) |request| if (std.mem.eql(u8, request.table_name, table)) {
             for (request.deletes) |deleted| if (std.mem.eql(u8, deleted, key)) return .{ .value = null };
             var i = request.writes.len;
@@ -421,6 +428,19 @@ const Builder = struct {
                 if (final_rows) if (self.by_row.get(identity)) |work| if (work.dirty) continue;
                 if (seen.contains(write.key) or !try self.partialMatches(child, json, parent, value, dependency.definition)) continue;
                 const witness = try self.partialWitness(parent, dependency, write.key, value);
+                try seen.put(self.alloc, witness.key, {});
+                try witnesses.append(self.alloc, witness);
+            }
+        };
+        if (self.previous_overlay) |overlay| if (overlay.rows(parent.name)) |rows| {
+            var iterator = rows.iterator();
+            while (iterator.next()) |entry| {
+                const value = entry.value_ptr.* orelse continue;
+                const key = entry.key_ptr.*;
+                const identity = try self.rowIdentity(parent.name, key);
+                if (final_rows) if (self.by_row.get(identity)) |work| if (work.dirty) continue;
+                if (seen.contains(key) or !try self.partialMatches(child, json, parent, value, dependency.definition)) continue;
+                const witness = try self.partialWitness(parent, dependency, key, value);
                 try seen.put(self.alloc, witness.key, {});
                 try witnesses.append(self.alloc, witness);
             }
@@ -827,7 +847,9 @@ const Builder = struct {
             if (continuation) |old| if (std.mem.eql(u8, old, next)) return error.InvalidIntegrityContinuation;
             continuation = next;
         }
-        for (self.previous) |request| if (std.mem.eql(u8, request.table_name, table)) try self.applyStatementCommands(&state, address, request.integrity_commands, false);
+        if (self.previous_overlay) |overlay| {
+            try self.applyStatementCommands(&state, address, overlay.commands(table, address), false);
+        } else for (self.previous) |request| if (std.mem.eql(u8, request.table_name, table)) try self.applyStatementCommands(&state, address, request.integrity_commands, false);
         return state;
     }
 
@@ -1061,9 +1083,13 @@ fn prepareModeWithTiming(alloc: Allocator, source: reads.TableReadSource, metada
 }
 
 fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_tables: []const []const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool, modes: []const native.ConstraintTiming, repair_admission: ?RepairAdmission) !Prepared {
+    return prepareModeRoutedWithOverlay(alloc, source, metadata, ranges, requests, request_control, repair_tables, statement, previous, validate_statement, modes, repair_admission, null);
+}
+
+fn prepareModeRoutedWithOverlay(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_tables: []const []const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool, modes: []const native.ConstraintTiming, repair_admission: ?RepairAdmission, previous_overlay: ?*const StatementOverlay) !Prepared {
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .ranges = ranges, .control = try boundedControl(request_control), .repair_tables = repair_tables, .repair_admission = repair_admission, .statement = statement, .previous = previous, .constraint_timing = modes };
+    var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .ranges = ranges, .control = try boundedControl(request_control), .repair_tables = repair_tables, .repair_admission = repair_admission, .statement = statement, .previous = previous, .previous_overlay = previous_overlay, .constraint_timing = modes };
     defer builder.deinit();
     try builder.output.appendSlice(builder.alloc, requests);
     for (requests) |request| {
@@ -1235,6 +1261,28 @@ pub fn prepareSessionStatementWithRepairAdmission(alloc: Allocator, source: read
     return prepareSessionStatementMode(alloc, source, metadata, ranges, previous, statement, control, &.{}, repairs.items, admission);
 }
 
+/// Build speculative prior effects once for a caller-fenced SQL snapshot.
+/// This is neither a reusable observation of another generation nor commit
+/// authority; the ordinary commit path still revalidates every participant.
+pub fn prepareSessionOverlay(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, previous: []const contract.TableCommitRequest, repair_admission: RepairAdmission, control: RequestContext) !Prepared {
+    return prepareModeRoutedWithTiming(alloc, source, metadata, &.{}, previous, control, &.{}, true, &.{}, false, &.{}, repair_admission);
+}
+
+pub fn prepareSessionStatementWithOverlay(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, overlay: *const StatementOverlay, statement: []const contract.TableCommitRequest, repair_admission: RepairAdmission, control: RequestContext) !Prepared {
+    var result = try prepareModeRoutedWithOverlay(alloc, source, metadata, &.{}, statement, control, &.{}, true, &.{}, true, &.{}, repair_admission, overlay);
+    errdefer result.deinit();
+    const names = try alloc.alloc([]const u8, result.tables.len);
+    defer alloc.free(names);
+    var count: usize = 0;
+    for (result.tables) |table| {
+        if (table.relational_repair) continue;
+        names[count] = table.table_name;
+        count += 1;
+    }
+    try ensureUniqueCoverageControlled(alloc, source, metadata, ranges, names[0..count], control);
+    return result;
+}
+
 fn prepareSessionStatementMode(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, previous: []const contract.TableCommitRequest, statement: []const contract.TableCommitRequest, control: RequestContext, modes: []const native.ConstraintTiming, repair_tables: []const []const u8, repair_admission: ?RepairAdmission) !Prepared {
     var before = try prepareModeRoutedWithTiming(alloc, source, metadata, &.{}, previous, control, repair_tables, true, &.{}, false, modes, repair_admission);
     defer before.deinit();
@@ -1358,13 +1406,17 @@ pub fn resolveConflictTargetOwners(alloc: Allocator, source: reads.TableReadSour
 }
 
 pub fn resolveConflictTargetOwnersWithScratch(alloc: Allocator, scratch_alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, name: []const u8, version: u32, target: ConflictTarget, writes: []const types.BatchWrite, previous: []const contract.TableCommitRequest, control: RequestContext) ![]const ConflictOwner {
+    return resolveConflictTargetOwnersWithOverlay(alloc, scratch_alloc, source, metadata, ranges, name, version, target, writes, previous, null, control);
+}
+
+pub fn resolveConflictTargetOwnersWithOverlay(alloc: Allocator, scratch_alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, name: []const u8, version: u32, target: ConflictTarget, writes: []const types.BatchWrite, previous: []const contract.TableCommitRequest, overlay: ?*const StatementOverlay, control: RequestContext) ![]const ConflictOwner {
     if (target.constraint_name != null and (target.columns.len != 0 or target.expressions.len != 0 or target.predicate.len != 0)) return error.InvalidIntegrityDefinition;
     if (writes.len > 4096) return error.TransactionTooLarge;
     // Absence is useful only after EVERY current owner proves unique coverage.
     try ensureUniqueCoverageControlled(scratch_alloc, source, metadata, ranges, &.{name}, control);
-    var before: ?Prepared = if (previous.len != 0) try prepareModeInternal(scratch_alloc, source, metadata, previous, control, &.{}, true, &.{}, false) else null;
+    var before: ?Prepared = if (overlay == null and previous.len != 0) try prepareModeInternal(scratch_alloc, source, metadata, previous, control, &.{}, true, &.{}, false) else null;
     defer if (before) |*prepared| prepared.deinit();
-    var builder: Builder = .{ .alloc = alloc, .scratch_alloc = scratch_alloc, .source = source, .metadata = metadata, .control = try boundedControl(control), .previous = if (before) |prepared| prepared.tables else &.{} };
+    var builder: Builder = .{ .alloc = alloc, .scratch_alloc = scratch_alloc, .source = source, .metadata = metadata, .control = try boundedControl(control), .previous = if (before) |prepared| prepared.tables else &.{}, .previous_overlay = overlay };
     defer builder.deinit();
     const table = try builder.load(name);
     if (table.view.version() != version) return error.PreparedGenerationChanged;
@@ -1400,7 +1452,9 @@ pub fn resolveConflictTargetOwnersWithScratch(alloc: Allocator, scratch_alloc: A
             }
             guard.* = .{ .address = item.address, .operation = .{ .compare_claim = actual } };
             var logical: Builder.StatementState = .{ .claim = actual };
-            for (builder.previous) |request| if (std.mem.eql(u8, request.table_name, name)) try builder.applyStatementCommands(&logical, item.address, request.integrity_commands, false);
+            if (builder.previous_overlay) |prior| {
+                try builder.applyStatementCommands(&logical, item.address, prior.commands(name, item.address), false);
+            } else for (builder.previous) |request| if (std.mem.eql(u8, request.table_name, name)) try builder.applyStatementCommands(&logical, item.address, request.integrity_commands, false);
             if (logical.claim) |claim| {
                 if (claim.state != .live) return error.ForeignKeyActionInProgress;
                 if (!std.mem.eql(u8, claim.parent_table, name) or !std.mem.eql(u8, claim.tuple, item.tuple)) return error.InvalidIntegrityRecord;

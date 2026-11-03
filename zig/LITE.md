@@ -1395,6 +1395,20 @@ committed/visibility-pending diagnostic. Resume derived work rather than replayi
 the batch, especially for transforms such as `$inc`. Pre-commit Busy refusals keep
 their existing retry behavior. SQL retains its committed-pending outcome.
 
+Native C/SQL sessions retain an owned statement overlay indexed by table/row and
+constraint address. Previously validated postimages and claim effects extend
+incrementally while the inode and nonzero primary/catalog logical cuts remain
+unchanged. Any data change, DDL, replacement, rollback or interrupted staging
+invalidates that speculation. Ordinary preparation remains available when a
+native witness cannot be established. The original mutation fold retains first
+observations and latest postimages; point reads also verify table identity when
+the requested key is absent. Cache storage is charged to the transaction budget
+and optional allocation failures evict it. COMMIT still performs authoritative
+constraint preparation and checks every original version/digest predicate.
+Background publication statistics expose SQL overlay hits, rebuilds, rebuilt
+rows, evictions and staged statements; rebuild rows distinguish work avoided
+across statements from an arbiter and validator sharing one statement's input.
+
 Native revision-7 background turns separate source-derived replay from immutable
 artifact maintenance. After the replay window and its source-dependent lifecycle
 work, the owner releases its primary snapshot before running one LSM maintenance
@@ -1734,6 +1748,14 @@ artifact work; keep its larger scope separate from replay time.
 Successful index and watermark admission waits are also reported separately as
 `replay_index_admission_ns` and `replay_metadata_admission_ns`; compare their
 respective group counts before changing publication grouping.
+
+For SQL statement scaling, add `--on-conflict --relational-key --no-text-index
+--transactions 1`, keep `--block-rows` fixed, and vary `--rows`. The declared SQL
+primary key exercises coordinated unique claims; the follow-up batch uses a
+separate unconstrained table. Reports include each block's elapsed time and its
+preceding staged row count. Two tables share the 4,096-entry transaction bound,
+so a single transaction supports at most 2,048 rows per table. This mode still
+verifies primary data, integrity and reopening after measurement.
 
 Sustained-write qualification must measure progress and storage while writers
 remain active. `scripts/bench/lite_contention.py native --require-sustained`

@@ -5986,7 +5986,7 @@
       }
     },
     "sql_constraint_scaling": {
-      "scope": "Public two-table declared-primary-key ON CONFLICT fixture, 128-row statements, 512-byte text. Six quiet Debug runs; primary rows, integrity and reopen pass. No native builds; no model/private inputs.",
+      "scope": "Public two-table declared-primary-key ON CONFLICT fixture, 128-row statements, 512-byte text. Six local Debug diagnostic runs; primary rows, integrity and reopen pass. No builds were launched by this task during these runs; external build activity was not monitored. No model/private inputs.",
       "runs": [
         {
           "tag": "v7-256",
@@ -6174,5 +6174,32 @@
       "finding": "Eight times as many staged rows costs about 61 times as much SQL preparation (0.41 to 25.2 seconds). Both libraries exhibit the same curve. Actual-importer early sampled stacks also contain repeated prior-transaction constraint preparation. This is an independent remaining cost, not a regression introduced by asynchronous merges.",
       "next": "Retain a generation-fenced, transaction-owned indexed overlay of already validated row and claim effects; invalidate on changed input state or rollback, and retain full authoritative commit validation."
     }
+  },
+  "incremental_sql_statement_constraints": {
+    "status": "Implementation checkpoint. Seven v3 focused regressions pass; final point-read identity safeguard, its additional regression and counters await the combined Debug gate. End-to-end remains unresolved.",
+    "design": [
+      "Retain owned, indexed row and canonical claim effects across validated statements instead of rebuilding all earlier staged rows.",
+      "Fence reuse with the native inode and nonzero primary/catalog logical identities plus exact staged-entry count. Any intervening data change rebuilds conservatively; unsupported backends retain ordinary preparation.",
+      "Use the existing mutation-fold semantics incrementally for cascade comparisons and point reads; preserve first-observation predicates, latest postimages and table incarnation/schema/storage fences.",
+      "Rollback and failed staging discard speculative effects. Optional cache allocation failures evict the cache while preserving accepted staged writes and refunding its budget.",
+      "Keep full authoritative constraint preparation and original version/digest guards at COMMIT. No cache grants mutation admission.",
+      "Add numeric cache reuse/rebuild counters and an opt-in numeric owner close summary for diagnosis without extra status-reader traffic."
+    ],
+    "v3_focused": {
+      "passed": 7,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0,
+      "log": ".tools/import-regression/root-cause/sql-constraint-overlay-v3-focused.log",
+      "scope": "Three C API lifecycle/conflict/FK/allocation regressions plus four fold/owned-overlay tests, before the final missing-key table-fence regression and counters."
+    },
+    "remaining": [
+      "Combined Debug focused tests, shared library, 134-export ABI smoke and storage-owner linkage.",
+      "Matched public primary-key scaling and unchanged original importer input 7 with zero builds overlapping.",
+      "Broad native/reader/persistent/C API and all SDK SQL/concurrency gates.",
+      "Final optimized wolfspider qualification, aggregate CI and Beads-owned factory."
+    ],
+    "sdk_change_required": false,
+    "issue1431_resolved": false
   }
 }

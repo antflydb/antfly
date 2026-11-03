@@ -32,37 +32,61 @@ const Context = struct {
     }
 };
 
+/// Borrowing incremental fold. Entries own their key/row storage; reset or
+/// rollback must discard this index before releasing those entries.
+pub fn Accumulator(comptime Entry: type) type {
+    return struct {
+        const Self = @This();
+        const Table = @TypeOf(@as(Entry, undefined).table);
+        allocator: std.mem.Allocator,
+        tables: std.StringHashMapUnmanaged(Table) = .empty,
+        positions: std.HashMapUnmanaged(Key, usize, Context, std.hash_map.default_max_load_percentage) = .empty,
+        entries: std.ArrayList(Entry) = .empty,
+        input_count: usize = 0,
+
+        pub fn init(allocator: std.mem.Allocator) Self {
+            return .{ .allocator = allocator };
+        }
+        pub fn deinit(self: *Self) void {
+            self.tables.deinit(self.allocator);
+            self.positions.deinit(self.allocator);
+            self.entries.deinit(self.allocator);
+        }
+        pub fn append(self: *Self, entry: Entry) !void {
+            if (self.input_count >= max_entries) return error.SqlProgramLimitExceeded;
+            const table = try self.tables.getOrPut(self.allocator, entry.table.physical_name);
+            if (table.found_existing) {
+                const prior = table.value_ptr.*;
+                if (prior.id != entry.table.id or prior.schema_version != entry.table.schema_version or
+                    prior.storage_mode != entry.table.storage_mode) return error.PreparedGenerationChanged;
+            } else table.value_ptr.* = entry.table;
+            const position = try self.positions.getOrPut(self.allocator, .{ .table = entry.table.physical_name, .row = entry.mutation.key });
+            if (!position.found_existing) {
+                position.value_ptr.* = self.entries.items.len;
+                try self.entries.append(self.allocator, entry);
+            } else if (!entry.mutation.predicate_only) {
+                const prior = &self.entries.items[position.value_ptr.*];
+                prior.mutation.row = entry.mutation.row;
+                if (@hasField(Entry, "encoded_row")) prior.encoded_row = entry.encoded_row;
+                prior.mutation.json_null_fields = entry.mutation.json_null_fields;
+                prior.mutation.predicate_only = false;
+            }
+            self.input_count += 1;
+        }
+        pub fn lookup(self: *const Self, table: []const u8, key: []const u8) ?Entry {
+            const index = self.positions.get(.{ .table = table, .row = key }) orelse return null;
+            return self.entries.items[index];
+        }
+    };
+}
+
 pub fn merge(comptime Entry: type, alloc: std.mem.Allocator, input: []const Entry) ![]Entry {
     if (input.len > max_entries) return error.SqlProgramLimitExceeded;
-    const Table = @TypeOf(@as(Entry, undefined).table);
-    var tables: std.StringHashMapUnmanaged(Table) = .empty;
-    defer tables.deinit(alloc);
-    var positions: std.HashMapUnmanaged(Key, usize, Context, std.hash_map.default_max_load_percentage) = .empty;
-    defer positions.deinit(alloc);
-    var result: std.ArrayList(Entry) = .empty;
-    errdefer result.deinit(alloc);
-    try result.ensureTotalCapacity(alloc, input.len);
-    for (input) |entry| {
-        const table = try tables.getOrPut(alloc, entry.table.physical_name);
-        if (table.found_existing) {
-            const prior = table.value_ptr.*;
-            // Fence the entire physical table, not only repeated primary keys.
-            if (prior.id != entry.table.id or prior.schema_version != entry.table.schema_version or
-                prior.storage_mode != entry.table.storage_mode) return error.PreparedGenerationChanged;
-        } else table.value_ptr.* = entry.table;
-        const position = try positions.getOrPut(alloc, .{ .table = entry.table.physical_name, .row = entry.mutation.key });
-        if (!position.found_existing) {
-            position.value_ptr.* = result.items.len;
-            result.appendAssumeCapacity(entry);
-        } else if (!entry.mutation.predicate_only) {
-            const prior = &result.items[position.value_ptr.*];
-            prior.mutation.row = entry.mutation.row;
-            if (@hasField(Entry, "encoded_row")) prior.encoded_row = entry.encoded_row;
-            prior.mutation.json_null_fields = entry.mutation.json_null_fields;
-            prior.mutation.predicate_only = false;
-        }
-    }
-    return result.toOwnedSlice(alloc);
+    var folded = Accumulator(Entry).init(alloc);
+    defer folded.deinit();
+    try folded.entries.ensureTotalCapacity(alloc, input.len);
+    for (input) |entry| try folded.append(entry);
+    return folded.entries.toOwnedSlice(alloc);
 }
 
 const TestEntry = struct {

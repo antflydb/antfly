@@ -1005,6 +1005,11 @@ pub const Owner = struct {
         text_merge_staged_bytes: u64 = 0,
         text_merge_publication_ns: u64 = 0,
         maintenance_storage_ns: u64 = 0,
+        sql_constraint_overlay_hits: u64 = 0,
+        sql_constraint_overlay_rebuilds: u64 = 0,
+        sql_constraint_overlay_rebuild_rows: u64 = 0,
+        sql_constraint_overlay_evictions: u64 = 0,
+        sql_constraint_staged_statements: u64 = 0,
         retirement_work_pages: usize = 128,
         replay_budget_table_id: u64 = 0,
         replay_budget: @import("../storage/db/derived/replay_budget.zig").Snapshot = .{},
@@ -3083,10 +3088,22 @@ pub const Owner = struct {
         }
     }
 
+    fn logQualificationSummary(self: *Owner) void {
+        if (comptime h.builtin.os.tag == .freestanding) return;
+        const raw = std.c.getenv("ANTFLY_BENCH_METRICS") orelse return;
+        const enabled = std.mem.span(raw);
+        if (enabled.len == 0 or std.mem.eql(u8, enabled, "0") or std.ascii.eqlIgnoreCase(enabled, "false")) return;
+        const p = &self.publication_stats;
+        // Numeric/enum diagnostics only: no path, SQL, model or document data.
+        // Preparation overlaps actor service; durations are not additive.
+        std.log.info("antfly_bench_native_owner source_turns={d} capture_ns={d} replay_ns={d} artifacts_ns={d} storage_ns={d} runtime_refreshes={d} maintenance_errors={d} maintenance_timeouts={d} merge_started={d} merge_applied={d} merge_discarded={d} merge_prepare_ns={d} merge_staging_ns={d} merge_staged_bytes={d} merge_publication_ns={d} sql_overlay_hits={d} sql_overlay_rebuilds={d} sql_overlay_rebuild_rows={d} sql_overlay_evictions={d} sql_staged_statements={d} replay_waits={d} replay_refused_prepare_ns={d} last_failure={s}", .{ p.maintenance_source_turns, p.maintenance_capture_ns, p.maintenance_replay_ns, p.maintenance_artifacts_ns, p.maintenance_storage_ns, p.serving_runtime_refreshes, p.maintenance_errors, p.maintenance_queue_timeouts, p.text_merge_jobs_started, p.text_merge_jobs_applied, p.text_merge_jobs_discarded, p.text_merge_prepare_ns, p.text_merge_staging_ns, p.text_merge_staged_bytes, p.text_merge_publication_ns, p.sql_constraint_overlay_hits, p.sql_constraint_overlay_rebuilds, p.sql_constraint_overlay_rebuild_rows, p.sql_constraint_overlay_evictions, p.sql_constraint_staged_statements, p.replay_backpressure_waits, p.replay_refused_preparation_ns, if (p.last_maintenance_failure) |err| @errorName(err) else "none" });
+    }
+
     fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
         const uncertain_merge = if (self.pending_text_merge) |pending| needsOutcomeReconciliation(pending.root) else false;
         self.discardPendingTextMerge();
+        self.logQualificationSummary();
         if (!uncertain_merge) self.certifyAllocatorOnClose() catch |err| {
             // Failure only loses the optimization; the previous checkpoint
             // remains recoverable and the next owner uses ordinary proof.
@@ -4935,6 +4952,136 @@ const AdmissionFollowupFixture = struct {
         }
     }
 };
+
+const ConstraintOverlayProbe = struct {
+    fn run(id: ?*anyopaque, session: ?u64, statement: []const u8, expected_error: ?[]const u8) !?i64 {
+        const a = std.testing.allocator;
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .statement = statement, .session_id = session }, .{});
+        defer a.free(encoded);
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free(&out);
+        const code = api.antfly_db_sql_json(id, .fromSlice(encoded), &out);
+        if (expected_error == null) {
+            if (code != .ok) std.debug.print("constraint overlay SQL fixture failed statement={s} response={s}\n", .{ statement, if (out.ptr) |ptr| ptr[0..out.len] else "" });
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, code);
+        } else try std.testing.expect(code != .ok);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+        defer parsed.deinit();
+        if (expected_error) |expected| {
+            try std.testing.expectEqualStrings(expected, parsed.value.object.get("error").?.object.get("code").?.string);
+            return null;
+        }
+        if (parsed.value.object.get("rows")) |rows| if (rows.array.items.len != 0) {
+            const cell = rows.array.items[0].array.items[0];
+            if (cell == .integer) return cell.integer;
+            if (cell == .string or cell == .number_string) return try std.fmt.parseInt(i64, if (cell == .string) cell.string else cell.number_string, 10);
+        };
+        return null;
+    }
+};
+
+test "capi native SQL constraint overlay extends once per statement and invalidates rollback primary and DDL cuts" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("sql-constraint-overlay", 5000, .batch);
+    defer fixture.deinit();
+    const Probe = ConstraintOverlayProbe;
+    _ = try Probe.run(fixture.id, null, "CREATE TABLE items (id BIGINT PRIMARY KEY, v BIGINT)", null);
+    _ = try Probe.run(fixture.id, null, "SELECT COUNT(*) FROM items", null);
+    var session_id: u64 = 0;
+    const sessions = @import("sql_session.zig");
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, sessions.antfly_db_sql_session_open(fixture.id, &session_id));
+    defer _ = sessions.antfly_db_sql_session_close(fixture.id, session_id);
+    _ = try Probe.run(fixture.id, session_id, "BEGIN", null);
+    _ = try Probe.run(fixture.id, session_id, "INSERT INTO items (id,v) VALUES (1,10) ON CONFLICT (id) DO UPDATE SET v=EXCLUDED.v", null);
+    const owner = fixture.connection.owner;
+    const session = fixture.connection.sql_sessions.get(session_id).?;
+    try std.testing.expectEqual(@as(usize, 1), session.test_overlay_rebuilds);
+    _ = try Probe.run(fixture.id, session_id, "INSERT INTO items (id,v) VALUES (2,20) ON CONFLICT (id) DO UPDATE SET v=EXCLUDED.v", null);
+    try std.testing.expectEqual(@as(usize, 1), session.test_overlay_rebuilds);
+    try std.testing.expectEqual(@as(usize, 2), session.test_overlay_extensions);
+    _ = try Probe.run(fixture.id, session_id, "SAVEPOINT kept", null);
+    _ = try Probe.run(fixture.id, session_id, "UPDATE items SET v=11 WHERE id=1", null);
+    _ = try Probe.run(fixture.id, session_id, "ROLLBACK TO SAVEPOINT kept", null);
+    try std.testing.expect(session.constraint_overlay == null);
+    _ = try Probe.run(fixture.id, session_id, "INSERT INTO items (id,v) VALUES (3,30)", null);
+    try std.testing.expectEqual(@as(usize, 2), session.test_overlay_rebuilds);
+    try std.testing.expectEqual(@as(?i64, 60), try Probe.run(fixture.id, session_id, "SELECT SUM(v) FROM items", null));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    _ = try Probe.run(fixture.id, session_id, "INSERT INTO items (id,v) VALUES (4,40)", null);
+    try std.testing.expectEqual(@as(usize, 3), session.test_overlay_rebuilds);
+    _ = try Probe.run(fixture.id, null, "CREATE TABLE unrelated (n BIGINT)", null);
+    _ = try Probe.run(fixture.id, session_id, "INSERT INTO items (id,v) VALUES (5,50)", null);
+    try std.testing.expectEqual(@as(usize, 4), session.test_overlay_rebuilds);
+    _ = try Probe.run(fixture.id, session_id, "INSERT INTO items (id,v) VALUES (1,44) ON CONFLICT (id) DO UPDATE SET v=EXCLUDED.v", null);
+    try std.testing.expectEqual(@as(?i64, 184), try Probe.run(fixture.id, session_id, "SELECT SUM(v) FROM items", null));
+    _ = try Probe.run(fixture.id, session_id, "COMMIT", null);
+    try std.testing.expect(session.constraint_overlay == null);
+    _ = try Probe.run(fixture.id, session_id, "BEGIN", null);
+    _ = try Probe.run(fixture.id, session_id, "UPDATE items SET v=77 WHERE id=1", null);
+    _ = try Probe.run(fixture.id, null, "UPDATE items SET v=88 WHERE id=1", null);
+    // A cached statement is never commit authority: a later conflicting write
+    // must remain fenced even when COMMIT follows without another statement.
+    _ = try Probe.run(fixture.id, session_id, "COMMIT", "40001");
+    _ = try Probe.run(fixture.id, session_id, "ROLLBACK", null);
+    try std.testing.expectEqual(@as(?i64, 88), try Probe.run(fixture.id, null, "SELECT v FROM items WHERE id=1", null));
+    try std.testing.expect((try owner.current.?.owned_lite_backend.?.native_docstore.?.checkWithCancel(null)).valid);
+}
+
+test "capi native SQL constraint overlay evicts optional allocation failures without losing staged writes" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("sql-constraint-overlay-budget", 5000, .batch);
+    defer fixture.deinit();
+    const Probe = ConstraintOverlayProbe;
+    _ = try Probe.run(fixture.id, null, "CREATE TABLE items (id BIGINT PRIMARY KEY, payload TEXT)", null);
+    var id: u64 = 0;
+    const sessions = @import("sql_session.zig");
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, sessions.antfly_db_sql_session_open(fixture.id, &id));
+    defer _ = sessions.antfly_db_sql_session_close(fixture.id, id);
+    _ = try Probe.run(fixture.id, id, "BEGIN", null);
+    _ = try Probe.run(fixture.id, id, "INSERT INTO items (id,payload) VALUES (1,'small')", null);
+    const session = fixture.connection.sql_sessions.get(id).?;
+    try std.testing.expect(session.constraint_overlay != null);
+    // Fail only optional cache growth, after authoritative statement planning
+    // and raw postimage ownership have succeeded. Existing arena frees still
+    // refund the original transaction budget through this allocator.
+    var failures = std.testing.FailingAllocator.init(session.budget.allocator(), .{ .fail_index = 0, .resize_fail_index = 0 });
+    session.constraint_overlay.?.value.arena.child_allocator = failures.allocator();
+    const payload: [65536]u8 = @splat('x');
+    const statement = try std.fmt.allocPrint(std.testing.allocator, "INSERT INTO items (id,payload) VALUES (2,'{s}')", .{payload});
+    defer std.testing.allocator.free(statement);
+    _ = try Probe.run(fixture.id, id, statement, null);
+    try std.testing.expect(session.constraint_overlay == null);
+    _ = try Probe.run(fixture.id, id, "INSERT INTO items (id,payload) VALUES (3,'after eviction')", null);
+    try std.testing.expectEqual(@as(?i64, 3), try Probe.run(fixture.id, id, "SELECT COUNT(*) FROM items", null));
+    _ = try Probe.run(fixture.id, id, "COMMIT", null);
+    try std.testing.expectEqual(@as(usize, 0), session.budget.live);
+    try std.testing.expectEqual(@as(?i64, 3), try Probe.run(fixture.id, null, "SELECT COUNT(*) FROM items", null));
+}
+
+test "capi native SQL constraint overlay preserves foreign key cascades duplicate errors and savepoints" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("sql-constraint-overlay-fk", 5000, .batch);
+    defer fixture.deinit();
+    const Probe = ConstraintOverlayProbe;
+    _ = try Probe.run(fixture.id, null, "CREATE TABLE parents (id BIGINT PRIMARY KEY)", null);
+    _ = try Probe.run(fixture.id, null, "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT REFERENCES parents(id) ON DELETE CASCADE)", null);
+    var session: u64 = 0;
+    const sessions = @import("sql_session.zig");
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, sessions.antfly_db_sql_session_open(fixture.id, &session));
+    defer _ = sessions.antfly_db_sql_session_close(fixture.id, session);
+    _ = try Probe.run(fixture.id, session, "BEGIN", null);
+    _ = try Probe.run(fixture.id, session, "INSERT INTO parents (id) VALUES (1)", null);
+    _ = try Probe.run(fixture.id, session, "INSERT INTO children (id,parent_id) VALUES (1,1)", null);
+    _ = try Probe.run(fixture.id, session, "SAVEPOINT valid", null);
+    _ = try Probe.run(fixture.id, session, "INSERT INTO children (id,parent_id) VALUES (1,1)", "23505");
+    _ = try Probe.run(fixture.id, session, "ROLLBACK TO SAVEPOINT valid", null);
+    _ = try Probe.run(fixture.id, session, "DELETE FROM parents WHERE id=1", null);
+    try std.testing.expectEqual(@as(?i64, 0), try Probe.run(fixture.id, session, "SELECT COUNT(*) FROM children", null));
+    _ = try Probe.run(fixture.id, session, "ROLLBACK TO SAVEPOINT valid", null);
+    try std.testing.expectEqual(@as(?i64, 1), try Probe.run(fixture.id, session, "SELECT COUNT(*) FROM children", null));
+    _ = try Probe.run(fixture.id, session, "COMMIT", null);
+    try std.testing.expectEqual(@as(?i64, 1), try Probe.run(fixture.id, null, "SELECT COUNT(*) FROM children", null));
+}
 
 fn seedPausedPrivateMerge(fixture: *AdmissionFollowupFixture) !*PendingTextMerge {
     return seedPausedPrivateMergeInTable(fixture, null);
