@@ -1039,7 +1039,7 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
     }
     // A descriptor claiming locally supported inputs must still expose a
     // locally usable MIME type after projection. Video-only models are handled
-    // as unavailable by parseModelCapabilities rather than admitted as text.
+    // as unsupported by parseModelCapabilities rather than admitted as text.
     if (@as(u8, @bitCast(modalities)) != 0 and mime_types.count() == 0)
         return error.InvalidInferenceCapabilities;
     const input_granularity: work.InputGranularity = std.meta.stringToEnum(
@@ -1134,7 +1134,14 @@ pub fn parseModelCapabilities(
     } else null;
     const resolved = try parseResolvedCapabilities(info.object, task);
     if (resolved) |wire| {
-        if (wire.exact) |exact| modalities = exact.modalities;
+        if (wire.exact) |exact| {
+            modalities = exact.modalities;
+            // An authoritative descriptor with no locally supported inputs is
+            // not a missing/legacy catalog. Preserve the rejection so discovery
+            // cannot activate it or return legacy capabilities.
+            if (@as(u8, @bitCast(modalities)) == 0)
+                return error.UnsupportedInferenceModality;
+        }
     }
     if (@as(u8, @bitCast(modalities)) == 0) return null;
     const exact = if (resolved) |wire| wire.exact else null;
@@ -1683,7 +1690,7 @@ test "remote Antfly capability projection does not admit a video only model" {
     defer std.testing.allocator.free(modalities);
     const payload = try hostedVideoCatalogWithField(std.testing.allocator, modalities, "accepted_mime_types", "[\"video/mp4\"]");
     defer std.testing.allocator.free(payload);
-    try std.testing.expectEqual(@as(?work.InferenceCapabilities, null), try parseModelCapabilities(std.testing.allocator, payload, hosted_video_model, .embed));
+    try std.testing.expectError(error.UnsupportedInferenceModality, parseModelCapabilities(std.testing.allocator, payload, hosted_video_model, .embed));
 }
 
 test "remote Antfly capability projection preserves strict descriptor validation" {
@@ -2176,6 +2183,78 @@ test "remote Antfly execution discovery single flights advertised activation and
             try std.testing.expect(results[index].?.capabilities != null);
             try std.testing.expectEqual(work.Task.read, results[index].?.capabilities.?.task);
             try std.testing.expectEqualStrings("fresh-route", results[index].?.routing_token.?.slice());
+        }
+    }
+}
+
+fn hostedVideoCatalogForTask(alloc: std.mem.Allocator, payload: []const u8, task: work.Task) ![]u8 {
+    var catalog = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer catalog.deinit();
+    const models = catalog.value.object.get("embedders").?;
+    const descriptor = models.object.getPtr(hosted_video_model).?.object.getPtr("inference_capabilities").?;
+    descriptor.object.getPtr("task").?.* = .{ .string = @tagName(task) };
+    descriptor.object.getPtr("output").?.* = .{ .string = @tagName(outputForTask(task)) };
+    descriptor.object.getPtr("result_cardinality").?.* = .{ .string = @tagName(resultCardinalityForTask(task)) };
+    descriptor.object.getPtr("prompt_policy").?.* = .{ .string = @tagName(promptPolicyForTask(task)) };
+    _ = catalog.value.object.swapRemove("embedders");
+    try catalog.value.object.put(catalog.arena.allocator(), taskCatalogName(task), models);
+    return try std.json.Stringify.valueAlloc(alloc, catalog.value, .{});
+}
+
+test "remote unsupported models never activate or fall back to legacy or stale capabilities" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const modalities = try hostedVideoCatalogWithField(a, hosted_video_catalog, "input_modalities", "[\"video\"]");
+    defer a.free(modalities);
+    const video_only = try hostedVideoCatalogWithField(a, modalities, "accepted_mime_types", "[\"video/mp4\"]");
+    defer a.free(video_only);
+    for (std.enums.values(work.Operation)) |operation| {
+        const payload = try hostedVideoCatalogForTask(a, video_only, operation.task());
+        defer a.free(payload);
+        const supported_payload = try hostedVideoCatalogForTask(a, hosted_video_catalog, operation.task());
+        defer a.free(supported_payload);
+        const supported = (try parseModelCapabilities(a, supported_payload, hosted_video_model, operation.task())).?;
+        for ([_]bool{ false, true }) |stale| {
+            const Probe = struct {
+                var activations = std.atomic.Value(usize).init(0);
+                fn recordActivation(_: httpx.testing_mod.RequestInfo) !void {
+                    _ = activations.fetchAdd(1, .monotonic);
+                }
+                fn serve(server: *httpx.TestServer) std.Io.Cancelable!void {
+                    while (true) server.handleOne() catch return;
+                }
+            };
+            Probe.activations.store(0, .monotonic);
+            var server = try httpx.TestServer.start(a, io, &.{
+                .{ .method = .GET, .path = "/ai/v1/models", .max_uses = 1, .respond = .{
+                    .headers = &.{.{ .name = model_activation_header, .value = "supported" }},
+                    .body = payload,
+                } },
+                .{ .method = .POST, .path = "/ai/v1/models/instances", .max_uses = 1, .assert_request = Probe.recordActivation, .respond = .{ .body = "{\"state\":\"loaded\"}" } },
+                .{ .method = .GET, .path = "/ai/v1/models", .respond = .{ .body = payload } },
+            });
+            defer server.deinit();
+            var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+            defer http.deinit();
+            var cache = Cache.init(a, io);
+            defer cache.deinit();
+            if (stale) {
+                const key = try capabilityCacheKeyAlloc(a, server.baseUrl(), hosted_video_model, operation, &.{});
+                defer a.free(key);
+                try cache.admitLocked(key, supported, null, null, monotonicNowNs(io));
+                cache.entries.getPtr(key).?.expires_at_ns = 0;
+            }
+            var group = std.Io.Group.init;
+            defer group.cancel(io);
+            try group.concurrent(io, Probe.serve, .{&server});
+            const result = cache.getOrDiscoverLeaseWithContext(&http, server.baseUrl(), hosted_video_model, operation, &.{}, .{
+                .deadline_ns = monotonicNowNs(io) + 2 * std.time.ns_per_s,
+            });
+            try std.testing.expectEqual(@as(usize, 0), Probe.activations.load(.monotonic));
+            try std.testing.expectError(error.UnsupportedInferenceModality, result);
+            try std.testing.expectError(error.InferenceCapabilitiesUnavailable, cache.routingToken(server.baseUrl(), hosted_video_model, operation, &.{}));
         }
     }
 }
